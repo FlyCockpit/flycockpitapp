@@ -356,7 +356,7 @@ fn gemini_uri_image_exactly_one_source_uri() {
             }
         ]
     } "#;
-    let response = parse_response(&json);
+    let response = parse_response(json);
     let result = extract_images(&response, 1).unwrap();
     assert_eq!(result.images.len(), 1);
     assert!(result.images[0].data.is_none());
@@ -400,7 +400,7 @@ fn gemini_rejects_neither_data_nor_uri() {
             }
         ]
     } "#;
-    let response = parse_response(&json);
+    let response = parse_response(json);
     let err = extract_images(&response, 1).unwrap_err();
     assert_eq!(err, GeminiAdapterError::ImageSourceAbsent);
 }
@@ -418,7 +418,7 @@ fn gemini_rejects_invalid_base64() {
             }
         ]
     } "#;
-    let response = parse_response(&json);
+    let response = parse_response(json);
     let err = extract_images(&response, 1).unwrap_err();
     assert_eq!(err, GeminiAdapterError::InvalidBase64);
 }
@@ -438,7 +438,7 @@ fn gemini_rejects_decode_mismatch() {
             }
         ]
     } "#;
-    let response = parse_response(&json);
+    let response = parse_response(json);
     let result = extract_images(&response, 1);
     // Either InvalidBase64 or DecodeMismatch is acceptable here; both are
     // stable slot failures.
@@ -596,7 +596,7 @@ fn gemini_text_only_response_fails_planned_slots() {
             }
         ]
     } "#;
-    let response = parse_response(&json);
+    let response = parse_response(json);
     let result = extract_images(&response, 1).unwrap();
     // Valid text but no valid image — fails planned slots (0 images).
     assert_eq!(result.images.len(), 0);
@@ -984,7 +984,7 @@ fn gemini_resolution_text_and_thought_parts_are_not_image_slots() {
     let result = extract_images(&response, 1).unwrap();
     assert_eq!(result.images.len(), 1);
     // Thought and text are retained as bounded provider metadata.
-    assert!(result.provider_text.len() >= 1);
+    assert!(!result.provider_text.is_empty());
 }
 
 #[test]

@@ -960,6 +960,8 @@ impl DossierClock for FakeDossierClock {
 
 /// Outcome of a cache lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// large_enum_variant: the oversized variant is intentional here; not boxed to keep the value owned inline.
+#[allow(clippy::large_enum_variant)]
 pub enum CacheLookupOutcome {
     /// A valid cached dossier was found. Its last-accessed time was updated.
     Hit { dossier: ImageSidecarDossier },

@@ -1607,7 +1607,7 @@ impl ActionPayloadDigest {
                 ComputerAction::MoveCursor { to, .. } => {
                     to.space.hash(&mut hasher);
                     // Coordinates are safe to hash (not sensitive).
-                    ((to.x.to_bits(), to.y.to_bits())).hash(&mut hasher);
+                    (to.x.to_bits(), to.y.to_bits()).hash(&mut hasher);
                 }
                 ComputerAction::Click {
                     button,
@@ -1760,6 +1760,7 @@ impl OutcomeJournal {
     ///   replay, return the prior outcome.
     /// - `Err(())` if the identity exists with a different digest —
     ///   `identity_conflict`, zero dispatch.
+    #[allow(clippy::result_unit_err)]
     pub fn check_identity(
         &self,
         identity: &ActionIdentity,
@@ -2287,7 +2288,8 @@ impl ComputerActionCoordinator {
         // cannot read.
         // Capture into locals first so the adapter borrow ends before any
         // `&mut self` fail-closed bookkeeping below.
-        let pre_capture: Option<Result<(u64, Option<[u8; 16]>), ()>> =
+        type PreCaptureSnapshot = Result<(u64, Option<[u8; 16]>), ()>;
+        let pre_capture: Option<PreCaptureSnapshot> =
             if let Some(adapter) = self.target_adapter.as_mut() {
                 match adapter.capture_snapshot() {
                     Ok(evidence) => Some(Ok((
@@ -4032,7 +4034,7 @@ mod tests {
         // The backing lock file is a regular file, mode 0o600 (Unix).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::fs::PermissionsExt;
             let mut found = false;
             for entry in std::fs::read_dir(&root).expect("read data root") {
                 let entry = entry.expect("dir entry");
@@ -6341,7 +6343,7 @@ mod tests {
     #[tokio::test]
     async fn computer_action_identity_conflict_different_payload_zero_dispatch() {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = FakeBackend::new();
+        let _backend = FakeBackend::new();
         let recorded = Arc::new(std::sync::Mutex::new(Vec::<ComputerAction>::new()));
         let backend_recorded = recorded.clone();
 

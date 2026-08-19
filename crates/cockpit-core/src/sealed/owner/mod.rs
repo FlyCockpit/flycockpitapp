@@ -573,10 +573,10 @@ impl<'a> SensitiveOwnerFrame<'a> {
             }
         }
         // Bound the literal before any store touch.
-        if let Some(literal) = &self.literal {
-            if literal.len() > MAX_SENSITIVE_FRAME_BYTES {
-                bail!("sensitive frame literal exceeds {MAX_SENSITIVE_FRAME_BYTES} bytes");
-            }
+        if let Some(literal) = &self.literal
+            && literal.len() > MAX_SENSITIVE_FRAME_BYTES
+        {
+            bail!("sensitive frame literal exceeds {MAX_SENSITIVE_FRAME_BYTES} bytes");
         }
         Ok(())
     }

@@ -2,8 +2,8 @@ use super::*;
 use cockpit_db::Db;
 use cockpit_proto::remote_device_identity_enrollment::{
     RemoteIdentityCustodyClassV1 as CustodyClass, RemoteIdentityCustodyError,
-    RemoteIdentityCustodyHandleId, RemoteIdentityCustodyProvider,
-    RemoteIdentityPresenceModeV1 as PresenceMode, RemoteSubjectKindV1 as SubjectKind,
+    RemoteIdentityCustodyProvider, RemoteIdentityPresenceModeV1 as PresenceMode,
+    RemoteSubjectKindV1 as SubjectKind,
 };
 use cockpit_proto::remote_identity_protocol::{
     CustodyEvidence, PossessionProof, PossessionPurpose, possession_proof_signing_digest,

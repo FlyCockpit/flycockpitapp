@@ -839,6 +839,7 @@ impl ImageGenerationDispatcher {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn finish_external_handoff(
         &self,
         dispatching: DispatchingImageGenerationAttempt,

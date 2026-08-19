@@ -187,9 +187,9 @@ fn production_or_test_construct() -> Result<(), SecureKeyError> {
     {
         // Unit tests inject via [`probe_platform_keyring_with`]. The default
         // construct never opens a real session bus.
-        return Err(SecureKeyError::Unavailable(
+        Err(SecureKeyError::Unavailable(
             "test default: inject probe_platform_keyring_with".into(),
-        ));
+        ))
     }
     #[cfg(not(test))]
     {

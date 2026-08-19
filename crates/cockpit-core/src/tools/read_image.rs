@@ -212,10 +212,10 @@ impl ReadImageArgs {
             _ => {}
         }
 
-        if let Some(ref u) = url {
-            if !u.starts_with("https://") {
-                return Err(invalid_input("`url` must use the https:// scheme"));
-            }
+        if let Some(ref u) = url
+            && !u.starts_with("https://")
+        {
+            return Err(invalid_input("`url` must use the https:// scheme"));
         }
 
         let region = obj

@@ -1247,6 +1247,7 @@ impl Model {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_completion_request(
         &self,
         system: &str,

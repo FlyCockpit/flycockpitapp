@@ -127,6 +127,7 @@ fn valid_counts() -> ComputerDossierCounts {
 mod coordinate_transform {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn transform(
         rotation: u16,
         crop_x: u32,

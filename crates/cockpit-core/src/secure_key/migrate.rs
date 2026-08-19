@@ -211,13 +211,7 @@ fn run_migrate_from_prepared(
             }
         }
     })
-    .map_err(|e| {
-        if e.to_string().contains("injected vault fault") {
-            SecureKeyError::Internal(e.to_string())
-        } else {
-            SecureKeyError::Internal(e.to_string())
-        }
-    })?;
+    .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
     fault.check(VaultFaultPoint::AfterActivation)?;
 
     fault.check(VaultFaultPoint::BeforeSourceDelete)?;

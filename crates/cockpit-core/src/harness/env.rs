@@ -43,6 +43,7 @@ pub fn harness_child_env(
     out
 }
 
+#[allow(dead_code)]
 fn env_value_for(key: &str, session_overlay: Option<&HashMap<String, String>>) -> Option<String> {
     session_overlay
         .and_then(|overlay| overlay.get(key).cloned())

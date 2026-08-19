@@ -155,6 +155,7 @@ async fn audit_upload_enabled(db: &Db, credential: &StoredFlycockpitCredential) 
     connector_enabled(db, credential).await
 }
 
+#[allow(dead_code)]
 async fn sync_once_with_client(
     db: &Db,
     credential: &StoredFlycockpitCredential,

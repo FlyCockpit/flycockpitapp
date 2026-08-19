@@ -7,8 +7,8 @@
 //! * List paging over the protected leak store: a per-daemon-boot MAC'd cursor
 //!   ([`encode_leak_cursor`] / [`decode_leak_cursor`]) bound to owner + filters
 //!   + rotation state + snapshot high watermark + last key; a first-page
-//!   watermark snapshot; `project_root`/`session`/`rotation` filters; and a
-//!   correct `has_more` via a `limit + 1` fetch ([`list_leak_reports`]).
+//!     watermark snapshot; `project_root`/`session`/`rotation` filters; and a
+//!     correct `has_more` via a `limit + 1` fetch ([`list_leak_reports`]).
 //! * The closed rotation plan derivation ([`LeakRotationPlan`]).
 //! * Rotation update and true protected-value delete wrappers
 //!   ([`update_rotation`], [`delete_protected_value`]).

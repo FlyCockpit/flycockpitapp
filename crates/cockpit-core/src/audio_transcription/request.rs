@@ -451,14 +451,14 @@ pub fn plan_gpt_transcribe(
             is_file: true,
         },
     ];
-    if let Some(p) = prompt {
-        if !p.is_empty() {
-            parts.push(MultipartPart {
-                name: "prompt".into(),
-                value: p.as_bytes().to_vec(),
-                is_file: false,
-            });
-        }
+    if let Some(p) = prompt
+        && !p.is_empty()
+    {
+        parts.push(MultipartPart {
+            name: "prompt".into(),
+            value: p.as_bytes().to_vec(),
+            is_file: false,
+        });
     }
     for kw in keywords {
         parts.push(MultipartPart {
@@ -509,14 +509,14 @@ pub fn plan_gpt_4o_transcribe_diarize(
             is_file: false,
         },
     ];
-    if let Some(dur) = probed_duration_ms {
-        if dur > 30_000 {
-            parts.push(MultipartPart {
-                name: "chunking_strategy".into(),
-                value: b"auto".to_vec(),
-                is_file: false,
-            });
-        }
+    if let Some(dur) = probed_duration_ms
+        && dur > 30_000
+    {
+        parts.push(MultipartPart {
+            name: "chunking_strategy".into(),
+            value: b"auto".to_vec(),
+            is_file: false,
+        });
     }
     if let Some(lang) = language {
         parts.push(MultipartPart {
@@ -575,14 +575,14 @@ pub fn plan_whisper_1(
             is_file: false,
         });
     }
-    if let Some(p) = prompt {
-        if !p.is_empty() {
-            parts.push(MultipartPart {
-                name: "prompt".into(),
-                value: p.as_bytes().to_vec(),
-                is_file: false,
-            });
-        }
+    if let Some(p) = prompt
+        && !p.is_empty()
+    {
+        parts.push(MultipartPart {
+            name: "prompt".into(),
+            value: p.as_bytes().to_vec(),
+            is_file: false,
+        });
     }
     finalize_plan(file_bytes, parts, boundary)
 }

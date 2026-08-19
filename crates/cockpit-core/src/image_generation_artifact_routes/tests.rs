@@ -701,7 +701,7 @@ fn image_thumbnail_pipeline_bilinear_source_coordinate_identity() {
 #[test]
 fn image_thumbnail_pipeline_bilinear_source_coordinate_downscale() {
     // Downscale 2x: destination 0 maps near source 0.
-    let (ix, fx) = bilinear_source_coordinate(0, 100, 50).expect("ok");
+    let (ix, _fx) = bilinear_source_coordinate(0, 100, 50).expect("ok");
     assert_eq!(ix, 0);
     // fx should be 32768 (the -32768 offset yields a centered sample).
     let (ix2, _fx2) = bilinear_source_coordinate(49, 100, 50).expect("ok");

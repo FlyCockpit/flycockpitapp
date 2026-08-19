@@ -1289,7 +1289,7 @@ mod transient_frames {
     #[test]
     fn transient_frame_never_enters_cache() {
         let cache = DossierCache::new();
-        let clock = FakeDossierClock::new(1000);
+        let _clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         // Transient frames never enter the 30-minute cache.
         // There is no API to insert a transient frame into the cache —

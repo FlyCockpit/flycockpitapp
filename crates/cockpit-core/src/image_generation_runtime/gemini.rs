@@ -752,10 +752,10 @@ pub fn extract_images(
         // without a step_id are always processed. The key must be the step_id
         // alone — mixing in the (always unique) step_index would defeat the
         // deduplication entirely.
-        if let Some(step_id) = &step.step_id {
-            if !seen_step_ids.insert(step_id.clone()) {
-                continue;
-            }
+        if let Some(step_id) = &step.step_id
+            && !seen_step_ids.insert(step_id.clone())
+        {
+            continue;
         }
 
         if step.kind != "model_output" {

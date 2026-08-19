@@ -3318,7 +3318,7 @@ async fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -
     .await
     .unwrap();
     seed_inference_request(
-        &db,
+        db,
         &call_id.to_string(),
         sid,
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),

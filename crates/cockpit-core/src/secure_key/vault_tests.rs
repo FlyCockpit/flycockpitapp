@@ -401,10 +401,13 @@ fn vault_windows_refuses_database_mode_without_dacl() {
     }
     #[cfg(not(windows))]
     {
-        assert!(
-            crate::private_fs::PRIVATE_FS_POLICY.unix_mode_enforced
-                || !crate::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced
-        );
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                crate::private_fs::PRIVATE_FS_POLICY.unix_mode_enforced
+                    || !crate::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced
+            );
+        }
     }
 }
 

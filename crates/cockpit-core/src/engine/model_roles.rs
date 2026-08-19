@@ -873,6 +873,7 @@ pub(crate) fn custody_for_trust(trust: ModelTrust) -> ModelCustody {
 /// The host named the target, so custody is the target's own configured trust
 /// class — host-authorized rather than a forced filter. The route is still
 /// custody-typed, so nothing reaches dispatch with an undecided custody class.
+#[allow(clippy::too_many_arguments)]
 fn build_host_selected_policy_model(
     selector: &str,
     stage: &'static str,

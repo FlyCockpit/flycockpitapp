@@ -617,7 +617,7 @@ async fn history_snapshot_is_consistent() {
 async fn unknown_trusted_sensitive_artifact_fails_closed() {
     let db = test_db().await;
     let resolver = test_resolver();
-    let history = ProtectedRedactionHistory::new(&db, &resolver);
+    let _history = ProtectedRedactionHistory::new(&db, &resolver);
 
     // The source set is closed: Sealed, Environment, Credential, ContainedLeak.
     // An "unclassified" source has no variant — it cannot be constructed.

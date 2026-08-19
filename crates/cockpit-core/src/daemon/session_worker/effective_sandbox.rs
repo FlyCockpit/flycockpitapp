@@ -220,10 +220,10 @@ pub fn evaluate_set_sandbox(
     })
 }
 
-fn capability_row_for_mode<'a>(
+fn capability_row_for_mode(
     mode: SandboxMode,
-    caps: &'a HostCapabilitySnapshot,
-) -> Option<&'a FeatureCapabilityRow> {
+    caps: &HostCapabilitySnapshot,
+) -> Option<&FeatureCapabilityRow> {
     match mode {
         SandboxMode::Off => None,
         SandboxMode::Sandbox => feature_row(caps, FEATURE_SANDBOX_HOST),

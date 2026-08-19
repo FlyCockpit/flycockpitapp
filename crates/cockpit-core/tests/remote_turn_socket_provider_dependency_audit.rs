@@ -70,10 +70,10 @@ fn lock_checksums(root: &Path) -> BTreeMap<(String, String), String> {
             name = Some(rest.trim_end_matches('"').to_string());
         } else if let Some(rest) = line.strip_prefix("version = \"") {
             version = Some(rest.trim_end_matches('"').to_string());
-        } else if let Some(rest) = line.strip_prefix("checksum = \"") {
-            if let (Some(n), Some(v)) = (name.clone(), version.clone()) {
-                map.insert((n, v), rest.trim_end_matches('"').to_string());
-            }
+        } else if let Some(rest) = line.strip_prefix("checksum = \"")
+            && let (Some(n), Some(v)) = (name.clone(), version.clone())
+        {
+            map.insert((n, v), rest.trim_end_matches('"').to_string());
         }
     }
     map

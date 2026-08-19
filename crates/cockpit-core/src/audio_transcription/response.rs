@@ -397,7 +397,7 @@ pub fn normalize_diarized_segments(response: &DiarizedResponse) -> Result<Vec<Di
 
 fn validate_id_string(s: &str) -> Result<()> {
     let bytes = s.len();
-    if bytes < MIN_ID_BYTES || bytes > MAX_ID_BYTES {
+    if !(MIN_ID_BYTES..=MAX_ID_BYTES).contains(&bytes) {
         bail!("invalid_output: id/speaker must be {MIN_ID_BYTES}..{MAX_ID_BYTES} UTF-8 bytes");
     }
     Ok(())
@@ -518,20 +518,20 @@ fn decode_whisper(body: &[u8], mode: WhisperMode) -> Result<WhisperVerboseRespon
             let mut total_tokens: u64 = 0;
             for seg in segs {
                 let s = decode_whisper_segment(seg, &mut total_tokens)?;
-                if let Some(pid) = prev_id {
-                    if s.id <= pid {
-                        bail!("invalid_output: segment ids must be strictly increasing");
-                    }
+                if let Some(pid) = prev_id
+                    && s.id <= pid
+                {
+                    bail!("invalid_output: segment ids must be strictly increasing");
                 }
-                if let Some(ps) = prev_seek {
-                    if s.seek < ps {
-                        bail!("invalid_output: seeks must be nondecreasing");
-                    }
+                if let Some(ps) = prev_seek
+                    && s.seek < ps
+                {
+                    bail!("invalid_output: seeks must be nondecreasing");
                 }
-                if let Some(pst) = prev_start {
-                    if s.start_us < pst {
-                        bail!("invalid_output: starts must be nondecreasing");
-                    }
+                if let Some(pst) = prev_start
+                    && s.start_us < pst
+                {
+                    bail!("invalid_output: starts must be nondecreasing");
                 }
                 prev_id = Some(s.id);
                 prev_seek = Some(s.seek);
@@ -557,10 +557,10 @@ fn decode_whisper(body: &[u8], mode: WhisperMode) -> Result<WhisperVerboseRespon
             let mut prev_start: Option<u64> = None;
             for w in ws {
                 let wd = decode_whisper_word(w)?;
-                if let Some(pst) = prev_start {
-                    if wd.start_us < pst {
-                        bail!("invalid_output: word starts must be nondecreasing");
-                    }
+                if let Some(pst) = prev_start
+                    && wd.start_us < pst
+                {
+                    bail!("invalid_output: word starts must be nondecreasing");
                 }
                 prev_start = Some(wd.start_us);
                 words.push(wd);
@@ -682,20 +682,19 @@ fn decode_whisper_segment(
         tokens.push(tn as u32);
     }
     let temperature = get_f64(obj, "temperature")?;
-    if !temperature.is_finite() || temperature < 0.0 || temperature > 1.0 {
+    if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
         bail!("invalid_output: temperature must be finite in [0,1]");
     }
     let avg_logprob = get_f64(obj, "avg_logprob")?;
-    if !avg_logprob.is_finite() || avg_logprob < -1_000_000.0 || avg_logprob > 0.0 {
+    if !avg_logprob.is_finite() || !(-1_000_000.0..=0.0).contains(&avg_logprob) {
         bail!("invalid_output: avg_logprob must be finite in [-1000000,0]");
     }
     let compression_ratio = get_f64(obj, "compression_ratio")?;
-    if !compression_ratio.is_finite() || compression_ratio < 0.0 || compression_ratio > 1_000_000.0
-    {
+    if !compression_ratio.is_finite() || !(0.0..=1_000_000.0).contains(&compression_ratio) {
         bail!("invalid_output: compression_ratio must be finite in [0,1000000]");
     }
     let no_speech_prob = get_f64(obj, "no_speech_prob")?;
-    if !no_speech_prob.is_finite() || no_speech_prob < 0.0 || no_speech_prob > 1.0 {
+    if !no_speech_prob.is_finite() || !(0.0..=1.0).contains(&no_speech_prob) {
         bail!("invalid_output: no_speech_prob must be finite in [0,1]");
     }
     Ok(WhisperSegment {

@@ -9,8 +9,6 @@
 
 #![forbid(unsafe_code)]
 
-use tenant_authority::UnsupportedPlatform;
-
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("serve");
@@ -31,8 +29,8 @@ fn main() -> std::process::ExitCode {
             eprintln!("tenant-authority replica: local replica administration");
             std::process::ExitCode::from(run_offline())
         }
-        // Default: open the submit-only mTLS listener.
-        "serve" | _ => run_service(),
+        // Default (including "serve"): open the submit-only mTLS listener.
+        _ => run_service(),
     }
 }
 

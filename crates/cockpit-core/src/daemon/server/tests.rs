@@ -9308,7 +9308,7 @@ fn unify_remaining_stores_stays_gone() {
         "credentials.rs",
         "db/secret_vault.rs",
     ] {
-        let path = format!(
+        let _path = format!(
             "{}/src/{}",
             env!("CARGO_MANIFEST_DIR"),
             rel.replace("db/", "../../../cockpit-db/src/db/")

@@ -434,7 +434,7 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
         for (i, v) in caps.iter().enumerate() {
             let ord = v.as_u64().unwrap() as u8;
             assert!(
-                ord >= 1 && ord <= 15,
+                (1..=15).contains(&ord),
                 "project capability ordinal out of range"
             );
             if i > 0 {

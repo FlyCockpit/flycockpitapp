@@ -1247,7 +1247,7 @@ impl Driver {
         let mut keep = initial_tail_kept;
         let mut tail_positions = candidate_tail.tail_message_positions;
         let draft_quota = Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default()));
-        let mut authoring_model: Option<CompactAuthoringModel> = None;
+        let mut authoring_model: Option<CompactAuthoringModel>;
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
             let (brief, authoring) = if let Some(ready) = shadow.as_ref() {

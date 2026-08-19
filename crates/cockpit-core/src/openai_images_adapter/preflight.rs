@@ -330,7 +330,7 @@ fn validate_size(
                     ),
                 });
             }
-            if width % alignment != 0 || height % alignment != 0 {
+            if !width.is_multiple_of(alignment) || !height.is_multiple_of(alignment) {
                 return Err(PreflightFailure {
                     reason: format!(
                         "edges {width}x{height} not aligned to {alignment} px; both edges must be multiples of {alignment}"

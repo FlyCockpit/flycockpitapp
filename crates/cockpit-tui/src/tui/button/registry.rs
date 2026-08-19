@@ -172,9 +172,7 @@ impl ButtonRegistry {
                 Some(ButtonPointerOutcome::Pressed(target.id))
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let Some(press) = self.pressed.take() else {
-                    return None;
-                };
+                let press = self.pressed.take()?;
                 let Some(target) = self.hit(mouse.column, mouse.row).cloned() else {
                     return Some(ButtonPointerOutcome::Cancelled);
                 };

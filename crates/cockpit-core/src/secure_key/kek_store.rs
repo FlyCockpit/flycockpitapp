@@ -256,6 +256,10 @@ impl MemoryKekStore {
     pub fn len(&self) -> usize {
         self.items.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl fmt::Debug for MemoryKekStore {

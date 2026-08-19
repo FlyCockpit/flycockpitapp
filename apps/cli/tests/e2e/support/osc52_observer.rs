@@ -260,7 +260,7 @@ fn parse_selector_and_payload(body: &[u8]) -> Option<Osc52FrameMeta> {
 /// feeding SHA-256 and a length counter. The decoded payload is never stored.
 fn digest_base64_streaming(input: &[u8]) -> Option<(usize, String)> {
     use base64::Engine;
-    if input.is_empty() || input.len() % 4 != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
         return None;
     }
     let mut hasher = Sha256::new();

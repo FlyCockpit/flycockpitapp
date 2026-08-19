@@ -368,6 +368,7 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
     )
 }
 
+#[allow(dead_code)]
 fn is_schema_rejection(message: &str) -> bool {
     [
         "database schema version mismatch",
@@ -378,6 +379,7 @@ fn is_schema_rejection(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+#[allow(dead_code)]
 fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
     let sessions = if retention.session_window_days == 0 {
         "disabled".to_string()

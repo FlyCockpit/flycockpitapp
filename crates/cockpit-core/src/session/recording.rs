@@ -870,6 +870,7 @@ impl Session {
     /// (decision 10.2): the payload row and the history/ref rows commit together
     /// or not at all. An untrusted target (payload already post-redaction) and a
     /// scratch session ([`Self::allow_unjournaled_inference`]) journal nothing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_inference_attempt(
         &self,
         call_id: Uuid,

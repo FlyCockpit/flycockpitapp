@@ -1264,13 +1264,7 @@ fn sandbox_select_options(
             });
         }
     }
-    if current != SandboxMode::Off {
-        options.push(SelectOption {
-            id: "off".into(),
-            label: "off".into(),
-            description: "Unconfined: commands the model runs are not sandboxed.".into(),
-        });
-    } else if !current_selectable {
+    if current != SandboxMode::Off || !current_selectable {
         options.push(SelectOption {
             id: "off".into(),
             label: "off".into(),

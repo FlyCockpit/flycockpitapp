@@ -230,6 +230,7 @@ pub(crate) fn failover_candidate_admitted(
 /// providers config and build it, inheriting `model`'s shutdown gate. Split
 /// from [`resolve_backup_model_for`] so the test-injected config path can reuse
 /// it without touching disk.
+#[allow(dead_code)]
 pub(crate) fn build_backup_model(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
@@ -323,6 +324,7 @@ pub(crate) fn build_backup_model_with_diagnostics_and_store(
     (Some(Arc::new(built)), None)
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_failover_models(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,

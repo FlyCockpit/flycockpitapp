@@ -14,8 +14,7 @@ use super::*;
 use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 use crate::daemon::relay_envelope::RelayGrantScope;
 use cockpit_proto::remote_public_service_policy::{
-    RemoteAttachmentCapabilityV1, RemotePermissionCeilingV1, RemoteProjectCapabilityV1,
-    permission_ceiling_digest,
+    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1, permission_ceiling_digest,
 };
 
 // ---------------------------------------------------------------------------

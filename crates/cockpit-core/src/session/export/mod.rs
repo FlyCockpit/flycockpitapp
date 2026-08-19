@@ -626,6 +626,7 @@ fn assemble_bundle_snapshot_conn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_bundle_snapshot_conn_with_after_collect<F>(
     db: &Db,
     conn: &Connection,
@@ -842,6 +843,7 @@ async fn build_zip_with_options_and_env(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_zip_with_options_and_env_conn(
     db: &Db,
     conn: &Connection,
@@ -1770,7 +1772,7 @@ pub fn process_env_map_for_conn() -> HashMap<String, String> {
 /// dispatch); that journal-backed inventory is a follow-up. Rotated/deleted
 /// secrets are covered here only insofar as they remain in the persisted union.
 pub fn redaction_table_for_session(
-    db: &Db,
+    _db: &Db,
     target: &SessionRow,
     env: &HashMap<String, String>,
     vault: &crate::secure_key::SecretVault,

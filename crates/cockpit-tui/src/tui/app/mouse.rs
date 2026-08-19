@@ -1640,10 +1640,7 @@ impl App {
         let cfg = mouse_gesture::GestureConfig {
             copy_on_release: self.copy_on_release,
         };
-        let state = std::mem::replace(
-            &mut self.mouse_gesture_state,
-            mouse_gesture::GestureState::new(),
-        );
+        let state = std::mem::take(&mut self.mouse_gesture_state);
         let (next, effects) = mouse_gesture::reduce(state, &cfg, &input);
         self.mouse_gesture_state = next;
         self.apply_gesture_effects(&effects);

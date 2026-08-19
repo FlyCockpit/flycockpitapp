@@ -81,20 +81,20 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use cockpit_proto::remote_ip_consent::ConsentCapability;
+use cockpit_proto::remote_transport_selection::MAX_COMMITTED_RESERVATIONS_ROLLING;
+// Consumed only by this module's `#[cfg(test)]` tests (via `super::*`).
+#[cfg(test)]
+use cockpit_proto::remote_transport_selection::INITIAL_DEADLINE_SECS;
 use cockpit_proto::remote_transport_selection::{
     ChildState, DurableLifecycle, HealthTier, ICE_DISCONNECTED_FALLBACK_MISSES,
-    INITIAL_DEADLINE_SECS, MAX_ORDINARY_PENDING_CHILDREN, MAX_PENDING_PER_KIND,
-    MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION, MAX_RESERVATIONS_PER_TRAIN, MAX_ROUTED_CURRENT_CHILDREN,
-    MAX_SAME_KIND_RETRIES, ParentState, RECOVERY_CONSECUTIVE_HEALTHY, RETRY_DELAY_SECS,
-    ROLLING_WINDOW_SECS, ReachabilityClass, RemoteTransportRetryReservation,
-    RemoteTransportRetryReservationKey, RoutingClass, SecondChildReason, TRAIN_ID_BYTES,
-    TransportDenial, TransportKind, UserTransportPreference, WEBRTC_DEGRADED_BUFFER_BYTES,
-    WEBRTC_DEGRADED_MISSES, WEBRTC_FAILED_MISSES, WEBRTC_HEALTHY_CONSECUTIVE_SUCCESSES,
-    WEBSOCKET_DEGRADED_BUFFER_BYTES, WEBSOCKET_DEGRADED_UNACKED_AGE_SECS,
-    WEBSOCKET_FAILED_RETRANSMISSIONS,
-};
-use cockpit_proto::remote_transport_selection::{
-    DRAINING_TIMEOUT_SECS, MAX_COMMITTED_RESERVATIONS_ROLLING,
+    MAX_ORDINARY_PENDING_CHILDREN, MAX_PENDING_PER_KIND, MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION,
+    MAX_RESERVATIONS_PER_TRAIN, MAX_ROUTED_CURRENT_CHILDREN, MAX_SAME_KIND_RETRIES, ParentState,
+    RECOVERY_CONSECUTIVE_HEALTHY, RETRY_DELAY_SECS, ROLLING_WINDOW_SECS, ReachabilityClass,
+    RemoteTransportRetryReservation, RemoteTransportRetryReservationKey, RoutingClass,
+    SecondChildReason, TRAIN_ID_BYTES, TransportDenial, TransportKind, UserTransportPreference,
+    WEBRTC_DEGRADED_BUFFER_BYTES, WEBRTC_DEGRADED_MISSES, WEBRTC_FAILED_MISSES,
+    WEBRTC_HEALTHY_CONSECUTIVE_SUCCESSES, WEBSOCKET_DEGRADED_BUFFER_BYTES,
+    WEBSOCKET_DEGRADED_UNACKED_AGE_SECS, WEBSOCKET_FAILED_RETRANSMISSIONS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -485,6 +485,8 @@ impl TransportSelectionState {
 /// Inputs to the transport selection reducer. All transitions are
 /// generation-bound and recorded as pure actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// large_enum_variant: the oversized variant is intentional here; not boxed to keep the value owned inline.
+#[allow(clippy::large_enum_variant)]
 pub enum TransportSelectionInput {
     /// Start the initial child plan.
     StartPlan,
@@ -1518,15 +1520,14 @@ fn reduce_route_request(
     delivery_id: &str,
     routing_class: RoutingClass,
 ) -> Vec<TransportSelectionAction> {
-    if let Some(&assigned) = state.delivery_assignments.get(delivery_id) {
-        if let Some(child) = state.find_child(assigned) {
-            if child.is_routed_current() {
-                return vec![TransportSelectionAction::RouteDelivery {
-                    delivery_id: delivery_id.to_string(),
-                    child_attempt: assigned,
-                }];
-            }
-        }
+    if let Some(&assigned) = state.delivery_assignments.get(delivery_id)
+        && let Some(child) = state.find_child(assigned)
+        && child.is_routed_current()
+    {
+        return vec![TransportSelectionAction::RouteDelivery {
+            delivery_id: delivery_id.to_string(),
+            child_attempt: assigned,
+        }];
     }
 
     let selected = select_route(state, routing_class);

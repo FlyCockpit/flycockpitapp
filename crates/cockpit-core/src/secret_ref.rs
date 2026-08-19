@@ -137,6 +137,7 @@ pub fn redact_provider_view(
     }
 }
 
+#[allow(dead_code)]
 fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
     migrate_effective_layers_once_with_store(cwd, None)
 }
@@ -190,6 +191,7 @@ fn open_secret_store_impl(store_path: Option<&Path>) -> Result<CredentialStore> 
 #[cfg(any(test, feature = "test-support"))]
 include!("secret_ref_test_open.rs");
 
+#[allow(dead_code)]
 fn load_paths_with_secret_migration(
     config_paths: &[PathBuf],
     store_path: Option<&Path>,
@@ -292,6 +294,7 @@ fn protect_literal_headers_in_store_with_notice(
     }))
 }
 
+#[allow(dead_code)]
 fn migrate_provider_files(
     config_paths: &[PathBuf],
     store_path: Option<&Path>,

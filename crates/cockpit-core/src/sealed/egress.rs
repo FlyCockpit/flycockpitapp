@@ -129,6 +129,7 @@ pub async fn active_sealed_value_ids(
 /// falls back to `None` — fail closed to safe generic rendering, never to a
 /// stale marker, a raw literal, or a dispatch error. Trusted targets keep raw
 /// custody (`None`).
+#[allow(clippy::too_many_arguments)]
 pub async fn derive_untrusted_interactive_sealed_egress(
     model: &crate::engine::model::Model,
     interactive: bool,

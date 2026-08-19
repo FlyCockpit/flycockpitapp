@@ -16,7 +16,7 @@ pub const MAX_REFERENCE_BYTES: usize = 64 * 1024 * 1024;
 /// Aggregate reference byte bound across all multipart parts.
 pub const MAX_AGGREGATE_REFERENCE_BYTES: usize = 256 * 1024 * 1024;
 /// Bound on the JSON generation body.
-pub const MAX_GENERATION_BODY_BYTES: usize = 1 * 1024 * 1024;
+pub const MAX_GENERATION_BODY_BYTES: usize = 1024 * 1024;
 
 /// A failure during wire encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]

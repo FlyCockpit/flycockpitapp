@@ -1,5 +1,9 @@
 //! Host capability snapshot dispatch and boot tests.
 
+// These tests intentionally hold a std `MutexGuard` across `.await` on a
+// single-threaded/local test executor; there is no cross-task contention.
+#![allow(clippy::await_holding_lock)]
+
 use super::dispatch::handle_request;
 use super::tests::test_ctx;
 use super::*;

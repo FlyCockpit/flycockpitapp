@@ -1036,7 +1036,7 @@ async fn inference_failure_projection_omits_provider_detail_from_all_safe_sinks(
     // Sink 4 — the driver's failed-turn recovery record. The recorded event's
     // JSON must not carry the secret, while the observed-status + recovery
     // metadata remain queryable.
-    let (mut driver, _tmp) = test_driver(1);
+    let (driver, _tmp) = test_driver(1);
     driver
         .session
         .db

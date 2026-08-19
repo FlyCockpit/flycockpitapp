@@ -85,7 +85,7 @@ fn https_origin_allowlist_rejects_duplicates() {
 #[test]
 fn https_origin_allowlist_rejects_too_many() {
     let mut origins: Vec<&str> = vec![];
-    for i in 0..(HTTPS_MAX_ORIGINS + 1) {
+    for _i in 0..(HTTPS_MAX_ORIGINS + 1) {
         origins.push("https://api.example.com");
     }
     // Can't easily build duplicates, so just test the count limit with unique

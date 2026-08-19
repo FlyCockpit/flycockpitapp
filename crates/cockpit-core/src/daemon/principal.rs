@@ -9,6 +9,8 @@ use cockpit_proto::remote_public_service_policy::{
 use crate::daemon::proto::{self, Request};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// large_enum_variant: the oversized variant is intentional here; not boxed to keep the value owned inline.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientPrincipal {
     Owner,
     Remote(RemotePrincipal),

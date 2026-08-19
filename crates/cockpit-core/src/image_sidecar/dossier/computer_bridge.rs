@@ -940,6 +940,7 @@ impl ComputerDossierRegistry {
     /// Borrow the dossier for a delegation, returning a coordinate candidate.
     /// Validates that the dossier is not expired, not stale, and that the
     /// generations match.
+    #[allow(clippy::too_many_arguments)]
     pub fn candidate(
         &self,
         delegation_id: &str,

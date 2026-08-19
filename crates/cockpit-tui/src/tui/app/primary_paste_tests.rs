@@ -18,6 +18,7 @@ use crate::tui::primary_paste::{
 use crate::tui::settings::Dialog;
 use crate::tui::structured_paste::PasteSource;
 
+#[allow(clippy::unusual_byte_groupings)]
 const HELD_TOKEN: u64 = 0xC0_11_EC_7;
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -268,6 +269,7 @@ fn primary_paste_platform_gate() {
     let mut app = primary_ready_app(&tmp);
     assert_eq!(composer_text(&app), "");
 
+    #[allow(clippy::type_complexity)]
     let mut gate_cases: Vec<(&str, Box<dyn Fn(&mut App)>)> = vec![
         (
             "macos",
@@ -422,8 +424,6 @@ fn primary_paste_platform_gate() {
         let before = composer_text(&case);
         let click = if label == "footer" {
             middle_down(2, 26)
-        } else if label == "pane-focus" {
-            middle_down(4, 22)
         } else {
             middle_down(4, 22)
         };

@@ -625,14 +625,12 @@ pub fn compile_guidance(rules: &[ComputerGuidanceRuleV1]) -> Vec<u8> {
 
     let mut out = Vec::new();
     let mut first = true;
-    for slot in &by_kind {
-        if let Some(rule) = slot {
-            if !first {
-                out.push(CLAUSE_SEPARATOR);
-            }
-            out.extend_from_slice(compiler_clause_bytes(rule));
-            first = false;
+    for rule in by_kind.iter().flatten() {
+        if !first {
+            out.push(CLAUSE_SEPARATOR);
         }
+        out.extend_from_slice(compiler_clause_bytes(rule));
+        first = false;
     }
     out
 }
@@ -643,20 +641,15 @@ pub fn compile_guidance(rules: &[ComputerGuidanceRuleV1]) -> Vec<u8> {
 
 /// The four applicable layers for `allow_computer_guidance_proposals`.
 /// Each layer is `absent | enabled | disabled`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EnablementValue {
     /// No explicit value at this layer.
+    #[default]
     Absent,
     /// Explicitly enabled at this layer.
     Enabled,
     /// Explicitly disabled at this layer (sticky safety veto).
     Disabled,
-}
-
-impl Default for EnablementValue {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 
 impl EnablementValue {
@@ -709,10 +702,10 @@ pub fn resolve_enablement(layers: &EnablementLayers) -> EnablementResolution {
     let all_layers = [layers.global, layers.project, layers.provider, layers.model];
 
     // Any explicit disable at any layer is a sticky veto.
-    let has_disable_veto = all_layers.iter().any(|l| *l == EnablementValue::Disabled);
+    let has_disable_veto = all_layers.contains(&EnablementValue::Disabled);
 
     // Any explicit enable.
-    let has_explicit_enable = all_layers.iter().any(|l| *l == EnablementValue::Enabled);
+    let has_explicit_enable = all_layers.contains(&EnablementValue::Enabled);
 
     // All absent → disabled.
     let all_absent = all_layers.iter().all(|l| *l == EnablementValue::Absent);
@@ -784,14 +777,12 @@ pub fn compose_and_compile(
 
     let mut out = Vec::new();
     let mut first = true;
-    for slot in &by_kind {
-        if let Some(rule) = slot {
-            if !first {
-                out.push(CLAUSE_SEPARATOR);
-            }
-            out.extend_from_slice(compiler_clause_bytes(rule));
-            first = false;
+    for rule in by_kind.iter().flatten() {
+        if !first {
+            out.push(CLAUSE_SEPARATOR);
         }
+        out.extend_from_slice(compiler_clause_bytes(rule));
+        first = false;
     }
     out
 }

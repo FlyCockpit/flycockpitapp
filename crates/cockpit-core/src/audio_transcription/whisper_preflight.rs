@@ -3,7 +3,7 @@
 //! Before any reservation or dispatch, count the exact trimmed prompt with
 //! the checked-in, SHA-256-pinned OpenAI Whisper multilingual tokenizer table;
 //! >224 tokens or unavailable/mismatched tokenizer data fails preflight with
-//! `transcription_prompt_too_long|transcription_unavailable` and zero request.
+//! > `transcription_prompt_too_long|transcription_unavailable` and zero request.
 //!
 //! The Whisper multilingual tokenizer uses the `r50k_base` BPE encoding (the
 //! same encoding used by Whisper pre-large-v3). The tokenizer table is

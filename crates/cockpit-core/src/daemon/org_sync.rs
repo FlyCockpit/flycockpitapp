@@ -204,6 +204,7 @@ async fn post_batch_with_retries(
     Err(anyhow!("Flycockpit session-log ingest exhausted retries"))
 }
 
+#[allow(dead_code)]
 async fn sync_once_with_client(
     db: &Db,
     credential: &StoredFlycockpitCredential,

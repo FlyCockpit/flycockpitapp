@@ -2568,8 +2568,9 @@ fn render_agent(
     // (or rows) for it. This row is inserted after the first row (which
     // carries the timestamp/pin) so the timestamp and controls are
     // preserved. The dedicated row is clickable.
-    if metric_text.is_some() && metric_region.is_none() {
-        let chip_text = metric_text.as_ref().unwrap();
+    if let Some(chip_text) = metric_text.as_ref()
+        && metric_region.is_none()
+    {
         let chip_w = chip_text.width();
         let avail = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
         let mut metric_rows: Vec<MetricRow> = Vec::new();
@@ -2581,10 +2582,10 @@ fn render_agent(
             out.insert(insert_at, row_line);
             conts.insert(insert_at, false);
             // Adjust chip_row if it was set.
-            if let Some(cr) = chip_row.as_mut() {
-                if *cr >= insert_at {
-                    *cr += 1;
-                }
+            if let Some(cr) = chip_row.as_mut()
+                && *cr >= insert_at
+            {
+                *cr += 1;
             }
             // Adjust copy_body_start if it was set.
             if let Some(copy) = copy_body_start.as_mut() {
@@ -2654,10 +2655,10 @@ fn render_agent(
             }
             // Adjust chip_row and copy_body_start for inserted rows.
             let inserted = current_row - insert_at;
-            if let Some(cr) = chip_row.as_mut() {
-                if *cr >= insert_at {
-                    *cr += inserted;
-                }
+            if let Some(cr) = chip_row.as_mut()
+                && *cr >= insert_at
+            {
+                *cr += inserted;
             }
             if let Some(copy) = copy_body_start.as_mut() {
                 copy.start += inserted;
@@ -2717,10 +2718,10 @@ fn render_agent(
             conts.insert(insert_at + i, false);
         }
         let inserted = detail_rows.len();
-        if let Some(cr) = chip_row.as_mut() {
-            if *cr >= insert_at {
-                *cr += inserted;
-            }
+        if let Some(cr) = chip_row.as_mut()
+            && *cr >= insert_at
+        {
+            *cr += inserted;
         }
         if let Some(copy) = copy_body_start.as_mut() {
             copy.start += inserted;
@@ -3797,7 +3798,7 @@ fn agent_pin_reserve(pin: Option<PinControl>) -> usize {
 /// if both chips cannot fit, `[fork]` is dropped before `[pin]`; if `[pin]`
 /// cannot fit either, no region is returned.
 fn render_first_line_with_pin_and_timestamp(
-    mut spans: Vec<Span<'static>>,
+    spans: Vec<Span<'static>>,
     timestamp: DateTime<Local>,
     width: u16,
     pin: Option<PinControl>,

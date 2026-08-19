@@ -484,6 +484,7 @@ impl RehydratedLiteral {
     /// guessing oracle; kept off every export / protocol / diagnostics
     /// projection (decision 6) and used only for same-session dedup and local
     /// (Owner-sensitive) leak-report correlation.
+    #[allow(dead_code)]
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -512,10 +513,12 @@ impl std::fmt::Debug for RehydratedLiteral {
 /// literals for the duration of a redaction pass and zeroizes them on drop.
 /// No literal in this frame is ever serialized into persisted ordinary
 /// redaction JSON.
+#[allow(dead_code)]
 pub struct RedactionRehydrationFrame {
     literals: Vec<RehydratedLiteral>,
 }
 
+#[allow(dead_code)]
 impl RedactionRehydrationFrame {
     /// Create an empty frame.
     pub fn new() -> Self {
@@ -737,6 +740,7 @@ impl<'a> ProtectedRedactionHistory<'a> {
     ///
     /// `literal` is consumed and zeroized. `artifacts` is the list of durable
     /// artifacts that reference this literal.
+    #[allow(dead_code)]
     pub async fn append_and_attach(
         &self,
         session_id: &str,
@@ -752,6 +756,7 @@ impl<'a> ProtectedRedactionHistory<'a> {
     /// Rehydrate the literals referenced by one artifact into a bounded
     /// zeroizing frame. Fails closed on any key-store failure, integrity
     /// mismatch, or missing reference.
+    #[allow(dead_code)]
     pub async fn rehydrate_for_artifact(
         &self,
         artifact_kind: RedactionArtifactKind,

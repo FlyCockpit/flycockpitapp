@@ -528,13 +528,11 @@ pub fn validate_routing_policy(
     // Validate discovered tags: reject a non-null tag with empty content,
     // leading/trailing whitespace, or ASCII controls.
     let mut valid_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for tag in endpoint_tags {
-        if let Some(t) = tag {
-            if t.is_empty() || t != t.trim() || t.bytes().any(|b| b.is_ascii_control()) {
-                return Err(RoutingError::InvalidDiscoveredTag);
-            }
-            valid_tags.insert(t.clone());
+    for t in endpoint_tags.iter().flatten() {
+        if t.is_empty() || t != t.trim() || t.bytes().any(|b| b.is_ascii_control()) {
+            return Err(RoutingError::InvalidDiscoveredTag);
         }
+        valid_tags.insert(t.clone());
     }
     // Reject unknown names in only/ignore/order.
     for list in [&policy.only, &policy.ignore, &policy.order] {
@@ -1056,10 +1054,10 @@ pub fn preflight(
     }
     // n must not exceed any possible endpoint's discovered maximum.
     for endpoint in endpoints {
-        if let Some(cap) = &endpoint.n {
-            if request.n > cap.max {
-                return PreflightOutcome::Reject(PreflightReason::NAboveEndpointCap);
-            }
+        if let Some(cap) = &endpoint.n
+            && request.n > cap.max
+        {
+            return PreflightOutcome::Reject(PreflightReason::NAboveEndpointCap);
         }
     }
     // resolution must be advertised by every possible endpoint.
@@ -1111,7 +1109,7 @@ pub fn preflight(
                         .collect::<Vec<_>>()
                 });
                 let canonical = format!("{width}x{height}");
-                if !intersection.iter().any(|s| *s == canonical) {
+                if !intersection.contains(&canonical) {
                     return PreflightOutcome::Reject(
                         PreflightReason::ExplicitPixelsNoSizeDescriptor,
                     );
@@ -1157,10 +1155,8 @@ pub fn preflight(
     }
     // seed: integer request field available only when every possible endpoint
     // advertises the boolean seed capability descriptor.
-    if request.seed.is_some() {
-        if !endpoints.iter().all(|e| e.seed == Some(true)) {
-            return PreflightOutcome::Reject(PreflightReason::SeedUnavailable);
-        }
+    if request.seed.is_some() && !endpoints.iter().all(|e| e.seed == Some(true)) {
+        return PreflightOutcome::Reject(PreflightReason::SeedUnavailable);
     }
     // input_references: availability and count limited by image input
     // modality, model record, every possible endpoint, target policy,
@@ -1281,7 +1277,7 @@ pub fn endpoint_max_microdollars(
         // the maximum unknown.
         return None;
     }
-    Some(ceiling_microdollars(&total)?)
+    ceiling_microdollars(&total)
 }
 
 /// Compute the exact megapixel quantity for explicit pixels using checked
@@ -1401,10 +1397,10 @@ pub fn parse_response(body: &[u8]) -> Result<ParsedImageResponse, ResponseParseE
         let detected =
             canonical_detect_media_type(&bytes).ok_or(ResponseParseError::UndetectableBytes)?;
         // A present media_type must match detection.
-        if let Some(media) = item.get("media_type").and_then(|v| v.as_str()) {
-            if media != detected {
-                return Err(ResponseParseError::MediaTypeConflict);
-            }
+        if let Some(media) = item.get("media_type").and_then(|v| v.as_str())
+            && media != detected
+        {
+            return Err(ResponseParseError::MediaTypeConflict);
         }
         // Raster formats pass canonical validation. SVG is sanitized once and
         // the sanitizer's CANONICAL output is retained in place of the raw
@@ -1531,6 +1527,7 @@ impl std::error::Error for ResponseParseError {}
 /// rejected. Empty values are valid suppression markers (they suppress the
 /// matching attribution default). Invalid headers fail before building a
 /// description with a stable redacted error — no secret value is surfaced.
+#[allow(dead_code)]
 fn validate_provider_header_overrides(
     provider_headers: &[(String, String)],
 ) -> Result<(), RuntimeError> {
@@ -1561,6 +1558,7 @@ fn validate_provider_header_overrides(
 /// that happens to share the OpenRouter image base URL) gets no OpenRouter
 /// attribution headers. This matches the chat/catalog gate in `models_fetch`
 /// (`origin.is_template("openrouter")`).
+#[allow(dead_code)]
 fn apply_openrouter_attribution(
     provider_origin: &ResolvedProviderOrigin,
     headers: &mut Vec<(String, String)>,
@@ -1584,6 +1582,7 @@ fn apply_openrouter_attribution(
 /// `ResolvedProviderOrigin::Template("openrouter")`, matching the chat/catalog
 /// identity gate in `models_fetch`. A non-template origin gets no OpenRouter
 /// attribution headers.
+#[allow(dead_code)]
 pub(crate) fn build_submit_request(
     origin: &str,
     provider_origin: &ResolvedProviderOrigin,
@@ -1614,6 +1613,7 @@ pub(crate) fn build_submit_request(
 /// `provider_headers` carries validated user/provider header overrides; the
 /// canonical attribution pair is merged via the shared helper when
 /// `provider_origin` is `ResolvedProviderOrigin::Template("openrouter")`.
+#[allow(dead_code)]
 pub(crate) fn build_discovery_request(
     origin: &str,
     provider_origin: &ResolvedProviderOrigin,
@@ -1641,6 +1641,7 @@ pub(crate) fn build_discovery_request(
 /// `provider_headers` carries validated user/provider header overrides; the
 /// canonical attribution pair is merged via the shared helper when
 /// `provider_origin` is `ResolvedProviderOrigin::Template("openrouter")`.
+#[allow(dead_code)]
 pub(crate) fn build_endpoint_request(
     origin: &str,
     provider_origin: &ResolvedProviderOrigin,
@@ -2465,7 +2466,7 @@ mod tests {
             image_url: InputReferenceImageUrl {
                 url: format!(
                     "data:image/png;base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(&png.repeat(100))
+                    base64::engine::general_purpose::STANDARD.encode(png.repeat(100))
                 ),
             },
         };
@@ -2722,7 +2723,7 @@ mod tests {
             base64_bytes: png,
         };
         let wire = InputReferenceWire::from_reference(&reference);
-        let mut eps = vec![ep.clone()];
+        let mut eps = [ep.clone()];
         eps[0].input_references = Some(EndpointReferenceCap {
             max_count: Some(2),
             max_bytes_per_reference: Some(1024 * 1024),

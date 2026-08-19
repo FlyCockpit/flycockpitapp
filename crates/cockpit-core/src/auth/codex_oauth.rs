@@ -296,7 +296,7 @@ async fn refresh_tokens(refresh_token: &str, previous: &StoredTokens) -> Result<
         ("refresh_token", refresh_token),
         ("client_id", CLIENT_ID),
     ];
-    token_request(&params, Some(&previous)).await
+    token_request(&params, Some(previous)).await
 }
 
 async fn token_request(

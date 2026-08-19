@@ -215,19 +215,19 @@ pub struct ImageModelDescriptor {
 
 impl ImageModelDescriptor {
     pub fn supports_quality(self, q: Quality) -> bool {
-        self.qualities.iter().any(|value| *value == q)
+        self.qualities.contains(&q)
     }
     pub fn supports_background(self, b: Background) -> bool {
-        self.backgrounds.iter().any(|value| *value == b)
+        self.backgrounds.contains(&b)
     }
     pub fn supports_format(self, f: OutputFormat) -> bool {
-        self.formats().iter().any(|value| *value == f)
+        self.formats().contains(&f)
     }
     pub fn supports_moderation(self, m: Moderation) -> bool {
-        self.moderations().iter().any(|value| *value == m)
+        self.moderations().contains(&m)
     }
     pub fn supports_input_fidelity(self, f: InputFidelity) -> bool {
-        self.input_fidelities.iter().any(|value| *value == f)
+        self.input_fidelities.contains(&f)
     }
     /// All four catalog entries support `png`, `jpeg`, `webp`.
     pub const fn formats(self) -> &'static [OutputFormat] {

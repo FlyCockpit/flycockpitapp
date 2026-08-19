@@ -1049,6 +1049,7 @@ fn map_db_err(err: anyhow::Error) -> SecureKeyError {
 }
 
 /// Tamper helpers for tests (no secret material in the names).
+#[allow(dead_code)]
 pub fn tamper_item_ciphertext(
     db: &Db,
     kind: SecretVaultKind,
@@ -1069,6 +1070,7 @@ pub fn tamper_item_ciphertext(
     .map_err(map_db_err)
 }
 
+#[allow(dead_code)]
 pub fn substitute_item_ciphertext(
     db: &Db,
     from_kind: SecretVaultKind,

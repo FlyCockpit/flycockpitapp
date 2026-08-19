@@ -497,7 +497,7 @@ pub fn validate_daemon_request(request: &ImageArtifactDaemonRequestV1) -> bool {
                 && parse_artifact_id(artifact_id).is_some()
                 && (validate_base64url_id_22(session_id)
                     || validate_uuid_lowercase_hyphenated(session_id))
-                && range_header.as_ref().map_or(true, |r| {
+                && range_header.as_ref().is_none_or(|r| {
                     r.len() <= MAX_RANGE_HEADER_BYTES && r.bytes().all(|b| b.is_ascii())
                 })
         }
@@ -514,7 +514,7 @@ pub fn validate_daemon_request(request: &ImageArtifactDaemonRequestV1) -> bool {
                 && (validate_base64url_id_22(session_id)
                     || validate_uuid_lowercase_hyphenated(session_id))
                 && THUMBNAIL_BOXES.contains(box_size)
-                && range_header.as_ref().map_or(true, |r| {
+                && range_header.as_ref().is_none_or(|r| {
                     r.len() <= MAX_RANGE_HEADER_BYTES && r.bytes().all(|b| b.is_ascii())
                 })
         }
@@ -556,6 +556,7 @@ impl ImageArtifactDaemonErrorCode {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "malformed" => Some(Self::Malformed),
@@ -627,7 +628,7 @@ impl ImageArtifactDaemonErrorV1 {
                 } else {
                     self.authorized_length
                         .as_ref()
-                        .map_or(false, |s| validate_canonical_decimal(s))
+                        .is_some_and(|s| validate_canonical_decimal(s))
                 }
             }
             _ => self.authorized_length.is_none(),

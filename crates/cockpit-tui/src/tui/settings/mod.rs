@@ -776,6 +776,7 @@ pub struct SettingsCx {
     pub(super) capability_refresh_in_flight: bool,
     pub(super) daemon_attached: bool,
     pub(super) pending_refresh_host_capabilities: bool,
+    #[allow(clippy::type_complexity)]
     pub(super) secret_store_migrate: Option<
         std::sync::Arc<
             dyn Fn(

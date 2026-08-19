@@ -441,10 +441,10 @@ impl JobReducer {
             self.jobs.push(job);
         }
         // Discard late results from a prior selection.
-        if let Some(selected) = self.selected_job_id.clone() {
-            if !self.jobs.iter().any(|j| j.job_id == selected) {
-                self.selected_job_id = None;
-            }
+        if let Some(selected) = self.selected_job_id.clone()
+            && !self.jobs.iter().any(|j| j.job_id == selected)
+        {
+            self.selected_job_id = None;
         }
         true
     }
@@ -468,11 +468,11 @@ impl JobReducer {
     /// requested" only after authoritative acknowledgement; never displays
     /// "Cancelled" until the daemon reports terminal `cancelled`.
     pub(crate) fn request_cancel(&mut self, job_id: &str) -> bool {
-        if let Some(job) = self.jobs.iter_mut().find(|j| j.job_id == job_id) {
-            if job.cancellable() {
-                job.state = ImageJobState::Cancelling;
-                return true;
-            }
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.job_id == job_id)
+            && job.cancellable()
+        {
+            job.state = ImageJobState::Cancelling;
+            return true;
         }
         false
     }
@@ -1568,13 +1568,14 @@ impl SettingsPage for JobDetailPage {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
             KeyCode::Char('c') => {
-                if let Some(job) = self.reducer.jobs.iter().find(|j| j.job_id == self.job_id) {
-                    if job.cancellable() && self.principal.can_cancel_job() {
-                        self.confirm = Some((
-                            GenerationAction::CancelJob(ImageJobId(self.job_id.clone())),
-                            ConfirmationChoice::Confirm,
-                        ));
-                    }
+                if let Some(job) = self.reducer.jobs.iter().find(|j| j.job_id == self.job_id)
+                    && job.cancellable()
+                    && self.principal.can_cancel_job()
+                {
+                    self.confirm = Some((
+                        GenerationAction::CancelJob(ImageJobId(self.job_id.clone())),
+                        ConfirmationChoice::Confirm,
+                    ));
                 }
                 Nav::Stay
             }
@@ -1686,35 +1687,29 @@ impl SettingsPage for JobDetailPage {
         } else {
             rows.push(("Job not found.".into(), None));
         }
-        if let Some((action, _)) = &self.confirm {
-            if let Some(text) = confirmation_text(action.clone()) {
-                let (confirm_label, _) = confirmation_buttons(action.clone()).unwrap();
-                rows.push((String::new(), None));
-                rows.push((format!("{text} [{confirm_label}] [Cancel]"), None));
-                if let GenerationAction::CancelJob(id) = action {
-                    rows.push((
-                        format!("[{confirm_label}]"),
-                        Some((
-                            GenerationAction::ConfirmCancelJob(
-                                id.clone(),
-                                ConfirmationChoice::Confirm,
-                            ),
-                            true,
-                            None,
-                        )),
-                    ));
-                    rows.push((
-                        "[Cancel]".into(),
-                        Some((
-                            GenerationAction::ConfirmCancelJob(
-                                id.clone(),
-                                ConfirmationChoice::Cancel,
-                            ),
-                            true,
-                            None,
-                        )),
-                    ));
-                }
+        if let Some((action, _)) = &self.confirm
+            && let Some(text) = confirmation_text(action.clone())
+        {
+            let (confirm_label, _) = confirmation_buttons(action.clone()).unwrap();
+            rows.push((String::new(), None));
+            rows.push((format!("{text} [{confirm_label}] [Cancel]"), None));
+            if let GenerationAction::CancelJob(id) = action {
+                rows.push((
+                    format!("[{confirm_label}]"),
+                    Some((
+                        GenerationAction::ConfirmCancelJob(id.clone(), ConfirmationChoice::Confirm),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[Cancel]".into(),
+                    Some((
+                        GenerationAction::ConfirmCancelJob(id.clone(), ConfirmationChoice::Cancel),
+                        true,
+                        None,
+                    )),
+                ));
             }
         }
         render_generation_page(
@@ -1887,7 +1882,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        let cx: &SettingsCx = &**dialog;
+        let cx: &SettingsCx = dialog;
         terminal
             .draw(|frame| {
                 let area = frame.area();

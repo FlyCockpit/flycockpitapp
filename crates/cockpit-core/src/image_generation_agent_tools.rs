@@ -453,7 +453,7 @@ pub fn validate_generate_image_args(args: &Value) -> Result<()> {
                 .and_then(Value::as_u64)
                 .unwrap_or(1) as u32;
             ensure!(
-                samples >= 1 && samples <= MAX_GENERATE_IMAGE_SAMPLES_PER_TARGET,
+                (1..=MAX_GENERATE_IMAGE_SAMPLES_PER_TARGET).contains(&samples),
                 "generate_image target `{target_id}` samples outside 1..={}",
                 MAX_GENERATE_IMAGE_SAMPLES_PER_TARGET
             );

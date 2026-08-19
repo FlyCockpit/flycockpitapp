@@ -520,22 +520,30 @@ fn computer_guidance_enablement_all_absent_is_disabled() {
 
 #[test]
 fn computer_guidance_enablement_single_enable_no_disable_is_enabled() {
-    let mut layers = EnablementLayers::default();
-    layers.global = EnablementValue::Enabled;
+    let layers = EnablementLayers {
+        global: EnablementValue::Enabled,
+        ..Default::default()
+    };
     let res = resolve_enablement(&layers);
     assert!(res.enabled);
 
     // Each layer independently.
-    let mut layers = EnablementLayers::default();
-    layers.project = EnablementValue::Enabled;
+    let layers = EnablementLayers {
+        project: EnablementValue::Enabled,
+        ..Default::default()
+    };
     assert!(resolve_enablement(&layers).enabled);
 
-    let mut layers = EnablementLayers::default();
-    layers.provider = EnablementValue::Enabled;
+    let layers = EnablementLayers {
+        provider: EnablementValue::Enabled,
+        ..Default::default()
+    };
     assert!(resolve_enablement(&layers).enabled);
 
-    let mut layers = EnablementLayers::default();
-    layers.model = EnablementValue::Enabled;
+    let layers = EnablementLayers {
+        model: EnablementValue::Enabled,
+        ..Default::default()
+    };
     assert!(resolve_enablement(&layers).enabled);
 }
 

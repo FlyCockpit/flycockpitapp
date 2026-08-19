@@ -643,7 +643,7 @@ fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateF
                 }
                 // SAFETY: `fstatat` returned 0, so `stat` is initialised.
                 let stat = unsafe { stat.assume_init() };
-                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFLNK) {
+                if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
                     return Err(PrivateFsError::Containment(format!(
                         "component {name:?} under {} is not a directory",
                         path.display()
@@ -1151,20 +1151,20 @@ fn refuse_hostile_target(
     }
     // SAFETY: `fstatat` returned 0, so `stat` is initialised.
     let stat = unsafe { stat.assume_init() };
-    let kind = u32::from(stat.st_mode) & u32::from(libc::S_IFMT);
-    if kind == u32::from(libc::S_IFLNK) {
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
         return Err(PrivateFsError::Containment(format!(
             "{}: write target is a symlink",
             label.display()
         )));
     }
-    if kind != u32::from(libc::S_IFREG) {
+    if kind != libc::S_IFREG {
         return Err(PrivateFsError::Containment(format!(
             "{}: write target is not a regular file",
             label.display()
         )));
     }
-    if u64::from(stat.st_nlink) != 1 {
+    if stat.st_nlink != 1 {
         return Err(PrivateFsError::MultiplyLinked(format!(
             "{}: write target has {} hard links",
             label.display(),
@@ -1287,7 +1287,7 @@ fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePubli
         let matches = stat_ok && {
             let named = unsafe { named.assume_init() };
             // `as u64`: `dev_t`/`ino_t` widths differ across Unix targets.
-            named.st_dev as u64 == held.dev() && named.st_ino as u64 == held.ino()
+            named.st_dev == held.dev() && named.st_ino == held.ino()
         };
         if !matches {
             unlinkat_best_effort(&dir_handle, &temp_c);

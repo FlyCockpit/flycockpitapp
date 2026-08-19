@@ -36,7 +36,7 @@ use cockpit_proto::remote_public_service_policy::{
     permission_ceiling_digest,
 };
 
-use crate::daemon::principal::{ClientPrincipal, PrincipalScope};
+use crate::daemon::principal::ClientPrincipal;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -163,6 +163,7 @@ impl ImageOperationKindV1 {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "remote_attachment" => Some(Self::RemoteAttachment),
@@ -261,6 +262,7 @@ impl ImageControlRequestTag {
     }
 
     /// Decode from the canonical snake_case string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "image_endpoint_list" => Some(Self::ImageEndpointList),
@@ -1026,10 +1028,7 @@ pub fn ceiling_authorizes_admin(
     project_id: &[u8; 16],
 ) -> bool {
     ceiling.projects.iter().any(|(pid, caps)| {
-        pid == project_id
-            && caps
-                .iter()
-                .any(|c| *c == RemoteProjectCapabilityV1::ImageGenerationAdmin)
+        pid == project_id && caps.contains(&RemoteProjectCapabilityV1::ImageGenerationAdmin)
     })
 }
 
@@ -1295,7 +1294,7 @@ impl ConfigEntityKind {
 }
 
 /// Sort config changes by `(entityKind ordinal, decoded entity ID)`.
-pub fn sort_config_changes(changes: &mut Vec<ConfigChange>) {
+pub fn sort_config_changes(changes: &mut [ConfigChange]) {
     changes.sort_by(|a, b| {
         let ord_a = config_change_sort_key(a);
         let ord_b = config_change_sort_key(b);
@@ -1510,9 +1509,9 @@ pub fn compute_active_authority_key(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"flycockpit.image-admin-active.v1\0");
-    hasher.update(&(instance_source_id.len() as u32).to_be_bytes());
+    hasher.update((instance_source_id.len() as u32).to_be_bytes());
     hasher.update(instance_source_id);
-    hasher.update(&(grantee_user_source_id.len() as u32).to_be_bytes());
+    hasher.update((grantee_user_source_id.len() as u32).to_be_bytes());
     hasher.update(grantee_user_source_id);
     hasher.update(project_protocol_id);
     let digest = hasher.finalize();

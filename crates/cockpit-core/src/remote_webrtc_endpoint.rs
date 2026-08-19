@@ -52,7 +52,10 @@ use cockpit_proto::remote_ip_consent::{ConsentCapability, VerifiedDirectCapabili
 use cockpit_proto::remote_signaling_attempt_store::{
     RemoteSignalingCommitAckV1, SignalingCodecError,
 };
-use cockpit_proto::remote_transport::channel::{REMOTE_LANE_CHANNELS, RemoteLaneChannel};
+use cockpit_proto::remote_transport::channel::REMOTE_LANE_CHANNELS;
+// Consumed only by this module's `#[cfg(test)]` tests (via `super::*`).
+#[cfg(test)]
+use cockpit_proto::remote_transport::channel::RemoteLaneChannel;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Dependency gate constants
@@ -1000,17 +1003,16 @@ impl ChildSupervisorState {
             }
             SupervisorInput::Timeout { now } => {
                 // Check ICE deadline.
-                if let Some(deadline) = self.generation.ice_deadline {
-                    if *now >= deadline
-                        && !self.generation.signaling_phase.both_ice_complete()
-                        && !self.generation.signaling_phase.is_cancelled()
-                    {
-                        self.generation.signaling_phase = SignalingPhase::Cancelled;
-                        return SupervisorOutput::Cancel {
-                            child_attempt_id: self.child_attempt_id,
-                            reason: CancelReason::Cancellation,
-                        };
-                    }
+                if let Some(deadline) = self.generation.ice_deadline
+                    && *now >= deadline
+                    && !self.generation.signaling_phase.both_ice_complete()
+                    && !self.generation.signaling_phase.is_cancelled()
+                {
+                    self.generation.signaling_phase = SignalingPhase::Cancelled;
+                    return SupervisorOutput::Cancel {
+                        child_attempt_id: self.child_attempt_id,
+                        reason: CancelReason::Cancellation,
+                    };
                 }
                 // Check draining deadline: once it elapses the drained
                 // predecessor generation is removed entirely (mirrors
@@ -1862,12 +1864,12 @@ mod tests {
         assert_eq!(MAX_LANE_APPLICATION_QUEUE_BYTES, 16 * 1024 * 1024);
 
         // SDP size validation.
-        assert!(validate_sdp_size(&vec![0u8; 100]).is_ok());
+        assert!(validate_sdp_size(&[0u8; 100]).is_ok());
         assert!(validate_sdp_size(&vec![0u8; MAX_SDP_PAYLOAD_BYTES + 1]).is_err());
         assert!(validate_sdp_size(&[]).is_err());
 
         // Candidate size validation.
-        assert!(validate_candidate_size(&vec![0u8; 100]).is_ok());
+        assert!(validate_candidate_size(&[0u8; 100]).is_ok());
         assert!(validate_candidate_size(&vec![0u8; MAX_CANDIDATE_BYTES + 1]).is_err());
         assert!(validate_candidate_size(&[]).is_err());
 

@@ -2,8 +2,8 @@
 //!
 //! After activation, `AuthorizePolicyRevisionV1` accepts only exact current
 //! + proposed policy JWS bytes and persists the accepted successor plus
-//! policy epoch/status/outbox atomically; no unsigned policy JSON,
-//! config-file policy mutation, or second bootstrap path is valid.
+//!   policy epoch/status/outbox atomically; no unsigned policy JSON,
+//!   config-file policy mutation, or second bootstrap path is valid.
 
 use cockpit_proto::remote_tenant_authority_protocol::{self as proto, TenantAuthorityOperation};
 

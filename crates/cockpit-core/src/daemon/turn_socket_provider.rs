@@ -116,6 +116,7 @@ pub const MAX_NONCURRENT_ALLOCATIONS: usize = 1;
 /// Implements redacted `Debug`/`Display` — never reveals the raw value.
 /// Zeroized on drop via `Zeroizing`.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TurnUsername(Zeroizing<String>);
 
 impl TurnUsername {
@@ -127,6 +128,7 @@ impl TurnUsername {
     /// Reveal the raw username to a caller that has proven it needs it.
     /// This is intentionally not `pub` beyond the crate — only the
     /// provider internals call it when feeding `turn-client-proto`.
+    #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -149,6 +151,7 @@ impl fmt::Display for TurnUsername {
 /// Implements redacted `Debug`/`Display` — never reveals the raw value.
 /// Zeroized on drop.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct TurnPassword(Zeroizing<String>);
 
 impl TurnPassword {
@@ -157,6 +160,7 @@ impl TurnPassword {
         Self(Zeroizing::new(value.into()))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -701,6 +705,7 @@ impl BoundedDatagramQueue {
         self.datagrams.len()
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.datagrams.is_empty()
     }
@@ -735,6 +740,7 @@ impl BoundedDatagramQueue {
         Some(data)
     }
 
+    #[allow(dead_code)]
     fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -786,6 +792,7 @@ pub struct TurnAllocation {
 }
 
 impl TurnAllocation {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         generation: u64,
         transport: TurnTransport,
@@ -1341,15 +1348,15 @@ impl TurnSocketProvider {
     /// (a pending cannot be promoted without ACK cutover, and cutover needs a
     /// live current). No-op if the noncurrent is absent or already closed.
     fn close_noncurrent_if_live(&mut self, reason: CloseReason) {
-        if let Some(ref mut nc) = self.noncurrent {
-            if !nc.is_closed() {
-                let alloc_gen = nc.generation;
-                nc.close(reason);
-                self.events.push_back(LifecycleEvent::Closed {
-                    generation: alloc_gen,
-                    reason,
-                });
-            }
+        if let Some(ref mut nc) = self.noncurrent
+            && !nc.is_closed()
+        {
+            let alloc_gen = nc.generation;
+            nc.close(reason);
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason,
+            });
         }
     }
 
@@ -1525,16 +1532,16 @@ impl TurnSocketProvider {
     /// Rejects late callbacks by generation.
     pub fn cancel(&mut self, generation: u64) {
         let mut hit_current = false;
-        if let Some(ref mut current) = self.current {
-            if current.generation == generation {
-                current.close(CloseReason::Cancelled);
-                let alloc_gen = current.generation;
-                self.events.push_back(LifecycleEvent::Closed {
-                    generation: alloc_gen,
-                    reason: CloseReason::Cancelled,
-                });
-                hit_current = true;
-            }
+        if let Some(ref mut current) = self.current
+            && current.generation == generation
+        {
+            current.close(CloseReason::Cancelled);
+            let alloc_gen = current.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Cancelled,
+            });
+            hit_current = true;
         }
         if hit_current {
             // Cancelling the current orphans any noncurrent: an unacked pending
@@ -1543,17 +1550,17 @@ impl TurnSocketProvider {
             // predecessor has nothing left to hand off to. Close it too so the
             // pair recovers via a fresh allocate.
             self.close_noncurrent_if_live(CloseReason::Cancelled);
-        } else if let Some(ref mut nc) = self.noncurrent {
-            if nc.generation == generation {
-                // Stale pending success or draining deallocate cannot affect
-                // current allocation/route/lease/budget.
-                nc.close(CloseReason::Cancelled);
-                let alloc_gen = nc.generation;
-                self.events.push_back(LifecycleEvent::Closed {
-                    generation: alloc_gen,
-                    reason: CloseReason::Cancelled,
-                });
-            }
+        } else if let Some(ref mut nc) = self.noncurrent
+            && nc.generation == generation
+        {
+            // Stale pending success or draining deallocate cannot affect
+            // current allocation/route/lease/budget.
+            nc.close(CloseReason::Cancelled);
+            let alloc_gen = nc.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Cancelled,
+            });
         }
         // Free any slot this cancel closed so a fresh allocation can be admitted.
         self.retire_closed();
@@ -1630,16 +1637,17 @@ impl TurnSocketProvider {
     pub fn check_credential_expiry(&mut self) {
         let now = self.clock.now_secs();
         let mut closed_current = false;
-        if let Some(ref mut current) = self.current {
-            if current.credential_expiry <= now && !current.is_closed() {
-                let alloc_gen = current.generation;
-                current.close(CloseReason::CredentialExpired);
-                self.events.push_back(LifecycleEvent::Closed {
-                    generation: alloc_gen,
-                    reason: CloseReason::CredentialExpired,
-                });
-                closed_current = true;
-            }
+        if let Some(ref mut current) = self.current
+            && current.credential_expiry <= now
+            && !current.is_closed()
+        {
+            let alloc_gen = current.generation;
+            current.close(CloseReason::CredentialExpired);
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::CredentialExpired,
+            });
+            closed_current = true;
         }
         if let Some(ref mut nc) = self.noncurrent {
             // Close the noncurrent if its OWN credential expired, or if the
@@ -1664,10 +1672,11 @@ impl TurnSocketProvider {
     pub fn deliver_inbound(&mut self, generation: u64, data: Vec<u8>) -> Result<(), QueueOverflow> {
         // Only current receives new inbound. Draining accepts existing
         // datagrams/replay/ACK/control only.
-        if let Some(ref mut current) = self.current {
-            if current.generation == generation && !current.is_closed() {
-                return current.deliver_inbound(data);
-            }
+        if let Some(ref mut current) = self.current
+            && current.generation == generation
+            && !current.is_closed()
+        {
+            return current.deliver_inbound(data);
         }
         // Stale generation — reject.
         Err(QueueOverflow)
@@ -1675,10 +1684,10 @@ impl TurnSocketProvider {
 
     /// Pump outbound datagrams from the current allocation.
     pub fn pump_outbound(&mut self) -> Option<(u64, Vec<u8>)> {
-        if let Some(ref mut current) = self.current {
-            if let Some(data) = current.pump_outbound() {
-                return Some((current.generation, data));
-            }
+        if let Some(ref mut current) = self.current
+            && let Some(data) = current.pump_outbound()
+        {
+            return Some((current.generation, data));
         }
         None
     }
@@ -1718,14 +1727,14 @@ impl TurnSocketProvider {
     /// Close a stale generation's allocation (late success / stale
     /// deallocate) without affecting current route/lease/budget.
     pub fn close_stale(&mut self, generation: u64) {
-        if let Some(ref mut nc) = self.noncurrent {
-            if nc.generation == generation {
-                nc.close(CloseReason::StaleGeneration);
-                self.events.push_back(LifecycleEvent::Closed {
-                    generation,
-                    reason: CloseReason::StaleGeneration,
-                });
-            }
+        if let Some(ref mut nc) = self.noncurrent
+            && nc.generation == generation
+        {
+            nc.close(CloseReason::StaleGeneration);
+            self.events.push_back(LifecycleEvent::Closed {
+                generation,
+                reason: CloseReason::StaleGeneration,
+            });
         }
         self.retire_closed();
     }

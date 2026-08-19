@@ -8,8 +8,6 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use super::*;
-
 const TEST_BOUNDARY: &str = "flycockpit-0123456789abcdef0123456789abcdef";
 
 // ===========================================================================

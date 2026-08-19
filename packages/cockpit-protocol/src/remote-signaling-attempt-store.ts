@@ -1,4 +1,3 @@
-import transitionFixture from "../fixtures/remote/signaling-attempt-store-v1.json";
 import { remoteIdentitySha256Sync } from "./remote-identity-protocol";
 import {
   decodeRemoteEndpointFinalProofV1,
@@ -44,23 +43,264 @@ export interface RemoteSignalingTransitionV1 {
   result: string;
   slotCardinality: "repeatable" | "one_per_role" | "one_terminal" | "one_per_attempt";
 }
-const transitionValues = {
-  transport: new Set(["common", "webrtc", "websocket_data"]),
-  role: new Set(["server", "client", "daemon"]),
-  slot: new Set(["repeatable", "one_per_role", "one_terminal", "one_per_attempt"]),
-};
-export const REMOTE_SIGNALING_TRANSITION_ROWS: readonly RemoteSignalingTransitionV1[] =
-  transitionFixture.transitions.map((row) => {
-    if (
-      !transitionValues.transport.has(row.transport) ||
-      !(row.event in RemoteSignalingEventKind) ||
-      !transitionValues.role.has(row.role) ||
-      !transitionValues.slot.has(row.slotCardinality)
-    )
-      throw new Error("invalid generated remote signaling transition row");
-    return row as RemoteSignalingTransitionV1;
-  });
-export const REMOTE_SIGNALING_REQUEST_VECTORS = transitionFixture.requests;
+// Code owns the transition table; the committed JSON fixture asserts equality
+// against it (see remote-signaling-attempt-store.test.ts, mirroring the Rust
+// side in crates/cockpit-proto). Production modules and the Redis/Lua reducer
+// derive their tables from this literal — never from a runtime fixture import.
+// The explicit RemoteSignalingTransitionV1[] annotation makes an invalid row a
+// compile error.
+export const REMOTE_SIGNALING_TRANSITION_ROWS: readonly RemoteSignalingTransitionV1[] = [
+  {
+    transport: "common",
+    event: "attempt_available",
+    role: "server",
+    from: "absent",
+    to: "created",
+    prerequisites: [],
+    result: "created",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "common",
+    event: "daemon_admission_offer",
+    role: "daemon",
+    from: "created",
+    to: "daemon_offered",
+    prerequisites: [],
+    result: "daemon_offered",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "common",
+    event: "client_admission_proof",
+    role: "client",
+    from: "daemon_offered",
+    to: "admitted",
+    prerequisites: [],
+    result: "admitted",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "webrtc",
+    event: "offer",
+    role: "client",
+    from: "admitted",
+    to: "offered",
+    prerequisites: [],
+    result: "offered",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "webrtc",
+    event: "answer",
+    role: "daemon",
+    from: "offered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "webrtc",
+    event: "ice_candidate",
+    role: "client",
+    from: "offered|answered",
+    to: "offered",
+    prerequisites: [],
+    result: "offered",
+    slotCardinality: "repeatable",
+  },
+  {
+    transport: "webrtc",
+    event: "ice_candidate",
+    role: "daemon",
+    from: "answered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "repeatable",
+  },
+  {
+    transport: "webrtc",
+    event: "ice_complete",
+    role: "client",
+    from: "offered|answered",
+    to: "offered",
+    prerequisites: [],
+    result: "offered",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "webrtc",
+    event: "ice_complete",
+    role: "daemon",
+    from: "answered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "webrtc",
+    event: "client_final_proof",
+    role: "client",
+    from: "answered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "webrtc",
+    event: "daemon_final_proof",
+    role: "daemon",
+    from: "answered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "webrtc",
+    event: "ready",
+    role: "client",
+    from: "answered",
+    to: "answered",
+    prerequisites: [],
+    result: "answered",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "fallback_pair_authenticated",
+    role: "server",
+    from: "admitted",
+    to: "fallback_paired",
+    prerequisites: [],
+    result: "fallback_paired",
+    slotCardinality: "one_per_attempt",
+  },
+  {
+    transport: "websocket_data",
+    event: "fallback_noise_complete",
+    role: "client",
+    from: "fallback_paired",
+    to: "fallback_paired",
+    prerequisites: [],
+    result: "fallback_paired",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "fallback_noise_complete",
+    role: "daemon",
+    from: "fallback_paired",
+    to: "fallback_noise_complete",
+    prerequisites: [],
+    result: "fallback_noise_complete",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "webrtc",
+    event: "ready",
+    role: "daemon",
+    from: "answered",
+    to: "completed",
+    prerequisites: [],
+    result: "completed",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "client_final_proof",
+    role: "client",
+    from: "fallback_noise_complete",
+    to: "fallback_noise_complete",
+    prerequisites: [],
+    result: "fallback_noise_complete",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "daemon_final_proof",
+    role: "daemon",
+    from: "fallback_noise_complete",
+    to: "fallback_noise_complete",
+    prerequisites: [],
+    result: "fallback_noise_complete",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "ready",
+    role: "client",
+    from: "fallback_noise_complete",
+    to: "fallback_noise_complete",
+    prerequisites: [],
+    result: "fallback_noise_complete",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "websocket_data",
+    event: "ready",
+    role: "daemon",
+    from: "fallback_noise_complete",
+    to: "completed",
+    prerequisites: [],
+    result: "completed",
+    slotCardinality: "one_per_role",
+  },
+  {
+    transport: "common",
+    event: "attempt_rejected",
+    role: "server",
+    from: "nonterminal",
+    to: "rejected",
+    prerequisites: [],
+    result: "rejected",
+    slotCardinality: "one_terminal",
+  },
+  {
+    transport: "common",
+    event: "attempt_cancelled",
+    role: "client",
+    from: "nonterminal",
+    to: "cancelled",
+    prerequisites: [],
+    result: "cancelled",
+    slotCardinality: "one_terminal",
+  },
+  {
+    transport: "common",
+    event: "attempt_rejected",
+    role: "daemon",
+    from: "nonterminal",
+    to: "rejected",
+    prerequisites: [],
+    result: "rejected",
+    slotCardinality: "one_terminal",
+  },
+  {
+    transport: "common",
+    event: "attempt_cancelled",
+    role: "daemon",
+    from: "nonterminal",
+    to: "cancelled",
+    prerequisites: [],
+    result: "cancelled",
+    slotCardinality: "one_terminal",
+  },
+  {
+    transport: "common",
+    event: "attempt_superseded",
+    role: "server",
+    from: "nonterminal",
+    to: "superseded",
+    prerequisites: [],
+    result: "superseded",
+    slotCardinality: "one_terminal",
+  },
+];
 export type RemoteSignalingTransportV1 = 1 | 2;
 export type RemoteSignalingProducerRoleV1 = 1 | 2 | 3;
 export type RemoteSignalingEventKindV1 =

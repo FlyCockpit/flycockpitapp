@@ -14,11 +14,11 @@ import {
   encodeRemoteWebRtcCandidateV1,
   encodeRemoteWebRtcIceCompleteV1,
   encodeRemoteWebRtcOfferV1,
-  REMOTE_SIGNALING_REQUEST_VECTORS,
   remoteChildAuthenticationDigests,
   remoteFinalProofSetDigest,
 } from "@flycockpit/cockpit-protocol";
 import { describe, expect, it, vi } from "vitest";
+import signalingFixture from "../../../cockpit-protocol/fixtures/remote/signaling-attempt-store-v1.json";
 import {
   MemoryRemoteSignalingAttemptStore,
   REMOTE_SIGNALING_ADMISSION_TICKET_TTL_MS,
@@ -195,7 +195,7 @@ describe("remote signaling attempt store", () => {
       () => 1_000,
       (out) => out.fill(7),
     );
-    const [available, superseded] = REMOTE_SIGNALING_REQUEST_VECTORS;
+    const [available, superseded] = signalingFixture.requests;
     expect(
       (await store.create(createInput, fromHex(available!.requestHex), actor("server"))).ackBytes,
     ).toEqual(fromHex(available!.ackHex));

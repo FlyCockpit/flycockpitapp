@@ -13,6 +13,7 @@ import {
   encodeRemoteWebRtcCandidateV1,
   encodeRemoteWebRtcIceCompleteV1,
   encodeRemoteWebRtcOfferV1,
+  REMOTE_SIGNALING_TRANSITION_ROWS,
   remoteSignalingEventDigest,
 } from "./remote-signaling-attempt-store";
 import {
@@ -28,6 +29,15 @@ const hex = (value: Uint8Array) =>
   Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
 describe("remote signaling attempt-store wire fixtures", () => {
+  it("keeps the code-owned transition table in lockstep with the fixture", () => {
+    // Production owns REMOTE_SIGNALING_TRANSITION_ROWS as a literal; the fixture
+    // asserts equality against it (the Rust table asserts against the same
+    // fixture in crates/cockpit-proto). Any drift fails here with a row diff.
+    expect(REMOTE_SIGNALING_TRANSITION_ROWS).toEqual(fixture.transitions);
+    // Guard the assertion against a silently-empty fixture or table.
+    expect(REMOTE_SIGNALING_TRANSITION_ROWS.length).toBe(fixture.transitions.length);
+    expect(REMOTE_SIGNALING_TRANSITION_ROWS.length).toBeGreaterThan(0);
+  });
   it("consumes literal common and fallback payload vectors", () => {
     expect(
       decodeRemoteChildAuthenticationBundleV1(bytes(fixture.payloads.fcabHex)).childAttemptId,

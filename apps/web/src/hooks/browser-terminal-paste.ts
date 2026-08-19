@@ -48,3 +48,34 @@ export function installTerminalPasteInterceptor(
     textarea.removeEventListener("paste", listener, { capture: true });
   };
 }
+
+/**
+ * Build the terminal drop handler used by {@link useBrowserTerminal}.
+ *
+ * The handler treats a multi-file drop as a single whole-gesture paste: it
+ * extracts every file from `DataTransfer.files` and forwards the complete
+ * array to `pasteFiles` in one call. A map-split implementation that called
+ * `pasteFiles([file])` per file would violate the whole-gesture contract
+ * (each single image would be accepted instead of one `too_many_files`
+ * rejection), so this factory is the single production path tests exercise.
+ *
+ * The event parameter is a structural subset of both the native `DragEvent`
+ * and React's `React.DragEvent`, so the same handler attaches to a raw DOM
+ * textarea (in tests) and to a React `onDrop` prop (in production) without
+ * adapter shims.
+ */
+export type TerminalDropEvent = {
+  readonly dataTransfer: DataTransfer | null;
+  preventDefault(): void;
+};
+
+export function createTerminalDropHandler(
+  pasteFiles: TerminalPasteIngress,
+): (event: TerminalDropEvent) => void {
+  return (event) => {
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (files.length === 0) return;
+    event.preventDefault();
+    pasteFiles(files);
+  };
+}

@@ -18,7 +18,10 @@
         "src/**/*.tsx",
         "src/**/*.test.ts",
         "src/**/*.test.tsx",
-        "vitest.config.*"
+        "vitest.config.*",
+        "vitest.node.config.ts",
+        "vitest.browser.config.ts",
+        "vitest.redis.config.ts"
       ]
     },
     "check-types": {

@@ -106,6 +106,19 @@ describe("browser terminal paste source contracts", () => {
     expect(workflow).toContain("pnpm --filter web exec playwright install --with-deps chromium");
   });
 
+  it("browser_terminal_turbo_test_inputs_match_vitest_configs", () => {
+    // AC6: turbo.json test task inputs must include the actual vitest config
+    // filenames so config edits invalidate the turbo cache.
+    const root = resolve(import.meta.dirname, "../../../..");
+    const turbo = JSON.parse(readFileSync(resolve(root, "turbo.json"), "utf8")) as {
+      tasks: { test: { inputs: string[] } };
+    };
+    const inputs = turbo.tasks.test.inputs;
+    expect(inputs).toContain("vitest.node.config.ts");
+    expect(inputs).toContain("vitest.browser.config.ts");
+    expect(inputs).toContain("vitest.redis.config.ts");
+  });
+
   it("browser_terminal_listener_targets_xterm_textarea_capture_phase", () => {
     const root = resolve(import.meta.dirname, "../../../..");
     const hook = readFileSync(resolve(root, "apps/web/src/hooks/use-browser-terminal.ts"), "utf8");

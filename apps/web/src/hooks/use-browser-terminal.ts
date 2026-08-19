@@ -1,17 +1,23 @@
 import {
   ClipboardWriteRateLimiter,
   planTerminalPaste,
+  type TerminalIngressErrorCode,
   type TerminalReattachState,
   terminalReattachReducer,
+  toTerminalIngressErrorCode,
 } from "@flycockpit/relay-protocol/terminal";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
-import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TerminalClient, type TerminalClientStatus } from "@/lib/terminal/terminal-client";
 import { useLiveTerminalStore } from "@/stores/live-terminal";
-import { installTerminalPasteInterceptor } from "./browser-terminal-paste";
+import {
+  createTerminalDropHandler,
+  installTerminalPasteInterceptor,
+  type TerminalDropEvent,
+} from "./browser-terminal-paste";
 
 type TokenInfo = {
   token: string;
@@ -34,7 +40,7 @@ export type BrowserTerminalState = {
   recording: boolean;
   pendingClipboardText: string | null;
   uploadProgress: { sentBytes: number; totalBytes: number } | null;
-  handleDrop: (event: DragEvent) => void;
+  handleDrop: (event: TerminalDropEvent) => void;
   confirmClipboardWrite: () => Promise<void>;
   sendInput: (data: string) => void;
   disconnect: () => void;
@@ -211,12 +217,7 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
   ]);
 
   const handleDrop = useCallback(
-    (event: DragEvent) => {
-      const files = Array.from(event.dataTransfer.files);
-      if (files.length === 0) return;
-      event.preventDefault();
-      void Promise.all(files.map((file) => pasteFiles([file])));
-    },
+    createTerminalDropHandler((files) => void pasteFiles(files)),
     [pasteFiles],
   );
 
@@ -249,25 +250,9 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
   };
 }
 
-function sanitizedIngressCode(error: unknown) {
-  if (!(error instanceof Error)) return "UploadFailed";
-  const allowed = new Set([
-    "Busy",
-    "TooManyFiles",
-    "TooLarge",
-    "UnsupportedType",
-    "HashFailed",
-    "Conflict",
-    "UploadFailed",
-    "MaterializationFailed",
-    "Expired",
-    "DeadlineExceeded",
-    "CommitUnknown",
-    "CleanupPending",
-    "Cancelled",
-    "TerminalUnavailable",
-  ]);
-  return allowed.has(error.message) ? error.message : "UploadFailed";
+function sanitizedIngressCode(error: unknown): TerminalIngressErrorCode {
+  if (!(error instanceof Error)) return toTerminalIngressErrorCode("UploadFailed");
+  return toTerminalIngressErrorCode(error.message);
 }
 
 function buildTerminalTheme() {

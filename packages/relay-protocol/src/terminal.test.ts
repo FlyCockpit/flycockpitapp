@@ -3,9 +3,11 @@ import {
   ClipboardWriteRateLimiter,
   planTerminalPaste,
   TERMINAL_IMAGE_MAX_BYTES,
+  TERMINAL_INGRESS_ERROR_CODES,
   terminalClientPayloadSchema,
   terminalDaemonPayloadSchema,
   terminalReattachReducer,
+  toTerminalIngressErrorCode,
 } from "./terminal";
 
 describe("terminal frame codec", () => {
@@ -136,6 +138,93 @@ describe("terminal paste router", () => {
       { type: "image/png", size: 0 },
     ]) {
       expect(planTerminalPaste({ files: [file] }).kind).toBe("error");
+    }
+  });
+});
+
+describe("terminal ingress error code vocabulary", () => {
+  it("exports a single unified snake_case error code set", () => {
+    // AC5: one shared error vocabulary. The paste planner codes and the
+    // controller PascalCase codes must all map into this set.
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("too_many_files");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("image_too_large");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("unsupported_file");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("busy");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("hash_failed");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("deadline_exceeded");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("terminal_unavailable");
+    expect(TERMINAL_INGRESS_ERROR_CODES).toContain("upload_failed");
+  });
+
+  it("maps every PascalCase controller code to the unified snake_case vocabulary", () => {
+    // The FIFO ingress controller historically emits PascalCase; each one must
+    // map to a canonical snake_case code so the UI locale has one key per code.
+    expect(toTerminalIngressErrorCode("TooManyFiles")).toBe("too_many_files");
+    expect(toTerminalIngressErrorCode("TooLarge")).toBe("image_too_large");
+    expect(toTerminalIngressErrorCode("UnsupportedType")).toBe("unsupported_file");
+    expect(toTerminalIngressErrorCode("Busy")).toBe("busy");
+    expect(toTerminalIngressErrorCode("HashFailed")).toBe("hash_failed");
+    expect(toTerminalIngressErrorCode("Conflict")).toBe("conflict");
+    expect(toTerminalIngressErrorCode("UploadFailed")).toBe("upload_failed");
+    expect(toTerminalIngressErrorCode("MaterializationFailed")).toBe("materialization_failed");
+    expect(toTerminalIngressErrorCode("Expired")).toBe("expired");
+    expect(toTerminalIngressErrorCode("DeadlineExceeded")).toBe("deadline_exceeded");
+    expect(toTerminalIngressErrorCode("CommitUnknown")).toBe("commit_unknown");
+    expect(toTerminalIngressErrorCode("CleanupPending")).toBe("cleanup_pending");
+    expect(toTerminalIngressErrorCode("Cancelled")).toBe("cancelled");
+    expect(toTerminalIngressErrorCode("TerminalUnavailable")).toBe("terminal_unavailable");
+  });
+
+  it("collapses unknown error strings to the fallback code", () => {
+    // Fail closed: an unrecognized error string must not leak through as-is;
+    // it maps to the canonical fallback.
+    expect(toTerminalIngressErrorCode("some-unknown-code")).toBe("upload_failed");
+    expect(toTerminalIngressErrorCode("")).toBe("upload_failed");
+  });
+
+  it("round-trips canonical snake_case codes without remapping", () => {
+    // AC5: an already-canonical snake_case code (e.g. from the paste planner
+    // or a wire frame) must pass through toTerminalIngressErrorCode unchanged
+    // — not be collapsed to the fallback. Each canonical code round-trips.
+    for (const code of TERMINAL_INGRESS_ERROR_CODES) {
+      expect(toTerminalIngressErrorCode(code)).toBe(code);
+    }
+    // Spot-check the specific regression: too_many_files must NOT become
+    // upload_failed (the bug when only the PascalCase map was consulted).
+    expect(toTerminalIngressErrorCode("too_many_files")).toBe("too_many_files");
+    expect(toTerminalIngressErrorCode("image_too_large")).toBe("image_too_large");
+    expect(toTerminalIngressErrorCode("deadline_exceeded")).toBe("deadline_exceeded");
+  });
+
+  it("paste plan error codes are members of the unified vocabulary", () => {
+    // The paste planner's error codes must be from the same set — no dual vocab.
+    const tooMany = planTerminalPaste({
+      files: [
+        { type: "image/png", size: 1 },
+        { type: "image/png", size: 1 },
+      ],
+    });
+    expect(tooMany.kind).toBe("error");
+    if (tooMany.kind === "error") {
+      expect(tooMany.code).toBe("too_many_files");
+      expect(TERMINAL_INGRESS_ERROR_CODES).toContain(tooMany.code);
+    }
+    // Use an input exceeding TERMINAL_IMAGE_MAX_BYTES so the image_too_large
+    // error is genuine (a size: 0 file is an edge case, not a representative
+    // oversized-image rejection). Assert kind/code before vocabulary membership.
+    const tooLarge = planTerminalPaste({
+      files: [{ type: "image/png", size: TERMINAL_IMAGE_MAX_BYTES + 1 }],
+    });
+    expect(tooLarge.kind).toBe("error");
+    if (tooLarge.kind === "error") {
+      expect(tooLarge.code).toBe("image_too_large");
+      expect(TERMINAL_INGRESS_ERROR_CODES).toContain(tooLarge.code);
+    }
+    const unsupported = planTerminalPaste({ files: [{ type: "text/plain", size: 1 }] });
+    expect(unsupported.kind).toBe("error");
+    if (unsupported.kind === "error") {
+      expect(unsupported.code).toBe("unsupported_file");
+      expect(TERMINAL_INGRESS_ERROR_CODES).toContain(unsupported.code);
     }
   });
 });

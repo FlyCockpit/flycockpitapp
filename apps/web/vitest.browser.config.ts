@@ -11,6 +11,11 @@ export default defineConfig({
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
     passWithNoTests: false,
+    server: {
+      deps: {
+        inline: [/react/, /react-dom/, /react\//, /react-dom\//],
+      },
+    },
     browser: {
       enabled: true,
       provider: playwright(),

@@ -190,12 +190,36 @@ export type TerminalPasteInput = {
   maxImageBytes?: number;
 };
 
+/**
+ * Unified terminal ingress error vocabulary (snake_case wire source of truth).
+ * Both the paste planner and the FIFO ingress controller map into this single
+ * set. The UI boundary resolves each code to one locale key, so there is no
+ * dual PascalCase/snake_case maintenance.
+ */
+export const TERMINAL_INGRESS_ERROR_CODES = [
+  "too_many_files",
+  "image_too_large",
+  "unsupported_file",
+  "busy",
+  "hash_failed",
+  "conflict",
+  "upload_failed",
+  "materialization_failed",
+  "expired",
+  "deadline_exceeded",
+  "commit_unknown",
+  "cleanup_pending",
+  "cancelled",
+  "terminal_unavailable",
+] as const;
+export type TerminalIngressErrorCode = (typeof TERMINAL_INGRESS_ERROR_CODES)[number];
+
 export type TerminalPastePlan =
   | { kind: "image"; image: TerminalPasteItem }
   | { kind: "empty" }
   | {
       kind: "error";
-      code: "image_too_large" | "unsupported_file" | "too_many_files";
+      code: TerminalIngressErrorCode;
       maxBytes: number;
     };
 
@@ -220,6 +244,41 @@ export function planTerminalPaste(input: TerminalPasteInput): TerminalPastePlan 
     };
   }
   return { kind: "empty" };
+}
+
+/**
+ * Map a PascalCase controller error code to the unified snake_case vocabulary.
+ * The FIFO ingress controller historically emits PascalCase codes; this maps
+ * each one to the canonical wire code so the UI boundary and locale keys stay
+ * single-vocabulary. Unknown strings collapse to {@link TERMINAL_INGRESS_FALLBACK_CODE}.
+ */
+export const TERMINAL_INGRESS_FALLBACK_CODE =
+  "upload_failed" as const satisfies TerminalIngressErrorCode;
+
+const PASCAL_TO_SNAKE: Readonly<Record<string, TerminalIngressErrorCode>> = {
+  TooManyFiles: "too_many_files",
+  TooLarge: "image_too_large",
+  UnsupportedType: "unsupported_file",
+  Busy: "busy",
+  HashFailed: "hash_failed",
+  Conflict: "conflict",
+  UploadFailed: "upload_failed",
+  MaterializationFailed: "materialization_failed",
+  Expired: "expired",
+  DeadlineExceeded: "deadline_exceeded",
+  CommitUnknown: "commit_unknown",
+  CleanupPending: "cleanup_pending",
+  Cancelled: "cancelled",
+  TerminalUnavailable: "terminal_unavailable",
+};
+
+export function toTerminalIngressErrorCode(value: string): TerminalIngressErrorCode {
+  if (isCanonicalIngressCode(value)) return value;
+  return PASCAL_TO_SNAKE[value] ?? TERMINAL_INGRESS_FALLBACK_CODE;
+}
+
+function isCanonicalIngressCode(value: string): value is TerminalIngressErrorCode {
+  return (TERMINAL_INGRESS_ERROR_CODES as readonly string[]).includes(value);
 }
 
 function isImageFile(file: FileLike) {

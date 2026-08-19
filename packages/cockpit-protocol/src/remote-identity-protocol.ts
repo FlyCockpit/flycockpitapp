@@ -230,6 +230,24 @@ function validateLowSP1363(signature: Uint8Array) {
   )
     fail("invalid or high-S P1363 signature");
 }
+/**
+ * SECURITY / AUDIT NOTE — pinned pure-JS SHA-256.
+ *
+ * A *synchronous* SHA-256 is required on security paths that cannot await:
+ * RFC 7638 thumbprint validation runs inside the synchronous `encode*` codecs
+ * (see {@link validateThumbprint}) and inside cross-language fixture
+ * generation, and WebCrypto's `crypto.subtle.digest` is async-only (there is no
+ * synchronous WebCrypto digest in browsers). The async {@link remoteIdentitySha256}
+ * uses platform crypto; this function is its synchronous counterpart.
+ *
+ * Because it is a hand-rolled implementation on a security path, it is PINNED to
+ * the workspace's audited SHA-256 by a known-answer test that compares it,
+ * byte-for-byte over empty / short / multi-block / high-bit inputs, against
+ * Node's `crypto.createHash("sha256")` and against WebCrypto
+ * `crypto.subtle.digest("SHA-256", …)` — see the "pinned to the audited SHA-256"
+ * suite in `remote-identity-protocol.test.ts`. Any drift from FIPS 180-4 fails
+ * that gate. Do NOT fork or "optimize" this without updating the KAT.
+ */
 export function remoteIdentitySha256Sync(input: Uint8Array) {
   const k = Uint32Array.from([
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,

@@ -1115,35 +1115,20 @@ pub fn validate_digest_hex(hex: &str) -> Result<()> {
     Ok(())
 }
 
-/// RFC 8785 canonical JSON (sorted keys, no whitespace). Reuses the same
-/// algorithm as `remote_identity_protocol::canonical_json` but is local to
-/// this module to keep the trust domain self-contained.
+/// RFC 8785 canonical JSON (sorted keys, no whitespace) for identity-adjacent
+/// documents.
+///
+/// SECURITY: this is a thin adapter over the single audited canonicalizer,
+/// [`crate::remote_identity_protocol::canonical_json`]. This module hosts NO
+/// forked algorithm: a second canonical-JSON implementation is a
+/// signature-bypass surface (two canonicalizers can diverge, so a signer and a
+/// verifier could disagree on the bytes being signed). Every public-service /
+/// tenant-authority / TURN / enterprise policy digest that flows through this
+/// helper is therefore canonicalized by the exact same code path the identity
+/// codecs use.
 pub fn canonical_json_value(value: &Value) -> Result<String> {
-    match value {
-        Value::Null => Ok("null".into()),
-        Value::Bool(_) | Value::Number(_) | Value::String(_) => serde_json::to_string(value)
-            .map_err(|e| RemotePublicPolicyError::Invalid(e.to_string())),
-        Value::Array(values) => Ok(format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json_value)
-                .collect::<Result<Vec<_>>>()?
-                .join(",")
-        )),
-        Value::Object(values) => {
-            let mut keys: Vec<_> = values.keys().collect();
-            keys.sort();
-            let mut parts: Vec<String> = Vec::with_capacity(keys.len());
-            for key in keys {
-                let k = serde_json::to_string(key)
-                    .map_err(|e| RemotePublicPolicyError::Invalid(e.to_string()))?;
-                let v = canonical_json_value(&values[key])?;
-                parts.push(format!("{k}:{v}"));
-            }
-            Ok(format!("{{{}}}", parts.join(",")))
-        }
-    }
+    crate::remote_identity_protocol::canonical_json(value)
+        .map_err(|e| RemotePublicPolicyError::Invalid(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

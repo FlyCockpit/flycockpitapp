@@ -264,6 +264,173 @@ malformed.push({
     ),
   ),
 });
+// ---------------------------------------------------------------------------
+// Semantic corpus extensions (identity-protocol-vector-corpus-completion)
+// ---------------------------------------------------------------------------
+// All additions are appended so the existing vectors — and every derivation
+// hash computed above — stay byte-identical.
+
+// (1) Empty-providerEvidence custody codec: valid iff digest == sha256("").
+const emptyEvidence = new Uint8Array(0);
+add(
+  "custody_empty",
+  "FCCE",
+  encodeCustodyEvidence({
+    subjectKind: SubjectKind.client,
+    subjectId: id(1),
+    generation: 1n,
+    custodyClass: CustodyClass.os_protected,
+    presenceMode: PresenceMode.unattended,
+    providerEvidence: emptyEvidence,
+    evidenceDigest: await remoteIdentitySha256(emptyEvidence),
+    observedAt: 1000n,
+  }),
+);
+
+const validHex = (name: string) => valid.find((v) => v.name === name)!.hex;
+const mutateByte = (hexStr: string, index: number, value: number) => {
+  const buf = Buffer.from(hexStr, "hex");
+  buf[index] = value;
+  return hex(Uint8Array.from(buf));
+};
+
+// Custody digest-mismatch: FCCE empty evidence with a corrupted digest byte.
+// Layout: magic4 ver1 kind1 subject16 gen8 custody1 presence1 len2 => digest@34.
+malformed.push({
+  name: "custody_digest_mismatch",
+  codec: "FCCE",
+  hex: mutateByte(validHex("custody_empty"), 34, 0xff),
+});
+
+// (2) Account-branch rejection vectors (client-with-account daemon-without).
+// Each is a byte-relabel of a valid vector's subjectKind discriminant so the
+// closed (kind, account-presence) pair becomes illegal. The codecs reject with
+// a "…account…" error in both languages.
+const CLIENT = 1;
+const DAEMON = 2;
+malformed.push(
+  {
+    // FCIP subjectKind@5; daemon layout (presence=0) relabeled client.
+    name: "account_branch_fcip_client_missing",
+    codec: "FCIP",
+    hex: mutateByte(validHex("proposal_daemon"), 5, CLIENT),
+  },
+  {
+    // FCIP client layout (presence=1 + id) relabeled daemon.
+    name: "account_branch_fcip_daemon_present",
+    codec: "FCIP",
+    hex: mutateByte(validHex("proposal_client"), 5, DAEMON),
+  },
+  {
+    // FCEN daemon layout: subjectKind@54 (magic4 ver1 enroll16 tenant16 presence1 instance16).
+    name: "account_branch_fcen_client_missing",
+    codec: "FCEN",
+    hex: mutateByte(validHex("transcript_daemon"), 54, CLIENT),
+  },
+  {
+    // FCEN client layout: subjectKind@70 (…presence1 account16 instance16).
+    name: "account_branch_fcen_daemon_present",
+    codec: "FCEN",
+    hex: mutateByte(validHex("transcript_client"), 70, DAEMON),
+  },
+);
+
+// (3) Certificate JWS header/payload/signature abuse vectors.
+const jwsB64 = (s: string) => b64(enc.encode(s));
+const assembleJws = (headerJson: string, payloadJson: string, signature: Uint8Array) =>
+  `${jwsB64(headerJson)}.${jwsB64(payloadJson)}.${b64(signature)}`;
+const jwsMalformed = (name: string, compact: string) =>
+  malformed.push({ name, codec: "JWS", hex: hex(enc.encode(compact)) });
+const TYP = "flycockpit-remote-identity-certificate+jws";
+const clientPayload = {
+  accountId: b64(id(6)),
+  aud: "flycockpit-remote-peer-v1",
+  authorityEpoch: "3",
+  certificateId: b64(id(4)),
+  custody: 2,
+  exp: "2000",
+  generation: "1",
+  iat: "1000",
+  instanceId: b64(id(3)),
+  iss: "https://example.com",
+  presenceMode: 1,
+  publicKey: { crv: "P-256", kty: "EC", x: b64(x), y: b64(y) },
+  schemaVersion: 1,
+  sub: b64(id(1)),
+  subjectKind: 1,
+  tenantId: b64(id(2)),
+  thumbprint: b64(thumb),
+};
+const canonHeader = canonicalizeRfc8785({ alg: "ES256", kid: "fixture-key", typ: TYP });
+const canonPayload = canonicalizeRfc8785(clientPayload);
+
+// duplicate-member: hand-rolled header JSON with a repeated key (never canonical).
+jwsMalformed(
+  "jws_duplicate_member",
+  assembleJws(
+    `{"alg":"ES256","alg":"ES256","kid":"fixture-key","typ":"${TYP}"}`,
+    canonPayload,
+    sig,
+  ),
+);
+// unknown-member: extra canonical header member (structural member-count check).
+jwsMalformed(
+  "jws_unknown_member",
+  assembleJws(
+    canonicalizeRfc8785({ alg: "ES256", extra: "x", kid: "fixture-key", typ: TYP }),
+    canonPayload,
+    sig,
+  ),
+);
+// crit: a "crit" header member is rejected (present as a 4th member).
+jwsMalformed(
+  "jws_crit",
+  assembleJws(
+    canonicalizeRfc8785({ alg: "ES256", crit: ["b64"], kid: "fixture-key", typ: TYP }),
+    canonPayload,
+    sig,
+  ),
+);
+// alg substitution: canonical, well-formed header whose alg is not ES256.
+jwsMalformed(
+  "jws_alg_substitution",
+  assembleJws(
+    canonicalizeRfc8785({ alg: "ES384", kid: "fixture-key", typ: TYP }),
+    canonPayload,
+    sig,
+  ),
+);
+// size cap: compact serialization exceeds the 4,096-byte ceiling.
+jwsMalformed(
+  "jws_size_cap",
+  assembleJws(
+    canonicalizeRfc8785({ alg: "ES256", kid: "A".repeat(5000), typ: TYP }),
+    canonPayload,
+    sig,
+  ),
+);
+// thumbprint mismatch: valid structure, RFC 7638 thumbprint does not match x/y.
+jwsMalformed(
+  "jws_thumbprint_mismatch",
+  assembleJws(
+    canonHeader,
+    canonicalizeRfc8785({ ...clientPayload, thumbprint: b64(bytes(0)) }),
+    sig,
+  ),
+);
+// high-S signature: s-component above n/2 is rejected (malleability).
+const highS = Uint8Array.from(sig);
+highS[32] = 0x80;
+jwsMalformed("jws_high_s", assembleJws(canonHeader, canonPayload, highS));
+// zero-r: r-component all zero is rejected.
+const zeroR = Uint8Array.from(sig);
+zeroR.fill(0, 0, 32);
+jwsMalformed("jws_zero_r", assembleJws(canonHeader, canonPayload, zeroR));
+// zero-s: s-component all zero is rejected.
+const zeroS = Uint8Array.from(sig);
+zeroS.fill(0, 32, 64);
+jwsMalformed("jws_zero_s", assembleJws(canonHeader, canonPayload, zeroS));
+
 writeFileSync(
   new URL("../fixtures/remote-identity-protocol-v1.json", import.meta.url),
   `${JSON.stringify({ schemaVersion: 1, valid, malformed, derivations }, null, 2)}\n`,

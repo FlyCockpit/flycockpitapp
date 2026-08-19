@@ -5,6 +5,7 @@ import {
   decodeRemoteCredentialRegistryV1,
   encodeRemoteAdminApprovalEvidenceV1,
   encodeRemoteCredentialRegistryV1,
+  type RemoteAdminOperation,
 } from "./remote-admin-passkey";
 import { tagProtocolIdBytes } from "./remote-protocol-id";
 
@@ -86,6 +87,44 @@ describe("remote_admin_webauthn_registration_assertion", () => {
     expect(() => decodeRemoteAdminApprovalEvidenceV1(unknownOperation)).toThrow(
       "approval_discriminant",
     );
+  });
+
+  it("round trips every FCWA operation 1..11 and rejects 0 and 12", () => {
+    const encodeWithOperation = (operation: number): Uint8Array =>
+      encodeRemoteAdminApprovalEvidenceV1({
+        tenantId: tagProtocolIdBytes("tenant", bytes(16, 1)),
+        principalId: tagProtocolIdBytes("account", bytes(16, 2)),
+        role: 2,
+        registryGeneration: 9n,
+        credentialIdHash: bytes(32, 3),
+        operation: operation as RemoteAdminOperation,
+        canonicalRequestDigest: bytes(32, 4),
+        operationEpoch: 10n,
+        issuedAt: 11n,
+        expiresAt: 12n,
+        challengeId: bytes(16, 5),
+        challengeHash: bytes(32, 6),
+        rpId: "admin.example.com",
+        origin: "https://admin.example.com",
+        authenticatorData: bytes(37, 7),
+        clientDataJson: new TextEncoder().encode("{}"),
+        coseAlg: -7,
+        signatureP1363: bytes(64, 8),
+      });
+    for (let operation = 1; operation <= 11; operation++) {
+      const encoded = encodeWithOperation(operation);
+      // Operation byte lives at offset 78 (magic4+ver1+tenant16+principal16+role1+gen8+hash32).
+      expect(encoded[78]).toBe(operation);
+      expect(decodeRemoteAdminApprovalEvidenceV1(encoded).operation).toBe(operation);
+    }
+    expect(() => encodeWithOperation(0)).toThrow("approval_discriminant");
+    expect(() => encodeWithOperation(12)).toThrow("approval_discriminant");
+    // Tamper a valid operation-11 encoding up to 12 and confirm decode rejects it,
+    // so the bound is enforced on the wire and not only at encode time.
+    const eleven = encodeWithOperation(11);
+    const twelve = eleven.slice();
+    twelve[78] = 12;
+    expect(() => decodeRemoteAdminApprovalEvidenceV1(twelve)).toThrow("approval_discriminant");
   });
 
   it("rejects invalid RP/origin and duplicate credential identities", () => {

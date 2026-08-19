@@ -20,6 +20,7 @@ import {
 } from "./remote-admin-state";
 import {
   normalizeCanonicalLowSDerSignature,
+  verifyPortableApprovalAtConsumption,
   verifyPortableRemoteAdminApproval,
   verifyRemoteAdminRegistration,
 } from "./remote-admin-webauthn";
@@ -489,5 +490,200 @@ describe("remote_admin_lockout_guards", () => {
     };
     await expect(commitRemoteAdminBootstrap(request)).resolves.toEqual({ orgId: "org" });
     await expect(commitRemoteAdminBootstrap(request)).resolves.toEqual({ orgId: "org" });
+  });
+});
+
+describe("remote_admin_portable_consumption_gate", () => {
+  const b64u = (value: Uint8Array) => Buffer.from(value).toString("base64url");
+  const sha256 = async (value: Uint8Array) =>
+    new Uint8Array(await crypto.subtle.digest("SHA-256", value));
+
+  // Mint a genuine FCWA approval: a real P-256 signature over
+  // authenticatorData || SHA-256(clientDataJson), exactly as an authenticator
+  // would produce, plus the raw challenge a verifier is expected to hold.
+  async function mintApproval(overrides?: {
+    beFlag?: boolean;
+    operation?: number;
+    origin?: string;
+    rpId?: string;
+  }) {
+    const rpId = overrides?.rpId ?? "admin.example.com";
+    const origin = overrides?.origin ?? "https://admin.example.com";
+    const operation = overrides?.operation ?? 9;
+    const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+      "sign",
+      "verify",
+    ]);
+    const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+    const decode = (value: string) => new Uint8Array(Buffer.from(value, "base64url"));
+    const challenge = new Uint8Array(32).fill(0x21);
+    const clientDataJson = new TextEncoder().encode(
+      JSON.stringify({
+        type: "webauthn.get",
+        challenge: b64u(challenge),
+        origin,
+        crossOrigin: false,
+      }),
+    );
+    const authenticatorData = new Uint8Array(37);
+    authenticatorData.set(await sha256(new TextEncoder().encode(rpId)), 0);
+    authenticatorData[32] = 0x05 | (overrides?.beFlag ? 0x08 : 0);
+    const clientHash = await sha256(clientDataJson);
+    const signed = new Uint8Array(authenticatorData.length + clientHash.length);
+    signed.set(authenticatorData);
+    signed.set(clientHash, authenticatorData.length);
+    const signatureP1363 = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keys.privateKey, signed),
+    );
+    const credentialIdHash = new Uint8Array(32).fill(2);
+    const principalId = tagProtocolIdBytes("account", new Uint8Array(16).fill(1));
+    const tenantId = tagProtocolIdBytes("tenant", new Uint8Array(16).fill(3));
+    const challengeId = new Uint8Array(16).fill(4);
+    const canonicalRequestDigest = new Uint8Array(32).fill(5);
+    const registryGeneration = 3n;
+    const operationEpoch = 7n;
+    const issuedAt = 1000n;
+    const expiresAt = 1900n;
+    return {
+      challenge,
+      challengeId,
+      credential: {
+        principalId,
+        role: 1 as const,
+        credentialIdHash,
+        coseAlg: -7 as const,
+        p256X: decode(jwk.x!),
+        p256Y: decode(jwk.y!),
+        declaredCustody: (overrides?.beFlag ? 2 : 3) as 1 | 2 | 3,
+        state: 1 as 1 | 2,
+        createdAt: 1n,
+        revokedAt: null,
+      },
+      currency: {
+        nowSeconds: 1500n,
+        expectedTenant: tenantId,
+        expectedDigest: canonicalRequestDigest,
+        expectedEpoch: operationEpoch,
+        expectedOperation: operation,
+        registryGeneration,
+      },
+      policy: { rpId, origin },
+      evidence: {
+        tenantId,
+        principalId,
+        role: 1 as const,
+        registryGeneration,
+        credentialIdHash,
+        operation: operation as 1,
+        canonicalRequestDigest,
+        operationEpoch,
+        issuedAt,
+        expiresAt,
+        challengeId,
+        challengeHash: await sha256(challenge),
+        rpId,
+        origin,
+        authenticatorData,
+        clientDataJson,
+        coseAlg: -7 as const,
+        signatureP1363,
+      },
+    };
+  }
+
+  const run = (minted: Awaited<ReturnType<typeof mintApproval>>) =>
+    verifyPortableApprovalAtConsumption({
+      evidence: minted.evidence,
+      credential: minted.credential,
+      policy: minted.policy,
+      expectedChallenge: minted.challenge,
+      expectedChallengeId: minted.challengeId,
+      ...minted.currency,
+    });
+
+  it("accepts a genuine approval whose scope, challenge, and signature all match", async () => {
+    await expect(run(await mintApproval())).resolves.toEqual({ signCount: 0n });
+  });
+
+  it("rejects an expired approval and a TTL over 900s", async () => {
+    const expired = await mintApproval();
+    await expect(
+      run({ ...expired, currency: { ...expired.currency, nowSeconds: 2000n } }),
+    ).rejects.toThrow("expired");
+    const stretched = await mintApproval();
+    stretched.evidence.expiresAt = stretched.evidence.issuedAt + 901n;
+    await expect(run(stretched)).rejects.toThrow("expired");
+  });
+
+  it("rejects a wrong origin or RP id even with a valid signature", async () => {
+    const wrongOrigin = await mintApproval();
+    await expect(
+      run({
+        ...wrongOrigin,
+        policy: { ...wrongOrigin.policy, origin: "https://evil.example.com" },
+      }),
+    ).rejects.toThrow("rp_origin_mismatch");
+    const wrongRp = await mintApproval();
+    await expect(
+      run({ ...wrongRp, policy: { ...wrongRp.policy, rpId: "evil.example.com" } }),
+    ).rejects.toThrow("rp_origin_mismatch");
+  });
+
+  it("rejects a replayed approval bound to a different challenge", async () => {
+    const minted = await mintApproval();
+    await expect(
+      verifyPortableApprovalAtConsumption({
+        evidence: minted.evidence,
+        credential: minted.credential,
+        policy: minted.policy,
+        expectedChallenge: new Uint8Array(32).fill(0x99),
+        expectedChallengeId: minted.challengeId,
+        ...minted.currency,
+      }),
+    ).rejects.toThrow("challenge_hash_mismatch");
+  });
+
+  it("rejects a forged or tampered signature", async () => {
+    const minted = await mintApproval();
+    minted.evidence.signatureP1363[0] ^= 0xff;
+    await expect(run(minted)).rejects.toThrow("signature_invalid");
+  });
+
+  it("rejects when the bound scope (digest / epoch / operation) does not match, proving currency is not skippable", async () => {
+    const badDigest = await mintApproval();
+    await expect(
+      run({
+        ...badDigest,
+        currency: { ...badDigest.currency, expectedDigest: new Uint8Array(32).fill(0xaa) },
+      }),
+    ).rejects.toThrow("scope_mismatch");
+    const badEpoch = await mintApproval();
+    await expect(
+      run({ ...badEpoch, currency: { ...badEpoch.currency, expectedEpoch: 999n } }),
+    ).rejects.toThrow("scope_mismatch");
+    const badOperation = await mintApproval();
+    await expect(
+      run({ ...badOperation, currency: { ...badOperation.currency, expectedOperation: 5 } }),
+    ).rejects.toThrow("scope_mismatch");
+  });
+
+  it("rejects a stale registry generation or a revoked credential", async () => {
+    const staleGen = await mintApproval();
+    await expect(
+      run({ ...staleGen, currency: { ...staleGen.currency, registryGeneration: 4n } }),
+    ).rejects.toThrow("registry_stale");
+    const revoked = await mintApproval();
+    revoked.credential.state = 2;
+    await expect(run(revoked)).rejects.toThrow("registry_stale");
+  });
+
+  it("enforces custody/BE consistently with the session assertion verifier", async () => {
+    const conflicting = await mintApproval({ beFlag: true });
+    // declaredCustody 2 (EXTERNAL_SECURITY_KEY) + backup-eligible flag is rejected.
+    await expect(run(conflicting)).rejects.toThrow("external_key_custody_conflict");
+    // The same backup-eligible authenticator with a synced-passkey custody is fine,
+    // proving the rejection is the custody/BE rule and not the BE flag alone.
+    conflicting.credential.declaredCustody = 1;
+    await expect(run(conflicting)).resolves.toEqual({ signCount: 0n });
   });
 });

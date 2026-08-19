@@ -55,9 +55,15 @@ const db = prisma as unknown as {
   enterpriseLogEvent: { createMany: MockInstance; count: MockInstance; findFirst: MockInstance };
   enterpriseLogExport: { create: MockInstance; findMany: MockInstance; findUnique: MockInstance };
   enterpriseAuditLog: { create: MockInstance };
-  remoteAdminRegistry: { findUnique: MockInstance };
+  remoteAdminRegistry: { findUnique: MockInstance; update: MockInstance };
   remoteAdminApproval: { findMany: MockInstance; updateMany: MockInstance };
-  remoteAdminCeremony: { create: MockInstance };
+  remoteAdminCredential: {
+    findUnique: MockInstance;
+    count: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+  };
+  remoteAdminCeremony: { create: MockInstance; findUnique: MockInstance };
 };
 const exportQueue = enterpriseLogExportQueue as unknown as { add: MockInstance };
 
@@ -175,6 +181,117 @@ describe("enterpriseRouter", () => {
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
     expect(db.remoteAdminApproval.updateMany).not.toHaveBeenCalled();
     expect(db.remoteAdminCeremony.create).not.toHaveBeenCalled();
+  });
+
+  it("denies a dual-control mutation when the stored FCWA evidence fails portable verification", async () => {
+    const targetHash = Buffer.alloc(32, 1);
+    const ownerKey = Buffer.alloc(32, 2);
+    const securityKey = Buffer.alloc(32, 3);
+    const digest = Buffer.alloc(32, 4);
+    db.remoteAdminRegistry.findUnique.mockResolvedValue({
+      id: "registry-1",
+      orgId: "org-1",
+      generation: 2n,
+      rpId: "admin.example.test",
+      origin: "https://admin.example.test",
+      tenantProtocolId: Buffer.alloc(16, 9),
+    });
+    const credentials: Record<string, unknown> = {
+      [targetHash.toString("hex")]: {
+        id: "cred-target",
+        principalId: "security-2",
+        role: "SECURITY_ADMIN",
+        state: "ACTIVE",
+        registryGeneration: 2n,
+        credentialIdHash: targetHash,
+      },
+      [ownerKey.toString("hex")]: {
+        id: "cred-owner",
+        principalId: "owner-2",
+        role: "OWNER",
+        state: "ACTIVE",
+        registryGeneration: 2n,
+        credentialIdHash: ownerKey,
+        principalProtocolId: Buffer.alloc(16, 10),
+        p256X: Buffer.alloc(32, 11),
+        p256Y: Buffer.alloc(32, 12),
+        declaredCustody: "SYNCED_PASSKEY",
+        createdAt: new Date("2026-01-01"),
+        revokedAt: null,
+      },
+      [securityKey.toString("hex")]: {
+        id: "cred-security",
+        principalId: "security-2",
+        role: "SECURITY_ADMIN",
+        state: "ACTIVE",
+        registryGeneration: 2n,
+        credentialIdHash: securityKey,
+        principalProtocolId: Buffer.alloc(16, 13),
+        p256X: Buffer.alloc(32, 14),
+        p256Y: Buffer.alloc(32, 15),
+        declaredCustody: "SYNCED_PASSKEY",
+        createdAt: new Date("2026-01-01"),
+        revokedAt: null,
+      },
+    };
+    db.remoteAdminCredential.findUnique.mockImplementation(
+      (args: { where: { orgId_credentialIdHash: { credentialIdHash: Buffer } } }) =>
+        Promise.resolve(
+          credentials[args.where.orgId_credentialIdHash.credentialIdHash.toString("hex")] ?? null,
+        ),
+    );
+    db.enterpriseOrgMember.findUnique.mockImplementation(
+      (args: { where: { orgId_userId: { userId: string } } }) =>
+        Promise.resolve(
+          args.where.orgId_userId.userId === "owner-2"
+            ? { userId: "owner-2", role: "OWNER" }
+            : { userId: "security-2", role: "SECURITY_ADMIN" },
+        ),
+    );
+    db.remoteAdminApproval.findMany.mockResolvedValue([
+      {
+        id: "11111111-1111-4111-8111-111111111111",
+        principalId: "owner-2",
+        role: "OWNER",
+        credentialIdHash: ownerKey,
+        operation: 9,
+        canonicalRequestDigest: digest,
+        operationEpoch: 7n,
+        registryGeneration: 2n,
+        challengeId: "ceremony-owner",
+        // Not a valid FCWA container — the portable verifier must reject it.
+        evidenceBytes: Buffer.from("not-a-real-fcwa-approval-blob"),
+      },
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        principalId: "security-2",
+        role: "SECURITY_ADMIN",
+        credentialIdHash: securityKey,
+        operation: 9,
+        canonicalRequestDigest: digest,
+        operationEpoch: 7n,
+        registryGeneration: 2n,
+        challengeId: "ceremony-security",
+        evidenceBytes: Buffer.from("not-a-real-fcwa-approval-blob"),
+      },
+    ]);
+    db.remoteAdminCeremony.findUnique.mockResolvedValue({ challengeBytes: Buffer.alloc(32, 7) });
+
+    const client = createRouterClient(enterpriseRouter, { context: buildContext() });
+    await expect(
+      client.revokeRemoteAdminCredential({
+        orgId: "org-1",
+        credentialIdHash: targetHash.toString("base64url"),
+        ownerApprovalId: "11111111-1111-4111-8111-111111111111",
+        securityApprovalId: "22222222-2222-4222-8222-222222222222",
+        operationEpoch: "7",
+        canonicalRequestDigest: digest.toString("base64url"),
+      }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    // The stale session + matching DB approval rows are not enough: the mutation
+    // must not happen when portable FCWA verification fails.
+    expect(db.remoteAdminApproval.updateMany).not.toHaveBeenCalled();
+    expect(db.remoteAdminCredential.update).not.toHaveBeenCalled();
   });
 
   it("ingests only event kinds enabled by policy and returns the policy version", async () => {

@@ -9,7 +9,7 @@ export const REMOTE_ADMIN_APPROVAL_MAX_BYTES = 16_384;
 export type RemoteAdminCredentialRole = 1 | 2;
 export type RemoteAdminCustody = 1 | 2 | 3;
 export type RemoteAdminCredentialState = 1 | 2;
-export type RemoteAdminOperation = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+export type RemoteAdminOperation = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
 export const RemoteAdminOperationV1 = {
   enterpriseEnrollment: 1,
   highAssuranceDeviceEnrollment: 2,
@@ -20,6 +20,10 @@ export const RemoteAdminOperationV1 = {
   recovery: 7,
   securityRoleGovernance: 8,
   credentialRegistryGovernance: 9,
+  // Aligned with the tenant-authority signer table (discriminants 10 and 11)
+  // so an FCWA can encode an identity-revocation approval.
+  tenantIdentityRevocationStatus: 10,
+  identityRevocation: 11,
 } as const satisfies Record<string, RemoteAdminOperation>;
 
 export function remoteAdminOperationRequiresDualControl(operation: RemoteAdminOperation) {
@@ -350,7 +354,7 @@ export function encodeRemoteAdminApprovalEvidenceV1(
   if (
     ![1, 2].includes(value.role) ||
     value.operation < 1 ||
-    value.operation > 9 ||
+    value.operation > 11 ||
     value.coseAlg !== -7
   )
     throw new Error("approval_discriminant");
@@ -417,7 +421,7 @@ export function decodeRemoteAdminApprovalEvidenceV1(
     coseAlg = r.int16(),
     signatureP1363 = r.take(64);
   r.done();
-  if ((role !== 1 && role !== 2) || operation < 1 || operation > 9 || coseAlg !== -7)
+  if ((role !== 1 && role !== 2) || operation < 1 || operation > 11 || coseAlg !== -7)
     throw new Error("approval_discriminant");
   if (
     authenticatorData.length < 37 ||

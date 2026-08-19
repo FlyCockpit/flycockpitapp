@@ -1,7 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
+  decodeRemoteAdminApprovalEvidenceV1,
   encodeRemoteAdminApprovalEvidenceV1,
   encodeRemoteCredentialRegistryV1,
+  type RemoteAdminCustody,
   type RemoteAdminOperation,
   remoteAdminOperationRequiresDualControl,
   tagProtocolIdBytes,
@@ -33,6 +35,7 @@ import { assertCeremonyRetryScope } from "./remote-admin-state";
 import {
   approvalChallenge,
   REMOTE_ADMIN_CEREMONY_TTL_MS,
+  verifyPortableApprovalAtConsumption,
   verifyRemoteAdminAssertion,
   verifyRemoteAdminRegistration,
 } from "./remote-admin-webauthn";
@@ -42,7 +45,11 @@ const exportIdInput = z.object({ exportId: z.string().min(1) });
 const remoteAdminActionSchema = z.enum(REMOTE_ADMIN_ACTIONS);
 const SECURITY_ADMIN_BOOTSTRAP_TTL_MS = 15 * 60 * 1000;
 const APPROVAL_TTL_MS = 15 * 60 * 1000;
-const approvalOperationSchema = z.number().int().min(1).max(9);
+const approvalOperationSchema = z.number().int().min(1).max(11);
+const custodyToEnum = (
+  custody: "SYNCED_PASSKEY" | "EXTERNAL_SECURITY_KEY" | "UNKNOWN",
+): RemoteAdminCustody =>
+  custody === "SYNCED_PASSKEY" ? 1 : custody === "EXTERNAL_SECURITY_KEY" ? 2 : 3;
 const remotePolicyStrengthSchema = z.object({
   minimumProtocolVersion: z.number().int().min(1),
   minimumKeyBits: z.number().int().min(128),
@@ -144,6 +151,95 @@ async function assertApproversRemainCurrent(
       });
   }
 }
+
+type StoredApproval = {
+  credentialIdHash: Uint8Array;
+  operation: number;
+  canonicalRequestDigest: Uint8Array;
+  operationEpoch: bigint;
+  challengeId: string;
+  evidenceBytes: Uint8Array;
+};
+
+/**
+ * Consumption gate for stored portable FCWA approvals. For every approval row
+ * about to authorize a dual-control mutation, this re-verifies the portable
+ * evidence bytes (signature, RP/origin, challenge binding, custody/BE) AND its
+ * currency (scope, registry generation, revoked credential, expiry/TTL) through
+ * the single un-splittable `verifyPortableApprovalAtConsumption`. A valid
+ * FlyCockpit session and matching DB approval rows are never sufficient on
+ * their own — a replayed, expired, wrong-scope, or forged FCWA is rejected.
+ */
+async function verifyStoredApprovalCohort(
+  tx: Prisma.TransactionClient,
+  registry: {
+    id: string;
+    orgId: string;
+    rpId: string;
+    origin: string;
+    tenantProtocolId: Uint8Array;
+    generation: bigint;
+  },
+  now: Date,
+  approvals: StoredApproval[],
+) {
+  const nowSeconds = BigInt(Math.floor(now.getTime() / 1000));
+  for (const approval of approvals) {
+    const [ceremony, credential] = await Promise.all([
+      tx.remoteAdminCeremony.findUnique({ where: { id: approval.challengeId } }),
+      tx.remoteAdminCredential.findUnique({
+        where: {
+          orgId_credentialIdHash: {
+            orgId: registry.orgId,
+            credentialIdHash: Buffer.from(approval.credentialIdHash),
+          },
+        },
+      }),
+    ]);
+    if (!ceremony?.challengeBytes || !credential)
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Portable approval evidence is unavailable.",
+      });
+    try {
+      const evidence = decodeRemoteAdminApprovalEvidenceV1(new Uint8Array(approval.evidenceBytes));
+      await verifyPortableApprovalAtConsumption({
+        evidence,
+        credential: {
+          principalId: tagProtocolIdBytes(
+            "account",
+            new Uint8Array(credential.principalProtocolId),
+          ),
+          role: credential.role === "OWNER" ? 1 : 2,
+          credentialIdHash: new Uint8Array(credential.credentialIdHash),
+          coseAlg: -7,
+          p256X: new Uint8Array(credential.p256X),
+          p256Y: new Uint8Array(credential.p256Y),
+          declaredCustody: custodyToEnum(credential.declaredCustody),
+          state: credential.state === "ACTIVE" ? 1 : 2,
+          createdAt: BigInt(Math.floor(credential.createdAt.getTime() / 1000)),
+          revokedAt: credential.revokedAt
+            ? BigInt(Math.floor(credential.revokedAt.getTime() / 1000))
+            : null,
+        },
+        policy: { rpId: registry.rpId, origin: registry.origin },
+        expectedChallenge: new Uint8Array(ceremony.challengeBytes),
+        expectedChallengeId: uuidBytes(approval.challengeId),
+        nowSeconds,
+        expectedTenant: new Uint8Array(registry.tenantProtocolId),
+        expectedDigest: new Uint8Array(approval.canonicalRequestDigest),
+        expectedEpoch: approval.operationEpoch,
+        expectedOperation: approval.operation,
+        registryGeneration: registry.generation,
+      });
+    } catch (error) {
+      if (error instanceof ORPCError) throw error;
+      throw new ORPCError("UNAUTHORIZED", {
+        message: "Portable approval evidence failed verification.",
+      });
+    }
+  }
+}
+
 async function consumeCurrentStepUp(
   tx: Prisma.TransactionClient,
   input: {
@@ -267,6 +363,7 @@ export const enterpriseRouter = {
             });
           }
           await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
+          await verifyStoredApprovalCohort(tx, registry, now, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -411,6 +508,7 @@ export const enterpriseRouter = {
               message: "An approving administrator must initiate registration.",
             });
           await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
+          await verifyStoredApprovalCohort(tx, registry, now, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -521,6 +619,7 @@ export const enterpriseRouter = {
               message: "Dual role approvals are required.",
             });
           await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
+          await verifyStoredApprovalCohort(tx, registry, now, approvals);
           if (
             (
               await tx.remoteAdminApproval.updateMany({
@@ -689,6 +788,7 @@ export const enterpriseRouter = {
               message: "Dual credential approvals are required.",
             });
           await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
+          await verifyStoredApprovalCohort(tx, registry, now, approvals);
           const remaining = await tx.remoteAdminCredential.count({
             where: {
               orgId: input.orgId,
@@ -793,6 +893,7 @@ export const enterpriseRouter = {
           )
             throw new ORPCError("CONFLICT", { message: "Recovery approvals are stale." });
           await assertApproversRemainCurrent(tx, input.orgId, registry.generation, approvals);
+          await verifyStoredApprovalCohort(tx, registry, now, approvals);
           const active = await tx.remoteAdminCredential.count({
             where: {
               orgId: input.orgId,
@@ -1248,7 +1349,7 @@ export const enterpriseRouter = {
           coseAlg: -7,
           p256X: new Uint8Array(credential.p256X),
           p256Y: new Uint8Array(credential.p256Y),
-          declaredCustody: 3,
+          declaredCustody: custodyToEnum(credential.declaredCustody),
           state: 1,
           createdAt: BigInt(Math.floor(credential.createdAt.getTime() / 1000)),
           revokedAt: null,

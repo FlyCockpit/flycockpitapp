@@ -324,6 +324,11 @@ export async function verifyPortableRemoteAdminApproval(input: {
   const flags = evidence.authenticatorData[32]!;
   if ((flags & 0x01) === 0 || (flags & 0x04) === 0)
     throw new Error("webauthn_user_verification_required");
+  // Mirror the session assertion verifier: an EXTERNAL_SECURITY_KEY credential
+  // must never present the backup-eligible flag. Keeping this here means both
+  // entry points agree on custody/BE posture.
+  if (credential.declaredCustody === 2 && (flags & 0x08) !== 0)
+    throw new Error("webauthn_external_key_custody_conflict");
   const publicKey = await crypto.subtle.importKey(
     "jwk",
     {
@@ -356,4 +361,50 @@ export async function verifyPortableRemoteAdminApproval(input: {
       ).getUint32(0),
     ),
   };
+}
+
+/**
+ * Consumption-time gate for a stored/presented portable FCWA approval.
+ *
+ * This is the single un-splittable entry point every dual-control consumption
+ * site must call before mutating authority state. It fails closed on any
+ * currency/expiry mismatch (scope, registry generation, revoked credential,
+ * expiry/issued-at, TTL ceiling) AND on any cryptographic mismatch (credential
+ * binding, RP/origin, challenge hash + id, client data, custody/BE, signature).
+ * A FlyCockpit session assertion alone is never sufficient for dual control:
+ * this re-verifies the portable evidence against the credential registry.
+ *
+ * Verification and currency are intentionally coupled here so a caller cannot
+ * perform one without the other.
+ */
+export async function verifyPortableApprovalAtConsumption(input: {
+  evidence: RemoteAdminApprovalEvidenceV1;
+  credential: RemoteCredentialRegistryEntryV1;
+  policy: WebAuthnPolicy;
+  expectedChallenge: Uint8Array;
+  expectedChallengeId: Uint8Array;
+  nowSeconds: bigint;
+  expectedTenant: Uint8Array;
+  expectedDigest: Uint8Array;
+  expectedEpoch: bigint;
+  expectedOperation: number;
+  registryGeneration: bigint;
+}): Promise<{ signCount: bigint }> {
+  assertPortableApprovalCurrent({
+    evidence: input.evidence,
+    nowSeconds: input.nowSeconds,
+    expectedTenant: input.expectedTenant,
+    expectedDigest: input.expectedDigest,
+    expectedEpoch: input.expectedEpoch,
+    expectedOperation: input.expectedOperation,
+    registryGeneration: input.registryGeneration,
+    credential: input.credential,
+  });
+  return verifyPortableRemoteAdminApproval({
+    evidence: input.evidence,
+    credential: input.credential,
+    policy: input.policy,
+    expectedChallenge: input.expectedChallenge,
+    expectedChallengeId: input.expectedChallengeId,
+  });
 }

@@ -1,4 +1,7 @@
-import type { AuthorityPublicSnapshot } from "@flycockpit/api/lib/remote-authority";
+import {
+  type AuthorityPublicSnapshot,
+  REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS,
+} from "@flycockpit/api/lib/remote-authority";
 import type { Context, Env, Hono } from "hono";
 
 export function mountRemoteAuthorityRoutes<E extends Env>(
@@ -12,7 +15,10 @@ export function mountRemoteAuthorityRoutes<E extends Env>(
         "Cache-Control": "no-store",
       });
     const headers = {
-      "Cache-Control": kind === "jwks" ? "public, max-age=30, must-revalidate" : "no-store",
+      "Cache-Control":
+        kind === "jwks"
+          ? `public, max-age=${REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS}, must-revalidate`
+          : "no-store",
       ETag: value.etag,
       Vary: "Accept-Encoding",
       "Content-Type": kind === "jwks" ? "application/json" : "application/jose",

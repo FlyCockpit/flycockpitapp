@@ -43,7 +43,7 @@ import {
 } from "./rate-limit.js";
 import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
-import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
+import { authorityReadiness, createServerRemoteAuthority } from "./remote-authority-runtime.js";
 import { loadRemoteFallbackRouteBindingKeyRuntime } from "./remote-fallback-route-keys.js";
 import {
   createServerRemoteSignalingGateway,
@@ -181,6 +181,20 @@ mountRelayRoutes(app, { rateLimiter: createRateLimiterMiddleware(rpcLimiter) });
 app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
 const redisConnection = getRedisConnection();
 const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
+if (!remoteAuthority.runtime) {
+  // Unconfigured authority is never silently "healthy": either an explicit disabled
+  // mode (OSS/local) or a fail-closed readiness state (production-shaped profiles).
+  if (remoteAuthority.disabled)
+    console.warn(
+      "[remote-authority] disabled: no signing key configured (DEPLOYMENT_PROFILE=oss). " +
+        "Remote grant minting is off and /ready reports authority as disabled.",
+    );
+  else
+    console.error(
+      `[remote-authority] not configured but required for DEPLOYMENT_PROFILE=${env.DEPLOYMENT_PROFILE}; ` +
+        "/ready fails closed until REMOTE_GRANT_SIGNING_* are set.",
+    );
+}
 let remoteFallbackRouteKeysReady = !REMOTE_CONNECTION_CAPABILITIES.websocketData;
 // Installed after `serve(...)` (the gateway needs the HTTP server for upgrades).
 let remoteSignalingGateway: InstalledRemoteSignalingGateway | undefined;
@@ -219,7 +233,7 @@ app.get("/ready", async (c) => {
   const checks = {
     postgres: false,
     redis: false,
-    remoteAuthority: remoteAuthority.runtime ? remoteAuthority.runtime.decision.ready : true,
+    remoteAuthority: authorityReadiness(remoteAuthority),
     remoteFallbackRouteKeys: remoteFallbackRouteKeysReady,
     remoteSignalingGateway: remoteSignalingGatewayReady,
   };
@@ -230,10 +244,9 @@ app.get("/ready", async (c) => {
     await withTimeout(redisConnection.ping(), 3000, "redis readiness check");
     checks.redis = true;
 
-    checks.remoteAuthority = remoteAuthority.runtime
-      ? remoteAuthority.runtime.decision.ready
-      : true;
-    if (!checks.remoteAuthority) return c.json({ ok: false, checks }, 503);
+    checks.remoteAuthority = authorityReadiness(remoteAuthority);
+    // `false` fails closed (503); `"disabled"` and `true` are both healthy.
+    if (checks.remoteAuthority === false) return c.json({ ok: false, checks }, 503);
     if (!checks.remoteFallbackRouteKeys) return c.json({ ok: false, checks }, 503);
     if (!checks.remoteSignalingGateway) return c.json({ ok: false, checks }, 503);
 

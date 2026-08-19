@@ -18,6 +18,24 @@ export const REMOTE_AUTHORITY = {
   maxCertificateLifetime: 2_592_000n,
   jwksCacheAge: 30n,
 } as const;
+
+/**
+ * Public `Cache-Control: max-age` (seconds) for the JWKS route, derived from the
+ * authority validity constants rather than a free-standing literal.
+ *
+ * A cached JWKS must be revalidated *before* the signed status window it
+ * accompanies can go stale, otherwise a client could keep trusting rotated-out
+ * keys past the staleness bound. We therefore cap max-age at
+ * `statusLifetime - statusRefresh` (the skew/refresh margin the authority itself
+ * leaves below the 60s status validity) and, within that ceiling, use the same
+ * `jwksCacheAge` cadence the server's own verifier refreshes on. `min` guarantees
+ * the bound holds structurally even if `jwksCacheAge` is later raised.
+ */
+export const REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS: number = Number(
+  REMOTE_AUTHORITY.jwksCacheAge < REMOTE_AUTHORITY.statusLifetime - REMOTE_AUTHORITY.statusRefresh
+    ? REMOTE_AUTHORITY.jwksCacheAge
+    : REMOTE_AUTHORITY.statusLifetime - REMOTE_AUTHORITY.statusRefresh,
+);
 export type KeyState = "current" | "verification_only" | "revoked";
 export interface AuthorityPrivateKey {
   kid: string;
@@ -238,6 +256,15 @@ export function authorityRingDigest(
   return createHash("sha256").update(canonicalAuthorityRing(ring, config)).digest("hex");
 }
 export function publicAuthorityRingDigest(ring: PublicAuthorityRing) {
+  return createHash("sha256").update(canonicalizeRfc8785(ring)).digest("hex");
+}
+/**
+ * RFC 8785 canonical digest of a *private* ring file (includes `d`). Used only to
+ * compare two locally-trusted ring files for byte equality independent of JSON key
+ * order — never published or logged. For the public, config-scoped ring digest use
+ * {@link authorityRingDigest} instead.
+ */
+export function authorityRingFileDigest(ring: AuthorityRingFile) {
   return createHash("sha256").update(canonicalizeRfc8785(ring)).digest("hex");
 }
 

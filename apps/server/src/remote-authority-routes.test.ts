@@ -1,4 +1,7 @@
-import { AuthorityPublicSnapshot } from "@flycockpit/api/lib/remote-authority";
+import {
+  AuthorityPublicSnapshot,
+  REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS,
+} from "@flycockpit/api/lib/remote-authority";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes";
@@ -22,7 +25,9 @@ describe("remote_authority_jwks_and_status_public_only", () => {
       jwksBody = await jwks.text(),
       etag = jwks.headers.get("etag")!;
     expect(jwks.status).toBe(200);
-    expect(jwks.headers.get("cache-control")).toBe("public, max-age=30, must-revalidate");
+    expect(jwks.headers.get("cache-control")).toBe(
+      `public, max-age=${REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS}, must-revalidate`,
+    );
     expect(jwks.headers.get("vary")).toBe("Accept-Encoding");
     expect(etag).toMatch(/^"[0-9a-f]{64}"$/);
     expect(jwksBody).not.toContain('"d"');

@@ -1,6 +1,22 @@
 import { lstat, open, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, parse } from "node:path";
-import { type AuthorityRingFile, parseAuthorityRingFile } from "./remote-authority";
+import {
+  type AuthorityRingFile,
+  authorityRingFileDigest,
+  parseAuthorityRingFile,
+} from "./remote-authority";
+
+// -----------------------------------------------------------------------------
+// DEVELOPMENT / BOOTSTRAP ONLY.
+//
+// This provider reads an authority signing ring from a local JSON file whose keys
+// carry the plaintext private scalar `d`. That is acceptable only for local dev
+// and first-boot bootstrap. Production deployments MUST keep private key material
+// in a KMS/HSM and sign through the non-extractable provider path
+// (`InjectedAuthoritySigner` in ./remote-authority, driven by a KMS-backed
+// signer) so the private scalar never lands on disk or in process memory here.
+// See remote-authority-kms.test.ts for the provider-native signing contract.
+// -----------------------------------------------------------------------------
 
 /** Read one complete owner-private regular file without following a final symlink. */
 export async function readAuthorityRingFile(
@@ -53,7 +69,7 @@ export async function readAuthorityRingFile(
       if (
         parsed.revision === previousRevision &&
         previousRing &&
-        JSON.stringify(parsed) === JSON.stringify(previousRing)
+        authorityRingFileDigest(parsed) === authorityRingFileDigest(previousRing)
       )
         return parsed;
       throw new Error("authority ring revision is nonmonotonic or reused with changed bytes");

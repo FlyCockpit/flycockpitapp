@@ -23,6 +23,7 @@ import {
   publicAuthorityRing,
   publicAuthorityRingDigest,
   REMOTE_AUTHORITY,
+  REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS,
   RingAuthorityVerifier,
   reconcileAuthorityFence,
   reduceAuthorityRollout,
@@ -100,6 +101,64 @@ describe("remote_authority_file_provider_rejects_unsafe_ring", () => {
     await expect(readAuthorityRingFile(unsafePath)).rejects.toThrow("parent is unsafe");
   });
 });
+describe("remote_authority_file_same_revision_reuse", () => {
+  it("reuses a same-revision ring by canonical digest regardless of key order, and rejects changed bytes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "authority-reuse-")),
+      path = join(dir, "ring.json"),
+      value = ring([makeKey("k0", "current")]);
+    await writeFile(path, JSON.stringify(value), { mode: 0o600 });
+    const first = await readAuthorityRingFile(path);
+
+    // Same logical ring, but every object's JSON property order reversed. The old
+    // `JSON.stringify` compare would see these as different bytes and reject reuse.
+    const reordered = {
+      keys: value.keys.map((k) => ({
+        retireAt: k.retireAt,
+        activatedAt: k.activatedAt,
+        state: k.state,
+        d: k.d,
+        y: k.y,
+        x: k.x,
+        crv: k.crv,
+        kty: k.kty,
+        alg: k.alg,
+        kid: k.kid,
+      })),
+      currentKid: value.currentKid,
+      authorityEpoch: value.authorityEpoch,
+      revision: value.revision,
+      schemaVersion: value.schemaVersion,
+    } as unknown as AuthorityRingFile;
+    // Precondition: byte order genuinely differs (so the old compare would have thrown).
+    expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(first));
+
+    const reused = await readAuthorityRingFile(path, first.revision, reordered);
+    expect(reused.currentKid).toBe("k0");
+
+    // Same revision, changed bytes (different epoch) → nonmonotonic-or-reused throw.
+    const changed = { ...first, authorityEpoch: "999" } as AuthorityRingFile;
+    await expect(readAuthorityRingFile(path, first.revision, changed)).rejects.toThrow(
+      "nonmonotonic or reused with changed bytes",
+    );
+  });
+});
+
+describe("remote_authority_jwks_max_age_binding", () => {
+  it("keeps the JWKS max-age within a skew margin below the status validity window", () => {
+    const statusValidity = Number(REMOTE_AUTHORITY.statusLifetime);
+    const refreshMargin = Number(REMOTE_AUTHORITY.statusRefresh);
+    // Hard literal so a broken derivation is caught outright.
+    expect(REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS).toBe(30);
+    expect(REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS).toBeGreaterThan(0);
+    // Staleness bound: a cached JWKS must revalidate before the signed status it
+    // accompanies can expire, leaving a refresh/skew margin below the 60s validity.
+    expect(REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS).toBeLessThanOrEqual(
+      statusValidity - refreshMargin,
+    );
+    expect(REMOTE_AUTHORITY_JWKS_MAX_AGE_SECONDS).toBeLessThan(statusValidity);
+  });
+});
+
 describe("remote_authority_canonical_digest_vectors", () => {
   it("normalizes only bounded HTTPS origins and deployment/digest configuration", () => {
     expect(normalizeAuthorityIssuer("https://EXAMPLE.com:443/")).toBe("https://example.com");

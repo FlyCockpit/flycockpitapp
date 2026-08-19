@@ -3608,7 +3608,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::ListSessions {
             project_id,
             parent_session_id,
-        } => list_sessions(ctx, &state.principal, project_id, parent_session_id).await,
+            assistant_id,
+        } => {
+            list_sessions(
+                ctx,
+                &state.principal,
+                project_id,
+                parent_session_id,
+                assistant_id,
+            )
+            .await
+        }
 
         Request::ReadSessionMessages {
             session_id,
@@ -3735,18 +3745,31 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     Err(e) => return Err(internal(e)),
                 }
             }
-            let statuses = visible_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ctx.registry.live_status(id).map(
-                        |(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
-                            session_id: id,
-                            has_active_schedules,
-                            processing,
-                        },
-                    )
-                })
-                .collect();
+            let mut statuses = Vec::new();
+            for id in visible_ids {
+                let Some((has_active_schedules, processing, _tool_running)) =
+                    ctx.registry.live_status(id)
+                else {
+                    continue;
+                };
+                // v10-only: include the session's canonical project root so a
+                // `cockpit run --session <id>` client can validate it matches
+                // --cwd/--project before attaching. The field is `None` for v9
+                // negotiated connections (the version gate strips it).
+                let project_root = ctx
+                    .db
+                    .get_session(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|row| row.project_root);
+                statuses.push(proto::LiveStatus {
+                    session_id: id,
+                    has_active_schedules,
+                    processing,
+                    project_root,
+                });
+            }
             Ok(Response::SessionLiveStatus { statuses })
         }
 
@@ -3985,7 +4008,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             record_session_note(ctx, session_id, &text).await
         }
 
-        Request::DeleteSession { session_id } => delete_session(ctx, session_id).await,
+        Request::DeleteSession { session_id } => {
+            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+        }
 
         Request::GetInventoryBundle {
             project_root,
@@ -7495,7 +7520,17 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
         Request::ListSessions {
             project_id,
             parent_session_id,
-        } => list_sessions(&ctx, &shared.principal, project_id, parent_session_id).await,
+            assistant_id,
+        } => {
+            list_sessions(
+                &ctx,
+                &shared.principal,
+                project_id,
+                parent_session_id,
+                assistant_id,
+            )
+            .await
+        }
         Request::ReadSessionMessages {
             session_id,
             before_seq,
@@ -7617,18 +7652,31 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                     Err(e) => return Err(internal(e)),
                 }
             }
-            let statuses = visible_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ctx.registry.live_status(id).map(
-                        |(has_active_schedules, processing, _tool_running)| proto::LiveStatus {
-                            session_id: id,
-                            has_active_schedules,
-                            processing,
-                        },
-                    )
-                })
-                .collect();
+            let mut statuses = Vec::new();
+            for id in visible_ids {
+                let Some((has_active_schedules, processing, _tool_running)) =
+                    ctx.registry.live_status(id)
+                else {
+                    continue;
+                };
+                // v10-only: include the session's canonical project root so a
+                // `cockpit run --session <id>` client can validate it matches
+                // --cwd/--project before attaching. The field is `None` for v9
+                // negotiated connections (the version gate strips it).
+                let project_root = ctx
+                    .db
+                    .get_session(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|row| row.project_root);
+                statuses.push(proto::LiveStatus {
+                    session_id: id,
+                    has_active_schedules,
+                    processing,
+                    project_root,
+                });
+            }
             Ok(Response::SessionLiveStatus { statuses })
         }
         Request::GetInventoryBundle {

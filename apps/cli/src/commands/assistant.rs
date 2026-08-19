@@ -9,7 +9,10 @@ use crate::cli::{
     MediaAccountingCommand,
 };
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{AssistantSessionResolutionMode, Request, Response};
 use crate::db::Db;
+#[cfg(test)]
 use crate::session::project_id_for;
 use crate::wizard::WizardRun;
 
@@ -104,22 +107,37 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 }
 
 async fn list() -> Result<()> {
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let rows = db.list_assistants().await.context("listing assistants")?;
-    if rows.is_empty() {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for assistant list")?;
+    let response = daemon
+        .client
+        .request(Request::ListAssistants)
+        .await
+        .context("requesting assistant list from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant list: {error}"))?;
+    let assistants = match response {
+        Response::Assistants { assistants } => assistants,
+        other => bail!("daemon returned unexpected response to assistant list: {other:?}"),
+    };
+    if assistants.is_empty() {
         println!("no assistants");
         return Ok(());
     }
-    for row in rows {
-        match crate::assistants::load_from_row(&row) {
-            Ok(def) => println!(
-                "{}\t{}\t{}",
-                def.name,
-                def.description,
-                def.home_dir.display()
-            ),
-            Err(error) => println!("{}\t<invalid: {}>\t{}", row.name, error, row.home_dir),
-        }
+    for assistant in assistants {
+        // The proto AssistantSummary carries name/home_dir but not the
+        // description (which lives in the assistant definition file).
+        // Load it from disk to preserve the CLI output format.
+        let description = crate::assistants::load_from_home(
+            &assistant.name,
+            std::path::Path::new(&assistant.home_dir),
+        )
+        .map(|def| def.description)
+        .unwrap_or_else(|_| "<invalid>".to_string());
+        println!(
+            "{}\t{}\t{}",
+            assistant.name, description, assistant.home_dir
+        );
     }
     Ok(())
 }
@@ -178,28 +196,32 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
 async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
     crate::assistants::validate_assistant_name(name)?;
     let project_root = std::env::current_dir().context("resolving cwd")?;
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let row = db
-        .get_assistant(name)
+    let project_root_str = project_root.to_string_lossy().into_owned();
+    let daemon = ensure_persistent_daemon()
         .await
-        .with_context(|| format!("loading assistant `{name}`"))?
-        .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-    crate::assistants::load_from_row(&row)
-        .with_context(|| format!("validating assistant `{name}` before chat"))?;
-    let session = match db.most_recent_session_for_assistant(name).await? {
-        Some(session) => session,
-        None => {
-            let project_id = project_id_for(&project_root);
-            let project_root_str = project_root.to_string_lossy().into_owned();
-            db.create_assistant_session(&project_id, &project_root_str, name, name)
-                .await
-                .context("creating assistant session")?
+        .context("starting persistent daemon for assistant chat")?;
+    let response = daemon
+        .client
+        .request(Request::ResolveAssistantSession {
+            assistant_id: name.to_string(),
+            project_root: project_root_str,
+            mode: AssistantSessionResolutionMode::MostRecentOrCreate,
+        })
+        .await
+        .context("requesting assistant session resolution from daemon")?
+        .map_err(|error| {
+            anyhow::anyhow!("daemon rejected assistant session resolution: {error}")
+        })?;
+    let session_id = match response {
+        Response::AssistantSessionResolved { session, .. } => session.session_id,
+        other => {
+            bail!("daemon returned unexpected response to assistant session resolution: {other:?}")
         }
     };
     crate::commands::tui::run_with_session(
         Some(&project_root),
         no_sandbox,
-        session.session_id,
+        session_id,
         launch_start,
     )
     .await

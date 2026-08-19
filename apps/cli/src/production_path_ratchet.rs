@@ -19,23 +19,17 @@ const FORBIDDEN: &[&str] = &[
 const ALLOWED: &[(&str, &str, usize)] = &[
     ("commands/ask.rs", "Db::open_default", 1),
     ("commands/ask.rs", "vault_for_db", 1),
-    ("commands/assistant.rs", "Db::open_default", 6),
+    ("commands/assistant.rs", "Db::open_default", 4),
     ("commands/connect.rs", "Db::open_default", 1),
     ("commands/connect.rs", "vault_for_db", 1),
     ("commands/debug.rs", "Db::open_default", 1),
     ("commands/export.rs", "Db::open_default", 1),
     ("commands/export.rs", "vault_for_db", 1),
-    ("commands/import.rs", "Db::open_default", 1),
     ("commands/kcl.rs", "Db::open_default", 1),
     ("commands/packages.rs", "Db::open_default", 4),
-    ("commands/run.rs", "Db::open_default", 1),
-    ("commands/run.rs", "vault_for_db", 1),
-    ("commands/session.rs", "Db::open_default", 5),
-    ("commands/skill.rs", "Db::open_default", 1),
-    ("commands/stats.rs", "Db::open_default", 1),
+    ("commands/session.rs", "Db::open_default", 2),
     ("commands/sync.rs", "Db::open_default", 1),
     ("commands/sync.rs", "vault_for_db", 1),
-    ("commands/trust.rs", "Db::open_default", 2),
 ];
 
 fn repo_src() -> PathBuf {

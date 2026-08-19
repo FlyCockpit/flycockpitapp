@@ -203,9 +203,15 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             next_offset: _,
         }
         | proto::Response::AttachmentUploaded { image_ref: _ }
-        | proto::Response::NoteRecorded { seq: _ }
-        | proto::Response::SessionLiveStatus { statuses: _ }
-        | proto::Response::TerminalOpened {
+        | proto::Response::NoteRecorded { seq: _ } => {}
+        proto::Response::SessionLiveStatus { statuses } => {
+            for status in statuses {
+                if let Some(project_root) = &mut status.project_root {
+                    scrub_string(project_root, redact);
+                }
+            }
+        }
+        proto::Response::TerminalOpened {
             terminal_id: _,
             viewer_count: _,
             recording: _,
@@ -3397,6 +3403,11 @@ struct MutableClientState {
     upload_limits: AttachmentUploadLimits,
     terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    /// Negotiated protocol version for this connection, updated from each
+    /// inbound envelope's `v`. v10-only semantic changes (e.g. active-session
+    /// rejection in DeleteSession) are gated on this so a v9 client retains
+    /// its frozen behavior.
+    negotiated_protocol_version: u32,
 }
 
 /// Immutable client-state view published by the serialized executor.
@@ -3490,6 +3501,7 @@ impl MutableClientState {
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
+            negotiated_protocol_version: proto::PROTOCOL_VERSION,
         }
     }
 
@@ -3502,6 +3514,26 @@ impl MutableClientState {
             Uuid::new_v4(),
             next_terminal_connection_epoch(),
         )
+    }
+
+    /// Update the negotiated protocol version from an inbound envelope. The
+    /// envelope version is the min(client, daemon) negotiated value, so this
+    /// is the authoritative per-connection version for semantic gates.
+    fn update_negotiated_protocol_version(&mut self, v: u32) {
+        self.negotiated_protocol_version = v;
+    }
+
+    /// The negotiated protocol version for this connection. v10-only
+    /// semantic changes gate on this so v9 clients keep frozen behavior.
+    fn negotiated_protocol_version(&self) -> u32 {
+        self.negotiated_protocol_version
+    }
+
+    #[cfg(test)]
+    fn detached_for_test_with_protocol_version(version: u32) -> Self {
+        let mut state = Self::detached_for_test();
+        state.negotiated_protocol_version = version;
+        state
     }
 
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
@@ -4545,6 +4577,10 @@ async fn handle_envelope(
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
+    // Track the negotiated protocol version for this connection so v10-only
+    // semantic changes can gate on it. The envelope version is the
+    // min(client, daemon) negotiated value.
+    state.update_negotiated_protocol_version(env.v);
     match env.body {
         Body::Request {
             id,

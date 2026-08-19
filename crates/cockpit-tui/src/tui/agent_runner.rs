@@ -2798,6 +2798,7 @@ pub fn list_sessions_blocking(
         Request::ListSessions {
             project_id,
             parent_session_id,
+            assistant_id: None,
         },
     )? {
         Response::Sessions { sessions } => Ok(sessions),

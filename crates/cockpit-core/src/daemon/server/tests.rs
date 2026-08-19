@@ -6192,6 +6192,7 @@ fn remote_state_with_grants(
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     }
 }
 
@@ -6225,6 +6226,7 @@ fn owner_state() -> MutableClientState {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     }
 }
 
@@ -10598,6 +10600,7 @@ async fn attached_state_with_worker_receiver(
             upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
+            negotiated_protocol_version: proto::PROTOCOL_VERSION,
         },
         session_row.session_id,
         work_rx,
@@ -13548,6 +13551,7 @@ impl ReadonlyDispatchCaseKind {
                     Request::ListSessions {
                         project_id: None,
                         parent_session_id: None,
+                        assistant_id: None,
                     },
                 )
                 .await
@@ -14032,6 +14036,7 @@ impl ReadonlyDispatchCaseKind {
                     Request::ListSessions {
                         project_id: Some("missing-project".into()),
                         parent_session_id: None,
+                        assistant_id: None,
                     },
                 )
                 .await
@@ -17555,6 +17560,8 @@ async fn assert_session_db_mutating_happy(kind: &str) {
             }));
         }
         "delete_session" => {
+            // v10: DeleteSession rejects active sessions; end it first.
+            ctx.db.end_session(session.session_id).await.unwrap();
             let response = dispatch_matrix_request(
                 &ctx,
                 Request::DeleteSession {
@@ -18946,6 +18953,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             request: Request::ListSessions {
                 project_id: Some("proj".into()),
                 parent_session_id: None,
+                assistant_id: None,
             },
             kind: "list_sessions",
             session_id: None,
@@ -24136,6 +24144,135 @@ async fn in_process_full_event_queue_emits_lag_marker() {
 }
 
 #[tokio::test]
+async fn delete_session_rejects_active_session() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    // A freshly created session is active (ended_at is None).
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+
+    let err = handle_request(
+        Request::DeleteSession {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("active session must be rejected");
+
+    // v10: DeleteSession rejects an active session with a typed Conflict
+    // error. The session row remains intact.
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("is active; end it before deleting"));
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn delete_session_v9_envelope_does_not_reject_active_session() {
+    let ctx = test_ctx();
+    // A v9 client: negotiated protocol version 9. The active-session
+    // rejection is v10-only, so a v9 envelope carrying the unchanged
+    // DeleteSession tag must NOT get the new rejection behavior.
+    let mut state = MutableClientState::detached_for_test_with_protocol_version(
+        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+    );
+    // A freshly created session is active (ended_at is None).
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+
+    let response = handle_request(
+        Request::DeleteSession {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("v9 DeleteSession must not reject an active session");
+
+    // v9 behavior: stop-and-delete proceeds (the old frozen behavior).
+    assert!(matches!(response, Response::Ack));
+    // The session row is gone (delete completed).
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "v9 DeleteSession must delete the active session, not reject it"
+    );
+}
+
+#[tokio::test]
+async fn session_list_assistant_filter_returns_only_matching_sessions() {
+    let ctx = test_ctx();
+    let mut state = MutableClientState::detached_for_test();
+    let project_id = "test-proj";
+    let project_root = "/x";
+
+    // Create a session for "helper-bot" and a session for "other-bot",
+    // plus a session with no assistant.
+    let helper_session = ctx
+        .db
+        .create_assistant_session(project_id, project_root, "helper-bot", "helper-bot")
+        .await
+        .unwrap();
+    let _other_session = ctx
+        .db
+        .create_assistant_session(project_id, project_root, "other-bot", "other-bot")
+        .await
+        .unwrap();
+    let _plain_session = ctx
+        .db
+        .create_session(project_id, project_root, "Build")
+        .await
+        .unwrap();
+
+    // Filtered list: only "helper-bot" sessions.
+    let response = handle_request(
+        Request::ListSessions {
+            project_id: None,
+            parent_session_id: None,
+            assistant_id: Some("helper-bot".into()),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("list_sessions with assistant filter");
+    let sessions = match response {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("expected Sessions, got {other:?}"),
+    };
+    // Exactly one session, the helper-bot one.
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, helper_session.session_id);
+
+    // Unfiltered list: all three sessions.
+    let response = handle_request(
+        Request::ListSessions {
+            project_id: None,
+            parent_session_id: None,
+            assistant_id: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("list_sessions without filter");
+    let sessions = match response {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("expected Sessions, got {other:?}"),
+    };
+    assert_eq!(sessions.len(), 3);
+}
+
+#[tokio::test]
 async fn delete_live_session_timeout_leaves_row_intact() {
     let ctx = test_ctx();
     let mut state = MutableClientState::detached_for_test();
@@ -24150,24 +24287,18 @@ async fn delete_live_session_timeout_leaves_row_intact() {
         &ctx,
     )
     .await
-    .expect_err("hung worker should block delete");
+    .expect_err("active session must not be deleted");
 
-    assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    // v10: DeleteSession rejects an active session with a typed Conflict
+    // error instead of stop-and-delete. The session row remains.
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("is active; end it before deleting"));
     assert!(
         ctx.db
             .get_session(session.session_id)
             .await
             .unwrap()
             .is_some()
-    );
-    assert!(
-        ctx.registry
-            .active_session_ids()
-            .contains(&session.session_id)
     );
 }
 
@@ -24318,6 +24449,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
     let ctx_for_parent = ctx.clone();
     let parent_request = tokio::spawn(async move {
@@ -24381,6 +24513,7 @@ async fn btw_concurrent_with_parent_turn() {
         upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
+        negotiated_protocol_version: proto::PROTOCOL_VERSION,
     };
     let ctx_for_btw = ctx.clone();
     let btw_request = tokio::spawn(async move {
@@ -24553,13 +24686,12 @@ async fn cascaded_delete_timeout_stops_before_any_db_mutation() {
         &ctx,
     )
     .await
-    .expect_err("hung child should block cascaded delete");
+    .expect_err("active session must not be deleted");
 
-    assert_eq!(err.code, ErrorCode::Internal);
-    assert!(
-        err.message
-            .contains("refusing destructive session mutation")
-    );
+    // v10: DeleteSession rejects an active session with a typed Conflict
+    // error instead of stop-and-delete. Both rows remain.
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("is active; end it before deleting"));
     assert!(ctx.db.get_session(root.session_id).await.unwrap().is_some());
     assert!(
         ctx.db

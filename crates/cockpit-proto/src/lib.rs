@@ -2044,6 +2044,12 @@ pub struct LiveStatus {
     pub has_active_schedules: bool,
     /// A turn is in flight (between `ThinkingStarted` and `AgentIdle`).
     pub processing: bool,
+    /// v10-only: the session's canonical project root, so a `cockpit run
+    /// --session <id>` client can validate it matches `--cwd`/`--project`
+    /// before attaching. Absent for v9 clients (the field is a v10
+    /// extension on the existing v9 `session_live_status` response tag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
 }
 
 #[allow(unused_imports)]
@@ -2668,6 +2674,19 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "save_image_spend_policy" => 10,
                 _ => 9,
             };
+            // Extended v10-only shapes on existing v9 tags: the base tag
+            // remains v9-compatible, but the new optional field bumps the
+            // required version when present so a v9 envelope carrying the
+            // extended body is rejected by the gate.
+            if version == 9 {
+                if let Request::ListSessions {
+                    assistant_id: Some(_),
+                    ..
+                } = request
+                {
+                    return (10, tag);
+                }
+            }
             (version, tag)
         }
         Body::Response { response, .. } => {
@@ -2695,6 +2714,17 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "image_spend_policy_saved" => 10,
                 _ => 9,
             };
+            // Extended v10-only shapes on existing v9 response tags: the base
+            // tag remains v9-compatible, but the new optional field bumps the
+            // required version when present so a v9 envelope carrying the
+            // extended body is rejected by the gate.
+            if version == 9 {
+                if let Response::SessionLiveStatus { statuses } = &**response
+                    && statuses.iter().any(|status| status.project_root.is_some())
+                {
+                    return (10, tag);
+                }
+            }
             (version, tag)
         }
         Body::Event { event } => (9, event.wire_tag()),
@@ -4900,6 +4930,7 @@ mod tests {
                     session_id: a,
                     has_active_schedules: true,
                     processing: false,
+                    project_root: None,
                 }],
             },
         );
@@ -5779,6 +5810,69 @@ mod tests {
             receiver.recv().await.unwrap(),
             Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
         ));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_list_sessions_assistant_filter_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        // The base list_sessions tag is v9-compatible, but the
+        // assistant_id filter field is a v10-only extended shape.
+        let forged = Envelope {
+            v: 9,
+            body: Body::Request {
+                id,
+                operation: None,
+                request: Request::ListSessions {
+                    project_id: None,
+                    parent_session_id: None,
+                    assistant_id: Some("helper-bot".into()),
+                },
+            },
+        };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[test]
+    fn list_sessions_assistant_filter_requires_v10() {
+        // The base shape (assistant_id = None) is v9-compatible.
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                operation: None,
+                request: Request::ListSessions {
+                    project_id: None,
+                    parent_session_id: None,
+                    assistant_id: None,
+                },
+            })
+            .0,
+            9
+        );
+        // The extended shape (assistant_id = Some) requires v10.
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                operation: None,
+                request: Request::ListSessions {
+                    project_id: None,
+                    parent_session_id: None,
+                    assistant_id: Some("helper-bot".into()),
+                },
+            })
+            .0,
+            10
+        );
     }
 
     #[test]

@@ -609,7 +609,11 @@ const requestParamSchemas = {
     })
     .strict(),
   list_sessions: z
-    .object({ project_id: z.string().nullable().optional(), parent_session_id: optionalUuidSchema })
+    .object({
+      project_id: z.string().nullable().optional(),
+      parent_session_id: optionalUuidSchema,
+      assistant_id: z.string().nullable().optional(),
+    })
     .strict(),
   read_history_page: z
     .object({

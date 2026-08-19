@@ -1,39 +1,44 @@
 //! `cockpit stats` — the plain-text mirror of the `/stats` pane
-//! (GOALS §15f). A thin renderer over [`crate::db::stats::rollup`]; the
-//! roll-up layer in [`crate::db::stats`] owns every query so the TUI
+//! (GOALS §15f). A thin renderer over the daemon-owned `StatsRollup` RPC;
+//! the roll-up layer in [`crate::db::stats`] owns every query so the TUI
 //! pane consumes the same structured data.
 
-use anyhow::Result;
-use chrono::Utc;
+use anyhow::{Context, Result};
 
 use crate::cli::{StatsArgs, StatsFormat, StatsProjectScope, StatsRangeArg};
-use crate::db::Db;
-use crate::db::stats::{
-    self, LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope,
-    TokenSpend,
-};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response, StatsRange as ProtoStatsRange};
+use crate::db::stats::{LanguageSection, RecoverySection, StatsRollup, TokenSpend};
 use crate::session::project_id_for;
 
 pub async fn run(args: StatsArgs) -> Result<()> {
-    let db = Db::open_default()?;
-
-    let scope = match args.project_scope {
-        StatsProjectScope::All => StatsScope::All,
-        StatsProjectScope::Current => StatsScope::Project(resolve_current_project_id()?),
+    let project_id = match args.project_scope {
+        StatsProjectScope::All => None,
+        StatsProjectScope::Current => Some(resolve_current_project_id()?),
     };
     let range = match args.range {
-        StatsRangeArg::SevenDays => StatsRange::Last7Days,
-        StatsRangeArg::All => StatsRange::AllTime,
+        StatsRangeArg::SevenDays => ProtoStatsRange::Last7Days,
+        StatsRangeArg::All => ProtoStatsRange::AllTime,
     };
     let by_role = args.by_role;
-    let prices = PriceTable::load_default();
-    let now = Utc::now().timestamp();
 
-    // Heavy aggregate scan → run off the executor (the layer's docstring
-    // calls this out).
-    let rollup = db
-        .read(move |conn| stats::rollup(conn, &scope, range, &prices, by_role, now))
-        .await?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for stats rollup")?;
+    let response = daemon
+        .client
+        .request(Request::StatsRollup {
+            project_id,
+            range,
+            by_role,
+        })
+        .await
+        .context("requesting stats rollup from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected stats rollup request: {error}"))?;
+    let rollup = match response {
+        Response::StatsRollup { rollup } => rollup,
+        other => anyhow::bail!("daemon returned unexpected response to stats rollup: {other:?}"),
+    };
 
     match args.format {
         StatsFormat::Json => print_json(&rollup)?,

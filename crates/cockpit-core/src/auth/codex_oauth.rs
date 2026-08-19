@@ -149,6 +149,14 @@ pub async fn complete_device_code_login(login: DeviceLogin) -> Result<StoredToke
     Ok(tokens)
 }
 
+/// Complete the device flow without selecting a persistence backend.  CLI and
+/// TUI callers must use this variant and then send the returned record through
+/// the daemon owner RPC; the completion itself must never fail because a
+/// legacy local store is unavailable.
+pub async fn complete_device_code_login_unpersisted(login: DeviceLogin) -> Result<StoredTokens> {
+    complete_device_code_login_tokens(login).await
+}
+
 pub async fn complete_device_code_login_in(
     login: DeviceLogin,
     store: &mut CredentialStore,
@@ -353,6 +361,7 @@ fn oauth_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[cfg(test)]
@@ -377,7 +386,7 @@ impl StoredTokens {
 fn classify_token_error(status: StatusCode, body: &str) -> anyhow::Error {
     let lower = body.to_ascii_lowercase();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return anyhow!("OpenAI Codex OAuth token endpoint rate limited ({status}): {body}");
+        return anyhow!("OpenAI Codex OAuth token endpoint rate limited ({status})");
     }
     if status == StatusCode::UNAUTHORIZED
         || status == StatusCode::FORBIDDEN
@@ -389,7 +398,7 @@ fn classify_token_error(status: StatusCode, body: &str) -> anyhow::Error {
             "OpenAI Codex OAuth refresh rejected ({status}): invalid_grant, invalid_token, or refresh_token_reused"
         );
     }
-    anyhow!("OpenAI Codex OAuth endpoint failed ({status}): {body}")
+    anyhow!("OpenAI Codex OAuth endpoint failed ({status})")
 }
 
 fn is_terminal_refresh_error(e: &anyhow::Error) -> bool {
@@ -545,6 +554,18 @@ mod tests {
     fn rate_limit_is_transient_not_terminal() {
         let err = classify_token_error(StatusCode::TOO_MANY_REQUESTS, "slow");
         assert!(!is_terminal_refresh_error(&err));
+    }
+
+    #[test]
+    fn token_endpoint_error_does_not_echo_response_body() {
+        let err = classify_token_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider-secret-access-token-body",
+        );
+        assert!(
+            !err.to_string()
+                .contains("provider-secret-access-token-body")
+        );
     }
 
     #[test]

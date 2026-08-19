@@ -1,6 +1,6 @@
 //! Canonical outer request framing for durable remote-operation identity.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -349,6 +349,16 @@ macro_rules! canonical_struct {
 canonical_struct!(crate::EnvSnapshotWire, self, out, [source, digest, vars]);
 canonical_struct!(crate::ImageAttachmentRef, self, out, [id]);
 canonical_struct!(crate::TagExpansionMeta, self, out, [tool, path, detail, ok]);
+// Image-spend policy is a versioned, serde-deny-unknown-fields value owned by
+// cockpit-config. Encode its canonical JSON as one scalar rather than relying
+// on a map iteration order at this protocol boundary.
+impl CanonicalFcorValueV1 for cockpit_config::config::image_spend::ImageSpendSettings {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        serde_json::to_string(self)
+            .context("serializing image-spend settings for FCOR")?
+            .encode_fcor_value_v1(out)
+    }
+}
 impl CanonicalFcorValueV1 for cockpit_config::config::providers::ActiveReasoningEffort {
     fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
         self.validate().map_err(anyhow::Error::msg)?;
@@ -356,6 +366,29 @@ impl CanonicalFcorValueV1 for cockpit_config::config::providers::ActiveReasoning
         self.value.encode_fcor_value_v1(&mut nested)?;
         out.0.extend(nested.0);
         Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for cockpit_config::config::providers::OnUnlistedModelsFetch {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let code = match self {
+            Self::Keep => 1,
+            Self::Remove => 2,
+            Self::Ask => 3,
+        };
+        out.push_u8(code);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for cockpit_config::config::providers::ProviderEntry {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        // Provider configs are serde structs/maps whose canonical wire form is
+        // their compact JSON representation.  This is used only after request
+        // semantic validation rejects literal header values, so F-COR never
+        // serializes a provider secret into an operation record.
+        let encoded = serde_json::to_string(self).context("encoding provider entry for F-COR")?;
+        out.push_string(&encoded)
     }
 }
 impl CanonicalFcorValueV1 for crate::RunInvocationOptions {

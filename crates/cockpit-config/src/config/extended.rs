@@ -2473,6 +2473,36 @@ impl ExtendedConfigDoc {
         Ok(removed)
     }
 
+    /// Render the result of removing one raw path without writing it. The
+    /// daemon-owned settings writer uses this to preserve the document's
+    /// unknown fields while keeping the actual filesystem mutation outside
+    /// the TUI process.
+    pub fn remove_raw_path_rendered(&mut self, path: &[&str]) -> Result<(bool, String)> {
+        let _lock = crate::config::files::ConfigMutationLock::acquire(&self.path)?;
+        let mut current = Self::load(&self.path)?;
+        let removed = remove_raw_path(&mut current.raw, path);
+        let rendered = current.render_raw()?;
+        self.raw = current.raw;
+        Ok((removed, rendered))
+    }
+
+    /// Render a typed update while preserving unknown raw keys. The caller is
+    /// responsible for committing the returned document through its owner.
+    pub fn rendered(&self, cfg: &ExtendedConfig) -> Result<String> {
+        let originally_loaded = serde_json::to_value(self.config())
+            .context("serializing originally loaded extended config")?;
+        let mut current = Self::load(&self.path)?;
+        current.merge_config_raw(&originally_loaded, cfg)?;
+        current.render_raw()
+    }
+
+    fn render_raw(&self) -> Result<String> {
+        let mut raw = self.raw.clone();
+        strip_secret_store_key(&mut raw);
+        let pretty = serde_json::to_string_pretty(&raw).context("serializing config.json")?;
+        Ok(format!("{pretty}\n"))
+    }
+
     fn persist_raw_unlocked(&self) -> Result<()> {
         let mut raw = self.raw.clone();
         strip_secret_store_key(&mut raw);

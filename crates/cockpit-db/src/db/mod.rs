@@ -342,35 +342,6 @@ impl Db {
         apply_connection_pragmas(&conn, true)
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
-        // Pre-release recreate. Covers (1) pre-0.1.0 databases whose old
-        // squash used user_version > 1 with a 1-row ledger, and (2) DBs that
-        // still have the deleted 0002–0005 ledger *names* after this squash.
-        // A future ledger (including version 2 named `future`) still fails closed.
-        let ledger = current_schema_version(&conn)?;
-        let obsolete_pre_release =
-            sqlite_schema_version(&conn)? > MIGRATIONS.len() as i64 && ledger <= 1;
-        let folded_away_v2_ledger = is_folded_away_pre_squash_ledger(&conn)?;
-        if obsolete_pre_release || folded_away_v2_ledger {
-            drop(conn);
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let moved = path.with_extension(format!("pre-0.1.0-{stamp}.sqlite"));
-            std::fs::rename(path, &moved)
-                .with_context(|| format!("moving obsolete database to {}", moved.display()))?;
-            for suffix in ["-wal", "-shm"] {
-                let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
-                if sidecar.exists() {
-                    let _ = std::fs::rename(
-                        &sidecar,
-                        PathBuf::from(format!("{}{}", moved.display(), suffix)),
-                    );
-                }
-            }
-            tracing::warn!(old_path = %moved.display(), "recreated obsolete database automatically");
-            return Self::open(path);
-        }
         if existed_before_open {
             backup_before_pending_migration(&conn, path, MIGRATIONS.len())?;
         }
@@ -851,26 +822,6 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     Ok(())
 }
 
-fn upgrade_legacy_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    let mut names = Vec::new();
-    let mut stmt = conn.prepare("PRAGMA table_info(schema_version)")?;
-    for row in stmt.query_map([], |row| row.get::<_, String>(1))? {
-        names.push(row?);
-    }
-    for (column, kind) in [("name", "TEXT"), ("sha256", "TEXT"), ("applied_at", "TEXT")] {
-        if !names.iter().any(|name| name == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE schema_version ADD COLUMN {column} {kind}"
-            ))?;
-        }
-    }
-    for (index, migration) in migrations.iter().enumerate() {
-        let version = (index + 1) as i64;
-        conn.execute("UPDATE schema_version SET name=?2, sha256=?3, applied_at=COALESCE(applied_at, CURRENT_TIMESTAMP) WHERE version=?1 AND (name IS NULL OR sha256 IS NULL)", rusqlite::params![version, migration.name, migration_hash(migration.sql)])?;
-    }
-    Ok(())
-}
-
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
 ///
 /// Pending migration work runs with SQLite foreign-key enforcement
@@ -896,7 +847,6 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         )
         .context("creating schema_version table")?;
 
-        upgrade_legacy_ledger(conn, migrations)?;
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
 
@@ -959,38 +909,6 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
         |row| row.get(0),
     )
     .context("reading current schema version")
-}
-
-/// Deleted 0002–0005 files that were folded into `0001_initial.sql`.
-const FOLDED_AWAY_MIGRATION_NAMES: &[&str] = &[
-    "0002_goal_inference_provenance.sql",
-    "0003_media_resource_reservation_ledger.sql",
-    "0004_secret_vault.sql",
-    "0005_secret_vault_unification.sql",
-];
-
-/// True only when extra ledger rows are the known folded-away 0002–0005 files.
-/// A same-number future row (`2, 'future'`) must fail closed, not recreate.
-fn is_folded_away_pre_squash_ledger(conn: &Connection) -> Result<bool> {
-    if MIGRATIONS.len() != 1 || !table_exists(conn, "schema_version")? {
-        return Ok(false);
-    }
-    let ledger = current_schema_version(conn)?;
-    if !(2..=5).contains(&ledger) {
-        return Ok(false);
-    }
-    let mut stmt = conn
-        .prepare("SELECT name FROM schema_version WHERE version > 1")
-        .context("reading folded-away ledger names")?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("mapping folded-away ledger names")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("collecting folded-away ledger names")?;
-    Ok(!names.is_empty()
-        && names
-            .iter()
-            .all(|name| FOLDED_AWAY_MIGRATION_NAMES.contains(&name.as_str())))
 }
 
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
@@ -1172,53 +1090,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_squash_v2_ledger_is_recreated() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cockpit.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            migrate_with(&conn, MIGRATIONS).unwrap();
-            conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, applied_at)
-                 VALUES (5, '0005_secret_vault_unification.sql', 'folded', 'now')",
-                [],
-            )
-            .unwrap();
-            conn.pragma_update(None, "user_version", 5_i64).unwrap();
-        }
-        let db = Db::open(&path).unwrap();
-        drop(db);
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 1);
-        drop(conn);
-        assert!(
-            temp.path()
-                .read_dir()
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0"))
-        );
-    }
-
-    #[test]
-    fn pre_reset_database_is_recreated_and_old_path_reported() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cockpit.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 9_i64).unwrap();
-        drop(conn);
-        let db = Db::open(&path).unwrap();
-        drop(db);
-        assert!(
-            temp.path()
-                .read_dir()
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0"))
-        );
-    }
-
-    #[test]
     fn backup_failure_aborts_migration() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_test_with(
@@ -1304,10 +1175,9 @@ mod tests {
         assert!(error.to_string().contains("0001_initial.sql"));
     }
 
-    /// Pre-release DBs are recreated. The old 0003 append-only upgrade
-    /// onto a v2 (0001+0002) database is rejected. Applying only 0001
-    /// must create the media reservation ledger; an ALTER-only leftover
-    /// in a later file would fail this 0001-only apply.
+    /// The folded schema is the only schema definition. Applying only 0001
+    /// must create the media reservation ledger; there is no runtime ALTER
+    /// path for an older ledger.
     #[test]
     fn media_ledger_is_an_append_only_upgrade_for_existing_v2_databases() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1330,6 +1200,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger, "media_reservation_state_graph");
+    }
+
+    #[test]
+    fn legacy_schema_ledger_without_checksum_columns_fails_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             INSERT INTO schema_version (version) VALUES (1);",
+        )
+        .unwrap();
+
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(
+            error.contains("no such column") || error.contains("schema_version"),
+            "legacy schema must be rejected without ALTER/checksum repair: {error}"
+        );
+        let columns = conn
+            .prepare("PRAGMA table_info(schema_version)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, vec!["version"]);
     }
 
     #[test]
@@ -2004,17 +1898,26 @@ mod tests {
     fn migration_waits_for_lock_then_skips_already_applied_versions() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("migrate-wait.db");
+        // The ledger is checksum-backed: `schema_version` records the name and
+        // sha256 of each applied migration, and `verify_ledger` reads those
+        // columns. Seed version 1 in that current shape (matching the name the
+        // test runner assigns and the hash of its SQL) so the second migrator
+        // recognizes it as already applied and skips it rather than re-running
+        // `CREATE TABLE migration_probe`.
+        const PROBE_SQL: &str = "CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);";
+        let probe_hash = migration_hash(PROBE_SQL);
         let conn_a = Connection::open(&path).unwrap();
         apply_connection_pragmas(&conn_a, true).unwrap();
         conn_a
-            .execute_batch(
+            .execute_batch(&format!(
                 r#"
                 BEGIN IMMEDIATE;
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);
                 CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);
-                INSERT INTO schema_version (version) VALUES (1);
+                INSERT INTO schema_version (version, name, sha256, applied_at)
+                    VALUES (1, '0001_test.sql', '{probe_hash}', CURRENT_TIMESTAMP);
                 "#,
-            )
+            ))
             .unwrap();
 
         let path_for_thread = path.clone();
@@ -2023,10 +1926,7 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let conn_b = Connection::open(path_for_thread).unwrap();
             apply_connection_pragmas(&conn_b, true).unwrap();
-            let result = migrate_test_with(
-                &conn_b,
-                &["CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);"],
-            );
+            let result = migrate_test_with(&conn_b, &[PROBE_SQL]);
             tx.send((started.elapsed(), result)).unwrap();
         });
 

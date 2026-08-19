@@ -959,7 +959,7 @@ pub fn validate_provider_headers(
     let mut names = std::collections::BTreeSet::new();
     for header in headers {
         let normalized = header.name.to_ascii_lowercase();
-        if !names.insert(normalized)
+        if !names.insert(normalized.clone())
             || reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
             || reqwest::header::HeaderValue::from_str(&header.value).is_err()
         {
@@ -967,6 +967,63 @@ pub fn validate_provider_headers(
         }
     }
     Ok(())
+}
+
+/// Header names are user-controlled and cannot decide whether a value is
+/// sensitive. Only a small set of protocol metadata headers may contain
+/// literals; every other non-empty value must be a structurally valid deferred
+/// reference (optionally prefixed by a conventional auth scheme). This keeps
+/// a custom `x-auth` header from bypassing the protection used by
+/// `Authorization` and `x-api-key`.
+pub fn is_safe_provider_header_reference(name: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    // These fields are public protocol metadata, so a conventional literal is
+    // useful and safe (for example `anthropic-version: 2023-06-01`).  A `$`
+    // is never just waved through, though: config interpolation only expands
+    // whole deferred references, and accepting arbitrary dollar-containing
+    // text here would create a second, weaker header grammar.
+    let public_metadata = matches!(
+        name,
+        "accept" | "content-type" | "user-agent" | "anthropic-version" | "x-goog-api-client"
+    );
+    if public_metadata && !value.contains('$') {
+        return true;
+    }
+    let reference = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .or_else(|| value.strip_prefix("Token "))
+        .or_else(|| value.strip_prefix("token "))
+        .or_else(|| value.strip_prefix("Basic "))
+        .or_else(|| value.strip_prefix("basic "))
+        .unwrap_or(value)
+        .trim();
+    valid_header_reference(reference)
+}
+
+fn valid_header_reference(value: &str) -> bool {
+    if let Some(name) = value.strip_prefix("$secret:") {
+        return !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+    }
+    if let Some(name) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return valid_env_name(name);
+    }
+    value.strip_prefix('$').is_some_and(valid_env_name)
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -265,6 +265,81 @@ pub enum Response {
         server_url: String,
     },
     FlycockpitNotLoggedIn,
+    FlycockpitOrgSync {
+        outcome: crate::FlycockpitOrgSyncOutcome,
+    },
+    SecretInventory {
+        entries: Vec<SecretInventoryEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    FlycockpitAccount {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<FlycockpitAccountView>,
+    },
+    /// Owner-only instructions for a daemon-owned provider OAuth flow. The
+    /// `authorize_url` is the provider's authorization endpoint the owner opens
+    /// to authorize; by OAuth necessity it carries the flow's `state`/CSRF
+    /// parameter (and any PKCE challenge), which is not a secret. It NEVER
+    /// carries access/refresh tokens, an authorization code, or any credential
+    /// secret.
+    #[serde(rename = "provider_oauth_started")]
+    ProviderOAuthStarted {
+        flow_id: String,
+        authorize_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
+    },
+    /// Completion/poll result for a daemon-owned provider OAuth flow.
+    #[serde(rename = "provider_oauth_completed")]
+    ProviderOAuthCompleted {
+        logged_in: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u64>,
+    },
+    /// Owner-only instructions for a daemon-owned MCP OAuth flow. The
+    /// `authorize_url` is the authorization endpoint the owner opens; by OAuth
+    /// necessity it carries the flow's `state`/CSRF parameter (and any PKCE
+    /// challenge), which is not a secret. It NEVER carries an access/refresh
+    /// token, an authorization/callback code, or any credential secret.
+    #[serde(rename = "mcp_oauth_started")]
+    McpOAuthStarted {
+        flow_id: String,
+        authorize_url: String,
+    },
+    /// Completion result for a daemon-owned MCP OAuth flow.
+    #[serde(rename = "mcp_oauth_completed")]
+    McpOAuthCompleted {
+        authenticated: bool,
+    },
+    #[serde(rename = "mcp_oauth_cancelled")]
+    McpOAuthCancelled {
+        cancelled: bool,
+    },
+    /// Authoritative result of an MCP config publication. Credential refs are
+    /// intentionally omitted; clients refresh their redacted view/inventory.
+    McpConfigSaved {
+        credential_count: u32,
+    },
+    ProviderCatalogSnapshot {
+        config: ProviderConfigView,
+    },
+    ProviderModelsFetched {
+        results: Vec<ProviderModelFetchResult>,
+        config: ProviderConfigView,
+    },
+    ProviderUsageSnapshot {
+        snapshots: Vec<ProviderUsageSnapshotView>,
+    },
+    ProviderConfigUpserted {
+        config: ProviderConfigView,
+    },
+    /// Result of deleting a provider credential. `found` reports whether the
+    /// authorized OAuth record existed; `deleted` reports the mutation.
+    ProviderCredentialDeleted {
+        found: bool,
+        deleted: bool,
+    },
     StartupDisclosures {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         org_sync: Option<OrgSyncDisclosure>,
@@ -422,6 +497,38 @@ pub enum Response {
 
     FsWrite {
         hash: String,
+    },
+
+    /// Result of a daemon-owned extended config mutation. The target path is
+    /// intentionally not echoed; callers only receive the committed content
+    /// hash and can reload their own safe view.
+    ExtendedConfigSaved {
+        hash: String,
+    },
+
+    /// Safe outcome of a daemon-owned setup wizard mutation.
+    SetupWizardApplied {
+        changed: bool,
+        model_file_written: bool,
+        default_scope: Option<String>,
+    },
+
+    PolicyExported {
+        bundle_json: String,
+    },
+
+    PolicyImported {
+        target: String,
+        provider_count: u32,
+    },
+
+    ImageSpendPolicy {
+        settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
+        policy_version: Option<u64>,
+    },
+
+    ImageSpendPolicySaved {
+        policy_version: u64,
     },
 
     GitStatus {
@@ -846,6 +953,20 @@ macro_rules! response_variants {
             (Response::FlycockpitAlreadyLoggedIn { .. }, "flycockpit_already_logged_in");
             (Response::FlycockpitCleared { .. }, "flycockpit_cleared");
             (Response::FlycockpitNotLoggedIn, "flycockpit_not_logged_in");
+            (Response::FlycockpitOrgSync { .. }, "flycockpit_org_sync");
+            (Response::SecretInventory { .. }, "secret_inventory");
+            (Response::FlycockpitAccount { .. }, "flycockpit_account");
+            (Response::ProviderOAuthStarted { .. }, "provider_oauth_started");
+            (Response::ProviderOAuthCompleted { .. }, "provider_oauth_completed");
+            (Response::McpOAuthStarted { .. }, "mcp_oauth_started");
+            (Response::McpOAuthCompleted { .. }, "mcp_oauth_completed");
+            (Response::McpOAuthCancelled { .. }, "mcp_oauth_cancelled");
+            (Response::McpConfigSaved { .. }, "mcp_config_saved");
+            (Response::ProviderCatalogSnapshot { .. }, "provider_catalog_snapshot");
+            (Response::ProviderModelsFetched { .. }, "provider_models_fetched");
+            (Response::ProviderUsageSnapshot { .. }, "provider_usage_snapshot");
+            (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");
+            (Response::ProviderCredentialDeleted { .. }, "provider_credential_deleted");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");
@@ -873,6 +994,12 @@ macro_rules! response_variants {
             (Response::FsStat { .. }, "fs_stat");
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
+            (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
+            (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
+            (Response::PolicyExported { .. }, "policy_exported");
+            (Response::PolicyImported { .. }, "policy_imported");
+            (Response::ImageSpendPolicy { .. }, "image_spend_policy");
+            (Response::ImageSpendPolicySaved { .. }, "image_spend_policy_saved");
             (Response::GitStatus { .. }, "git_status");
             (Response::GitDiffFile { .. }, "git_diff_file");
             (Response::TerminalOpened { .. }, "terminal_opened");
@@ -915,6 +1042,26 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_oauth_wire_responses_are_opaque_to_tokens() {
+        let started = serde_json::to_string(&Response::McpOAuthStarted {
+            flow_id: "flow-opaque".into(),
+            authorize_url: "https://auth.example.test/authorize?state=daemon-state".into(),
+        })
+        .unwrap();
+        assert!(started.contains("flow-opaque"));
+        assert!(!started.contains("access_token"));
+        assert!(!started.contains("refresh_token"));
+
+        let completed = serde_json::to_value(Response::McpOAuthCompleted {
+            authenticated: true,
+        })
+        .unwrap();
+        assert_eq!(completed["response"], "mcp_oauth_completed");
+        assert_eq!(completed["data"]["authenticated"], true);
+        assert!(completed.to_string().find("token").is_none());
+    }
     use serde_json::json;
 
     /// `ExportSessionData` must reference a bulk transfer, not embed the export.

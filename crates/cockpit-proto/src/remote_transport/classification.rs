@@ -793,6 +793,168 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "set_flycockpit_connector_enabled",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sync_flycockpit_org_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "enroll_flycockpit_org_sync",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "list_secret_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "put_named_secret",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "put_subscription_ack",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "delete_named_secret",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "put_provider_credential",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "delete_provider_credential",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_flycockpit_account",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_provider_catalog_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "fetch_provider_models",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_provider_usage_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "upsert_provider_config",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "save_provider_config",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    // Composite MCP publication reserves the owner remote ledger before
+    // dispatch; its staged vault/config journal supplies nonrepeatable
+    // recovery evidence. It remains bounded because the request carries
+    // credential-bearing JSON.
+    row(
+        "save_mcp_config",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    // OAuth flows are process-local state (`request.rs` marks every one
+    // `local_only`), but they remain wire variants and therefore need a
+    // bounded lane classification for exhaustive decoding.  This table never
+    // grants remote eligibility.
+    row(
+        "begin_provider_oauth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "complete_provider_oauth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "begin_mcp_oauth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "complete_mcp_oauth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "cancel_mcp_oauth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "delete_provider_config",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "set_provider_layer_metadata",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    // Setup/copilot, wizard-apply, extended-config, policy import/export, and
+    // image-spend policy are `local_only` in `request.rs` (they never gain
+    // remote eligibility here), but they remain wire variants and so need a
+    // bounded lane classification for exhaustive decoding.
+    row(
+        "setup_copilot_auth",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "apply_setup_wizard",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "save_extended_config",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "export_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "import_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_image_spend_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "save_image_spend_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "daemon_status",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
@@ -1377,6 +1539,108 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "flycockpit_org_sync",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "secret_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "flycockpit_account",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_catalog_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_models_fetched",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_usage_snapshot",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_config_upserted",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    // Owner-remoted settings/policy/mcp mutation acknowledgements. Bounded
+    // status responses; they never carry secret bytes.
+    row(
+        "provider_credential_deleted",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mcp_config_saved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "extended_config_saved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "setup_wizard_applied",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "policy_exported",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "policy_imported",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_spend_policy",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_spend_policy_saved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_oauth_started",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_oauth_completed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mcp_oauth_started",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mcp_oauth_completed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mcp_oauth_cancelled",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "startup_disclosures",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1851,7 +2115,9 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Request, "set_goal_settings_override"),
     (RemoteMessageKind::Request, "pin"),
     (RemoteMessageKind::Request, "refresh_env"),
+    (RemoteMessageKind::Request, "list_secret_inventory"),
     (RemoteMessageKind::Request, "append_media_upload_chunk"),
+    (RemoteMessageKind::Response, "secret_inventory"),
     (RemoteMessageKind::Response, "user_message_queued"),
     (
         RemoteMessageKind::Response,
@@ -2047,8 +2313,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 145);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 98);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 175);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 118);
         assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }
 
@@ -2104,7 +2370,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 69);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 71);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

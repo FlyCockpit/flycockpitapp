@@ -4,3 +4,11 @@
 # per-bundle knowledge sidecar vector storage/query; disable only the missing
 # optional DiskANN compile path so the native extension links consistently.
 CFLAGS = { value = "-DSQLITE_VEC_ENABLE_DISKANN=0 -DSQLITE_VEC_ENABLE_RESCORE=0", force = true }
+# Debug (unoptimized) test builds keep every local of the large async daemon
+# dispatch state machine live on the frame, and the owner-secret write path
+# rebuilds the daemon redaction table (AEAD-decrypting vault items with wide
+# SIMD frames) synchronously beneath tokio's block_on. That finite-but-deep
+# chain overflows the 2 MiB default test-thread stack on some hosts (SIGABRT).
+# Raise the floor so these deterministic-in-debug frames fit; release builds
+# are unaffected. Not forced, so a developer/CI may still raise it further.
+RUST_MIN_STACK = "16777216"

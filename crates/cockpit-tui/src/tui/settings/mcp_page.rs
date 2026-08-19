@@ -1,7 +1,8 @@
 //! `/settings → MCP` page (GOALS §18a).
 //!
-//! Edits the sibling `mcp.json` in the same `.cockpit/` directory as the
-//! settings dialog's `config.json`. Two views:
+//! Edits the daemon-owned sibling `mcp.json` in the same `.cockpit/` directory
+//! as the settings dialog's `config.json`. The page consumes a daemon-redacted
+//! snapshot and submits mutations through the daemon. Two views:
 //!   - **List**: every configured server with transport, enabled, and auth
 //!     status, color-coded (green = ready + enabled, yellow = ready + not
 //!     enabled, red = needs auth + not authed). Per-server actions: toggle
@@ -42,6 +43,18 @@ pub(super) struct ListState {
     /// Two-step delete confirm: armed by the first `d`, applied by the
     /// second on the same row.
     pub(super) delete_pending: bool,
+    /// In-progress daemon-owned OAuth handshake. Keeping this in the list
+    /// page lets SSH/headless users see the authorize URL and paste a
+    /// callback without exposing any token or PKCE state.
+    pub(super) oauth: Option<McpOAuthState>,
+}
+
+pub(super) struct McpOAuthState {
+    pub(super) server: String,
+    pub(super) flow_id: String,
+    pub(super) authorize_url: String,
+    pub(super) callback: TextField,
+    pub(super) status: Option<String>,
 }
 
 pub(super) struct AddState {
@@ -240,18 +253,9 @@ fn lifecycle(name: &str, s: &ServerConfig) -> ServerLifecycle {
                 ServerLifecycle::Ready
             }
         }
-        Auth::Oauth(_) => {
-            // OAuth is ready iff a token is stored for `mcp:<name>`.
-            let stored = crate::tui::settings::cockpit_credential_store()
-                .ok()
-                .and_then(|store| store.get(&cockpit_core::mcp::auth::cred_key(name)).cloned())
-                .is_some();
-            if stored {
-                ServerLifecycle::Ready
-            } else {
-                ServerLifecycle::NeedsAuth
-            }
-        }
+        // The renderer supplies the cached OAuth answer below.  The pure
+        // fallback remains conservative for non-render callers and tests.
+        Auth::Oauth(_) => ServerLifecycle::NeedsAuth,
     }
 }
 
@@ -261,6 +265,44 @@ fn lifecycle_label(name: &str, s: &ServerConfig) -> &'static str {
         ServerLifecycle::NeedsAuth => "needs_auth",
         ServerLifecycle::Ready => "ready",
         ServerLifecycle::Error => "error",
+    }
+}
+
+fn cached_lifecycle(cx: &SettingsCx, name: &str, s: &ServerConfig) -> ServerLifecycle {
+    if !matches!(s.auth, Auth::Oauth(_)) {
+        return lifecycle(name, s);
+    }
+    if s.validate_transport_auth(name).is_err() {
+        return ServerLifecycle::Error;
+    }
+    if !s.enabled {
+        return ServerLifecycle::DisabledDraft;
+    }
+    let key = cockpit_core::mcp::auth::cred_key(name);
+    if cx
+        .cached_secret_inventory_contains(&key, None)
+        .unwrap_or(false)
+    {
+        ServerLifecycle::Ready
+    } else {
+        ServerLifecycle::NeedsAuth
+    }
+}
+
+fn cached_lifecycle_label(cx: &SettingsCx, name: &str, s: &ServerConfig) -> &'static str {
+    match cached_lifecycle(cx, name, s) {
+        ServerLifecycle::DisabledDraft => "disabled/draft",
+        ServerLifecycle::NeedsAuth => "needs_auth",
+        ServerLifecycle::Ready => "ready",
+        ServerLifecycle::Error => "error",
+    }
+}
+
+fn cached_row_color(cx: &SettingsCx, name: &str, s: &ServerConfig) -> Color {
+    match cached_lifecycle(cx, name, s) {
+        ServerLifecycle::Error | ServerLifecycle::NeedsAuth => Color::Red,
+        ServerLifecycle::Ready => Color::Green,
+        ServerLifecycle::DisabledDraft => Color::Yellow,
     }
 }
 
@@ -275,30 +317,124 @@ pub(crate) fn row_color(name: &str, s: &ServerConfig) -> Color {
 }
 
 impl SettingsCx {
-    /// The path to the sibling `mcp.json` (same dir as `config.json`).
-    pub(super) fn mcp_path(&self) -> std::path::PathBuf {
-        self.config_path
-            .parent()
-            .map(|p| p.join("mcp.json"))
-            .unwrap_or_else(|| std::path::PathBuf::from("mcp.json"))
-    }
-
+    /// Return the daemon-redacted MCP snapshot cached when the settings
+    /// session opened. Disk reads belong to the daemon owner boundary.
     pub(super) fn load_mcp(&self) -> McpConfig {
-        std::fs::read_to_string(self.mcp_path())
-            .ok()
-            .and_then(|raw| McpConfig::parse(&raw).ok())
-            .unwrap_or_default()
+        self.mcp_config.clone()
     }
 
-    fn save_mcp(&self, cfg: &McpConfig) -> Result<(), String> {
-        let path = self.mcp_path();
-        cfg.write_private(&path).map_err(|e| e.to_string())
+    fn save_mcp(
+        &mut self,
+        cfg: &McpConfig,
+        secret_values: &BTreeMap<String, String>,
+        cleanup_names: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let project_root = self
+            .active_project_root
+            .clone()
+            .or_else(|| self.config_path.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config_json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+        let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
+        let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = crate::tui::settings::settings_daemon_client()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match client
+                    .request(cockpit_core::daemon::proto::Request::SaveMcpConfig {
+                        project_root: project_root.display().to_string(),
+                        config_json,
+                        secret_values_json,
+                        cleanup_names_json,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::McpConfigSaved { .. }) => Ok(()),
+                    Ok(other) => Err(format!(
+                        "daemon returned unexpected MCP save response: {other:?}"
+                    )),
+                    Err(error) => Err(format!("daemon rejected MCP config save: {error}")),
+                }
+            })
+        });
+        if result.is_ok() {
+            self.invalidate_secret_inventory();
+            self.mcp_config = cfg.clone();
+        }
+        result
     }
 
     fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
         let cfg = self.load_mcp();
         let names: Vec<String> = cfg.servers.keys().cloned().collect();
         let row_count = names.len() + 1; // + [+ add server]
+        if s.oauth.is_some() {
+            let mut flow = s.oauth.take().expect("MCP OAuth state present");
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    let flow_id = flow.flow_id.clone();
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let client = crate::tui::settings::settings_daemon_client().await?;
+                            client
+                                .request(cockpit_core::daemon::proto::Request::CancelMcpOAuth {
+                                    flow_id,
+                                })
+                                .await?
+                                .map_err(|error| anyhow::anyhow!(error))
+                        })
+                    });
+                    s.status = Some(match result {
+                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCancelled {
+                            cancelled: true,
+                        }) => format!("cancelled MCP OAuth for `{}`", flow.server),
+                        Ok(_) => "MCP OAuth cancelled".into(),
+                        Err(error) => format!("OAuth cancellation failed: {error}"),
+                    });
+                }
+                KeyCode::Enter => {
+                    let input = flow.callback.text().trim().to_string();
+                    if input.is_empty() {
+                        flow.status = Some(
+                            "paste the callback URL or authorization code, then press Enter".into(),
+                        );
+                        s.oauth = Some(flow);
+                        return Nav::Stay;
+                    }
+                    let flow_id = flow.flow_id.clone();
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let client = crate::tui::settings::settings_daemon_client().await?;
+                            client
+                                .request(cockpit_core::daemon::proto::Request::CompleteMcpOAuth {
+                                    flow_id,
+                                    input: Some(input),
+                                })
+                                .await?
+                                .map_err(|error| anyhow::anyhow!(error))
+                        })
+                    });
+                    s.status = Some(match result {
+                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCompleted {
+                            authenticated: true,
+                        }) => {
+                            self.invalidate_secret_inventory();
+                            format!("authenticated `{}`", flow.server)
+                        }
+                        Ok(other) => format!("unexpected MCP OAuth response: {other:?}"),
+                        Err(error) => format!("auth failed: {error}"),
+                    });
+                }
+                _ => {
+                    flow.callback.handle_key(key);
+                    s.oauth = Some(flow);
+                }
+            }
+            return Nav::Stay;
+        }
         match key.code {
             KeyCode::Char('q') => return Nav::Close,
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
@@ -332,28 +468,61 @@ impl SettingsCx {
                     if let Some(server) = cfg.servers.get_mut(name) {
                         server.enabled = !server.enabled;
                     }
-                    s.status = save_status(self.save_mcp(&cfg));
+                    s.status = save_status(self.save_mcp(&cfg, &BTreeMap::new(), &BTreeSet::new()));
                 }
             }
             KeyCode::Char('a') => {
-                // Authenticate (OAuth servers only). Runs the flow inline.
+                // Authenticate (OAuth servers only). The daemon owns the
+                // browser callback, PKCE verifier, exchange, and vault write;
+                // the TUI only forwards begin/complete requests.
                 if let Some(name) = names.get(s.cursor)
                     && let Some(server) = cfg.servers.get(name)
                 {
                     if matches!(server.auth, Auth::Oauth(_)) {
                         let name = name.clone();
-                        let server = server.clone();
+                        let project_root = self
+                            .active_project_root
+                            .clone()
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
                         let res = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
-                                let mut store = crate::tui::settings::cockpit_credential_store()?;
-                                cockpit_core::mcp::auth::run_oauth_flow(&name, &server, &mut store)
-                                    .await
+                                let client = crate::tui::settings::settings_daemon_client().await?;
+                                let started = client
+                                    .request(cockpit_core::daemon::proto::Request::BeginMcpOAuth {
+                                        project_root: project_root.display().to_string(),
+                                        server: name.clone(),
+                                    })
+                                    .await?
+                                    .map_err(|error| anyhow::anyhow!(error))?;
+                                let cockpit_core::daemon::proto::Response::McpOAuthStarted {
+                                    flow_id,
+                                    authorize_url,
+                                } = started
+                                else {
+                                    anyhow::bail!(
+                                        "daemon returned unexpected MCP OAuth start response"
+                                    );
+                                };
+                                Ok((flow_id, authorize_url))
                             })
                         });
-                        s.status = Some(match res {
-                            Ok(_) => format!("authenticated `{name}`"),
-                            Err(e) => format!("auth failed: {e}"),
-                        });
+                        match res {
+                            Ok((flow_id, authorize_url)) => {
+                                s.oauth = Some(McpOAuthState {
+                                    server: name,
+                                    flow_id,
+                                    authorize_url,
+                                    callback: TextField::default(),
+                                    status: None,
+                                });
+                                s.status = Some(
+                                    "open the authorize URL, then paste the callback or code below"
+                                        .into(),
+                                );
+                            }
+                            Err(e) => s.status = Some(format!("auth failed: {e}")),
+                        }
                     } else {
                         s.status = Some("server uses no OAuth — nothing to authenticate".into());
                     }
@@ -363,14 +532,17 @@ impl SettingsCx {
                 if let Some(name) = names.get(s.cursor) {
                     if s.delete_pending {
                         let mut cfg = cfg;
-                        if let Some(old) = cfg.servers.remove(name) {
-                            let _ = remove_credential_refs(&credential_refs(name, &old));
-                        }
+                        let cleanup = cfg
+                            .servers
+                            .get(name)
+                            .map(|old| credential_refs(name, old))
+                            .unwrap_or_default();
+                        cfg.servers.remove(name);
                         s.delete_pending = false;
                         if s.cursor > 0 {
                             s.cursor -= 1;
                         }
-                        s.status = save_status(self.save_mcp(&cfg));
+                        s.status = save_status(self.save_mcp(&cfg, &BTreeMap::new(), &cleanup));
                     } else {
                         s.delete_pending = true;
                         s.status = Some(format!("press d again to delete `{name}`"));
@@ -390,6 +562,7 @@ impl SettingsCx {
                     cursor: 0,
                     status: None,
                     delete_pending: false,
+                    oauth: None,
                 })));
             }
             KeyCode::Up => s.cursor = crate::tui::nav::wrap_prev(s.cursor, ADD_FIELDS),
@@ -449,7 +622,7 @@ impl SettingsCx {
                     .map(|old| credential_refs(old_name, old))
             })
             .unwrap_or_default();
-        let (server, new_refs) = match build_server_from_editor(&name, s) {
+        let (server, new_refs, secret_values) = match build_server_from_editor(&name, s) {
             Ok(pair) => pair,
             Err(e) => {
                 s.status = Some(e);
@@ -462,11 +635,11 @@ impl SettingsCx {
             cfg.servers.remove(original);
         }
         cfg.servers.insert(name.clone(), server);
-        if let Err(e) = reconcile_credential_refs(&old_refs, &new_refs) {
-            s.status = Some(format!("credential cleanup failed: {e}"));
-            return Nav::Stay;
-        }
-        match self.save_mcp(&cfg) {
+        let stale_refs = old_refs
+            .difference(&new_refs)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        match self.save_mcp(&cfg, &secret_values, &stale_refs) {
             Ok(()) => Nav::Replace(super::mcp_page(McpPage::List(ListState {
                 cursor: 0,
                 status: Some(if s.original_name.is_some() {
@@ -475,6 +648,7 @@ impl SettingsCx {
                     format!("added `{name}`")
                 }),
                 delete_pending: false,
+                oauth: None,
             }))),
             Err(e) => {
                 s.status = Some(format!("save failed: {e}"));
@@ -503,7 +677,7 @@ impl SettingsCx {
         let names: Vec<&String> = cfg.servers.keys().collect();
         for (i, name) in names.iter().enumerate() {
             let server = &cfg.servers[*name];
-            let color = row_color(name, server);
+            let color = cached_row_color(self, name, server);
             let marker = marker(i == s.cursor);
             let text = format!(
                 "{marker}{name}  {}  {}  auth={}  {}",
@@ -514,7 +688,7 @@ impl SettingsCx {
                     "disabled"
                 },
                 server.auth.kind_str(),
-                lifecycle_label(name, server),
+                cached_lifecycle_label(self, name, server),
             );
             bindings.push((
                 lines.len(),
@@ -589,6 +763,26 @@ impl SettingsCx {
                 status.clone(),
                 Style::default().add_modifier(Modifier::ITALIC),
             )));
+        }
+        if let Some(flow) = &s.oauth {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("OAuth for `{}` — open this URL:", flow.server),
+                warning_style(),
+            )));
+            lines.push(Line::from(flow.authorize_url.clone()));
+            lines.push(Line::from(Span::styled(
+                "Paste the callback URL or authorization code:",
+                muted_style(),
+            )));
+            lines.push(Line::from(format!("> {}", flow.callback.text())));
+            lines.push(Line::from(Span::styled(
+                "Enter: complete   Esc: cancel",
+                muted_style(),
+            )));
+            if let Some(status) = &flow.status {
+                lines.push(Line::from(Span::styled(status.clone(), error_style())));
+            }
         }
         let selected_line = selected_line_from_marker(&lines);
         self.scroll_states.render_bound_lines(
@@ -978,10 +1172,11 @@ pub(super) fn paste_into_add_state(s: &mut AddState, text: &str) {
     }
 }
 
-fn build_server_from_editor(
-    name: &str,
-    s: &AddState,
-) -> Result<(ServerConfig, BTreeSet<String>), String> {
+/// A server built from the editor: its config, the set of credential
+/// references it declares, and the staged secret values keyed by reference.
+type BuiltServerFromEditor = (ServerConfig, BTreeSet<String>, BTreeMap<String, String>);
+
+fn build_server_from_editor(name: &str, s: &AddState) -> Result<BuiltServerFromEditor, String> {
     if !s.auth.is_compatible(s.transport) {
         return Err("auth mode is incompatible with transport".into());
     }
@@ -993,12 +1188,14 @@ fn build_server_from_editor(
     let command = nonempty_option(s.command.text());
     let args = split_words(s.args.text());
     let mut credential_refs = BTreeSet::new();
+    let mut secret_values = BTreeMap::new();
     let (env, env_credential_refs) = split_secret_pairs(
         name,
         s.base_env.text(),
         &s.stored_base_env_refs,
         cockpit_core::mcp::auth::base_env_cred_key,
         &mut credential_refs,
+        &mut secret_values,
     )?;
     let auth = match s.auth {
         AuthKind::None => Auth::None,
@@ -1021,14 +1218,14 @@ fn build_server_from_editor(
                     }
                     None => {
                         let key = cockpit_core::mcp::auth::header_cred_key(name);
-                        store_secret(&key, value).map_err(|e| e.to_string())?;
+                        secret_values.insert(key.clone(), value.to_string());
                         credential_refs.insert(key.clone());
                         Some(key)
                     }
                 }
             } else {
                 let key = cockpit_core::mcp::auth::header_cred_key(name);
-                store_secret(&key, value).map_err(|e| e.to_string())?;
+                secret_values.insert(key.clone(), value.to_string());
                 credential_refs.insert(key.clone());
                 Some(key)
             };
@@ -1049,6 +1246,7 @@ fn build_server_from_editor(
                 &s.stored_auth_env_refs,
                 cockpit_core::mcp::auth::auth_env_cred_key,
                 &mut credential_refs,
+                &mut secret_values,
             )?;
             if vars.is_empty() && credential_refs_map.is_empty() {
                 return Err("at least one auth env mapping is required for env auth".into());
@@ -1096,7 +1294,7 @@ fn build_server_from_editor(
     server
         .validate_transport_auth(name)
         .map_err(|e| e.to_string())?;
-    Ok((server, credential_refs))
+    Ok((server, credential_refs, secret_values))
 }
 
 fn parse_required_u64(raw: &str, label: &str) -> Result<u64, String> {
@@ -1150,6 +1348,7 @@ fn split_secret_pairs(
     existing_refs: &BTreeMap<String, String>,
     key_fn: fn(&str, &str) -> String,
     refs: &mut BTreeSet<String>,
+    secret_values: &mut BTreeMap<String, String>,
 ) -> Result<EnvMaps, String> {
     let pairs = parse_pairs(raw)?;
     let mut plain = BTreeMap::new();
@@ -1163,13 +1362,13 @@ fn split_secret_pairs(
                 credential_refs.insert(key, credential_ref.clone());
             } else {
                 let credential_ref = key_fn(server, &key);
-                store_secret(&credential_ref, &value).map_err(|e| e.to_string())?;
+                secret_values.insert(credential_ref.clone(), value.clone());
                 refs.insert(credential_ref.clone());
                 credential_refs.insert(key, credential_ref);
             }
         } else {
             let credential_ref = key_fn(server, &key);
-            store_secret(&credential_ref, &value).map_err(|e| e.to_string())?;
+            secret_values.insert(credential_ref.clone(), value.clone());
             refs.insert(credential_ref.clone());
             credential_refs.insert(key, credential_ref);
         }
@@ -1179,31 +1378,6 @@ fn split_secret_pairs(
 
 fn is_env_reference(value: &str) -> bool {
     value.trim().starts_with('$')
-}
-
-fn store_secret(key: &str, value: &str) -> anyhow::Result<()> {
-    let store = crate::tui::settings::cockpit_credential_store()?;
-    store.save_record_merged(key, serde_json::json!({ "secret": value }))
-}
-
-fn remove_credential_refs(refs: &BTreeSet<String>) -> anyhow::Result<()> {
-    let store = crate::tui::settings::cockpit_credential_store()?;
-    for key in refs {
-        store.remove_record_merged(key)?;
-    }
-    Ok(())
-}
-
-fn reconcile_credential_refs(
-    old_refs: &BTreeSet<String>,
-    new_refs: &BTreeSet<String>,
-) -> anyhow::Result<()> {
-    let stale: BTreeSet<String> = old_refs.difference(new_refs).cloned().collect();
-    if stale.is_empty() {
-        Ok(())
-    } else {
-        remove_credential_refs(&stale)
-    }
 }
 
 fn credential_refs(name: &str, server: &ServerConfig) -> BTreeSet<String> {
@@ -1225,7 +1399,13 @@ fn credential_refs(name: &str, server: &ServerConfig) -> BTreeSet<String> {
                 }
             }
         }
-        Auth::Oauth(_) | Auth::None => {}
+        Auth::Oauth(_) => {
+            // OAuth tokens share the named-secret compartment with the header
+            // and env MCP credentials, so deleting/renaming a server must
+            // include this owner-RPC-managed key in its cleanup set.
+            refs.insert(cockpit_core::mcp::auth::cred_key(name));
+        }
+        Auth::None => {}
     }
     refs
 }
@@ -1456,6 +1636,20 @@ impl SettingsPage for McpPage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mcp_secret_custody_stays_daemon_owned() {
+        let source = include_str!("mcp_page.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(production.contains("Request::SaveMcpConfig"));
+        assert!(production.contains("self.mcp_config.clone()"));
+        assert!(!production.contains("read_to_string"));
+        assert!(production.contains("Response::McpConfigSaved"));
+        assert!(!production.contains("Response::Ack"));
+        assert!(!production.contains("write_private"));
+        assert!(!production.contains("CredentialStore"));
+        assert!(!production.contains("save_record_merged"));
+    }
+
     fn server(auth: Auth, enabled: bool) -> ServerConfig {
         ServerConfig {
             transport: Transport::Streamable,
@@ -1563,6 +1757,26 @@ mod tests {
     }
 
     #[test]
+    fn oauth_credential_cleanup_uses_its_named_secret_key() {
+        let refs = credential_refs(
+            "example",
+            &server(
+                Auth::Oauth(OauthAuth {
+                    authorize_url: Some("https://auth.example/authorize".into()),
+                    token_url: Some("https://auth.example/token".into()),
+                    client_id: None,
+                    scopes: vec![],
+                }),
+                true,
+            ),
+        );
+        assert_eq!(
+            refs.into_iter().collect::<Vec<_>>(),
+            vec![cockpit_core::mcp::auth::cred_key("example")]
+        );
+    }
+
+    #[test]
     fn env_pairs_allow_commas_in_values_per_row() {
         let pairs = parse_pairs("A=one,two\nB=three").unwrap();
         assert_eq!(pairs.get("A").map(String::as_str), Some("one,two"));
@@ -1575,16 +1789,6 @@ mod tests {
 
     #[test]
     fn editor_masks_stored_header_secret_and_preserves_ref_when_unchanged() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
-        store
-            .save_record_merged(
-                "mcp:typefully:header",
-                serde_json::json!({ "secret": "Bearer decrypted-token" }),
-            )
-            .unwrap();
-
         let state = AddState::from_server(
             "typefully",
             &server(
@@ -1599,7 +1803,7 @@ mod tests {
         assert_eq!(state.header_value.text(), secret_display::mask_value());
         assert!(!state.header_value.text().contains("decrypted-token"));
 
-        let (server, refs) = build_server_from_editor("typefully", &state).unwrap();
+        let (server, refs, secret_values) = build_server_from_editor("typefully", &state).unwrap();
         match server.auth {
             Auth::Header(h) => {
                 assert!(h.value.is_empty());
@@ -1608,28 +1812,11 @@ mod tests {
             other => panic!("expected header auth, got {other:?}"),
         }
         assert!(refs.contains("mcp:typefully:header"));
-        let reloaded = cockpit_core::credentials::CredentialStore::open_default().unwrap();
-        assert_eq!(
-            reloaded
-                .get("mcp:typefully:header")
-                .and_then(|v| v.get("secret"))
-                .and_then(|v| v.as_str()),
-            Some("Bearer decrypted-token")
-        );
+        assert!(secret_values.is_empty(), "masked refs must not rotate");
     }
 
     #[test]
     fn editor_replaces_stored_header_secret_only_when_new_value_typed() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
-        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
-        store
-            .save_record_merged(
-                "mcp:typefully:header",
-                serde_json::json!({ "secret": "Bearer old-token" }),
-            )
-            .unwrap();
-
         let mut state = AddState::from_server(
             "typefully",
             &server(
@@ -1642,7 +1829,7 @@ mod tests {
             ),
         );
         state.header_value.set("Bearer replacement-token");
-        let (server, refs) = build_server_from_editor("typefully", &state).unwrap();
+        let (server, refs, secret_values) = build_server_from_editor("typefully", &state).unwrap();
         match server.auth {
             Auth::Header(h) => {
                 assert!(h.value.is_empty());
@@ -1651,26 +1838,22 @@ mod tests {
             other => panic!("expected header auth, got {other:?}"),
         }
         assert!(refs.contains("mcp:typefully:header"));
-        let reloaded = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         assert_eq!(
-            reloaded
+            secret_values
                 .get("mcp:typefully:header")
-                .and_then(|v| v.get("secret"))
-                .and_then(|v| v.as_str()),
+                .map(String::as_str),
             Some("Bearer replacement-token")
         );
     }
 
     #[test]
     fn editor_header_secret_builds_credential_ref_without_raw_value() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let mut state = AddState::new();
         state.name.set("typefully");
         state.endpoint.set("https://api.example.com/mcp");
         state.auth = AuthKind::Header;
         state.header_value.set("Bearer secret-token");
-        let (server, refs) = build_server_from_editor("typefully", &state).unwrap();
+        let (server, refs, secret_values) = build_server_from_editor("typefully", &state).unwrap();
         match server.auth {
             Auth::Header(h) => {
                 assert!(h.value.is_empty());
@@ -1679,12 +1862,10 @@ mod tests {
             other => panic!("expected header auth, got {other:?}"),
         }
         assert!(refs.contains("mcp:typefully:header"));
-        let store = cockpit_core::credentials::CredentialStore::open_default().unwrap();
         assert_eq!(
-            store
+            secret_values
                 .get("mcp:typefully:header")
-                .and_then(|v| v.get("secret"))
-                .and_then(|v| v.as_str()),
+                .map(String::as_str),
             Some("Bearer secret-token")
         );
     }

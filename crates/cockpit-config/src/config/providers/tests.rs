@@ -853,6 +853,64 @@ fn provider_default_resolvers_match_model_resolvers_without_overrides() {
 }
 
 #[test]
+fn provider_headers_allow_public_metadata_but_require_structural_references() {
+    // `validate_provider_headers` enforces HTTP shape (unique names, valid
+    // header name/value bytes). The secret-vs-literal structural gate is
+    // `is_safe_provider_header_reference`: it decides whether a value may stay
+    // as a config literal or must be protected (extracted to the owner vault)
+    // on save. Both are HTTP-valid, so the structural distinction is the one
+    // under test here.
+    let valid = [
+        ("anthropic-version", "2023-06-01"),
+        ("authorization", "Bearer $API_TOKEN"),
+        ("x-custom-auth", "$secret:provider.token"),
+    ];
+    validate_provider_headers(
+        "provider",
+        &valid
+            .iter()
+            .map(|(name, value)| HeaderSpec {
+                name: (*name).into(),
+                value: (*value).into(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid deferred references are HTTP-valid");
+    for (name, value) in valid {
+        assert!(
+            is_safe_provider_header_reference(name, value),
+            "public metadata literal or structural reference must be safe: {name}={value}"
+        );
+    }
+
+    // Non-structural, HTTP-valid values must NOT be treated as safe literals:
+    // a custom auth header carrying a bare secret, a malformed `$` reference,
+    // and a public-metadata header abusing `$` all fail the structural gate,
+    // so save protects them as secrets instead of writing them verbatim.
+    for (name, value) in [
+        ("x-custom-auth", "plain-secret"),
+        ("authorization", "Bearer $not-a-valid-reference!"),
+        ("user-agent", "$not-a-public-metadata-reference!"),
+    ] {
+        assert!(
+            validate_provider_headers(
+                "provider",
+                &[HeaderSpec {
+                    name: name.into(),
+                    value: value.into(),
+                }],
+            )
+            .is_ok(),
+            "precondition: {name}={value} is HTTP-valid, so only the structural gate can reject it"
+        );
+        assert!(
+            !is_safe_provider_header_reference(name, value),
+            "non-structural header input must not bypass the secret gate: {name}={value}"
+        );
+    }
+}
+
+#[test]
 fn round_trips_a_provider_entry() {
     let tmp = TempDir::new().unwrap();
     let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());

@@ -67,7 +67,10 @@ pub use resolve::{
 pub use resolve::{
     TestInjectedVault, test_available_keyring_probe, test_missing_keyring_probe, test_open_db,
 };
-pub use vault::{SecretVault, redaction_table_item_id, session_sealed_item_id};
+pub use vault::{
+    SecretVault, SecretVaultItemSnapshot, SecretVaultMutation, redaction_table_item_id,
+    session_sealed_item_id,
+};
 pub use vault_store::VaultNativeStore;
 // set_default / unset_default are actor-owned only (`pub(crate)` in platform.rs).
 pub use platform::{

@@ -185,14 +185,15 @@ async fn org_logging_indicator_does_not_corrupt_ndjson() {
         display_name: None,
         relay_choice: None,
     };
-    let mut store =
-        cockpit_core::credentials::CredentialStore::open(home.credentials_path()).unwrap();
-    store.set(
-        cockpit_core::auth::flycockpit::CREDENTIAL_KEY,
-        serde_json::to_value(credential).unwrap(),
-    );
-    store.save().unwrap();
     let db = cockpit_db::Db::open(&home.db_path()).unwrap();
+    let vault = cockpit_core::secure_key::open_for_db(&db).unwrap();
+    vault
+        .put_item(
+            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+            cockpit_core::auth::flycockpit::CREDENTIAL_KEY,
+            &serde_json::to_vec(&credential).unwrap(),
+        )
+        .unwrap();
     db.upsert_org_sync_policy(
         "https://app.example.test",
         "org-1",

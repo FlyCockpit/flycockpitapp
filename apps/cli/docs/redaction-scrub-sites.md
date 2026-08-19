@@ -6,7 +6,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 
 <!-- scrub-inventory:start -->
 - Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/mod.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/engine/model_roles.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`
-- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
+- Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
 - Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`, `crates/cockpit-core/src/session/recording.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
@@ -32,7 +32,6 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - `apps/cli/src/commands/debug.rs`: assembled-context diagnostics are scrubbed and bounded before they are printed to the local client.
 - `crates/cockpit-core/src/daemon/server/mod.rs`: recursively scrubs event JSON strings for non-owner principals at socket forwarding and attach-history egress.
 - `crates/cockpit-core/src/daemon/server/dispatch.rs`: applies the server scrub helpers when returning attach/list history to non-owner clients.
-- `crates/cockpit-core/src/engine/driver/reports.rs`: `redacted_bounded_snippet` emits bounded, scrubbed failure diagnostics for client/display payloads while the raw failure remains local.
 
 ## Off Machine
 

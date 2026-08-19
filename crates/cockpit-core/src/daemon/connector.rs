@@ -18,6 +18,8 @@ use crate::auth::flycockpit::{
 };
 use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 use crate::daemon::proto::{self, Body, Envelope, Event, InterruptQuestion};
+#[cfg(test)]
+use crate::daemon::relay_envelope::RelayGrant;
 use crate::daemon::relay_envelope::{
     AttentionEventType, AttentionNotificationPayload, IncomingRelayFrame, RelayGrantScope,
     RelayPrincipal, daemon_client_frame, daemon_control_frame, parse_incoming,
@@ -1107,6 +1109,21 @@ mod tests {
             display_name: Some("devbox".to_string()),
             relay_choice: None,
         }
+    }
+
+    #[test]
+    fn relay_wire_principal_cannot_self_assert_local_owner() {
+        let principal = principal_from_relay_wire(RelayPrincipal {
+            user_id: "remote-account".to_string(),
+            grants: vec![RelayGrant {
+                scope: RelayGrantScope::Agent,
+                project_root: None,
+            }],
+            actor_binding: None,
+        });
+
+        assert!(matches!(principal, ClientPrincipal::Remote(_)));
+        assert!(!principal.is_owner());
     }
 
     fn test_context() -> (tempfile::TempDir, Arc<DaemonContext>) {

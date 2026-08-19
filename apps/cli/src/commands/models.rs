@@ -6,10 +6,46 @@ use crate::config::providers::{
     ProviderEntry, ProvidersConfig, WireApi, format_model_fetch_age,
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
 };
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
+
+async fn daemon_catalog(
+    cwd: &std::path::Path,
+    provider_id: Option<String>,
+) -> Result<ProvidersConfig> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for provider catalog")?;
+    let response = daemon
+        .client
+        .request(Request::GetProviderCatalogSnapshot {
+            project_root: cwd.display().to_string(),
+            provider_id,
+        })
+        .await
+        .context("requesting provider catalog from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected provider catalog request: {error}"))?;
+    let Response::ProviderCatalogSnapshot { config } = response else {
+        anyhow::bail!(
+            "daemon returned unexpected response to provider catalog request: {response:?}"
+        );
+    };
+    Ok(ProvidersConfig {
+        providers: config
+            .providers
+            .into_iter()
+            .map(|(id, view)| (id, view.entry))
+            .collect(),
+        category_defaults: config.category_defaults,
+        on_unlisted_models_fetch: config.on_unlisted_models_fetch,
+        active_model: config.active_model,
+        ..Default::default()
+    })
+}
 
 pub async fn run(args: ModelsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let cfg = crate::secret_ref::load_effective(&cwd);
+    let cfg = daemon_catalog(&cwd, args.provider.clone()).await?;
     print!("{}", render_effective_default(&cwd, &cfg));
     if cfg.providers.is_empty() {
         println!("{}", no_models_message());
@@ -57,7 +93,7 @@ pub(crate) fn render_effective_default(cwd: &std::path::Path, cfg: &ProvidersCon
 
 pub async fn run_provider_catalog_status(args: ProviderCatalogStatusArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let cfg = crate::secret_ref::load_effective(&cwd);
+    let cfg = daemon_catalog(&cwd, args.provider.clone()).await?;
     print!(
         "{}",
         render_provider_catalog_status(&cfg, args.provider.as_deref(), Utc::now())?

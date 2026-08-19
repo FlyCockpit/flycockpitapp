@@ -98,6 +98,10 @@ pub fn redact_provider_view(
                     })
                     .collect();
                 let mut entry = entry.clone();
+                // URLs are generally safe configuration metadata, but users
+                // and providers do put credentials in query/user-info.  This
+                // view is owner-remoted, so never echo either component.
+                entry.url = proto::redact_url_for_owner_view(&entry.url);
                 entry.credential_ref = None;
                 entry.headers.clear();
                 (
@@ -113,6 +117,8 @@ pub fn redact_provider_view(
         category_defaults: providers.category_defaults.clone(),
         on_unlisted_models_fetch: providers.on_unlisted_models_fetch,
         active_model: providers.active_model.clone(),
+        mcp_config_json: None,
+        extended_config_json: None,
     }
 }
 
@@ -408,6 +414,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_view_redacts_url_credentials_and_query() {
+        let secret = "provider-url-secret";
+        let providers = ProvidersConfig {
+            providers: BTreeMap::from([(
+                "custom".to_string(),
+                ProviderEntry {
+                    url: format!("https://user:{secret}@api.example.test/v1?key={secret}"),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let view = redact_provider_view(&providers);
+        let url = &view.providers["custom"].entry.url;
+        assert_eq!(url, "https://api.example.test/v1");
+        assert!(!url.contains(secret));
+    }
+
+    #[test]
     fn migrates_literal_header_to_secret_ref() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config/config.json");
@@ -421,7 +446,9 @@ mod tests {
         let notice = notice.unwrap();
         assert_eq!(notice.migrated, 1);
         let rendered_notice = notice.render();
-        assert!(rendered_notice.contains(&store_path.display().to_string()));
+        // Secrets now land in the daemon-owned vault, so the migration notice
+        // names "vault" rather than echoing a concrete credentials.json path.
+        assert!(rendered_notice.contains("vault"));
         assert!(!rendered_notice.contains(literal));
         assert_eq!(
             loaded.providers["openai"].headers[0].value,
@@ -615,8 +642,8 @@ mod tests {
         assert!(credentials_src.contains("from_vault"));
         let setup_src = include_str!("../../../apps/cli/src/commands/setup.rs");
         assert!(
-            setup_src.contains("protect_literal_headers_in_store"),
-            "setup must inject a vault-backed store rather than path-open"
+            setup_src.contains("SaveProviderConfig"),
+            "setup must persist provider headers through the daemon SaveProviderConfig owner RPC rather than opening a local store"
         );
         assert!(
             !setup_src.contains("CredentialStore::open(state_home.join"),

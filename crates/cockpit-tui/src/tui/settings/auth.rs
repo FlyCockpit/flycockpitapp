@@ -6,11 +6,10 @@
 //! pass. It lives here rather than in the main dialog file because it is
 //! async plumbing, not UI state.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use cockpit_config::providers::ProviderEntry;
-use cockpit_core::providers::models_fetch::{self, FetchOutcome};
+use cockpit_core::daemon::proto::{ProviderModelFetchOutcome, Request, Response};
+use cockpit_core::providers::models_fetch::FetchOutcome;
+use std::sync::{Arc, Mutex};
 
 /// Shared cell for an in-flight `/models` fetch. The background task
 /// writes the result; the event loop polls it on each tick.
@@ -29,35 +28,59 @@ pub enum FetchState {
 }
 
 impl FetchHandle {
-    pub fn spawn(provider_id: String, entry: ProviderEntry) -> Self {
+    pub fn spawn(provider_id: String, _entry: ProviderEntry, project_root: String) -> Self {
         let state = Arc::new(Mutex::new(FetchState::Running));
         let state_w = Arc::clone(&state);
         let pid = provider_id.clone();
         tokio::spawn(async move {
-            let result = match crate::tui::settings::cockpit_credential_store() {
-                Err(e) => Err(e.to_string()),
-                Ok(store) => {
-                    match models_fetch::resolve_provider_request_async_with_store(
-                        &pid,
-                        &entry,
-                        store.clone(),
-                        |name| std::env::var(name).ok(),
-                    )
+            let result = async {
+                let client = crate::tui::settings::settings_daemon_client()
                     .await
-                    {
-                        Err(e) => Err(e.to_string()),
-                        Ok(r) => models_fetch::fetch_models_for_provider_with_store(
-                            &pid,
-                            &entry,
-                            &r,
-                            Duration::from_secs(15),
-                            Some(store),
-                        )
-                        .await
-                        .map_err(|e| e.to_string()),
+                    .map_err(|error| error.to_string())?;
+                let response = client
+                    .request(Request::FetchProviderModels {
+                        project_root,
+                        provider_id: Some(pid.clone()),
+                        model_id: None,
+                        deep: false,
+                        on_unlisted: None,
+                        allow_fallback: false,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                let Response::ProviderModelsFetched { mut results, .. } = response else {
+                    return Err(
+                        "daemon returned unexpected provider model fetch response".to_string()
+                    );
+                };
+                let outcome = results
+                    .pop()
+                    .ok_or_else(|| "daemon returned no provider model fetch result".to_string())?
+                    .outcome;
+                Ok(match outcome {
+                    ProviderModelFetchOutcome::Models { models, catalog } => {
+                        FetchOutcome::Models { models, catalog }
                     }
-                }
-            };
+                    ProviderModelFetchOutcome::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    } => FetchOutcome::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    },
+                    ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
+                        return Err(format!(
+                            "model fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
+                        ));
+                    }
+                    ProviderModelFetchOutcome::Unsupported => FetchOutcome::Unsupported,
+                    ProviderModelFetchOutcome::Error { message } => return Err(message),
+                })
+            }
+            .await;
             if let Ok(mut s) = state_w.lock() {
                 *s = FetchState::Done(result);
             }

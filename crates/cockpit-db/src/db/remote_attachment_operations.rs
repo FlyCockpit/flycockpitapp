@@ -261,6 +261,27 @@ struct RemoteRenameEvidenceRow {
 }
 
 impl Db {
+    /// Commit a reserved nonrepeatable operation on a caller-owned SQLite
+    /// transaction.  This is deliberately exposed for domains (such as the
+    /// encrypted vault) whose durable mutation must become visible in exactly
+    /// the same transaction as its replay record and authoritative outbox
+    /// event.
+    pub fn commit_remote_attachment_operation_on_conn(
+        conn: &Connection,
+        request: CommitRemoteOperation<'_>,
+    ) -> Result<CommitRemoteOperationOutcome> {
+        let owned = OwnedCommitRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            safe_response: request.safe_response.to_vec(),
+            outbox_delivery_id: request.outbox_delivery_id.to_owned(),
+            outbox_kind: request.outbox_kind.to_owned(),
+            outbox_payload: request.outbox_payload.to_vec(),
+            now_ms: request.now_ms,
+        };
+        commit_conn(conn, &owned)
+    }
+
     pub async fn remote_rename_artifact_cleanup_intents(
         &self,
     ) -> Result<Vec<RemoteRenameArtifactCleanupIntent>> {

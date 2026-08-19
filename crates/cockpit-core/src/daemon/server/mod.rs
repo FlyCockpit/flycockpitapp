@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -77,41 +77,33 @@ fn daemon_process_env() -> HashMap<String, String> {
 fn build_daemon_redaction_table(
     config_source: &crate::daemon::config_source::ConfigSource,
     vault: &Arc<crate::secure_key::SecretVault>,
-) -> Arc<RedactionTable> {
+) -> Result<Arc<RedactionTable>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let cfg = config_source
+    let (_, extended) = config_source
         .load(&cwd)
-        .map(|(_, extended)| extended.redact)
-        .unwrap_or_default();
+        .context("loading config for daemon redaction")?;
+    let cfg = extended.redact;
     let env = daemon_process_env();
-    let built = match crate::credentials::CredentialStore::from_vault(vault.clone()) {
-        Ok(store) => RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &env, &store),
-        Err(error) => {
-            tracing::warn!(error = %error, "opening daemon vault for redaction failed");
-            RedactionTable::build_with_env(&cfg, &cwd, &env)
-        }
-    };
-    Arc::new(built.unwrap_or_else(|error| {
-        tracing::warn!(error = %error, "building daemon redaction table failed");
-        RedactionTable::empty()
-    }))
+    let store = crate::credentials::CredentialStore::from_vault(vault.clone())
+        .context("opening daemon vault for redaction")?;
+    let built = RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &env, &store)
+        .context("building daemon redaction table")?;
+    Ok(Arc::new(built))
 }
 
 fn refresh_global_redaction_table(
     shared: &SharedRedactionTable,
     config_source: &crate::daemon::config_source::ConfigSource,
     vault: &Arc<crate::secure_key::SecretVault>,
-) -> Arc<RedactionTable> {
-    let fresh = build_daemon_redaction_table(config_source, vault);
-    let table = match current_redaction(shared).union(&fresh) {
-        Ok(table) => Arc::new(table),
-        Err(error) => {
-            tracing::warn!(error = %error, "unioning daemon redaction table failed");
-            fresh
-        }
-    };
+) -> Result<Arc<RedactionTable>> {
+    let fresh = build_daemon_redaction_table(config_source, vault)?;
+    let table = Arc::new(
+        current_redaction(shared)
+            .union(&fresh)
+            .context("unioning daemon redaction table")?,
+    );
     set_current_redaction(shared, table.clone());
-    table
+    Ok(table)
 }
 
 fn scrub_json_strings(value: &mut serde_json::Value, redact: &RedactionTable) {
@@ -221,6 +213,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             terminal_generation: _,
         }
         | proto::Response::FsWrite { hash: _ }
+        | proto::Response::ExtendedConfigSaved { hash: _ }
+        | proto::Response::SetupWizardApplied { .. }
         | proto::Response::UsageCounts {
             models: _,
             slash: _,
@@ -513,6 +507,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::WorkspaceTrust { .. }
         | proto::Response::FlycockpitStored
         | proto::Response::FlycockpitNotLoggedIn
+        | proto::Response::SecretInventory { .. }
+        | proto::Response::FlycockpitAccount { .. }
+        | proto::Response::ProviderCatalogSnapshot { .. }
+        | proto::Response::ProviderModelsFetched { .. }
+        | proto::Response::ProviderUsageSnapshot { .. }
+        | proto::Response::ProviderConfigUpserted { .. }
+        | proto::Response::ProviderCredentialDeleted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
         proto::Response::FlycockpitAlreadyLoggedIn { email, server_url } => {
@@ -521,6 +522,11 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         proto::Response::FlycockpitCleared { server_url } => {
             scrub_string(server_url, redact);
+        }
+        proto::Response::FlycockpitOrgSync { outcome } => {
+            if let proto::FlycockpitOrgSyncOutcome::EnrollmentRequired { org_id } = outcome {
+                scrub_string(org_id, redact);
+            }
         }
         proto::Response::StartupDisclosures {
             org_sync,
@@ -556,10 +562,31 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
-        | proto::Response::RemoteOperationStatus { .. } => {}
+        | proto::Response::RemoteOperationStatus { .. }
+        | proto::Response::ProviderOAuthCompleted { .. }
+        | proto::Response::McpOAuthCompleted { .. }
+        | proto::Response::McpOAuthCancelled { .. }
+        | proto::Response::McpConfigSaved { .. } => {}
+        proto::Response::ProviderOAuthStarted { authorize_url, .. } => {
+            scrub_string(authorize_url, redact);
+        }
+        proto::Response::McpOAuthStarted { authorize_url, .. } => {
+            scrub_string(authorize_url, redact);
+        }
         proto::Response::HostCapabilities { snapshot } => {
             scrub_host_capability_snapshot(snapshot, redact);
         }
+        // Exported policy bundle is opaque serialized config free-text; scrub any
+        // known secret value that a caller may have placed inline (defense in
+        // depth — the bundle normally carries only `$secret:` references).
+        proto::Response::PolicyExported { bundle_json } => {
+            scrub_string(bundle_json, redact);
+        }
+        // Metadata-only: a config file path + counts / typed spend settings /
+        // version numbers. No user free-text that could embed a secret.
+        proto::Response::PolicyImported { .. }
+        | proto::Response::ImageSpendPolicy { .. }
+        | proto::Response::ImageSpendPolicySaved { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -1830,6 +1857,13 @@ pub struct DaemonContext {
     /// [`proto::Event::CaffeinateState`] reaches *all* connected clients.
     global_events: EventSender,
     global_redaction: SharedRedactionTable,
+    /// Vault inventory generation reflected by the currently published
+    /// `global_redaction` table. `broadcast_global` rebuilds the table only
+    /// when the live vault generation has advanced past this value, so a
+    /// direct/cross-process vault write still refreshes redaction while a
+    /// bursty broadcast with no vault change stays cheap. `0` forces a rebuild
+    /// on the first broadcast after construction.
+    redaction_generation: std::sync::atomic::AtomicU64,
     pub terminal_host: crate::daemon::terminal::TerminalHostHandle,
     /// Live count of connected clients. Each [`handle_client`] task
     /// increments on accept and decrements on exit. The ephemeral
@@ -1854,6 +1888,8 @@ pub struct DaemonContext {
     /// Daemon-held wrap-key vault. Flycockpit credential persist uses this
     /// handle; leftover `credentials.json` is never consulted.
     pub(crate) secret_vault: Arc<crate::secure_key::SecretVault>,
+    /// Context-owned bounded OAuth state; never process-global.
+    pub(crate) oauth_flows: Arc<dispatch::OAuthFlowStore>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
     /// the single route by which request handling resolves layered
     /// provider/extended config. Shared with the registry so attach-create,
@@ -1911,6 +1947,14 @@ pub struct DaemonContext {
     pub(crate) host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore,
     /// Probe sources used by boot and `RefreshHostCapabilities`.
     pub(crate) host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs,
+    /// A post-commit redaction publication failure means the daemon cannot
+    /// safely serve another request with its stale in-memory table.  This is
+    /// deliberately sticky until process restart.
+    redaction_publication_poisoned: AtomicBool,
+    /// Context-scoped test failpoint; unlike process-global state it cannot
+    /// make a parallel test daemon fail spuriously.
+    #[cfg(test)]
+    redaction_refresh_failure: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -2003,10 +2047,26 @@ impl DaemonContext {
             .unwrap_or_else(|error| panic!("daemon vault required at construction: {error}"));
         registry.set_secret_vault(secret_vault.clone());
         config_source.install_vault(secret_vault.clone());
-        let global_redaction = Arc::new(std::sync::RwLock::new(build_daemon_redaction_table(
-            &config_source,
-            &secret_vault,
-        )));
+        let global_redaction = Arc::new(std::sync::RwLock::new(
+            build_daemon_redaction_table(&config_source, &secret_vault).unwrap_or_else(|error| {
+                panic!("daemon redaction table required at construction: {error}")
+            }),
+        ));
+        // MCP connections retain only the vault handle, not the full daemon
+        // context. Install the owner publication seam here so an in-band
+        // OAuth refresh cannot commit a new token while leaving the active
+        // daemon redaction table stale. A Weak avoids a vault↔callback cycle.
+        let redaction_vault = Arc::downgrade(&secret_vault);
+        let redaction_config_source = config_source.clone();
+        let redaction_shared = global_redaction.clone();
+        secret_vault.install_owner_redaction_publisher(Arc::new(move || {
+            let vault = redaction_vault
+                .upgrade()
+                .ok_or_else(|| "daemon vault is no longer available".to_string())?;
+            refresh_global_redaction_table(&redaction_shared, &redaction_config_source, &vault)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }));
         let terminal_host = terminal_factory.build(
             global_events.clone(),
             global_redaction.clone(),
@@ -2071,6 +2131,7 @@ impl DaemonContext {
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
+            redaction_generation: std::sync::atomic::AtomicU64::new(0),
             terminal_host,
             client_count,
             shutdown,
@@ -2084,6 +2145,7 @@ impl DaemonContext {
             scheduler,
             credential_store_path: None,
             secret_vault,
+            oauth_flows: Arc::new(dispatch::OAuthFlowStore::new()),
             config_source,
             secure_key: None,
             _secure_key_actor: None,
@@ -2105,6 +2167,9 @@ impl DaemonContext {
             host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs::production(
                 canonical_cwd.clone(),
             ),
+            redaction_publication_poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            redaction_refresh_failure: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2199,6 +2264,7 @@ impl DaemonContext {
             .map(Some)
     }
 
+    #[cfg(test)]
     pub(crate) fn store_flycockpit_credential(
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
@@ -2206,8 +2272,354 @@ impl DaemonContext {
         crate::auth::flycockpit::store_credential_in_vault(self.secret_vault.clone(), credential)
     }
 
-    pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
-        crate::auth::flycockpit::clear_credential_in_vault(self.secret_vault.clone())
+    #[cfg(test)]
+    pub(crate) fn set_force_daemon_redaction_refresh_failure(&self, value: bool) {
+        self.redaction_refresh_failure
+            .store(value, Ordering::SeqCst);
+    }
+
+    pub(crate) fn redaction_publication_is_poisoned(&self) -> bool {
+        self.redaction_publication_poisoned.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn poison_redaction_publication(&self, error: &anyhow::Error) {
+        if !self
+            .redaction_publication_poisoned
+            .swap(true, Ordering::SeqCst)
+        {
+            tracing::error!(error = %error, "post-commit redaction publication failed; forcing daemon shutdown");
+            self.shutdown.force();
+        }
+    }
+
+    /// Publish the current vault-backed redaction table.  The test failpoint
+    /// is kept at this boundary so local and remote owner mutations exercise
+    /// identical publication-failure behavior.
+    pub(crate) fn publish_owner_redaction_table(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.redaction_refresh_failure.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected daemon redaction publication failure");
+        }
+        self.refresh_redaction_table()
+    }
+
+    /// Apply one owner-vault mutation and publish its redaction table as one
+    /// logical operation. Publication lives outside SQLite, so a failure is
+    /// compensated by restoring the exact prior item bytes (or its absence).
+    pub(crate) fn mutate_owner_vault_item(
+        &self,
+        kind: cockpit_db::secret_vault::SecretVaultKind,
+        item_id: &str,
+        plaintext: Option<&[u8]>,
+    ) -> Result<()> {
+        let mutation = self
+            .secret_vault
+            .mutate_item(kind, item_id, plaintext)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let Err(error) = self.publish_owner_redaction_table() {
+            return self
+                .restore_owner_vault_item(
+                    kind,
+                    item_id,
+                    &mutation.after,
+                    mutation.prior.row.as_ref(),
+                )
+                .map_err(|rollback| {
+                    anyhow::anyhow!(
+                        "redaction publication failed: {error}; vault rollback failed: {rollback}"
+                    )
+                })
+                .and_then(|_| Err(error));
+        }
+        Ok(())
+    }
+
+    /// Delete an owner-vault item while coupling the account's org-sync
+    /// disable transition to the same durable vault transaction. Redaction
+    /// publication is process-local, so publication failure is compensated by
+    /// restoring both the exact vault row and the prior sync enablement. A
+    /// failed compensation poisons the daemon rather than serving with an
+    /// unverifiable secret/redaction state.
+    pub(crate) async fn mutate_owner_vault_item_with_org_sync_disabled(
+        &self,
+        kind: cockpit_db::secret_vault::SecretVaultKind,
+        item_id: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        let vault = self.secret_vault.clone();
+        let item_id = item_id.to_owned();
+        let server_url = server_url.to_owned();
+        let item_id_for_tx = item_id.clone();
+        let server_url_for_tx = server_url.clone();
+        let (mutation, prior_sync) = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::secret_vault::ensure_inventory_generation_conn(conn)?;
+                let mut stmt =
+                    conn.prepare("SELECT org_id, enabled FROM sync_state WHERE server_url = ?1")?;
+                let prior_sync = stmt
+                    .query_map([&server_url_for_tx], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mutation = vault
+                    .mutate_item_on_conn(conn, kind, &item_id_for_tx, None)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                cockpit_db::Db::mark_org_sync_disabled_on_conn(
+                    conn,
+                    &server_url_for_tx,
+                    chrono::Utc::now().timestamp_millis(),
+                )?;
+                Ok((mutation, prior_sync))
+            })
+            .await?;
+
+        if let Err(publication_error) = self.publish_owner_redaction_table() {
+            let rollback_vault = self.restore_owner_vault_item(
+                kind,
+                &item_id,
+                &mutation.after,
+                mutation.prior.row.as_ref(),
+            );
+            let db = self.db.clone();
+            let restore_server_url = server_url.clone();
+            let rollback_sync = db
+                .transaction(move |conn| {
+                    for (org_id, enabled) in prior_sync {
+                        conn.execute(
+                            "UPDATE sync_state SET enabled = ?3, updated_at_ms = ?4
+                             WHERE server_url = ?1 AND org_id = ?2",
+                            rusqlite::params![
+                                restore_server_url,
+                                org_id,
+                                if enabled { 1_i64 } else { 0_i64 },
+                                chrono::Utc::now().timestamp_millis(),
+                            ],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = rollback_vault.and(rollback_sync) {
+                self.poison_redaction_publication(&error);
+                return Err(anyhow::anyhow!(
+                    "redaction publication failed: {publication_error}; owner clear rollback failed: {error}"
+                ));
+            }
+            return Err(publication_error);
+        }
+        Ok(())
+    }
+
+    fn restore_owner_vault_item(
+        &self,
+        kind: cockpit_db::secret_vault::SecretVaultKind,
+        item_id: &str,
+        expected: &crate::secure_key::SecretVaultItemSnapshot,
+        prior: Option<&cockpit_db::secret_vault::SecretVaultItemRow>,
+    ) -> Result<()> {
+        if self
+            .secret_vault
+            .restore_item_if_unchanged(kind, item_id, expected, prior)
+            .map_err(|error| anyhow::anyhow!(error))?
+        {
+            return Ok(());
+        }
+        // The failed publication left a row newer than the one this request
+        // produced. Refresh once so the daemon does not retain a stale
+        // redaction snapshot, then fail closed rather than clobbering it.
+        let refresh_error = self.refresh_redaction_table().err();
+        match refresh_error {
+            Some(error) => anyhow::bail!(
+                "owner vault item changed concurrently; refusing redaction rollback and refresh failed: {error}"
+            ),
+            None => {
+                anyhow::bail!("owner vault item changed concurrently; refusing redaction rollback")
+            }
+        }
+    }
+
+    pub(crate) fn list_secret_inventory(
+        &self,
+        cursor: Option<&str>,
+        requested_limit: Option<u16>,
+    ) -> std::result::Result<proto::Response, proto::ErrorPayload> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Cursor {
+            snapshot: String,
+            kind: String,
+            item_id: String,
+        }
+
+        fn digest(snapshot: &str) -> String {
+            Sha256::digest(snapshot.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        let decode_cursor = |raw: &str| -> std::result::Result<Cursor, proto::ErrorPayload> {
+            if raw.len() > proto::MAX_OWNER_INVENTORY_CURSOR_BYTES {
+                return Err(proto::ErrorPayload {
+                    code: proto::ErrorCode::BadRequest,
+                    message: "secret inventory cursor exceeds maximum length".into(),
+                });
+            }
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw)
+                .map_err(|_| proto::ErrorPayload {
+                    code: proto::ErrorCode::BadRequest,
+                    message: "invalid secret inventory cursor".into(),
+                })?;
+            let cursor: Cursor =
+                serde_json::from_slice(&bytes).map_err(|_| proto::ErrorPayload {
+                    code: proto::ErrorCode::BadRequest,
+                    message: "invalid secret inventory cursor".into(),
+                })?;
+            if cursor.snapshot.len() != 64
+                || cursor.item_id.is_empty()
+                || cursor.item_id.len() > proto::MAX_OWNER_INVENTORY_ITEM_ID_BYTES
+                || !matches!(
+                    cursor.kind.as_str(),
+                    "named_secret" | "credential_record" | "subscription_ack"
+                )
+            {
+                return Err(proto::ErrorPayload {
+                    code: proto::ErrorCode::BadRequest,
+                    message: "invalid secret inventory cursor".into(),
+                });
+            }
+            Ok(cursor)
+        };
+
+        let parsed = cursor.map(decode_cursor).transpose()?;
+        let limit = requested_limit
+            .map(usize::from)
+            .unwrap_or(proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES);
+        if limit == 0 {
+            return Err(proto::ErrorPayload {
+                code: proto::ErrorCode::BadRequest,
+                message: "secret inventory page limit must be positive".into(),
+            });
+        }
+        let limit = limit.min(proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES);
+        let after = parsed
+            .as_ref()
+            .map(|cursor| (cursor.kind.as_str(), cursor.item_id.as_str()));
+        let page = self
+            .secret_vault
+            .list_inventory_page(after, limit)
+            .map_err(|error| proto::ErrorPayload {
+                code: proto::ErrorCode::Internal,
+                message: format!("listing secret inventory: {error}"),
+            })?;
+        if page.total_entries > proto::MAX_OWNER_INVENTORY_TOTAL_ENTRIES {
+            return Err(proto::ErrorPayload {
+                code: proto::ErrorCode::InventoryTooLarge,
+                message: format!(
+                    "secret inventory exceeds maximum of {} entries",
+                    proto::MAX_OWNER_INVENTORY_TOTAL_ENTRIES
+                ),
+            });
+        }
+        let snapshot = digest(&page.snapshot);
+        if parsed
+            .as_ref()
+            .is_some_and(|cursor| cursor.snapshot != snapshot)
+        {
+            return Err(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: "secret inventory changed; restart pagination".into(),
+            });
+        }
+        let wire_kind = |kind: cockpit_db::secret_vault::SecretVaultKind| match kind {
+            cockpit_db::secret_vault::SecretVaultKind::NamedSecret => {
+                proto::SecretInventoryKind::NamedSecret
+            }
+            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord => {
+                proto::SecretInventoryKind::CredentialRecord
+            }
+            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck => {
+                proto::SecretInventoryKind::SubscriptionAck
+            }
+            _ => unreachable!("inventory query returned a hidden vault kind"),
+        };
+        let mut count = page.items.len();
+        loop {
+            let has_more = page.has_more || count < page.items.len();
+            let next_cursor = if has_more && count > 0 {
+                let last = &page.items[count - 1];
+                let raw = serde_json::to_vec(&Cursor {
+                    snapshot: snapshot.clone(),
+                    kind: last.kind.as_str().to_string(),
+                    item_id: last.item_id.clone(),
+                })
+                .map_err(|error| proto::ErrorPayload {
+                    code: proto::ErrorCode::Internal,
+                    message: format!("serializing secret inventory cursor: {error}"),
+                })?;
+                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+                if encoded.len() > proto::MAX_OWNER_INVENTORY_CURSOR_BYTES {
+                    return Err(proto::ErrorPayload {
+                        code: proto::ErrorCode::InventoryTooLarge,
+                        message: "secret inventory cursor exceeds response bound".into(),
+                    });
+                }
+                Some(encoded)
+            } else {
+                None
+            };
+            let response = proto::Response::SecretInventory {
+                entries: page.items[..count]
+                    .iter()
+                    .map(|item| proto::SecretInventoryEntry {
+                        name: item.item_id.clone(),
+                        kind: wire_kind(item.kind),
+                        configured: true,
+                    })
+                    .collect(),
+                next_cursor,
+            };
+            let encoded = serde_json::to_vec(&response).map_err(|error| proto::ErrorPayload {
+                code: proto::ErrorCode::Internal,
+                message: format!("serializing secret inventory: {error}"),
+            })?;
+            if encoded.len() <= proto::MAX_OWNER_INVENTORY_PAGE_BYTES {
+                return Ok(response);
+            }
+            if count <= 1 {
+                return Err(proto::ErrorPayload {
+                    code: proto::ErrorCode::InventoryTooLarge,
+                    message: "a secret inventory entry exceeds the response byte cap".into(),
+                });
+            }
+            count -= 1;
+        }
+    }
+
+    pub(crate) fn flycockpit_account_view(&self) -> Result<Option<proto::FlycockpitAccountView>> {
+        let Some(credential) = self.load_flycockpit_credential()? else {
+            return Ok(None);
+        };
+        let fingerprint = Sha256::digest(credential.instance_token.as_bytes());
+        let token_fingerprint = fingerprint
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let relay_choice = credential.relay_choice.map(|mut relay| {
+            relay.ws_url = proto::redact_url_for_owner_view(&relay.ws_url);
+            relay
+        });
+        let view = proto::FlycockpitAccountView {
+            server_url: credential.server_url,
+            instance_id: credential.instance_id,
+            account: credential.account,
+            display_name: credential.display_name,
+            relay_choice,
+            token_fingerprint,
+        };
+        view.validate()?;
+        Ok(Some(view))
     }
 
     /// The daemon's graceful-shutdown gate. New-user-work rejection and the
@@ -2232,12 +2644,55 @@ impl DaemonContext {
 
     /// Broadcast a daemon-global event to all connected clients.
     pub fn broadcast_global(&self, event: proto::Event) {
-        let table = refresh_global_redaction_table(
+        // Keep the redaction table current w.r.t. the vault, but rebuild it
+        // ONLY when the durable vault inventory generation has advanced. A
+        // rebuild walks the workspace (env/ssh secret scan) and spawns a git
+        // worktree availability probe; doing that per event turns a bursty
+        // broadcast (e.g. the in-process lag-marker path, which enqueues
+        // thousands of events with no vault change) into an unbounded
+        // fork/scan storm that starves the event loop. Gating on the
+        // trigger-maintained generation still catches direct and cross-process
+        // vault writes (a plain `refresh_redaction_table` on the owner-mutation
+        // path stays authoritative), so no secret escapes redaction.
+        let table = match self.secret_vault.current_inventory_generation() {
+            Ok(generation)
+                if generation
+                    != self
+                        .redaction_generation
+                        .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                match refresh_global_redaction_table(
+                    &self.global_redaction,
+                    &self.config_source,
+                    &self.secret_vault,
+                ) {
+                    Ok(table) => {
+                        self.redaction_generation
+                            .store(generation, std::sync::atomic::Ordering::SeqCst);
+                        table
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "refreshing daemon redaction failed; retaining committed table");
+                        current_redaction(&self.global_redaction)
+                    }
+                }
+            }
+            Ok(_) => current_redaction(&self.global_redaction),
+            Err(error) => {
+                tracing::error!(error = %error, "reading vault inventory generation failed; retaining committed redaction table");
+                current_redaction(&self.global_redaction)
+            }
+        };
+        send_event(&self.global_events, &table, event);
+    }
+
+    pub(crate) fn refresh_redaction_table(&self) -> Result<()> {
+        refresh_global_redaction_table(
             &self.global_redaction,
             &self.config_source,
             &self.secret_vault,
-        );
-        send_event(&self.global_events, &table, event);
+        )
+        .map(|_| ())
     }
 
     #[cfg(test)]
@@ -2745,6 +3200,12 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     // trust policy; startup covers the non-project layers.
     {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Err(error) = dispatch::recover_all_provider_config_journals(&ctx).await {
+            tracing::error!(%error, "startup provider-config journal recovery failed; provider requests will retry it");
+        }
+        if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
+            tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
+        }
         match crate::daemon::effective_default_recovery::recover_effective_default_journals(
             &ctx.db, &cwd, None,
         )
@@ -3455,25 +3916,6 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
     handle_client_transport(stream, ctx).await
 }
 
-#[allow(dead_code)]
-pub(crate) async fn handle_relay_channel<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    handle_relay_channel_as(stream, ctx, ClientPrincipal::owner()).await
-}
-
-pub(crate) async fn handle_relay_channel_as<S>(
-    stream: S,
-    ctx: Arc<DaemonContext>,
-    principal: ClientPrincipal,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    handle_client_transport_as(stream, ctx, principal, Uuid::new_v4()).await
-}
-
 pub(crate) async fn handle_relay_channel_as_with_instance<S>(
     stream: S,
     ctx: Arc<DaemonContext>,
@@ -4128,6 +4570,7 @@ async fn handle_envelope(
                 concurrent.tasks.spawn(async move {
                     let _permit = permit;
                     let response_shared = request_shared.clone();
+                    let response_ctx = ctx.clone();
                     let result = run_concurrent_request_catching_panic_with_remote_operation(
                         request,
                         request_shared,
@@ -4135,7 +4578,8 @@ async fn handle_envelope(
                         remote_operation,
                     )
                     .await;
-                    let envelope = response_envelope_for_shared(id, result, &response_shared);
+                    let envelope =
+                        response_envelope_for_shared(id, result, &response_shared, &response_ctx);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
                 });
                 return Ok(());
@@ -4155,7 +4599,7 @@ async fn handle_envelope(
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
             }
-            let envelope = response_envelope_for_shared(id, result, shared);
+            let envelope = response_envelope_for_shared(id, result, shared, ctx);
             let envelope_kind = envelope_kind(&envelope);
             let sent = if effects.shutdown_after_response {
                 send_writer_envelope_with_ack(writer_tx, envelope).await
@@ -4461,10 +4905,20 @@ fn response_envelope_for_shared(
     id: Uuid,
     result: std::result::Result<Response, ErrorPayload>,
     shared: &SharedClientState,
+    ctx: &DaemonContext,
 ) -> Envelope {
     match result {
         Ok(response) => {
             let response = if shared.principal.is_owner() {
+                // Owner responses are trusted, but still pass through the
+                // daemon-global redaction table as defense in depth: any known
+                // vault/env secret value that leaked into a response (for
+                // example an inline credential a serializer failed to strip)
+                // is neutralized before it crosses the socket. This is a
+                // backstop; secret-bearing payloads must be sanitized
+                // structurally at their source (see `policy::export`).
+                let mut response = response;
+                scrub_response_free_text(&mut response, &current_redaction(&ctx.global_redaction));
                 Some(response)
             } else if let Some(attached) = shared.attached.as_ref() {
                 scrub_proto_response(response, &attached.redaction_table())

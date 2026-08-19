@@ -1064,11 +1064,21 @@ impl RedactionTable {
 
         for (name, value) in stored_secrets {
             let origin = if name.starts_with('$') {
-                name
+                name.clone()
             } else {
                 format!("$secret:{name}")
             };
-            candidates.push(Candidate::forced(value, origin, true));
+            candidates.push(Candidate::forced(value.clone(), origin.clone(), true));
+            // MCP OAuth records are intentionally stored as one JSON named
+            // secret, but the record container is not itself a useful
+            // redaction literal. Register every sensitive leaf as well so a
+            // refreshed access/refresh token is scrubbed independently of
+            // JSON formatting and immediately after owner publication.
+            if name.starts_with("mcp:") {
+                for (field, secret) in mcp_sensitive_json_values(&value) {
+                    candidates.push(Candidate::forced(secret, format!("{origin}.{field}"), true));
+                }
+            }
         }
 
         // (3) Prune: drop candidates that aren't plausibly secrets. The
@@ -1658,6 +1668,59 @@ impl RedactionTable {
     }
 }
 
+/// Extract secret-bearing leaves from an MCP named-secret JSON record. Keep
+/// this allowlist closed: metadata such as expiry timestamps and issuer URLs
+/// must not become redaction literals merely because they live beside tokens.
+fn mcp_sensitive_json_values(raw: &str) -> Vec<(String, String)> {
+    const SENSITIVE_FIELDS: &[&str] = &[
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token",
+        "client_secret",
+        "api_key",
+        "secret",
+        "password",
+        "private_key",
+    ];
+
+    fn walk(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    let next = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if SENSITIVE_FIELDS
+                        .iter()
+                        .any(|field| key.eq_ignore_ascii_case(field))
+                        && let serde_json::Value::String(secret) = value
+                        && !secret.is_empty()
+                    {
+                        out.push((next.clone(), secret.clone()));
+                    }
+                    walk(value, &next, out);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    walk(value, &format!("{path}[{index}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk(&value, "", &mut out);
+    out
+}
+
 /// One distinct redaction-table entry that matched a haystack, carried by
 /// [`match_sensitive_literals`]. This is the exact unit the production
 /// journaling chokepoint records — no more, no less.
@@ -2190,7 +2253,6 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/daemon/session_worker/run.rs",
         "crates/cockpit-core/src/embeddings.rs",
         "crates/cockpit-core/src/engine/driver/mod.rs",
-        "crates/cockpit-core/src/engine/driver/reports.rs",
         "crates/cockpit-core/src/engine/model/dispatch.rs",
         "crates/cockpit-core/src/engine/model/mod.rs",
         "crates/cockpit-core/src/engine/model/outbound_guard.rs",
@@ -2282,7 +2344,14 @@ mod scrub_inventory_tests {
     }
 
     fn is_test_path(path: &Path) -> bool {
-        path.file_name().is_some_and(|name| name == "tests.rs")
+        // Exclude test scaffolding: `tests.rs`, any `*_tests.rs` module (e.g.
+        // `secret_store_boot_tests.rs`, which is included behind `#[cfg(test)]`
+        // but whose body is not itself wrapped in a `#[cfg(test)]` block), and
+        // any file under a `tests` directory. The inventory tracks production
+        // scrub sites only.
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
             || path
                 .components()
                 .any(|component| component.as_os_str() == "tests")

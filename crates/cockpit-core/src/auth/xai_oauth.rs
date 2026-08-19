@@ -27,6 +27,7 @@ const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CALLBACK_REQUEST_LINE_LIMIT: usize = 8 * 1024;
+const XAI_OAUTH_HOST: &str = "auth.x.ai";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackSource {
@@ -113,6 +114,17 @@ pub fn store_tokens_in(store: &mut CredentialStore, tokens: &StoredTokens) -> Re
 
 pub async fn complete_manual_login(login: ManualLogin, input: &str) -> Result<StoredTokens> {
     complete_login(login, input, CallbackSource::ManualPaste, None).await
+}
+
+/// Complete OAuth without selecting a persistence backend.  Daemon-owning
+/// frontends persist the returned record through their owner RPC instead of
+/// opening a client-side vault.
+pub async fn complete_manual_login_unpersisted(
+    login: ManualLogin,
+    input: &str,
+) -> Result<StoredTokens> {
+    let code = parse_callback_input(input, &login.state, CallbackSource::ManualPaste)?;
+    exchange_code(&login.token_endpoint, &code, &login.verifier).await
 }
 
 pub async fn complete_manual_login_in(
@@ -220,7 +232,24 @@ async fn fetch_discovery() -> Result<Discovery> {
         .json()
         .await
         .context("parsing xAI OAuth discovery document")?;
+    validate_xai_oauth_endpoint(&doc.authorization_endpoint, "authorization")?;
+    validate_xai_oauth_endpoint(&doc.token_endpoint, "token")?;
     Ok(doc)
+}
+
+/// Discovery is an untrusted network document.  Do not let it turn the
+/// browser-facing authorize link or token exchange into an arbitrary-origin
+/// request, even if the discovery response itself was somehow replaced.
+fn validate_xai_oauth_endpoint(endpoint: &str, kind: &str) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .with_context(|| format!("xAI OAuth {kind} endpoint is not a URL"))?;
+    if url.scheme() != "https" || url.host_str() != Some(XAI_OAUTH_HOST) {
+        bail!("xAI OAuth {kind} endpoint must be HTTPS on {XAI_OAUTH_HOST}");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("xAI OAuth {kind} endpoint contains forbidden URL components");
+    }
+    Ok(())
 }
 
 fn build_authorize_url(authorize_endpoint: &str, state: &str, challenge: &str) -> String {
@@ -298,6 +327,10 @@ fn oauth_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(OAUTH_CONNECT_TIMEOUT)
         .timeout(OAUTH_TOTAL_TIMEOUT)
+        // OAuth discovery and token requests must not follow a hostile
+        // cross-origin redirect. The configured endpoints are validated
+        // separately before use.
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[cfg(test)]
@@ -313,7 +346,7 @@ fn classify_token_error(status: StatusCode, body: &str) -> anyhow::Error {
         );
     }
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        return anyhow!("xAI OAuth token endpoint transient failure ({status}): {body}");
+        return anyhow!("xAI OAuth token endpoint transient failure ({status})");
     }
     if status == StatusCode::BAD_REQUEST
         || status == StatusCode::UNAUTHORIZED
@@ -322,7 +355,7 @@ fn classify_token_error(status: StatusCode, body: &str) -> anyhow::Error {
     {
         return anyhow!("xAI OAuth refresh rejected ({status}): invalid_grant or revoked token");
     }
-    anyhow!("xAI OAuth token endpoint failed ({status}): {body}")
+    anyhow!("xAI OAuth token endpoint failed ({status})")
 }
 
 fn is_terminal_refresh_error(e: &anyhow::Error) -> bool {
@@ -479,6 +512,15 @@ pub async fn complete_local_callback_login(
     complete_local_callback_login_in_store(login, listener, None).await
 }
 
+pub async fn complete_local_callback_login_unpersisted(
+    login: ManualLogin,
+    listener: tokio::net::TcpListener,
+) -> Result<StoredTokens> {
+    let callback = wait_for_callback_async(&listener).await?;
+    let code = parse_callback_input(&callback, &login.state, CallbackSource::LocalListener)?;
+    exchange_code(&login.token_endpoint, &code, &login.verifier).await
+}
+
 pub async fn complete_local_callback_login_in(
     login: ManualLogin,
     listener: tokio::net::TcpListener,
@@ -521,8 +563,7 @@ fn parse_callback_input(
     let query = query.split('#').next().unwrap_or(query);
     let mut code = None;
     let mut state = None;
-    let mut error = None;
-    let mut error_description = None;
+    let mut has_error = false;
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         let Some(name) = parts.next() else {
@@ -535,8 +576,11 @@ fn parse_callback_input(
         match name {
             "code" => code = Some(value),
             "state" => state = Some(value),
-            "error" => error = Some(value),
-            "error_description" => error_description = Some(value),
+            // The provider-supplied `error` code and `error_description` free
+            // text are NOT echoed below: they would otherwise be reflected
+            // verbatim into `ErrorPayload.message`. Only note that the callback
+            // reported a failure.
+            "error" => has_error = true,
             _ => {}
         }
     }
@@ -549,11 +593,10 @@ fn parse_callback_input(
         }
         _ => {}
     }
-    if let Some(error) = error {
-        if let Some(description) = error_description.filter(|text| !text.is_empty()) {
-            bail!("xAI OAuth returned `{error}`: {description}");
-        }
-        bail!("xAI OAuth returned `{error}`");
+    if has_error {
+        // Fixed, non-reflective message: never surface provider-supplied
+        // callback text to the client.
+        bail!("xAI OAuth authorization failed");
     }
     code.context("OAuth callback missing `code`")
 }
@@ -675,7 +718,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_callback_error_param_manual_paste_reports_denial() {
+    fn parse_callback_error_param_manual_paste_is_non_reflective() {
+        // The provider-supplied `error` code and `error_description` free text
+        // must NOT be echoed into the surfaced error (it flows into
+        // `ErrorPayload.message`). The message is fixed and reveals neither.
         let err = parse_callback_input(
             "/callback?error=access_denied&error_description=You%20denied%20access",
             "state-1",
@@ -683,12 +729,16 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("access_denied"), "{err}");
-        assert!(err.contains("You denied access"), "{err}");
+        assert!(err.contains("xAI OAuth authorization failed"), "{err}");
+        assert!(!err.contains("access_denied"), "leaked error code: {err}");
+        assert!(
+            !err.contains("You denied access"),
+            "leaked error_description: {err}"
+        );
     }
 
     #[test]
-    fn parse_callback_error_param_listener_reports_denial() {
+    fn parse_callback_error_param_listener_is_non_reflective() {
         let err = parse_callback_input(
             "/callback?error=access_denied&error_description=You%20denied%20access&state=state-1",
             "state-1",
@@ -696,8 +746,12 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("access_denied"), "{err}");
-        assert!(err.contains("You denied access"), "{err}");
+        assert!(err.contains("xAI OAuth authorization failed"), "{err}");
+        assert!(!err.contains("access_denied"), "leaked error code: {err}");
+        assert!(
+            !err.contains("You denied access"),
+            "leaked error_description: {err}"
+        );
     }
 
     #[test]
@@ -868,6 +922,18 @@ mod tests {
     fn invalid_grant_is_terminal_refresh_error() {
         let err = classify_token_error(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#);
         assert!(is_terminal_refresh_error(&err));
+    }
+
+    #[test]
+    fn token_endpoint_error_does_not_echo_response_body() {
+        let err = classify_token_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider-secret-access-token-body",
+        );
+        assert!(
+            !err.to_string()
+                .contains("provider-secret-access-token-body")
+        );
     }
 
     #[test]

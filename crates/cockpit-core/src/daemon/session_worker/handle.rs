@@ -797,6 +797,16 @@ impl SessionWorkerHandle {
         *overlay = vars;
     }
 
+    /// Snapshot the authenticated session environment for daemon-owned
+    /// provider resolution. The values never cross the wire; callers use this
+    /// only as an in-daemon lookup source.
+    pub fn env_overlay_snapshot(&self) -> HashMap<String, String> {
+        self.env_overlay
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     #[cfg(test)]
     pub fn env_overlay(&self) -> Arc<RwLock<HashMap<String, String>>> {
         self.env_overlay.clone()

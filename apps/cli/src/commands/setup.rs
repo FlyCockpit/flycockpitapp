@@ -2,21 +2,26 @@ use std::future::Future;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(test)]
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
-
 use crate::cli::SetupArgs;
-use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
-use crate::config::providers::{ConfigDoc, HeaderSpec, ModelMergePolicy, OnUnlistedModelsFetch};
-use crate::providers::models_fetch::{self, FetchOutcome};
+use crate::config::dirs::CONFIG_FILE;
+#[cfg(test)]
+use crate::config::dirs::most_specific_config_write_target;
+#[cfg(test)]
+use crate::config::providers::ConfigDoc;
+use crate::config::providers::HeaderSpec;
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response, SecretInventoryEntry, SecretInventoryKind};
+#[cfg(test)]
+use crate::wizard::descriptor_for_cwd;
 use crate::wizard::{
-    StepKind, WizardAnswer, WizardDescriptor, WizardRun, apply_model_answers,
-    apply_security_answers_with_caps, compose_wizard_host_capabilities, descriptor_for_cwd,
+    StepKind, WizardAnswer, WizardDescriptor, WizardRun, compose_wizard_host_capabilities,
     descriptor_for_cwd_with_caps, provider_entry_from_answers, provider_id_answer,
     selected_provider_template,
 };
+use anyhow::{Context, Result, anyhow, bail};
 
 pub async fn run(args: SetupArgs) -> Result<()> {
     let stdin_tty = io::stdin().is_terminal();
@@ -382,6 +387,34 @@ fn submit(run: &mut WizardRun, answer: WizardAnswer, io: &mut dyn TerminalIo) ->
     }
 }
 
+#[cfg(not(test))]
+async fn apply_setup_wizard_via_daemon(
+    cwd: &std::path::Path,
+    wizard_id: &str,
+    run: &WizardRun,
+) -> Result<(bool, bool, Option<String>)> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for setup wizard")?;
+    let response = daemon
+        .client
+        .request(Request::ApplySetupWizard {
+            project_root: cwd.display().to_string(),
+            wizard_id: wizard_id.to_string(),
+            answers_json: run.answers_json()?,
+        })
+        .await?
+        .map_err(|error| anyhow!("daemon rejected setup wizard: {error}"))?;
+    match response {
+        Response::SetupWizardApplied {
+            changed,
+            model_file_written,
+            default_scope,
+        } => Ok((changed, model_file_written, default_scope)),
+        other => bail!("daemon returned unexpected setup response: {other:?}"),
+    }
+}
+
 struct ProviderSetupActions {
     cwd: PathBuf,
     headers: Vec<HeaderSpec>,
@@ -406,11 +439,6 @@ impl ProviderSetupActions {
     fn with_host_capabilities(mut self, snapshot: cockpit_proto::HostCapabilitySnapshot) -> Self {
         self.host_capabilities = Some(snapshot);
         self
-    }
-
-    fn config_path(&self) -> PathBuf {
-        most_specific_config_write_target(&self.cwd)
-            .unwrap_or_else(|| self.cwd.join(".cockpit").join(CONFIG_FILE))
     }
 
     async fn handle_action(
@@ -439,68 +467,85 @@ impl ProviderSetupActions {
                 self.headers = crate::providers::default_headers_for(template);
             }
             "grok-oauth" => {
-                require_oauth_acknowledgement("grok-oauth", io)?;
+                require_oauth_acknowledgement("grok-oauth", io).await?;
                 io.write_line("Starting Grok OAuth login.")?;
-                let login = crate::auth::xai_oauth::begin_manual_login().await?;
+                let (flow_id, authorize_url, _) =
+                    begin_provider_oauth_via_daemon("grok-oauth").await?;
                 io.write_line("Open this URL and approve access:")?;
-                io.write_line(&login.authorize_url)?;
+                io.write_line(&authorize_url)?;
                 if !crate::sysinfo::is_ssh() {
-                    let _ = crate::browser::open(&login.authorize_url);
+                    let _ = crate::browser::open(&authorize_url);
                 }
                 io.write("Paste the callback URL or code: ")?;
                 let input = io.read_line().context("reading Grok OAuth callback")?;
-                let mut store = setup_credential_store()?;
-                crate::auth::xai_oauth::complete_manual_login_in(login, input.trim(), &mut store)
-                    .await?;
+                complete_provider_oauth_via_daemon(flow_id, Some(input.trim().to_string())).await?;
                 io.write_line("Grok OAuth login complete.")?;
             }
             "codex-oauth" => {
-                require_oauth_acknowledgement("codex-oauth", io)?;
+                require_oauth_acknowledgement("codex-oauth", io).await?;
                 io.write_line("Starting Codex device-code login.")?;
-                let login = crate::auth::codex_oauth::begin_device_code_login().await?;
-                io.write_line(&login.verification_uri)?;
-                io.write_line(&format!("Enter code: {}", login.user_code))?;
+                let (flow_id, authorize_url, user_code) =
+                    begin_provider_oauth_via_daemon("codex-oauth").await?;
+                io.write_line(&authorize_url)?;
+                io.write_line(&format!("Enter code: {}", user_code.unwrap_or_default()))?;
                 if !crate::sysinfo::is_ssh() {
-                    let _ = crate::browser::open(&login.verification_uri);
+                    let _ = crate::browser::open(&authorize_url);
                 }
-                let mut store = setup_credential_store()?;
-                crate::auth::codex_oauth::complete_device_code_login_in(login, &mut store).await?;
+                complete_provider_oauth_via_daemon(flow_id, None).await?;
                 io.write_line("Codex OAuth login complete.")?;
             }
             "saving" => {
-                self.save_provider(run, io)?;
+                self.save_provider(run, io).await?;
             }
             "fetching" => {
-                self.fetch_models(run, io).await?;
+                self.fetch_models(io).await?;
             }
             "test-key" => {
-                self.test_key(run, io).await?;
+                self.test_key(io).await?;
             }
-            "security-save" => match apply_security_answers_with_caps(
-                &self.cwd,
-                run,
-                self.host_capabilities.as_ref(),
-            )? {
-                Some(path) => {
-                    self.security_saved = Some(path.clone());
-                    io.write_line(&format!("Saved security settings to {}.", path.display()))?;
+            "security-save" => {
+                #[cfg(test)]
+                let result = cockpit_core::wizard::apply_security_answers_with_caps(
+                    &self.cwd,
+                    run,
+                    self.host_capabilities.as_ref(),
+                )?
+                .map(|_| true)
+                .unwrap_or(false);
+                #[cfg(not(test))]
+                let (result, _, _) =
+                    apply_setup_wizard_via_daemon(&self.cwd, "security", run).await?;
+                if result {
+                    self.security_saved =
+                        Some(cockpit_core::wizard::security_config_path(&self.cwd));
+                    io.write_line("Saved security settings through the daemon.")?;
+                } else {
+                    io.write_line("Security settings unchanged.")?;
                 }
-                None => io.write_line("Security settings unchanged.")?,
-            },
+            }
             "model-save" => {
-                let outcome = apply_model_answers(&self.cwd, run)?;
-                if let Some(path) = outcome.model_file.as_ref() {
-                    self.model_saved = Some(path.clone());
-                    io.write_line(&format!("Saved model settings to {}.", path.display()))?;
+                #[cfg(test)]
+                let (changed, model_file_written, default_scope) = {
+                    let outcome = cockpit_core::wizard::apply_model_answers(&self.cwd, run)?;
+                    (
+                        !outcome.changed_nothing(),
+                        outcome.model_file.is_some(),
+                        outcome.default_scope,
+                    )
+                };
+                #[cfg(not(test))]
+                let (changed, model_file_written, default_scope) =
+                    apply_setup_wizard_via_daemon(&self.cwd, "model", run).await?;
+                if model_file_written {
+                    self.model_saved = Some(self.cwd.join(CONFIG_FILE));
+                    io.write_line("Saved model settings through the daemon.")?;
                 }
-                // The default is layer-wide policy verified by the daemon-owned
-                // effective-default operation, so it names a scope, not a path.
-                if let Some(scope) = outcome.default_scope.as_ref() {
+                if let Some(scope) = default_scope {
                     io.write_line(&format!(
                         "Set the default model for new sessions in this configuration context ({scope}). Sessions that already exist keep their own saved model."
                     ))?;
                 }
-                if outcome.changed_nothing() {
+                if !changed {
                     io.write_line("Model settings unchanged.")?;
                 }
             }
@@ -509,195 +554,150 @@ impl ProviderSetupActions {
         Ok(())
     }
 
-    fn save_provider(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
+    async fn save_provider(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
         let id = provider_id_answer(run).context("provider id answer")?;
         let headers = provider_headers_for_answers(run, &self.headers)?;
-        let mut entry = provider_entry_from_answers(run, headers).context("provider answers")?;
-        let config_path = self.config_path();
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let mut doc = ConfigDoc::load(&config_path)?;
-        let mut cfg = doc.providers();
-        let mut providers = std::collections::BTreeMap::from([(id.clone(), entry.clone())]);
-        let mut store = setup_credential_store()?;
-        let notice =
-            crate::secret_ref::protect_literal_headers_in_store(&mut providers, &mut store)?;
-        entry = providers
-            .remove(&id)
-            .expect("provider inserted for secret protection");
+        let entry = provider_entry_from_answers(run, headers).context("provider answers")?;
+        let daemon = ensure_persistent_daemon()
+            .await
+            .context("starting persistent daemon for provider setup")?;
+        // The daemon stages vault bytes and the reference-only config entry
+        // under one recoverable journal.  The CLI never allocates predictable
+        // vault names or performs a secret/config two-step.
+        let header_secrets = entry
+            .headers
+            .iter()
+            .map(|header| {
+                let value = header.value.trim();
+                // Only literal secret material is owner-remoted. A structurally
+                // valid deferred reference (`$secret:…`, `$VAR`, `Bearer $VAR`,
+                // or public protocol metadata) must stay verbatim in config —
+                // extracting an env-var reference would replace it with an
+                // opaque `$secret:` vault entry and break the provider's auth.
+                // Mirrors the TUI's `upsert_provider_config_via_daemon` gate.
+                (!value.is_empty()
+                    && !crate::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        value,
+                    ))
+                .then(|| header.value.clone())
+            })
+            .collect();
         let headers_for_notice = entry.headers.clone();
-        cfg.providers.insert(id.clone(), entry);
-        doc.write(&cfg)?;
-        self.saved = Some((id.clone(), config_path));
-        if let Some(notice) = notice {
-            io.write_line(&format!("Saved provider `{id}`. {}", notice.render()))?;
-        } else {
-            io.write_line(&format!("Saved provider `{id}`."))?;
+        match daemon
+            .client
+            .request(Request::SaveProviderConfig {
+                project_root: self.cwd.display().to_string(),
+                provider_id: id.clone(),
+                entry,
+                header_secrets,
+            })
+            .await?
+        {
+            Ok(Response::ProviderConfigUpserted { .. }) => {}
+            Ok(other) => {
+                bail!("daemon returned unexpected response to provider config save: {other:?}")
+            }
+            Err(error) => bail!("daemon rejected provider config save: {error}"),
         }
-        if let Some(message) = env_var_detection_notice(&headers_for_notice) {
+        self.saved = Some((id.clone(), self.cwd.join(".cockpit").join(CONFIG_FILE)));
+        io.write_line(&format!("Saved provider `{id}`."))?;
+        if let Some(message) = env_var_reference_notice(&headers_for_notice) {
             io.write_line(&message)?;
         }
         Ok(())
     }
 
-    async fn test_key(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
-        let Some((id, config_path)) = self.saved.clone() else {
+    async fn test_key(&mut self, io: &mut dyn TerminalIo) -> Result<()> {
+        let Some((id, _)) = self.saved.clone() else {
             return Ok(());
         };
-        let Some(template) = selected_provider_template(run) else {
-            return Ok(());
+        let daemon = ensure_persistent_daemon()
+            .await
+            .context("starting persistent daemon for provider test")?;
+        let response = daemon
+            .client
+            .request(Request::FetchProviderModels {
+                project_root: self.cwd.display().to_string(),
+                provider_id: Some(id.clone()),
+                model_id: None,
+                deep: false,
+                on_unlisted: None,
+                allow_fallback: false,
+            })
+            .await?
+            .map_err(|error| anyhow!("daemon rejected provider key test: {error}"))?;
+        let Response::ProviderModelsFetched { results, .. } = response else {
+            bail!("daemon returned unexpected provider key test response: {response:?}");
         };
-        let mut doc = ConfigDoc::load(&config_path)?;
-        let mut cfg = doc.providers();
-        let Some(entry) = cfg.providers.get(&id).cloned() else {
-            return Ok(());
-        };
-        let store = setup_credential_store().ok();
-        match crate::providers::auth_check::check_provider_auth_with_store(
-            &id,
-            &entry,
-            template,
-            Duration::from_secs(15),
-            store,
-        )
-        .await
-        {
-            Ok(crate::providers::auth_check::AuthCheckSuccess::Models { models, catalog }) => {
-                let Some(entry) = cfg.providers.get_mut(&id) else {
-                    return Ok(());
-                };
-                let policy = match cfg
-                    .on_unlisted_models_fetch
-                    .unwrap_or(OnUnlistedModelsFetch::Keep)
-                {
-                    OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
-                    OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
-                        ModelMergePolicy::KeepUnlisted
-                    }
-                };
-                let before = entry.models.clone();
-                entry.models = crate::config::providers::merge_fetched_models_with_policy(
-                    entry.effective_template(&id),
-                    &before,
-                    models,
-                    policy,
-                );
-                entry.models_fetched_at = Some(Utc::now());
-                entry.model_catalog = catalog;
-                entry.mark_model_fetch_success(catalog);
-                io.write_line(&format!("key verified · {} models", entry.models.len()))?;
-                doc.write(&cfg)?;
+        let outcome = results.into_iter().next().map(|result| result.outcome);
+        match outcome {
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::Models { models, .. }) => {
+                io.write_line(&format!("key verified · {} models", models.len()))?
             }
-            Ok(crate::providers::auth_check::AuthCheckSuccess::Checked) => {
-                io.write_line("key verified")?;
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::Unsupported) => {
+                io.write_line("key test unavailable: provider does not support model discovery")?
             }
-            Err(crate::providers::auth_check::AuthCheckError::CredentialsRejected(error)) => {
-                io.write_line(&format!(
-                    "{error} Retry, re-enter key, or choose skip-test to continue."
-                ))?;
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
+                unlisted_count,
+            }) => io.write_line(&format!(
+                "Model fetch needs a keep/remove decision for {unlisted_count} configured model(s)."
+            ))?,
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
+                reason,
+                ..
+            }) => io.write_line(&format!("Model fetch fallback available: {reason}"))?,
+            Some(crate::daemon::proto::ProviderModelFetchOutcome::Error { message }) => {
+                io.write_line(&format!("key test failed: {message}"))?
             }
-            Err(crate::providers::auth_check::AuthCheckError::Network(error)) => {
-                io.write_line(&format!(
-                    "could not reach provider host: {error}. Retry or choose skip-test to continue."
-                ))?;
-            }
-            Err(crate::providers::auth_check::AuthCheckError::Other(error)) => {
-                io.write_line(&format!("key test failed: {error}"))?;
-            }
+            None => io.write_line("key test failed: daemon returned no provider result")?,
         }
         Ok(())
     }
 
-    async fn fetch_models(&mut self, run: &WizardRun, io: &mut dyn TerminalIo) -> Result<()> {
-        let Some((id, config_path)) = self.saved.clone() else {
-            return Ok(());
-        };
-        let Some(template) = selected_provider_template(run) else {
-            return Ok(());
-        };
-        if !template.supports_models_endpoint {
-            io.write_line("Provider has no /models endpoint.")?;
-            return Ok(());
-        }
-        let mut doc = ConfigDoc::load(&config_path)?;
-        let mut cfg = doc.providers();
-        let Some(entry) = cfg.providers.get(&id).cloned() else {
-            return Ok(());
-        };
-        let store = match setup_credential_store() {
-            Ok(store) => store,
-            Err(error) => {
-                io.write_line(&format!("Skipped model fetch: {error}"))?;
-                return Ok(());
-            }
-        };
-        let resolved = match models_fetch::resolve_provider_request_async_with_store(
-            &id,
-            &entry,
-            store.clone(),
-            |name| std::env::var(name).ok(),
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                io.write_line(&format!("Skipped model fetch: {error}"))?;
-                return Ok(());
-            }
-        };
-        let outcome = models_fetch::fetch_models_for_provider_with_store(
-            &id,
-            &entry,
-            &resolved,
-            Duration::from_secs(15),
-            Some(store),
-        )
-        .await;
-        let Some(entry) = cfg.providers.get_mut(&id) else {
-            return Ok(());
-        };
-        match outcome {
-            Ok(FetchOutcome::Models { models, catalog }) => {
-                let policy = match cfg
-                    .on_unlisted_models_fetch
-                    .unwrap_or(OnUnlistedModelsFetch::Keep)
-                {
-                    OnUnlistedModelsFetch::Remove => ModelMergePolicy::RemoveUnlisted,
-                    OnUnlistedModelsFetch::Ask | OnUnlistedModelsFetch::Keep => {
-                        ModelMergePolicy::KeepUnlisted
-                    }
-                };
-                let before = entry.models.clone();
-                entry.models = crate::config::providers::merge_fetched_models_with_policy(
-                    entry.effective_template(&id),
-                    &before,
-                    models,
-                    policy,
-                );
-                entry.models_fetched_at = Some(Utc::now());
-                entry.model_catalog = catalog;
-                entry.mark_model_fetch_success(catalog);
-                io.write_line(&format!("Fetched {} model(s).", entry.models.len()))?;
-            }
-            Ok(FetchOutcome::FallbackAvailable { reason, .. }) => {
-                let reason = crate::config::providers::redact_model_fetch_reason(reason);
-                entry.mark_model_fetch_failed_kept_existing(reason.clone());
-                io.write_line(&format!("Model fetch fallback available: {reason}"))?;
-            }
-            Ok(FetchOutcome::Unsupported) => {
-                entry.mark_model_fetch_unsupported();
-                io.write_line("Provider has no /models endpoint.")?;
-            }
-            Err(error) => {
-                let reason = crate::config::providers::redact_model_fetch_reason(error.to_string());
-                entry.mark_model_fetch_failed_kept_existing(reason.clone());
-                io.write_line(&format!("Model fetch failed: {reason}"))?;
-            }
-        }
-        doc.write(&cfg)?;
+    async fn fetch_models(&mut self, io: &mut dyn TerminalIo) -> Result<()> {
+        self.test_key(io).await?;
         Ok(())
+    }
+}
+
+async fn begin_provider_oauth_via_daemon(
+    provider_id: &str,
+) -> Result<(String, String, Option<String>)> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for OAuth login")?;
+    match daemon
+        .client
+        .request(Request::BeginProviderOAuth {
+            provider_id: provider_id.to_string(),
+        })
+        .await?
+    {
+        Ok(Response::ProviderOAuthStarted {
+            flow_id,
+            authorize_url,
+            user_code,
+        }) => Ok((flow_id, authorize_url, user_code)),
+        Ok(other) => bail!("daemon returned unexpected OAuth begin response: {other:?}"),
+        Err(error) => bail!("daemon rejected OAuth begin: {error}"),
+    }
+}
+
+async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<String>) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for OAuth login")?;
+    match daemon
+        .client
+        .request(Request::CompleteProviderOAuth { flow_id, input })
+        .await?
+    {
+        Ok(Response::ProviderOAuthCompleted {
+            logged_in: true, ..
+        }) => Ok(()),
+        Ok(other) => bail!("daemon returned unexpected OAuth completion response: {other:?}"),
+        Err(error) => bail!("daemon rejected OAuth completion: {error}"),
     }
 }
 
@@ -726,22 +726,24 @@ fn provider_headers_for_answers(
     }
 }
 
-fn env_var_detection_notice(headers: &[HeaderSpec]) -> Option<String> {
-    let mut missing = Vec::new();
+fn env_var_reference_notice(headers: &[HeaderSpec]) -> Option<String> {
+    // Setup is a daemon client.  Inspecting process environment values here
+    // would make the CLI a second secret resolver; syntax metadata is enough
+    // to remind the user which variables the daemon will resolve later.
+    let mut referenced = Vec::new();
     for header in headers {
-        let resolved = crate::envref::resolve(&header.value);
-        for name in resolved.missing {
-            if !name.starts_with("secret:") && !missing.contains(&name) {
-                missing.push(name);
+        for name in cockpit_core::envref::referenced_names(&header.value) {
+            if !name.starts_with("secret:") && !referenced.contains(&name) {
+                referenced.push(name);
             }
         }
     }
-    if missing.is_empty() {
+    if referenced.is_empty() {
         None
     } else {
         Some(format!(
-            "Environment variable not detected, make sure to set it: {}",
-            missing.join(", ")
+            "Environment variable reference detected; make sure to set it before use: {}",
+            referenced.join(", ")
         ))
     }
 }
@@ -765,26 +767,64 @@ fn subscription_oauth_provider(step_id: &str) -> Option<&'static str> {
     }
 }
 
-fn require_oauth_acknowledgement(step_id: &str, io: &mut dyn TerminalIo) -> Result<()> {
+async fn require_oauth_acknowledgement(step_id: &str, io: &mut dyn TerminalIo) -> Result<()> {
     let Some(provider) = subscription_oauth_provider(step_id) else {
         return Ok(());
     };
-    require_subscription_oauth_acknowledgement(provider, io)
+    require_subscription_oauth_acknowledgement(provider, io).await
 }
 
-fn setup_credential_store() -> Result<crate::credentials::CredentialStore> {
-    let db = crate::db::Db::open_default().context("opening cockpit DB")?;
-    let vault = cockpit_core::secure_key::open_for_db(&db)
-        .map_err(|e| anyhow::anyhow!("opening setup vault: {e}"))?;
-    crate::credentials::CredentialStore::from_vault(vault)
-}
-
-fn require_subscription_oauth_acknowledgement(
+async fn require_subscription_oauth_acknowledgement(
     provider: &str,
     io: &mut dyn TerminalIo,
 ) -> Result<()> {
-    let mut store = setup_credential_store()?;
-    if crate::auth::subscription_ack::acknowledged_in(&store, provider) {
+    // This marker is deliberately a daemon-owned named secret.  The setup
+    // client only needs existence metadata (not its value), so it can make the
+    // acknowledgement decision without opening a vault or DB locally.
+    let name = format!("subscription-oauth-ack:{provider}");
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for subscription acknowledgement")?;
+    let mut cursor = None;
+    let mut restarts = 0;
+    let already_acknowledged = loop {
+        let response = daemon
+            .client
+            .request(Request::ListSecretInventory {
+                cursor: cursor.clone(),
+                limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+            })
+            .await?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error)
+                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
+                    && restarts < 2 =>
+            {
+                // A concurrent owner mutation invalidates the cursor. Restart
+                // the bounded traversal so setup never silently misses an ack.
+                restarts += 1;
+                cursor = None;
+                continue;
+            }
+            Err(error) => bail!("daemon rejected subscription acknowledgement lookup: {error}"),
+        };
+        let Response::SecretInventory {
+            entries,
+            next_cursor,
+        } = response
+        else {
+            bail!("daemon returned unexpected acknowledgement lookup response")
+        };
+        if inventory_contains_subscription_ack(&entries, &name) {
+            break true;
+        }
+        let Some(next_cursor) = next_cursor else {
+            break false;
+        };
+        cursor = Some(next_cursor);
+    };
+    if already_acknowledged {
         return Ok(());
     }
 
@@ -794,13 +834,31 @@ fn require_subscription_oauth_acknowledgement(
         .read_line()
         .context("reading subscription OAuth acknowledgement")?;
     if response.trim().eq_ignore_ascii_case("I acknowledge") {
-        crate::auth::subscription_ack::record_in(&mut store, provider)?;
+        match daemon
+            .client
+            .request(Request::PutSubscriptionAck {
+                provider_id: provider.to_string(),
+            })
+            .await?
+        {
+            Ok(Response::Ack) => {}
+            Ok(other) => {
+                bail!("daemon returned unexpected acknowledgement store response: {other:?}")
+            }
+            Err(error) => bail!("daemon rejected subscription acknowledgement store: {error}"),
+        }
         return Ok(());
     }
 
     bail!(
         "subscription OAuth login requires acknowledgement; run `cockpit setup` interactively and type `I acknowledge` to continue"
     )
+}
+
+fn inventory_contains_subscription_ack(entries: &[SecretInventoryEntry], name: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.kind == SecretInventoryKind::SubscriptionAck && entry.name == name)
 }
 
 #[cfg(test)]
@@ -881,6 +939,10 @@ mod tests {
     }
 
     struct CockpitConfigEnvGuard {
+        // Ordering matters: `_daemon` (the in-process auto-promote guard) is
+        // declared before `_guard` so it drops first, tearing the promoted
+        // daemon down while the process-global env lock is still held.
+        _daemon: cockpit_core::daemon::InProcessAutoPromoteGuard,
         _guard: crate::test_env::TestEnvGuard,
     }
 
@@ -902,9 +964,148 @@ mod tests {
             guard.set_var(COCKPIT_CONFIG_ENV, path);
             guard.set_var("XDG_STATE_HOME", state_home);
             guard.set_var("XDG_DATA_HOME", state_home);
+            // Isolate the daemon socket/runtime namespace so `ensure_persistent_
+            // daemon()` never discovers a real user daemon and the in-process
+            // promotion binds an isolated canonical path.
+            let runtime_dir = state_home.join("runtime");
+            std::fs::create_dir_all(&runtime_dir).ok();
+            guard.set_var("XDG_RUNTIME_DIR", &runtime_dir);
             guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
-            Self { _guard: guard }
+            // Setup/provider paths now route every secret and config write
+            // through the owner-remoted daemon. Promote an in-process daemon
+            // (production layered config source) so those RPCs resolve against
+            // an isolated in-memory owner instead of timing out on a real
+            // socket. Booting is lazy: tests that never call the daemon pay
+            // nothing.
+            let daemon =
+                cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+            Self {
+                _daemon: daemon,
+                _guard: guard,
+            }
         }
+    }
+
+    /// Seed workspace trust in the auto-promoted daemon for `root`. Provider
+    /// config/secret writes are owner-remoted and fail closed on an untrusted
+    /// workspace, exactly as in production; a real user trusts the workspace
+    /// once before setup can persist. Trust is DB-owned by the daemon, so it
+    /// must be set through the RPC — a local runtime-policy override would not
+    /// reach the daemon's authoritative check.
+    async fn trust_workspace_via_daemon(root: &std::path::Path) {
+        let daemon = ensure_persistent_daemon()
+            .await
+            .expect("attach in-process daemon to seed workspace trust");
+        let project_root = root.display().to_string();
+        let expected_config_generation = match daemon
+            .client
+            .request(Request::GetWorkspaceTrust {
+                project_root: project_root.clone(),
+            })
+            .await
+            .expect("workspace trust read transport")
+            .expect("workspace trust read response")
+        {
+            Response::WorkspaceTrust {
+                config_generation, ..
+            } => config_generation,
+            other => panic!("unexpected workspace trust read: {other:?}"),
+        };
+        match daemon
+            .client
+            .request(Request::SetWorkspaceTrust {
+                project_root,
+                mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                expected_config_generation,
+            })
+            .await
+            .expect("workspace trust set transport")
+            .expect("workspace trust set response")
+        {
+            Response::WorkspaceTrustSet { .. } => {}
+            other => panic!("unexpected workspace trust set: {other:?}"),
+        }
+    }
+
+    /// Collect the daemon's redacted owner secret inventory. Setup persists
+    /// every secret/ack through the owner, so verifying persistence goes
+    /// through the same redacted read path production uses — the CLI never
+    /// reads secret bytes back. The wire form carries names/kinds only; a
+    /// broken persist leaves the entry absent, so presence is a real signal.
+    async fn owner_secret_inventory() -> Vec<SecretInventoryEntry> {
+        let daemon = ensure_persistent_daemon()
+            .await
+            .expect("attach in-process daemon to read owner inventory");
+        let mut cursor = None;
+        let mut collected = Vec::new();
+        loop {
+            let response = daemon
+                .client
+                .request(Request::ListSecretInventory {
+                    cursor: cursor.clone(),
+                    limit: Some(
+                        cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16,
+                    ),
+                })
+                .await
+                .expect("owner inventory transport")
+                .expect("owner inventory response");
+            let Response::SecretInventory {
+                entries,
+                next_cursor,
+            } = response
+            else {
+                panic!("unexpected owner inventory response");
+            };
+            // The redacted inventory must never carry secret bytes.
+            let wire = serde_json::to_string(&entries).expect("inventory serializes");
+            collected.extend(entries);
+            let Some(next) = next_cursor else {
+                let _ = wire;
+                break;
+            };
+            cursor = Some(next);
+        }
+        collected
+    }
+
+    /// Pull the `$secret:NAME` reference the daemon materialized into a config
+    /// header. The daemon allocates the vault name (the CLI never picks a
+    /// predictable one), so the reference is opaque and must be read from the
+    /// written config rather than assumed.
+    fn extract_secret_reference(raw: &str) -> Option<String> {
+        let start = raw.find("$secret:")? + "$secret:".len();
+        let name: String = raw[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Assert a pasted provider secret was owner-remoted: the config header
+    /// carries only a daemon-allocated `$secret:` reference (never the literal
+    /// bytes), and the owner vault holds that exact named secret. Verified
+    /// through the redacted owner inventory — the CLI never reads secret bytes.
+    async fn assert_provider_secret_owned(provider_file: &std::path::Path, literal: &str) {
+        let raw = std::fs::read_to_string(provider_file).expect("provider file");
+        assert!(
+            !raw.contains(literal),
+            "config must not embed the literal provider secret: {raw}"
+        );
+        let name = extract_secret_reference(&raw)
+            .unwrap_or_else(|| panic!("provider header must carry a $secret: reference: {raw}"));
+        let inventory = owner_secret_inventory().await;
+        assert!(
+            inventory
+                .iter()
+                .any(|entry| entry.name == name && entry.kind == SecretInventoryKind::NamedSecret),
+            "owner vault must hold the referenced secret `{name}`: {inventory:?}"
+        );
+        let wire = serde_json::to_string(&inventory).expect("inventory serializes");
+        assert!(
+            !wire.contains(literal),
+            "owner inventory must not leak secret bytes"
+        );
     }
 
     #[tokio::test]
@@ -915,7 +1116,9 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut io = ScriptIo::new(&["no"]);
 
-        let error = require_oauth_acknowledgement("codex-oauth", &mut io).unwrap_err();
+        let error = require_oauth_acknowledgement("codex-oauth", &mut io)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("requires acknowledgement"));
         assert!(io.output.contains("third-party client"));
@@ -931,7 +1134,9 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut io = ScriptIo::new(&["no"]);
 
-        let error = require_oauth_acknowledgement("grok-oauth", &mut io).unwrap_err();
+        let error = require_oauth_acknowledgement("grok-oauth", &mut io)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("requires acknowledgement"));
         assert!(io.output.contains("third-party client"));
@@ -947,22 +1152,33 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut first = ScriptIo::new(&["I acknowledge"]);
 
-        require_oauth_acknowledgement("codex-oauth", &mut first).unwrap();
+        require_oauth_acknowledgement("codex-oauth", &mut first)
+            .await
+            .unwrap();
+        // The acknowledgement is a daemon-owned named secret now, not an
+        // on-disk marker the CLI writes. Verify it landed in the owner vault
+        // through the same redacted inventory the production read path uses.
+        let ack_name = format!(
+            "subscription-oauth-ack:{}",
+            crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+        );
         assert!(
-            crate::auth::subscription_ack::acknowledged(
-                crate::auth::subscription_ack::CODEX_OAUTH_PROVIDER
-            )
-            .unwrap()
+            inventory_contains_subscription_ack(&owner_secret_inventory().await, &ack_name),
+            "codex acknowledgement must be recorded in the owner vault"
         );
         assert_eq!(first.reads, 1);
 
         let mut second = ScriptIo::default();
-        require_oauth_acknowledgement("codex-oauth", &mut second).unwrap();
+        require_oauth_acknowledgement("codex-oauth", &mut second)
+            .await
+            .unwrap();
         assert_eq!(second.reads, 0);
         assert!(second.output.is_empty());
 
         let mut grok = ScriptIo::default();
-        let error = require_oauth_acknowledgement("grok-oauth", &mut grok).unwrap_err();
+        let error = require_oauth_acknowledgement("grok-oauth", &mut grok)
+            .await
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -978,6 +1194,31 @@ mod tests {
         assert_eq!(subscription_oauth_provider("test-key"), None);
     }
 
+    #[test]
+    fn acknowledgement_lookup_requires_the_subscription_ack_kind() {
+        let name = "subscription-oauth-ack:codex";
+        let entries = vec![
+            SecretInventoryEntry {
+                name: name.into(),
+                kind: SecretInventoryKind::NamedSecret,
+                configured: true,
+            },
+            SecretInventoryEntry {
+                name: name.into(),
+                kind: SecretInventoryKind::CredentialRecord,
+                configured: true,
+            },
+        ];
+        assert!(!inventory_contains_subscription_ack(&entries, name));
+        let mut entries = entries;
+        entries.push(SecretInventoryEntry {
+            name: name.into(),
+            kind: SecretInventoryKind::SubscriptionAck,
+            configured: true,
+        });
+        assert!(inventory_contains_subscription_ack(&entries, name));
+    }
+
     #[tokio::test]
     async fn noninteractive_oauth_refuses_without_acknowledgement() {
         let tmp = tempfile::tempdir().unwrap();
@@ -986,7 +1227,9 @@ mod tests {
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
         let mut io = ScriptIo::default();
 
-        let error = require_oauth_acknowledgement("codex-oauth", &mut io).unwrap_err();
+        let error = require_oauth_acknowledgement("codex-oauth", &mut io)
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -1031,6 +1274,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = CockpitConfigEnvGuard::set_async(&tmp.path().join("global-config.json")).await;
         write_model_wizard_provider(tmp.path());
+        trust_workspace_via_daemon(tmp.path()).await;
         let descriptor = descriptor_for_cwd(crate::wizard::MODEL_WIZARD_ID, tmp.path()).unwrap();
         let mut io = ScriptIo::new(&[
             "p", "p:m", "frontier", "trusted", "images", "", "", "none", "y", "skip", "", "", "",
@@ -1068,7 +1312,10 @@ mod tests {
         assert_eq!(model.can_delegate, Some(false));
         assert_eq!(cfg.active_model.as_ref().unwrap().provider, "p");
         assert_eq!(cfg.active_model.as_ref().unwrap().model, "m");
-        assert!(io.output.contains("Saved model settings to"));
+        assert!(
+            io.output
+                .contains("Saved model settings through the daemon")
+        );
     }
 
     #[tokio::test]
@@ -1163,6 +1410,7 @@ mod tests {
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        trust_workspace_via_daemon(tmp.path()).await;
         let secret = "sk-provider-secret-abcdefghijklmnopqrstuvwxyz";
         let mut io = ScriptIo::new(&["openai", "", "", "", secret, "skip-test"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
@@ -1180,20 +1428,18 @@ mod tests {
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
-        let raw = std::fs::read_to_string(provider_path).expect("provider file");
-        assert!(raw.contains("$secret:openai"), "{raw}");
-        assert!(!raw.contains(secret), "{raw}");
-        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
-        assert_eq!(
-            store.named_secret("openai"),
-            Some(&format!("Bearer {secret}")[..])
-        );
+        // The secret is owner-remoted: the config header carries only a
+        // daemon-allocated `$secret:` reference (never the literal), it lands
+        // in the daemon vault (not a local `credentials.json`), and the CLI
+        // never reads its bytes back — verified via the redacted owner
+        // inventory.
+        assert_provider_secret_owned(&provider_path, secret).await;
         assert!(
             !state_home.join("cockpit/credentials.json").exists(),
             "setup must persist through the vault, not credentials.json"
         );
         assert!(!io.output.contains(secret), "secret leaked in output");
-        assert!(io.output.contains("Stored 1 provider secret"));
+        assert!(io.output.contains("Saved provider `openai`"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1202,6 +1448,7 @@ mod tests {
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        trust_workspace_via_daemon(tmp.path()).await;
         let secret = "nr-provider-secret-abcdefghijklmnopqrstuvwxyz";
         // Explicit paste-key + skip-test so we never hit the network.
         let mut io = ScriptIo::new(&["nous-research", "", "", "paste-key", secret, "skip-test"]);
@@ -1221,17 +1468,11 @@ mod tests {
             crate::config::providers::provider_file_path_for_config(&config_path, "nous-research")
                 .expect("provider path");
         let raw = std::fs::read_to_string(&provider_path).expect("provider file");
-        assert!(raw.contains("$secret:nous-research"), "{raw}");
         assert!(
             raw.contains("https://inference-api.nousresearch.com/v1"),
             "{raw}"
         );
-        assert!(!raw.contains(secret), "{raw}");
-        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
-        assert_eq!(
-            store.named_secret("nous-research"),
-            Some(&format!("Bearer {secret}")[..])
-        );
+        assert_provider_secret_owned(&provider_path, secret).await;
         assert!(!state_home.join("cockpit/credentials.json").exists());
         assert!(!io.output.contains(secret), "secret leaked in output");
     }
@@ -1244,6 +1485,7 @@ mod tests {
             let config_path = tmp.path().join("config/config.json");
             let state_home = tmp.path().join("state");
             let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+            trust_workspace_via_daemon(tmp.path()).await;
             let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret, "skip-test"]);
             let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
             let run = tokio::time::timeout(
@@ -1262,16 +1504,9 @@ mod tests {
             let provider_path =
                 crate::config::providers::provider_file_path_for_config(&config_path, "baseten")
                     .expect("provider path");
-            let raw = std::fs::read_to_string(provider_path).expect("provider file");
-            assert!(raw.contains("$secret:baseten"), "{raw}");
+            let raw = std::fs::read_to_string(&provider_path).expect("provider file");
             assert!(raw.contains("https://inference.baseten.co/v1"), "{raw}");
-            assert!(!raw.contains(secret), "{raw}");
-            let store =
-                crate::credentials::CredentialStore::open_default().expect("credential store");
-            assert_eq!(
-                store.named_secret("baseten"),
-                Some(&format!("Bearer {secret}")[..])
-            );
+            assert_provider_secret_owned(&provider_path, secret).await;
             assert!(!state_home.join("cockpit/credentials.json").exists());
             assert!(!io.output.contains(secret));
         }
@@ -1282,6 +1517,7 @@ mod tests {
             let state_home2 = tmp2.path().join("state");
             let _env2 =
                 CockpitConfigEnvGuard::set_with_state_async(&config_path2, &state_home2).await;
+            trust_workspace_via_daemon(tmp2.path()).await;
             let mut io2 =
                 ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY", "skip-test"]);
             let mut actions2 = ProviderSetupActions::new(tmp2.path().to_path_buf());
@@ -1312,6 +1548,7 @@ mod tests {
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        trust_workspace_via_daemon(tmp.path()).await;
         let mut io = ScriptIo::new(&[
             "nous-research",
             "",
@@ -1343,6 +1580,7 @@ mod tests {
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        trust_workspace_via_daemon(tmp.path()).await;
         let mut io = ScriptIo::new(&[
             "openai",
             "",
@@ -1366,8 +1604,11 @@ mod tests {
         let provider_path =
             crate::config::providers::provider_file_path_for_config(&config_path, "openai")
                 .expect("provider path");
-        let raw = std::fs::read_to_string(provider_path).expect("provider file");
-        assert!(raw.contains("$secret:openai"), "{raw}");
+        assert_provider_secret_owned(
+            &provider_path,
+            "sk-provider-secret-abcdefghijklmnopqrstuvwxyz",
+        )
+        .await;
         assert!(
             io.output
                 .contains("key saved but unverified — it will be tested on your first message.")
@@ -1380,6 +1621,7 @@ mod tests {
         let config_path = tmp.path().join("config/config.json");
         let state_home = tmp.path().join("state");
         let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
+        trust_workspace_via_daemon(tmp.path()).await;
         let mut io = ScriptIo::new(&["openai", "", "", "env-var", "OPENAI_API_KEY", "skip-test"]);
         let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
 
@@ -1399,7 +1641,9 @@ mod tests {
         assert!(raw.contains("Bearer $OPENAI_API_KEY"), "{raw}");
         assert!(
             io.output
-                .contains("Environment variable not detected, make sure to set it: OPENAI_API_KEY"),
+                .contains(
+                    "Environment variable reference detected; make sure to set it before use: OPENAI_API_KEY"
+                ),
             "{}",
             io.output
         );

@@ -1,18 +1,18 @@
 //! Explicit-confirmation UI for the billable provider deep-fetch probes.
 
 use super::*;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use cockpit_config::providers::{ConfigDoc, ProvidersConfig};
+use cockpit_config::providers::ConfigDoc;
+#[cfg(test)]
+use cockpit_config::providers::ProvidersConfig;
 use cockpit_core::providers::deepfetch::{
-    DeepfetchPlan, DeepfetchScope, DeepfetchTarget, HttpDeepfetchProbeClient,
-    collect_deepfetch_targets, deepfetch_confirmation_body, format_deepfetch_report,
-    plan_deepfetch, probe_target,
+    DeepfetchPlan, DeepfetchScope, DeepfetchTarget, collect_deepfetch_targets,
+    deepfetch_confirmation_body, plan_deepfetch,
 };
-use cockpit_core::providers::models_fetch;
+#[cfg(test)]
+use cockpit_core::providers::deepfetch::{format_deepfetch_report, probe_target};
 
 const TAIL_LINES: usize = 24;
 
@@ -28,6 +28,8 @@ struct DeepFetchProgress {
     completed: usize,
     lines: Vec<String>,
     result: Option<Result<String, String>>,
+    /// Latest authoritative catalog returned with a successful daemon probe.
+    config: Option<cockpit_core::daemon::proto::ProviderConfigView>,
 }
 
 /// State is deliberately prepared from the config document, rather than from
@@ -52,8 +54,18 @@ impl DeepFetchState {
         let config = ConfigDoc::load(config_path)
             .map_err(|error| format!("deep fetch failed: {error}"))?
             .providers();
+        Self::prepare_from_config(&config, provider_id)
+    }
+
+    /// Production settings dialogs already hold the layer selected by the
+    /// active workspace. Preparing from that snapshot avoids accidentally
+    /// estimating a project operation from a global/XDG config path.
+    pub(super) fn prepare_from_config(
+        config: &cockpit_config::providers::ProvidersConfig,
+        provider_id: &str,
+    ) -> Result<Self, String> {
         let targets = collect_deepfetch_targets(
-            &config,
+            config,
             &DeepfetchScope {
                 provider: Some(provider_id.to_string()),
                 model: None,
@@ -76,7 +88,7 @@ impl DeepFetchState {
         })
     }
 
-    fn start(&mut self, config_path: std::path::PathBuf) {
+    fn start(&mut self, project_root: std::path::PathBuf) {
         debug_assert_eq!(self.phase, DeepFetchPhase::Confirm);
         self.phase = DeepFetchPhase::Running;
         self.status = None;
@@ -85,8 +97,14 @@ impl DeepFetchState {
         let progress = Arc::clone(&self.progress);
         let cancel = Arc::clone(&self.cancel);
         tokio::spawn(async move {
-            let result =
-                run_deep_fetch(config_path, provider_id, targets, &progress, &cancel).await;
+            let result = run_deep_fetch(
+                project_root.display().to_string(),
+                provider_id,
+                targets,
+                &progress,
+                &cancel,
+            )
+            .await;
             if let Ok(mut progress) = progress.lock() {
                 progress.result = Some(result);
             }
@@ -135,50 +153,87 @@ impl DeepFetchState {
 }
 
 async fn run_deep_fetch(
-    config_path: std::path::PathBuf,
+    project_root: String,
     provider_id: String,
     targets: Vec<DeepfetchTarget>,
     progress: &Arc<Mutex<DeepFetchProgress>>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<String, String> {
-    // This is intentionally inside the Run task: the confirmation screen must
-    // not resolve credentials, construct an HTTP client, or issue a probe.
-    let mut config = ConfigDoc::load(&config_path)
-        .map_err(|error| format!("deep fetch failed: {error}"))?
-        .providers();
-    let entry = config.providers.get(&provider_id).cloned().ok_or_else(|| {
-        format!("deep fetch failed: provider `{provider_id}` disappeared from config")
-    })?;
-    let store = crate::tui::settings::cockpit_credential_store()
-        .map_err(|error| format!("deep fetch failed: opening vault: {error}"))?;
-    let resolved = models_fetch::resolve_provider_request_async_with_store(
-        &provider_id,
-        &entry,
-        store,
-        |name| std::env::var(name).ok(),
-    )
-    .await
-    .map_err(|error| format!("deep fetch failed: resolving provider `{provider_id}`: {error}"))?;
-    let mut resolved_by_provider = BTreeMap::new();
-    resolved_by_provider.insert(provider_id.clone(), resolved);
-    let mut client = HttpDeepfetchProbeClient::new(resolved_by_provider, Duration::from_secs(20));
-
-    run_deep_fetch_targets(
-        &config_path,
-        &targets,
-        progress,
-        cancel,
-        &mut config,
-        &mut client,
-    )
-    .await?;
-    if cancel.load(Ordering::Acquire) {
+    // The confirmation UI may inspect the non-secret configuration to estimate
+    // cost, but the daemon owns credential resolution, probes, and persistence.
+    // A settings config path may be the global XDG layer rather than a
+    // workspace `.cockpit/config.json`; it is not a project-root authority.
+    // The caller supplies the active dialog/picker workspace explicitly.
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|error| format!("deep fetch failed: {error}"))?;
+    // Use one daemon operation per model. This keeps probing and persistence
+    // daemon-owned while giving the TUI an observable target boundary: Esc
+    // never interrupts an in-flight probe, but prevents the next request.
+    for target in &targets {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        append_line(
+            progress,
+            format!("→ {}:{}", target.provider_id, target.model_id),
+        );
+        let response = client
+            .request(cockpit_core::daemon::proto::Request::FetchProviderModels {
+                project_root: project_root.clone(),
+                provider_id: Some(provider_id.clone()),
+                model_id: Some(target.model_id.clone()),
+                deep: true,
+                on_unlisted: None,
+                allow_fallback: false,
+            })
+            .await
+            .map_err(|error| format!("deep fetch failed: {error}"))?
+            .map_err(|error| format!("deep fetch failed: {error}"))?;
+        let cockpit_core::daemon::proto::Response::ProviderModelsFetched { results, config } =
+            response
+        else {
+            return Err("deep fetch failed: daemon returned unexpected response".into());
+        };
+        let result = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| "deep fetch failed: daemon returned no provider result".to_string())?;
+        match result.outcome {
+            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Models { .. } => {
+                append_line(progress, "  daemon deep fetch complete".to_string());
+            }
+            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Error { message } => {
+                return Err(format!("deep fetch failed: {message}"));
+            }
+            cockpit_core::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
+                unlisted_count,
+            } => {
+                return Err(format!(
+                    "deep fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
+                ));
+            }
+            cockpit_core::daemon::proto::ProviderModelFetchOutcome::Unsupported => {
+                append_line(progress, "  provider does not publish /models".to_string());
+            }
+            cockpit_core::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
+                ..
+            } => {
+                append_line(progress, "  daemon returned fallback catalog".to_string());
+            }
+        }
+        if let Ok(mut state) = progress.lock() {
+            state.completed += 1;
+            state.config = Some(config);
+        }
+    }
+    let completed = progress
+        .lock()
+        .map(|progress| progress.completed)
+        .unwrap_or_default();
+    if cancel.load(Ordering::Acquire) && completed < targets.len() {
         return Ok(format!(
-            "deep fetch cancelled: completed model results have already been saved ({}/{})",
-            progress
-                .lock()
-                .map(|progress| progress.completed)
-                .unwrap_or_default(),
+            "deep fetch cancelled: completed model results have already been saved ({completed}/{})",
             targets.len()
         ));
     }
@@ -189,6 +244,7 @@ async fn run_deep_fetch(
     ))
 }
 
+#[cfg(test)]
 async fn run_deep_fetch_targets<C: cockpit_core::providers::deepfetch::DeepfetchProbeClient>(
     config_path: &std::path::Path,
     targets: &[DeepfetchTarget],
@@ -285,6 +341,18 @@ impl DeepFetchState {
         progress.lines = lines;
         progress.result = Some(result);
     }
+
+    pub(super) fn finish_with_config_for_test(
+        &mut self,
+        result: Result<String, String>,
+        lines: Vec<String>,
+        config: &ProvidersConfig,
+    ) {
+        let mut progress = self.progress.lock().expect("test progress lock");
+        progress.lines = lines;
+        progress.config = Some(cockpit_core::secret_ref::redact_provider_view(config));
+        progress.result = Some(result);
+    }
 }
 
 fn append_line(progress: &Arc<Mutex<DeepFetchProgress>>, line: String) {
@@ -293,6 +361,7 @@ fn append_line(progress: &Arc<Mutex<DeepFetchProgress>>, line: String) {
     }
 }
 
+#[cfg(test)]
 fn persist_models(
     config_path: &std::path::Path,
     provider_id: &str,
@@ -325,7 +394,19 @@ impl SettingsCx {
                 KeyCode::Up | KeyCode::BackTab => state.cursor = state.cursor.saturating_sub(1),
                 KeyCode::Down | KeyCode::Tab => state.cursor = (state.cursor + 1).min(1),
                 KeyCode::Esc => return deep_fetch_back(parent, "deep fetch cancelled".into()),
-                KeyCode::Enter if state.cursor == 0 => state.start(self.config_path.clone()),
+                KeyCode::Enter if state.cursor == 0 => {
+                    let Some(project_root) = self
+                        .active_project_root
+                        .as_deref()
+                        .or(self.picker_cwd.as_deref())
+                        .map(std::path::Path::to_path_buf)
+                    else {
+                        state.status =
+                            Some("deep fetch requires the active settings workspace".into());
+                        return Nav::Stay;
+                    };
+                    state.start(project_root);
+                }
                 KeyCode::Enter => return deep_fetch_back(parent, "deep fetch cancelled".into()),
                 _ => {}
             },
@@ -469,23 +550,35 @@ impl SettingsDialog {
         let Some(result) = state.drain() else {
             return;
         };
+        // The daemon persisted the probe result. Adopt its returned catalog
+        // before returning to the editor so a later editor save cannot put
+        // stale model metadata back on disk.
+        let catalog_update = if let Ok(mut progress) = state.progress.lock()
+            && let Some(config) = progress.config.take()
+            && let Some(entry) = config.providers.get(&state.provider_id)
+        {
+            let update = (state.provider_id.clone(), entry.entry.clone());
+            *parent.entry = entry.entry.clone();
+            Some(update)
+        } else {
+            None
+        };
         state.phase = DeepFetchPhase::Done;
         state.status = Some(match result {
-            Ok(summary) => {
-                if let Ok(doc) = ConfigDoc::load(&self.cx.config_path) {
-                    let disk = doc.providers();
-                    if let Some(entry) = disk.providers.get(&state.provider_id).cloned() {
-                        self.cx
-                            .config
-                            .providers
-                            .insert(state.provider_id.clone(), entry.clone());
-                        *parent.entry = entry;
-                    }
-                }
-                summary
-            }
+            // The daemon already persisted this fetch.  Do not reload a
+            // mutable client-side config layer just to mirror its model
+            // metadata; the next daemon catalog refresh is authoritative.
+            Ok(summary) => summary,
             Err(error) => error,
         });
+        let _ = state;
+        let _ = parent;
+        if let Some((provider_id, entry)) = catalog_update {
+            self.config
+                .providers
+                .insert(provider_id.clone(), entry.clone());
+            self.original_config.providers.insert(provider_id, entry);
+        }
     }
 }
 

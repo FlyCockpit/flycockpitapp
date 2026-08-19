@@ -5,9 +5,221 @@ use super::sessions::*;
 use super::*;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
+use rusqlite::OptionalExtension;
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static FLYCOCKPIT_CREDENTIAL_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SECRET_OWNER_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Credential clear must never wait indefinitely on a best-effort remote
+/// instance revoke. Local vault ownership is cleared independently below.
+const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Serialize daemon-side provider/config read-modify-write operations. The
+/// ConfigDoc writer also takes the shared cross-process lock, so this closes
+/// races between clients in one daemon while the file lock covers peers.
+/// Serialize every provider/MCP config publication, reference scan, and
+/// cleanup. They share the named-secret vault namespace.
+static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct McpOAuthPending {
+    project_root: String,
+    server: String,
+    flow: crate::mcp::auth::McpOAuthFlow,
+}
+
+#[derive(Clone)]
+enum ProviderOAuthFlow {
+    /// A flow that has not started its one-time provider exchange.
+    Ready(ProviderOAuthReady),
+    /// A flow is never left in this state in the map: claiming it removes the
+    /// Ready value before network I/O. The variant documents the state machine
+    /// and makes accidental re-insertion of an in-flight flow conspicuous.
+    #[allow(dead_code)]
+    Completing,
+}
+
+#[derive(Clone)]
+enum ProviderOAuthReady {
+    Grok(crate::auth::xai_oauth::ManualLogin),
+    Codex(crate::auth::codex_oauth::DeviceLogin),
+}
+
+const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
+const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
+
+struct StoredProviderOAuthFlow {
+    owner: String,
+    created_at: Instant,
+    flow: ProviderOAuthFlow,
+}
+
+struct StoredMcpOAuthFlow {
+    owner: String,
+    created_at: Instant,
+    flow: McpOAuthPending,
+}
+
+/// Daemon-owned OAuth state. Keeping this on the context prevents one daemon
+/// instance or test from observing another's PKCE/device state, while the
+/// bounded TTL/capacity prevents abandoned flows from growing without limit.
+pub(crate) struct OAuthFlowStore {
+    provider: tokio::sync::Mutex<std::collections::HashMap<String, StoredProviderOAuthFlow>>,
+    mcp: tokio::sync::Mutex<std::collections::HashMap<String, StoredMcpOAuthFlow>>,
+}
+
+impl OAuthFlowStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            provider: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            mcp: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn purge_provider(flows: &mut std::collections::HashMap<String, StoredProviderOAuthFlow>) {
+        let now = Instant::now();
+        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+    }
+
+    fn purge_mcp(flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>) {
+        let now = Instant::now();
+        flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+    }
+
+    fn evict_oldest_provider(
+        flows: &mut std::collections::HashMap<String, StoredProviderOAuthFlow>,
+        owner: &str,
+    ) {
+        if let Some(id) = flows
+            .iter()
+            .filter(|(_, flow)| flow.owner == owner)
+            .min_by_key(|(_, flow)| flow.created_at)
+            .map(|(id, _)| id.clone())
+        {
+            flows.remove(&id);
+        }
+    }
+
+    fn evict_oldest_mcp(
+        flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>,
+        owner: &str,
+    ) {
+        if let Some(id) = flows
+            .iter()
+            .filter(|(_, flow)| flow.owner == owner)
+            .min_by_key(|(_, flow)| flow.created_at)
+            .map(|(id, _)| id.clone())
+        {
+            flows.remove(&id);
+        }
+    }
+
+    async fn insert_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
+            Self::evict_oldest_provider(&mut flows, &owner);
+        }
+        if flows.len() >= OAUTH_FLOW_GLOBAL_CAPACITY
+            && let Some(id) = flows
+                .iter()
+                .min_by_key(|(_, flow)| flow.created_at)
+                .map(|(id, _)| id.clone())
+        {
+            flows.remove(&id);
+        }
+        flows.insert(
+            id,
+            StoredProviderOAuthFlow {
+                owner,
+                created_at: Instant::now(),
+                flow,
+            },
+        );
+    }
+
+    async fn take_provider(&self, id: &str, owner: &str) -> Option<ProviderOAuthFlow> {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        (flows.get(id).is_some_and(|flow| flow.owner == owner))
+            .then(|| flows.remove(id).expect("flow checked above").flow)
+    }
+
+    async fn restore_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
+        self.insert_provider(id, owner, flow).await;
+    }
+
+    async fn remove_provider(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+    }
+
+    async fn insert_mcp(&self, id: String, owner: String, flow: McpOAuthPending) {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
+            Self::evict_oldest_mcp(&mut flows, &owner);
+        }
+        if flows.len() >= OAUTH_FLOW_GLOBAL_CAPACITY
+            && let Some(id) = flows
+                .iter()
+                .min_by_key(|(_, flow)| flow.created_at)
+                .map(|(id, _)| id.clone())
+        {
+            flows.remove(&id);
+        }
+        flows.insert(
+            id,
+            StoredMcpOAuthFlow {
+                owner,
+                created_at: Instant::now(),
+                flow,
+            },
+        );
+    }
+
+    async fn take_mcp(&self, id: &str, owner: &str) -> Option<McpOAuthPending> {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        (flows.get(id).is_some_and(|flow| flow.owner == owner))
+            .then(|| flows.remove(id).expect("flow checked above").flow)
+    }
+
+    async fn remove_mcp(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+    }
+}
+
+fn oauth_owner(state: &MutableClientState) -> String {
+    state
+        .principal
+        .tag()
+        .unwrap_or_else(|| "local-owner".to_string())
+}
+
+#[cfg(test)]
+mod oauth_store_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn provider_store_is_owner_scoped_and_bounded_per_owner() {
+        let store = OAuthFlowStore::new();
+        for index in 0..=OAUTH_FLOW_OWNER_CAPACITY {
+            store
+                .insert_provider(
+                    format!("flow-{index}"),
+                    "owner-a".to_string(),
+                    ProviderOAuthFlow::Completing,
+                )
+                .await;
+        }
+
+        assert!(store.take_provider("flow-0", "owner-a").await.is_none());
+        assert!(store.take_provider("flow-1", "owner-b").await.is_none());
+        assert!(store.take_provider("flow-8", "owner-a").await.is_some());
+    }
+}
 
 #[derive(Debug)]
 struct AppFlagVersionConflict;
@@ -318,7 +530,7 @@ async fn begin_remote_nonrepeatable(
         .canonical_remote_operation_params_v1()
         .map_err(internal)?;
     let canonical = authorized.encode_fcor(request, &params)?;
-    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let request_hash = remote_request_hash(ctx, &canonical);
     let attachment = operation.logical_attachment_id.to_string();
     let operation_id = operation.operation_id.to_string();
     let device = operation.authenticated_device_id.to_string();
@@ -342,6 +554,15 @@ async fn begin_remote_nonrepeatable(
         crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
     }
+}
+
+/// Derive the identity persisted in a remote-operation ledger from the
+/// daemon-held vault key. FCOR is canonical and authenticated, but its plain
+/// SHA-256 is intentionally not suitable for ledger rows because it would let
+/// anyone who can read a row test guesses for secret-bearing requests.
+pub(super) fn remote_request_hash(ctx: &DaemonContext, canonical: &[u8]) -> [u8; 32] {
+    ctx.secret_vault
+        .keyed_request_identity(b"flycockpit-remote-operation-v1\0", canonical)
 }
 
 async fn commit_remote_nonrepeatable(
@@ -391,6 +612,135 @@ async fn commit_remote_nonrepeatable(
     }
 }
 
+/// Finish a provider configuration mutation that was admitted as a remote
+/// nonrepeatable operation.
+///
+/// Provider layers live on the filesystem, so their write cannot share the
+/// SQLite transaction that commits the remote replay record.  In particular,
+/// a write error may be reported after an atomic replacement has reached the
+/// filesystem.  Close the reserved operation as unknown in that case: a
+/// retry must never run the mutation again and turn an indeterminate write
+/// into a second provider-layer change.
+pub(super) async fn finish_remote_provider_mutation<F>(
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    kind: &str,
+    mutation: F,
+) -> std::result::Result<Response, ErrorPayload>
+where
+    F: std::future::Future<Output = std::result::Result<Response, ErrorPayload>>,
+{
+    match mutation.await {
+        Ok(response) => commit_remote_nonrepeatable(operation, ctx, kind, response).await,
+        Err(error) => {
+            let attachment = operation.logical_attachment_id.to_string();
+            let operation_id = operation.operation_id.to_string();
+            ctx.db
+                .mark_nonrepeatable_remote_operation_outcome_unknown(
+                    &attachment,
+                    &operation_id,
+                    br#"{"outcome":"unknown"}"#,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            Err(error)
+        }
+    }
+}
+
+/// Apply an owner-vault mutation and commit its remote replay/outbox outcome
+/// in one SQLite transaction.  A remote reservation is intentionally created
+/// before dispatch, but must never be terminally recorded *after* a separate
+/// vault transaction: a process loss between those writes would make the
+/// mutation durable while leaving an indeterminate replay record.
+// The argument list threads a durable vault mutation, its remote-ledger
+// context, and the response together so the whole thing commits atomically;
+// bundling them into a params struct would only obscure that hot security path
+// for a purely cosmetic lint, so allow the count here.
+#[allow(clippy::too_many_arguments)]
+async fn mutate_owner_vault_item_with_remote_ledger(
+    ctx: &DaemonContext,
+    operation: &super::RemoteOperationContext,
+    kind: cockpit_db::secret_vault::SecretVaultKind,
+    item_id: &str,
+    plaintext: Option<&[u8]>,
+    outbox_kind: &'static str,
+    response: Response,
+    disable_org_sync_for: Option<&str>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let item_id = item_id.to_owned();
+    let plaintext = plaintext.map(ToOwned::to_owned);
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let vault = ctx.secret_vault.clone();
+    let transaction_attachment = attachment.clone();
+    let transaction_operation_id = operation_id.clone();
+    let disable_org_sync_for = disable_org_sync_for.map(ToOwned::to_owned);
+    let committed = ctx
+        .db
+        .transaction(move |conn| {
+            match plaintext.as_deref() {
+                Some(value) => vault
+                    .put_item_on_conn(conn, kind, &item_id, value)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+                None => vault
+                    .delete_item_on_conn(conn, kind, &item_id)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            }
+            if let Some(server_url) = disable_org_sync_for.as_deref() {
+                cockpit_db::Db::mark_org_sync_disabled_on_conn(conn, server_url, now_ms)?;
+            }
+            match crate::db::Db::commit_remote_attachment_operation_on_conn(
+                conn,
+                cockpit_db::remote_attachment_operations::CommitRemoteOperation {
+                    logical_attachment_id: &transaction_attachment,
+                    operation_id: &transaction_operation_id,
+                    safe_response: &bytes,
+                    outbox_delivery_id: &delivery,
+                    outbox_kind,
+                    outbox_payload: &bytes,
+                    now_ms,
+                },
+            )? {
+                cockpit_db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed { .. } => Ok(()),
+                outcome => anyhow::bail!("remote owner-secret ledger commit failed: {outcome:?}"),
+            }
+        })
+        .await;
+    if let Err(error) = committed {
+        // The durable mutation transaction rolled back.  Preserve the
+        // nonrepeatable safety rule: the reserved operation is not retried
+        // after an indeterminate writer failure.
+        ctx.db
+            .mark_nonrepeatable_remote_operation_outcome_unknown(
+                &attachment,
+                &operation_id,
+                br#"{\"outcome\":\"unknown\"}"#,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: format!(
+                "remote operation outcome is unknown; it will not be retried ({error})"
+            ),
+        });
+    }
+    // The committed response is now authoritative. Returning a normal error
+    // here would make the caller retry while replay returns that response, so
+    // publication failure instead poisons and force-shuts the daemon before
+    // it can serve another request with a stale redaction table.
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        ctx.poison_redaction_publication(&error);
+    }
+    Ok(response)
+}
+
 async fn begin_remote_idempotent_adapter(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -401,7 +751,7 @@ async fn begin_remote_idempotent_adapter(
         .canonical_remote_operation_params_v1()
         .map_err(internal)?;
     let canonical = authorized.encode_fcor(request, &params)?;
-    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let request_hash = remote_request_hash(ctx, &canonical);
     let attachment = operation.logical_attachment_id.to_string();
     let operation_id = operation.operation_id.to_string();
     let device = operation.authenticated_device_id.to_string();
@@ -593,7 +943,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
         .canonical_remote_operation_params_v1()
         .map_err(internal)?;
     let canonical = authorized.encode_fcor(request, &params)?;
-    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let request_hash = remote_request_hash(ctx, &canonical);
     let attachment = operation.logical_attachment_id.to_string();
     let operation_id = operation.operation_id.to_string();
     let device = operation.authenticated_device_id.to_string();
@@ -977,6 +1327,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     effects: &mut ClientRequestEffects,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if ctx.redaction_publication_is_poisoned() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "daemon is shutting down after a redaction publication failure".into(),
+        });
+    }
     if let Some(operation) = remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -1199,8 +1555,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&canonical_request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -1403,8 +1758,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     operation_id: operation.operation_id.to_string(),
                     authenticated_device_id: operation.authenticated_device_id.to_string(),
                     authenticated_device_generation: operation.authenticated_device_generation,
-                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
-                        .map_err(internal)?,
+                    request_hash: remote_request_hash(ctx, &canonical),
                 })
             } else {
                 None
@@ -1448,8 +1802,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     operation_id: operation.operation_id.to_string(),
                     authenticated_device_id: operation.authenticated_device_id.to_string(),
                     authenticated_device_generation: operation.authenticated_device_generation,
-                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
-                        .map_err(internal)?,
+                    request_hash: remote_request_hash(ctx, &canonical),
                 })
             } else {
                 None
@@ -1486,8 +1839,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     operation_id: operation.operation_id.to_string(),
                     authenticated_device_id: operation.authenticated_device_id.to_string(),
                     authenticated_device_generation: operation.authenticated_device_generation,
-                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
-                        .map_err(internal)?,
+                    request_hash: remote_request_hash(ctx, &canonical),
                 })
             } else {
                 None
@@ -1517,8 +1869,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -1581,8 +1932,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -1742,8 +2092,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -1876,8 +2225,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -1958,8 +2306,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2044,8 +2391,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2093,8 +2439,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2138,8 +2483,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2389,8 +2733,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     },
                     &canonical_params,
                 )?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2646,8 +2989,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -2784,6 +3126,95 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
                 .await
+        }
+
+        Request::SaveExtendedConfig {
+            project_root,
+            path,
+            content,
+            base_hash,
+        } => {
+            let response =
+                crate::daemon::fs_api::save_extended_config(project_root, path, content, base_hash)
+                    .await?;
+            // The saved config can change `redact.denylist`. The committed
+            // global redaction table is otherwise rebuilt only when the vault
+            // inventory generation advances (see `broadcast_global`), so a
+            // config-only denylist change would leave the next global broadcast
+            // scrubbing against a STALE table and disclose a newly denylisted
+            // secret. Rebuild the table now — mirroring how owner-vault
+            // mutations publish theirs — so every subsequent broadcast uses the
+            // fresh denylist. This runs once per (rare) config mutation, never
+            // per broadcast, so it does not reintroduce the per-event fork/scan
+            // storm. A rebuild failure must not be swallowed: retaining the
+            // stale table could disclose the secret, so poison the daemon.
+            if let Err(error) = ctx.refresh_redaction_table() {
+                ctx.poison_redaction_publication(&error);
+                return Err(internal(error));
+            }
+            Ok(response)
+        }
+
+        Request::ExportPolicy { project_root } => {
+            let bundle_json = tokio::task::spawn_blocking(move || {
+                crate::policy::export(std::path::Path::new(&project_root))
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+            Ok(Response::PolicyExported { bundle_json })
+        }
+
+        Request::ImportPolicy {
+            project_root,
+            bundle_json,
+            replace,
+        } => {
+            let (target, provider_count) = tokio::task::spawn_blocking(move || {
+                crate::policy::import(std::path::Path::new(&project_root), &bundle_json, replace)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+            Ok(Response::PolicyImported {
+                target: target.display().to_string(),
+                provider_count,
+            })
+        }
+
+        Request::GetImageSpendPolicy { project_key } => {
+            let current = ctx
+                .db
+                .current_image_spend_policy(project_key)
+                .await
+                .map_err(internal)?;
+            Ok(Response::ImageSpendPolicy {
+                settings: current.as_ref().map(|policy| policy.settings.clone()),
+                policy_version: current.map(|policy| policy.policy_version),
+            })
+        }
+
+        Request::SaveImageSpendPolicy {
+            project_key,
+            settings_json,
+            expected_policy_version,
+        } => {
+            let settings = serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!("invalid image spend settings: {error}"),
+            })?;
+            let saved = cockpit_config::config::image_spend::activate_saved_policy(
+                &ctx.db,
+                project_key,
+                settings,
+                expected_policy_version,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+            Ok(Response::ImageSpendPolicySaved {
+                policy_version: saved.policy_version,
+            })
         }
 
         Request::FsCreateDir { project_root, path } => {
@@ -3205,8 +3636,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -3243,8 +3673,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -3308,8 +3737,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let logical_attachment_id = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device_id = operation.authenticated_device_id.to_string();
@@ -3368,8 +3796,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let agent = ctx
                     .db
                     .get_session(session_id)
@@ -3658,8 +4085,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let attachment = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
@@ -3738,8 +4164,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .canonical_remote_operation_params_v1()
                     .map_err(internal)?;
                 let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash =
-                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let request_hash = remote_request_hash(ctx, &canonical);
                 let attachment = operation.logical_attachment_id.to_string();
                 let operation_id = operation.operation_id.to_string();
                 let device = operation.authenticated_device_id.to_string();
@@ -4247,22 +4672,77 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::StoreFlycockpitCredential { credential, force } => {
+            let request = Request::StoreFlycockpitCredential {
+                credential: credential.clone(),
+                force,
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
-            let _credential_lock = FLYCOCKPIT_CREDENTIAL_RPC_LOCK.lock().await;
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let _credential_lock = SECRET_OWNER_RPC_LOCK.lock().await;
             if !force && let Some(existing) = ctx.load_flycockpit_credential().map_err(internal)? {
-                return Ok(Response::FlycockpitAlreadyLoggedIn {
+                let response = Response::FlycockpitAlreadyLoggedIn {
                     email: existing.account.email,
                     server_url: existing.server_url,
-                });
+                };
+                return match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(
+                            operation,
+                            ctx,
+                            "store_flycockpit_credential",
+                            response,
+                        )
+                        .await
+                    }
+                    None => Ok(response),
+                };
             }
-            ctx.store_flycockpit_credential(&credential)
-                .map_err(internal)?;
-            ctx.wake_connector();
-            Ok(Response::FlycockpitStored)
+            credential.validate().map_err(internal)?;
+            let credential_bytes = serde_json::to_vec(&credential).map_err(internal)?;
+            let response = Response::FlycockpitStored;
+            let result = match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        crate::auth::flycockpit::CREDENTIAL_KEY,
+                        Some(&credential_bytes),
+                        "store_flycockpit_credential",
+                        response,
+                        None,
+                    )
+                    .await
+                }
+                None => ctx
+                    .mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        crate::auth::flycockpit::CREDENTIAL_KEY,
+                        Some(&credential_bytes),
+                    )
+                    .map(|()| response)
+                    .map_err(internal),
+            };
+            if result.is_ok() {
+                // Mirror the legacy `store_credential_in_store` path: keep the
+                // instance token redactable after a successful store. This is
+                // a no-op in production (redaction reads the vault directly);
+                // it restores the hermetic test seam the owner-RPC store path
+                // otherwise bypasses.
+                crate::auth::flycockpit::register_credential_for_redaction(&credential);
+                ctx.wake_connector();
+            }
+            result
         }
 
         Request::ClearFlycockpitCredential => {
@@ -4271,24 +4751,1164 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
-            let _credential_lock = FLYCOCKPIT_CREDENTIAL_RPC_LOCK.lock().await;
-            let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? else {
-                return Ok(Response::FlycockpitNotLoggedIn);
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::ClearFlycockpitCredential,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
+            let credential = {
+                let _credential_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                ctx.load_flycockpit_credential().map_err(internal)?
+            };
+            let Some(credential) = credential else {
+                let response = Response::FlycockpitNotLoggedIn;
+                return match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(
+                            operation,
+                            ctx,
+                            "clear_flycockpit_credential",
+                            response,
+                        )
+                        .await
+                    }
+                    None => Ok(response),
+                };
             };
             if let Ok(client) =
                 crate::auth::flycockpit::FlycockpitClient::new(&credential.server_url)
-                && let Err(error) = client.revoke_instance(&credential).await
             {
-                tracing::warn!(
-                    error = %error,
-                    "FlyCockpit credential clear: best-effort instance revoke failed"
-                );
+                match tokio::time::timeout(
+                    FLYCOCKPIT_REVOKE_TIMEOUT,
+                    client.revoke_instance(&credential),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %error,
+                        "FlyCockpit credential clear: best-effort instance revoke failed"
+                    ),
+                    Err(_) => tracing::warn!(
+                        timeout_ms = FLYCOCKPIT_REVOKE_TIMEOUT.as_millis(),
+                        "FlyCockpit credential clear: best-effort instance revoke timed out"
+                    ),
+                }
             }
-            ctx.clear_flycockpit_credential().map_err(internal)?;
+            // The network revoke deliberately runs without the owner-secret
+            // lock. A replacement may be stored while it is in flight; never
+            // let this clear remove that newer credential.
+            let _credential_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let current = ctx.load_flycockpit_credential().map_err(internal)?;
+            if current.as_ref() != Some(&credential) {
+                let response = match current {
+                    Some(current) => Response::FlycockpitAlreadyLoggedIn {
+                        email: current.account.email,
+                        server_url: current.server_url,
+                    },
+                    None => Response::FlycockpitNotLoggedIn,
+                };
+                return match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(
+                            operation,
+                            ctx,
+                            "clear_flycockpit_credential",
+                            response,
+                        )
+                        .await
+                    }
+                    None => Ok(response),
+                };
+            }
+            let response = Response::FlycockpitCleared {
+                server_url: credential.server_url.clone(),
+            };
+            let result = match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        crate::auth::flycockpit::CREDENTIAL_KEY,
+                        None,
+                        "clear_flycockpit_credential",
+                        response,
+                        Some(&credential.server_url),
+                    )
+                    .await
+                }
+                None => ctx
+                    .mutate_owner_vault_item_with_org_sync_disabled(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        crate::auth::flycockpit::CREDENTIAL_KEY,
+                        &credential.server_url,
+                    )
+                    .await
+                    .map(|()| response)
+                    .map_err(internal),
+            };
+            if result.is_ok() {
+                // Mirror the legacy `clear_credential_in_store` path so a
+                // cleared credential stops being redactable in the hermetic
+                // test seam (no-op in production).
+                crate::auth::flycockpit::clear_credential_redaction_registration();
+                ctx.wake_connector();
+            }
+            result
+        }
+
+        Request::SetFlycockpitConnectorEnabled { enabled } => {
+            let request = Request::SetFlycockpitConnectorEnabled { enabled };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept FlyCockpit connector settings",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? else {
+                return Err(bad_request("not logged in to FlyCockpit"));
+            };
+            ctx.db
+                .set_connector_enabled(&credential.server_url, &credential.instance_id, enabled)
+                .await
+                .map_err(internal)?;
             ctx.wake_connector();
-            Ok(Response::FlycockpitCleared {
-                server_url: credential.server_url,
+            let response = Response::Ack;
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_flycockpit_connector_enabled",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::SyncFlycockpitOrgPolicy => {
+            let request = Request::SyncFlycockpitOrgPolicy;
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept FlyCockpit org policy sync",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let outcome = crate::daemon::org_sync::sync_current_credential_once(ctx)
+                .await
+                .map_err(internal)?;
+            let outcome = match outcome {
+                crate::daemon::org_sync::OrgSyncOnceOutcome::NoCredential => {
+                    proto::FlycockpitOrgSyncOutcome::NoCredential
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::Disabled => {
+                    proto::FlycockpitOrgSyncOutcome::Disabled
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::EnrollmentRequired { org_id } => {
+                    proto::FlycockpitOrgSyncOutcome::EnrollmentRequired { org_id }
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::Idle => {
+                    proto::FlycockpitOrgSyncOutcome::Idle
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::Filtered { cursor_seq } => {
+                    proto::FlycockpitOrgSyncOutcome::Filtered { cursor_seq }
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::Uploaded { events, cursor_seq } => {
+                    proto::FlycockpitOrgSyncOutcome::Uploaded { events, cursor_seq }
+                }
+                crate::daemon::org_sync::OrgSyncOnceOutcome::Revoked => {
+                    proto::FlycockpitOrgSyncOutcome::Revoked
+                }
+            };
+            let response = Response::FlycockpitOrgSync { outcome };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "sync_flycockpit_org_policy",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::EnrollFlycockpitOrgSync { org_id } => {
+            let request = Request::EnrollFlycockpitOrgSync {
+                org_id: org_id.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept FlyCockpit org sync enrollment",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? else {
+                return Err(bad_request("not logged in to FlyCockpit"));
+            };
+            ctx.db
+                .set_org_sync_enrolled(&credential.server_url, &org_id)
+                .await
+                .map_err(internal)?;
+            let response = Response::Ack;
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "enroll_flycockpit_org_sync",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::ListSecretInventory { cursor, limit } => {
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            ctx.list_secret_inventory(cursor.as_deref(), limit)
+        }
+
+        Request::PutNamedSecret { name, value } => {
+            let request = Request::PutNamedSecret {
+                name: name.clone(),
+                value: value.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent named-secret writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            reject_owned_named_secret(ctx, &name).await?;
+            match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &name,
+                        Some(value.as_bytes()),
+                        "put_named_secret",
+                        Response::Ack,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &name,
+                        Some(value.as_bytes()),
+                    )
+                    .map_err(internal)?;
+                    Ok(Response::Ack)
+                }
+            }
+        }
+
+        Request::PutSubscriptionAck { provider_id } => {
+            let request = Request::PutSubscriptionAck {
+                provider_id: provider_id.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent subscription acknowledgement writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
+            let payload = serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
+            match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                        &item_id,
+                        Some(&payload),
+                        "put_subscription_ack",
+                        Response::Ack,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                        &item_id,
+                        Some(&payload),
+                    )
+                    .map_err(internal)?;
+                    Ok(Response::Ack)
+                }
+            }
+        }
+
+        Request::DeleteNamedSecret { name } => {
+            let request = Request::DeleteNamedSecret { name: name.clone() };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent named-secret writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            reject_owned_named_secret(ctx, &name).await?;
+            match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &name,
+                        None,
+                        "delete_named_secret",
+                        Response::Ack,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &name,
+                        None,
+                    )
+                    .map_err(internal)?;
+                    Ok(Response::Ack)
+                }
+            }
+        }
+
+        Request::PutProviderCredential {
+            provider_id,
+            record,
+        } => {
+            let request = Request::PutProviderCredential {
+                provider_id: provider_id.clone(),
+                record: record.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent provider credential writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let record_value: serde_json::Value = serde_json::from_str(&record).map_err(|_| {
+                // Malformed caller-supplied JSON is a client error, not an
+                // internal fault. Keep the message field-only so a partially
+                // parsed record cannot leak secret bytes through the error.
+                bad_request("provider credential record is not valid JSON")
+            })?;
+            let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                        Some(&record_bytes),
+                        "put_provider_credential",
+                        Response::Ack,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                        Some(&record_bytes),
+                    )
+                    .map_err(internal)?;
+                    Ok(Response::Ack)
+                }
+            }
+        }
+
+        Request::BeginProviderOAuth { provider_id } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent provider OAuth logins",
+                ));
+            }
+            let flow_id = uuid::Uuid::new_v4().to_string();
+            let owner = oauth_owner(state);
+            let (flow, authorize_url, user_code) = match provider_id.as_str() {
+                crate::auth::xai_oauth::CREDENTIAL_KEY => {
+                    let login = crate::auth::xai_oauth::begin_manual_login()
+                        .await
+                        .map_err(internal)?;
+                    let authorize_url = login.authorize_url.clone();
+                    (
+                        ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
+                        authorize_url,
+                        None,
+                    )
+                }
+                crate::auth::codex_oauth::CREDENTIAL_KEY => {
+                    let login = crate::auth::codex_oauth::begin_device_code_login()
+                        .await
+                        .map_err(internal)?;
+                    let authorize_url = login.verification_uri.clone();
+                    let user_code = Some(login.user_code.clone());
+                    (
+                        ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+                        authorize_url,
+                        user_code,
+                    )
+                }
+                _ => return Err(bad_request("unsupported provider OAuth flow")),
+            };
+            ctx.oauth_flows
+                .insert_provider(flow_id.clone(), owner, flow)
+                .await;
+            Ok(Response::ProviderOAuthStarted {
+                flow_id,
+                authorize_url,
+                user_code,
             })
+        }
+
+        Request::CompleteProviderOAuth { flow_id, input } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent provider OAuth logins",
+                ));
+            }
+            // Atomically claim the one-shot flow before any provider network
+            // exchange. A second concurrent completion therefore fails at
+            // lookup instead of issuing another token set. Restore only when
+            // validation or the pre-persistence exchange fails; once the
+            // provider has exchanged the code, replay must remain rejected.
+            let owner = oauth_owner(state);
+            let flow = ctx
+                .oauth_flows
+                .take_provider(&flow_id, &owner)
+                .await
+                .ok_or_else(|| {
+                    bad_request("provider OAuth flow is unknown or already completed")
+                })?;
+            let ready = match flow {
+                ProviderOAuthFlow::Ready(ready) => ready,
+                ProviderOAuthFlow::Completing => {
+                    return Err(bad_request("provider OAuth flow is already completing"));
+                }
+            };
+            let exchange_ready = ready.clone();
+            let exchange = match exchange_ready {
+                ProviderOAuthReady::Grok(login) => {
+                    let Some(callback) = input.as_deref() else {
+                        ctx.oauth_flows
+                            .restore_provider(
+                                flow_id,
+                                owner.clone(),
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
+                            )
+                            .await;
+                        return Err(bad_request(
+                            "Grok OAuth completion requires a callback URL or code",
+                        ));
+                    };
+                    crate::auth::xai_oauth::complete_manual_login_unpersisted(login, callback)
+                        .await
+                        .map_err(internal)
+                        .and_then(|tokens| {
+                            serde_json::to_vec(&tokens)
+                                .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
+                                .map_err(internal)
+                        })
+                }
+                ProviderOAuthReady::Codex(login) => {
+                    if input.is_some() {
+                        ctx.oauth_flows
+                            .restore_provider(
+                                flow_id,
+                                owner.clone(),
+                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+                            )
+                            .await;
+                        return Err(bad_request(
+                            "Codex device OAuth does not accept callback input",
+                        ));
+                    }
+                    crate::auth::codex_oauth::complete_device_code_login_unpersisted(login)
+                        .await
+                        .map_err(internal)
+                        .and_then(|tokens| {
+                            serde_json::to_vec(&tokens)
+                                .map(|record| (crate::auth::codex_oauth::CREDENTIAL_KEY, record))
+                                .map_err(internal)
+                        })
+                }
+            };
+            let (provider_id, record) = match exchange {
+                Ok(value) => value,
+                Err(error) => {
+                    ctx.oauth_flows
+                        .restore_provider(flow_id, owner.clone(), ProviderOAuthFlow::Ready(ready))
+                        .await;
+                    return Err(error);
+                }
+            };
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            ctx.mutate_owner_vault_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                provider_id,
+                Some(&record),
+            )
+            .map_err(internal)?;
+            // The token record is now durable; consuming the one-time flow
+            // prevents a duplicate exchange after a successful completion.
+            ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
+            Ok(Response::ProviderOAuthCompleted {
+                logged_in: true,
+                retry_after_seconds: None,
+            })
+        }
+
+        Request::BeginMcpOAuth {
+            project_root,
+            server,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent MCP OAuth logins",
+                ));
+            }
+            let cwd = std::path::PathBuf::from(&project_root);
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                    .await
+                    .map_err(workspace_trust_error)?;
+            let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+            let config = mcp_config_from_paths(&paths)?;
+            let server_config = config
+                .servers
+                .get(&server)
+                .ok_or_else(|| bad_request(format!("MCP server `{server}` is not configured")))?;
+            if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
+                return Err(bad_request(format!(
+                    "MCP server `{server}` is not configured for OAuth"
+                )));
+            }
+            ensure_mcp_ownership_available(
+                ctx,
+                &project_root,
+                [crate::mcp::auth::cred_key(&server)],
+            )
+            .await?;
+            let (flow, authorize_url) = crate::mcp::auth::begin_oauth_flow(&server, server_config)
+                .await
+                .map_err(internal)?;
+            let flow_id = uuid::Uuid::new_v4().to_string();
+            ctx.oauth_flows
+                .insert_mcp(
+                    flow_id.clone(),
+                    oauth_owner(state),
+                    McpOAuthPending {
+                        project_root,
+                        server,
+                        flow,
+                    },
+                )
+                .await;
+            Ok(Response::McpOAuthStarted {
+                flow_id,
+                authorize_url,
+            })
+        }
+
+        Request::CompleteMcpOAuth { flow_id, input } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent MCP OAuth logins",
+                ));
+            }
+            let owner = oauth_owner(state);
+            let pending = ctx
+                .oauth_flows
+                .take_mcp(&flow_id, &owner)
+                .await
+                .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
+            // Once claimed, this flow is one-shot. A provider exchange may have
+            // consumed its authorization code even if vault persistence fails,
+            // so it must not be reinserted for a second exchange.
+            let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
+                .await
+                .map_err(internal)?;
+            let record = serde_json::to_vec(&tokens).map_err(internal)?;
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let credential_key = crate::mcp::auth::cred_key(&pending.server);
+            let owner_root = pending.project_root.clone();
+            let vault = ctx.secret_vault.clone();
+            ctx.db
+                .transaction(move |conn| {
+                    // ATOMIC cross-kind admission for the flow-managed OAuth
+                    // token key. The `ensure_mcp_ownership_available` check ran
+                    // back at `StartMcpOAuth`; a provider (or another workspace)
+                    // could have claimed `mcp:<server>` during the OAuth round
+                    // trip. Re-check INSIDE this `BEGIN IMMEDIATE` transaction so
+                    // the completion cannot overwrite a foreign-owned secret. A
+                    // conflict fails closed (the token must be re-authorized)
+                    // rather than clobbering another owner's live value.
+                    reject_conflicting_named_ownership_on_conn(
+                        conn,
+                        &credential_key,
+                        "mcp",
+                        &owner_root,
+                    )?;
+                    vault
+                        .mutate_item_on_conn(
+                            conn,
+                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                            &credential_key,
+                            Some(&record),
+                        )
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO secret_named_ownership
+                         (item_id, owner_kind, project_root, created_at)
+                         VALUES (?1, 'mcp', ?2, ?3)",
+                        rusqlite::params![
+                            credential_key,
+                            owner_root,
+                            chrono::Utc::now().timestamp_millis()
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(map_named_secret_tx_error)?;
+            if let Err(error) = ctx.publish_owner_redaction_table() {
+                // Vault + ownership are committed. The exchange is one-shot,
+                // so rollback could orphan the already-authorized token;
+                // poison and fail closed until the daemon is restarted.
+                ctx.poison_redaction_publication(&error);
+                return Err(internal(error));
+            }
+            Ok(Response::McpOAuthCompleted {
+                authenticated: true,
+            })
+        }
+
+        Request::CancelMcpOAuth { flow_id } => {
+            let owner = oauth_owner(state);
+            let cancelled = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+            Ok(Response::McpOAuthCancelled { cancelled })
+        }
+
+        Request::DeleteProviderCredential {
+            provider_id,
+            project_root,
+        } => {
+            let request = Request::DeleteProviderCredential {
+                provider_id: provider_id.clone(),
+                project_root: project_root.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent provider credential writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+            if let Some(root) = project_root.as_deref() {
+                recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
+            }
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            // A CLI identifies a configured provider, never a hidden vault
+            // record name. Resolve that reference only inside the daemon so a
+            // custom OAuth provider cannot delete an unrelated record. The
+            // direct (`project_root: None`) path is the owner-settings mirror
+            // of `PutProviderCredential`: the owner supplies the raw vault
+            // record id and receives a plain `Ack`.
+            let (credential_record_id, response) = if let Some(project_root) =
+                project_root.as_deref()
+            {
+                let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+                let provider = config.providers.get(&provider_id).ok_or_else(|| {
+                    bad_request(format!("provider `{provider_id}` is not configured"))
+                })?;
+                if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                    return Err(bad_request(
+                        "provider credential logout is only available for OAuth providers",
+                    ));
+                }
+                let credential_record_id = provider.credential_ref.clone().ok_or_else(|| {
+                    bad_request(format!("provider `{provider_id}` has no credential_ref"))
+                })?;
+                let credential_present = ctx
+                    .secret_vault
+                    .get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                    )
+                    .is_ok();
+                (
+                    credential_record_id,
+                    Response::ProviderCredentialDeleted {
+                        found: credential_present,
+                        deleted: credential_present,
+                    },
+                )
+            } else {
+                (provider_id.clone(), Response::Ack)
+            };
+            match remote_operation {
+                Some(operation) => {
+                    mutate_owner_vault_item_with_remote_ledger(
+                        ctx,
+                        operation,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                        None,
+                        "delete_provider_credential",
+                        response,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                        None,
+                    )
+                    .map_err(internal)?;
+                    Ok(response)
+                }
+            }
+        }
+
+        Request::GetFlycockpitAccount => ctx
+            .flycockpit_account_view()
+            .map(|account| Response::FlycockpitAccount { account })
+            .map_err(internal),
+
+        Request::GetProviderCatalogSnapshot {
+            project_root,
+            provider_id,
+        } => provider_catalog_snapshot(ctx, &project_root, provider_id.as_deref()).await,
+
+        Request::FetchProviderModels {
+            project_root,
+            provider_id,
+            model_id,
+            deep,
+            on_unlisted,
+            allow_fallback,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider model fetches that persist config",
+                ));
+            }
+            let request = Request::FetchProviderModels {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+                deep,
+                on_unlisted,
+                allow_fallback,
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "fetch_provider_models",
+                        provider_models_fetch(
+                            ctx,
+                            &project_root,
+                            provider_id.as_deref(),
+                            model_id.as_deref(),
+                            deep,
+                            on_unlisted,
+                            allow_fallback,
+                            provider_env_snapshot(ctx, state),
+                        ),
+                    )
+                    .await
+                }
+                None => {
+                    provider_models_fetch(
+                        ctx,
+                        &project_root,
+                        provider_id.as_deref(),
+                        model_id.as_deref(),
+                        deep,
+                        on_unlisted,
+                        allow_fallback,
+                        provider_env_snapshot(ctx, state),
+                    )
+                    .await
+                }
+            }
+        }
+
+        Request::GetProviderUsageSnapshot {
+            project_root,
+            provider_id,
+        } => {
+            provider_usage_snapshot(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                provider_env_snapshot(ctx, state),
+            )
+            .await
+        }
+
+        Request::UpsertProviderConfig {
+            project_root,
+            provider_id,
+            entry,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            let request = Request::UpsertProviderConfig {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+                entry: entry.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "upsert_provider_config",
+                        provider_config_upsert(ctx, &project_root, &provider_id, entry),
+                    )
+                    .await
+                }
+                None => provider_config_upsert(ctx, &project_root, &provider_id, entry).await,
+            }
+        }
+
+        Request::SaveProviderConfig {
+            project_root,
+            provider_id,
+            entry,
+            header_secrets,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            let request = Request::SaveProviderConfig {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+                entry: entry.clone(),
+                header_secrets: header_secrets.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "save_provider_config",
+                        provider_config_save(
+                            ctx,
+                            &project_root,
+                            &provider_id,
+                            entry,
+                            header_secrets,
+                        ),
+                    )
+                    .await
+                }
+                None => {
+                    provider_config_save(ctx, &project_root, &provider_id, entry, header_secrets)
+                        .await
+                }
+            }
+        }
+
+        Request::SetupCopilotAuth {
+            project_root,
+            provider_id,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept Copilot auth setup",
+                ));
+            }
+            let request = Request::SetupCopilotAuth {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let operation_result = setup_copilot_auth(
+                ctx,
+                &project_root,
+                &provider_id,
+                provider_env_snapshot(ctx, state),
+            )
+            .await;
+            let operation_result = operation_result.map(|_| Response::Ack);
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(operation, ctx, "setup_copilot_auth", async {
+                        operation_result
+                    })
+                    .await
+                }
+                None => operation_result,
+            }
+        }
+
+        Request::ApplySetupWizard {
+            project_root,
+            wizard_id,
+            answers_json,
+        } => {
+            let result = crate::wizard::apply_setup_wizard_answers_authoritative(
+                std::path::Path::new(&project_root),
+                &wizard_id,
+                &answers_json,
+            )
+            .await
+            .map_err(internal)?;
+            Ok(Response::SetupWizardApplied {
+                changed: result.0,
+                model_file_written: result.1,
+                default_scope: result.2,
+            })
+        }
+
+        Request::SaveMcpConfig {
+            project_root,
+            config_json,
+            secret_values_json,
+            cleanup_names_json,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept MCP config writes",
+                ));
+            }
+            let request = Request::SaveMcpConfig {
+                project_root: project_root.clone(),
+                config_json: config_json.clone(),
+                secret_values_json: secret_values_json.clone(),
+                cleanup_names_json: cleanup_names_json.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let operation_result = save_mcp_config(
+                ctx,
+                &project_root,
+                &config_json,
+                &secret_values_json,
+                &cleanup_names_json,
+            );
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "save_mcp_config",
+                        operation_result,
+                    )
+                    .await
+                }
+                None => operation_result.await,
+            }
+        }
+
+        Request::DeleteProviderConfig {
+            project_root,
+            provider_id,
+            delete_stored_secrets,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            let request = Request::DeleteProviderConfig {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+                delete_stored_secrets,
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "delete_provider_config",
+                        provider_config_delete(
+                            ctx,
+                            &project_root,
+                            &provider_id,
+                            delete_stored_secrets,
+                        ),
+                    )
+                    .await
+                }
+                None => {
+                    provider_config_delete(ctx, &project_root, &provider_id, delete_stored_secrets)
+                        .await
+                }
+            }
+        }
+
+        Request::SetProviderLayerMetadata {
+            project_root,
+            category_defaults_json,
+            on_unlisted_models_fetch,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider metadata writes",
+                ));
+            }
+            let request = Request::SetProviderLayerMetadata {
+                project_root: project_root.clone(),
+                category_defaults_json: category_defaults_json.clone(),
+                on_unlisted_models_fetch,
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "set_provider_layer_metadata",
+                        provider_layer_metadata_set(
+                            ctx,
+                            &project_root,
+                            category_defaults_json,
+                            on_unlisted_models_fetch,
+                        ),
+                    )
+                    .await
+                }
+                None => {
+                    provider_layer_metadata_set(
+                        ctx,
+                        &project_root,
+                        category_defaults_json,
+                        on_unlisted_models_fetch,
+                    )
+                    .await
+                }
+            }
         }
 
         Request::DaemonStatus => Ok(Response::DaemonStatus {
@@ -5198,15 +6818,15 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             project_root,
             session_id,
             rotation,
-        } => list_leak_reports(&ctx, cursor, limit, project_root, session_id, rotation).await,
+        } => list_leak_reports(ctx, cursor, limit, project_root, session_id, rotation).await,
         Request::BeginLeakReveal { report_id } => {
-            begin_leak_reveal(&ctx, &state.principal, report_id).await
+            begin_leak_reveal(ctx, &state.principal, report_id).await
         }
         Request::MarkLeakRotated {
             report_id,
             rotation,
-        } => mark_leak_rotated(&ctx, report_id, rotation).await,
-        Request::DeleteLeakReport { report_id } => delete_leak_report(&ctx, report_id).await,
+        } => mark_leak_rotated(ctx, report_id, rotation).await,
+        Request::DeleteLeakReport { report_id } => delete_leak_report(ctx, report_id).await,
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,
@@ -5886,6 +7506,42 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             provider,
             model,
         } => guidance_estimate(&ctx, project_root, provider, model).await,
+        // Owner-only concurrent policy reads. Their ordering is declared
+        // `concurrent` in the command table (and asserted by
+        // `request_ordering_concurrent_set_is_exactly_the_enumerated_reads`), so
+        // they are routed here rather than to the serialized dispatch; implement
+        // them on this concurrent path so an owner export/read does not fall
+        // through to the "not marked concurrent" arm below.
+        Request::ExportPolicy { project_root } => {
+            let bundle_json = tokio::task::spawn_blocking(move || {
+                crate::policy::export(std::path::Path::new(&project_root))
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+            Ok(Response::PolicyExported { bundle_json })
+        }
+        Request::GetImageSpendPolicy { project_key } => {
+            let current = ctx
+                .db
+                .current_image_spend_policy(project_key)
+                .await
+                .map_err(internal)?;
+            Ok(Response::ImageSpendPolicy {
+                settings: current.as_ref().map(|policy| policy.settings.clone()),
+                policy_version: current.map(|policy| policy.policy_version),
+            })
+        }
+        // Owner-only catalog read. It resolves only from `ctx` (config source +
+        // vault) and takes its own config-publication lock, so it needs no
+        // per-connection session state and is safe to run concurrently. Its
+        // sibling `GetProviderUsageSnapshot` stays serialized because it needs
+        // the attached session's env overlay snapshot, which is not carried on
+        // the concurrent (shared) path.
+        Request::GetProviderCatalogSnapshot {
+            project_root,
+            provider_id,
+        } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("request `{request_kind}` is not marked concurrent"),
@@ -6004,7 +7660,2772 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
         .map_err(|message| ErrorPayload {
             code: ErrorCode::BadRequest,
             message: format!("invalid {} request: {message}", request.wire_tag()),
+        })?;
+    let owner_secret_error = match request {
+        Request::PutNamedSecret { name, .. } | Request::DeleteNamedSecret { name } => {
+            if name.trim().is_empty() {
+                Some("secret name must not be empty")
+            } else if name.contains('\0') {
+                Some("secret name contains NUL")
+            } else {
+                None
+            }
+        }
+        Request::PutProviderCredential {
+            provider_id,
+            record,
+        } => {
+            if provider_id.trim().is_empty() {
+                Some("provider id must not be empty")
+            } else if provider_id.contains('\0') {
+                Some("provider id contains NUL")
+            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+                || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+            {
+                Some("provider id is reserved")
+            } else if serde_json::from_str::<serde_json::Value>(record).is_err() {
+                Some("provider credential record must be valid JSON")
+            } else {
+                None
+            }
+        }
+        Request::DeleteProviderCredential { provider_id, .. } => {
+            if provider_id.trim().is_empty() {
+                Some("provider id must not be empty")
+            } else if provider_id.contains('\0') {
+                Some("provider id contains NUL")
+            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+                || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
+            {
+                Some("provider id is reserved")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(message) = owner_secret_error {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("invalid {} request: {message}", request.wire_tag()),
+        });
+    }
+    Ok(())
+}
+
+/// Load a provider configuration through the daemon's one injected,
+/// trust-aware resolver.  Settings and CLI callers deliberately never get a
+/// chance to resolve a credential-bearing config on their own.
+async fn daemon_provider_config(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<
+    (
+        std::path::PathBuf,
+        crate::config::trust::WorkspaceTrustPolicy,
+        crate::config::providers::ProvidersConfig,
+    ),
+    ErrorPayload,
+> {
+    let cwd = std::path::PathBuf::from(project_root);
+    if project_root.trim().is_empty() {
+        return Err(bad_request("project_root must not be empty"));
+    }
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+        .await
+        .map_err(internal)?;
+    let (config, _) = ctx
+        .config_source()
+        .load_effective_for_daemon(&cwd, &trust_policy)
+        .map_err(daemon_config_error)?;
+    Ok((cwd, trust_policy, config))
+}
+
+/// Use the attached session's authenticated RefreshEnv overlay when one is
+/// available. Detached owner RPCs fall back to the daemon-owned baseline. In
+/// neither case do provider operations consult the daemon process's stale
+/// startup environment directly.
+pub(super) fn provider_env_snapshot(
+    ctx: &DaemonContext,
+    state: &MutableClientState,
+) -> std::collections::HashMap<String, String> {
+    state
+        .attached
+        .as_ref()
+        .map(|attached| attached.handle.env_overlay_snapshot())
+        .unwrap_or_else(|| {
+            ctx.env_baseline
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .vars()
+                .clone()
         })
+}
+
+async fn provider_catalog_snapshot(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    if let Some(provider_id) = provider_id {
+        let Some(entry) = config.providers.remove(provider_id) else {
+            return Err(bad_request(format!(
+                "provider `{provider_id}` is not configured"
+            )));
+        };
+        config.providers.clear();
+        config.providers.insert(provider_id.to_string(), entry);
+    }
+    let mut view = crate::secret_ref::redact_provider_view(&config);
+    view.mcp_config_json = Some(redacted_mcp_config_json(ctx, &cwd, &trust_policy)?);
+    view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
+    bounded_provider_response(Response::ProviderCatalogSnapshot { config: view })
+}
+
+fn redacted_extended_config_json(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> std::result::Result<String, ErrorPayload> {
+    // Owner projection: resolve the extended config through the daemon's
+    // trust-aware config source rather than a direct disk primitive, so the
+    // session-config boundary ratchet holds and trust gating matches the
+    // provider snapshot resolved alongside it.
+    let (_, mut extended) = ctx
+        .config_source()
+        .load_with_trust(cwd, trust_policy)
+        .map_err(daemon_config_error)?;
+    extended.redact.denylist = extended
+        .redact
+        .denylist
+        .iter()
+        .map(|_| "[redacted]".to_string())
+        .collect();
+    extended.image_generation = extended.image_generation.redacted_for_snapshot();
+    serde_json::to_string(&extended).map_err(internal)
+}
+
+/// Project the layered MCP config for settings clients without returning any
+/// credential-bearing literal. The daemon still reads/parses the config at
+/// this owner boundary; the TUI receives only this sanitized projection.
+fn redacted_mcp_config_json(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> std::result::Result<String, ErrorPayload> {
+    let paths = daemon_mcp_paths(ctx, cwd, trust_policy)?;
+    let mut config = mcp_config_from_paths(&paths)?;
+    for server in config.servers.values_mut() {
+        server.endpoint = server
+            .endpoint
+            .as_deref()
+            .map(cockpit_proto::redact_url_for_owner_view);
+        server.env = server
+            .env
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    if value.trim_start().starts_with('$') {
+                        value.clone()
+                    } else {
+                        "[redacted]".to_string()
+                    },
+                )
+            })
+            .collect();
+        match &mut server.auth {
+            crate::mcp::config::Auth::Header(header) => {
+                if !header.value.trim_start().starts_with('$') {
+                    header.value = "[redacted]".to_string();
+                }
+            }
+            crate::mcp::config::Auth::Env(env) => {
+                env.vars = env
+                    .vars
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            if value.trim_start().starts_with('$') {
+                                value.clone()
+                            } else {
+                                "[redacted]".to_string()
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            crate::mcp::config::Auth::Oauth(oauth) => {
+                oauth.authorize_url = oauth
+                    .authorize_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+                oauth.token_url = oauth
+                    .token_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+            }
+            crate::mcp::config::Auth::None => {}
+        }
+    }
+    serde_json::to_string(&config).map_err(internal)
+}
+
+// Model fetch is parameterized by provider/model selectors plus the fetch-mode
+// flags and the resolved env; bundling them into a struct buys nothing but
+// churn for a cosmetic lint, so allow the count.
+#[allow(clippy::too_many_arguments)]
+async fn provider_models_fetch(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    deep: bool,
+    on_unlisted: Option<crate::config::providers::OnUnlistedModelsFetch>,
+    allow_fallback: bool,
+    env: std::collections::HashMap<String, String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    // Finish an older save/delete intent before deciding whether this request
+    // owns a layer entry.  A crash after the file replacement must not turn a
+    // later delete into an early no-op that forgets its vault cleanup.
+    recover_provider_config_journals(ctx, project_root, provider_id).await?;
+    let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    // An all-provider probe is one user-visible operation.  Keep its original
+    // catalog until every selected provider has yielded a durable-safe result:
+    // persisting the early successes after a later failure would make a retry
+    // repeat paid probes against a partially updated catalog.
+    let original_config = config.clone();
+    let provider_ids = match provider_id {
+        Some(provider_id) => {
+            if !config.providers.contains_key(provider_id) {
+                return Err(bad_request(format!(
+                    "provider `{provider_id}` is not configured"
+                )));
+            }
+            vec![provider_id.to_string()]
+        }
+        None => config.providers.keys().cloned().collect::<Vec<_>>(),
+    };
+    if provider_ids.is_empty() {
+        return bounded_provider_response(Response::ProviderModelsFetched {
+            results: Vec::new(),
+            config: crate::secret_ref::redact_provider_view(&config),
+        });
+    }
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .map_err(internal)?;
+    let selected_policy = on_unlisted
+        .or(config.on_unlisted_models_fetch)
+        .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep);
+    let mut changed_provider_ids = std::collections::BTreeSet::new();
+    let results = if deep {
+        let (results, completed_provider_ids) =
+            daemon_deep_provider_fetch(&mut config, &provider_ids, model_id, store.clone(), &env)
+                .await?;
+        // A failed provider may have completed an earlier target before its
+        // later probe failed. Do not expose or persist that ambiguous partial
+        // mutation; retain the original provider snapshot and account only
+        // for providers whose complete target set finished successfully.
+        for result in &results {
+            if matches!(
+                &result.outcome,
+                crate::daemon::proto::ProviderModelFetchOutcome::Error { .. }
+            ) && let Some(original) = original_config.providers.get(&result.provider_id)
+            {
+                config
+                    .providers
+                    .insert(result.provider_id.clone(), original.clone());
+            }
+        }
+        changed_provider_ids.extend(completed_provider_ids);
+        results
+    } else {
+        let mut results = Vec::with_capacity(provider_ids.len());
+        for provider_id in provider_ids {
+            let entry = config
+                .providers
+                .get(&provider_id)
+                .expect("selected provider")
+                .clone();
+            let resolved =
+                crate::providers::models_fetch::resolve_provider_request_async_with_store(
+                    &provider_id,
+                    &entry,
+                    store.clone(),
+                    |name| env.get(name).cloned(),
+                )
+                .await
+                .map_err(internal)?;
+            let fetched = crate::providers::models_fetch::fetch_models_for_provider_with_store(
+                &provider_id,
+                &entry,
+                &resolved,
+                std::time::Duration::from_secs(15),
+                Some(store.clone()),
+            )
+            .await;
+            let outcome = match fetched {
+                Ok(crate::providers::models_fetch::FetchOutcome::Models { models, catalog }) => {
+                    let mut updated = entry.clone();
+                    let unlisted = entry
+                        .models
+                        .iter()
+                        .filter(|old| !models.iter().any(|fetched| fetched.id == old.id))
+                        .collect::<Vec<_>>();
+                    // Ask is an explicit decision point. Do not persist a
+                    // fetched list while silently dropping local entries;
+                    // the client must retry with Keep or Remove.
+                    if selected_policy == crate::config::providers::OnUnlistedModelsFetch::Ask
+                        && !unlisted.is_empty()
+                    {
+                        results.push(crate::daemon::proto::ProviderModelFetchResult {
+                            provider_id,
+                            outcome: crate::daemon::proto::ProviderModelFetchOutcome::UnlistedModelsPreview {
+                                unlisted_count: u32::try_from(unlisted.len()).unwrap_or(u32::MAX),
+                            },
+                        });
+                        continue;
+                    }
+                    let merge_policy = match selected_policy {
+                        crate::config::providers::OnUnlistedModelsFetch::Remove => {
+                            crate::config::providers::ModelMergePolicy::RemoveUnlisted
+                        }
+                        crate::config::providers::OnUnlistedModelsFetch::Ask
+                        | crate::config::providers::OnUnlistedModelsFetch::Keep => {
+                            crate::config::providers::ModelMergePolicy::KeepUnlisted
+                        }
+                    };
+                    updated.models = crate::config::providers::merge_fetched_models_with_policy(
+                        updated.effective_template(&provider_id),
+                        &entry.models,
+                        models.clone(),
+                        merge_policy,
+                    );
+                    updated.models_fetched_at = Some(chrono::Utc::now());
+                    updated.model_catalog = catalog;
+                    config.providers.insert(provider_id.clone(), updated);
+                    changed_provider_ids.insert(provider_id.clone());
+                    crate::daemon::proto::ProviderModelFetchOutcome::Models { models, catalog }
+                }
+                Ok(crate::providers::models_fetch::FetchOutcome::FallbackAvailable {
+                    models,
+                    catalog,
+                    reason,
+                }) => {
+                    let reason = crate::config::providers::redact_model_fetch_reason(reason);
+                    if allow_fallback {
+                        let mut updated = entry.clone();
+                        let merge_policy = match selected_policy {
+                            crate::config::providers::OnUnlistedModelsFetch::Remove => {
+                                crate::config::providers::ModelMergePolicy::RemoveUnlisted
+                            }
+                            crate::config::providers::OnUnlistedModelsFetch::Ask
+                            | crate::config::providers::OnUnlistedModelsFetch::Keep => {
+                                crate::config::providers::ModelMergePolicy::KeepUnlisted
+                            }
+                        };
+                        updated.models = crate::config::providers::merge_fetched_models_with_policy(
+                            updated.effective_template(&provider_id),
+                            &entry.models,
+                            models.clone(),
+                            merge_policy,
+                        );
+                        updated.models_fetched_at = Some(chrono::Utc::now());
+                        updated.model_catalog = catalog;
+                        updated.mark_model_fetch_fallback(reason.clone());
+                        config.providers.insert(provider_id.clone(), updated);
+                        changed_provider_ids.insert(provider_id.clone());
+                    } else {
+                        // Preserve the live catalog and persist only the
+                        // failure marker. A later --allow-fallback retry can
+                        // safely activate the returned fallback catalog.
+                        let mut updated = entry.clone();
+                        updated.mark_model_fetch_failed_kept_existing(reason.clone());
+                        config.providers.insert(provider_id.clone(), updated);
+                        changed_provider_ids.insert(provider_id.clone());
+                    }
+                    crate::daemon::proto::ProviderModelFetchOutcome::FallbackAvailable {
+                        models,
+                        catalog,
+                        reason,
+                    }
+                }
+                Ok(crate::providers::models_fetch::FetchOutcome::Unsupported) => {
+                    crate::daemon::proto::ProviderModelFetchOutcome::Unsupported
+                }
+                Err(error) => crate::daemon::proto::ProviderModelFetchOutcome::Error {
+                    message: crate::config::providers::redact_model_fetch_reason(error.to_string()),
+                },
+            };
+            results.push(crate::daemon::proto::ProviderModelFetchResult {
+                provider_id,
+                outcome,
+            });
+        }
+        results
+    };
+    let aggregate_fetch_failed = provider_id.is_none()
+        && results.iter().any(|result| {
+            matches!(
+                &result.outcome,
+                crate::daemon::proto::ProviderModelFetchOutcome::Error { .. }
+            )
+        });
+    if aggregate_fetch_failed && !deep {
+        config = original_config;
+        changed_provider_ids.clear();
+    }
+    if let Some(on_unlisted) = on_unlisted {
+        // Keep the aggregate operation all-or-nothing at the config boundary.
+        // A caller can make the policy update explicitly rather than coupling
+        // it to a failed multi-provider network probe.
+        if !aggregate_fetch_failed {
+            config.on_unlisted_models_fetch = Some(on_unlisted);
+        }
+    }
+    // Build and bound the exact response before any persistence. Otherwise a
+    // large fetched catalog could become durable while the caller receives an
+    // error and therefore cannot distinguish a safe retry from a replay.
+    let response = Response::ProviderModelsFetched {
+        results,
+        config: crate::secret_ref::redact_provider_view(&config),
+    };
+    let response =
+        bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
+    for provider_id in changed_provider_ids {
+        let entry = config
+            .providers
+            .get(&provider_id)
+            .expect("changed provider remains configured")
+            .clone();
+        persist_daemon_provider(&cwd, &trust_policy, ctx, &provider_id, entry)?;
+    }
+    if let Some(on_unlisted) = on_unlisted.filter(|_| !aggregate_fetch_failed) {
+        persist_provider_layer_metadata(
+            &cwd,
+            &trust_policy,
+            ctx,
+            config.category_defaults.clone(),
+            on_unlisted,
+        )?;
+    }
+    Ok(response)
+}
+
+async fn daemon_deep_provider_fetch(
+    config: &mut crate::config::providers::ProvidersConfig,
+    provider_ids: &[String],
+    model_id: Option<&str>,
+    store: crate::credentials::CredentialStore,
+    env: &std::collections::HashMap<String, String>,
+) -> std::result::Result<
+    (
+        Vec<crate::daemon::proto::ProviderModelFetchResult>,
+        std::collections::BTreeSet<String>,
+    ),
+    ErrorPayload,
+> {
+    use crate::providers::deepfetch::{
+        DeepfetchScope, HttpDeepfetchProbeClient, collect_deepfetch_targets, probe_target,
+    };
+    let scope = DeepfetchScope {
+        provider: (provider_ids.len() == 1).then(|| provider_ids[0].clone()),
+        model: model_id.map(str::to_string),
+    };
+    let targets = collect_deepfetch_targets(config, &scope).map_err(internal)?;
+    let mut resolved = std::collections::BTreeMap::new();
+    let mut failures = std::collections::BTreeMap::new();
+    for target in &targets {
+        if resolved.contains_key(&target.provider_id) {
+            continue;
+        }
+        let entry = config
+            .providers
+            .get(&target.provider_id)
+            .expect("deepfetch target provider");
+        let request = crate::providers::models_fetch::resolve_provider_request_async_with_store(
+            &target.provider_id,
+            entry,
+            store.clone(),
+            |name| env.get(name).cloned(),
+        )
+        .await;
+        match request {
+            Ok(request) => {
+                resolved.insert(target.provider_id.clone(), request);
+            }
+            Err(error) => {
+                failures.insert(
+                    target.provider_id.clone(),
+                    crate::config::providers::redact_model_fetch_reason(error.to_string()),
+                );
+            }
+        }
+    }
+    let mut client = HttpDeepfetchProbeClient::new(resolved, std::time::Duration::from_secs(20));
+    for target in &targets {
+        if failures.contains_key(&target.provider_id) {
+            continue;
+        }
+        if let Err(error) = probe_target(&mut client, config, target).await {
+            failures.insert(
+                target.provider_id.clone(),
+                crate::config::providers::redact_model_fetch_reason(error.to_string()),
+            );
+        }
+    }
+    // Persistence happens only after the caller has a bounded complete
+    // response; see `provider_models_fetch`.
+    let completed = provider_ids
+        .iter()
+        .filter(|provider_id| !failures.contains_key(*provider_id))
+        .filter(|provider_id| {
+            targets
+                .iter()
+                .any(|target| &target.provider_id == *provider_id)
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok((
+        provider_ids
+            .iter()
+            .filter_map(|provider_id| {
+                config.providers.get(provider_id).map(|entry| {
+                    let outcome = failures.get(provider_id).map_or_else(
+                        || crate::daemon::proto::ProviderModelFetchOutcome::Models {
+                            models: entry.models.clone(),
+                            catalog: entry.model_catalog,
+                        },
+                        |message| crate::daemon::proto::ProviderModelFetchOutcome::Error {
+                            message: message.clone(),
+                        },
+                    );
+                    crate::daemon::proto::ProviderModelFetchResult {
+                        provider_id: provider_id.clone(),
+                        outcome,
+                    }
+                })
+            })
+            .collect(),
+        completed,
+    ))
+}
+
+async fn provider_usage_snapshot(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    env: std::collections::HashMap<String, String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .map_err(internal)?;
+    let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
+        &config,
+        provider_id,
+        Some(store.clone()),
+        env.clone(),
+    )
+    .await
+    .map_err(internal)?;
+    bounded_provider_response(Response::ProviderUsageSnapshot {
+        snapshots: rows
+            .into_iter()
+            .map(|row| provider_usage_view(row, &store, &config, &env))
+            .collect(),
+    })
+}
+
+/// Provider catalog, discovery, and usage responses all travel on the
+/// interactive RPC lane.  Reject an oversized complete response before it is
+/// handed to the transport: sending a prefix (or relying on a later transport
+/// failure) would make the client observe ambiguous partial state.
+pub(super) fn bounded_provider_response(
+    response: Response,
+) -> std::result::Result<Response, ErrorPayload> {
+    let encoded = serde_json::to_vec(&response).map_err(internal)?;
+    if encoded.len() > proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES {
+        return Err(bad_request(
+            "provider response exceeds the interactive payload limit; narrow the provider or model selection",
+        ));
+    }
+    Ok(response)
+}
+
+fn validate_unique_provider_header_names(
+    headers: &[crate::config::providers::HeaderSpec],
+) -> std::result::Result<(), ErrorPayload> {
+    let mut names = std::collections::BTreeSet::new();
+    for header in headers {
+        let normalized = header.name.trim().to_ascii_lowercase();
+        if !names.insert(normalized) {
+            return Err(bad_request(
+                "provider header names must be unique (case-insensitive)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn provider_usage_view(
+    row: crate::providers::usage::ProviderUsageSnapshot,
+    store: &crate::credentials::CredentialStore,
+    config: &crate::config::providers::ProvidersConfig,
+    env: &std::collections::HashMap<String, String>,
+) -> crate::daemon::proto::ProviderUsageSnapshotView {
+    use crate::daemon::proto::{ProviderUsageAvailabilityView as Wire, ProviderUsageWindowView};
+    use crate::providers::usage::UsageAvailability;
+    let availability = match row.availability {
+        UsageAvailability::Fetched {
+            source,
+            plan,
+            windows,
+            details,
+        } => Wire::Fetched {
+            source: source.to_string(),
+            plan: plan.map(|value| redact_provider_response_text(&value, store, config, env)),
+            windows: windows
+                .into_iter()
+                .enumerate()
+                .map(|(index, window)| ProviderUsageWindowView {
+                    label: format!("window {}", index + 1),
+                    used_percent: window.used_percent,
+                    reset_at: window.reset_at,
+                    detail: window
+                        .detail
+                        .map(|value| redact_provider_response_text(&value, store, config, env)),
+                })
+                .collect(),
+            details: details
+                .into_iter()
+                .map(|value| redact_provider_response_text(&value, store, config, env))
+                .collect(),
+        },
+        UsageAvailability::Unsupported { reason } => Wire::Unsupported {
+            reason: redact_provider_response_text(reason, store, config, env),
+        },
+        UsageAvailability::Unavailable {
+            reason,
+            hint_url: _hint_url,
+        } => Wire::Unavailable {
+            reason: redact_provider_response_text(&reason, store, config, env),
+            hint_url: None,
+        },
+        UsageAvailability::Error { message } => Wire::Error {
+            message: redact_provider_response_text(&message, store, config, env),
+        },
+    };
+    crate::daemon::proto::ProviderUsageSnapshotView {
+        provider_id: redact_provider_response_text(&row.provider_id, store, config, env),
+        display_name: redact_provider_response_text(&row.display_name, store, config, env),
+        fetched_at: row.fetched_at,
+        availability,
+    }
+}
+
+fn redact_provider_response_text(
+    text: &str,
+    store: &crate::credentials::CredentialStore,
+    config: &crate::config::providers::ProvidersConfig,
+    env: &std::collections::HashMap<String, String>,
+) -> String {
+    redact_provider_response_text_with_values(
+        text,
+        provider_response_secret_values(store, config, env),
+    )
+}
+
+pub(super) fn redact_provider_response_text_with_values(
+    text: &str,
+    secret_values: impl IntoIterator<Item = String>,
+) -> String {
+    let mut value = text.to_string();
+    for secret in secret_values {
+        if !secret.is_empty() {
+            value = value.replace(&secret, "[redacted]");
+        }
+    }
+    crate::config::providers::redact_model_fetch_reason(value)
+}
+
+/// Provider APIs can reflect credentials in error, quota, and even catalog
+/// fields. Header-backed environment values therefore join vault values in
+/// the daemon's response scrubber.
+fn provider_response_secret_values(
+    store: &crate::credentials::CredentialStore,
+    config: &crate::config::providers::ProvidersConfig,
+    env: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    let mut values = store
+        .named_secret_entries()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain(store.provider_credential_entries())
+        .chain(store.provider_credential_leaf_entries())
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    values.extend(configured_provider_env_values(config, |name| {
+        env.get(name).cloned()
+    }));
+    values
+}
+
+pub(super) fn configured_provider_env_values<F>(
+    config: &crate::config::providers::ProvidersConfig,
+    lookup: F,
+) -> std::collections::BTreeSet<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    config
+        .providers
+        .values()
+        .flat_map(|entry| &entry.headers)
+        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .filter(|name| !name.starts_with("secret:"))
+        .filter_map(|name| lookup(&name))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Fetch results contain upstream-owned strings such as model labels and
+/// diagnostics. Traverse their typed wire representation as a final barrier
+/// so a reflected environment credential cannot reach a client.
+pub(super) fn scrub_provider_response(
+    response: Response,
+    config: &crate::config::providers::ProvidersConfig,
+    store: &crate::credentials::CredentialStore,
+    env: &std::collections::HashMap<String, String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    fn scrub_value(value: &mut serde_json::Value, secret_values: &[String]) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text =
+                    redact_provider_response_text_with_values(text, secret_values.iter().cloned());
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    scrub_value(item, secret_values);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for value in fields.values_mut() {
+                    scrub_value(value, secret_values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let secret_values = provider_response_secret_values(store, config, env)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut value = serde_json::to_value(response).map_err(internal)?;
+    scrub_value(&mut value, &secret_values);
+    serde_json::from_value(value).map_err(internal)
+}
+
+async fn provider_config_upsert(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    mut entry: crate::config::providers::ProviderEntry,
+) -> std::result::Result<Response, ErrorPayload> {
+    if provider_id.trim().is_empty() {
+        return Err(bad_request("provider_id must not be empty"));
+    }
+    // Upsert is also used by redacted settings projections. A missing
+    // credential_ref means “unchanged” in that projection, never removal.
+    if entry.credential_ref.is_none() {
+        let (_, _, current) = daemon_provider_config(ctx, project_root).await?;
+        if let Some(existing) = current.providers.get(provider_id) {
+            entry.credential_ref = existing.credential_ref.clone();
+        }
+    }
+    let header_secrets = vec![None; entry.headers.len()];
+    provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await
+}
+
+/// Configure Copilot without exposing its credential to a client.  The daemon
+/// is the only component allowed to inspect its environment and the only
+/// component that stages the resulting secret through `provider_config_save`.
+async fn setup_copilot_auth(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    env: std::collections::HashMap<String, String>,
+) -> std::result::Result<(), ErrorPayload> {
+    let token = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| env.get(name).filter(|value| !value.trim().is_empty()))
+        .cloned()
+        .ok_or_else(|| {
+            bad_request(
+                "Copilot authentication is unavailable in the daemon environment; set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN for the daemon",
+            )
+        })?;
+    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    let mut entry = config
+        .providers
+        .get(provider_id)
+        .cloned()
+        .ok_or_else(|| bad_request(format!("provider `{provider_id}` is not configured")))?;
+    let auth_index = entry
+        .headers
+        .iter()
+        .position(|header| header.name.eq_ignore_ascii_case("authorization"));
+    let mut header_secrets = vec![None; entry.headers.len()];
+    let index = if let Some(index) = auth_index {
+        index
+    } else {
+        entry.headers.push(crate::config::providers::HeaderSpec {
+            name: "Authorization".into(),
+            value: "$secret:copilot".into(),
+        });
+        header_secrets.push(None);
+        entry.headers.len() - 1
+    };
+    header_secrets[index] = Some(token);
+    provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderConfigJournal {
+    journal_id: String,
+    provider_id: String,
+    action: String,
+    entry_json: Option<String>,
+    cleanup_named_json: String,
+    cleanup_credential_json: String,
+}
+
+fn provider_owned_secret_references(
+    entry: &crate::config::providers::ProviderEntry,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let named = entry
+        .headers
+        .iter()
+        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+        .collect();
+    let credentials = entry.credential_ref.iter().cloned().collect();
+    (named, credentials)
+}
+
+/// Upsert is a reference-only provider write. A caller may not introduce an
+/// arbitrary `$secret:` name unless the daemon already has a durable provider
+/// claim for it (staged provider saves create that claim transactionally).
+/// This prevents a config-only write from acquiring an untracked vault row
+/// that later delete/recovery paths cannot safely account for.
+async fn ensure_provider_named_references_claimed(
+    ctx: &DaemonContext,
+    project_root: &str,
+    entry: &crate::config::providers::ProviderEntry,
+) -> std::result::Result<(), ErrorPayload> {
+    let (names, _) = provider_owned_secret_references(entry);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let root = project_root.to_owned();
+    let names = names.into_iter().collect::<Vec<_>>();
+    for name in names {
+        if ctx
+            .secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                &name,
+            )
+            .is_err()
+        {
+            return Err(bad_request(format!(
+                "provider secret reference `{name}` is not a daemon-owned staged secret"
+            )));
+        }
+        let name_for_query = name.clone();
+        let root_for_query = root.clone();
+        let claimed = ctx
+            .db
+            .read(move |conn| {
+                let claimed = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM secret_named_ownership
+                         WHERE item_id = ?1 AND owner_kind = 'provider' AND project_root = ?2
+                     )",
+                    rusqlite::params![name_for_query, root_for_query],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok(claimed)
+            })
+            .await
+            .map_err(internal)?;
+        if !claimed {
+            return Err(bad_request(format!(
+                "provider secret reference `{name}` has no durable provider claim"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_provider_credential_reference_available(
+    ctx: &DaemonContext,
+    entry: &crate::config::providers::ProviderEntry,
+) -> std::result::Result<(), ErrorPayload> {
+    if let Some(reference) = entry.credential_ref.as_deref()
+        && ctx
+            .secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                reference,
+            )
+            .is_err()
+    {
+        return Err(bad_request(format!(
+            "provider credential reference `{reference}` is not present in the daemon vault"
+        )));
+    }
+    Ok(())
+}
+
+/// Only names minted by a provider-save operation are safe for automatic
+/// cleanup. The vault is shared by all workspaces, while journal rows are
+/// scoped to one workspace; a journal cannot prove that a user-chosen name
+/// is unowned elsewhere without a global ownership index. Provider saves use
+/// `provider-{slug}-{journal UUID}-{index}`.
+fn is_operation_owned_secret_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("provider-") else {
+        return false;
+    };
+    let parts = rest.split('-').collect::<Vec<_>>();
+    parts
+        .windows(5)
+        .any(|window| Uuid::parse_str(&window.join("-")).is_ok())
+}
+
+#[cfg(test)]
+mod operation_owned_secret_tests {
+    use super::{
+        is_operation_owned_secret_name, mcp_secret_references,
+        validate_unique_provider_header_names,
+    };
+
+    #[test]
+    fn only_provider_journal_names_are_eligible_for_automatic_cleanup() {
+        assert!(is_operation_owned_secret_name(
+            "provider-openai-018f0f2e-6c3b-7b42-ae1a-8e2b8a6f4d11-0"
+        ));
+        assert!(!is_operation_owned_secret_name("mcp:server:header"));
+        assert!(!is_operation_owned_secret_name(
+            "provider-openai-user-token"
+        ));
+        assert!(!is_operation_owned_secret_name("mcp:server"));
+        assert!(!is_operation_owned_secret_name("user-chosen-token"));
+    }
+
+    #[test]
+    fn provider_header_names_are_unique_case_insensitively() {
+        let unique = vec![
+            crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:one".into(),
+            },
+            crate::config::providers::HeaderSpec {
+                name: "X-Trace".into(),
+                value: "$secret:two".into(),
+            },
+        ];
+        assert!(validate_unique_provider_header_names(&unique).is_ok());
+
+        let duplicate = vec![
+            crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "********".into(),
+            },
+            crate::config::providers::HeaderSpec {
+                name: "authorization".into(),
+                value: "********".into(),
+            },
+        ];
+        let error = validate_unique_provider_header_names(&duplicate).unwrap_err();
+        assert_eq!(error.code, cockpit_proto::ErrorCode::BadRequest);
+        assert!(error.message.contains("case-insensitive"));
+    }
+
+    #[test]
+    fn mcp_oauth_servers_protect_their_named_token_reference() {
+        let server: crate::mcp::config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "transport": "streamable",
+            "auth": { "kind": "oauth" }
+        }))
+        .expect("valid MCP OAuth server");
+        let refs = mcp_secret_references("example", &server);
+        assert!(refs.contains(&crate::mcp::auth::cred_key("example")));
+    }
+}
+
+pub(super) async fn recover_provider_config_journals(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+) -> std::result::Result<(), ErrorPayload> {
+    let project_root = project_root.to_string();
+    let provider_id = provider_id.map(str::to_string);
+    let project_root_query = project_root.clone();
+    let journals = ctx
+        .db
+        .read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT journal_id, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json
+                 FROM provider_config_journals WHERE project_root = ?1 AND (?2 IS NULL OR provider_id = ?2)
+                 ORDER BY created_at, journal_id",
+            )?;
+            statement
+                .query_map(rusqlite::params![project_root_query, provider_id], |row| {
+                    Ok(ProviderConfigJournal {
+                        journal_id: row.get(0)?,
+                        provider_id: row.get(1)?,
+                        action: row.get(2)?,
+                        entry_json: row.get(3)?,
+                        cleanup_named_json: row.get(4)?,
+                        cleanup_credential_json: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    for journal in journals {
+        let (cwd, trust_policy, _) = daemon_provider_config(ctx, project_root.as_str()).await?;
+        match journal.action.as_str() {
+            "save" => {
+                let entry: crate::config::providers::ProviderEntry =
+                    serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
+                        bad_request("provider save journal is missing its reference-only entry")
+                    })?)
+                    .map_err(internal)?;
+                // Recovery re-applies a journaled entry, but a journaled entry
+                // is NOT trusted to still be valid at replay time — it must run
+                // the SAME validation funnel as the create path
+                // (`provider_config_save`). Between journaling and recovery a
+                // referenced credential record or named secret can be logged
+                // out / deleted (dead reference), and the URL/header invariants
+                // must still hold. On any validation failure we FAIL CLOSED:
+                // the `?` aborts before the journal-deletion below, so the
+                // journal is RETAINED for a later attempt rather than
+                // republishing config that points at a dead reference.
+                validate_daemon_provider_url(&entry.url)?;
+                validate_unique_provider_header_names(&entry.headers)?;
+                ensure_provider_named_references_claimed(ctx, project_root.as_str(), &entry)
+                    .await?;
+                ensure_provider_credential_reference_available(ctx, &entry).await?;
+                persist_daemon_provider(&cwd, &trust_policy, ctx, &journal.provider_id, entry)?;
+            }
+            "delete" => {
+                let path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                    ctx.config_source()
+                        .config_write_target_for_provider(&cwd, &journal.provider_id)
+                })
+                .ok_or_else(|| bad_request("no cockpit config found"))?;
+                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                let mut layer = doc.providers();
+                if layer.providers.remove(&journal.provider_id).is_some() {
+                    doc.write(&layer).map_err(internal)?;
+                }
+            }
+            _ => return Err(bad_request("provider config journal has an invalid action")),
+        }
+        let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
+        let mut named: std::collections::BTreeSet<String> =
+            serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
+        let mut credentials: std::collections::BTreeSet<String> =
+            serde_json::from_str(&journal.cleanup_credential_json).map_err(internal)?;
+        for provider in effective.providers.values() {
+            let (used_named, used_credentials) = provider_owned_secret_references(provider);
+            for name in used_named {
+                named.remove(&name);
+            }
+            for reference in used_credentials {
+                credentials.remove(&reference);
+            }
+        }
+        // MCP and provider entries share the named-secret namespace. A
+        // provider journal must not delete a name still live in MCP config.
+        for name in mcp_global_live_secret_references(ctx, project_root.as_str()).await? {
+            named.remove(&name);
+        }
+        let live_credentials =
+            provider_global_live_credential_references(ctx, project_root.as_str()).await?;
+        let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+        for name in named {
+            if !is_operation_owned_secret_name(&name) {
+                continue;
+            }
+            if !release_named_secret_ownership(ctx, &name, "provider", &project_root).await? {
+                retire_named_secret_ownership(ctx, &name, "provider", &project_root).await?;
+                continue;
+            }
+            delete_owned_named_secret(ctx, &name, "provider", &project_root).await?;
+        }
+        for reference in credentials {
+            let sole_claim =
+                release_credential_ownership(ctx, &reference, &journal.provider_id, &project_root)
+                    .await?;
+            retire_credential_ownership(ctx, &reference, &journal.provider_id, &project_root)
+                .await?;
+            if !live_credentials.contains(&reference) && sole_claim.is_none_or(|sole| sole) {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &reference,
+                    None,
+                )
+                .map_err(internal)?;
+            }
+        }
+        let journal_id = journal.journal_id;
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM provider_config_journals WHERE journal_id = ?1",
+                    rusqlite::params![journal_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+pub(super) async fn recover_all_provider_config_journals(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let roots: Vec<String> = ctx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_root FROM provider_config_journals
+                 UNION SELECT project_root FROM secret_named_ownership
+                 UNION SELECT project_root FROM secret_credential_ownership
+                 ORDER BY project_root",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    for root in roots {
+        recover_provider_config_journals(ctx, &root, None).await?;
+    }
+    Ok(())
+}
+
+/// Compensate a staged provider save in one SQLite transaction.  The vault
+/// rows and their recovery journal are one durable unit: if any deletion or
+/// the journal retirement fails, SQLite rolls back every deletion and leaves
+/// the journal available for recovery on the next daemon start.
+async fn compensate_provider_config_save(
+    ctx: &DaemonContext,
+    journal_id: &str,
+    staged_named: &[String],
+    credential_ref: Option<&str>,
+) -> std::result::Result<(), ErrorPayload> {
+    let journal_id = journal_id.to_owned();
+    let staged_named = staged_named.to_vec();
+    let credential_ref = credential_ref.map(str::to_owned);
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            for name in &staged_named {
+                vault
+                    .delete_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        name,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                conn.execute(
+                    "DELETE FROM secret_named_ownership
+                     WHERE item_id = ?1 AND owner_kind = 'provider'
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)
+                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?2)",
+                    rusqlite::params![name, journal_id],
+                )?;
+            }
+            if let Some(reference) = credential_ref {
+                conn.execute(
+                    "DELETE FROM secret_credential_ownership
+                     WHERE item_id = ?1
+                       AND provider_id = (SELECT provider_id FROM provider_config_journals WHERE journal_id = ?2)
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)
+                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?2)",
+                    rusqlite::params![reference, journal_id],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM provider_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn provider_config_save(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    mut entry: crate::config::providers::ProviderEntry,
+    mut header_secrets: Vec<Option<String>>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    // Defense in depth: typed in-process callers must not be able to bypass
+    // the protocol ingress validator and journal a credential-bearing URL.
+    validate_daemon_provider_url(&entry.url)?;
+    validate_unique_provider_header_names(&entry.headers)?;
+    recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
+    if header_secrets.len() != entry.headers.len() {
+        return Err(bad_request(
+            "provider header secret count does not match headers",
+        ));
+    }
+    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    let old_references = config
+        .providers
+        .get(provider_id)
+        .map(provider_owned_secret_references)
+        .unwrap_or_default();
+    // Validate only references present in the caller's projection. Header
+    // secrets staged below intentionally receive new daemon-owned names that
+    // do not exist until the journal/vault transaction commits.
+    ensure_provider_named_references_claimed(ctx, project_root, &entry).await?;
+    // Settings receives only redacted header values after a successful save.
+    // Treat its non-secret marker as an instruction to retain the daemon's
+    // existing value; otherwise every subsequent save would either rotate or
+    // fail validation despite no user edit.
+    if let Some(old_entry) = config.providers.get(provider_id) {
+        validate_unique_provider_header_names(&old_entry.headers)?;
+        for (index, header) in entry.headers.iter_mut().enumerate() {
+            if header.value.trim() == "********"
+                && let Some(old_header) = old_entry
+                    .headers
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&header.name))
+            {
+                header.value.clone_from(&old_header.value);
+            }
+            // A redacted snapshot intentionally omits legacy literal values.
+            // If the marker restored the daemon's old literal, stage that
+            // value here so migration remains daemon-owned and atomic.
+            if header_secrets[index].is_none()
+                && !header.value.trim().is_empty()
+                && !crate::config::providers::is_safe_provider_header_reference(
+                    &header.name.to_ascii_lowercase(),
+                    &header.value,
+                )
+            {
+                header_secrets[index] = Some(header.value.clone());
+            }
+        }
+    }
+    let journal_id = Uuid::now_v7().to_string();
+    let provider_slug = provider_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(48)
+        .collect::<String>();
+    let mut staged = Vec::new();
+    for (index, (header, secret)) in entry.headers.iter_mut().zip(header_secrets).enumerate() {
+        if let Some(secret) = secret {
+            if secret.is_empty() {
+                return Err(bad_request("provider header secret must not be empty"));
+            }
+            let name = format!("provider-{}-{}-{index}", provider_slug, journal_id);
+            header.value = format!("$secret:{name}");
+            staged.push((name, secret));
+        } else if !header.value.is_empty()
+            && !crate::config::providers::is_safe_provider_header_reference(
+                &header.name.to_ascii_lowercase(),
+                &header.value,
+            )
+        {
+            return Err(bad_request(
+                "provider header values must use a reference or be staged as secrets",
+            ));
+        }
+    }
+    let entry_json = serde_json::to_string(&entry).map_err(internal)?;
+    let named_json = serde_json::to_string(&old_references.0).map_err(internal)?;
+    let credentials_json = serde_json::to_string(&old_references.1).map_err(internal)?;
+    ensure_provider_credential_reference_available(ctx, &entry).await?;
+    // Existing static `$secret:` header references that are NOT freshly staged
+    // in this save must be re-verified atomically with the publish below,
+    // symmetric with the MCP writer. `ensure_provider_named_references_claimed`
+    // validated them in a pre-transaction read, but a cross-process actor could
+    // rotate the claim (e.g. an MCP save claiming the same shared name) between
+    // that read and this commit; without an in-transaction re-check a provider
+    // save could stomp / consume an mcp-owned name in the same racy way.
+    let staged_name_set = staged
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let static_named_refs = provider_owned_secret_references(&entry)
+        .0
+        .into_iter()
+        .filter(|name| !staged_name_set.contains(name))
+        .collect::<std::collections::BTreeSet<_>>();
+    let project_root_owned = project_root.to_string();
+    let provider_id_owned = provider_id.to_string();
+    let journal_id_owned = journal_id.clone();
+    let vault = ctx.secret_vault.clone();
+    let staged_for_tx = staged.clone();
+    let credential_ref_for_tx = entry.credential_ref.clone();
+    let static_named_refs_for_tx = static_named_refs.clone();
+    ctx.db.transaction(move |conn| {
+        // Atomic backstop for the non-staged static header references: each must
+        // still be owned by this exact provider/root with a live vault row,
+        // verified on THIS connection under the writer lock (fails closed on a
+        // conflict, rolling the whole save back).
+        for reference in &static_named_refs_for_tx {
+            ensure_static_named_reference_owned_on_conn(
+                conn,
+                &vault,
+                reference,
+                "provider",
+                &project_root_owned,
+            )?;
+        }
+        for (name, secret) in &staged_for_tx {
+            // ATOMIC cross-kind admission, symmetric with the MCP writer:
+            // re-check ownership INSIDE the same `BEGIN IMMEDIATE` transaction
+            // that writes the vault value and inserts the provider claim. These
+            // are freshly minted per-save names, but an atomic guard here (not
+            // just `INSERT OR IGNORE`) fails closed rather than silently
+            // coexisting should any name ever collide with a foreign owner.
+            reject_conflicting_named_ownership_on_conn(conn, name, "provider", &project_root_owned)?;
+            vault.put_item_on_conn(conn, cockpit_db::secret_vault::SecretVaultKind::NamedSecret, name, secret.as_bytes())?;
+            conn.execute(
+                "INSERT OR IGNORE INTO secret_named_ownership
+                 (item_id, owner_kind, project_root, created_at)
+                 VALUES (?1, 'provider', ?2, ?3)",
+                rusqlite::params![name, project_root_owned, chrono::Utc::now().timestamp_millis()],
+            )?;
+        }
+        if let Some(reference) = credential_ref_for_tx {
+            conn.execute(
+                "INSERT OR IGNORE INTO secret_credential_ownership
+                 (item_id, provider_id, project_root, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    reference,
+                    provider_id_owned.clone(),
+                    project_root_owned.clone(),
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
+             VALUES (?1, ?2, ?3, 'save', ?4, ?5, ?6, ?7)",
+            rusqlite::params![journal_id_owned, project_root_owned, provider_id_owned, entry_json, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }).await.map_err(map_named_secret_tx_error)?;
+    // The staged writes above intentionally bypass `mutate_owner_vault_item`
+    // so they can share one SQLite transaction with the recovery journal. Do
+    // not acknowledge (or persist the config) until the live redaction table
+    // includes those newly-created values. A publication failure is a
+    // fail-closed operation: compensate the staged rows and retire the
+    // journal, then poison the daemon if compensation itself cannot complete.
+    if let Err(publication_error) = ctx.publish_owner_redaction_table() {
+        let staged_names = staged
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let rollback_error = compensate_provider_config_save(
+            ctx,
+            &journal_id,
+            &staged_names,
+            entry.credential_ref.as_deref(),
+        )
+        .await
+        .err()
+        .map(|error| anyhow::anyhow!(error.message));
+        let error = if let Some(rollback_error) = rollback_error {
+            anyhow::anyhow!(
+                "provider secret redaction publication failed: {publication_error}; compensation failed: {rollback_error}"
+            )
+        } else {
+            publication_error
+        };
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
+    let (_, _, final_config) = daemon_provider_config(ctx, project_root).await?;
+    Ok(Response::ProviderConfigUpserted {
+        config: crate::secret_ref::redact_provider_view(&final_config),
+    })
+}
+
+/// Save the complete MCP layer through the daemon. The client supplies only
+/// a reference-bearing JSON projection plus staged named-secret values; the
+/// daemon owns vault staging, config publication, redaction publication, and
+/// cleanup of refs made stale by delete/rename edits.
+async fn save_mcp_config(
+    ctx: &DaemonContext,
+    project_root: &str,
+    config_json: &str,
+    secret_values_json: &str,
+    _cleanup_names_json: &str,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    recover_mcp_config_journals(ctx, project_root).await?;
+    let mut config: crate::mcp::config::McpConfig =
+        crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
+    let secret_values: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(secret_values_json)
+            .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
+    for (name, value) in &secret_values {
+        if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
+            return Err(bad_request("MCP secret name exceeds maximum length"));
+        }
+        if value.is_empty() || value.len() > cockpit_proto::MAX_OWNER_SECRET_VALUE_BYTES {
+            return Err(bad_request("MCP secret value exceeds maximum length"));
+        }
+    }
+    // The owner RPC is the final custody boundary.  Do not rely on the TUI's
+    // editor to turn credential-bearing MCP fields into references: callers
+    // can invoke this production path directly.  Normalize values supplied
+    // alongside a staged secret, and reject every other literal before either
+    // the vault transaction or config publication starts.
+    validate_and_normalize_mcp_credentials(&mut config, &secret_values)?;
+    let cwd = std::path::PathBuf::from(project_root);
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+        .await
+        .map_err(workspace_trust_error)?;
+    let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+    let target = mcp_paths.last().cloned().or_else(|| {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
+                .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+        })
+    });
+    let target =
+        target.ok_or_else(|| bad_request("no Cockpit config layer is available for MCP save"))?;
+    let path = target
+        .parent()
+        .ok_or_else(|| bad_request("MCP config target has no parent"))?
+        .join(cockpit_config::config::dirs::MCP_FILE);
+    // Cleanup authority comes from the daemon's prior on-disk layer, never
+    // from a caller-supplied list of arbitrary vault names. A malformed prior
+    // layer is a hard failure: treating it as empty could delete credentials
+    // still needed by that layer.
+    let prior_config = match std::fs::read_to_string(&path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => return Err(internal(error)),
+    };
+    let prior_references = prior_config
+        .servers
+        .iter()
+        .flat_map(|(server_name, server)| mcp_secret_references(server_name, server))
+        .collect::<std::collections::BTreeSet<_>>();
+    let journal_id = Uuid::now_v7().to_string();
+    let cleanup_json = serde_json::to_string(&prior_references).map_err(internal)?;
+    let config_json_owned = serde_json::to_string(&config).map_err(internal)?;
+    let staged_values = secret_values.into_iter().collect::<Vec<_>>();
+    let staged_names = staged_values
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    // Validate EVERY named-secret reference in the submitted config — not just
+    // the staged entries — before any vault mutation. Otherwise an owner could
+    // point an MCP server's `credential_ref` at an existing provider-owned (or
+    // foreign-workspace) `$secret:` with an empty staged map and silently make
+    // the MCP server consume that secret (a cross-kind boundary bypass).
+    ensure_mcp_references_claimable(ctx, project_root, &config, &staged_names).await?;
+    // Derive the FULL normalized reference set once, so the in-transaction guard
+    // re-checks EVERY reference (not just the staged ones) atomically with the
+    // config publish below. `all_refs` covers staged names, existing static
+    // `credential_ref`s, and flow-managed OAuth keys (`mcp:<server>`);
+    // `static_nonstaged_refs` is the subset that must already be owned by this
+    // mcp/root with a live vault row (OAuth keys stay permissive-when-absent and
+    // are therefore excluded).
+    let mut all_refs = std::collections::BTreeSet::new();
+    let mut oauth_keys = std::collections::BTreeSet::new();
+    for (server_name, server) in &config.servers {
+        if matches!(server.auth, crate::mcp::config::Auth::Oauth(_)) {
+            oauth_keys.insert(crate::mcp::auth::cred_key(server_name));
+        }
+        for reference in mcp_secret_references(server_name, server) {
+            all_refs.insert(reference);
+        }
+    }
+    let static_nonstaged_refs = all_refs
+        .iter()
+        .filter(|reference| !oauth_keys.contains(*reference) && !staged_names.contains(*reference))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let staged_for_tx = staged_values.clone();
+    let staged_mutations = ctx
+        .db
+        .transaction({
+            let vault = ctx.secret_vault.clone();
+            let journal_id = journal_id.clone();
+            let project_root = project_root.to_string();
+            let config_path = path.to_string_lossy().into_owned();
+            let config_json = config_json_owned.clone();
+            let cleanup_json = cleanup_json.clone();
+            let all_refs = all_refs.clone();
+            let static_nonstaged_refs = static_nonstaged_refs.clone();
+            move |conn| {
+                conn.execute(
+                    "INSERT INTO mcp_config_journals
+                     (journal_id, project_root, config_path, config_json, cleanup_names_json, phase, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'staged', ?6)",
+                    rusqlite::params![
+                        journal_id,
+                        project_root,
+                        config_path,
+                        config_json,
+                        cleanup_json,
+                        chrono::Utc::now().timestamp_millis(),
+                    ],
+                )?;
+                // ATOMIC full-reference admission: re-check EVERY normalized
+                // reference (staged, existing static, and flow-managed OAuth
+                // keys) inside this `BEGIN IMMEDIATE` transaction, not only in
+                // the pre-transaction read. This closes the cross-process TOCTOU
+                // where another workspace/provider claims a non-staged or OAuth
+                // name after the precheck but before this publish. A conflict
+                // rolls the whole transaction back (no journal, no vault write,
+                // no claim). OAuth keys that are absent stay permissive so
+                // configure-then-authenticate still works.
+                guard_mcp_reference_ownership_on_conn(
+                    conn,
+                    &vault,
+                    &all_refs,
+                    &static_nonstaged_refs,
+                    &project_root,
+                )?;
+                let mut mutations = std::collections::BTreeMap::new();
+                for (name, value) in &staged_for_tx {
+                    // ATOMIC cross-kind admission: re-check ownership INSIDE the
+                    // transaction that mutates the vault and inserts the claim,
+                    // not only in the earlier `ensure_mcp_references_claimable`
+                    // read. `BEGIN IMMEDIATE` holds the writer lock across this
+                    // whole closure, so a provider in another daemon process
+                    // cannot claim the name between the check and the write. A
+                    // conflict fails closed: no vault mutation, no claim insert,
+                    // and the enclosing transaction rolls back. Do NOT rely on
+                    // `INSERT OR IGNORE` to let cross-kind claims silently
+                    // coexist.
+                    reject_conflicting_named_ownership_on_conn(
+                        conn,
+                        name,
+                        "mcp",
+                        &project_root,
+                    )?;
+                    let mutation = vault.mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        name,
+                        Some(value.as_bytes()),
+                    )?;
+                    mutations.insert(name.clone(), mutation);
+                    conn.execute(
+                        "INSERT OR IGNORE INTO secret_named_ownership
+                         (item_id, owner_kind, project_root, created_at)
+                         VALUES (?1, 'mcp', ?2, ?3)",
+                        rusqlite::params![
+                            name,
+                            project_root,
+                            chrono::Utc::now().timestamp_millis()
+                        ],
+                    )?;
+                }
+                Ok(mutations)
+            }
+        })
+        .await
+        .map_err(map_named_secret_tx_error)?;
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    if let Err(error) = config.write_private(&path) {
+        let error = anyhow::anyhow!(error);
+        ctx.poison_redaction_publication(&error);
+        // The atomic write may have succeeded before reporting an error. Keep
+        // the journal and staged claims for recovery rather than deleting a
+        // vault value that the file may now reference.
+        return Err(internal(error));
+    }
+    if let Err(error) = ctx
+        .db
+        .write({
+            let journal_id = journal_id.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE mcp_config_journals SET phase = 'published' WHERE journal_id = ?1",
+                    rusqlite::params![journal_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+    {
+        let error = anyhow::anyhow!(error);
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    let referenced = mcp_global_live_secret_references(ctx, project_root).await?;
+    let cleanup_names = prior_references
+        .difference(&referenced)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+    for name in cleanup_names {
+        if !release_named_secret_ownership(ctx, &name, "mcp", project_root).await? {
+            retire_named_secret_ownership(ctx, &name, "mcp", project_root).await?;
+            continue;
+        }
+        delete_owned_named_secret(ctx, &name, "mcp", project_root).await?;
+    }
+    delete_mcp_journal(ctx, &journal_id).await?;
+    let credential_count = config
+        .servers
+        .iter()
+        .flat_map(|(name, server)| mcp_secret_references(name, server))
+        .count();
+    Ok(Response::McpConfigSaved {
+        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
+    })
+}
+
+async fn delete_mcp_journal(
+    ctx: &DaemonContext,
+    journal_id: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let journal_id = journal_id.to_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+fn mcp_live_secret_references(
+    project_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let mut merged = crate::mcp::config::McpConfig::default();
+    for path in
+        cockpit_config::config::dirs::mcp_file_paths_for_load(std::path::Path::new(project_root))
+    {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(internal(error)),
+        };
+        let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
+        for (name, server) in layer.servers {
+            merged.servers.insert(name, server);
+        }
+    }
+    Ok(merged
+        .servers
+        .iter()
+        .flat_map(|(server_name, server)| mcp_secret_references(server_name, server))
+        .collect())
+}
+
+fn daemon_mcp_paths(
+    ctx: &DaemonContext,
+    cwd: &std::path::Path,
+    policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> std::result::Result<Vec<std::path::PathBuf>, ErrorPayload> {
+    let config_files = crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+        ctx.config_source().watch_paths(cwd).config_files
+    });
+    Ok(config_files
+        .into_iter()
+        .filter_map(|path| {
+            path.parent()
+                .map(|parent| parent.join(cockpit_config::config::dirs::MCP_FILE))
+        })
+        .collect())
+}
+
+fn mcp_config_from_paths(
+    paths: &[std::path::PathBuf],
+) -> std::result::Result<crate::mcp::config::McpConfig, ErrorPayload> {
+    let mut merged = crate::mcp::config::McpConfig::default();
+    for path in paths {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(internal(error)),
+        };
+        let layer = crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
+        for (name, server) in layer.servers {
+            merged.servers.insert(name, server);
+        }
+    }
+    Ok(merged)
+}
+
+fn mcp_and_provider_live_secret_references(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let mut references = mcp_live_secret_references(project_root)?;
+    // Provider entries share the named-secret vault namespace with MCP. Use
+    // the daemon config source's effective layered resolver so a provider in
+    // any live config layer protects a name from MCP cleanup (and the
+    // session-config boundary ratchet holds).
+    let (providers, _) = ctx
+        .config_source()
+        .load(std::path::Path::new(project_root))
+        .map_err(daemon_config_error)?;
+    for provider in providers.providers.values() {
+        let (named, _) = provider_owned_secret_references(provider);
+        references.extend(named);
+    }
+    Ok(references)
+}
+
+fn provider_credential_references_for_root(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let (providers, _) = ctx
+        .config_source()
+        .load(std::path::Path::new(project_root))
+        .map_err(daemon_config_error)?;
+    Ok(providers
+        .providers
+        .values()
+        .filter_map(|provider| provider.credential_ref.clone())
+        .collect())
+}
+
+/// Credential records use a separate vault kind from named header secrets.
+/// Their cleanup must therefore be based on every durable provider config
+/// reference, not on the generated names used for staged header values.
+async fn provider_global_live_credential_references(
+    ctx: &DaemonContext,
+    current_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let current_root = current_root.to_owned();
+    let mut roots: std::collections::BTreeSet<String> = ctx
+        .db
+        .read(|conn| {
+            let mut roots = std::collections::BTreeSet::new();
+            for sql in [
+                "SELECT project_root FROM provider_config_journals",
+                "SELECT project_root FROM secret_credential_ownership",
+            ] {
+                let mut statement = conn.prepare(sql)?;
+                for root in statement.query_map([], |row| row.get::<_, String>(0))? {
+                    roots.insert(root?);
+                }
+            }
+            Ok(roots)
+        })
+        .await
+        .map_err(internal)?;
+    roots.insert(current_root);
+    let mut references = std::collections::BTreeSet::new();
+    for root in roots {
+        references.extend(provider_credential_references_for_root(ctx, &root)?);
+    }
+    Ok(references)
+}
+
+/// Build the live named-secret inventory across every workspace that has
+/// durable configuration activity recorded by this daemon. MCP OAuth and
+/// staged names are daemon-generated but the vault is shared, so checking
+/// only the current project can delete a token still referenced elsewhere.
+/// The current root is always included, even before its journal is retired.
+async fn mcp_global_live_secret_references(
+    ctx: &DaemonContext,
+    current_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let current_root = current_root.to_owned();
+    let mut roots: std::collections::BTreeSet<String> = ctx
+        .db
+        .read(|conn| {
+            let mut roots = std::collections::BTreeSet::new();
+            for sql in [
+                "SELECT project_root FROM mcp_config_journals",
+                "SELECT project_root FROM provider_config_journals",
+                "SELECT project_root FROM secret_named_ownership",
+            ] {
+                let mut statement = conn.prepare(sql)?;
+                for root in statement.query_map([], |row| row.get::<_, String>(0))? {
+                    roots.insert(root?);
+                }
+            }
+            Ok(roots)
+        })
+        .await
+        .map_err(internal)?;
+    roots.insert(current_root);
+    let mut references = std::collections::BTreeSet::new();
+    for root in roots {
+        references.extend(mcp_and_provider_live_secret_references(ctx, &root)?);
+    }
+    Ok(references)
+}
+
+/// Report whether this workspace is the sole durable owner. The claim is
+/// retired only after the vault deletion succeeds.
+async fn release_named_secret_ownership(
+    ctx: &DaemonContext,
+    item_id: &str,
+    owner_kind: &str,
+    project_root: &str,
+) -> std::result::Result<bool, ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let owner_kind = owner_kind.to_owned();
+    let project_root = project_root.to_owned();
+    ctx.db
+        .transaction(move |conn| {
+            let owned: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3",
+                rusqlite::params![item_id, owner_kind, project_root],
+                |row| row.get(0),
+            )?;
+            if owned == 0 {
+                return Ok(false);
+            }
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |row| row.get(0),
+            )?;
+            // The caller's own claim is included in the count.
+            Ok(remaining == 1)
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn release_credential_ownership(
+    ctx: &DaemonContext,
+    item_id: &str,
+    provider_id: &str,
+    project_root: &str,
+) -> std::result::Result<Option<bool>, ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let provider_id = provider_id.to_owned();
+    let project_root = project_root.to_owned();
+    ctx.db
+        .transaction(move |conn| {
+            let owned: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_credential_ownership
+                 WHERE item_id = ?1 AND provider_id = ?2 AND project_root = ?3",
+                rusqlite::params![item_id, provider_id, project_root],
+                |row| row.get(0),
+            )?;
+            if owned == 0 {
+                return Ok(None);
+            }
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_credential_ownership WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |row| row.get(0),
+            )?;
+            Ok(Some(remaining == 1))
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn retire_credential_ownership(
+    ctx: &DaemonContext,
+    item_id: &str,
+    provider_id: &str,
+    project_root: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let provider_id = provider_id.to_owned();
+    let project_root = project_root.to_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "DELETE FROM secret_credential_ownership
+                 WHERE item_id = ?1 AND provider_id = ?2 AND project_root = ?3",
+                rusqlite::params![item_id, provider_id, project_root],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn ensure_mcp_ownership_available(
+    ctx: &DaemonContext,
+    project_root: &str,
+    names: impl IntoIterator<Item = String>,
+) -> std::result::Result<(), ErrorPayload> {
+    let root = project_root.to_owned();
+    let names = names.into_iter().collect::<Vec<_>>();
+    ctx.db
+        .read(move |conn| {
+            for name in names {
+                // Reject ANY existing claim that does not belong to this exact
+                // MCP owner (same `mcp` kind AND same project root). This
+                // covers cross-kind claims (for example a `provider`-owned
+                // `$secret:` name) as well as `mcp` claims held by another
+                // workspace, so an MCP save can never overwrite a vault value a
+                // provider or another root still authenticates with. Re-saving
+                // the same MCP owner/root remains permitted (idempotent).
+                let conflict: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT owner_kind, project_root FROM secret_named_ownership
+                         WHERE item_id = ?1
+                           AND NOT (owner_kind = 'mcp' AND project_root = ?2)
+                         LIMIT 1",
+                        rusqlite::params![name, root],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if conflict.is_some() {
+                    return Err(rusqlite::Error::InvalidQuery.into());
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            bad_request(format!(
+                "MCP credential name is already claimed by a provider or another workspace: {error}"
+            ))
+        })
+}
+
+/// Typed marker carried out of a vault-mutation transaction when the
+/// in-transaction cross-kind ownership guard rejects a named secret. It lets the
+/// async caller re-map a genuine ownership conflict to a `BadRequest` while a
+/// real DB fault still surfaces as `internal`.
+#[derive(Debug)]
+pub(super) struct NamedSecretClaimConflict {
+    item_id: String,
+}
+
+impl std::fmt::Display for NamedSecretClaimConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "named secret `{}` is already claimed by a provider or another workspace",
+            self.item_id
+        )
+    }
+}
+
+impl std::error::Error for NamedSecretClaimConflict {}
+
+/// Reject any existing `secret_named_ownership` row for `item_id` that is not
+/// held by this exact (`owner_kind`, `project_root`) owner, using the SAME
+/// connection (and therefore the same `BEGIN IMMEDIATE` transaction) that then
+/// writes the vault value and inserts the claim.
+///
+/// This is the atomic core of the cross-kind admission check. The daemon's
+/// writer runs every `Db::transaction` under `BEGIN IMMEDIATE`, which holds the
+/// SQLite write lock for the whole closure; no other daemon process can commit
+/// an interposing claim between this SELECT and the subsequent write. Running
+/// the conflict check as a separate `Db::read` before the transaction (as the
+/// admission precheck does) leaves a cross-process TOCTOU window where a
+/// provider could claim the name after the check but before the mutation — this
+/// guard closes it. On conflict it returns [`NamedSecretClaimConflict`] so the
+/// enclosing transaction rolls back with no vault write and no claim insert.
+pub(super) fn reject_conflicting_named_ownership_on_conn(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    owner_kind: &str,
+    project_root: &str,
+) -> anyhow::Result<()> {
+    let conflict: Option<(String, String)> = conn
+        .query_row(
+            "SELECT owner_kind, project_root FROM secret_named_ownership
+             WHERE item_id = ?1 AND NOT (owner_kind = ?2 AND project_root = ?3)
+             LIMIT 1",
+            rusqlite::params![item_id, owner_kind, project_root],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if conflict.is_some() {
+        return Err(anyhow::Error::new(NamedSecretClaimConflict {
+            item_id: item_id.to_string(),
+        }));
+    }
+    Ok(())
+}
+
+/// Atomic in-transaction admission for a named reference that is NOT staged in
+/// this transaction (an existing static `credential_ref`): the value must
+/// already be owned by exactly this (`owner_kind`, `project_root`) AND back a
+/// live vault row, both verified on THIS connection (hence inside the same
+/// `BEGIN IMMEDIATE` transaction as the config publish). This is the atomic
+/// backstop for the pre-transaction `ensure_*_references_claimable` read: a
+/// cross-process actor could release/rotate the claim (or delete the vault row)
+/// between that read and this commit, so re-verifying here — under the writer
+/// lock, right before publish/journal — closes the TOCTOU window. A missing
+/// claim or vanished vault row fails closed as a [`NamedSecretClaimConflict`]
+/// so the enclosing transaction rolls back with no config publication.
+pub(super) fn ensure_static_named_reference_owned_on_conn(
+    conn: &rusqlite::Connection,
+    vault: &crate::secure_key::SecretVault,
+    reference: &str,
+    owner_kind: &str,
+    project_root: &str,
+) -> anyhow::Result<()> {
+    reject_conflicting_named_ownership_on_conn(conn, reference, owner_kind, project_root)?;
+    let claimed: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM secret_named_ownership
+             WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3
+         )",
+        rusqlite::params![reference, owner_kind, project_root],
+        |row| row.get(0),
+    )?;
+    if !claimed {
+        return Err(anyhow::Error::new(NamedSecretClaimConflict {
+            item_id: reference.to_string(),
+        }));
+    }
+    vault
+        .get_item_on_conn(
+            conn,
+            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+            reference,
+        )
+        .map_err(|_| {
+            anyhow::Error::new(NamedSecretClaimConflict {
+                item_id: reference.to_string(),
+            })
+        })?;
+    Ok(())
+}
+
+/// Atomic in-transaction admission for the FULL normalized MCP reference set —
+/// staged names, existing static `credential_ref`s, AND flow-managed OAuth keys
+/// (`mcp:<server>`) — run on the SAME connection (hence the same
+/// `BEGIN IMMEDIATE` transaction) that publishes/journals the MCP config.
+///
+/// The pre-transaction `ensure_mcp_references_claimable` read validates the
+/// same set, but a cross-process actor can interpose a foreign claim on a
+/// non-staged or OAuth reference between that read and this commit (e.g.
+/// workspace B stages+claims `mcp:example` after workspace A's OAuth-server
+/// pre-check passes but before A commits). Because the staged-secret loop only
+/// re-checks the staged names, that interposed claim would otherwise never be
+/// re-examined and A would consume B's foreign secret. This guard re-checks
+/// EVERY reference here:
+///   * `all_refs` — every reference gets the cross-kind / foreign-owner
+///     rejection. A flow-managed OAuth key that is ABSENT (no ownership row)
+///     passes, keeping configure-then-authenticate permissive; only a foreign
+///     or cross-kind row is rejected.
+///   * `static_nonstaged_refs` — existing static references (neither staged in
+///     this transaction nor flow-managed OAuth) must additionally already be
+///     owned by this exact `mcp`/root and back a live vault row.
+///
+/// A conflict fails closed as [`NamedSecretClaimConflict`]; the enclosing
+/// transaction rolls back with no config publication and no journal row.
+pub(super) fn guard_mcp_reference_ownership_on_conn(
+    conn: &rusqlite::Connection,
+    vault: &crate::secure_key::SecretVault,
+    all_refs: &std::collections::BTreeSet<String>,
+    static_nonstaged_refs: &std::collections::BTreeSet<String>,
+    project_root: &str,
+) -> anyhow::Result<()> {
+    for reference in all_refs {
+        reject_conflicting_named_ownership_on_conn(conn, reference, "mcp", project_root)?;
+    }
+    for reference in static_nonstaged_refs {
+        ensure_static_named_reference_owned_on_conn(conn, vault, reference, "mcp", project_root)?;
+    }
+    Ok(())
+}
+
+/// Map an error returned from a vault-mutation transaction: a
+/// [`NamedSecretClaimConflict`] becomes a `BadRequest` (fail-closed ownership
+/// rejection), everything else an `internal` fault.
+fn map_named_secret_tx_error(error: anyhow::Error) -> ErrorPayload {
+    match error.downcast::<NamedSecretClaimConflict>() {
+        Ok(conflict) => bad_request(conflict.to_string()),
+        Err(error) => internal(error),
+    }
+}
+
+/// Validate that every named-secret reference in a normalized MCP config is
+/// legitimately available to this MCP owner BEFORE any vault mutation. This is
+/// the MCP analog of `ensure_provider_named_references_claimed`: a config-only
+/// write must not make an MCP server consume a vault value it does not own.
+///
+/// References are derived from the whole normalized config, not just the staged
+/// map, and split into:
+///   * staging-managed references (header/env `credential_ref`s): a reference
+///     staged in THIS transaction is allowed (the transaction creates the `mcp`
+///     claim), and any other reference must already be claimed `owner_kind='mcp'`
+///     at THIS project root AND have a live vault item. This rejects an MCP save
+///     that references an existing provider-owned (or foreign-workspace)
+///     `$secret:` name with an empty staged map.
+///   * OAuth token keys (`mcp:<server>`), which are flow-managed and persisted
+///     later by `CompleteMcpOAuth`: only checked for cross-kind/foreign-workspace
+///     conflicts, never required to already exist.
+///
+/// Every reference (including OAuth keys and freshly staged names) is also run
+/// through the cross-kind conflict check so a name currently claimed by a
+/// provider or another workspace can never be adopted here.
+async fn ensure_mcp_references_claimable(
+    ctx: &DaemonContext,
+    project_root: &str,
+    config: &crate::mcp::config::McpConfig,
+    staged_names: &std::collections::BTreeSet<String>,
+) -> std::result::Result<(), ErrorPayload> {
+    let mut staging_refs = std::collections::BTreeSet::new();
+    let mut all_refs = std::collections::BTreeSet::new();
+    for (server_name, server) in &config.servers {
+        let oauth_key = matches!(server.auth, crate::mcp::config::Auth::Oauth(_))
+            .then(|| crate::mcp::auth::cred_key(server_name));
+        for reference in mcp_secret_references(server_name, server) {
+            if Some(&reference) != oauth_key.as_ref() {
+                staging_refs.insert(reference.clone());
+            }
+            all_refs.insert(reference);
+        }
+    }
+
+    // Cross-kind / foreign-workspace conflict check for every reference,
+    // including flow-managed OAuth keys and freshly staged names. A brand-new
+    // staged name has no prior claim and passes; a provider- or foreign-root
+    // claim is rejected here.
+    ensure_mcp_ownership_available(ctx, project_root, all_refs).await?;
+
+    // Every non-staged staging-managed reference must already be owned by this
+    // MCP at this root and have a live vault item.
+    let root = project_root.to_owned();
+    for reference in &staging_refs {
+        if staged_names.contains(reference) {
+            continue;
+        }
+        if ctx
+            .secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                reference,
+            )
+            .is_err()
+        {
+            return Err(bad_request(format!(
+                "MCP credential reference `{reference}` is not a daemon-owned staged secret"
+            )));
+        }
+        let reference_for_query = reference.clone();
+        let root_for_query = root.clone();
+        let claimed = ctx
+            .db
+            .read(move |conn| {
+                let claimed = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM secret_named_ownership
+                         WHERE item_id = ?1 AND owner_kind = 'mcp' AND project_root = ?2
+                     )",
+                    rusqlite::params![reference_for_query, root_for_query],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok(claimed)
+            })
+            .await
+            .map_err(internal)?;
+        if !claimed {
+            return Err(bad_request(format!(
+                "MCP credential reference `{reference}` has no durable MCP claim at this workspace"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn reject_owned_named_secret(
+    ctx: &DaemonContext,
+    item_id: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let claimed = ctx
+        .db
+        .read(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |row| row.get(0),
+            )?;
+            Ok(count != 0)
+        })
+        .await
+        .map_err(internal)?;
+    if claimed {
+        return Err(bad_request(
+            "named secret is daemon-owned by a provider or MCP workspace",
+        ));
+    }
+    Ok(())
+}
+
+async fn retire_named_secret_ownership(
+    ctx: &DaemonContext,
+    item_id: &str,
+    owner_kind: &str,
+    project_root: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let owner_kind = owner_kind.to_owned();
+    let project_root = project_root.to_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "DELETE FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3",
+                rusqlite::params![item_id, owner_kind, project_root],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn delete_owned_named_secret(
+    ctx: &DaemonContext,
+    item_id: &str,
+    owner_kind: &str,
+    project_root: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_id = item_id.to_owned();
+    let owner_kind = owner_kind.to_owned();
+    let project_root = project_root.to_owned();
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    &item_id,
+                    None,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            conn.execute(
+                "DELETE FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3",
+                rusqlite::params![item_id, owner_kind, project_root],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    Ok(())
+}
+
+/// Complete MCP vault/file journals left by a crashed daemon. The config is
+/// reference-only, so replaying publication is idempotent; cleanup is gated
+/// by a fresh cross-layer reference inventory.
+pub(super) async fn recover_mcp_config_journals(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let root = project_root.to_owned();
+    let journals: Vec<(String, String, String, String)> = ctx
+        .db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT journal_id, config_path, config_json, cleanup_names_json
+                 FROM mcp_config_journals WHERE project_root = ?1
+                 ORDER BY created_at, journal_id",
+            )?;
+            stmt.query_map(rusqlite::params![root], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    for (journal_id, path, config_json, cleanup_json) in journals {
+        let config = crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
+        config
+            .write_private(std::path::Path::new(&path))
+            .map_err(internal)?;
+        let cleanup: std::collections::BTreeSet<String> =
+            serde_json::from_str(&cleanup_json).map_err(internal)?;
+        let live = mcp_global_live_secret_references(ctx, project_root).await?;
+        let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+        for name in cleanup.difference(&live) {
+            if !release_named_secret_ownership(ctx, name, "mcp", project_root).await? {
+                retire_named_secret_ownership(ctx, name, "mcp", project_root).await?;
+                continue;
+            }
+            delete_owned_named_secret(ctx, name, "mcp", project_root).await?;
+        }
+        delete_mcp_journal(ctx, &journal_id).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn recover_all_mcp_config_journals(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let roots: Vec<String> = ctx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_root FROM mcp_config_journals
+                 UNION SELECT project_root FROM secret_named_ownership
+                 ORDER BY project_root",
+            )?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    for root in roots {
+        recover_mcp_config_journals(ctx, &root).await?;
+    }
+    Ok(())
+}
+
+/// Validate the reference-only MCP wire projection and normalize a newly
+/// entered literal into the corresponding credential reference.  This runs
+/// before any vault transaction or filesystem write.
+fn validate_and_normalize_mcp_credentials(
+    config: &mut crate::mcp::config::McpConfig,
+    staged: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<(), ErrorPayload> {
+    let mut consumed = std::collections::BTreeSet::new();
+
+    for (server_name, server) in &mut config.servers {
+        normalize_mcp_env_map(
+            server_name,
+            &mut server.env,
+            &mut server.env_credential_refs,
+            crate::mcp::auth::base_env_cred_key,
+            staged,
+            &mut consumed,
+            "server env",
+        )?;
+
+        match &mut server.auth {
+            crate::mcp::config::Auth::Header(header) => {
+                if let Some(reference) = &header.credential_ref {
+                    validate_mcp_secret_ref(reference)?;
+                    if staged.contains_key(reference) {
+                        consumed.insert(reference.clone());
+                    }
+                    if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                        let value = staged.get(reference).ok_or_else(|| {
+                            bad_request(format!(
+                                "MCP server `{server_name}` header must use a staged secret or reference"
+                            ))
+                        })?;
+                        if value != header.value.trim() {
+                            return Err(bad_request(format!(
+                                "MCP server `{server_name}` header literal does not match its staged secret"
+                            )));
+                        }
+                        header.value.clear();
+                    } else if !header.value.trim().is_empty() {
+                        return Err(bad_request(format!(
+                            "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
+                        )));
+                    }
+                } else if !header.value.trim().is_empty() && !is_mcp_env_reference(&header.value) {
+                    let reference = crate::mcp::auth::header_cred_key(server_name);
+                    let value = staged.get(&reference).ok_or_else(|| {
+                        bad_request(format!(
+                            "MCP server `{server_name}` header value must be a reference or staged secret"
+                        ))
+                    })?;
+                    if value != header.value.trim() {
+                        return Err(bad_request(format!(
+                            "MCP server `{server_name}` header literal does not match its staged secret"
+                        )));
+                    }
+                    header.value.clear();
+                    header.credential_ref = Some(reference.clone());
+                    consumed.insert(reference);
+                }
+            }
+            crate::mcp::config::Auth::Env(env) => {
+                normalize_mcp_env_map(
+                    server_name,
+                    &mut env.vars,
+                    &mut env.credential_refs,
+                    crate::mcp::auth::auth_env_cred_key,
+                    staged,
+                    &mut consumed,
+                    "auth env",
+                )?;
+            }
+            crate::mcp::config::Auth::Oauth(_) | crate::mcp::config::Auth::None => {}
+        }
+
+        for reference in server.env_credential_refs.values() {
+            validate_mcp_secret_ref(reference)?;
+            if staged.contains_key(reference) {
+                consumed.insert(reference.clone());
+            }
+        }
+        if let crate::mcp::config::Auth::Env(env) = &server.auth {
+            for reference in env.credential_refs.values() {
+                validate_mcp_secret_ref(reference)?;
+                if staged.contains_key(reference) {
+                    consumed.insert(reference.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(unused) = staged.keys().find(|name| !consumed.contains(*name)) {
+        return Err(bad_request(format!(
+            "MCP staged secret `{unused}` is not referenced by the configuration"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_mcp_env_map(
+    server_name: &str,
+    values: &mut std::collections::BTreeMap<String, String>,
+    refs: &mut std::collections::BTreeMap<String, String>,
+    key_fn: fn(&str, &str) -> String,
+    staged: &std::collections::BTreeMap<String, String>,
+    consumed: &mut std::collections::BTreeSet<String>,
+    field: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    for reference in refs.values() {
+        validate_mcp_secret_ref(reference)?;
+        if staged.contains_key(reference) {
+            consumed.insert(reference.clone());
+        }
+    }
+
+    let mut remove = Vec::new();
+    for (name, value) in values.iter() {
+        let value = value.trim();
+        if value.is_empty() || is_mcp_env_reference(value) {
+            continue;
+        }
+        let reference = refs
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| key_fn(server_name, name));
+        validate_mcp_secret_ref(&reference)?;
+        let staged_value = staged.get(&reference).ok_or_else(|| {
+            bad_request(format!(
+                "MCP server `{server_name}` {field} `{name}` must use a reference or staged secret"
+            ))
+        })?;
+        if staged_value != value {
+            return Err(bad_request(format!(
+                "MCP server `{server_name}` {field} `{name}` literal does not match its staged secret"
+            )));
+        }
+        refs.insert(name.clone(), reference.clone());
+        consumed.insert(reference);
+        remove.push(name.clone());
+    }
+    for name in remove {
+        values.remove(&name);
+    }
+    Ok(())
+}
+
+fn validate_mcp_secret_ref(reference: &str) -> std::result::Result<(), ErrorPayload> {
+    if reference.is_empty()
+        || reference.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES
+        || reference.contains('\0')
+    {
+        return Err(bad_request("MCP credential reference is invalid"));
+    }
+    Ok(())
+}
+
+fn is_mcp_env_reference(value: &str) -> bool {
+    value.trim().starts_with('$')
+}
+
+/// Restore staged MCP rows and retire their journal under one SQLite writer
+/// transaction. Raw row/revision comparison keeps a concurrent newer write
+/// intact; a failed compensation leaves the journal for recovery.
+async fn compensate_mcp_staged_and_retire(
+    ctx: &DaemonContext,
+    journal_id: &str,
+    mutations: &std::collections::BTreeMap<String, crate::secure_key::SecretVaultMutation>,
+) -> std::result::Result<(), ErrorPayload> {
+    let journal_id = journal_id.to_owned();
+    let mutations = mutations.clone();
+    ctx.db
+        .transaction(move |conn| {
+            let kind = cockpit_db::secret_vault::SecretVaultKind::NamedSecret;
+            for (name, mutation) in &mutations {
+                let current = cockpit_db::secret_vault::load_item_conn(conn, kind, name)?;
+                let revision: u64 = conn
+                    .query_row(
+                        "SELECT revision FROM secret_vault_item_revisions WHERE kind = ?1 AND item_id = ?2",
+                        rusqlite::params![kind.as_str(), name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0)
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid vault item revision"))?;
+                if revision != mutation.after.generation || current != mutation.after.row {
+                    continue;
+                }
+                let next_revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("vault item revision overflow"))?;
+                match &mutation.prior.row {
+                    Some(row) => {
+                        conn.execute(
+                            "INSERT INTO secret_vault_items
+                             (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                             ON CONFLICT(kind, item_id) DO UPDATE SET
+                               key_version = excluded.key_version, nonce = excluded.nonce,
+                               ciphertext = excluded.ciphertext, created_at = excluded.created_at,
+                               updated_at = excluded.updated_at, revision = excluded.revision",
+                            rusqlite::params![
+                                row.kind.as_str(), row.item_id, row.key_version, row.nonce,
+                                row.ciphertext, row.created_at, row.updated_at,
+                                i64::try_from(next_revision).map_err(|_| anyhow::anyhow!("vault item revision overflow"))?
+                            ],
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "DELETE FROM secret_vault_items WHERE kind = ?1 AND item_id = ?2",
+                            rusqlite::params![kind.as_str(), name],
+                        )?;
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO secret_vault_item_revisions (kind, item_id, revision)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(kind, item_id) DO UPDATE SET revision = excluded.revision",
+                    rusqlite::params![
+                        kind.as_str(),
+                        name,
+                        i64::try_from(next_revision)
+                            .map_err(|_| anyhow::anyhow!("vault item revision overflow"))?
+                    ],
+                )?;
+                // An overwrite may reuse an existing claim. Compensation may
+                // retire only claims created by this staging operation.
+                if mutation.prior.row.is_none() {
+                    conn.execute(
+                        "DELETE FROM secret_named_ownership
+                         WHERE item_id = ?1 AND owner_kind = 'mcp'
+                           AND project_root = (SELECT project_root FROM mcp_config_journals WHERE journal_id = ?2)",
+                        rusqlite::params![name, journal_id],
+                    )?;
+                }
+            }
+            conn.execute(
+                "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+fn mcp_secret_references(
+    server_name: &str,
+    server: &crate::mcp::config::ServerConfig,
+) -> std::collections::BTreeSet<String> {
+    let mut refs: std::collections::BTreeSet<String> =
+        server.env_credential_refs.values().cloned().collect();
+    match &server.auth {
+        crate::mcp::config::Auth::Header(header) => {
+            if let Some(name) = &header.credential_ref {
+                refs.insert(name.clone());
+            }
+        }
+        crate::mcp::config::Auth::Env(env) => {
+            refs.extend(env.credential_refs.values().cloned());
+        }
+        crate::mcp::config::Auth::Oauth(_) => {
+            refs.insert(crate::mcp::auth::cred_key(server_name));
+        }
+        crate::mcp::config::Auth::None => {}
+    }
+    refs
+}
+
+fn validate_daemon_provider_url(url: &str) -> std::result::Result<(), ErrorPayload> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| bad_request("provider URL must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(bad_request("provider URL must use HTTP or HTTPS"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(bad_request("provider URL must not include credentials"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(bad_request(
+            "provider URL must not include a query string or fragment",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_daemon_provider(
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ctx: &DaemonContext,
+    provider_id: &str,
+    entry: crate::config::providers::ProviderEntry,
+) -> std::result::Result<(), ErrorPayload> {
+    let path = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(cwd, provider_id)
+    })
+    .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+    let mut layer = doc.providers();
+    layer.providers.insert(provider_id.to_string(), entry);
+    doc.write(&layer).map_err(internal)
+}
+
+async fn provider_config_delete(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    delete_stored_secrets: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    // Converge a matching prior intent before deciding that the provider is
+    // absent; otherwise a crash between journal/file publication can turn a
+    // requested no-op into a skipped cleanup.
+    recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
+    let (cwd, trust_policy, config) = daemon_provider_config(ctx, project_root).await?;
+    let path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+        ctx.config_source()
+            .config_write_target_for_provider(&cwd, provider_id)
+    })
+    .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+    let layer = doc.providers();
+    // Only a provider actually owned by this layer can be deleted here.  In
+    // particular, a project request must not clean credentials for a provider
+    // inherited from a lower layer merely because this layer has no override.
+    let Some(removed_provider) = layer.providers.get(provider_id).cloned() else {
+        return Ok(Response::ProviderConfigUpserted {
+            config: crate::secret_ref::redact_provider_view(&config),
+        });
+    };
+    let cleanup = if delete_stored_secrets {
+        provider_owned_secret_references(&removed_provider)
+    } else {
+        Default::default()
+    };
+    let journal_id = Uuid::now_v7().to_string();
+    let project_root_owned = project_root.to_string();
+    let provider_id_owned = provider_id.to_string();
+    let named_json = serde_json::to_string(&cleanup.0).map_err(internal)?;
+    let credentials_json = serde_json::to_string(&cleanup.1).map_err(internal)?;
+    ctx.db.write(move |conn| {
+        conn.execute(
+            "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
+             VALUES (?1, ?2, ?3, 'delete', NULL, ?4, ?5, ?6)",
+            rusqlite::params![journal_id, project_root_owned, provider_id_owned, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }).await.map_err(internal)?;
+    recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
+    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    Ok(Response::ProviderConfigUpserted {
+        config: crate::secret_ref::redact_provider_view(&config),
+    })
+}
+
+async fn provider_layer_metadata_set(
+    ctx: &DaemonContext,
+    project_root: &str,
+    category_defaults_json: String,
+    on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let category_defaults: std::collections::BTreeMap<
+        String,
+        crate::config::providers::ProviderModelRef,
+    > = serde_json::from_str(&category_defaults_json)
+        .map_err(|error| bad_request(format!("invalid category defaults: {error}")))?;
+    let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    persist_provider_layer_metadata(
+        &cwd,
+        &trust_policy,
+        ctx,
+        category_defaults.clone(),
+        on_unlisted_models_fetch,
+    )?;
+    config.category_defaults = category_defaults;
+    config.on_unlisted_models_fetch = Some(on_unlisted_models_fetch);
+    Ok(Response::ProviderConfigUpserted {
+        config: crate::secret_ref::redact_provider_view(&config),
+    })
+}
+
+fn persist_provider_layer_metadata(
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    ctx: &DaemonContext,
+    category_defaults: std::collections::BTreeMap<
+        String,
+        crate::config::providers::ProviderModelRef,
+    >,
+    on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
+) -> std::result::Result<(), ErrorPayload> {
+    let path = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(cwd, "default")
+    })
+    .ok_or_else(|| bad_request("no cockpit config found"))?;
+    let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+    let mut layer = doc.providers();
+    layer.category_defaults = category_defaults;
+    layer.on_unlisted_models_fetch = Some(on_unlisted_models_fetch);
+    doc.write(&layer).map_err(internal)
 }
 
 pub(super) async fn attached_trust_policy(

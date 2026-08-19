@@ -166,16 +166,27 @@ impl Db {
         let updated_at_ms = now_ms();
         let server_url = server_url.to_owned();
         self.write(move |conn| {
-            conn.execute(
-                "UPDATE sync_state
-                    SET enabled = 0, updated_at_ms = ?2
-                  WHERE server_url = ?1",
-                params![server_url, updated_at_ms],
-            )
-            .context("marking org sync disabled")?;
-            Ok(())
+            Self::mark_org_sync_disabled_on_conn(conn, &server_url, updated_at_ms)
         })
         .await
+    }
+
+    /// Disable an account's org-sync policies inside a caller-owned write
+    /// transaction. Credential lifecycle RPCs use this to keep the policy
+    /// transition, vault delete, and remote replay record indivisible.
+    pub fn mark_org_sync_disabled_on_conn(
+        conn: &rusqlite::Connection,
+        server_url: &str,
+        updated_at_ms: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sync_state
+                SET enabled = 0, updated_at_ms = ?2
+              WHERE server_url = ?1",
+            params![server_url, updated_at_ms],
+        )
+        .context("marking org sync disabled")?;
+        Ok(())
     }
 
     pub async fn update_org_sync_cursor(

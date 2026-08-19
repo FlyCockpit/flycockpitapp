@@ -240,6 +240,54 @@ pub async fn fs_write(
     .await
 }
 
+/// Persist a rendered extended config layer through the daemon-owned config
+/// mutation boundary. Unlike generic FsWrite this reloads and hashes the
+/// config while holding the cross-process config lock, then commits atomically.
+pub async fn save_extended_config(
+    project_root: String,
+    path: String,
+    content: String,
+    base_hash: Option<String>,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "save_extended_config",
+        tokio::task::spawn_blocking(move || {
+            save_extended_config_sync(&project_root, &path, &content, base_hash)
+        }),
+    )
+    .await
+}
+
+fn save_extended_config_sync(
+    project_root: &str,
+    path: &str,
+    content: &str,
+    base_hash: Option<String>,
+) -> Result<Response, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let target = resolve_for_write(&root, path)?;
+    if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
+        return Err(bad_request("extended config target must be config.json"));
+    }
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+    let current = std::fs::read(&target).unwrap_or_default();
+    let current_hash = content_hash(&current);
+    if let Some(expected) = base_hash.as_deref()
+        && expected != current_hash
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::HashMismatch,
+            message: format!("configuration changed before write; current hash is {current_hash}"),
+        });
+    }
+    let desired_hash = content_hash(content.as_bytes());
+    if desired_hash != current_hash {
+        cockpit_config::config::write_config_bytes_atomic(&target, content.as_bytes())
+            .map_err(internal)?;
+    }
+    Ok(Response::ExtendedConfigSaved { hash: desired_hash })
+}
+
 pub async fn fs_write_staged_remote(
     ctx: Arc<DaemonContext>,
     project_root: String,

@@ -583,7 +583,7 @@ pub fn register_credential_for_redaction(credential: &StoredFlycockpitCredential
     }
 }
 
-fn clear_credential_redaction_registration() {
+pub fn clear_credential_redaction_registration() {
     #[cfg(test)]
     {
         TEST_REDACTION_TOKEN.with(|token| {

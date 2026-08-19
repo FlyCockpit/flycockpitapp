@@ -64,6 +64,7 @@ pub mod model_system_prompt;
 pub mod openai_images_adapter;
 pub mod packages;
 pub mod path_containment;
+pub mod policy;
 pub mod private_fs;
 pub mod process;
 pub mod process_containment;

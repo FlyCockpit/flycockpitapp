@@ -12,7 +12,7 @@
 //!     (multiple `impl` blocks across this file and `mod.rs`)
 //!   - provider-only free helpers (`render_header_editor`,
 //!     `render_field_row`, `valid_url`, `valid_id`,
-//!     `apply_copilot_setup`, `render_copilot_body`).
+//!     `render_copilot_body`).
 
 mod deepfetch;
 mod fetch;
@@ -32,9 +32,11 @@ pub(super) use fetch::{
 pub(crate) use oauth_flow::CodexOAuthOption;
 #[cfg(test)]
 use oauth_flow::handle_oauth_flow_key_with;
+#[cfg(test)]
+pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
-    GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest,
-    OAuthFlowState, OAuthOption, OAuthProvider, prepare_grok_browser_start,
+    OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
+    OAuthProvider, OAuthPublicBegin,
 };
 use oauth_flow::{
     OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend, oauth_options,
@@ -59,12 +61,7 @@ use cockpit_config::providers::{
     merge_fetched_models_with_policy, provider_model_fetch_display_state,
     provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
-use cockpit_core::auth::{
-    codex_oauth,
-    copilot_setup::{self, Shell as CopilotShell},
-    xai_oauth,
-};
-use cockpit_core::envref;
+use cockpit_core::auth::copilot_setup::Shell as CopilotShell;
 use cockpit_core::providers::models_fetch::FetchOutcome;
 use cockpit_core::providers::{self as templates, ProviderTemplate};
 use cockpit_core::wizard::{WizardAnswer, WizardRun};
@@ -300,8 +297,7 @@ fn is_sensitive_header_name(name: &str) -> bool {
 }
 
 fn header_value_is_env_only(value: &str) -> bool {
-    let resolved = envref::resolve(value);
-    if resolved.referenced.is_empty() {
+    if cockpit_core::envref::referenced_names(value).is_empty() {
         return false;
     }
     let mut literal = String::with_capacity(value.len());
@@ -479,13 +475,10 @@ pub(super) enum ProvidersPage {
         state: DeepFetchState,
         parent: Box<EditState>,
     },
-    /// One-button "Set up GitHub Copilot auth" confirm screen for the
-    /// Copilot provider whose Edit state is in `parent`. Reached by Enter
-    /// on the "Copilot auth" row of the Edit page (Copilot providers
-    /// only). Appends `export GH_TOKEN=$(gh auth token)` to the user's
-    /// shell rc and sets `GH_TOKEN` in the running process so Copilot
-    /// works without a restart. Back navigation returns to `Edit(parent)`
-    /// with the parent's cursor/status/unsaved edits intact.
+    /// Informational "GitHub Copilot auth" screen. Authentication is owned
+    /// by the daemon; the TUI never invokes `gh`, reads a token, or edits a
+    /// shell startup file. Back navigation returns to `Edit(parent)` with
+    /// the parent's cursor/status/unsaved edits intact.
     CopilotSetup {
         state: CopilotSetupState,
         parent: Box<EditState>,
@@ -698,7 +691,7 @@ fn oauth_link_target(flow: OAuthFlowView<'_>) -> Option<(&str, &str)> {
             Some((state.authorize_url()?, "open xai.com authorization page"))
         }
         OAuthFlowView::OAuth(state) if state.provider == OAuthProvider::Codex => {
-            let uri = state.device_login()?.verification_uri.as_str();
+            let (_, uri, _) = state.device_login()?;
             Some((uri, uri))
         }
         OAuthFlowView::Copilot(_) => None,
@@ -744,33 +737,25 @@ impl ProvidersPage {
 
 /// State for the "Set up GitHub Copilot auth" sub-page.
 pub(super) struct CopilotSetupState {
-    /// Detected shell. `None` means we'll show manual instructions
-    /// instead of a write button.
+    /// Retained for compatibility with the pointer fixture shape. Production
+    /// never probes a shell or derives a startup-file path: Copilot auth is
+    /// daemon-owned.
     pub(super) shell: Option<CopilotShell>,
-    /// Absolute rc-file path we'd append to. `None` when shell is None.
+    /// Always `None` in production; the TUI never writes a shell rc file.
     pub(super) rc_path: Option<PathBuf>,
-    /// `Some(true)` if our marker is already in the rc file. The
-    /// confirm prompt collapses to a "remove and re-add" hint.
+    /// Retained for compatibility with existing test fixtures.
     pub(super) already_configured: bool,
-    /// Action result after the user confirms. On success, we also
-    /// inject `GH_TOKEN` into the running process so the resolver
-    /// picks it up before the user restarts.
+    /// Action result after the user asks the daemon to inspect auth.
     pub(super) outcome: Option<Result<String, String>>,
     operation: super::shell::PointerOperationGate,
 }
 
 impl CopilotSetupState {
     pub(super) fn new() -> Self {
-        let shell = copilot_setup::detect_shell();
-        let rc_path = shell.and_then(copilot_setup::rc_path);
-        let already_configured = rc_path
-            .as_deref()
-            .and_then(|p| copilot_setup::rc_already_configured(p).ok())
-            .unwrap_or(false);
         Self {
-            shell,
-            rc_path,
-            already_configured,
+            shell: None,
+            rc_path: None,
+            already_configured: false,
             outcome: None,
             operation: super::shell::PointerOperationGate::default(),
         }
@@ -782,6 +767,9 @@ impl CopilotSetupState {
         effect: &mut impl CopilotSetupEffect,
     ) {
         let (Some(shell), Some(rc_path)) = (self.shell, self.rc_path.as_deref()) else {
+            self.outcome = Some(Ok(
+                "Copilot authentication is daemon-owned. Set GH_TOKEN in the daemon's environment or authenticate through the daemon account; no shell files or tokens are handled by the TUI.".into(),
+            ));
             return;
         };
         if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
@@ -789,6 +777,39 @@ impl CopilotSetupState {
         }
         let operation_id = self.operation.begin();
         let result = effect.apply(shell, rc_path, credential_store_path);
+        self.complete(operation_id, result);
+    }
+
+    /// Ask the daemon to acquire and persist Copilot auth. The daemon returns
+    /// only an acknowledgement; the TUI never receives or handles the token.
+    fn submit_daemon(&mut self, project_root: &std::path::Path, provider_id: &str) {
+        if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
+            return;
+        }
+        let operation_id = self.operation.begin();
+        let project_root = project_root.display().to_string();
+        let provider_id = provider_id.to_string();
+        let result = super::run_settings_daemon(async move {
+            let client = super::settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            match client
+                .request(cockpit_core::daemon::proto::Request::SetupCopilotAuth {
+                    project_root,
+                    provider_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                    Ok("Copilot token configured in the daemon vault".into())
+                }
+                Ok(other) => Err(format!(
+                    "unexpected daemon Copilot setup response: {other:?}"
+                )),
+                Err(error) => Err(error.to_string()),
+            }
+        });
         self.complete(operation_id, result);
     }
 
@@ -810,19 +831,6 @@ trait CopilotSetupEffect {
         rc_path: &std::path::Path,
         credential_store_path: Option<&std::path::Path>,
     ) -> Result<String, String>;
-}
-
-struct ProductionCopilotSetupEffect;
-
-impl CopilotSetupEffect for ProductionCopilotSetupEffect {
-    fn apply(
-        &mut self,
-        shell: CopilotShell,
-        rc_path: &std::path::Path,
-        credential_store_path: Option<&std::path::Path>,
-    ) -> Result<String, String> {
-        apply_copilot_setup(shell, rc_path, credential_store_path)
-    }
 }
 
 pub(super) fn oauth_setup_confirming_logged_in(
@@ -1152,6 +1160,18 @@ impl SettingsDialog {
     }
 }
 impl SettingsCx {
+    /// All provider side effects use the project selected for this dialog;
+    /// config editing must never silently retarget to the process cwd.
+    fn provider_fetch_root(&self) -> String {
+        self.active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref())
+            .or_else(|| self.config_path.parent())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .display()
+            .to_string()
+    }
+
     fn handle_provider_list_key(
         &mut self,
         key: KeyEvent,
@@ -1234,7 +1254,9 @@ impl SettingsCx {
                     if *delete_pending {
                         let id = ids[idx].clone();
                         let msg = match self.delete_provider_and_stored_secrets(&id, true) {
-                            Ok(0) => format!("deleted `{id}`"),
+                            Ok(0) => {
+                                format!("deleted `{id}`; stored secret cleanup completed")
+                            }
                             Ok(count) => format!("deleted `{id}` and {count} stored secret(s)"),
                             Err(e) => format!("delete failed: {e}"),
                         };
@@ -1347,7 +1369,7 @@ impl SettingsCx {
                         Some(notice) => format!("saved. {notice} Fetching /models…"),
                         None => "saved. Fetching /models…".into(),
                     });
-                    s.fetch = Some(FetchHandle::spawn(id, entry));
+                    s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
                     let _ = s.run.submit(WizardAnswer::Acknowledged);
                 } else if s.is_step("test-key-choice") {
                     s.error = Some(match notice {
@@ -1585,28 +1607,18 @@ impl SettingsCx {
                         self.save_and_fetch_provider(s, id, entry, template);
                         return Nav::Stay;
                     }
-                    // No outcome yet. Apply the action if we can; else
-                    // jump straight to save + fetch (manual / already-
-                    // configured paths are informational only).
-                    let can_apply = state.shell.is_some()
-                        && state.rc_path.is_some()
-                        && !state.already_configured;
-                    if can_apply {
-                        state.submit(
-                            self.credential_store_path.as_deref(),
-                            &mut ProductionCopilotSetupEffect,
-                        );
-                    } else {
-                        // Skip — move to save + fetch.
-                        let template = s.template.expect("template chosen");
-                        let id = s.id_field.text().trim().to_string();
-                        let entry = provider_entry_from_add(
-                            s,
-                            template,
-                            templates::default_headers_for(template),
-                        );
-                        self.save_and_fetch_provider(s, id, entry, template);
-                    }
+                    // A newly-added provider is not persisted until this
+                    // wizard completes. Save it first, then use the Edit
+                    // page's daemon-owned Copilot action if configuration is
+                    // available in the daemon environment.
+                    let template = s.template.expect("template chosen");
+                    let id = s.id_field.text().trim().to_string();
+                    let entry = provider_entry_from_add(
+                        s,
+                        template,
+                        templates::default_headers_for(template),
+                    );
+                    self.save_and_fetch_provider(s, id, entry, template);
                 }
                 KeyCode::Char('s') => {
                     // Skip the GH_TOKEN action and go straight to save
@@ -1671,7 +1683,8 @@ impl SettingsCx {
                         } else if let Some(id) = s.saved_provider_id.clone() {
                             if let Some(entry) = self.config.providers.get(&id).cloned() {
                                 s.error = Some("Testing key via /models…".into());
-                                s.fetch = Some(FetchHandle::spawn(id, entry));
+                                s.fetch =
+                                    Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
                             }
                             let _ = s.run.submit(WizardAnswer::Acknowledged);
                         }
@@ -1755,41 +1768,73 @@ impl SettingsCx {
         active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
     }
 
-    fn provider_oauth_store(&self) -> Result<cockpit_core::credentials::CredentialStore, String> {
-        #[cfg(test)]
-        if let Some(path) = self.credential_store_path.as_deref() {
-            return cockpit_core::credentials::CredentialStore::open(path.to_path_buf())
-                .map_err(|e| e.to_string());
-        }
-        super::cockpit_credential_store().map_err(|e| e.to_string())
-    }
-
-    fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> bool {
-        let Ok(store) = self.provider_oauth_store() else {
-            return false;
+    fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> Option<bool> {
+        let provider_id = match provider {
+            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         };
-        match provider {
-            OAuthProvider::Grok => xai_oauth::is_logged_in_in(&store),
-            OAuthProvider::Codex => codex_oauth::is_logged_in_in(&store),
-        }
+        // The inventory is deliberately metadata-only. Rendering consumes a
+        // cache miss asynchronously instead of waiting on the daemon socket.
+        self.cached_secret_inventory_contains(
+            provider_id,
+            Some(cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+        )
     }
 
     fn provider_oauth_status_value(&self, provider: OAuthProvider) -> String {
-        if self.provider_oauth_logged_in(provider) {
-            "logged in — Enter: Sign out"
-        } else {
-            "not logged in — Enter: Sign in"
+        match self.provider_oauth_logged_in(provider) {
+            Some(true) => "logged in — Enter: Sign out",
+            Some(false) => "not logged in — Enter: Sign in",
+            None => "checking daemon auth status…",
         }
         .to_string()
     }
 
     fn logout_provider_oauth(&self, provider: OAuthProvider) -> Result<(), String> {
-        let mut store = self.provider_oauth_store()?;
-        match provider {
-            OAuthProvider::Grok => xai_oauth::logout_in(&mut store),
-            OAuthProvider::Codex => codex_oauth::logout_in(&mut store),
+        let provider_id = match provider {
+            OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+            OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         }
-        .map_err(|error| error.to_string())
+        .to_string();
+        let project_root = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref())
+            .or_else(|| self.config_path.parent())
+            .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?
+            .display()
+            .to_string();
+        let inventory_provider_id = provider_id.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = super::settings_daemon_client()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match client
+                    .request(
+                        cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+                            provider_id,
+                            project_root: Some(project_root),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::ProviderCredentialDeleted {
+                        ..
+                    })
+                    | Ok(cockpit_core::daemon::proto::Response::Ack) => Ok(()),
+                    Ok(other) => Err(format!(
+                        "unexpected daemon OAuth logout response: {other:?}"
+                    )),
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+        });
+        if result.is_ok() {
+            self.invalidate_secret_inventory_entry(&inventory_provider_id, None);
+        }
+        result
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
@@ -1857,18 +1902,19 @@ impl SettingsCx {
             }
             KeyCode::Char('r') => {
                 let status = self.commit_edit_entry(s);
-                s.fetch = Some(FetchHandle::spawn(
-                    s.provider_id.clone(),
-                    (*s.entry).clone(),
-                ));
-                s.status = if status
+                let save_failed = status
                     .as_deref()
-                    .is_some_and(|msg| msg.starts_with("save failed:"))
-                {
-                    status
+                    .is_some_and(|msg| msg.starts_with("save failed:"));
+                if save_failed {
+                    s.status = status;
                 } else {
-                    Some("refetching /models…".into())
-                };
+                    s.fetch = Some(FetchHandle::spawn(
+                        s.provider_id.clone(),
+                        (*s.entry).clone(),
+                        self.provider_fetch_root(),
+                    ));
+                    s.status = Some("refetching /models…".into());
+                }
             }
             KeyCode::Char('f') => {
                 let new = !s.entry.favorite.unwrap_or(false);
@@ -1895,7 +1941,12 @@ impl SettingsCx {
                 if s.delete_pending {
                     let saved = self.delete_provider_and_stored_secrets(&s.provider_id, true);
                     let msg = match saved {
-                        Ok(0) => format!("deleted `{}`", s.provider_id),
+                        Ok(0) => {
+                            format!(
+                                "deleted `{}`; stored secret cleanup completed",
+                                s.provider_id
+                            )
+                        }
                         Ok(count) => {
                             format!("deleted `{}` and {count} stored secret(s)", s.provider_id)
                         }
@@ -1961,7 +2012,7 @@ impl SettingsCx {
                 }));
             }
             Some(EditAction::OAuthAuth(provider)) => {
-                if self.provider_oauth_logged_in(provider) {
+                if self.provider_oauth_logged_in(provider) == Some(true) {
                     s.status = Some(match self.logout_provider_oauth(provider) {
                         Ok(()) => match provider {
                             OAuthProvider::Grok => "signed out of Grok subscription auth".into(),
@@ -2021,23 +2072,24 @@ impl SettingsCx {
             Some(EditAction::Refetch) => {
                 // Same as 'r'
                 let status = self.commit_edit_entry(s);
-                s.fetch = Some(FetchHandle::spawn(
-                    s.provider_id.clone(),
-                    (*s.entry).clone(),
-                ));
-                s.status = if status
+                let save_failed = status
                     .as_deref()
-                    .is_some_and(|msg| msg.starts_with("save failed:"))
-                {
-                    status
+                    .is_some_and(|msg| msg.starts_with("save failed:"));
+                if save_failed {
+                    s.status = status;
                 } else {
-                    Some("refetching /models…".into())
-                };
+                    s.fetch = Some(FetchHandle::spawn(
+                        s.provider_id.clone(),
+                        (*s.entry).clone(),
+                        self.provider_fetch_root(),
+                    ));
+                    s.status = Some("refetching /models…".into());
+                }
             }
             Some(EditAction::DeepFetch) => {
                 let owned =
                     std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
-                match DeepFetchState::prepare(&self.config_path, &owned.provider_id) {
+                match DeepFetchState::prepare_from_config(&self.config, &owned.provider_id) {
                     Ok(state) => {
                         return Nav::Replace(super::providers_page(ProvidersPage::DeepFetch {
                             state,
@@ -2643,7 +2695,11 @@ impl SettingsCx {
                     };
                     let mut edit = EditState::new(s.provider_id.clone(), entry.clone());
                     edit.status = Some("retrying live model fetch...".into());
-                    edit.fetch = Some(FetchHandle::spawn(s.provider_id.clone(), entry));
+                    edit.fetch = Some(FetchHandle::spawn(
+                        s.provider_id.clone(),
+                        entry,
+                        self.provider_fetch_root(),
+                    ));
                     return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
                 }
                 1 => {
@@ -2750,23 +2806,16 @@ impl SettingsCx {
                     return back_to_edit(parent, status);
                 }
 
-                // If we can't auto-write (unsupported shell, marker
-                // already present), Enter just returns to the Edit page —
-                // the screen was informational only.
-                let Some(_shell) = s.shell else {
-                    return back_to_edit(parent, None);
+                let Some(project_root) = self
+                    .active_project_root
+                    .as_deref()
+                    .or(self.picker_cwd.as_deref())
+                    .or_else(|| self.config_path.parent())
+                else {
+                    s.outcome = Some(Err("unable to resolve the provider workspace".into()));
+                    return Nav::Stay;
                 };
-                if s.already_configured {
-                    return back_to_edit(parent, None);
-                }
-                let Some(_rc_path) = s.rc_path.clone() else {
-                    return back_to_edit(parent, None);
-                };
-
-                s.submit(
-                    self.credential_store_path.as_deref(),
-                    &mut ProductionCopilotSetupEffect,
-                );
+                s.submit_daemon(project_root, &parent.provider_id);
             }
             _ => {}
         }
@@ -3445,7 +3494,7 @@ impl SettingsCx {
             );
         }
         if s.is_step("headers") && s.headers.is_editing() {
-            render_header_edit_popup(frame, area, &s.headers);
+            render_header_edit_popup(self, frame, area, &s.headers);
         }
     }
 
@@ -3698,7 +3747,7 @@ impl SettingsCx {
                 .into(),
         );
         if editor.is_editing() {
-            render_header_edit_popup(frame, area, editor);
+            render_header_edit_popup(self, frame, area, editor);
         }
     }
 
@@ -4507,7 +4556,7 @@ fn provider_header_pointer_action(
 /// top of the header list when the editor is in `EditName`/`EditValue`
 /// mode. The `Clear` widget wipes the cells underneath so the list
 /// doesn't bleed through.
-fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
+fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &HeaderEditor) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
 
@@ -4518,50 +4567,69 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
     render_field_row(&mut body, "Value", &h.value_buf, !name_focus);
 
     // Dynamic-reference status for the value (headers commonly reference
-    // `$VAR` or `$secret:<name>`).
-    let resolved = envref::resolve(h.value_buf.text());
-    if resolved.has_missing() {
-        let env_missing = resolved
-            .missing
-            .iter()
-            .filter(|name| !name.starts_with("secret:"))
-            .map(|name| format!("${name}"))
-            .collect::<Vec<_>>();
-        let secret_missing = resolved
-            .missing
-            .iter()
-            .filter(|name| name.starts_with("secret:"))
-            .map(|name| format!("${name}"))
-            .collect::<Vec<_>>();
-        let message = if !secret_missing.is_empty() && env_missing.is_empty() {
-            let path = cockpit_core::credentials::default_path()
-                .map(|path| cockpit_core::welcome::display_path(&path))
-                .unwrap_or_else(|| "the credential store".to_string());
-            format!(
-                "  Named secret not detected in {path}: {}",
-                secret_missing.join(", ")
+    // `$VAR` or `$secret:<name>`).  This is deliberately syntax-only: the
+    // TUI never expands env refs or opens/inspects the local credential
+    // store. Named-secret presence is metadata returned by the daemon and
+    // cached by SettingsCx.
+    let references = cockpit_core::envref::referenced_names(h.value_buf.text());
+    let env_refs = references
+        .iter()
+        .filter(|name| !name.starts_with("secret:"))
+        .map(|name| format!("${name}"))
+        .collect::<Vec<_>>();
+    let secret_refs = references
+        .iter()
+        .filter_map(|name| name.strip_prefix("secret:"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let secret_missing = secret_refs
+        .iter()
+        .filter(|name| {
+            matches!(
+                cx.cached_secret_inventory_contains(
+                    name,
+                    Some(cockpit_core::daemon::proto::SecretInventoryKind::NamedSecret),
+                ),
+                Some(false)
             )
-        } else if secret_missing.is_empty() {
-            format!(
-                "  Environment variable not detected, make sure to set it: {}",
-                env_missing.join(", ")
-            )
-        } else {
-            format!(
-                "  References not detected: {}",
-                env_missing
-                    .into_iter()
-                    .chain(secret_missing)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        body.push(Line::from(Span::styled(message, yellow)));
-    } else if !resolved.referenced.is_empty() {
+        })
+        .map(|name| format!("$secret:{name}"))
+        .collect::<Vec<_>>();
+    if !secret_missing.is_empty() {
+        body.push(Line::from(Span::styled(
+            format!("  Named secret not detected: {}", secret_missing.join(", ")),
+            yellow,
+        )));
+    } else if !env_refs.is_empty() && !secret_refs.is_empty() {
         body.push(Line::from(Span::styled(
             format!(
-                "  dynamic reference(s) detected: ${}",
-                resolved.referenced.join(", $")
+                "  dynamic references detected (daemon resolves values): {} {}",
+                env_refs.join(", "),
+                secret_refs
+                    .iter()
+                    .map(|name| format!("$secret:{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            muted,
+        )));
+    } else if !env_refs.is_empty() {
+        body.push(Line::from(Span::styled(
+            format!(
+                "  environment reference(s) detected (daemon resolves values): {}",
+                env_refs.join(", ")
+            ),
+            muted,
+        )));
+    } else if !secret_refs.is_empty() {
+        body.push(Line::from(Span::styled(
+            format!(
+                "  named secret reference(s) detected (daemon resolves values): {}",
+                secret_refs
+                    .iter()
+                    .map(|name| format!("$secret:{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             muted,
         )));
@@ -4904,49 +4972,6 @@ pub(super) fn active_model_settings_page(
 pub(super) fn valid_url(s: &str) -> bool {
     let s = s.trim();
     s.starts_with("http://") || s.starts_with("https://")
-}
-
-/// Store a Copilot token in Cockpit credentials so the provider resolver can
-/// use it immediately without mutating the running process environment.
-fn store_copilot_token(
-    credential_store_path: Option<&std::path::Path>,
-    token: String,
-) -> Result<(), String> {
-    let mut store = crate::tui::settings::cockpit_credential_store()
-        .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
-    store.set_named_secret(
-        cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY,
-        token,
-    );
-    store
-        .save()
-        .map_err(|error| format!("could not save Cockpit credential store: {error}"))
-}
-
-/// Execute the "Set up Copilot auth" action: append the export to the shell rc
-/// file and persist the token in Cockpit credentials so the resolver picks it up
-/// without a restart. Returns a user-facing status string on success, or an
-/// error message on failure.
-fn apply_copilot_setup(
-    shell: CopilotShell,
-    rc_path: &std::path::Path,
-    credential_store_path: Option<&std::path::Path>,
-) -> Result<String, String> {
-    // Fetch the token first — if `gh` isn't installed or the user
-    // isn't logged in, we want to fail before mutating the rc file.
-    let token = copilot_setup::fetch_gh_token().map_err(|e| e.to_string())?;
-    let wrote = copilot_setup::append_to_rc(rc_path, shell).map_err(|e| e.to_string())?;
-
-    store_copilot_token(credential_store_path, token)?;
-
-    let suffix = if wrote {
-        format!("added export to {}", rc_path.display())
-    } else {
-        format!("export already in {}", rc_path.display())
-    };
-    Ok(format!(
-        "Copilot auth ready — {suffix}; Cockpit credential stored for this session"
-    ))
 }
 
 /// Provider ids are config-map keys. Restrict to a conservative

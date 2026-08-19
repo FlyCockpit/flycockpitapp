@@ -1,5 +1,101 @@
 use super::*;
 
+async fn begin_provider_oauth(provider_id: &str) -> Result<AsyncActionPayload, String> {
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|e| e.to_string())?;
+    match client
+        .request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+            provider_id: provider_id.to_string(),
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+            flow_id,
+            authorize_url,
+            user_code,
+        }) => Ok(AsyncActionPayload::OAuthProviderBegin {
+            flow_id,
+            authorize_url,
+            user_code,
+        }),
+        Ok(other) => Err(format!(
+            "unexpected provider OAuth begin response: {other:?}"
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn complete_provider_oauth(
+    flow_id: String,
+    input: Option<String>,
+) -> Result<AsyncActionPayload, String> {
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|e| e.to_string())?;
+    match client
+        .request(cockpit_core::daemon::proto::Request::CompleteProviderOAuth { flow_id, input })
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. }) => {
+            Ok(AsyncActionPayload::OAuthCodexComplete { logged_in })
+        }
+        Ok(other) => Err(format!(
+            "unexpected provider OAuth completion response: {other:?}"
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn provider_usage_from_wire(
+    row: cockpit_core::daemon::proto::ProviderUsageSnapshotView,
+) -> cockpit_core::providers::usage::ProviderUsageSnapshot {
+    use cockpit_core::daemon::proto::ProviderUsageAvailabilityView as Wire;
+    use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability, UsageWindow};
+
+    let availability = match row.availability {
+        Wire::Fetched {
+            source: _,
+            plan,
+            windows,
+            details,
+        } => UsageAvailability::Fetched {
+            // The core renderer only uses this as a diagnostic label. Wire
+            // values are daemon-defined, so retain the conservative static
+            // label instead of inventing a leaked remote payload.
+            source: "daemon",
+            plan,
+            windows: windows
+                .into_iter()
+                .map(|window| UsageWindow {
+                    label: window.label,
+                    used_percent: window.used_percent,
+                    reset_at: window.reset_at,
+                    detail: window.detail,
+                })
+                .collect(),
+            details,
+        },
+        Wire::Unsupported { reason: _ } => UsageAvailability::Unsupported {
+            // This legacy local rendering type uses a static reason; detailed
+            // daemon data is intentionally not required for this state.
+            reason: "unsupported by provider",
+        },
+        Wire::Unavailable { reason, hint_url } => {
+            UsageAvailability::Unavailable { reason, hint_url }
+        }
+        Wire::Error { message } => UsageAvailability::Error { message },
+    };
+    ProviderUsageSnapshot {
+        provider_id: row.provider_id,
+        display_name: row.display_name,
+        fetched_at: row.fetched_at,
+        availability,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StartupDisclosureIdentity<'a> {
     project_root: &'a str,
@@ -1065,14 +1161,30 @@ impl App {
                     tracing::debug!(error = %e, "display daemon probe failed");
                 }
             },
+            AsyncActionKind::Internal("oauth.acknowledge") => {
+                let payload = match result.payload {
+                    Ok(AsyncActionPayload::OAuthAcknowledged) => Ok(()),
+                    Ok(_) => Err("unexpected OAuth acknowledgement response".to_string()),
+                    Err(e) => Err(e),
+                };
+                self.dialog.apply_oauth_acknowledgement(payload);
+            }
             AsyncActionKind::Internal("oauth.codex.begin") => {
                 let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthCodexBegin(login)) => Ok(login),
+                    Ok(AsyncActionPayload::OAuthProviderBegin {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    }) => Ok(settings::OAuthPublicBegin {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    }),
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
                 self.dialog
-                    .apply_oauth_begin(OAuthProvider::Codex, OAuthBeginResult::Device(payload));
+                    .apply_oauth_begin(OAuthProvider::Codex, OAuthBeginResult::Public(payload));
             }
             AsyncActionKind::Internal("oauth.codex.poll") => {
                 let payload = match result.payload {
@@ -1085,42 +1197,20 @@ impl App {
             }
             AsyncActionKind::Internal("oauth.grok.begin") => {
                 let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthGrokBegin { login }) => {
-                        let settings::GrokBrowserStart { begin, listener } =
-                            settings::prepare_grok_browser_start(
-                                login,
-                                settings::OAuthEffects::production(),
-                                cockpit_core::auth::xai_oauth::CALLBACK_PORT,
-                            );
-                        if let Some(listener) = listener {
-                            let listener_login = begin.login.clone();
-                            self.async_actions.start(
-                                AsyncActionKind::Internal("oauth.grok.complete"),
-                                AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                                async move {
-                                    let mut store =
-                                        crate::tui::settings::cockpit_credential_store()
-                                            .map_err(|e| e.to_string())?;
-                                    cockpit_core::auth::xai_oauth::complete_local_callback_login_in(
-                                        listener_login,
-                                        listener,
-                                        &mut store,
-                                    )
-                                    .await
-                                    .map(|_| AsyncActionPayload::OAuthGrokComplete {
-                                        logged_in: true,
-                                    })
-                                    .map_err(|e| e.to_string())
-                                },
-                            );
-                        }
-                        Ok(begin)
-                    }
+                    Ok(AsyncActionPayload::OAuthProviderBegin {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    }) => Ok(settings::OAuthPublicBegin {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    }),
                     Ok(_) => Err("unexpected OAuth response".to_string()),
                     Err(e) => Err(e),
                 };
                 self.dialog
-                    .apply_oauth_begin(OAuthProvider::Grok, OAuthBeginResult::Browser(payload));
+                    .apply_oauth_begin(OAuthProvider::Grok, OAuthBeginResult::Public(payload));
             }
             AsyncActionKind::Internal("oauth.grok.complete") => {
                 let payload = match result.payload {
@@ -1400,32 +1490,54 @@ impl App {
     pub(super) fn drain_oauth_actions(&mut self) {
         while let Some(action) = self.dialog.take_oauth_action() {
             match (action.provider, action.op) {
+                (provider, OAuthFlowOp::Acknowledge) => {
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("oauth.acknowledge"),
+                        AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.acknowledge")),
+                        async move {
+                            let provider_id = match provider {
+                                OAuthProvider::Grok => {
+                                    cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
+                                }
+                                OAuthProvider::Codex => {
+                                    cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+                                }
+                            };
+                            let client = crate::tui::settings::settings_daemon_client()
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            match client
+                                .request(cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                    provider_id: provider_id.to_string(),
+                                })
+                                .await
+                                .map_err(|e| e.to_string())?
+                            {
+                                Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                                    Ok(AsyncActionPayload::OAuthAcknowledged)
+                                }
+                                Ok(other) => {
+                                    Err(format!("unexpected acknowledgement response: {other:?}"))
+                                }
+                                Err(error) => {
+                                    Err(format!("daemon rejected acknowledgement: {error}"))
+                                }
+                            }
+                        },
+                    );
+                }
                 (OAuthProvider::Codex, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async {
-                            cockpit_core::auth::codex_oauth::begin_device_code_login()
-                                .await
-                                .map(AsyncActionPayload::OAuthCodexBegin)
-                                .map_err(|e| e.to_string())
-                        },
+                        async { begin_provider_oauth("codex-oauth").await },
                     );
                 }
-                (OAuthProvider::Codex, OAuthFlowOp::Poll(login)) => {
+                (OAuthProvider::Codex, OAuthFlowOp::Poll { flow_id }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async move {
-                            let mut store = crate::tui::settings::cockpit_credential_store()
-                                .map_err(|e| e.to_string())?;
-                            cockpit_core::auth::codex_oauth::complete_device_code_login_in(
-                                login, &mut store,
-                            )
-                            .await
-                            .map(|_| AsyncActionPayload::OAuthCodexComplete { logged_in: true })
-                            .map_err(|e| e.to_string())
-                        },
+                        async move { complete_provider_oauth(flow_id, None).await },
                     );
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Cancel) => {
@@ -1436,28 +1548,14 @@ impl App {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move {
-                            let login = cockpit_core::auth::xai_oauth::begin_manual_login()
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            Ok(AsyncActionPayload::OAuthGrokBegin { login })
-                        },
+                        async move { begin_provider_oauth("grok-oauth").await },
                     );
                 }
-                (OAuthProvider::Grok, OAuthFlowOp::Complete { login, input }) => {
+                (OAuthProvider::Grok, OAuthFlowOp::Complete { flow_id, input }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move {
-                            let mut store = crate::tui::settings::cockpit_credential_store()
-                                .map_err(|e| e.to_string())?;
-                            cockpit_core::auth::xai_oauth::complete_manual_login_in(
-                                login, &input, &mut store,
-                            )
-                            .await
-                            .map(|_| AsyncActionPayload::OAuthGrokComplete { logged_in: true })
-                            .map_err(|e| e.to_string())
-                        },
+                        async move { complete_provider_oauth(flow_id, Some(input)).await },
                     );
                 }
                 (OAuthProvider::Grok, OAuthFlowOp::Cancel) => {
@@ -1465,7 +1563,7 @@ impl App {
                         .abort_key(&AsyncActionKey::new("oauth.grok"));
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Complete { .. })
-                | (OAuthProvider::Grok, OAuthFlowOp::Poll(_)) => {}
+                | (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {}
             }
         }
     }
@@ -1596,23 +1694,32 @@ impl App {
             AsyncActionKind::Refresh("provider.usage"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("provider.usage")),
             async move {
-                // Provider usage probes make authenticated network requests,
-                // so they need full (unredacted) provider entries the daemon's
-                // redacted snapshot cannot supply, and there is no wire request
-                // for daemon-side usage. Load the layered provider config
-                // directly (NOT `load_effective`); credentials resolve at
-                // request-construction time in core, never in TUI state.
-                let paths = cockpit_config::dirs::config_file_paths_for_load(&cwd);
-                let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
-                let store = crate::tui::settings::cockpit_credential_store().ok();
-                cockpit_core::providers::usage::probes::fetch_all_provider_usage_with_store(
-                    &cfg,
-                    filter.as_deref(),
-                    store,
-                )
-                .await
-                .map(AsyncActionPayload::ProviderUsage)
-                .map_err(|e| e.to_string())
+                let client = crate::tui::settings::settings_daemon_client()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match client
+                    .request(
+                        cockpit_core::daemon::proto::Request::GetProviderUsageSnapshot {
+                            project_root: cwd.display().to_string(),
+                            provider_id: filter,
+                        },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::ProviderUsageSnapshot {
+                        snapshots,
+                    }) => Ok(AsyncActionPayload::ProviderUsage(
+                        snapshots
+                            .into_iter()
+                            .map(provider_usage_from_wire)
+                            .collect(),
+                    )),
+                    Ok(other) => Err(format!(
+                        "unexpected provider usage daemon response: {other:?}"
+                    )),
+                    Err(error) => Err(error.to_string()),
+                }
             },
         );
     }

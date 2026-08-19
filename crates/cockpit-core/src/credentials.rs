@@ -220,6 +220,25 @@ impl CredentialStore {
         entries.into_iter()
     }
 
+    /// Return every string leaf in a provider credential record.
+    ///
+    /// Provider records are opaque JSON owned by integrations. The narrower
+    /// [`provider_credential_entries`] inventory is appropriate for building
+    /// the long-lived general redaction table, but response scrubbers must
+    /// also cover credentials stored under provider-specific, non-secret
+    /// field names. Keeping this traversal separate prevents metadata from
+    /// becoming a broadly redacted candidate while still stopping a provider
+    /// from reflecting any string held in its credential record.
+    pub(crate) fn provider_credential_leaf_entries(
+        &self,
+    ) -> impl Iterator<Item = (String, String)> {
+        let mut entries = Vec::new();
+        for (provider, record) in &self.records {
+            collect_string_leaves(record, &format!("$credentials:{provider}"), &mut entries);
+        }
+        entries.into_iter()
+    }
+
     pub fn save(&mut self) -> Result<()> {
         match &self.backend {
             CredentialBackend::Vault(vault) => {
@@ -265,6 +284,35 @@ impl CredentialStore {
                 self.record_mutations.clear();
                 self.secret_mutations.clear();
                 Ok(())
+            }
+        }
+    }
+
+    /// Persist one named secret through the daemon owner-mutation seam. MCP
+    /// token refreshes use this instead of `save`: the vault publishes the
+    /// active redaction table immediately and compensates the write if that
+    /// publication fails.
+    pub fn set_named_secret_and_save_published(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let name = name.into();
+        let value = value.into();
+        match &self.backend {
+            CredentialBackend::Vault(vault) => {
+                vault
+                    .mutate_owner_item(SecretVaultKind::NamedSecret, &name, Some(value.as_bytes()))
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                self.secrets.insert(name, value);
+                self.record_mutations.clear();
+                self.secret_mutations.clear();
+                Ok(())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { .. } => {
+                self.set_named_secret(name, value);
+                self.save()
             }
         }
     }
@@ -455,6 +503,23 @@ fn collect_all_strings(value: &Value, origin: &str, out: &mut Vec<(String, Strin
     }
 }
 
+fn collect_string_leaves(value: &Value, origin: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(value) => out.push((origin.to_string(), value.clone())),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                collect_string_leaves(value, &format!("{origin}.{key}"), out);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                collect_string_leaves(value, &format!("{origin}[{index}]"), out);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 fn read_credential_file(path: &Path) -> Result<CredentialFile> {
     if !path.exists() {
         return Ok(CredentialFile::default());
@@ -597,6 +662,33 @@ mod tests {
                 .iter()
                 .any(|(_, value)| value == "not-a-credential.test")
         );
+    }
+
+    #[test]
+    fn provider_credential_leaf_entries_collect_opaque_nested_strings() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CredentialStore::open(tmp.path().join("credentials.json")).unwrap();
+        store.set(
+            "provider",
+            serde_json::json!({
+                "oauth": { "opaque": { "token_value": "reflected-token-123456" } },
+                "account": { "id": "account-id-123456" },
+                "enabled": true
+            }),
+        );
+
+        let entries: Vec<_> = store.provider_credential_leaf_entries().collect();
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "reflected-token-123456")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, value)| value == "account-id-123456")
+        );
+        assert!(!entries.iter().any(|(_, value)| value == "true"));
     }
 
     #[test]

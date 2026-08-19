@@ -1138,6 +1138,17 @@ pub(crate) async fn boot_in_process(
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn boot_test_persistent_daemon() -> Result<std::sync::Arc<server::DaemonContext>> {
+    boot_test_persistent_daemon_with_source(config_source::ConfigSource::fixed(
+        Default::default(),
+        Default::default(),
+    ))
+    .await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+async fn boot_test_persistent_daemon_with_source(
+    source: config_source::ConfigSource,
+) -> Result<std::sync::Arc<server::DaemonContext>> {
     let paths = DaemonPaths::resolve_canonical()?;
     if let Some(ctx) = server::in_process_context(&paths.socket) {
         return Ok(ctx);
@@ -1150,7 +1161,7 @@ pub async fn boot_test_persistent_daemon() -> Result<std::sync::Arc<server::Daem
             locks,
             paths,
             terminal::default_host_factory(),
-            config_source::ConfigSource::fixed(Default::default(), Default::default()),
+            source,
         ))
     })
     .await
@@ -1166,6 +1177,10 @@ static IN_PROCESS_AUTO_PROMOTE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(any(test, feature = "test-support"))]
+static IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
 static AUTO_PROMOTED_DAEMON: std::sync::Mutex<Option<Arc<server::DaemonContext>>> =
     std::sync::Mutex::new(None);
 
@@ -1176,6 +1191,7 @@ pub struct InProcessAutoPromoteGuard;
 impl Drop for InProcessAutoPromoteGuard {
     fn drop(&mut self) {
         IN_PROCESS_AUTO_PROMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
+        IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.store(false, std::sync::atomic::Ordering::SeqCst);
         *AUTO_PROMOTED_DAEMON
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -1188,6 +1204,17 @@ pub fn enable_in_process_auto_promote() -> InProcessAutoPromoteGuard {
     InProcessAutoPromoteGuard
 }
 
+/// Test seam equivalent to [`enable_in_process_auto_promote`] whose daemon
+/// uses the production layered config source. This is intentionally separate
+/// from the fixed-config guard so existing core tests retain their isolated
+/// config behavior.
+#[cfg(any(test, feature = "test-support"))]
+pub fn enable_in_process_auto_promote_with_production_config() -> InProcessAutoPromoteGuard {
+    IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.store(true, std::sync::atomic::Ordering::SeqCst);
+    IN_PROCESS_AUTO_PROMOTE.store(true, std::sync::atomic::Ordering::SeqCst);
+    InProcessAutoPromoteGuard
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn in_process_auto_promote_enabled() -> bool {
     IN_PROCESS_AUTO_PROMOTE.load(std::sync::atomic::Ordering::SeqCst)
@@ -1195,7 +1222,12 @@ pub(crate) fn in_process_auto_promote_enabled() -> bool {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn auto_promote_in_process_persistent() -> Result<u32> {
-    let ctx = boot_test_persistent_daemon().await?;
+    let ctx = if IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        boot_test_persistent_daemon_with_source(config_source::ConfigSource::production()).await?
+    } else {
+        boot_test_persistent_daemon().await?
+    };
     *AUTO_PROMOTED_DAEMON
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ctx);

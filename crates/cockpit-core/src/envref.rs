@@ -12,8 +12,8 @@
 //! expands to the user's home directory.
 //!
 //! [`resolve`] returns the expanded string plus the names of any
-//! references whose env var is unset; the TUI uses that list to render a
-//! yellow "Environment variable not detected" warning under the input.
+//! references whose env var is unset. Frontends can use [`referenced_names`]
+//! when they need reference metadata without expanding secret values.
 
 use std::env;
 

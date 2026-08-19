@@ -51,6 +51,20 @@ pub enum SecretVaultKind {
     RedactionTable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVaultInventoryItem {
+    pub kind: SecretVaultKind,
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVaultInventoryPage {
+    pub items: Vec<SecretVaultInventoryItem>,
+    pub snapshot: String,
+    pub total_entries: usize,
+    pub has_more: bool,
+}
+
 impl SecretVaultKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -142,6 +156,9 @@ pub struct SecretVaultItemRow {
     pub ciphertext: Vec<u8>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Monotonic fence for this item. Unlike the inventory generation this
+    /// does not change when a different owner item is mutated.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +170,60 @@ pub struct SecretVaultSagaRow {
     pub phase: SecretVaultSagaPhase,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Verify the durable owner-inventory schema installed by the database
+/// migration. Schema changes are migration-owned; vault operations must never
+/// repair a live database with ad-hoc DDL while another process may be using
+/// it.
+pub fn ensure_inventory_generation_conn(conn: &rusqlite::Connection) -> Result<()> {
+    for table in [
+        "secret_vault_items",
+        "secret_vault_item_revisions",
+        "secret_vault_inventory_state",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        if !exists {
+            bail!("secret vault schema is missing migrated table `{table}`");
+        }
+    }
+    let has_revision = conn
+        .prepare("PRAGMA table_info(secret_vault_items)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == "revision");
+    if !has_revision {
+        bail!("secret vault schema is missing migrated column `revision`");
+    }
+    for trigger in [
+        "secret_vault_inventory_insert_generation",
+        "secret_vault_inventory_update_generation",
+        "secret_vault_inventory_delete_generation",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1)",
+            [trigger],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        if !exists {
+            bail!("secret vault schema is missing migrated trigger `{trigger}`");
+        }
+    }
+    Ok(())
+}
+
+pub fn inventory_generation_conn(conn: &rusqlite::Connection) -> Result<u64> {
+    let generation: i64 = conn.query_row(
+        "SELECT generation FROM secret_vault_inventory_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    u64::try_from(generation).context("secret vault inventory generation is invalid")
 }
 
 impl Db {
@@ -332,17 +403,56 @@ pub fn upsert_item_conn(
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<()> {
+    with_immediate_transaction(conn, || {
+        upsert_item_locked(conn, kind, item_id, key_version, nonce, ciphertext)
+    })
+}
+
+fn upsert_item_locked(
+    conn: &rusqlite::Connection,
+    kind: SecretVaultKind,
+    item_id: &str,
+    key_version: i64,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<()> {
     let now = Utc::now().timestamp();
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM secret_vault_item_revisions
+             WHERE kind = ?1 AND item_id = ?2",
+            params![kind.as_str(), item_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0_i64)
+        .checked_add(1)
+        .context("vault item revision overflow")?;
+    conn.execute(
+        "INSERT INTO secret_vault_item_revisions (kind, item_id, revision)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind, item_id) DO UPDATE SET revision = excluded.revision",
+        params![kind.as_str(), item_id, revision],
+    )?;
     conn.execute(
         "INSERT INTO secret_vault_items
-            (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
          ON CONFLICT(kind, item_id) DO UPDATE SET
             key_version = excluded.key_version,
             nonce = excluded.nonce,
             ciphertext = excluded.ciphertext,
-            updated_at = excluded.updated_at",
-        params![kind.as_str(), item_id, key_version, nonce, ciphertext, now],
+            updated_at = excluded.updated_at,
+            revision = excluded.revision",
+        params![
+            kind.as_str(),
+            item_id,
+            key_version,
+            nonce,
+            ciphertext,
+            now,
+            revision
+        ],
     )
     .context("upserting vault item")?;
     Ok(())
@@ -354,7 +464,7 @@ pub fn load_item_conn(
     item_id: &str,
 ) -> Result<Option<SecretVaultItemRow>> {
     conn.query_row(
-        "SELECT kind, item_id, key_version, nonce, ciphertext, created_at, updated_at
+        "SELECT kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision
          FROM secret_vault_items WHERE kind = ?1 AND item_id = ?2",
         params![kind.as_str(), item_id],
         map_item_row,
@@ -368,6 +478,31 @@ pub fn delete_item_conn(
     kind: SecretVaultKind,
     item_id: &str,
 ) -> Result<bool> {
+    with_immediate_transaction(conn, || delete_item_locked(conn, kind, item_id))
+}
+
+fn delete_item_locked(
+    conn: &rusqlite::Connection,
+    kind: SecretVaultKind,
+    item_id: &str,
+) -> Result<bool> {
+    let revision: i64 = conn
+        .query_row(
+            "SELECT revision FROM secret_vault_item_revisions
+             WHERE kind = ?1 AND item_id = ?2",
+            params![kind.as_str(), item_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0_i64)
+        .checked_add(1)
+        .context("vault item revision overflow")?;
+    conn.execute(
+        "INSERT INTO secret_vault_item_revisions (kind, item_id, revision)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind, item_id) DO UPDATE SET revision = excluded.revision",
+        params![kind.as_str(), item_id, revision],
+    )?;
     let n = conn
         .execute(
             "DELETE FROM secret_vault_items WHERE kind = ?1 AND item_id = ?2",
@@ -375,6 +510,35 @@ pub fn delete_item_conn(
         )
         .context("deleting vault item")?;
     Ok(n > 0)
+}
+
+/// Serialize an item mutation while preserving callers that already own a
+/// broader transaction (for example `mutate_item`).  Autocommit callers are
+/// the important case here: a revision read followed by its write must not
+/// be interleaved with another daemon/process mutating the same item.
+fn with_immediate_transaction<T>(
+    conn: &rusqlite::Connection,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("beginning secret vault item mutation")?;
+    }
+    let result = operation();
+    match result {
+        Ok(value) if owns_transaction => conn
+            .execute_batch("COMMIT;")
+            .context("committing secret vault item mutation")
+            .map(|()| value),
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if owns_transaction {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+            Err(error)
+        }
+    }
 }
 
 pub fn list_item_ids_conn(
@@ -391,9 +555,109 @@ pub fn list_item_ids_conn(
         .context("listing vault item ids")
 }
 
+/// Return a bounded, keyset-paginated owner inventory. The caller supplies a
+/// reliable mutation-generation token; this function only performs a bounded
+/// overflow probe and never loads or aggregates the full inventory.
+pub fn list_inventory_page_conn(
+    conn: &rusqlite::Connection,
+    after: Option<(&str, &str)>,
+    limit: usize,
+    max_total_entries: usize,
+) -> Result<SecretVaultInventoryPage> {
+    if limit == 0 {
+        bail!("inventory page limit must be positive");
+    }
+    if max_total_entries == 0 {
+        bail!("inventory total bound must be positive");
+    }
+    // The generation token, bounded overflow probe, and page rows must all
+    // come from one SQLite snapshot.  A read pool connection may otherwise
+    // observe a trigger writer between any two of those statements.  An
+    // explicit deferred transaction establishes the snapshot at the first
+    // read and keeps it until the page is complete.
+    conn.execute_batch("BEGIN DEFERRED;")
+        .context("beginning secret vault inventory read transaction")?;
+    let result = list_inventory_page_snapshot_conn(conn, after, limit, max_total_entries);
+    match result {
+        Ok(page) => {
+            if let Err(error) = conn.execute_batch("COMMIT;") {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error).context("committing secret vault inventory read transaction")
+            } else {
+                Ok(page)
+            }
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn list_inventory_page_snapshot_conn(
+    conn: &rusqlite::Connection,
+    after: Option<(&str, &str)>,
+    limit: usize,
+    max_total_entries: usize,
+) -> Result<SecretVaultInventoryPage> {
+    let generation = inventory_generation_conn(conn)?;
+    // Count only up to the advertised hard bound plus one. This is an
+    // overflow probe, not an unbounded aggregate scan; the caller rejects
+    // the page when the extra row is present.
+    let mut count_stmt = conn.prepare(
+        "SELECT 1
+         FROM secret_vault_items
+         WHERE kind IN ('named_secret', 'credential_record', 'subscription_ack')
+         LIMIT ?1",
+    )?;
+    let mut count_rows = count_stmt.query([i64::try_from(max_total_entries + 1)?])?;
+    let mut total_entries = 0usize;
+    while count_rows.next()?.is_some() {
+        total_entries += 1;
+    }
+    let (after_kind, after_item) = after
+        .map(|(kind, item)| (Some(kind), Some(item)))
+        .unwrap_or((None, None));
+    let mut stmt = conn.prepare(
+        "SELECT kind, item_id
+         FROM secret_vault_items
+         WHERE kind IN ('named_secret', 'credential_record', 'subscription_ack')
+           AND (
+             ?1 IS NULL
+             OR item_id > ?2
+             OR (item_id = ?2 AND kind > ?3)
+           )
+         ORDER BY item_id ASC, kind ASC
+         LIMIT ?4",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        after_item,
+        after_item,
+        after_kind,
+        i64::try_from(limit.saturating_add(1)).context("inventory page limit overflow")?,
+    ])?;
+    let mut items = Vec::with_capacity(limit.min(128));
+    while let Some(row) = rows.next()? {
+        items.push(SecretVaultInventoryItem {
+            kind: SecretVaultKind::parse(&row.get::<_, String>(0)?)?,
+            item_id: row.get(1)?,
+        });
+    }
+    let has_more = items.len() > limit;
+    if has_more {
+        items.truncate(limit);
+    }
+    Ok(SecretVaultInventoryPage {
+        items,
+        snapshot: generation.to_string(),
+        total_entries,
+        has_more,
+    })
+}
+
 pub fn list_items_conn(conn: &rusqlite::Connection) -> Result<Vec<SecretVaultItemRow>> {
     let mut stmt = conn.prepare(
-        "SELECT kind, item_id, key_version, nonce, ciphertext, created_at, updated_at
+        "SELECT kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision
          FROM secret_vault_items
          WHERE kind != 'sealed_compartment'
          ORDER BY kind ASC, item_id ASC",
@@ -419,6 +683,13 @@ fn map_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultItemRow>
         ciphertext: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        revision: u64::try_from(row.get::<_, i64>(7)?).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::other("negative vault item revision")),
+            )
+        })?,
     })
 }
 
@@ -581,6 +852,150 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn inventory_generation_is_durable_and_tracks_direct_writes() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            ensure_inventory_generation_conn(conn)?;
+            let before = inventory_generation_conn(conn)?;
+            let nonce = [7u8; 12];
+            let wrapped = [9u8; 48];
+            insert_key_conn(conn, 1, 1, &nonce, &wrapped, true)?;
+            // Simulate a writer that bypasses SecretVault but uses the shared
+            // SQLite database: the durable trigger must still invalidate a
+            // cursor held by another daemon process.
+            upsert_item_conn(
+                conn,
+                SecretVaultKind::NamedSecret,
+                "direct",
+                1,
+                &[8; 12],
+                &[0; 16],
+            )?;
+            let after_insert = inventory_generation_conn(conn)?;
+            assert!(after_insert > before);
+            conn.execute(
+                "DELETE FROM secret_vault_items WHERE kind = 'named_secret' AND item_id = 'direct'",
+                [],
+            )?;
+            assert!(inventory_generation_conn(conn)? > after_insert);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn inventory_page_keeps_generation_and_rows_on_one_sqlite_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let db = Db::open(&path).unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            ensure_inventory_generation_conn(conn)?;
+            insert_key_conn(conn, 1, 1, &[9; 12], &[8; 48], true)?;
+            upsert_item_conn(
+                conn,
+                SecretVaultKind::NamedSecret,
+                "before",
+                1,
+                &[1; 12],
+                &[2; 16],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Model a second daemon process with independent SQLite connections.
+        // The reader starts its snapshot before the writer commits a new
+        // inventory row, then runs the same bounded generation/count/page
+        // sequence used by list_inventory_page_conn.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader
+            .execute_batch("PRAGMA busy_timeout = 5000; BEGIN DEFERRED;")
+            .unwrap();
+        let generation_before = inventory_generation_conn(&reader).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        upsert_item_conn(
+            &writer,
+            SecretVaultKind::NamedSecret,
+            "after",
+            1,
+            &[3; 12],
+            &[4; 16],
+        )
+        .unwrap();
+
+        let page = list_inventory_page_snapshot_conn(&reader, None, 10, 10).unwrap();
+        assert_eq!(page.snapshot, generation_before.to_string());
+        assert_eq!(page.total_entries, 1);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before"]
+        );
+        reader.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn same_item_revision_allocation_is_atomic_across_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault.db");
+        let db = Db::open(&path).unwrap();
+        db.blocking_write_for_sync_maintenance(ensure_inventory_generation_conn)
+            .unwrap();
+        drop(db);
+
+        let left = rusqlite::Connection::open(&path).unwrap();
+        let right = rusqlite::Connection::open(&path).unwrap();
+        left.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        right.execute_batch("PRAGMA busy_timeout = 5000;").unwrap();
+        insert_key_conn(&left, 1, 1, &[9; 12], &[8; 48], true).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let left_start = std::sync::Arc::clone(&start);
+        let right_start = std::sync::Arc::clone(&start);
+        let left_thread = std::thread::spawn(move || {
+            left_start.wait();
+            upsert_item_conn(
+                &left,
+                SecretVaultKind::NamedSecret,
+                "same-item",
+                1,
+                &[1; 12],
+                &[2; 16],
+            )
+        });
+        let right_thread = std::thread::spawn(move || {
+            right_start.wait();
+            upsert_item_conn(
+                &right,
+                SecretVaultKind::NamedSecret,
+                "same-item",
+                1,
+                &[3; 12],
+                &[4; 16],
+            )
+        });
+        left_thread.join().unwrap().unwrap();
+        right_thread.join().unwrap().unwrap();
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        let item = load_item_conn(&reader, SecretVaultKind::NamedSecret, "same-item")
+            .unwrap()
+            .expect("same-item row");
+        let revision: i64 = reader
+            .query_row(
+                "SELECT revision FROM secret_vault_item_revisions
+                 WHERE kind = 'named_secret' AND item_id = 'same-item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(item.revision, 2);
+        assert_eq!(revision, 2);
     }
 
     #[test]

@@ -7,6 +7,46 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, TestBackend};
 use std::collections::BTreeMap;
 
+#[test]
+fn settings_config_mutations_stay_daemon_owned() {
+    let source = include_str!("mod.rs");
+    // Every settings config mutation funnels through the daemon's owned
+    // save RPC via `write_settings_text_via_daemon`.
+    assert!(
+        source.contains("Request::SaveExtendedConfig"),
+        "settings must issue the daemon-owned config-save RPC"
+    );
+    assert!(
+        source.contains("write_settings_text_via_daemon"),
+        "settings writes must route through the daemon helper"
+    );
+    // The retired local-save helper must be gone entirely.
+    assert!(!source.contains("remove_raw_path_and_save"));
+    // Direct local config writes / directory scaffolding survive only as
+    // `#[cfg(test)]` fallbacks; the production branch of every funnel uses the
+    // daemon. Prove each occurrence is test-gated (an ungated production write
+    // would regress the owner boundary).
+    for pattern in ["doc.write(&self.extended)", "scaffold_config_dir("] {
+        let mut rest = source;
+        let mut seen = 0usize;
+        while let Some(idx) = rest.find(pattern) {
+            seen += 1;
+            let preceding = &rest[..idx];
+            let window = &preceding[preceding.len().saturating_sub(240)..];
+            assert!(
+                window.contains("#[cfg(test)]"),
+                "local config write `{pattern}` must stay behind #[cfg(test)]; \
+                 production must go through the daemon"
+            );
+            rest = &rest[idx + pattern.len()..];
+        }
+        assert!(
+            seen > 0,
+            "expected `{pattern}` to exist as a test-only fallback"
+        );
+    }
+}
+
 fn entry(id_models: &[&str]) -> ProviderEntry {
     ProviderEntry {
         url: "https://x.example/v1".into(),
@@ -245,7 +285,15 @@ impl EditorEnv {
 pub(super) fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    SettingsDialog::open(path)
+    let mut dialog = SettingsDialog::open(path);
+    // `SettingsDialog::open` seeds the MCP snapshot from the daemon view, which
+    // in the cfg(test) path falls back to `McpConfig::discover` and would read
+    // this developer box's real `~/.config/cockpit/mcp.json`. Clear it so every
+    // fresh dialog starts from an empty, hermetic MCP inventory; tests that need
+    // servers seed `dialog.mcp_config` explicitly (mirroring the daemon
+    // snapshot the production TUI receives).
+    dialog.mcp_config = cockpit_core::mcp::config::McpConfig::default();
+    dialog
 }
 
 fn write_provider_file(config_path: &std::path::Path, provider_id: &str, json: &str) {
@@ -1460,7 +1508,6 @@ fn pointer_read_only_tool_sources_render_disabled() {
     );
 
     let raw = r#"{"servers":{"docs":{"transport":"streamable","endpoint":"https://example.test/mcp","enabled":true}}}"#;
-    std::fs::write(tmp.path().join("mcp.json"), raw).unwrap();
     let cfg = cockpit_core::mcp::config::McpConfig::parse(raw).unwrap();
     let server = cfg.servers.get("docs").unwrap();
     let cache_dir = tmp.path().join("mcp-cache");
@@ -1475,6 +1522,10 @@ fn pointer_read_only_tool_sources_render_disabled() {
     )
     .unwrap();
     dialog.mcp_cache_dir = Some(cache_dir);
+    // The tools page renders the daemon-owned MCP snapshot cached on the
+    // dialog, not a disk file. Seed it directly so the "docs" server's cached
+    // tool inventory renders as a read-only row.
+    dialog.mcp_config = cfg;
     set_tools_cursor_to_label(&mut dialog, "docs/lookup");
     let _ = render_settings_rows(&dialog, 100, 18);
     assert!(
@@ -2184,12 +2235,45 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
       }
     }"#;
 
-    fn fixture(tmp: &TempDir) -> SettingsDialog {
+    // MCP list edits (toggle/delete/save) are owner-remoted through the daemon
+    // (`Request::SaveMcpConfig`), which blocks on the ambient runtime and fails
+    // closed on an untrusted workspace. Promote an isolated in-process daemon,
+    // trust one shared project root, and drive every click that can persist
+    // under a multi-thread runtime so `block_in_place(Handle::current())` has a
+    // reactor. The environment is isolated so the owner write never touches this
+    // developer box.
+    let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("mcp pointer daemon runtime");
+    let trust_tmp = TempDir::new().unwrap();
+    let trusted_root = trust_tmp.path().to_path_buf();
+    // Give the trusted root a concrete config layer and pin the daemon's write
+    // target to it, so the owner-remoted MCP save has a layer to publish into
+    // (an empty directory yields "no Cockpit config layer is available").
+    let trusted_config = trusted_root.join("config.json");
+    std::fs::write(&trusted_config, "{}").unwrap();
+    _env.set_cockpit_config(&trusted_config);
+    seed_workspace_trust(&trusted_root);
+
+    let fixture = |tmp: &TempDir| -> SettingsDialog {
         let mut dialog = fresh_dialog(tmp);
-        std::fs::write(tmp.path().join("mcp.json"), MCP).unwrap();
+        // The MCP list renders the daemon-owned snapshot cached on the dialog
+        // (never a disk file). Seed it directly with the "docs" server so the
+        // populated-row control set renders and its owner-remoted edits persist.
+        dialog.mcp_config = cockpit_core::mcp::config::McpConfig::parse(MCP).unwrap();
+        // Owner-remoted MCP saves fail closed unless the project root is
+        // trusted; pin every fixture to the one trusted root seeded above.
+        dialog.active_project_root = Some(trusted_root.clone());
         enter_root_node(&mut dialog, "MCP");
         dialog
-    }
+    };
+    let run_click = |dialog: &mut SettingsDialog, action: &SettingsPointerAction| {
+        runtime.block_on(async { click_settings_action(dialog, action) });
+    };
 
     fn config(dialog: &SettingsDialog) -> cockpit_core::mcp::config::McpConfig {
         dialog.load_mcp()
@@ -2240,23 +2324,19 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         let tmp = TempDir::new().unwrap();
         let mut dialog = fixture(&tmp);
         let before = config(&dialog);
-        match &action {
-            SettingsPointerAction::Mcp(McpAction::Authenticate(_)) => {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async { click_settings_action(&mut dialog, &action) });
-                assert_eq!(
-                    snapshot(&config(&dialog)),
-                    snapshot(&before),
-                    "authentication does not rewrite mcp.json"
-                );
-                assert!(
-                    matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::List(state)) if state.status.is_some())
-                );
-            }
-            _ => click_settings_action(&mut dialog, &action),
+        run_click(&mut dialog, &action);
+        if matches!(
+            &action,
+            SettingsPointerAction::Mcp(McpAction::Authenticate(_))
+        ) {
+            assert_eq!(
+                snapshot(&config(&dialog)),
+                snapshot(&before),
+                "authentication does not rewrite mcp.json"
+            );
+            assert!(
+                matches!(dialog.test_page(), TestPageRef::Mcp(McpPage::List(state)) if state.status.is_some())
+            );
         }
         match action {
             SettingsPointerAction::Mcp(McpAction::Open(_)) => {
@@ -2287,11 +2367,11 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
 
                 let cancel_tmp = TempDir::new().unwrap();
                 let mut cancel = fixture(&cancel_tmp);
-                click_settings_action(&mut cancel, &action);
-                click_settings_action(&mut cancel, &SettingsPointerAction::Mcp(McpAction::Cancel));
+                run_click(&mut cancel, &action);
+                run_click(&mut cancel, &SettingsPointerAction::Mcp(McpAction::Cancel));
                 assert_eq!(snapshot(&config(&cancel)), snapshot(&before));
 
-                click_settings_action(&mut dialog, &action);
+                run_click(&mut dialog, &action);
                 assert!(config(&dialog).servers.is_empty());
             }
             SettingsPointerAction::Mcp(McpAction::Cancel) => unreachable!(),
@@ -2301,7 +2381,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
 
     let editor_source_tmp = TempDir::new().unwrap();
     let mut editor_source = fixture(&editor_source_tmp);
-    click_settings_action(
+    run_click(
         &mut editor_source,
         &SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId("docs".into()))),
     );
@@ -2318,7 +2398,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
         let open = SettingsPointerAction::Mcp(McpAction::Open(pointer_actions::McpServerId(
             "docs".into(),
         )));
-        click_settings_action(&mut dialog, &open);
+        run_click(&mut dialog, &open);
         let before = config(&dialog);
         let saved_enabled_from_editor = match dialog.test_page() {
             TestPageRef::Mcp(McpPage::Add(state)) => {
@@ -2333,7 +2413,7 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
             }
             other => panic!("MCP open did not produce an editor source: {other:?}"),
         };
-        click_settings_action(&mut dialog, &action);
+        run_click(&mut dialog, &action);
         match action {
             SettingsPointerAction::Mcp(McpAction::ToggleEditorEnabled) => {
                 assert!(
@@ -5069,10 +5149,109 @@ fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
     d
 }
 
+/// Environment + in-process daemon guard for settings tests whose mutations are
+/// owner-remoted. The fixture must outlive the dialog: dropping it restores the
+/// environment and tears the promoted daemon down.
+struct SettingsDaemonFixture {
+    _env: cockpit_test_support::TestEnvGuard,
+    _daemon: cockpit_core::daemon::InProcessAutoPromoteGuard,
+}
+
+/// A one-provider dialog whose config writes and secret cleanups are
+/// owner-remoted to an isolated in-process daemon (production layered config
+/// source) rather than timing out on a real socket. The environment is
+/// isolated, `COCKPIT_CONFIG` pins the daemon's write target to the dialog's
+/// config file (so owner-remoted provider writes land where the dialog reads
+/// them back), and the workspace is trusted — as a user trusts it once —
+/// because owner-remoted config writes fail closed on an untrusted workspace.
+fn daemon_dialog_with_one_provider(tmp: &TempDir) -> (SettingsDialog, SettingsDaemonFixture) {
+    let root = tmp.path();
+    let env = cockpit_test_support::TestEnvGuard::blocking_lock();
+    for (var, sub) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+    ] {
+        let dir = root.join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        env.set_var(var, &dir);
+    }
+    env.set_var("COCKPIT_TEST_NO_KEYRING", "1");
+
+    let path = root.join("config.json");
+    std::fs::write(&path, "{}").unwrap();
+    env.set_cockpit_config(&path);
+    write_provider_file(&path, "vendor", r#"{"url":"https://x","headers":[]}"#);
+
+    let daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+
+    let mut d = SettingsDialog::open(path);
+    d.active_project_root = Some(root.to_path_buf());
+    d.enter_providers();
+
+    seed_workspace_trust(root);
+
+    (
+        d,
+        SettingsDaemonFixture {
+            _env: env,
+            _daemon: daemon,
+        },
+    )
+}
+
+/// Trust `root` in the promoted daemon so owner-remoted config writes are
+/// accepted. Trust is DB-owned by the daemon (a local runtime-policy override
+/// would not reach its authoritative check), so it must be set via RPC. The
+/// transient runtime here only carries the request; the daemon context — and
+/// thus the seeded trust — persists across the per-call runtimes the settings
+/// reducers spin up.
+fn seed_workspace_trust(root: &std::path::Path) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("settings trust seed runtime");
+    runtime.block_on(async {
+        let client = crate::tui::settings::settings_daemon_client()
+            .await
+            .expect("settings daemon client for trust seed");
+        let project_root = root.display().to_string();
+        let expected_config_generation = match client
+            .request(Request::GetWorkspaceTrust {
+                project_root: project_root.clone(),
+            })
+            .await
+            .expect("trust read transport")
+            .expect("trust read response")
+        {
+            Response::WorkspaceTrust {
+                config_generation, ..
+            } => config_generation,
+            other => panic!("unexpected trust read: {other:?}"),
+        };
+        match client
+            .request(Request::SetWorkspaceTrust {
+                project_root,
+                mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                expected_config_generation,
+            })
+            .await
+            .expect("trust set transport")
+            .expect("trust set response")
+        {
+            Response::WorkspaceTrustSet { .. } => {}
+            other => panic!("unexpected trust set: {other:?}"),
+        }
+    });
+}
+
 #[test]
 fn save_config_preserves_untouched_provider_file_disk_edits() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     write_provider_file(
         &d.config_path,
         "vendor",
@@ -5259,7 +5438,7 @@ fn pressing_d_once_arms_delete_and_keeps_provider() {
 #[test]
 fn pressing_d_twice_deletes_the_provider() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     d.handle_key(press(KeyCode::Char('d')));
     d.handle_key(press(KeyCode::Char('d')));
     assert!(
@@ -5318,7 +5497,7 @@ fn disk_url(d: &SettingsDialog, id: &str) -> Option<String> {
 #[test]
 fn edit_save_changes_row_commits_and_stays() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     // Stage a URL edit, then move the cursor to the `[save changes]`
     // row and activate it.
@@ -5347,7 +5526,7 @@ fn edit_save_changes_row_commits_and_stays() {
 #[test]
 fn edit_url_field_enter_commits_to_disk() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     // Cursor 0 is the URL row; Enter opens the inline field pre-filled
     // with the current value. Clear it, type a new URL, Enter commits.
@@ -5365,7 +5544,7 @@ fn edit_url_field_enter_commits_to_disk() {
 #[test]
 fn edit_esc_persists_staged_url() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     // Stage a URL edit directly on the EditState (no manual save).
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
@@ -5384,7 +5563,7 @@ fn edit_esc_persists_staged_url() {
 #[test]
 fn headers_save_accelerator_commits_and_stays() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     // Open the Headers sub-page (Edit cursor 1 → Enter).
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
@@ -5428,7 +5607,7 @@ fn headers_save_accelerator_commits_and_stays() {
 #[test]
 fn headers_esc_persists_edits() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
         s.cursor = 1;
@@ -5462,7 +5641,7 @@ fn headers_esc_persists_edits() {
 #[test]
 fn models_esc_persists_edits() {
     let tmp = TempDir::new().unwrap();
-    let mut d = dialog_with_one_provider(&tmp);
+    let (mut d, _fx) = daemon_dialog_with_one_provider(&tmp);
     enter_edit_first_provider(&mut d);
     if let TestPageMut::Providers(ProvidersPage::Edit(s)) = d.test_page_mut() {
         s.cursor = 2; // Models row
@@ -5610,7 +5789,10 @@ async fn fetch_all_in_flight_ignores_keys_except_esc() {
     // Force a state with a live in-flight handle, independent of how
     // fast the spawned task completes (we never tick, so in_flight
     // stays populated).
-    let state = ProvidersPage::FetchAll(FetchAllState::spawn(&d.config));
+    let state = ProvidersPage::FetchAll(FetchAllState::spawn(
+        &d.config,
+        tmp.path().display().to_string(),
+    ));
     d.set_test_page(Page::Providers(state));
     if let TestPageRef::Providers(ProvidersPage::FetchAll(s)) = d.test_page() {
         assert!(s.is_fetching(), "expected an in-flight fetch");
@@ -5649,11 +5831,29 @@ fn fresh_install_reaches_add_provider() {
 
     assert!(dialog.test_provider_is_add());
     assert!(
-        tmp.path()
-            .join("home/.config/cockpit/config.json")
-            .is_file()
+        !tmp.path().join("home/.config/cockpit/config.json").exists(),
+        "opening provider add must not scaffold a config before save"
     );
     assert!(!tmp.path().join(".cockpit").exists());
+}
+
+#[test]
+fn mcp_oauth_ui_retains_public_url_and_accepts_manual_callback() {
+    let mut callback = TextField::default();
+    callback.set("http://127.0.0.1:43123/callback?code=opaque");
+    let state = mcp_page::McpOAuthState {
+        server: "docs".into(),
+        flow_id: "flow-id".into(),
+        authorize_url: "https://auth.example.test/authorize".into(),
+        callback,
+        status: None,
+    };
+    assert_eq!(state.authorize_url, "https://auth.example.test/authorize");
+    assert_eq!(
+        state.callback.text(),
+        "http://127.0.0.1:43123/callback?code=opaque"
+    );
+    assert_eq!(state.flow_id, "flow-id");
 }
 
 #[test]
@@ -7900,6 +8100,12 @@ fn tools_page_reserved_user_defined_tool_name_is_rejected() {
 #[test]
 fn tools_page_mcp_section_empty_and_cached_tools_jump_to_mcp() {
     let tmp = TempDir::new().unwrap();
+    // The tools page's MCP view is the daemon's redacted MCP snapshot, taken
+    // when the dialog opens. Isolate the environment and promote an in-process
+    // daemon so that snapshot is empty here rather than reflecting a real
+    // developer daemon's servers.
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote();
     let mut d = fresh_dialog(&tmp);
     enter_tools_from_root(&mut d);
     let empty = tools_page_lines(&d).join("\n");
@@ -7907,13 +8113,12 @@ fn tools_page_mcp_section_empty_and_cached_tools_jump_to_mcp() {
     assert!(empty.contains("configure in MCP ->"), "{empty}");
 
     let raw = r#"{"servers":{"docs":{"transport":"streamable","endpoint":"https://example.test/mcp","enabled":true}}}"#;
-    std::fs::write(tmp.path().join("mcp.json"), raw).unwrap();
     let cfg = cockpit_core::mcp::config::McpConfig::parse(raw).unwrap();
-    let server = cfg.servers.get("docs").unwrap();
+    let server = cfg.servers.get("docs").unwrap().clone();
     let cache_dir = tmp.path().join("mcp-cache");
     cockpit_core::mcp::cache::save_in(
         &cache_dir,
-        &cockpit_core::mcp::cache::cache_key("docs", server),
+        &cockpit_core::mcp::cache::cache_key("docs", &server),
         &[cockpit_core::mcp::protocol::ToolDescriptor {
             name: "lookup".into(),
             description: "Find docs\nwith details".into(),
@@ -7921,6 +8126,10 @@ fn tools_page_mcp_section_empty_and_cached_tools_jump_to_mcp() {
         }],
     )
     .unwrap();
+    // The MCP snapshot the tools page reads is the daemon's redacted view; seed
+    // the dialog's snapshot with the configured "docs" server (as a fresh
+    // daemon snapshot would deliver it) so the cached tool inventory renders.
+    d.mcp_config = cfg;
     d.mcp_cache_dir = Some(cache_dir);
 
     let cached = tools_page_lines(&d).join("\n");
@@ -7942,60 +8151,91 @@ fn tools_page_mcp_section_empty_and_cached_tools_jump_to_mcp() {
     assert!(matches!(d.test_page(), TestPageRef::Mcp(_)));
 }
 
-#[test]
-fn tools_page_web_key_entry_persists_and_renders_masked() {
+fn tools_page_rendered(d: &SettingsDialog) -> String {
+    let p = match d.test_page() {
+        TestPageRef::Tools(p) => p,
+        other => panic!("expected Tools, got {other:?}"),
+    };
+    d.build_tools_page_lines(80, p)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The web-tools API key is owner-remoted (`PutProviderCredential`): the field
+/// masks the pasted value, the daemon persists it, and the settings client
+/// never reads its bytes back. `save_web_api_key` blocks on the ambient
+/// runtime, so this test runs under a multi-thread runtime with the promoted
+/// in-process daemon; persistence is verified through the daemon's redacted
+/// owner inventory (a local `credentials.json` is never written).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_page_web_key_entry_persists_and_renders_masked() {
     let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home_async().await;
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+    // Boot the in-process daemon once, up front, so its canonical context is
+    // registered before anything else touches it. Rendering the tools page
+    // spawns background secret-inventory refresh tasks that also call
+    // `settings_daemon_client()`; without priming, that spawn can race the
+    // owner-remoted save's own boot and split-brain into two in-memory daemon
+    // DBs (the save lands in one, the verification reads the other, empty).
+    crate::tui::settings::settings_daemon_client()
+        .await
+        .expect("prime in-process settings daemon");
     let mut d = fresh_dialog(&tmp);
-    d.credential_store_path = Some(tmp.path().join("credentials.json"));
     enter_tools_from_root(&mut d);
 
     set_tools_cursor_to_label(&mut d, "api key");
     d.handle_key(press(KeyCode::Enter)); // key field
     d.paste("fc-secret-value");
 
-    let p = match d.test_page() {
-        TestPageRef::Tools(p) => p,
-        other => panic!("expected Tools, got {other:?}"),
-    };
-    let rendered = d
-        .build_tools_page_lines(80, p)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let rendered = tools_page_rendered(&d);
     assert!(rendered.contains(secret_display::MASKED_VALUE));
     assert!(!rendered.contains("fc-secret-value"));
 
-    d.handle_key(press(KeyCode::Enter));
-    let store =
-        cockpit_core::credentials::CredentialStore::open(d.credential_store_path.clone().unwrap())
-            .unwrap();
-    assert_eq!(
-        store.api_key("firecrawl").as_deref(),
-        Some("fc-secret-value")
+    d.handle_key(press(KeyCode::Enter)); // owner-remoted persist
+
+    // Persistence is owner-remoted: the key must land in the daemon vault as a
+    // redacted provider credential record — never a local credentials.json —
+    // and the settings client never reads its bytes back. Verify through the
+    // same redacted owner inventory the production read path consults.
+    assert!(
+        !tmp.path().join("credentials.json").exists(),
+        "web-key save must persist through the owner vault, not credentials.json"
+    );
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .expect("settings daemon client");
+    let response = client
+        .request(Request::ListSecretInventory {
+            cursor: None,
+            limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+        })
+        .await
+        .expect("owner inventory transport")
+        .expect("owner inventory response");
+    let Response::SecretInventory { entries, .. } = response else {
+        panic!("unexpected owner inventory response");
+    };
+    assert!(
+        entries.iter().any(|entry| entry.name == "firecrawl"
+            && entry.kind == cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+        "owner vault must hold the firecrawl web-key credential: {entries:?}"
+    );
+    let wire = serde_json::to_string(&entries).expect("inventory serializes");
+    assert!(
+        !wire.contains("fc-secret-value"),
+        "owner inventory must not leak the web-key bytes"
     );
 
-    let p = match d.test_page() {
-        TestPageRef::Tools(p) => p,
-        other => panic!("expected Tools, got {other:?}"),
-    };
-    let rendered = d
-        .build_tools_page_lines(80, p)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains(secret_display::MASKED_VALUE));
+    // And the editor still never displays the raw bytes.
+    let rendered = tools_page_rendered(&d);
     assert!(!rendered.contains("fc-secret-value"));
 }
 

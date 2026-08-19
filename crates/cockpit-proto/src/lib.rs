@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! { "v": 9, "kind": "req"|"res"|"evt"|"err", ... }
+//! { "v": 10, "kind": "req"|"res"|"evt"|"err", ... }
 //! ```
 //!
 //! - **`req`** — client → daemon. Carries a uuid `id` the daemon
@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +73,102 @@ pub struct ImageSpendPreflightView {
     pub policy_version: Option<u64>,
     pub epoch_policy_version: Option<u64>,
     pub epoch_sequence: Option<u64>,
+}
+
+#[cfg(test)]
+mod owner_credential_bounds_tests {
+    use super::*;
+
+    fn credential() -> StoredFlycockpitCredential {
+        StoredFlycockpitCredential {
+            server_url: "https://cockpit.example.test".into(),
+            instance_id: "instance".into(),
+            instance_token: "token".into(),
+            account: AccountInfo {
+                user_id: "user".into(),
+                email: "user@example.test".into(),
+            },
+            display_name: None,
+            relay_choice: None,
+        }
+    }
+
+    #[test]
+    fn owner_credential_bounds_cover_token_and_all_relay_strings() {
+        let mut too_long_token = credential();
+        too_long_token.instance_token = "x".repeat(MAX_OWNER_INSTANCE_TOKEN_BYTES + 1);
+        assert!(too_long_token.validate().is_err());
+
+        let too_long = "x".repeat(MAX_OWNER_RELAY_ID_BYTES + 1);
+        assert!(
+            RelayChoice {
+                relay_id: too_long,
+                region: Some("region".into()),
+                ws_url: "wss://relay.example.test/ws".into(),
+                rtt_ms: None,
+                chosen_at: 1,
+            }
+            .validate()
+            .is_err()
+        );
+        let too_long = "x".repeat(MAX_OWNER_RELAY_REGION_BYTES + 1);
+        assert!(
+            RelayChoice {
+                relay_id: "relay".into(),
+                region: Some(too_long),
+                ws_url: "wss://relay.example.test/ws".into(),
+                rtt_ms: None,
+                chosen_at: 1,
+            }
+            .validate()
+            .is_err()
+        );
+        let too_long = "x".repeat(MAX_OWNER_RELAY_URL_BYTES + 1);
+        assert!(
+            RelayChoice {
+                relay_id: "relay".into(),
+                region: Some("region".into()),
+                ws_url: too_long,
+                rtt_ms: None,
+                chosen_at: 1,
+            }
+            .validate()
+            .is_err()
+        );
+
+        let mut view = FlycockpitAccountView {
+            server_url: "https://cockpit.example.test".into(),
+            instance_id: "instance".into(),
+            account: AccountInfo {
+                user_id: "user".into(),
+                email: "user@example.test".into(),
+            },
+            display_name: None,
+            relay_choice: Some(RelayChoice {
+                relay_id: String::new(),
+                region: None,
+                ws_url: "wss://relay.example.test/ws".into(),
+                rtt_ms: None,
+                chosen_at: 1,
+            }),
+            token_fingerprint: "fingerprint".into(),
+        };
+        assert!(view.validate().is_err());
+        view.relay_choice = None;
+        view.validate().expect("valid account view");
+    }
+
+    #[test]
+    fn owner_view_url_redaction_removes_userinfo_query_and_fragment() {
+        let raw = "wss://user:token@relay.example.test/ws?access_token=secret#fragment";
+        let redacted = redact_url_for_owner_view(raw);
+        assert_eq!(redacted, "wss://relay.example.test/ws");
+        assert!(!redacted.contains("token"));
+        assert_eq!(
+            redact_url_for_owner_view("not a URL?token=secret"),
+            "[redacted]"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +213,16 @@ pub struct ProviderConfigView {
     pub on_unlisted_models_fetch: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+    /// Optional daemon-redacted MCP layer projection. The string is JSON so
+    /// the MCP config crate remains a client/core implementation detail; it
+    /// contains no header/env literals or credential values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config_json: Option<String>,
+    /// Optional daemon-redacted extended settings projection. JSON keeps the
+    /// settings crate out of the wire/core protocol while ensuring clients do
+    /// not load legacy config.json literals locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_config_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +240,76 @@ pub struct ProviderEntryView {
     pub headers: Vec<ProviderHeaderView>,
     #[serde(default)]
     pub credential_configured: bool,
+}
+
+/// Secret-free provider model discovery result returned by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProviderModelFetchOutcome {
+    Models {
+        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        catalog: cockpit_config::config::providers::ProviderModelCatalog,
+    },
+    FallbackAvailable {
+        models: Vec<cockpit_config::config::providers::ModelEntry>,
+        catalog: cockpit_config::config::providers::ProviderModelCatalog,
+        reason: String,
+    },
+    /// The effective unlisted-model policy is `ask` and the fetched catalog
+    /// would drop one or more configured models.  This is a no-write preview:
+    /// callers must retry explicitly with `keep` or `remove`.
+    UnlistedModelsPreview {
+        unlisted_count: u32,
+    },
+    Unsupported,
+    Error {
+        message: String,
+    },
+}
+
+/// One provider result from a daemon-owned catalog refresh.  The request can
+/// intentionally target one provider or the complete configured catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelFetchResult {
+    pub provider_id: String,
+    pub outcome: ProviderModelFetchOutcome,
+}
+
+/// Safe provider usage data. No credential, header, or opaque response body
+/// is represented by this wire type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderUsageSnapshotView {
+    pub provider_id: String,
+    pub display_name: String,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub availability: ProviderUsageAvailabilityView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ProviderUsageAvailabilityView {
+    Fetched {
+        source: String,
+        plan: Option<String>,
+        windows: Vec<ProviderUsageWindowView>,
+        details: Vec<String>,
+    },
+    Unsupported {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+        hint_url: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderUsageWindowView {
+    pub label: String,
+    pub used_percent: Option<f64>,
+    pub reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -472,6 +648,14 @@ impl AccountInfo {
             "account user id must not be empty"
         );
         anyhow::ensure!(!self.email.is_empty(), "account email must not be empty");
+        anyhow::ensure!(
+            self.user_id.len() <= MAX_OWNER_ACCOUNT_FIELD_BYTES,
+            "account user id exceeds maximum length"
+        );
+        anyhow::ensure!(
+            self.email.len() <= MAX_OWNER_ACCOUNT_FIELD_BYTES,
+            "account email exceeds maximum length"
+        );
         Ok(())
     }
 }
@@ -487,6 +671,92 @@ impl<'de> Deserialize<'de> for AccountInfo {
         let value = Self {
             user_id: wire.user_id,
             email: wire.email,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+/// Secret inventory metadata. Values are intentionally not represented here;
+/// this type is safe to return over owner-remoted RPCs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretInventoryKind {
+    NamedSecret,
+    CredentialRecord,
+    SubscriptionAck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretInventoryEntry {
+    pub name: String,
+    pub kind: SecretInventoryKind,
+    pub configured: bool,
+}
+
+/// Redacted projection of a stored Flycockpit account. The instance token is
+/// deliberately absent; the fingerprint is only an opaque change detector.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlycockpitAccountView {
+    pub server_url: String,
+    pub instance_id: String,
+    pub account: AccountInfo,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_choice: Option<RelayChoice>,
+    pub token_fingerprint: String,
+}
+
+impl FlycockpitAccountView {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.server_url.len() <= MAX_OWNER_SERVER_URL_BYTES,
+            "account server URL exceeds maximum length"
+        );
+        anyhow::ensure!(
+            self.instance_id.len() <= MAX_OWNER_INSTANCE_ID_BYTES,
+            "account instance id exceeds maximum length"
+        );
+        if let Some(display_name) = &self.display_name {
+            anyhow::ensure!(
+                display_name.len() <= MAX_OWNER_DISPLAY_NAME_BYTES,
+                "account display name exceeds maximum length"
+            );
+        }
+        anyhow::ensure!(
+            self.token_fingerprint.len() <= MAX_OWNER_TOKEN_FINGERPRINT_BYTES,
+            "account token fingerprint exceeds maximum length"
+        );
+        self.account.validate()?;
+        if let Some(relay) = &self.relay_choice {
+            relay.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for FlycockpitAccountView {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            server_url: String,
+            instance_id: String,
+            account: AccountInfo,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            relay_choice: Option<RelayChoice>,
+            token_fingerprint: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            server_url: wire.server_url,
+            instance_id: wire.instance_id,
+            account: wire.account,
+            display_name: wire.display_name,
+            relay_choice: wire.relay_choice,
+            token_fingerprint: wire.token_fingerprint,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -519,6 +789,24 @@ pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
         "server URL must use HTTPS except for localhost development"
     );
     Ok(url.origin().ascii_serialization())
+}
+
+/// Produce a safe display-only URL for an owner-remoted response.
+///
+/// Provider and relay URLs are configuration metadata, but query strings and
+/// user-info routinely contain bearer tokens.  Keep the endpoint shape useful
+/// to the UI while making those credential-bearing components impossible to
+/// export.  An unparseable value is not safe to echo either.
+pub fn redact_url_for_owner_view(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "[redacted]".to_string();
+    };
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return "[redacted]".to_string();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
@@ -574,7 +862,25 @@ impl StoredFlycockpitCredential {
             !self.instance_token.is_empty(),
             "instance token must not be empty"
         );
+        anyhow::ensure!(
+            self.instance_token.len() <= MAX_OWNER_INSTANCE_TOKEN_BYTES,
+            "instance token exceeds maximum length"
+        );
+        anyhow::ensure!(
+            self.server_url.len() <= MAX_OWNER_SERVER_URL_BYTES,
+            "server URL exceeds maximum length"
+        );
+        anyhow::ensure!(
+            self.instance_id.len() <= MAX_OWNER_INSTANCE_ID_BYTES,
+            "instance id exceeds maximum length"
+        );
         self.account.validate()?;
+        if let Some(display_name) = &self.display_name {
+            anyhow::ensure!(
+                display_name.len() <= MAX_OWNER_DISPLAY_NAME_BYTES,
+                "display name exceeds maximum length"
+            );
+        }
         if let Some(relay) = &self.relay_choice {
             relay.validate()?;
         }
@@ -598,11 +904,23 @@ impl RelayChoice {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.relay_id.is_empty(), "relay id must not be empty");
         anyhow::ensure!(
+            self.relay_id.len() <= MAX_OWNER_RELAY_ID_BYTES,
+            "relay id exceeds maximum length"
+        );
+        anyhow::ensure!(
             !self.ws_url.is_empty(),
             "relay websocket URL must not be empty"
         );
+        anyhow::ensure!(
+            self.ws_url.len() <= MAX_OWNER_RELAY_URL_BYTES,
+            "relay websocket URL exceeds maximum length"
+        );
         if let Some(region) = &self.region {
             anyhow::ensure!(!region.is_empty(), "relay region must not be empty");
+            anyhow::ensure!(
+                region.len() <= MAX_OWNER_RELAY_REGION_BYTES,
+                "relay region exceeds maximum length"
+            );
         }
         Ok(())
     }
@@ -654,13 +972,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version.
 ///
-/// Additive wire changes, including new request/response/event variants and
-/// new fields carrying `#[serde(default)]`, bump only this value: older peers
-/// keep the connection open and degrade feature-by-feature. Breaking changes
-/// such as removals, renames, and type changes bump
-/// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
-/// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// Current wire schema version. v10 adds owner/provider persistence RPCs.
+///
+/// A v10 client may still negotiate v9 with an older daemon, but the typed
+/// transport refuses to put v10-only payloads on that connection.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Oldest wire schema version this binary accepts. The supervised-goal batch
 /// retires v8 because it replaces the goal status shape, renames its progress
@@ -680,6 +996,45 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// escaping) fits comfortably in the remaining 349,524 bytes. 1 MiB is the
 /// smallest clean power-of-two bound with that headroom.
 pub const MAX_NDJSON_FRAME_BYTES: usize = 1_048_576;
+
+/// Bounds for owner-only secret-management RPC fields. These are deliberately
+/// below the NDJSON frame limit so a single request cannot consume the whole
+/// transport budget with one field (and so typed/in-process callers have the
+/// same contract as decoded wire callers).
+pub const MAX_OWNER_SECRET_NAME_BYTES: usize = 256;
+pub const MAX_OWNER_SECRET_VALUE_BYTES: usize = 256 * 1024;
+pub const MAX_OWNER_PROVIDER_ID_BYTES: usize = 256;
+pub const MAX_OWNER_PROVIDER_RECORD_BYTES: usize = 512 * 1024;
+pub const RESERVED_OWNER_PROVIDER_ID_PREFIX: &str = "subscription-oauth-ack:";
+/// Inventory item ids include the reserved subscription-ack prefix. Keep the
+/// cursor decoder large enough for the longest valid id in any inventory kind.
+pub const MAX_OWNER_INVENTORY_ITEM_ID_BYTES: usize =
+    MAX_OWNER_SECRET_NAME_BYTES + RESERVED_OWNER_PROVIDER_ID_PREFIX.len();
+/// Reserved for the dedicated FlyCockpit credential RPCs; generic provider
+/// credential mutations must never overwrite or remove this record.
+pub const RESERVED_FLYCOCKPIT_PROVIDER_ID: &str = "flycockpit";
+pub const MAX_OWNER_INVENTORY_CURSOR_BYTES: usize = 1024;
+pub const MAX_OWNER_INVENTORY_PAGE_ENTRIES: usize = 128;
+pub const MAX_OWNER_INVENTORY_TOTAL_ENTRIES: usize = 4096;
+pub const MAX_OWNER_INVENTORY_PAGE_BYTES: usize = 512 * 1024;
+pub const MAX_OWNER_SERVER_URL_BYTES: usize = 2048;
+pub const MAX_OWNER_INSTANCE_ID_BYTES: usize = 256;
+pub const MAX_OWNER_INSTANCE_TOKEN_BYTES: usize = 4096;
+pub const MAX_OWNER_ACCOUNT_FIELD_BYTES: usize = 512;
+pub const MAX_OWNER_DISPLAY_NAME_BYTES: usize = 512;
+pub const MAX_OWNER_TOKEN_FINGERPRINT_BYTES: usize = 128;
+pub const MAX_OWNER_RELAY_ID_BYTES: usize = 256;
+pub const MAX_OWNER_RELAY_URL_BYTES: usize = 2048;
+pub const MAX_OWNER_RELAY_REGION_BYTES: usize = 256;
+/// Owner-RPC provider metadata is kept comfortably below the 512 KiB remote
+/// interactive-lane cap, including JSON envelope overhead.
+pub const MAX_OWNER_PROVIDER_METADATA_JSON_BYTES: usize = 256 * 1024;
+pub const MAX_OWNER_PROVIDER_URL_BYTES: usize = 8 * 1024;
+pub const MAX_OWNER_PROVIDER_MODEL_ID_BYTES: usize = 1024;
+pub const MAX_OWNER_PROJECT_ROOT_BYTES: usize = 16 * 1024;
+pub const MAX_OWNER_ORG_ID_BYTES: usize = 256;
+/// Maximum canonical JSON size accepted for one provider configuration entry.
+pub const MAX_OWNER_PROVIDER_ENTRY_BYTES: usize = 256 * 1024;
 
 /// Pasted-image upload limits. Chunks are base64 strings inside JSON frames,
 /// so keep the base64 payload below the bulk lane's 512 KiB logical cap.
@@ -1812,6 +2167,21 @@ pub struct ConnectorDisclosure {
     pub last_error: Option<String>,
 }
 
+/// Secret-free outcome of a daemon-owned organization policy synchronization.
+/// The daemon retains the credential and performs all network/SQLite work;
+/// only the policy state needed by the CLI enrollment prompt crosses the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlycockpitOrgSyncOutcome {
+    NoCredential,
+    Disabled,
+    EnrollmentRequired { org_id: String },
+    Idle,
+    Filtered { cursor_seq: i64 },
+    Uploaded { events: usize, cursor_seq: i64 },
+    Revoked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppFlagKey {
@@ -2257,6 +2627,96 @@ pub enum InterruptRaiseReason {
     Rehydration,
 }
 
+/// Return the first protocol version that can carry a typed body. This gate
+/// is intentionally applied after negotiation and before serialization: a
+/// v10 client can use the v9 compatibility window, but must never serialize a
+/// v10-only RPC with a v9 envelope and leave an older daemon to interpret it.
+fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
+    match body {
+        Body::Request { request, .. } => {
+            let tag = request.wire_tag();
+            let version = match tag {
+                "list_secret_inventory"
+                | "put_named_secret"
+                | "put_subscription_ack"
+                | "delete_named_secret"
+                | "put_provider_credential"
+                | "delete_provider_credential"
+                | "get_flycockpit_account"
+                | "set_flycockpit_connector_enabled"
+                | "sync_flycockpit_org_policy"
+                | "enroll_flycockpit_org_sync"
+                | "get_provider_catalog_snapshot"
+                | "fetch_provider_models"
+                | "get_provider_usage_snapshot"
+                | "upsert_provider_config"
+                | "delete_provider_config"
+                | "set_provider_layer_metadata"
+                | "save_provider_config"
+                | "save_mcp_config"
+                | "begin_provider_oauth"
+                | "complete_provider_oauth"
+                | "begin_mcp_oauth"
+                | "complete_mcp_oauth"
+                | "cancel_mcp_oauth"
+                | "setup_copilot_auth"
+                | "apply_setup_wizard"
+                | "save_extended_config"
+                | "export_policy"
+                | "import_policy"
+                | "get_image_spend_policy"
+                | "save_image_spend_policy" => 10,
+                _ => 9,
+            };
+            (version, tag)
+        }
+        Body::Response { response, .. } => {
+            let tag = response.wire_tag();
+            let version = match tag {
+                "flycockpit_org_sync"
+                | "provider_catalog_snapshot"
+                | "provider_models_fetched"
+                | "provider_usage_snapshot"
+                | "provider_config_upserted"
+                | "secret_inventory"
+                | "flycockpit_account"
+                | "provider_oauth_started"
+                | "provider_oauth_completed"
+                | "mcp_oauth_started"
+                | "mcp_oauth_completed"
+                | "mcp_oauth_cancelled"
+                | "provider_credential_deleted"
+                | "mcp_config_saved"
+                | "extended_config_saved"
+                | "setup_wizard_applied"
+                | "policy_exported"
+                | "policy_imported"
+                | "image_spend_policy"
+                | "image_spend_policy_saved" => 10,
+                _ => 9,
+            };
+            (version, tag)
+        }
+        Body::Event { event } => (9, event.wire_tag()),
+        Body::Error { .. }
+        | Body::RemoteReplayRequest(_)
+        | Body::RemoteReplayResponse(_)
+        | Body::RemoteReplayAck(_)
+        | Body::RemoteReplayAckResponse(_)
+        | Body::Unknown => (9, "unknown"),
+    }
+}
+
+fn ensure_body_supported(version: u32, body: &Body) -> Result<()> {
+    let (required, tag) = body_required_protocol_version(body);
+    if required > version {
+        bail!(
+            "protocol payload {tag:?} requires v{required}, but negotiated daemon protocol is v{version}; run `cockpit daemon restart`"
+        );
+    }
+    Ok(())
+}
+
 // ---- Codec -----------------------------------------------------------------
 
 /// NDJSON framed codec over an arbitrary byte stream. Use the same
@@ -2319,6 +2779,7 @@ where
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
         env.v = self.version;
+        ensure_body_supported(self.version, &env.body)?;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -2381,6 +2842,7 @@ where
     pub async fn send(&mut self, env: &Envelope) -> Result<()> {
         let mut env = env.clone();
         env.v = self.version;
+        ensure_body_supported(self.version, &env.body)?;
         let line = serde_json::to_string(&env).context("serializing envelope")?;
         self.framed
             .send(line)
@@ -2453,6 +2915,12 @@ where
             let env: Envelope = serde_json::from_value(value).context("deserializing envelope")?;
             if envelope_contains_unknown(&env) {
                 return Ok(Some(RecvFrame::Unknown { v, kind, tag, id }));
+            }
+            // Negotiation permits a v10 peer to keep a v9 connection alive
+            // for the frozen v9 surface.  Do not let a raw/skewed peer label a
+            // v10-only body as v9 and bypass the corresponding send gate.
+            if body_required_protocol_version(&env.body).0 > v {
+                return Ok(Some(RecvFrame::VersionMismatch { v, kind, id }));
             }
             Ok(Some(RecvFrame::Envelope(Box::new(env))))
         }
@@ -2532,7 +3000,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9, 10];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -2718,7 +3186,7 @@ mod proto_fixture_tests {
         read_fixture_for(PROTOCOL_VERSION, file_name)
     }
 
-    fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
+    pub(crate) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
         let path = fixture_root_for(version).join(file_name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
@@ -5223,6 +5691,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v10_only_request_is_not_sent_to_v9_daemon() {
+        let (a, _b) = duplex(4096);
+        let mut v9 = ProtoStream::with_version(a, 9);
+        let request = Envelope::request(
+            Uuid::new_v4(),
+            Request::ListSecretInventory {
+                cursor: None,
+                limit: Some(32),
+            },
+        );
+        let error = v9
+            .send(&request)
+            .await
+            .expect_err("v10-only payload must be gated on a v9 connection");
+        assert!(error.to_string().contains("requires v10"));
+        assert!(error.to_string().contains("daemon restart"));
+    }
+
+    #[tokio::test]
+    async fn v10_only_provider_credential_response_is_not_sent_to_v9_daemon() {
+        let (a, _b) = duplex(4096);
+        let mut v9 = ProtoStream::with_version(a, 9);
+        let response = Envelope::response(
+            Uuid::new_v4(),
+            Response::ProviderCredentialDeleted {
+                found: true,
+                deleted: true,
+            },
+        );
+        let error = v9
+            .send(&response)
+            .await
+            .expect_err("v10-only response must be gated on a v9 connection");
+        assert!(error.to_string().contains("provider_credential_deleted"));
+        assert!(error.to_string().contains("requires v10"));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_request_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope {
+            v: 9,
+            body: Body::Request {
+                id,
+                operation: None,
+                request: Request::ListSecretInventory {
+                    cursor: None,
+                    limit: Some(32),
+                },
+            },
+        };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_response_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope::response_at(
+            9,
+            id,
+            Response::ProviderCredentialDeleted {
+                found: true,
+                deleted: true,
+            },
+        );
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[test]
+    fn every_new_oauth_and_durable_save_surface_requires_v10() {
+        for request in [
+            Request::BeginProviderOAuth {
+                provider_id: "codex-oauth".into(),
+            },
+            Request::CompleteProviderOAuth {
+                flow_id: "flow".into(),
+                input: None,
+            },
+            Request::BeginMcpOAuth {
+                project_root: "/tmp/project".into(),
+                server: "server".into(),
+            },
+            Request::CompleteMcpOAuth {
+                flow_id: "flow".into(),
+                input: None,
+            },
+            Request::CancelMcpOAuth {
+                flow_id: "flow".into(),
+            },
+            Request::SetupCopilotAuth {
+                project_root: "/tmp/project".into(),
+                provider_id: "copilot".into(),
+            },
+        ] {
+            assert_eq!(
+                body_required_protocol_version(&Body::Request {
+                    id: Uuid::nil(),
+                    operation: None,
+                    request,
+                })
+                .0,
+                10
+            );
+        }
+        for response in [
+            Response::ProviderOAuthStarted {
+                flow_id: "flow".into(),
+                authorize_url: "https://example.test".into(),
+                user_code: None,
+            },
+            Response::ProviderOAuthCompleted {
+                logged_in: true,
+                retry_after_seconds: None,
+            },
+            Response::McpOAuthStarted {
+                flow_id: "flow".into(),
+                authorize_url: "https://example.test".into(),
+            },
+            Response::McpOAuthCompleted {
+                authenticated: true,
+            },
+            Response::McpOAuthCancelled { cancelled: true },
+            Response::McpConfigSaved {
+                credential_count: 0,
+            },
+            Response::ProviderCredentialDeleted {
+                found: true,
+                deleted: true,
+            },
+        ] {
+            assert_eq!(
+                body_required_protocol_version(&Body::Response {
+                    id: Uuid::nil(),
+                    response: Box::new(response),
+                })
+                .0,
+                10
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v10_only_request_is_sent_after_v10_negotiation() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 10);
+        let mut receiver = ProtoStream::with_version(b, 10);
+        sender
+            .send(&Envelope::request(
+                Uuid::new_v4(),
+                Request::ListSecretInventory {
+                    cursor: None,
+                    limit: Some(32),
+                },
+            ))
+            .await
+            .unwrap();
+        let frame = receiver.recv().await.unwrap().expect("v10 frame");
+        match frame {
+            RecvFrame::Envelope(env) => {
+                assert_eq!(env.v, 10);
+                assert!(matches!(
+                    env.body,
+                    Body::Request {
+                        request: Request::ListSecretInventory { .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected v10 request envelope, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn recv_rejects_non_object_and_missing_v() {
         let (a, b) = duplex(4096);
         let mut left = ProtoStream::new(a);
@@ -5253,9 +5916,9 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_tests::read_fixture_for(9, "response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
@@ -5274,9 +5937,9 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_v9_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_tests::read_fixture_for(9, "response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture

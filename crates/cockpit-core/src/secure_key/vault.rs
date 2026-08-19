@@ -1,20 +1,24 @@
 //! Wrap-key vault: ChaCha20-Poly1305 wrap + item AEAD keyed by an unwrapped DEK.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use cockpit_db::secret_vault::{
-    SecretVaultKind, SecretVaultPlacement, VAULT_ALGORITHM, VAULT_NONCE_LEN, VAULT_TAG_LEN,
-    VAULT_WRAP_VERSION, VAULT_WRAPPED_DEK_LEN, count_active_keys_conn, deactivate_key_conn,
-    delete_item_conn, insert_key_conn, is_unique_constraint, list_item_ids_conn,
-    load_active_key_conn, load_authority_conn, load_item_conn, upsert_item_conn,
+    SecretVaultItemRow, SecretVaultKind, SecretVaultPlacement, VAULT_ALGORITHM, VAULT_NONCE_LEN,
+    VAULT_TAG_LEN, VAULT_WRAP_VERSION, VAULT_WRAPPED_DEK_LEN, count_active_keys_conn,
+    deactivate_key_conn, delete_item_conn, ensure_inventory_generation_conn, insert_key_conn,
+    is_unique_constraint, list_inventory_page_conn, list_item_ids_conn, load_active_key_conn,
+    load_authority_conn, load_item_conn, upsert_item_conn,
 };
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::Rng;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
 
 use crate::db::Db;
 use crate::db::installation_identity::InstallationIdentity;
@@ -35,6 +39,28 @@ pub struct SecretVault {
     dek: SecureKeyBytes,
     kek_version: i64,
     key_version: i64,
+    /// Daemon owner-mutation publication hook.  This is deliberately kept on
+    /// the shared vault handle so refreshes performed deep in MCP client
+    /// code cannot commit a named secret without publishing the active
+    /// redaction table.
+    owner_redaction_publisher: Arc<Mutex<Option<OwnerRedactionPublisher>>>,
+}
+
+pub type OwnerRedactionPublisher = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Exact state of one owner-visible item at a durable inventory generation.
+/// The generation remains part of the token when the row is absent, so an
+/// ABA delete cannot compare equal to the absence produced by the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVaultItemSnapshot {
+    pub generation: u64,
+    pub row: Option<SecretVaultItemRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVaultMutation {
+    pub prior: SecretVaultItemSnapshot,
+    pub after: SecretVaultItemSnapshot,
 }
 
 impl fmt::Debug for SecretVault {
@@ -48,6 +74,58 @@ impl fmt::Debug for SecretVault {
 }
 
 impl SecretVault {
+    /// Install the daemon-owned redaction publication callback.  The callback
+    /// is process-local and never persisted with vault state.
+    pub fn install_owner_redaction_publisher(&self, publisher: OwnerRedactionPublisher) {
+        *self
+            .owner_redaction_publisher
+            .lock()
+            .expect("owner redaction publisher mutex poisoned") = Some(publisher);
+    }
+
+    fn publish_owner_redaction(&self) -> Result<(), SecureKeyError> {
+        let publisher = self
+            .owner_redaction_publisher
+            .lock()
+            .expect("owner redaction publisher mutex poisoned")
+            .clone();
+        if let Some(publisher) = publisher {
+            publisher().map_err(SecureKeyError::Internal)?;
+        }
+        Ok(())
+    }
+
+    /// Mutate one owner-visible item and publish the current redaction table.
+    /// If publication fails, restore the exact prior row unless another
+    /// writer has advanced the same item.
+    pub fn mutate_owner_item(
+        &self,
+        kind: SecretVaultKind,
+        item_id: &str,
+        plaintext: Option<&[u8]>,
+    ) -> Result<(), SecureKeyError> {
+        let mutation = self.mutate_item(kind, item_id, plaintext)?;
+        if let Err(error) = self.publish_owner_redaction() {
+            self.restore_item_if_unchanged(kind, item_id, &mutation.after, mutation.prior.row.as_ref())
+                .map_err(|rollback| SecureKeyError::Internal(format!(
+                    "owner redaction publication failed: {error:?}; vault rollback failed: {rollback:?}"
+                )))?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Compute a daemon-held keyed identity for replay ledgers. The digest is
+    /// stable for this daemon/vault key and request bytes, but unlike a plain
+    /// SHA-256 it is not an offline verifier for secret-bearing requests.
+    pub fn keyed_request_identity(&self, domain: &[u8], request: &[u8]) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(self.dek.as_ref())
+            .expect("SecretVault DEK always has the fixed key length");
+        mac.update(domain);
+        mac.update(request);
+        mac.finalize().into_bytes().into()
+    }
+
     pub fn kek_store(&self) -> &Arc<dyn KekStore> {
         &self.kek_store
     }
@@ -117,6 +195,7 @@ impl SecretVault {
                 move |conn| {
                     conn.execute_batch("BEGIN IMMEDIATE;")?;
                     let result = (|| {
+                        ensure_inventory_generation_conn(conn)?;
                         if count_active_keys_conn(conn)? != 0 {
                             anyhow::bail!("vault already has an active DEK");
                         }
@@ -162,6 +241,7 @@ impl SecretVault {
                 dek,
                 kek_version,
                 key_version,
+                owner_redaction_publisher: Arc::new(Mutex::new(None)),
             })
         })();
         if built.is_err() {
@@ -236,7 +316,9 @@ impl SecretVault {
                 continue;
             }
             match upsert_item_conn(conn, kind, item_id, self.key_version, &nonce, &ciphertext) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    return Ok(());
+                }
                 Err(error) => {
                     if error
                         .downcast_ref::<rusqlite::Error>()
@@ -279,6 +361,97 @@ impl SecretVault {
     ) -> Result<(), SecureKeyError> {
         delete_item_conn(conn, kind, item_id).map_err(map_db_err)?;
         Ok(())
+    }
+
+    /// Mutate one owner-visible item and capture the exact before/after
+    /// encrypted rows and durable inventory generations in the same SQLite
+    /// writer transaction. Keeping mutation and capture together closes the
+    /// window in which another process could write between them.
+    pub fn mutate_item(
+        &self,
+        kind: SecretVaultKind,
+        item_id: &str,
+        plaintext: Option<&[u8]>,
+    ) -> Result<SecretVaultMutation, SecureKeyError> {
+        let item_id = item_id.to_owned();
+        let plaintext = plaintext.map(ToOwned::to_owned);
+        let vault = self.clone();
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                ensure_inventory_generation_conn(conn).map_err(map_db_err)?;
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                let result = vault.mutate_item_on_conn(conn, kind, &item_id, plaintext.as_deref());
+                match result {
+                    Ok(value) => {
+                        conn.execute_batch("COMMIT;")
+                            .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        Err(error.into())
+                    }
+                }
+            })
+            .map_err(map_db_err)
+    }
+
+    /// Apply an item mutation on a caller-owned SQLite transaction and return
+    /// the compare-and-restore token used by redaction publication
+    /// compensation. The caller must already hold the transaction's writer
+    /// lock; unlike [`Self::mutate_item`], this method neither starts nor
+    /// commits a transaction.
+    pub fn mutate_item_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        kind: SecretVaultKind,
+        item_id: &str,
+        plaintext: Option<&[u8]>,
+    ) -> Result<SecretVaultMutation, SecureKeyError> {
+        let prior_row = load_item_conn(conn, kind, item_id).map_err(map_db_err)?;
+        if prior_row.is_some() {
+            // Preserve fail-closed behavior for corrupt rows before allowing
+            // compensation to bind to them.
+            self.get_item_on_conn(conn, kind, item_id)?;
+        }
+        let prior_revision: u64 = conn
+            .query_row(
+                "SELECT revision FROM secret_vault_item_revisions
+                 WHERE kind = ?1 AND item_id = ?2",
+                rusqlite::params![kind.as_str(), item_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| SecureKeyError::Internal(error.to_string()))?
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| SecureKeyError::Corrupt("invalid vault item revision".into()))?;
+        let prior = SecretVaultItemSnapshot {
+            generation: prior_revision,
+            row: prior_row,
+        };
+        match plaintext {
+            Some(value) => self.put_item_on_conn(conn, kind, item_id, value)?,
+            None => {
+                delete_item_conn(conn, kind, item_id).map_err(map_db_err)?;
+            }
+        }
+        let after_revision: u64 = conn
+            .query_row(
+                "SELECT revision FROM secret_vault_item_revisions
+                 WHERE kind = ?1 AND item_id = ?2",
+                rusqlite::params![kind.as_str(), item_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| SecureKeyError::Internal(error.to_string()))?
+            .try_into()
+            .map_err(|_| SecureKeyError::Corrupt("invalid vault item revision".into()))?;
+        let after = SecretVaultItemSnapshot {
+            generation: after_revision,
+            row: load_item_conn(conn, kind, item_id).map_err(map_db_err)?,
+        };
+        Ok(SecretVaultMutation { prior, after })
     }
 
     pub fn put_item_with_nonce(
@@ -357,6 +530,18 @@ impl SecretVault {
         Err(SecureKeyError::Corrupt("vault item nonce reuse".into()))
     }
 
+    /// Current durable inventory generation. SQLite triggers bump this on
+    /// every visible vault write (including direct and cross-process writes),
+    /// so a caller can cheaply detect whether the vault changed since a prior
+    /// read without decrypting any item.
+    pub fn current_inventory_generation(&self) -> Result<u64, SecureKeyError> {
+        self.db
+            .blocking_write_for_sync_maintenance(|conn| {
+                cockpit_db::secret_vault::inventory_generation_conn(conn)
+            })
+            .map_err(map_db_err)
+    }
+
     pub fn get_item(
         &self,
         kind: SecretVaultKind,
@@ -408,6 +593,95 @@ impl SecretVault {
         Ok(())
     }
 
+    /// Restore one item only if its raw encrypted row is still exactly the
+    /// state supplied as `expected`. The compare and replacement happen in a
+    /// single writer transaction, so a different daemon cannot have its
+    /// newer same-item write overwritten by redaction compensation.
+    pub fn restore_item_if_unchanged(
+        &self,
+        kind: SecretVaultKind,
+        item_id: &str,
+        expected: &SecretVaultItemSnapshot,
+        prior: Option<&SecretVaultItemRow>,
+    ) -> Result<bool, SecureKeyError> {
+        let item_id = item_id.to_owned();
+        let expected = expected.clone();
+        let prior = prior.cloned();
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE;")?;
+                let result = (|| {
+                    let current = load_item_conn(conn, kind, &item_id)?;
+                    let revision: u64 = conn
+                        .query_row(
+                            "SELECT revision FROM secret_vault_item_revisions
+                             WHERE kind = ?1 AND item_id = ?2",
+                            rusqlite::params![kind.as_str(), item_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .unwrap_or(0)
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid vault item revision"))?;
+                    if revision != expected.generation || current != expected.row {
+                        return Ok(false);
+                    }
+                    let next_revision: i64 = revision
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("vault item revision overflow"))?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("vault item revision overflow"))?;
+                    match prior.as_ref() {
+                        Some(row) => {
+                            conn.execute(
+                                "INSERT INTO secret_vault_items
+                                    (kind, item_id, key_version, nonce, ciphertext, created_at, updated_at, revision)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                 ON CONFLICT(kind, item_id) DO UPDATE SET
+                                    key_version = excluded.key_version,
+                                    nonce = excluded.nonce,
+                                    ciphertext = excluded.ciphertext,
+                                    created_at = excluded.created_at,
+                                    updated_at = excluded.updated_at,
+                                    revision = excluded.revision",
+                                rusqlite::params![
+                                    row.kind.as_str(),
+                                    row.item_id,
+                                    row.key_version,
+                                    row.nonce,
+                                    row.ciphertext,
+                                    row.created_at,
+                                    row.updated_at,
+                                    next_revision,
+                                ],
+                            )?;
+                        }
+                        None => {
+                            delete_item_conn(conn, kind, &item_id)?;
+                        }
+                    }
+                    conn.execute(
+                        "INSERT INTO secret_vault_item_revisions (kind, item_id, revision)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(kind, item_id) DO UPDATE SET revision = excluded.revision",
+                        rusqlite::params![kind.as_str(), item_id, next_revision],
+                    )?;
+                    Ok(true)
+                })();
+                match result {
+                    Ok(value) => {
+                        conn.execute_batch("COMMIT;")?;
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        Err(error)
+                    }
+                }
+            })
+            .map_err(map_db_err)
+    }
+
     pub fn list_item_ids(&self, kind: SecretVaultKind) -> Result<Vec<String>, SecureKeyError> {
         if kind == SecretVaultKind::SealedCompartment {
             return Err(SecureKeyError::Internal(
@@ -416,6 +690,27 @@ impl SecretVault {
         }
         self.db
             .blocking_write_for_sync_maintenance(move |conn| list_item_ids_conn(conn, kind))
+            .map_err(map_db_err)
+    }
+
+    pub fn list_inventory_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<cockpit_db::secret_vault::SecretVaultInventoryPage, SecureKeyError> {
+        let after = after.map(|(kind, item_id)| (kind.to_string(), item_id.to_string()));
+        self.db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                ensure_inventory_generation_conn(conn)?;
+                list_inventory_page_conn(
+                    conn,
+                    after
+                        .as_ref()
+                        .map(|(kind, item_id)| (kind.as_str(), item_id.as_str())),
+                    limit,
+                    cockpit_proto::MAX_OWNER_INVENTORY_TOTAL_ENTRIES,
+                )
+            })
             .map_err(map_db_err)
     }
 
@@ -492,6 +787,7 @@ impl SecretVault {
     ) -> Result<Self, SecureKeyError> {
         let snapshot = db
             .blocking_write_for_sync_maintenance(|conn| {
+                ensure_inventory_generation_conn(conn)?;
                 let active = count_active_keys_conn(conn)?;
                 if active != 1 {
                     return Ok(Err(SecureKeyError::Corrupt(format!(
@@ -522,6 +818,7 @@ impl SecretVault {
             dek,
             kek_version: snapshot.kek_version,
             key_version: snapshot.key_version,
+            owner_redaction_publisher: Arc::new(Mutex::new(None)),
         })
     }
 }

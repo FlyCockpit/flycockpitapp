@@ -67,8 +67,10 @@ mod tools_page;
 mod ui_page;
 
 use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -79,27 +81,161 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
+#[cfg(test)]
+use cockpit_config::dirs::scaffold_config_dir;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
-    cwd_scoped_creatable_dirs, discover_config_dirs, scaffold_config_dir,
+    cwd_scoped_creatable_dirs, discover_config_dirs,
 };
-use cockpit_config::extended::{ExtendedConfig, ExtendedConfigDoc};
-use cockpit_config::providers::{
-    AuthKind, ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig,
-};
+use cockpit_config::extended::ExtendedConfig;
+#[cfg(test)]
+use cockpit_config::extended::ExtendedConfigDoc;
+#[cfg(test)]
+use cockpit_config::providers::ConfigDoc;
+use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 
-pub(crate) fn cockpit_credential_store()
--> anyhow::Result<cockpit_core::credentials::CredentialStore> {
-    let db = cockpit_core::db::Db::open_default()?;
-    let vault = cockpit_core::secure_key::open_for_db(&db)
-        .map_err(|error| anyhow::anyhow!("opening settings vault: {error}"))?;
-    cockpit_core::credentials::CredentialStore::from_vault(vault)
+/// Settings-side operations that need provider secrets must use the persistent
+/// daemon.  Keeping this tiny helper here makes accidental local vault opens
+/// in settings code both unnecessary and easy for the boundary ratchet to
+/// reject.
+pub(crate) async fn settings_daemon_client()
+-> anyhow::Result<cockpit_core::daemon::client::DaemonClient> {
+    Ok(cockpit_core::daemon::client::ensure_persistent_daemon()
+        .await?
+        .client)
 }
-use cockpit_core::daemon::proto::Request;
+
+/// Run a short daemon RPC from an input reducer. Production reducers execute
+/// beneath the application's multi-thread Tokio runtime. Unit reducers are
+/// intentionally synchronous, so give those tests the same daemon boundary
+/// instead of panicking before the request can be exercised.
+fn run_settings_daemon<T>(
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| handle.block_on(future));
+        }
+        return Err("settings daemon RPC requires a multi-thread application runtime".to_string());
+    }
+    #[cfg(test)]
+    {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(future)
+    }
+    #[cfg(not(test))]
+    Err("settings daemon RPC requires the application runtime".to_string())
+}
+
+fn write_settings_text_via_daemon(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    content: String,
+) -> Result<(), String> {
+    let (root, relative) = project_root
+        .filter(|root| path.starts_with(root))
+        .and_then(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| (root, relative))
+        })
+        .or_else(|| {
+            path.parent().and_then(|root| {
+                path.file_name()
+                    .map(|name| (root, std::path::Path::new(name)))
+            })
+        })
+        .ok_or_else(|| "settings write target has no parent".to_string())?;
+    let project_root = root.display().to_string();
+    let relative = relative.display().to_string();
+    // The daemon owns the target and performs the freshness check. The TUI
+    // must not read config.json merely to compute a hash: legacy layers can
+    // contain literal secrets before daemon redaction.
+    let base_hash = None;
+    run_settings_daemon(async move {
+        let client = settings_daemon_client()
+            .await
+            .map_err(|error| error.to_string())?;
+        match client
+            .request(Request::SaveExtendedConfig {
+                project_root,
+                path: relative,
+                content,
+                base_hash,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
+            Ok(other) => Err(format!(
+                "unexpected settings file-write response: {other:?}"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
+/// Search the complete metadata-only secret inventory.  Inventory pages are
+/// keyset-paginated; callers must not treat the first page as the whole
+/// answer, and a concurrent mutation requires restarting the traversal.
+pub(crate) async fn secret_inventory_contains(
+    client: &cockpit_core::daemon::client::DaemonClient,
+    name: &str,
+    kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+) -> Result<bool, String> {
+    let mut cursor = None;
+    let mut restarts = 0;
+    loop {
+        let response = match client
+            .request(cockpit_core::daemon::proto::Request::ListSecretInventory {
+                cursor: cursor.clone(),
+                limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+            })
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error))
+                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
+                    && restarts < 2 =>
+            {
+                restarts += 1;
+                cursor = None;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+            Ok(Err(error)) => return Err(error.to_string()),
+        };
+        let cockpit_core::daemon::proto::Response::SecretInventory {
+            entries,
+            next_cursor,
+        } = response
+        else {
+            return Err("daemon returned an unexpected secret inventory response".into());
+        };
+        if entries
+            .iter()
+            .any(|entry| entry.name == name && kind.as_ref().is_none_or(|kind| &entry.kind == kind))
+        {
+            return Ok(true);
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+    }
+}
+use cockpit_core::daemon::proto::{Request, Response};
 use cockpit_core::providers::models_fetch::FetchOutcome;
 use shell::{
-    SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsPointerTarget,
-    SettingsScrollStates, marker, muted_style, selected_or_field,
+    SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsScrollStates,
+    marker, muted_style, selected_or_field,
 };
 
 /// Height (in rows) the dialog wants when active.
@@ -590,6 +726,9 @@ pub struct SettingsCx {
     /// recent load. Unknown raw keys are preserved separately by
     /// [`ExtendedConfigDoc`].
     pub(super) extended_warnings: Vec<String>,
+    /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
+    /// the TUI; saves replace this cache only after the owner RPC succeeds.
+    pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
     /// settings dialog was opened from a flow that has no picker to
@@ -615,6 +754,11 @@ pub struct SettingsCx {
     /// Disclosure produced when a provider save moved literal header values
     /// into the credential store. Consumed by the provider page's status line.
     pub(super) last_secret_notice: Option<String>,
+    /// Metadata-only secret-presence cache used by settings renderers.  A
+    /// frame must never wait for the daemon socket; cache misses are filled in
+    /// the background and render as an unknown/checking state meanwhile.
+    secret_inventory_cache: Arc<Mutex<BTreeMap<String, bool>>>,
+    secret_inventory_pending: Arc<Mutex<BTreeSet<String>>>,
     pending_daemon_request: Option<Request>,
     pending_oauth_action: Option<OAuthFlowRequest>,
     /// Close settings and open the model picker for default-only mutation.
@@ -647,6 +791,76 @@ pub struct SettingsCx {
 }
 
 impl SettingsCx {
+    /// Return a cached metadata-only inventory answer and arrange a background
+    /// refresh on a cache miss.  This is deliberately safe to call from a
+    /// renderer: it never waits on the daemon or opens a local secret store.
+    pub(super) fn cached_secret_inventory_contains(
+        &self,
+        name: &str,
+        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+    ) -> Option<bool> {
+        let key = format!("{kind:?}:{name}");
+        if let Ok(cache) = self.secret_inventory_cache.lock()
+            && let Some(value) = cache.get(&key)
+        {
+            return Some(*value);
+        }
+        self.refresh_secret_inventory_entry(name.to_string(), kind);
+        None
+    }
+
+    pub(super) fn refresh_secret_inventory_entry(
+        &self,
+        name: String,
+        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+    ) {
+        // Synchronous unit-render tests intentionally have no Tokio runtime;
+        // leave their cache miss as "checking" rather than panicking.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let key = format!("{kind:?}:{name}");
+        let Ok(mut pending) = self.secret_inventory_pending.lock() else {
+            return;
+        };
+        if !pending.insert(key.clone()) {
+            return;
+        }
+        let cache = Arc::clone(&self.secret_inventory_cache);
+        let pending = Arc::clone(&self.secret_inventory_pending);
+        tokio::spawn(async move {
+            let present = match settings_daemon_client().await {
+                Ok(client) => secret_inventory_contains(&client, &name, kind).await,
+                Err(error) => Err(error.to_string()),
+            };
+            if let Ok(present) = present
+                && let Ok(mut cache) = cache.lock()
+            {
+                cache.insert(key.clone(), present);
+            }
+            if let Ok(mut pending) = pending.lock() {
+                pending.remove(&key);
+            }
+        });
+    }
+
+    pub(super) fn invalidate_secret_inventory_entry(
+        &self,
+        name: &str,
+        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+    ) {
+        let key = format!("{kind:?}:{name}");
+        if let Ok(mut cache) = self.secret_inventory_cache.lock() {
+            cache.remove(&key);
+        }
+    }
+
+    pub(super) fn invalidate_secret_inventory(&self) {
+        if let Ok(mut cache) = self.secret_inventory_cache.lock() {
+            cache.clear();
+        }
+    }
+
     pub(super) fn refresh_host_capabilities(&mut self) -> cockpit_proto::HostCapabilitySnapshot {
         if self.capability_refresh_in_flight {
             return self.host_capabilities.clone();
@@ -913,8 +1127,7 @@ use mcp_page::McpPage;
 pub(crate) use mcp_page::row_color as mcp_row_color;
 use providers::{AddState, EditState, ModelEditor, ProvidersPage};
 pub(crate) use providers::{
-    GrokBrowserStart, OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthProvider,
-    prepare_grok_browser_start,
+    OAuthBeginResult, OAuthFlowOp, OAuthFlowRequest, OAuthProvider, OAuthPublicBegin,
 };
 use reset::ResetButton;
 use skills_page::SkillsPage;
@@ -922,6 +1135,25 @@ use string_list::StringListPage;
 use tools_page::ToolsPage;
 
 use ui_page::{InstructionsPage, RedactPatternsPage};
+
+fn oauth_credential_inventory_name(provider: OAuthProvider) -> &'static str {
+    match provider {
+        OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
+        OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
+    }
+}
+
+fn oauth_acknowledgement_inventory_name(provider: OAuthProvider) -> String {
+    let provider = match provider {
+        OAuthProvider::Grok => cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER,
+        OAuthProvider::Codex => cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER,
+    };
+    format!(
+        "{}{}",
+        cockpit_core::auth::subscription_ack::PREFIX,
+        provider
+    )
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RowDeleteConfirm {
@@ -1206,15 +1438,13 @@ impl Dialog {
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
-        let dirs = discover_config_dirs(cwd);
-        let Some(dir) = dirs.first() else {
-            return true;
-        };
-        let path = dir.path.join("config.json");
-        match ConfigDoc::load(&path) {
-            Ok(doc) => doc.providers().providers.is_empty(),
-            Err(_) => true,
+        #[cfg(test)]
+        {
+            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+            ConfigDoc::providers_from_paths(&paths).providers.is_empty()
         }
+        #[cfg(not(test))]
+        daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
 
     /// Open the Add-Provider wizard directly, skipping the Providers
@@ -1226,16 +1456,15 @@ impl Dialog {
 
     pub fn open_providers_add_with_status(cwd: &std::path::Path, status: Option<String>) -> Self {
         // The provider wizard is the first-run destination, not the generic
-        // config-location picker. A clean install has no discovered layer,
-        // so materialize the normal first global layer before opening Add.
-        // This deliberately does not create project config and is reached
-        // only after the caller has obtained an explicit trust decision.
+        // config-location picker. Opening (or cancelling) it must not create
+        // a config layer. The daemon creates the selected target atomically
+        // when the user first saves a provider.
         let path = match discover_config_dirs(cwd).first() {
             Some(dir) => Ok(dir.path.join(CONFIG_FILE)),
             None => creatable_config_dirs()
                 .first()
                 .ok_or_else(|| std::io::Error::other("no Cockpit config directory is available"))
-                .and_then(|dir| scaffold_config_dir(&dir.path)),
+                .map(|dir| dir.path.join(CONFIG_FILE)),
         };
 
         match path {
@@ -1250,7 +1479,9 @@ impl Dialog {
                 choices: creatable_config_dirs(),
                 cursor: 0,
                 cwd: cwd.to_path_buf(),
-                status: Some(format!("could not create initial Cockpit config: {error}")),
+                status: Some(format!(
+                    "could not select an initial Cockpit config: {error}"
+                )),
             },
         }
     }
@@ -1333,22 +1564,21 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        // The provider settings editor mutates and persists config to a
-        // specific write-target file; it needs the full (unredacted) entry to
-        // seed the edit form, which the daemon's redacted snapshot cannot
-        // supply. Load the layered provider config directly (NOT
-        // `load_effective`): no credential resolution happens here, and the
-        // resulting write is signalled to the daemon on dialog close
-        // (`resync_config_after_local_write`).
-        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-        let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
-        let Some(entry) = cfg.providers.get(provider_id).cloned() else {
+        // The daemon is the authority for effective provider state. Its
+        // redacted snapshot is safe to seed into the editor and also lets the
+        // daemon migrate any legacy literal headers during the first save.
+        let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
+            return Self::open(cwd);
+        };
+        let Some(entry) = config.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };
         let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+        let mut settings = SettingsDialog::open_with_config(path, config);
+        settings.picker_cwd = Some(cwd.to_path_buf());
+        settings.active_project_root = Some(cwd.to_path_buf());
         let parent = EditState::new(provider_id.to_string(), entry.clone());
         let oauth_provider = if oauth_expired {
             match entry.effective_template(provider_id) {
@@ -1377,8 +1607,15 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-        let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
+        #[cfg(test)]
+        let cfg = {
+            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+            ConfigDoc::providers_from_paths(&paths)
+        };
+        #[cfg(not(test))]
+        let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
+            return Self::open(cwd);
+        };
         let Some(entry) = cfg.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };
@@ -1556,7 +1793,7 @@ impl Dialog {
                     false
                 }
                 ListAction::Close => true,
-                ListAction::Select(idx) => match scaffold_config_dir(&choices[idx].path) {
+                ListAction::Select(idx) => match scaffold_config_dir_owned(&choices[idx].path) {
                     Ok(config_path) => {
                         let cwd = cwd.clone();
                         *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
@@ -1584,7 +1821,7 @@ impl Dialog {
                 ListAction::Stay => false,
                 ListAction::Select(idx) => {
                     let target = &choices[idx];
-                    match scaffold_config_dir(&target.path) {
+                    match scaffold_config_dir_owned(&target.path) {
                         Ok(config_path) => {
                             let cwd = cwd.clone();
                             *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
@@ -1723,6 +1960,12 @@ impl Dialog {
     ) {
         if let Dialog::Settings(s) = self {
             s.apply_oauth_complete(provider, result);
+        }
+    }
+
+    pub(crate) fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_acknowledgement(result);
         }
     }
 
@@ -2097,25 +2340,49 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
+        #[cfg(test)]
         let config = ConfigDoc::load(&config_path)
-            .map(|d| d.providers())
+            .map(|document| document.providers())
             .unwrap_or_default();
+        #[cfg(not(test))]
+        let project_root = config_path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .or_else(|| config_path.parent())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        #[cfg(not(test))]
+        let config = daemon_provider_snapshot(project_root, None).unwrap_or_default();
+        Self::open_with_config(config_path, config)
+    }
+
+    /// Construct settings from an already-authoritative provider snapshot.
+    /// Direct provider entry points use this so legacy literal headers are
+    /// never loaded into TUI state before the daemon redacts/migrates them.
+    fn open_with_config(config_path: PathBuf, config: ProvidersConfig) -> Self {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
+        #[cfg(test)]
         let (mut extended, extended_warnings) = ExtendedConfigDoc::load(&extended_path)
             .map(|d| d.config_with_warnings())
+            .unwrap_or_default();
+        #[cfg(not(test))]
+        let (extended, extended_warnings) = config_cwd(&extended_path)
+            .and_then(|cwd| daemon_extended_snapshot(&cwd))
+            .map(|config| (config, Vec::new()))
             .unwrap_or_default();
         // Fresh install (no config at this location yet): seed the
         // skills scan-dir list with the defaults so they show as ordinary
         // editable rows. Materialization-only — an existing config whose
         // `scan_dirs` is absent/empty stays empty (clean break).
+        #[cfg(test)]
         if !extended_path.exists() {
             extended.skills.scan_dirs = cockpit_config::extended::SEEDED_SCAN_DIRS
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
         }
+        let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
         Self {
             page: root_page(0),
             stack: Vec::new(),
@@ -2128,6 +2395,7 @@ impl SettingsDialog {
                 config,
                 extended,
                 extended_warnings,
+                mcp_config,
                 picker_cwd: None,
                 active_project_root: None,
                 sandbox_enabled: true,
@@ -2139,6 +2407,8 @@ impl SettingsDialog {
                 credential_store_path: None,
                 mcp_cache_dir: None,
                 last_secret_notice: None,
+                secret_inventory_cache: Arc::new(Mutex::new(BTreeMap::new())),
+                secret_inventory_pending: Arc::new(Mutex::new(BTreeSet::new())),
                 pending_daemon_request: None,
                 pending_oauth_action: None,
                 pending_default_model_picker: false,
@@ -2160,26 +2430,76 @@ impl SettingsDialog {
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        let mut s = Self::open(config_path);
+        #[cfg(test)]
+        let config = ConfigDoc::load(&config_path)
+            .map(|document| document.providers())
+            .unwrap_or_default();
+        #[cfg(not(test))]
+        let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
+        let mut s = Self::open_with_config(config_path, config);
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
+        #[cfg(test)]
+        {
+            s.cx.mcp_config = cockpit_core::mcp::config::McpConfig::discover(
+                s.active_project_root.as_deref().expect("picker cwd"),
+            );
+        }
+        #[cfg(not(test))]
+        if let Some(snapshot) = s
+            .active_project_root
+            .as_deref()
+            .and_then(|root| daemon_provider_view_snapshot(root, None))
+            .and_then(|config| config.mcp_config_json)
+            .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
+        {
+            s.cx.mcp_config = snapshot;
+        }
+        #[cfg(not(test))]
+        if let Some(extended) =
+            daemon_extended_snapshot(s.active_project_root.as_deref().expect("picker root"))
+        {
+            s.cx.extended = extended;
+            s.cx.extended_warnings.clear();
+        }
         s
     }
 
     /// Reload extended-config from disk. Used after saving so the
     /// cached view stays in sync.
     fn reload_extended(&mut self) {
+        #[cfg(test)]
         if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
             let (extended, warnings) = doc.config_with_warnings();
             self.extended = extended;
             self.extended_warnings = warnings;
         }
+        #[cfg(not(test))]
+        if let Some(extended) =
+            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
+        {
+            self.extended = extended;
+            self.extended_warnings.clear();
+        }
     }
 
     /// Persist the cached extended-config to disk.
     pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        let mut doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        doc.write(&self.extended).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        {
+            let mut doc = doc;
+            doc.write(&self.extended).map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(test))]
+        write_settings_text_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
+        )?;
         Ok(())
     }
 
@@ -2221,9 +2541,7 @@ impl SettingsDialog {
     }
 
     fn save_config(&mut self) -> Result<(), String> {
-        let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
-        let mut merged = doc.providers();
-        merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        let mut merged = self.config.clone();
         for (provider_id, entry) in &merged.providers {
             cockpit_config::config::providers::validate_provider_headers(
                 provider_id,
@@ -2236,9 +2554,13 @@ impl SettingsDialog {
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
         self.stage_default_model_change();
-        doc.write(&merged).map_err(|e| e.to_string())?;
-        self.config = merged.clone();
-        self.original_config = merged;
+        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
+        // The daemon response is the only post-save source of truth.  It is
+        // deliberately redacted, so replacing the editor state here also
+        // guarantees that a literal header cannot be retained or rotated on
+        // the next save.
+        self.config = authoritative.clone();
+        self.original_config = authoritative;
         self.last_secret_notice = notice.map(|notice| notice.render());
         Ok(())
     }
@@ -2248,62 +2570,39 @@ impl SettingsDialog {
         provider_id: &str,
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
-        let mut names = self
-            .config
-            .providers
-            .get(provider_id)
-            .into_iter()
-            .flat_map(|provider| &provider.headers)
-            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
-            .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut credential_refs = self
-            .config
-            .providers
-            .get(provider_id)
-            .into_iter()
-            .filter(|provider| provider.auth == Some(AuthKind::OAuth))
-            .filter_map(|provider| provider.credential_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for (other_id, provider) in &self.config.providers {
-            if other_id == provider_id {
-                continue;
-            }
-            for name in provider
-                .headers
-                .iter()
-                .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
-                .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+        // The daemon performs secret cleanup and config deletion as one
+        // retry-safe composite. Do not remove the local row or issue separate
+        // secret RPCs before this succeeds: a failed cleanup must leave the
+        // config as durable intent for the next attempt.
+        let project_root = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "provider delete requires a project context".to_string())?;
+        run_settings_daemon(async {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            match client
+                .request(Request::DeleteProviderConfig {
+                    project_root: project_root.display().to_string(),
+                    provider_id: provider_id.to_string(),
+                    delete_stored_secrets,
+                })
+                .await
+                .map_err(|error| error.to_string())?
             {
-                names.remove(&name);
+                Ok(Response::ProviderConfigUpserted { .. }) => Ok(()),
+                Ok(other) => Err(format!(
+                    "unexpected daemon provider-delete response: {other:?}"
+                )),
+                Err(error) => Err(error.to_string()),
             }
-            if let Some(credential_ref) = provider.credential_ref.as_deref() {
-                credential_refs.remove(credential_ref);
-            }
-        }
-
-        if !delete_stored_secrets {
-            names.clear();
-        }
-
+        })?;
         self.config.providers.remove(provider_id);
-        self.save_config()?;
-        if names.is_empty() && credential_refs.is_empty() {
-            return Ok(0);
-        }
-
-        let mut store = cockpit_credential_store()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        for name in &names {
-            store.remove_named_secret(name);
-        }
-        for credential_ref in &credential_refs {
-            store.remove(credential_ref);
-        }
-        store
-            .save()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        Ok(names.len() + credential_refs.len())
+        Ok(0)
     }
 
     fn tick(&mut self) {
@@ -2336,6 +2635,7 @@ impl SettingsDialog {
 
         self.drain_fetch_all();
         self.drain_deep_fetch();
+        self.refresh_oauth_inventory_state();
         if let Some(page) = self.page.downcast_mut::<ProvidersPage>() {
             match page {
                 ProvidersPage::OAuthSetup { state, .. } if state.pending || state.polling => {
@@ -2365,10 +2665,61 @@ impl SettingsDialog {
     }
 
     fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
+        if result.is_ok() {
+            self.invalidate_secret_inventory_entry(oauth_credential_inventory_name(provider), None);
+        }
         let Some(state) = self.oauth_flow_state_mut(provider) else {
             return;
         };
         state.apply_complete(result);
+    }
+
+    fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
+        let provider = self.oauth_flow_provider();
+        if result.is_ok()
+            && let Some(provider) = provider
+        {
+            self.invalidate_secret_inventory_entry(
+                &oauth_acknowledgement_inventory_name(provider),
+                None,
+            );
+        }
+        if let Some(state) = self.oauth_flow_state_mut_for_any_provider() {
+            state.apply_acknowledgement(result);
+        }
+    }
+
+    fn refresh_oauth_inventory_state(&mut self) {
+        let Some(provider) = self.oauth_flow_provider() else {
+            return;
+        };
+        let logged_in =
+            self.cached_secret_inventory_contains(oauth_credential_inventory_name(provider), None);
+        let acknowledged = self.cached_secret_inventory_contains(
+            &oauth_acknowledgement_inventory_name(provider),
+            None,
+        );
+        if let Some(state) = self.oauth_flow_state_mut(provider) {
+            state.refresh_inventory_state(logged_in, acknowledged);
+        }
+    }
+
+    fn oauth_flow_provider(&self) -> Option<OAuthProvider> {
+        let page = self.page.downcast_ref::<ProvidersPage>()?;
+        match page {
+            ProvidersPage::OAuthSetup { state, .. } => Some(state.provider),
+            ProvidersPage::Add(add) => add.oauth_auth.as_ref().map(|state| state.provider),
+            _ => None,
+        }
+    }
+
+    fn oauth_flow_state_mut_for_any_provider(&mut self) -> Option<&mut providers::OAuthFlowState> {
+        let page = self.page.downcast_mut::<ProvidersPage>()?;
+        match page {
+            ProvidersPage::OAuthSetup { state, .. } => Some(state),
+            ProvidersPage::Add(add) => add.oauth_auth.as_deref_mut(),
+            _ => None,
+        }
     }
 
     fn oauth_flow_state_mut(
@@ -2720,6 +3071,7 @@ impl SettingsDialog {
             cursor: 0,
             status: None,
             delete_pending: false,
+            oauth: None,
         }));
     }
 
@@ -2964,6 +3316,7 @@ impl SettingsPage for RootPage {
                         cursor: 0,
                         status: None,
                         delete_pending: false,
+                        oauth: None,
                     }))),
                     "LSP" => {
                         cx.reload_extended();
@@ -3234,14 +3587,10 @@ impl SettingsCx {
     pub(super) fn effective_default_model(
         &self,
     ) -> Option<cockpit_config::providers::ActiveModelRef> {
-        let cwd = self
-            .active_project_root
-            .clone()
-            .or_else(|| self.picker_cwd.clone());
-        match cwd {
-            Some(cwd) => cockpit_config::providers::ConfigDoc::load_effective(&cwd).active_model,
-            None => self.config.active_model.clone(),
-        }
+        // This is the dialog's daemon-synchronised provider snapshot.  Do
+        // not load an effective layer here: that client-side helper may run
+        // recovery/migration work and is not the authority for settings.
+        self.config.active_model.clone()
     }
 
     pub(super) fn effective_default_scope_label(&self) -> String {
@@ -3295,16 +3644,37 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
+        #[cfg(test)]
         if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
             let (extended, warnings) = doc.config_with_warnings();
             self.extended = extended;
             self.extended_warnings = warnings;
         }
+        #[cfg(not(test))]
+        if let Some(extended) =
+            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
+        {
+            self.extended = extended;
+            self.extended_warnings.clear();
+        }
     }
 
     pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        let mut doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        doc.write(&self.extended).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        {
+            let mut doc = doc;
+            doc.write(&self.extended).map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(test))]
+        write_settings_text_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
+        )?;
         Ok(())
     }
 
@@ -3312,28 +3682,226 @@ impl SettingsCx {
         &self,
         providers: &mut std::collections::BTreeMap<String, ProviderEntry>,
     ) -> Result<Option<cockpit_core::secret_ref::SecretRefNotice>, String> {
-        #[cfg(test)]
-        if let Some(path) = self.credential_store_path.as_deref() {
-            return cockpit_core::secret_ref::protect_literal_headers(providers, Some(path))
-                .map_err(|e| e.to_string());
+        // The SaveProviderConfig RPC owns materialization and collision-safe
+        // names. Settings must retain plaintext only long enough to include it
+        // in that one daemon request; it never writes a separate vault record.
+        let count = providers
+            .values()
+            .flat_map(|entry| &entry.headers)
+            .filter(|header| {
+                let value = header.value.trim();
+                !value.is_empty()
+                    && !value.starts_with('$')
+                    && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        value,
+                    )
+                    && !secret_display::is_mask_value(value)
+            })
+            .count();
+        if count == 0 {
+            return Ok(None);
         }
-        let mut store = cockpit_credential_store().map_err(|e| e.to_string())?;
-        cockpit_core::secret_ref::protect_literal_headers_in_store(providers, &mut store)
-            .map_err(|e| e.to_string())
+        Ok(Some(cockpit_core::secret_ref::SecretRefNotice {
+            migrated: count,
+            store_path: PathBuf::from("daemon vault"),
+        }))
+    }
+
+    /// Provider configuration is daemon-owned for the same reason as the
+    /// adjacent credentials: the daemon has the trust-aware write target and
+    /// can refresh its authoritative snapshot atomically with the mutation.
+    fn upsert_provider_config_via_daemon(
+        &self,
+        config: &ProvidersConfig,
+    ) -> Result<ProvidersConfig, String> {
+        let project_root = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "provider save requires a project context".to_string())?;
+        // `config` is the dialog's effective view in some launch paths. Send
+        // only the user's edit intent: unchanged inherited providers must not
+        // be re-upserted into the defining layer and shadow the global entry.
+        let providers = config
+            .providers
+            .iter()
+            .filter(|(provider_id, entry)| {
+                self.original_config
+                    .providers
+                    .get(*provider_id)
+                    .is_none_or(|original| !provider_entries_equal(original, entry))
+            })
+            .map(|(provider_id, entry)| (provider_id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        let deleted = self
+            .original_config
+            .providers
+            .keys()
+            .filter(|provider_id| !config.providers.contains_key(*provider_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let category_defaults = config.category_defaults.clone();
+        let on_unlisted_models_fetch = config
+            .on_unlisted_models_fetch
+            .unwrap_or(OnUnlistedModelsFetch::Keep);
+        let metadata_changed = config.category_defaults != self.original_config.category_defaults
+            || config.on_unlisted_models_fetch != self.original_config.on_unlisted_models_fetch;
+        run_settings_daemon(async move {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut authoritative = None;
+            for (provider_id, entry) in providers {
+                let header_secrets = entry
+                        .headers
+                        .iter()
+                        .map(|header| {
+                            let value = header.value.trim();
+                            (!value.is_empty()
+                                && !value.starts_with('$')
+                                && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                                    &header.name.to_ascii_lowercase(),
+                                    value,
+                                )
+                                && !secret_display::is_mask_value(value))
+                            .then(|| header.value.clone())
+                        })
+                        .collect();
+                match client
+                    .request(Request::SaveProviderConfig {
+                        project_root: project_root.display().to_string(),
+                        provider_id,
+                        entry,
+                        header_secrets,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
+                        config,
+                    }) => authoritative = Some(config),
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected daemon provider-config response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            for provider_id in deleted {
+                match client
+                    .request(Request::DeleteProviderConfig {
+                        project_root: project_root.display().to_string(),
+                        provider_id,
+                        delete_stored_secrets: false,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
+                        config,
+                    }) => authoritative = Some(config),
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected daemon provider-delete response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            if !metadata_changed {
+                let mut effective = authoritative
+                    .as_ref()
+                    .map(providers_config_from_view)
+                    .unwrap_or_else(|| config.clone());
+                // A provider-config save must never publish the staged
+                // default-model edit. That change is confirmed only by
+                // the separately queued SetDefaultModel request.
+                effective.active_model = self.original_config.active_model.clone();
+                return Ok::<ProvidersConfig, String>(effective);
+            }
+            match client
+                .request(Request::SetProviderLayerMetadata {
+                    project_root: project_root.display().to_string(),
+                    category_defaults_json: serde_json::to_string(&category_defaults)
+                        .map_err(|error| error.to_string())?,
+                    on_unlisted_models_fetch,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { config }) => {
+                    authoritative = Some(config)
+                }
+                Ok(other) => {
+                    return Err(format!(
+                        "unexpected daemon provider-metadata response: {other:?}"
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            let mut effective = authoritative
+                .as_ref()
+                .map(providers_config_from_view)
+                .unwrap_or_else(|| config.clone());
+            // See the early return above: layer metadata persistence is
+            // not confirmation of the pending default-model mutation.
+            effective.active_model = self.original_config.active_model.clone();
+            Ok::<ProvidersConfig, String>(effective)
+        })
+    }
+
+    fn delete_provider_config_via_daemon(
+        &self,
+        provider_id: String,
+        delete_stored_secrets: bool,
+    ) -> Result<(), String> {
+        let project_root = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "provider delete requires a project context".to_string())?;
+        run_settings_daemon(async move {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            match client
+                .request(Request::DeleteProviderConfig {
+                    project_root: project_root.display().to_string(),
+                    provider_id,
+                    delete_stored_secrets,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { .. }) => Ok(()),
+                Ok(other) => Err(format!(
+                    "unexpected daemon provider-delete response: {other:?}"
+                )),
+                Err(error) => Err(error.to_string()),
+            }
+        })
     }
 
     fn save_config(&mut self) -> Result<(), String> {
-        let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
-        let mut merged = doc.providers();
-        merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        let mut merged = self.config.clone();
         let notice = self.protect_provider_literal_headers(&mut merged.providers)?;
         // The layer-wide default is never part of this file write; it goes to
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
         self.stage_default_model_change();
-        doc.write(&merged).map_err(|e| e.to_string())?;
-        self.config = merged.clone();
-        self.original_config = merged;
+        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
+        // Provider-layer persistence is not confirmation of the separately
+        // staged default-model mutation. Keep the daemon view, which still
+        // contains the previously verified default, until that operation
+        // completes.
+        self.config = authoritative.clone();
+        self.original_config = authoritative;
         self.last_secret_notice = notice.map(|notice| notice.render());
         Ok(())
     }
@@ -3343,62 +3911,9 @@ impl SettingsCx {
         provider_id: &str,
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
-        let mut names = self
-            .config
-            .providers
-            .get(provider_id)
-            .into_iter()
-            .flat_map(|provider| &provider.headers)
-            .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
-            .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut credential_refs = self
-            .config
-            .providers
-            .get(provider_id)
-            .into_iter()
-            .filter(|provider| provider.auth == Some(AuthKind::OAuth))
-            .filter_map(|provider| provider.credential_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for (other_id, provider) in &self.config.providers {
-            if other_id == provider_id {
-                continue;
-            }
-            for name in provider
-                .headers
-                .iter()
-                .flat_map(|header| cockpit_core::envref::referenced_names(&header.value))
-                .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
-            {
-                names.remove(&name);
-            }
-            if let Some(credential_ref) = provider.credential_ref.as_deref() {
-                credential_refs.remove(credential_ref);
-            }
-        }
-
-        if !delete_stored_secrets {
-            names.clear();
-        }
-
+        self.delete_provider_config_via_daemon(provider_id.to_string(), delete_stored_secrets)?;
         self.config.providers.remove(provider_id);
-        self.save_config()?;
-        if names.is_empty() && credential_refs.is_empty() {
-            return Ok(0);
-        }
-
-        let mut store = cockpit_credential_store()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        for name in &names {
-            store.remove_named_secret(name);
-        }
-        for credential_ref in &credential_refs {
-            store.remove(credential_ref);
-        }
-        store
-            .save()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
-        Ok(names.len() + credential_refs.len())
+        Ok(0)
     }
 }
 
@@ -3428,6 +3943,112 @@ fn merge_dialog_provider_config(
             disk.providers.insert(provider_id.clone(), entry.clone());
         }
     }
+}
+
+fn providers_config_from_view(
+    view: &cockpit_core::daemon::proto::ProviderConfigView,
+) -> ProvidersConfig {
+    ProvidersConfig {
+        providers: view
+            .providers
+            .iter()
+            .map(|(provider_id, entry_view)| {
+                let mut entry = entry_view.entry.clone();
+                // Keep only a non-secret editor marker. The daemon accepts
+                // this marker as "preserve the existing value" on a later
+                // save, so the literal never remains in TUI state.
+                entry.headers = entry_view
+                    .headers
+                    .iter()
+                    .map(|header| cockpit_config::config::providers::HeaderSpec {
+                        name: header.name.clone(),
+                        value: secret_display::MASKED_VALUE.to_string(),
+                    })
+                    .collect();
+                (provider_id.clone(), entry)
+            })
+            .collect(),
+        category_defaults: view.category_defaults.clone(),
+        on_unlisted_models_fetch: view.on_unlisted_models_fetch,
+        active_model: view.active_model.clone(),
+        resolution_generation: 0,
+    }
+}
+
+fn daemon_provider_snapshot(
+    cwd: &std::path::Path,
+    provider_id: Option<&str>,
+) -> Option<ProvidersConfig> {
+    let project_root = cwd.display().to_string();
+    let provider_id = provider_id.map(str::to_string);
+    daemon_provider_view_snapshot_inner(project_root, provider_id)
+        .map(|config| providers_config_from_view(&config))
+}
+
+fn daemon_provider_view_snapshot(
+    cwd: &std::path::Path,
+    provider_id: Option<&str>,
+) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+    let project_root = cwd.display().to_string();
+    let provider_id = provider_id.map(str::to_string);
+    daemon_provider_view_snapshot_inner(project_root, provider_id)
+}
+
+fn daemon_provider_view_snapshot_inner(
+    project_root: String,
+    provider_id: Option<String>,
+) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+    run_settings_daemon(async move {
+        let client = settings_daemon_client()
+            .await
+            .map_err(|error| error.to_string())?;
+        match client
+            .request(Request::GetProviderCatalogSnapshot {
+                project_root,
+                provider_id,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Ok(Response::ProviderCatalogSnapshot { config }) => Ok(config),
+            Ok(other) => Err(format!(
+                "unexpected daemon provider snapshot response: {other:?}"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+    .ok()
+}
+
+fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.parent()
+        .and_then(std::path::Path::parent)
+        .or_else(|| path.parent())
+        .map(std::path::Path::to_path_buf)
+}
+
+fn daemon_extended_snapshot(cwd: &std::path::Path) -> Option<ExtendedConfig> {
+    daemon_provider_view_snapshot(cwd, None)
+        .and_then(|config| config.extended_config_json)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+fn daemon_mcp_snapshot(
+    config_path: &std::path::Path,
+) -> Option<cockpit_core::mcp::config::McpConfig> {
+    let cwd = config_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .or_else(|| config_path.parent())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(test)]
+    {
+        Some(cockpit_core::mcp::config::McpConfig::discover(cwd))
+    }
+    #[cfg(not(test))]
+    daemon_provider_view_snapshot(cwd, None)
+        .and_then(|config| config.mcp_config_json)
+        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
@@ -4287,9 +4908,24 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
         return dir.path.join(cockpit_config::dirs::CONFIG_FILE);
     }
     let project = cwd.join(".cockpit");
-    // Best-effort scaffold; if it fails the doc loader still writes on save.
-    let _ = scaffold_config_dir(&project);
     project.join(cockpit_config::dirs::CONFIG_FILE)
+}
+
+fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        scaffold_config_dir(dir).map_err(|error| error.to_string())
+    }
+    #[cfg(not(test))]
+    {
+        let config_path = dir.join(CONFIG_FILE);
+        write_settings_text_via_daemon(
+            &config_path,
+            None,
+            "{\n  \"agents\": {},\n  \"tools\": {}\n}\n".to_string(),
+        )?;
+        Ok(config_path)
+    }
 }
 
 fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {

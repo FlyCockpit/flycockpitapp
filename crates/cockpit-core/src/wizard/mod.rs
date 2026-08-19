@@ -6,13 +6,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 mod apply;
 
 pub use apply::{
     ModelAnswersOutcome, apply_model_answers, apply_security_answers,
-    apply_security_answers_with_caps, compose_wizard_host_capabilities, descriptor_for_cwd,
+    apply_security_answers_with_caps, apply_setup_wizard_answers,
+    apply_setup_wizard_answers_authoritative, compose_wizard_host_capabilities, descriptor_for_cwd,
     descriptor_for_cwd_with_caps, model_descriptor_for_cwd, security_config_path,
 };
 
@@ -39,7 +40,7 @@ pub enum StepKind {
     Confirm,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WizardAnswer {
     Select(String),
     MultiToggle(Vec<String>),
@@ -185,6 +186,35 @@ impl WizardRun {
 
     pub fn answers(&self) -> &BTreeMap<&'static str, WizardAnswer> {
         &self.answers
+    }
+
+    /// Encode the completed answers for the daemon-owned setup mutation RPC.
+    /// Descriptors and hooks never cross the wire.
+    pub fn answers_json(&self) -> Result<String> {
+        let answers = self
+            .answers
+            .iter()
+            .map(|(id, answer)| ((*id).to_string(), answer))
+            .collect::<BTreeMap<_, _>>();
+        serde_json::to_string(&answers).context("serializing wizard answers")
+    }
+
+    /// Rebuild a validated run from daemon RPC answers. The descriptor is
+    /// selected from the daemon's current config, so client-side stale steps
+    /// cannot bypass current validation or branching.
+    pub fn from_answers_json(descriptor: WizardDescriptor, json: &str) -> Result<Self> {
+        let answers: BTreeMap<String, WizardAnswer> =
+            serde_json::from_str(json).context("deserializing wizard answers")?;
+        let mut run = Self::new(descriptor)?;
+        while let Some(step) = run.current_step() {
+            let answer = answers
+                .get(step.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing answer for wizard step `{}`", step.id))?;
+            run.submit(answer)
+                .map_err(|error| anyhow!("invalid wizard answer: {error}"))?;
+        }
+        Ok(run)
     }
 
     pub fn prefill(&self) -> Option<WizardAnswer> {

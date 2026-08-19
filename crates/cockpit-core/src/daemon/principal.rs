@@ -421,11 +421,14 @@ mod tests {
         );
         let expected = std::collections::BTreeSet::from([
             "daemon_status",
+            "export_policy",
             "export_session_data",
             "fs_list",
             "fs_read",
             "fs_stat",
             "get_host_capabilities",
+            "get_image_spend_policy",
+            "get_provider_catalog_snapshot",
             "get_run_invocation_status",
             "get_usage_counts",
             "git_diff_file",

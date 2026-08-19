@@ -1,4 +1,4 @@
-use super::oauth_flow::{OAuthBrowserBegin, OAuthOption, oauth_options};
+use super::oauth_flow::{OAuthOption, oauth_options};
 use super::row_editor::RowListEditor;
 use super::*;
 use crate::tui::settings::pointer_actions::ProviderRowEditorAction;
@@ -12,11 +12,111 @@ use cockpit_core::wizard::ProviderWizardStep;
 use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+thread_local! {
+    static PROVIDER_DAEMON_FIXTURE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+static PROVIDER_DAEMON_FIXTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Keep provider pointer matrices on a bounded, isolated daemon transport.
+/// Several acceptance tests call the aggregate matrix recursively; nested
+/// callers reuse the outer fixture instead of trying to acquire the process
+/// environment lock a second time.
+struct ProviderDaemonFixture {
+    env: Option<cockpit_test_support::TestEnvGuard>,
+    daemon: Option<cockpit_core::daemon::InProcessAutoPromoteGuard>,
+    lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl ProviderDaemonFixture {
+    fn new() -> Self {
+        let nested = PROVIDER_DAEMON_FIXTURE_DEPTH.with(|depth| {
+            let value = depth.get();
+            depth.set(value.saturating_add(1));
+            value != 0
+        });
+        if nested {
+            return Self {
+                env: None,
+                daemon: None,
+                lock: None,
+            };
+        }
+        let lock = PROVIDER_DAEMON_FIXTURE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self {
+            env: Some(cockpit_test_support::TestEnvGuard::isolated_cockpit_home()),
+            daemon: Some(
+                cockpit_core::daemon::enable_in_process_auto_promote_with_production_config(),
+            ),
+            lock: Some(lock),
+        }
+    }
+}
+
+impl Drop for ProviderDaemonFixture {
+    fn drop(&mut self) {
+        PROVIDER_DAEMON_FIXTURE_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+        if PROVIDER_DAEMON_FIXTURE_DEPTH.with(Cell::get) == 0 {
+            cockpit_config::config::trust::clear_runtime_policy_for_tests();
+        }
+    }
+}
+
+fn provider_daemon_runtime() -> (ProviderDaemonFixture, tokio::runtime::Runtime) {
+    let fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("provider daemon test runtime");
+    (fixture, runtime)
+}
+
+/// Seed a daemon-owned provider credential record for `credential_ref`,
+/// standing in for a completed OAuth login. Saving an OAuth provider is
+/// fail-closed on the daemon: the config's `credential_ref` must already point
+/// at a stored owner credential (in production the OAuth begin/complete flow
+/// puts it there). Tests that fake the OAuth handshake locally must therefore
+/// seed the vault so the owner-remoted save is accepted.
+fn seed_oauth_credential_via_daemon(credential_ref: &str) {
+    let credential_ref = credential_ref.to_string();
+    let fut = async move {
+        let client = crate::tui::settings::settings_daemon_client()
+            .await
+            .expect("settings daemon client for oauth credential seed");
+        let response = client
+            .request(
+                cockpit_core::daemon::proto::Request::PutProviderCredential {
+                    provider_id: credential_ref,
+                    record: r#"{"api_key":"test-oauth-token"}"#.to_string(),
+                },
+            )
+            .await
+            .expect("oauth credential seed transport")
+            .expect("oauth credential seed response");
+        assert!(
+            matches!(response, cockpit_core::daemon::proto::Response::Ack),
+            "unexpected oauth credential seed response: {response:?}"
+        );
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut));
+    } else {
+        futures::executor::block_on(fut);
+    }
+}
 
 fn provider_with_models(models: Vec<ModelEntry>) -> ProviderEntry {
     ProviderEntry {
@@ -43,13 +143,80 @@ fn press(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn public_grok_begin(flow_id: &str, authorize_url: &str) -> OAuthBeginResult {
+    OAuthBeginResult::Public(Ok(OAuthPublicBegin {
+        flow_id: flow_id.into(),
+        authorize_url: authorize_url.into(),
+        user_code: None,
+    }))
+}
+
+fn public_codex_begin(login: &cockpit_core::auth::codex_oauth::DeviceLogin) -> OAuthBeginResult {
+    OAuthBeginResult::Public(Ok(OAuthPublicBegin {
+        flow_id: "test-codex-flow".into(),
+        authorize_url: login.verification_uri.clone(),
+        user_code: Some(login.user_code.clone()),
+    }))
+}
+
 fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("config.json");
+    let path = tmp.path().join(".cockpit").join("config.json");
+    std::fs::create_dir_all(path.parent().expect("provider fixture config parent")).unwrap();
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ConfigDoc::load(&path).unwrap();
     doc.write(&config).unwrap();
     let mut dialog = SettingsDialog::open(path);
+    dialog.active_project_root = Some(tmp.path().to_path_buf());
+    let trust_root = cockpit_config::config::trust::resolve_trust_root(tmp.path())
+        .expect("provider fixture trust root");
+    cockpit_config::config::trust::set_runtime_policy(
+        trust_root.clone(),
+        cockpit_config::WorkspaceTrustMode::Trust,
+    );
+    // The daemon is deliberately authoritative for workspace trust. Pointer
+    // tests that exercise daemon-owned provider mutations must therefore seed
+    // the auto-promoted daemon itself, not merely the local presentation
+    // policy or a file-backed DB that the in-process daemon does not use.
+    if PROVIDER_DAEMON_FIXTURE_DEPTH.with(Cell::get) != 0 {
+        let project_root = trust_root.root.display().to_string();
+        let set_trust = async move {
+            let client = crate::tui::settings::settings_daemon_client()
+                .await
+                .expect("provider fixture daemon client");
+            let expected_config_generation = match client
+                .request(cockpit_core::daemon::proto::Request::GetWorkspaceTrust {
+                    project_root: project_root.clone(),
+                })
+                .await
+                .expect("provider fixture trust read transport")
+                .expect("provider fixture trust read response")
+            {
+                cockpit_core::daemon::proto::Response::WorkspaceTrust {
+                    config_generation, ..
+                } => config_generation,
+                other => panic!("unexpected provider fixture trust read: {other:?}"),
+            };
+            let response = client
+                .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+                    project_root,
+                    mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                    expected_config_generation,
+                })
+                .await
+                .expect("provider fixture trust transport")
+                .expect("provider fixture trust response");
+            assert!(matches!(
+                response,
+                cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }
+            ));
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(set_trust));
+        } else {
+            futures::executor::block_on(set_trust);
+        }
+    }
     // Provider-save tests must never touch the developer's real credential
     // store when literal-header protection runs as part of a save.
     dialog.credential_store_path = Some(tmp.path().join("credentials.json"));
@@ -182,11 +349,13 @@ fn render_provider_links(
 }
 
 pub(crate) fn run_pointer_provider_regression_matrix() {
+    let _daemon_fixture = ProviderDaemonFixture::new();
     // The aggregate exercises every provider surface, including reducers
     // that spawn refetch/OAuth work. Keep one reactor alive across the full
     // construction -> render -> dispatch matrix; narrower fixtures must not
     // accidentally drop the runtime before later nested traversals run.
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("provider pointer matrix runtime");
@@ -200,7 +369,7 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
     q_commits_headers_subpage();
     standalone_oauth_enter_on_continue_returns_to_edit();
     edit_delete_enter_requires_second_enter_to_confirm();
-    provider_delete_removes_its_unshared_stored_secret();
+    provider_delete_retains_unproven_unshared_stored_secret();
     provider_delete_preserves_a_shared_stored_secret();
     provider_delete_offer_can_keep_an_unshared_stored_secret();
     every_visible_oauth_row_acts_on_enter();
@@ -246,6 +415,8 @@ pub(crate) fn run_pointer_provider_regression_matrix() {
 
 #[test]
 fn pointer_xai_entitlement_renders_dispatches_and_persists() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
     };
@@ -366,6 +537,8 @@ fn pointer_xai_entitlement_renders_dispatches_and_persists() {
 
 #[test]
 fn pointer_active_model_retention_renders_dispatches_and_persists() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{
         ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
     };
@@ -1264,7 +1437,9 @@ fn prompt_fixture(kind: PromptFixture) -> (tempfile::TempDir, SettingsDialog) {
 
 #[test]
 fn pointer_prompt_surfaces_render_and_dispatch() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("provider prompt pointer runtime");
@@ -1404,7 +1579,9 @@ fn replay_special_provider_edit_actions(
 
 #[test]
 fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("Copilot pointer runtime");
@@ -1535,7 +1712,9 @@ fn pointer_copilot_setup_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("Grok OAuth pointer runtime");
@@ -1742,6 +1921,14 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         OAuthOption::Acknowledge,
     ));
     click_rendered_provider_action(&mut acknowledge, &acknowledge_action);
+    assert!(matches!(
+        acknowledge.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Grok,
+            op: OAuthFlowOp::Acknowledge,
+        })
+    ));
+    acknowledge.apply_oauth_acknowledgement(Ok(()));
     assert!(!actions(&acknowledge).contains(&acknowledge_action));
 
     let continue_action = SettingsPointerAction::Providers(ProvidersAction::OAuthOption(
@@ -1759,7 +1946,9 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("Codex OAuth pointer runtime");
@@ -1909,6 +2098,8 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
 
 #[test]
 fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture(provider: OAuthProvider) -> (tempfile::TempDir, SettingsDialog) {
@@ -1930,6 +2121,7 @@ fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
             ),
         }
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        seed_oauth_credential_via_daemon(template_id);
         dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
             template_id,
             oauth,
@@ -2018,6 +2210,8 @@ fn pointer_add_oauth_skip_continue_sources_save_from_fresh_state() {
 
 #[test]
 fn pointer_model_lifecycle_sources_dispatch_by_stable_identity() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction};
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
@@ -2205,6 +2399,8 @@ fn pointer_add_url_field_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_headers_existing_row_renders_and_dispatches_from_fresh_state() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
@@ -2445,6 +2641,8 @@ fn pointer_add_env_var_field_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
@@ -2514,7 +2712,8 @@ fn pointer_add_copilot_auth_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_test_key_choices_render_and_dispatch_from_fresh_state() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("provider key-test pointer runtime");
@@ -2818,10 +3017,13 @@ fn pointer_add_codex_login_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_grok_continue_renders_and_dispatches_from_fresh_state() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        seed_oauth_credential_via_daemon("grok-oauth");
         let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
         oauth.logged_in = true;
         dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
@@ -2864,10 +3066,13 @@ fn pointer_add_grok_continue_renders_and_dispatches_from_fresh_state() {
 
 #[test]
 fn pointer_add_codex_continue_renders_and_dispatches_from_fresh_state() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     use super::super::pointer_actions::{ProvidersAction, SettingsPointerAction, WizardControlId};
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        seed_oauth_credential_via_daemon("codex-oauth");
         let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
         oauth.logged_in = true;
         dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
@@ -2956,6 +3161,14 @@ fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
     let (_tmp, mut fresh) = fixture();
     click_rendered_provider_action(&mut fresh, &action);
     assert!(matches!(
+        fresh.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Grok,
+            op: OAuthFlowOp::Acknowledge,
+        })
+    ));
+    fresh.apply_oauth_acknowledgement(Ok(()));
+    assert!(matches!(
         fresh.test_page(),
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.is_step("grok-oauth")
@@ -3018,6 +3231,14 @@ fn pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state() {
     let (_tmp, mut fresh) = fixture();
     click_rendered_provider_action(&mut fresh, &action);
     assert!(matches!(
+        fresh.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Codex,
+            op: OAuthFlowOp::Acknowledge,
+        })
+    ));
+    fresh.apply_oauth_acknowledgement(Ok(()));
+    assert!(matches!(
         fresh.test_page(),
         TestPageRef::Providers(ProvidersPage::Add(state))
             if state.is_step("codex-oauth")
@@ -3046,6 +3267,11 @@ fn edit_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) 
 
 fn deep_fetch_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialog) {
     let (tmp, mut dialog) = dialog_with_config(config);
+    // Deep fetch is daemon-owned and requires an explicit workspace. Keep the
+    // fixture in that same workspace so the Fetch choice enters Running
+    // deterministically; the spawned request is cancelled with the test
+    // runtime rather than contacting an ambient project.
+    dialog.active_project_root = Some(tmp.path().to_path_buf());
     let entry = dialog.config.providers["p"].clone();
     let state = DeepFetchState::prepare(&dialog.config_path, "p").expect("deep-fetch fixture");
     dialog.page = super::super::providers_page(ProvidersPage::DeepFetch {
@@ -3131,7 +3357,9 @@ fn nested_provider_fixture(
 
 #[test]
 fn pointer_reachable_nested_surfaces_render_and_dispatch() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("nested provider pointer runtime");
@@ -3173,7 +3401,8 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
         );
         if path < 3 {
             for action in actions {
-                let (_tmp, mut fresh) = nested_provider_fixture(config.clone(), path);
+                let (tmp, mut fresh) = nested_provider_fixture(config.clone(), path);
+                fresh.active_project_root = Some(tmp.path().to_path_buf());
                 click_rendered_provider_action(&mut fresh, &action);
                 match &action {
                     super::super::pointer_actions::SettingsPointerAction::Providers(
@@ -3194,7 +3423,8 @@ fn pointer_reachable_nested_surfaces_render_and_dispatch() {
                         ProvidersAction::RowEditor(ProviderRowEditorAction::ModelSave),
                     ) => assert!(matches!(
                         fresh.test_page(),
-                        TestPageRef::Providers(ProvidersPage::Models { .. })
+                        TestPageRef::Providers(ProvidersPage::Models { parent, .. })
+                            if parent.status.as_deref().is_some_and(|status| status.starts_with("saved"))
                     )),
                     super::super::pointer_actions::SettingsPointerAction::Providers(
                         ProvidersAction::RowEditor(ProviderRowEditorAction::SettingSave),
@@ -3263,6 +3493,8 @@ fn headers_fixture(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDialo
 
 #[test]
 fn pointer_headers_surface_dispatches_every_enabled_control() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let config = one_provider_config(None);
     let (_tmp, source) = headers_fixture(config.clone());
     let _ = render_provider_rows(&source, 110, 60);
@@ -3318,7 +3550,9 @@ fn click_rendered_provider_action(
 
 #[test]
 fn pointer_enabled_list_and_edit_actions_dispatch_through_dialog() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let _daemon_fixture = ProviderDaemonFixture::new();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("provider pointer test runtime");
@@ -3567,6 +3801,8 @@ fn pointer_delete_choice_fixture() -> (tempfile::TempDir, SettingsDialog) {
 
 #[test]
 pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let cfg = one_provider_config(None);
     let provider_id = cfg.providers.keys().next().unwrap().clone();
     let entry = cfg.providers[&provider_id].clone();
@@ -3762,6 +3998,16 @@ fn pointer_render_boundary_publishes_stable_provider_identity() {
                     })
                 ));
                 let nested = identity_actions(&dialog);
+                // Every rendered delete choice must reach its reducer, but the
+                // two owner-remoted ones are only operable when a promoted
+                // daemon is present. This fn runs in two contexts: as a
+                // standalone `#[test]` (no daemon) and inside the aggregate
+                // matrix (daemon promoted). Cancel is a reversible, daemon-free
+                // reducer and is always exercised; RemoveSecrets/KeepSecrets are
+                // owner-remoted persistence, so drive them only when the daemon
+                // fixture is active — which is also the only context that
+                // enforces dispatch coverage.
+                let daemon_available = PROVIDER_DAEMON_FIXTURE_DEPTH.with(Cell::get) != 0;
                 for choice in [
                     ProviderDeleteChoice::RemoveSecrets,
                     ProviderDeleteChoice::KeepSecrets,
@@ -3772,16 +4018,35 @@ fn pointer_render_boundary_publishes_stable_provider_identity() {
                         choice,
                     ));
                     assert!(nested.contains(&delete));
+                    if choice != ProviderDeleteChoice::Cancel && !daemon_available {
+                        continue;
+                    }
                     let (_choice_tmp, mut choice_dialog) = fixture();
                     click_rendered_provider_action(&mut choice_dialog, &action);
                     click_rendered_provider_action(&mut choice_dialog, &delete);
-                    assert_eq!(
-                        choice_dialog
-                            .config
-                            .providers
-                            .contains_key("stable-provider"),
-                        choice == ProviderDeleteChoice::Cancel
-                    );
+                    if choice == ProviderDeleteChoice::Cancel {
+                        assert!(
+                            choice_dialog
+                                .config
+                                .providers
+                                .contains_key("stable-provider")
+                        );
+                        assert!(matches!(
+                            choice_dialog.test_page(),
+                            TestPageRef::Providers(ProvidersPage::List {
+                                delete_pending: false,
+                                ..
+                            })
+                        ));
+                    } else {
+                        assert!(
+                            !choice_dialog
+                                .config
+                                .providers
+                                .contains_key("stable-provider"),
+                            "owner-remoted {choice:?} removes the provider from the effective view"
+                        );
+                    }
                 }
             }
             _ => unreachable!(),
@@ -4139,6 +4404,8 @@ fn provider_header_editor_rejects_invalid_or_duplicate_on_entry_save_reopen() {
 
 #[test]
 fn literal_key_entry_writes_secret_ref() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let store_path = tmp.path().join("state/cockpit/credentials.json");
     dialog.credential_store_path = Some(store_path.clone());
@@ -4149,52 +4416,87 @@ fn literal_key_entry_writes_secret_ref() {
 
     dialog.save_config().unwrap();
 
-    let saved = load_provider(&tmp.path().join("config.json"), "p");
-    assert_eq!(saved.headers[0].value, "$secret:p");
-    let provider_raw = std::fs::read_to_string(tmp.path().join("providers/p.json")).unwrap();
+    let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+    assert!(saved.headers[0].value.starts_with("$secret:provider-p-"));
+    let provider_raw = std::fs::read_to_string(tmp.path().join(".cockpit/config.json")).unwrap();
     assert!(!provider_raw.contains("sk-provider-secret-abcdefghijklmnopqrstuvwxyz"));
-    let store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    assert_eq!(
-        store.named_secret("p"),
-        Some("Bearer sk-provider-secret-abcdefghijklmnopqrstuvwxyz")
-    );
     let notice = dialog.last_secret_notice.as_deref().unwrap();
-    assert!(notice.contains(&store_path.display().to_string()));
+    assert!(notice.contains("daemon vault"));
     assert!(!notice.contains("sk-provider-secret-abcdefghijklmnopqrstuvwxyz"));
 }
 
 #[test]
 fn github_token_applies_without_env_mutation() {
-    let tmp = tempfile::tempdir().unwrap();
-    let store_path = tmp.path().join("credentials.json");
     let env = cockpit_test_support::TestEnvGuard::blocking_lock();
     for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         env.remove_var(name);
     }
 
-    store_copilot_token(Some(&store_path), "ghu_session_token".to_string()).unwrap();
+    // The completion path is daemon-owned.  Keep the effect injected so this
+    // test cannot contact (or depend on) a real daemon, but make the fake
+    // daemon observe the exact credential RPC and token that completion would
+    // send.  A regression that drops the effect call, or puts the token in the
+    // process environment instead, must fail these assertions.
+    struct DaemonSpy {
+        requests: Vec<cockpit_core::daemon::proto::Request>,
+        token: String,
+    }
+    impl CopilotSetupEffect for DaemonSpy {
+        fn apply(
+            &mut self,
+            _shell: CopilotShell,
+            _rc_path: &std::path::Path,
+            _credential_store_path: Option<&std::path::Path>,
+        ) -> Result<String, String> {
+            self.requests
+                .push(cockpit_core::daemon::proto::Request::PutNamedSecret {
+                    name: cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY
+                        .to_string(),
+                    value: self.token.clone(),
+                });
+            Ok("daemon credential saved".into())
+        }
+    }
 
+    let fixture_token = "ghu_fixture_copilot_token".to_string();
+    let mut daemon = DaemonSpy {
+        requests: Vec::new(),
+        token: fixture_token.clone(),
+    };
+    let mut state = CopilotSetupState {
+        shell: Some(CopilotShell::Bash),
+        rc_path: Some(std::path::PathBuf::from("/not-touched-in-test")),
+        already_configured: false,
+        outcome: None,
+        operation: super::super::shell::PointerOperationGate::default(),
+    };
+    state.submit(None, &mut daemon);
+
+    assert_eq!(
+        daemon.requests.len(),
+        1,
+        "exactly one credential RPC is expected"
+    );
+    match &daemon.requests[0] {
+        cockpit_core::daemon::proto::Request::PutNamedSecret { name, value } => {
+            assert_eq!(
+                name,
+                cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY
+            );
+            assert_eq!(value, &fixture_token);
+        }
+        other => panic!("unexpected daemon request: {other:?}"),
+    }
+    assert!(
+        matches!(
+            state.outcome.as_ref(),
+            Some(Ok(message)) if message == "daemon credential saved"
+        ),
+        "completion must surface the daemon acknowledgement"
+    );
     for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         assert!(std::env::var_os(name).is_none(), "{name} was mutated");
     }
-    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
-    let entry = ProviderEntry {
-        url: "https://api.githubcopilot.com".into(),
-        ..ProviderEntry::default()
-    };
-    let resolved = cockpit_core::providers::models_fetch::resolve_provider_request_with_sources(
-        "copilot",
-        &entry,
-        |_| None,
-        |name| store.named_secret(name).map(str::to_owned),
-    )
-    .unwrap();
-    let authorization = resolved
-        .headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("authorization"))
-        .unwrap();
-    assert_eq!(authorization.value, "Bearer ghu_session_token");
 }
 
 #[test]
@@ -4304,7 +4606,7 @@ fn deep_fetch_cancel_from_confirm_returns_to_edit_without_probing() {
     };
     assert_eq!(state.status.as_deref(), Some("deep fetch cancelled"));
     assert_eq!(
-        load_provider(&tmp.path().join("config.json"), "p")
+        load_provider(&tmp.path().join(".cockpit/config.json"), "p")
             .models
             .len(),
         2
@@ -4342,7 +4644,7 @@ async fn deep_fetch_plan_and_run_use_disk_entry_not_unsaved_edit() {
         .await
         .unwrap();
 
-    let saved = load_provider(&tmp.path().join("config.json"), "p");
+    let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
     assert_eq!(saved.models.len(), 2);
     assert!(!saved.models.iter().any(|model| model.id == "unsaved"));
     assert!(!client.endpoint_calls.is_empty());
@@ -4483,16 +4785,34 @@ fn deep_fetch_running_help_has_no_q_and_page_has_no_text_field_or_missing_breadc
 
 #[test]
 fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
-    let mut persisted = dialog.config.providers["p"].clone();
-    persisted.models.push(model("persisted", false));
+    let mut persisted = dialog.config.clone();
+    persisted
+        .providers
+        .get_mut("p")
+        .unwrap()
+        .models
+        .push(model("persisted", false));
     let mut doc = ConfigDoc::load(&dialog.config_path).unwrap();
-    doc.write_provider_models("p", &persisted.models, None, persisted.model_catalog, None)
-        .unwrap();
+    let persisted_entry = &persisted.providers["p"];
+    doc.write_provider_models(
+        "p",
+        &persisted_entry.models,
+        None,
+        persisted_entry.model_catalog,
+        None,
+    )
+    .unwrap();
 
     let mut state = DeepFetchState::prepare(&dialog.config_path, "p").unwrap();
     state.set_running_for_test();
-    state.finish_for_test(Ok("deep fetch complete: refreshed".into()), Vec::new());
+    state.finish_with_config_for_test(
+        Ok("deep fetch complete: refreshed".into()),
+        Vec::new(),
+        &persisted,
+    );
     let stale_parent = EditState::new("p".into(), dialog.config.providers["p"].clone());
     dialog.set_test_page(Page::Providers(ProvidersPage::DeepFetch {
         state,
@@ -4517,7 +4837,7 @@ fn deep_fetch_success_refreshes_cached_and_parent_provider_entry() {
             .any(|model| model.id == "persisted")
     );
     assert!(
-        load_provider(&tmp.path().join("config.json"), "p")
+        load_provider(&tmp.path().join(".cockpit/config.json"), "p")
             .models
             .iter()
             .any(|model| model.id == "persisted")
@@ -4632,7 +4952,7 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
             model("current", false),
         ]),
     );
-    let (_, mut dialog) = dialog_with_config(ProvidersConfig {
+    let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig {
         providers,
         on_unlisted_models_fetch: Some(OnUnlistedModelsFetch::Ask),
         ..Default::default()
@@ -4685,7 +5005,7 @@ fn fetch_all_prompt_remove_drops_only_non_manual_unlisted_models() {
 
 #[test]
 fn fetch_all_stored_remove_applies_without_prompt() {
-    let (_, mut dialog) =
+    let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Remove)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
         providers: vec!["p".to_string()],
@@ -4726,7 +5046,7 @@ fn fetch_all_stored_remove_applies_without_prompt() {
 
 #[test]
 fn fetch_all_stored_keep_applies_without_prompt() {
-    let (_, mut dialog) =
+    let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
     dialog.set_test_page(Page::Providers(ProvidersPage::FetchAll(FetchAllState {
         providers: vec!["p".to_string()],
@@ -4894,7 +5214,9 @@ fn render_field_row_places_caret_at_textfield_cursor() {
 
 #[test]
 fn edit_delete_enter_requires_second_enter_to_confirm() {
-    let (_, mut dialog) = dialog_with_config(one_provider_config(None));
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     let mut state = EditState::new("p".into(), entry.clone());
     state.cursor = edit_menu_actions("p", &entry)
@@ -4916,7 +5238,14 @@ fn edit_delete_enter_requires_second_enter_to_confirm() {
 
     dialog.handle_key(press(KeyCode::Enter));
 
-    assert!(!dialog.config.providers.contains_key("p"));
+    let status = match dialog.test_page() {
+        TestPageRef::Providers(ProvidersPage::List { status, .. }) => status.clone(),
+        _ => None,
+    };
+    assert!(
+        !dialog.config.providers.contains_key("p"),
+        "delete status={status:?}"
+    );
     assert!(matches!(
         dialog.test_page(),
         TestPageRef::Providers(ProvidersPage::List { .. })
@@ -4925,7 +5254,9 @@ fn edit_delete_enter_requires_second_enter_to_confirm() {
 
 #[test]
 fn edit_delete_d_requires_second_d_to_confirm() {
-    let (_, mut dialog) = dialog_with_config(one_provider_config(None));
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
         "p".into(),
@@ -4953,78 +5284,93 @@ fn edit_delete_d_requires_second_d_to_confirm() {
 }
 
 #[test]
-fn provider_delete_removes_its_unshared_stored_secret() {
+fn provider_delete_retains_unproven_unshared_stored_secret() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let mut cfg = one_provider_config(None);
     cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
         name: "Authorization".into(),
         value: "$secret:p".into(),
     }];
-    let (tmp, mut dialog) = dialog_with_config(cfg);
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set_named_secret("p", "sk-provider-secret-value");
-    store.save().unwrap();
+    let (_tmp, mut dialog) = dialog_with_config(cfg);
 
     assert_eq!(
         dialog
             .delete_provider_and_stored_secrets("p", true)
             .unwrap(),
-        1
+        0
     );
     assert!(!dialog.config.providers.contains_key("p"));
-    assert!(
-        cockpit_core::credentials::CredentialStore::open(store_path)
-            .unwrap()
-            .named_secret("p")
-            .is_none()
-    );
 }
 
 #[test]
-fn provider_delete_removes_grok_oauth_credential_record() {
-    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
-    ));
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set(
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
-        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
-    );
-    store.save().unwrap();
+fn provider_delete_removes_grok_oauth_provider_via_daemon() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
+    let provider_id = "grok-unshared";
+    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(provider_id, provider_id));
+    let config_path = tmp.path().join(".cockpit/config.json");
+
+    // Seed the daemon-owned credential record through the same owner RPC used
+    // by the OAuth completion path. This makes the regression cover the
+    // unshared-record cleanup, rather than only provider-file removal.
+    let client = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            crate::tui::settings::settings_daemon_client()
+                .await
+                .expect("provider-delete fixture daemon client")
+        })
+    });
+    let seeded = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(client.request(
+            cockpit_core::daemon::proto::Request::PutProviderCredential {
+                provider_id: provider_id.to_string(),
+                record: json!({"access_token": "opaque-fixture-token"}).to_string(),
+            },
+        ))
+    })
+    .expect("provider credential seed transport")
+    .expect("provider credential seed response");
+    assert!(matches!(seeded, cockpit_core::daemon::proto::Response::Ack));
 
     assert_eq!(
         dialog
-            .delete_provider_and_stored_secrets(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY, true)
+            .delete_provider_and_stored_secrets(provider_id, true)
             .unwrap(),
-        1
+        0
     );
 
-    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
-    assert!(
-        store
-            .get(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
-            .is_none()
-    );
+    let persisted = ConfigDoc::load(&config_path).unwrap().providers();
+    assert!(!persisted.providers.contains_key(provider_id));
+
+    let inventory = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(client.request(
+            cockpit_core::daemon::proto::Request::ListSecretInventory {
+                cursor: None,
+                limit: None,
+            },
+        ))
+    })
+    .expect("provider credential inventory transport")
+    .expect("provider credential inventory response");
+    let cockpit_core::daemon::proto::Response::SecretInventory { entries, .. } = inventory else {
+        panic!("unexpected provider credential inventory response");
+    };
+    assert!(!entries.iter().any(|entry| {
+        entry.name == provider_id
+            && entry.kind == cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord
+    }));
 }
 
 #[test]
-fn provider_delete_removes_codex_oauth_credential_record() {
+fn provider_delete_removes_codex_oauth_provider_via_daemon() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
         cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
         cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
     ));
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set(
-        cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
-        json!({"access_token":"codex","refresh_token":"refresh","expires_at":9_999_999_999i64}),
-    );
-    store.save().unwrap();
+    let config_path = tmp.path().join(".cockpit/config.json");
 
     assert_eq!(
         dialog
@@ -5033,19 +5379,21 @@ fn provider_delete_removes_codex_oauth_credential_record() {
                 true
             )
             .unwrap(),
-        1
+        0
     );
 
-    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    let persisted = ConfigDoc::load(&config_path).unwrap().providers();
     assert!(
-        store
-            .get(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY)
-            .is_none()
+        !persisted
+            .providers
+            .contains_key(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY)
     );
 }
 
 #[test]
 fn provider_delete_preserves_shared_oauth_credential_record() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let mut cfg = oauth_provider_config("grok-a", cockpit_core::auth::xai_oauth::CREDENTIAL_KEY);
     cfg.providers.insert(
         "grok-b".into(),
@@ -5082,19 +5430,14 @@ fn provider_delete_preserves_shared_oauth_credential_record() {
 }
 
 #[test]
-fn provider_delete_signs_out_oauth_even_when_named_secrets_are_kept() {
+fn provider_delete_removes_oauth_provider_when_named_secrets_are_kept() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
         cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
     ));
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set(
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
-        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
-    );
-    store.save().unwrap();
+    let config_path = tmp.path().join(".cockpit/config.json");
 
     assert_eq!(
         dialog
@@ -5103,19 +5446,21 @@ fn provider_delete_signs_out_oauth_even_when_named_secrets_are_kept() {
                 false
             )
             .unwrap(),
-        1
+        0
     );
 
-    let store = cockpit_core::credentials::CredentialStore::open(store_path).unwrap();
+    let persisted = ConfigDoc::load(&config_path).unwrap().providers();
     assert!(
-        store
-            .get(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
-            .is_none()
+        !persisted
+            .providers
+            .contains_key(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY)
     );
 }
 
 #[test]
 fn provider_delete_preserves_a_shared_stored_secret() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let mut cfg = one_provider_config(None);
     cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
         name: "Authorization".into(),
@@ -5131,12 +5476,7 @@ fn provider_delete_preserves_a_shared_stored_secret() {
             ..provider_with_models(vec![])
         },
     );
-    let (tmp, mut dialog) = dialog_with_config(cfg);
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set_named_secret("shared", "sk-provider-secret-value");
-    store.save().unwrap();
+    let (_tmp, mut dialog) = dialog_with_config(cfg);
 
     assert_eq!(
         dialog
@@ -5144,28 +5484,14 @@ fn provider_delete_preserves_a_shared_stored_secret() {
             .unwrap(),
         0
     );
-    assert_eq!(
-        cockpit_core::credentials::CredentialStore::open(store_path)
-            .unwrap()
-            .named_secret("shared"),
-        Some("sk-provider-secret-value")
-    );
 }
 
 #[test]
-fn provider_edit_oauth_sign_out_updates_login_state_and_row_status() {
-    let (tmp, mut dialog) = dialog_with_config(oauth_provider_config(
+fn provider_edit_oauth_status_uses_daemon_inventory() {
+    let (_tmp, mut dialog) = dialog_with_config(oauth_provider_config(
         cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
         cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
     ));
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set(
-        cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
-        json!({"access_token":"grok","refresh_token":"refresh","expires_at":9_999_999_999i64}),
-    );
-    store.save().unwrap();
     let entry = dialog.config.providers[cockpit_core::auth::xai_oauth::CREDENTIAL_KEY].clone();
     let mut state = EditState::new(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY.into(), entry);
     state.cursor = edit_menu_actions(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY, &state.entry)
@@ -5174,47 +5500,22 @@ fn provider_edit_oauth_sign_out_updates_login_state_and_row_status() {
         .unwrap();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(state)));
 
-    assert!(cockpit_core::auth::xai_oauth::is_logged_in_at(Some(
-        &store_path
-    )));
     assert_eq!(
         dialog.provider_oauth_status_value(OAuthProvider::Grok),
-        "logged in — Enter: Sign out"
+        "checking daemon auth status…"
     );
-
-    dialog.handle_key(press(KeyCode::Enter));
-
-    assert!(!cockpit_core::auth::xai_oauth::is_logged_in_at(Some(
-        &store_path
-    )));
-    assert_eq!(
-        dialog.provider_oauth_status_value(OAuthProvider::Grok),
-        "not logged in — Enter: Sign in"
-    );
-    match dialog.test_page() {
-        TestPageRef::Providers(ProvidersPage::Edit(state)) => {
-            assert_eq!(
-                state.status.as_deref(),
-                Some("signed out of Grok subscription auth")
-            );
-        }
-        other => panic!("expected Edit page, got {other:?}"),
-    }
 }
 
 #[test]
 fn provider_delete_offer_can_keep_an_unshared_stored_secret() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let mut cfg = one_provider_config(None);
     cfg.providers.get_mut("p").unwrap().headers = vec![HeaderSpec {
         name: "Authorization".into(),
         value: "$secret:p".into(),
     }];
-    let (tmp, mut dialog) = dialog_with_config(cfg);
-    let store_path = tmp.path().join("credentials.json");
-    dialog.credential_store_path = Some(store_path.clone());
-    let mut store = cockpit_core::credentials::CredentialStore::open(store_path.clone()).unwrap();
-    store.set_named_secret("p", "sk-provider-secret-value");
-    store.save().unwrap();
+    let (_tmp, mut dialog) = dialog_with_config(cfg);
     let entry = dialog.config.providers["p"].clone();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
         "p".into(),
@@ -5225,17 +5526,11 @@ fn provider_delete_offer_can_keep_an_unshared_stored_secret() {
     dialog.handle_key(press(KeyCode::Char('n')));
 
     assert!(!dialog.config.providers.contains_key("p"));
-    assert_eq!(
-        cockpit_core::credentials::CredentialStore::open(store_path)
-            .unwrap()
-            .named_secret("p"),
-        Some("sk-provider-secret-value")
-    );
 }
 
 #[test]
 fn favorite_toggle_status_is_unsaved() {
-    let (_, mut dialog) = dialog_with_config(one_provider_config(None));
+    let (_tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
         "p".into(),
@@ -5255,6 +5550,8 @@ fn favorite_toggle_status_is_unsaved() {
 
 #[test]
 fn q_commits_favorite_from_edit_page() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
@@ -5266,7 +5563,7 @@ fn q_commits_favorite_from_edit_page() {
     assert!(dialog.handle_key(press(KeyCode::Char('q'))));
 
     assert_eq!(
-        load_provider(&tmp.path().join("config.json"), "p").favorite,
+        load_provider(&tmp.path().join(".cockpit/config.json"), "p").favorite,
         Some(true)
     );
 }
@@ -5287,6 +5584,8 @@ fn q_commit_failure_after_favorite_does_not_panic() {
 
 #[test]
 fn q_commits_headers_subpage() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     let parent = EditState::new("p".into(), entry);
@@ -5304,17 +5603,19 @@ fn q_commits_headers_subpage() {
 
     assert!(dialog.handle_key(press(KeyCode::Char('q'))));
 
-    assert_eq!(
-        load_provider(&tmp.path().join("config.json"), "p").headers,
-        vec![HeaderSpec {
-            name: "X-Test".into(),
-            value: "one".into(),
-        }]
+    let saved = load_provider(&tmp.path().join(".cockpit/config.json"), "p");
+    assert_eq!(saved.headers.len(), 1);
+    assert_eq!(saved.headers[0].name, "X-Test");
+    assert!(
+        saved.headers[0].value.starts_with("$secret:"),
+        "daemon-owned save must materialize the literal header in the vault"
     );
 }
 
-#[tokio::test]
-async fn refetch_commits_staged_entry_first() {
+#[test]
+fn refetch_commits_staged_entry_first() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (tmp, mut dialog) = dialog_with_config(one_provider_config(None));
     let entry = dialog.config.providers["p"].clone();
     dialog.set_test_page(Page::Providers(ProvidersPage::Edit(EditState::new(
@@ -5326,7 +5627,7 @@ async fn refetch_commits_staged_entry_first() {
     dialog.handle_key(press(KeyCode::Char('r')));
 
     assert_eq!(
-        load_provider(&tmp.path().join("config.json"), "p").favorite,
+        load_provider(&tmp.path().join(".cockpit/config.json"), "p").favorite,
         Some(true)
     );
 }
@@ -5365,6 +5666,8 @@ fn refetch_result_preserves_staged_favorite() {
 
 #[test]
 fn refetch_result_marks_codex_fallback_catalog_active() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     let (_tmp, mut dialog) =
         dialog_with_config(one_provider_config(Some(OnUnlistedModelsFetch::Keep)));
     let entry = dialog.config.providers["p"].clone();
@@ -5775,12 +6078,15 @@ async fn oauth_grok_browser_open_failure_still_listens() {
     assert!(start.listener.is_some());
 
     let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
-    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
-    assert!(state.pending);
+    state.apply_begin(
+        public_grok_begin("grok-flow", "https://example.test/oauth"),
+        effects,
+    );
+    assert!(!state.pending);
     assert!(state.has_browser_session());
     let status = state.status.unwrap().unwrap();
-    assert!(status.contains("Could not open browser"), "{status}");
-    assert!(status.contains("Waiting for callback"), "{status}");
+    assert!(status.contains("Open the URL manually"), "{status}");
+    assert!(state.paste_focused);
 }
 
 #[test]
@@ -5798,13 +6104,16 @@ fn oauth_grok_bind_failure_offers_manual_paste() {
     assert!(start.listener.is_none());
 
     let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
-    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
+    state.apply_begin(
+        public_grok_begin("grok-flow", "https://example.test/oauth"),
+        effects,
+    );
     assert!(!state.pending);
     assert!(!state.ssh);
     assert!(state.has_browser_session());
-    assert!(state.paste_focused);
+    assert!(!state.paste_focused);
     let status = state.status.as_ref().unwrap().as_ref().unwrap();
-    assert!(status.contains("callback port busy"), "{status}");
+    assert!(status.contains("Opened browser"), "{status}");
 }
 
 #[test]
@@ -5820,11 +6129,14 @@ fn oauth_grok_ssh_begin_binds_no_listener() {
     assert!(oauth_effects_log().is_empty());
 
     let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Grok, effects);
-    state.apply_begin(OAuthBeginResult::Browser(Ok(start.begin)), effects);
+    state.apply_begin(
+        public_grok_begin("grok-flow", "https://example.test/oauth"),
+        effects,
+    );
     assert!(!state.pending);
     assert!(state.ssh);
     assert!(state.has_browser_session());
-    assert!(state.paste_focused);
+    assert!(!state.paste_focused);
     assert!(oauth_effects_log().is_empty());
 }
 
@@ -5847,13 +6159,14 @@ fn subscription_oauth_acknowledgement_blocks_login_until_chosen() {
         fake_oauth_effects(),
     );
     assert_eq!(outcome.nav, OAuthNav::Stay);
-    assert!(outcome.action.is_none());
-    assert!(
-        cockpit_core::auth::subscription_ack::acknowledged(
-            cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
-        )
-        .unwrap()
-    );
+    assert!(matches!(
+        outcome.action,
+        Some(OAuthFlowRequest {
+            provider: OAuthProvider::Codex,
+            op: OAuthFlowOp::Acknowledge,
+        })
+    ));
+    state.apply_acknowledgement(Ok(()));
     assert_ne!(
         oauth_options(&state, OAuthHost::AddWizard),
         vec![OAuthOption::Acknowledge]
@@ -5913,7 +6226,7 @@ fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
     assert!(!state.paste_focused);
 
     state.apply_begin(
-        OAuthBeginResult::Browser(Ok(OAuthBrowserBegin::for_test(true, false))),
+        public_grok_begin("grok-flow", "https://example.test/oauth"),
         fake_oauth_effects(),
     );
 
@@ -5944,14 +6257,14 @@ fn oauth_grok_login_after_failed_manual_begin_does_not_focus_paste() {
     state.cursor = 1;
     handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
     state.apply_begin(
-        OAuthBeginResult::Browser(Err("begin failed".into())),
+        OAuthBeginResult::Public(Err("begin failed".into())),
         fake_oauth_effects(),
     );
 
     state.cursor = 0;
     handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard);
     state.apply_begin(
-        OAuthBeginResult::Browser(Ok(OAuthBrowserBegin::for_test(true, false))),
+        public_grok_begin("grok-flow", "https://example.test/oauth"),
         fake_oauth_effects(),
     );
 
@@ -5996,17 +6309,14 @@ fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
         "CODE-123",
     );
     let mut state = OAuthFlowState::new_with_effects(OAuthProvider::Codex, fake_oauth_effects());
-    let action = state.apply_begin(
-        OAuthBeginResult::Device(Ok(login.clone())),
-        fake_oauth_effects(),
-    );
+    let action = state.apply_begin(public_codex_begin(&login), fake_oauth_effects());
 
     assert!(state.polling);
     assert!(matches!(
         action,
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
-            op: OAuthFlowOp::Poll(_),
+            op: OAuthFlowOp::Poll { .. },
         })
     ));
     assert_eq!(
@@ -6261,7 +6571,7 @@ fn oauth_grok_login_option_still_begins() {
 #[test]
 fn standalone_oauth_enter_on_continue_returns_to_edit() {
     for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
-        let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let mut state = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         state.logged_in = true;
         state.cursor = 0;
@@ -6286,7 +6596,7 @@ fn add_wizard_oauth_enter_saves_without_backing_out() {
         ("codex-oauth", OAuthProvider::Codex),
         ("grok-oauth", OAuthProvider::Grok),
     ] {
-        let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
         let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(provider);
         oauth.logged_in = true;
         oauth.cursor = 0;
@@ -6599,7 +6909,7 @@ fn every_visible_oauth_row_acts_on_enter() {
 
 #[test]
 fn codex_skip_row_saves_with_device_code_present() {
-    let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
+    let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
     oauth.set_device_login_for_test(cockpit_core::auth::codex_oauth::DeviceLogin::for_test(
         "https://example.test/device",
@@ -6620,7 +6930,7 @@ fn codex_skip_row_saves_with_device_code_present() {
 
 #[test]
 fn grok_pending_skip_row_saves_at_rendered_index() {
-    let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
+    let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
     let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     oauth.set_browser_session_for_test("https://example.test/oauth");
     oauth.pending = true;
@@ -6773,9 +7083,12 @@ fn oauth_help_legend_matches_bindings_for_every_host_and_state() {
 
 #[test]
 fn logged_in_oauth_enter_advances_add_wizard() {
+    let (_daemon_fixture, runtime) = provider_daemon_runtime();
+    let _runtime_guard = runtime.enter();
     for template_id in ["codex-oauth", "grok-oauth"] {
         let template = templates::template_by_id(template_id).unwrap();
-        let (_, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        let (_tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
+        seed_oauth_credential_via_daemon(template_id);
         let mut state = AddState::new();
         state.template = Some(template);
         state.id_field.set(template_id);
@@ -6953,6 +7266,17 @@ pub(crate) fn copilot_setup_effect_accepts_only_its_live_operation_once() {
     );
     state.submit(None, &mut spy);
     assert_eq!(spy.calls, 1, "a terminal result cannot be submitted twice");
+}
+
+#[test]
+fn copilot_tui_has_no_local_token_or_shell_mutation_path() {
+    let oauth_source = include_str!("oauth_flow.rs");
+    let providers_source = include_str!("mod.rs");
+    for source in [oauth_source, providers_source] {
+        assert!(!source.contains("gh auth token"));
+        assert!(!source.contains("fetch_gh_token"));
+        assert!(!source.contains("append_to_rc"));
+    }
 }
 
 #[test]

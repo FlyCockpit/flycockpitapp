@@ -103,6 +103,65 @@ pub fn apply_security_answers(cwd: &Path, run: &WizardRun) -> Result<Option<Path
     apply_security_answers_with_caps(cwd, run, None)
 }
 
+/// Apply setup answers after the daemon has reconstructed and validated the
+/// current wizard descriptor. This is the owner boundary used by CLI setup;
+/// all writes retain the existing config lock/reload/atomic semantics.
+pub fn apply_setup_wizard_answers(
+    cwd: &Path,
+    wizard_id: &str,
+    answers_json: &str,
+) -> Result<(bool, bool, Option<String>)> {
+    if !matches!(
+        wizard_id,
+        crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID
+    ) {
+        return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
+    }
+    let descriptor = descriptor_for_cwd(wizard_id, cwd)
+        .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
+    let run = WizardRun::from_answers_json(descriptor, answers_json)?;
+    if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
+        let changed = apply_security_answers(cwd, &run)?.is_some();
+        return Ok((changed, false, None));
+    }
+    let outcome = apply_model_answers(cwd, &run)?;
+    Ok((
+        !outcome.changed_nothing(),
+        outcome.model_file.is_some(),
+        outcome.default_scope,
+    ))
+}
+
+/// Daemon-owned setup application. Host capabilities are probed by the
+/// daemon at the owner boundary, so a CLI-provided snapshot cannot authorize
+/// an unavailable sandbox mode.
+pub async fn apply_setup_wizard_answers_authoritative(
+    cwd: &Path,
+    wizard_id: &str,
+    answers_json: &str,
+) -> Result<(bool, bool, Option<String>)> {
+    if !matches!(
+        wizard_id,
+        crate::wizard::SECURITY_WIZARD_ID | crate::wizard::MODEL_WIZARD_ID
+    ) {
+        return Err(anyhow!("unsupported setup wizard `{wizard_id}`"));
+    }
+    let caps = compose_wizard_host_capabilities(cwd).await;
+    let descriptor = descriptor_for_cwd_with_caps(wizard_id, cwd, Some(&caps))
+        .ok_or_else(|| anyhow!("unknown setup wizard `{wizard_id}`"))?;
+    let run = WizardRun::from_answers_json(descriptor, answers_json)?;
+    if wizard_id == crate::wizard::SECURITY_WIZARD_ID {
+        let changed = apply_security_answers_with_caps(cwd, &run, Some(&caps))?.is_some();
+        return Ok((changed, false, None));
+    }
+    let outcome = apply_model_answers(cwd, &run)?;
+    Ok((
+        !outcome.changed_nothing(),
+        outcome.model_file.is_some(),
+        outcome.default_scope,
+    ))
+}
+
 /// Persist security-wizard answers. When `caps` is present, unavailable
 /// sandbox modes are refused and not written.
 pub fn apply_security_answers_with_caps(

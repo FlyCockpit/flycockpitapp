@@ -3877,6 +3877,11 @@ async fn session_scoped_code_has_no_direct_config_reads() {
         // Session bootstrap: captures a config-derived snapshot on the row
         // before any worker/handle exists.
         "session/lifecycle.rs",
+        // Owner ExportPolicy/ImportPolicy surface: a session-less owner RPC
+        // that renders/applies a portable policy bundle for a `project_root`,
+        // with no attached session to read a snapshot from (mirrors
+        // `session/export/mod.rs` and `wizard/apply.rs`).
+        "policy.rs",
     ];
 
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

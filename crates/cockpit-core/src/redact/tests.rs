@@ -55,6 +55,36 @@ fn assert_origin_absent(table: &RedactionTable, origin: &str) {
 }
 
 #[test]
+fn mcp_oauth_json_registers_each_token_leaf() {
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let access = "mcp-access-token-value-123";
+    let refresh = "mcp-refresh-token-value-456";
+    let metadata = "issuer-metadata-value-789";
+    let raw = serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": metadata,
+    })
+    .to_string();
+    let table = RedactionTable::build_with_env_and_secrets(
+        &cfg,
+        dir.path(),
+        &HashMap::new(),
+        [("mcp:example".to_string(), raw)],
+    )
+    .unwrap();
+
+    let scrubbed = table.scrub(&format!("{access} {refresh} {metadata}"));
+    assert!(!scrubbed.contains(access));
+    assert!(!scrubbed.contains(refresh));
+    assert!(
+        scrubbed.contains(metadata),
+        "non-sensitive metadata is not a token leaf"
+    );
+}
+
+#[test]
 fn disabled_passes_through() {
     let mut cfg = enabled_cfg();
     cfg.enabled = false;

@@ -6,7 +6,10 @@ pub const CODEX_OAUTH_PROVIDER: &str = "codex-oauth";
 pub const GROK_OAUTH_PROVIDER: &str = "grok-oauth";
 pub const ACKNOWLEDGEMENT_TEXT: &str = "Using subscription credentials from this third-party client may violate the provider terms of service and may result in account suspension.";
 
-const PREFIX: &str = "subscription-oauth-ack:";
+/// Namespace reserved for subscription OAuth acknowledgement records. Generic
+/// provider credential RPCs must reject this prefix so rollback cannot confuse
+/// an acknowledgement with an ordinary provider record.
+pub const PREFIX: &str = "subscription-oauth-ack:";
 
 pub fn acknowledged_in(store: &CredentialStore, provider: &str) -> bool {
     store

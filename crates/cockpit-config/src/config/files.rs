@@ -991,7 +991,9 @@ impl PreparedAtomicWrite {
             rename_file_at(&self.parent_dir, tmp_name, &self.destination_name)
                 .with_context(|| format!("replacing {}", self.parent.display()))?;
             self.tmp_name = None;
-            let _ = self.parent_dir.sync_all();
+            self.parent_dir
+                .sync_all()
+                .context("fsync config directory after replacement")?;
             Ok(())
         }
         #[cfg(windows)]
@@ -1003,7 +1005,9 @@ impl PreparedAtomicWrite {
             rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name, true)
                 .with_context(|| format!("replacing {}", self.parent.display()))?;
             self.tmp_file = None;
-            let _ = self.parent_dir.sync_all();
+            self.parent_dir
+                .sync_all()
+                .context("fsync config directory after replacement")?;
             Ok(())
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -1015,7 +1019,9 @@ impl PreparedAtomicWrite {
             replace_atomic_file(tmp_path, &self.path)
                 .with_context(|| format!("replacing {}", self.path.display()))?;
             self.tmp_path = None;
-            let _ = std::fs::File::open(&self.parent).and_then(|dir| dir.sync_all());
+            std::fs::File::open(&self.parent)
+                .and_then(|dir| dir.sync_all())
+                .context("fsync config directory after replacement")?;
             Ok(())
         }
     }

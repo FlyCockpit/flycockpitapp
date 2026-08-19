@@ -23,6 +23,7 @@ impl FetchAllState {
     /// handles as they complete.
     pub(in crate::tui::settings) fn spawn(
         providers: &cockpit_config::providers::ProvidersConfig,
+        project_root: String,
     ) -> Self {
         let mut ids: Vec<String> = providers.providers.keys().cloned().collect();
         ids.sort();
@@ -34,7 +35,11 @@ impl FetchAllState {
                 continue;
             };
             pre_fetch_models.insert(id.clone(), entry.models.clone());
-            in_flight.push(FetchHandle::spawn(id.clone(), entry.clone()));
+            in_flight.push(FetchHandle::spawn(
+                id.clone(),
+                entry.clone(),
+                project_root.clone(),
+            ));
         }
         Self {
             providers: ids,
@@ -250,7 +255,7 @@ impl SettingsCx {
                 delete_pending: false,
             }));
         }
-        let state = FetchAllState::spawn(&self.config);
+        let state = FetchAllState::spawn(&self.config, self.provider_fetch_root());
         Nav::Replace(super::super::providers_page(ProvidersPage::FetchAll(state)))
     }
 

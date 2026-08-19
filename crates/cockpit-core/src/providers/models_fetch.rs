@@ -2951,10 +2951,15 @@ mod tests {
                 headers: Vec::new(),
             };
 
-            let outcome =
-                fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
-                    .await
-                    .unwrap();
+            let outcome = fetch_models_for_provider_with_store(
+                "codex-oauth",
+                &entry,
+                &resolved,
+                Duration::from_secs(5),
+                Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            )
+            .await
+            .unwrap();
 
             let request = request_handle.await.unwrap();
             assert!(
@@ -3042,10 +3047,15 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let outcome =
-            fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
-                .await
-                .unwrap();
+        let outcome = fetch_models_for_provider_with_store(
+            "codex-oauth",
+            &entry,
+            &resolved,
+            Duration::from_secs(5),
+            Some(crate::credentials::CredentialStore::open_default().unwrap()),
+        )
+        .await
+        .unwrap();
         let _ = request_handle.await.unwrap();
 
         match outcome {
@@ -3078,10 +3088,15 @@ mod tests {
                 headers: Vec::new(),
             };
 
-            let err =
-                fetch_models_for_provider("codex-oauth", &entry, &resolved, Duration::from_secs(5))
-                    .await
-                    .unwrap_err();
+            let err = fetch_models_for_provider_with_store(
+                "codex-oauth",
+                &entry,
+                &resolved,
+                Duration::from_secs(5),
+                Some(crate::credentials::CredentialStore::open_default().unwrap()),
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains(&format!("returned {status}")));
             assert_eq!(request_handle.await.unwrap().len(), 1);
         }

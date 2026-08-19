@@ -1172,8 +1172,8 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
 
     let operation_id = characterized_operation_id();
     let side_effects = std::sync::atomic::AtomicUsize::new(0);
-    let first_hash = proto::remote_operation_fcor::hash_fcor_v1(&first).unwrap();
-    let second_hash = proto::remote_operation_fcor::hash_fcor_v1(&second).unwrap();
+    let first_hash = remote_request_hash(&ctx, &first);
+    let second_hash = remote_request_hash(&ctx, &second);
     assert!(matches!(
         characterize_operation_dispatch(
             &ctx.db,
@@ -1197,6 +1197,79 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         CharacterizedDispatchOutcome::Conflict
     );
     assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn remote_replay_identity_is_keyed_and_preserves_replay_conflicts() {
+    use crate::db::remote_attachment_operations::{
+        RemoteOperationClass, ReserveRemoteOperation, ReserveRemoteOperationOutcome,
+    };
+
+    let ctx = test_ctx();
+    let canonical = proto::remote_operation_fcor::encode_fcor_v1(
+        "send_user_message",
+        &[],
+        b"secret-bearing request payload",
+    )
+    .unwrap();
+    let plain_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).unwrap();
+    let keyed_hash = remote_request_hash(&ctx, &canonical);
+    assert_ne!(
+        keyed_hash, plain_hash,
+        "remote replay rows must not expose an offline FCOR SHA-256 verifier"
+    );
+
+    let attachment = Uuid::new_v4().to_string();
+    let operation = Uuid::now_v7().to_string();
+    let device = Uuid::new_v4().to_string();
+    let reserve = |request_hash| ReserveRemoteOperation {
+        logical_attachment_id: &attachment,
+        operation_id: &operation,
+        authenticated_device_id: &device,
+        authenticated_device_generation: 1,
+        operation_class: RemoteOperationClass::TransactionalMutation,
+        request_hash,
+        now_ms: 1,
+    };
+
+    assert!(matches!(
+        ctx.db
+            .reserve_remote_attachment_operation(reserve(keyed_hash))
+            .await
+            .unwrap(),
+        ReserveRemoteOperationOutcome::Reserved(_)
+    ));
+    assert!(matches!(
+        ctx.db
+            .reserve_remote_attachment_operation(reserve(keyed_hash))
+            .await
+            .unwrap(),
+        ReserveRemoteOperationOutcome::Replay(_)
+    ));
+    assert!(matches!(
+        ctx.db
+            .reserve_remote_attachment_operation(reserve(plain_hash))
+            .await
+            .unwrap(),
+        ReserveRemoteOperationOutcome::OperationConflict
+    ));
+    let persisted: Vec<u8> = ctx
+        .db
+        .read({
+            let attachment = attachment.clone();
+            let operation = operation.clone();
+            move |conn| {
+                Ok(conn.query_row(
+                    "SELECT request_hash FROM remote_attachment_operations
+                     WHERE logical_attachment_id=?1 AND operation_id=?2",
+                    rusqlite::params![attachment, operation],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted, keyed_hash);
 }
 
 #[tokio::test]
@@ -6155,6 +6228,21 @@ fn owner_state() -> MutableClientState {
     }
 }
 
+async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
+    let normalized = path.canonicalize().unwrap().to_string_lossy().into_owned();
+    ctx.db
+        .write(move |conn| {
+            crate::db::Db::set_workspace_trust_conn(
+                conn,
+                &normalized,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .await
+        .unwrap();
+}
+
 fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredential {
     crate::auth::flycockpit::StoredFlycockpitCredential {
         server_url: "https://app.example.test".to_string(),
@@ -6229,10 +6317,22 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
     let ctx = persistent_test_ctx_with_credential_path(credential_path.clone());
+    let credential = flycockpit_credential();
     let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
-    crate::auth::flycockpit::store_credential_in_vault(vault, &flycockpit_credential()).unwrap();
+    crate::auth::flycockpit::store_credential_in_vault(vault, &credential).unwrap();
     let mut state = owner_state();
     let mut wake_rx = ctx.connector_wake_rx();
+
+    ctx.db
+        .upsert_org_sync_policy(
+            &credential.server_url,
+            "org-fixture",
+            Some("v1"),
+            &serde_json::json!({"org_id":"org-fixture"}),
+            true,
+        )
+        .await
+        .unwrap();
 
     let response = handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
         .await
@@ -6249,7 +6349,2105 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
             .get("flycockpit")
             .is_none()
     );
+    assert!(
+        !ctx.db
+            .org_sync_state(&credential.server_url, "org-fixture")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    assert!(matches!(
+        handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
+            .await
+            .expect("second clear is an idempotent typed response"),
+        Response::FlycockpitNotLoggedIn
+    ));
     let _ = credential_path;
+}
+
+#[tokio::test]
+async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_projections() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut planted = flycockpit_credential();
+    planted.relay_choice = Some(crate::auth::flycockpit::RelayChoice {
+        relay_id: "relay-1".into(),
+        region: None,
+        ws_url: "wss://relay.example.test/ws?access_token=relay-query-secret".into(),
+        rtt_ms: None,
+        chosen_at: 1,
+    });
+    let planted_named = "planted_named_secret_value";
+    let planted_provider = "planted_provider_secret_value";
+    let mut planted_store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    planted_store.set_named_secret("planted-name", planted_named);
+    planted_store.set(
+        "planted-provider",
+        serde_json::json!({"api_key": planted_provider}),
+    );
+    planted_store.set(
+        crate::auth::flycockpit::CREDENTIAL_KEY,
+        serde_json::to_value(&planted).unwrap(),
+    );
+    planted_store.save().unwrap();
+
+    let mut state = owner_state();
+    let inventory = handle_request(
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let inventory_wire = serde_json::to_string(&inventory).unwrap();
+    assert!(inventory_wire.contains("planted-name"));
+    assert!(inventory_wire.contains("planted-provider"));
+    assert!(!inventory_wire.contains(planted_named));
+    assert!(!inventory_wire.contains(planted_provider));
+    assert!(!inventory_wire.contains(&planted.instance_token));
+
+    let account = handle_request(Request::GetFlycockpitAccount, &mut state, &ctx)
+        .await
+        .unwrap();
+    let account_wire = serde_json::to_string(&account).unwrap();
+    assert!(account_wire.contains("user@example.test"));
+    assert!(!account_wire.contains(&planted.instance_token));
+    assert!(!account_wire.contains("relay-query-secret"));
+    assert!(account_wire.contains("wss://relay.example.test/ws"));
+
+    assert!(matches!(
+        handle_request(
+            Request::PutNamedSecret {
+                name: "rpc-name".into(),
+                value: "rpc-named-value".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap(),
+        Response::Ack
+    ));
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("rpc-name"),
+        Some("rpc-named-value")
+    );
+
+    assert!(matches!(
+        handle_request(
+            Request::PutProviderCredential {
+                provider_id: "rpc-provider".into(),
+                record: r#"{"api_key":"rpc-provider-value"}"#.into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap(),
+        Response::Ack
+    ));
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .api_key("rpc-provider"),
+        Some("rpc-provider-value".into())
+    );
+
+    // Each persistent write refreshes the daemon-global redaction table.
+    let scrubbed = crate::daemon::current_redaction(&ctx.global_redaction)
+        .scrub("rpc-named-value rpc-provider-value");
+    assert!(!scrubbed.contains("rpc-named-value"));
+    assert!(!scrubbed.contains("rpc-provider-value"));
+
+    // Semantic validation rejects malformed provider JSON before opening the
+    // vault, leaving the existing record untouched.
+    let invalid = handle_request(
+        Request::PutProviderCredential {
+            provider_id: "rpc-provider".into(),
+            record: "not-json".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("invalid provider record must be rejected");
+    assert_eq!(invalid.code, ErrorCode::BadRequest);
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .api_key("rpc-provider"),
+        Some("rpc-provider-value".into())
+    );
+
+    assert!(matches!(
+        handle_request(
+            Request::DeleteNamedSecret {
+                name: "rpc-name".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap(),
+        Response::Ack
+    ));
+    assert!(matches!(
+        handle_request(
+            Request::DeleteProviderCredential {
+                provider_id: "rpc-provider".into(),
+                project_root: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap(),
+        Response::Ack
+    ));
+    let after = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    assert!(after.named_secret("rpc-name").is_none());
+    assert!(after.get("rpc-provider").is_none());
+}
+
+#[test]
+fn provider_responses_over_interactive_limit_fail_without_partial_payload() {
+    let response = Response::ProviderUsageSnapshot {
+        snapshots: vec![crate::daemon::proto::ProviderUsageSnapshotView {
+            provider_id: "provider".into(),
+            display_name: "Provider".into(),
+            fetched_at: chrono::Utc::now(),
+            availability: crate::daemon::proto::ProviderUsageAvailabilityView::Error {
+                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+            },
+        }],
+    };
+    let error = bounded_provider_response(response).expect_err("oversized provider response");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("interactive payload limit"));
+}
+
+#[test]
+fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
+    // `provider_models_fetch` constructs this exact response and calls the
+    // bound before its deferred config writes. Keep the regression payload on
+    // the fetch shape so its no-pagination classification cannot drift.
+    let response = Response::ProviderModelsFetched {
+        results: vec![crate::daemon::proto::ProviderModelFetchResult {
+            provider_id: "provider".into(),
+            outcome: crate::daemon::proto::ProviderModelFetchOutcome::Error {
+                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+            },
+        }],
+        config: crate::daemon::proto::ProviderConfigView::default(),
+    };
+    let error = bounded_provider_response(response).expect_err("oversized fetch response");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(error.message.contains("narrow the provider"));
+}
+
+#[test]
+fn provider_response_scrubber_redacts_configured_environment_values() {
+    let env_secret = "env-provider-secret-value";
+    let config = crate::config::providers::ProvidersConfig {
+        providers: std::collections::BTreeMap::from([(
+            "provider".to_string(),
+            crate::config::providers::ProviderEntry {
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "X-Custom-Auth".to_string(),
+                    value: "Bearer $PROVIDER_RESPONSE_TEST_TOKEN".to_string(),
+                }],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let values = configured_provider_env_values(&config, |name| {
+        (name == "PROVIDER_RESPONSE_TEST_TOKEN").then(|| env_secret.to_string())
+    });
+    assert_eq!(
+        values,
+        std::collections::BTreeSet::from([env_secret.to_string()])
+    );
+    let reflected = format!("upstream rejected Bearer {env_secret} in an echoed header");
+    let scrubbed = redact_provider_response_text_with_values(&reflected, values);
+    assert!(scrubbed.contains("[redacted]"));
+    assert!(!scrubbed.contains(env_secret));
+}
+
+#[test]
+fn provider_response_scrubber_redacts_nested_credential_record_leaves() {
+    let ctx = test_ctx();
+    let credential = "opaque-reflected-token-123456";
+    let mut store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .expect("credential store");
+    store.set(
+        "provider-record",
+        serde_json::json!({
+            "oauth": { "opaque": { "value": credential } },
+            "account": { "id": "provider-account-123456" },
+            "enabled": true
+        }),
+    );
+    store.save().expect("credential record save");
+
+    let response = Response::ProviderUsageSnapshot {
+        snapshots: vec![crate::daemon::proto::ProviderUsageSnapshotView {
+            provider_id: "provider".into(),
+            display_name: "Provider".into(),
+            fetched_at: chrono::Utc::now(),
+            availability: crate::daemon::proto::ProviderUsageAvailabilityView::Error {
+                message: format!("upstream reflected {credential}"),
+            },
+        }],
+    };
+    let scrubbed = scrub_provider_response(
+        response,
+        &crate::config::providers::ProvidersConfig::default(),
+        &store,
+        &HashMap::new(),
+    )
+    .expect("scrubbed response");
+    let wire = serde_json::to_string(&scrubbed).expect("wire response");
+    assert!(!wire.contains(credential), "{wire}");
+    assert!(wire.contains("[redacted]"), "{wire}");
+}
+
+#[tokio::test]
+async fn attached_refresh_env_overlay_drives_provider_resolution_and_scrubbing() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    *ctx.env_baseline.write().unwrap() = EnvSnapshot::new(
+        EnvSnapshotSource::DaemonStart,
+        HashMap::from([("PROVIDER_REFRESH_TEST_TOKEN".into(), "stale-token".into())]),
+    );
+
+    handle_request(
+        Request::RefreshEnv {
+            vars: HashMap::from([(
+                "PROVIDER_REFRESH_TEST_TOKEN".into(),
+                "refreshed-token".into(),
+            )]),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("refresh env succeeds for attached owner");
+
+    let env = provider_env_snapshot(&ctx, &state);
+    assert_eq!(
+        env.get("PROVIDER_REFRESH_TEST_TOKEN").map(String::as_str),
+        Some("refreshed-token")
+    );
+    assert_ne!(
+        env.get("PROVIDER_REFRESH_TEST_TOKEN").map(String::as_str),
+        Some("stale-token")
+    );
+
+    let entry = crate::config::providers::ProviderEntry {
+        url: "https://provider.example.test/v1".into(),
+        headers: vec![crate::config::providers::HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer $PROVIDER_REFRESH_TEST_TOKEN".into(),
+        }],
+        ..Default::default()
+    };
+    let resolved = crate::providers::models_fetch::resolve_provider_request_with_env(
+        "provider",
+        &entry,
+        |name| env.get(name).cloned(),
+    )
+    .expect("provider resolution uses the refreshed overlay");
+    assert_eq!(resolved.headers[0].value, "Bearer refreshed-token");
+
+    let config = crate::config::providers::ProvidersConfig {
+        providers: std::collections::BTreeMap::from([("provider".into(), entry)]),
+        ..Default::default()
+    };
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    let response = Response::ProviderUsageSnapshot {
+        snapshots: vec![crate::daemon::proto::ProviderUsageSnapshotView {
+            provider_id: "provider".into(),
+            display_name: "Provider".into(),
+            fetched_at: chrono::Utc::now(),
+            availability: crate::daemon::proto::ProviderUsageAvailabilityView::Error {
+                message: "upstream echoed refreshed-token".into(),
+            },
+        }],
+    };
+    let scrubbed = scrub_provider_response(response, &config, &store, &env).unwrap();
+    let wire = serde_json::to_string(&scrubbed).unwrap();
+    assert!(!wire.contains("refreshed-token"), "{wire}");
+    assert!(wire.contains("[redacted]"), "{wire}");
+}
+
+#[tokio::test]
+async fn owner_secret_inventory_is_keyset_paginated_and_rejects_stale_cursor() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    for name in ["inventory-a", "inventory-b", "inventory-c"] {
+        store.set_named_secret(name, format!("{name}-value"));
+    }
+    store.save().unwrap();
+    let mut state = owner_state();
+    let first = handle_request(
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let cursor = match first {
+        Response::SecretInventory {
+            entries,
+            next_cursor: Some(cursor),
+        } => {
+            assert_eq!(entries.len(), 1);
+            cursor
+        }
+        other => panic!("expected one-entry page with cursor, got {other:?}"),
+    };
+    let mut changed =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    changed.set_named_secret("inventory-before-cursor", "changed-value");
+    changed.save().unwrap();
+    let stale = handle_request(
+        Request::ListSecretInventory {
+            cursor: Some(cursor),
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a changed inventory must invalidate the cursor");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn owner_secret_inventory_cursor_detects_interior_update_and_reinsert() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    for name in ["interior-a", "interior-b", "interior-c"] {
+        store.set_named_secret(name, format!("{name}-value"));
+    }
+    store.save().unwrap();
+    let mut state = owner_state();
+    let first = handle_request(
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let cursor = match first {
+        Response::SecretInventory {
+            next_cursor: Some(cursor),
+            ..
+        } => cursor,
+        other => panic!("expected a cursor, got {other:?}"),
+    };
+
+    // The changed row is interior to the page order and keeps the same key
+    // and cardinality. A count/max-row aggregate must not miss this update.
+    let mut changed =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    changed.set_named_secret("interior-b", "interior-b-updated");
+    changed.save().unwrap();
+    let stale = handle_request(
+        Request::ListSecretInventory {
+            cursor: Some(cursor.clone()),
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("an interior update must invalidate the cursor");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+
+    // Delete/reinsert the same interior key, preserving size and ordering.
+    let mut changed =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    changed.remove_named_secret("interior-b");
+    changed.save().unwrap();
+    let mut changed =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    changed.set_named_secret("interior-b", "interior-b-reinserted");
+    changed.save().unwrap();
+    let stale = handle_request(
+        Request::ListSecretInventory {
+            cursor: Some(cursor),
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("an interior delete/reinsert must invalidate the cursor");
+    assert_eq!(stale.code, ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn owner_secret_inventory_accepts_max_subscription_ack_cursor() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let provider_id = "p".repeat(proto::MAX_OWNER_PROVIDER_ID_BYTES);
+    let mut state = owner_state();
+    handle_request(
+        Request::PutSubscriptionAck {
+            provider_id: provider_id.clone(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("maximum-length subscription acknowledgement is valid");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret("zz-after-max-ack", "inventory-value");
+    store.save().unwrap();
+
+    let first = handle_request(
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let cursor = match first {
+        Response::SecretInventory {
+            entries,
+            next_cursor: Some(cursor),
+        } => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].kind, proto::SecretInventoryKind::SubscriptionAck);
+            cursor
+        }
+        other => panic!("expected max acknowledgement page cursor, got {other:?}"),
+    };
+    let second = handle_request(
+        Request::ListSecretInventory {
+            cursor: Some(cursor),
+            limit: Some(1),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("cursor containing prefixed maximum-length ack id remains valid");
+    assert!(matches!(second, Response::SecretInventory { entries, .. } if entries.len() == 1));
+}
+
+#[tokio::test]
+async fn owner_secret_write_does_not_ack_when_redaction_publication_fails() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut state = owner_state();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    let result = handle_request(
+        Request::PutNamedSecret {
+            name: "publication-failure-name".into(),
+            value: "publication-failure-value".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await;
+    ctx.set_force_daemon_redaction_refresh_failure(false);
+    let error = result.expect_err("publication failure must not acknowledge the write");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("publication-failure-name"),
+        None
+    );
+    ctx.refresh_redaction_table().unwrap();
+    assert!(
+        crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub("publication-failure-value")
+            .contains("publication-failure-value")
+    );
+}
+
+#[tokio::test]
+async fn provider_config_save_redaction_failure_compensates_all_staged_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let project_root = tmp.path().to_string_lossy().into_owned();
+    let entry = crate::config::providers::ProviderEntry {
+        url: "https://provider.example.test/v1".into(),
+        headers: vec![
+            crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer first-placeholder".into(),
+            },
+            crate::config::providers::HeaderSpec {
+                name: "X-API-Key".into(),
+                value: "second-placeholder".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mut state = owner_state();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    let result = handle_request(
+        Request::SaveProviderConfig {
+            project_root: project_root.clone(),
+            provider_id: "multi-provider".into(),
+            entry,
+            header_secrets: vec![
+                Some("first-staged-secret".into()),
+                Some("second-staged-secret".into()),
+            ],
+        },
+        &mut state,
+        &ctx,
+    )
+    .await;
+    ctx.set_force_daemon_redaction_refresh_failure(false);
+    let error = result.expect_err("redaction publication failure must reject save");
+    assert_eq!(error.code, ErrorCode::Internal);
+
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    let staged_names = store
+        .named_secret_entries()
+        .map(|(name, _)| name.to_string())
+        .filter(|name| name.starts_with("provider-multiprovider-"))
+        .collect::<Vec<_>>();
+    assert!(
+        staged_names.is_empty(),
+        "staged names survived compensation: {staged_names:?}"
+    );
+    let journal_count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM provider_config_journals
+                 WHERE project_root = ?1 AND provider_id = 'multi-provider'",
+                [project_root],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(journal_count, 0, "failed save left a recovery journal");
+    let redaction = crate::daemon::current_redaction(&ctx.global_redaction);
+    assert!(
+        redaction
+            .scrub("first-staged-secret")
+            .contains("first-staged-secret")
+    );
+    assert!(
+        redaction
+            .scrub("second-staged-secret")
+            .contains("second-staged-secret")
+    );
+}
+
+#[tokio::test]
+async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let mcp_path = cockpit_dir.join("mcp.json");
+    let prior_config = "{\"servers\":{}}\n";
+    std::fs::write(&mcp_path, prior_config).unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret("prior-mcp-secret", "prior-value");
+    store.save().unwrap();
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let cases = [
+        serde_json::json!({
+            "servers": {"literal-header": {
+                "transport": "streamable", "endpoint": "https://mcp.example.test",
+                "auth": {"kind": "header", "value": "Bearer plaintext"}
+            }}
+        }),
+        serde_json::json!({
+            "servers": {"literal-auth-env": {
+                "transport": "stdio", "command": "server",
+                "auth": {"kind": "env", "vars": {"TOKEN": "plaintext"}}
+            }}
+        }),
+        serde_json::json!({
+            "servers": {"literal-base-env": {
+                "transport": "stdio", "command": "server",
+                "env": {"TOKEN": "plaintext"}
+            }}
+        }),
+    ];
+    for config in cases {
+        let result = handle_request(
+            Request::SaveMcpConfig {
+                project_root: root.clone(),
+                config_json: serde_json::to_string(&config).unwrap(),
+                secret_values_json: "{}".into(),
+                cleanup_names_json: "[]".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("literal MCP credentials must be rejected");
+        assert_eq!(result.code, ErrorCode::BadRequest);
+        assert_eq!(std::fs::read_to_string(&mcp_path).unwrap(), prior_config);
+        assert_eq!(
+            crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+                .unwrap()
+                .named_secret("prior-mcp-secret"),
+            Some("prior-value")
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_save_stages_literal_and_persists_reference_only_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let config = serde_json::json!({
+        "servers": {"staged": {
+            "transport": "streamable", "endpoint": "https://mcp.example.test",
+            "auth": {"kind": "header", "value": "Bearer staged-value"}
+        }}
+    });
+    let response = handle_request(
+        Request::SaveMcpConfig {
+            project_root: root,
+            config_json: serde_json::to_string(&config).unwrap(),
+            secret_values_json: serde_json::json!({
+                "mcp:staged:header": "Bearer staged-value"
+            })
+            .to_string(),
+            cleanup_names_json: "[]".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("staged MCP credential save succeeds");
+    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    let wire = std::fs::read_to_string(cockpit_dir.join("mcp.json")).unwrap();
+    assert!(!wire.contains("Bearer staged-value"));
+    assert!(wire.contains("mcp:staged:header"));
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("mcp:staged:header"),
+        Some("Bearer staged-value")
+    );
+}
+
+#[tokio::test]
+async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    // A provider already owns a named secret in the shared vault namespace.
+    let victim = "provider-openai-018f0f2e-6c3b-7b42-ae1a-8e2b8a6f4d11-0";
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret(victim, "provider-real-value");
+    store.save().unwrap();
+    {
+        let victim_owned = victim.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'provider', ?2, ?3)",
+                    rusqlite::params![victim_owned, root_owned, 1i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // The owner crafts an MCP server whose credential reference reuses the
+    // provider's `$secret:` name and stages a new value for it. Before the
+    // cross-kind ownership check, this would overwrite the provider's live
+    // vault value while both claims persist.
+    let config = serde_json::json!({
+        "servers": {"attacker": {
+            "transport": "streamable", "endpoint": "https://mcp.example.test",
+            "auth": {"kind": "header", "credential_ref": victim}
+        }}
+    });
+    let mut secret_values = serde_json::Map::new();
+    secret_values.insert(
+        victim.to_string(),
+        serde_json::Value::String("mcp-attacker-value".into()),
+    );
+    let mut state = owner_state();
+    let result = handle_request(
+        Request::SaveMcpConfig {
+            project_root: root.clone(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            secret_values_json: serde_json::Value::Object(secret_values).to_string(),
+            cleanup_names_json: "[]".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await;
+
+    let error = result.expect_err("MCP save must not overwrite a provider-claimed secret");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+
+    // The provider's vault value is intact and its claim survives.
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret(victim),
+        Some("provider-real-value"),
+        "provider vault value must not be overwritten by an MCP save"
+    );
+    let victim_q = victim.to_string();
+    let provider_claims: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = 'provider'",
+                rusqlite::params![victim_q],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_claims, 1,
+        "provider claim must survive the rejected MCP save"
+    );
+}
+
+/// The cross-kind ownership admission is ATOMIC with the vault mutation: the
+/// conflict check runs on the SAME connection (hence the same `BEGIN IMMEDIATE`
+/// transaction) that writes the secret and inserts the claim, so no
+/// cross-process window can interpose a foreign claim between check and write.
+///
+/// The end-to-end tests above are satisfied by the pre-transaction
+/// `ensure_mcp_references_claimable` read alone, so they cannot prove the
+/// in-transaction guard exists. This test drives the real
+/// `reject_conflicting_named_ownership_on_conn` guard and a real
+/// `vault.mutate_item_on_conn` inside one `Db::transaction` and asserts that a
+/// pre-seeded provider conflict rolls the WHOLE transaction back — vault value
+/// and claim table unchanged — while a legitimate same-owner write commits.
+#[tokio::test]
+async fn mcp_named_secret_claim_guard_is_atomic_within_the_vault_transaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+
+    // A provider owns `victim` in the shared vault namespace.
+    let victim = "provider-openai-018f0f2e-6c3b-7b42-ae1a-8e2b8a6f4d11-0";
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret(victim, "provider-real-value");
+    store.save().unwrap();
+    {
+        let victim_owned = victim.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'provider', ?2, ?3)",
+                    rusqlite::params![victim_owned, root_owned, 1i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // A transaction that would overwrite the provider's secret and claim it for
+    // MCP, then runs the guard. Placing a real vault mutation and claim insert
+    // BEFORE the guard proves the guard's rejection ROLLS THEM BACK atomically
+    // (a stronger property than the guard merely returning early). Production
+    // runs the guard first; either ordering is safe because both live in the
+    // one transaction.
+    let attempt = {
+        let vault = ctx.secret_vault.clone();
+        let victim_owned = victim.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .transaction(move |conn| {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &victim_owned,
+                        Some(b"mcp-attacker-value"),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_named_ownership
+                     (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'mcp', ?2, ?3)",
+                    rusqlite::params![victim_owned, root_owned, 2i64],
+                )?;
+                reject_conflicting_named_ownership_on_conn(
+                    conn,
+                    &victim_owned,
+                    "mcp",
+                    &root_owned,
+                )?;
+                Ok(())
+            })
+            .await
+    };
+    let error = attempt.expect_err("the conflict guard must abort the transaction");
+    assert!(
+        error.downcast_ref::<NamedSecretClaimConflict>().is_some(),
+        "abort must be the typed cross-kind conflict, not an unrelated fault: {error:#}"
+    );
+
+    // Rollback: the provider's vault value is intact and no MCP claim exists.
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret(victim),
+        Some("provider-real-value"),
+        "the aborted transaction must not overwrite the provider's vault value"
+    );
+    let (provider_claims, mcp_claims): (i64, i64) = {
+        let victim_q = victim.to_string();
+        ctx.db
+            .read(move |conn| {
+                let provider: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM secret_named_ownership
+                     WHERE item_id = ?1 AND owner_kind = 'provider'",
+                    rusqlite::params![victim_q],
+                    |row| row.get(0),
+                )?;
+                let mcp: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM secret_named_ownership
+                     WHERE item_id = ?1 AND owner_kind = 'mcp'",
+                    rusqlite::params![victim_q],
+                    |row| row.get(0),
+                )?;
+                Ok((provider, mcp))
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        provider_claims, 1,
+        "provider claim must survive the rollback"
+    );
+    assert_eq!(
+        mcp_claims, 0,
+        "the aborted transaction must not leave a coexisting MCP claim"
+    );
+
+    // Non-vacuity / positive control: the same guard ADMITS a write when the
+    // name is owned by this exact MCP owner, so the rejection above is specific
+    // to the cross-kind conflict and not an always-fail guard.
+    let owned = "mcp:own-server:header";
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret(owned, "old-mcp-value");
+    store.save().unwrap();
+    {
+        let owned_owned = owned.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'mcp', ?2, ?3)",
+                    rusqlite::params![owned_owned, root_owned, 3i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    {
+        let vault = ctx.secret_vault.clone();
+        let owned_owned = owned.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .transaction(move |conn| {
+                reject_conflicting_named_ownership_on_conn(conn, &owned_owned, "mcp", &root_owned)?;
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &owned_owned,
+                        Some(b"new-mcp-value"),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok(())
+            })
+            .await
+            .expect("the guard must admit a write owned by this MCP owner");
+    }
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret(owned),
+        Some("new-mcp-value"),
+        "a same-owner write must commit through the guard"
+    );
+}
+
+/// The in-transaction MCP guard re-checks the FULL normalized reference set —
+/// flow-managed OAuth keys (`mcp:<server>`) and existing static references that
+/// carry NO staged value — not just the staged names. This closes the
+/// cross-process TOCTOU the pre-transaction read leaves open: workspace A's
+/// OAuth-server pre-check sees `mcp:example` unclaimed, then workspace B claims
+/// it before A commits; the staged-only re-check never re-examines the OAuth
+/// key, so A would consume B's foreign token. Driving the real
+/// `guard_mcp_reference_ownership_on_conn` inside one transaction proves:
+///   * a foreign OAuth-key claim is rejected ATOMICALLY (a real vault mutation
+///     seeded before the guard is rolled back), and
+///   * an ABSENT OAuth key is ADMITTED so configure-then-authenticate works,
+///   * a static reference with no durable mcp/root claim fails closed.
+#[tokio::test]
+async fn mcp_in_transaction_guard_rejects_unstaged_oauth_reference_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+
+    // A FOREIGN workspace owns the OAuth key in the shared vault namespace and
+    // backs it with a live token — the exact state a racing process could
+    // establish between our precheck read and our commit.
+    let oauth_key = "mcp:example";
+    let foreign_root = format!("{root}::other-workspace");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret(oauth_key, "foreign-oauth-token");
+    store.save().unwrap();
+    {
+        let key = oauth_key.to_string();
+        let foreign = foreign_root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'mcp', ?2, ?3)",
+                    rusqlite::params![key, foreign, 1i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // Our save references `mcp:example` via an OAuth server with NO staged
+    // value: it is in `all_refs` but not in `static_nonstaged_refs` (OAuth keys
+    // are flow-managed / permissive-when-absent).
+    let all_refs: std::collections::BTreeSet<String> =
+        [oauth_key.to_string()].into_iter().collect();
+    let static_nonstaged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Seed a real vault mutation (overwriting the foreign token) BEFORE the
+    // guard so a rejection proves the WHOLE transaction rolls back — a stronger
+    // property than the guard merely returning early.
+    let attempt = {
+        let vault = ctx.secret_vault.clone();
+        let all = all_refs.clone();
+        let stat = static_nonstaged.clone();
+        let root_owned = root.clone();
+        let key = oauth_key.to_string();
+        ctx.db
+            .transaction(move |conn| {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                        &key,
+                        Some(b"attacker-overwrite"),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                guard_mcp_reference_ownership_on_conn(conn, &vault, &all, &stat, &root_owned)?;
+                Ok(())
+            })
+            .await
+    };
+    let error = attempt.expect_err("a foreign OAuth-key claim must abort the transaction");
+    assert!(
+        error.downcast_ref::<NamedSecretClaimConflict>().is_some(),
+        "abort must be the typed cross-kind conflict, not an unrelated fault: {error:#}"
+    );
+
+    // Rollback: the foreign token is intact and no `mcp`/OUR-root claim exists.
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret(oauth_key),
+        Some("foreign-oauth-token"),
+        "the aborted transaction must not overwrite the foreign OAuth token"
+    );
+    let our_root = root.clone();
+    let key_q = oauth_key.to_string();
+    let our_claims: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = 'mcp' AND project_root = ?2",
+                rusqlite::params![key_q, our_root],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        our_claims, 0,
+        "the rejected save must not create a claim on the foreign OAuth key"
+    );
+
+    // Permissive control: when the OAuth key is ABSENT (configure-then-
+    // authenticate), the SAME guard ADMITS the reference — no ownership row
+    // means no conflict, and OAuth keys are never required to pre-exist. This
+    // proves the rejection above is specific to the foreign claim, not an
+    // always-fail guard.
+    let fresh_all: std::collections::BTreeSet<String> =
+        ["mcp:fresh-server".to_string()].into_iter().collect();
+    let empty: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    {
+        let vault = ctx.secret_vault.clone();
+        let root_owned = root.clone();
+        ctx.db
+            .transaction(move |conn| {
+                guard_mcp_reference_ownership_on_conn(
+                    conn,
+                    &vault,
+                    &fresh_all,
+                    &empty,
+                    &root_owned,
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("an absent OAuth key must be admitted (configure-then-authenticate)");
+    }
+
+    // A static NON-staged reference with no durable mcp/root claim must be
+    // rejected in-transaction (the claim-existence backstop), proving the guard
+    // is not merely a cross-kind-only check.
+    let orphan_all: std::collections::BTreeSet<String> =
+        ["mcp:orphan:header".to_string()].into_iter().collect();
+    let orphan_static = orphan_all.clone();
+    let orphan_attempt = {
+        let vault = ctx.secret_vault.clone();
+        let root_owned = root.clone();
+        ctx.db
+            .transaction(move |conn| {
+                guard_mcp_reference_ownership_on_conn(
+                    conn,
+                    &vault,
+                    &orphan_all,
+                    &orphan_static,
+                    &root_owned,
+                )?;
+                Ok(())
+            })
+            .await
+    };
+    let orphan_error =
+        orphan_attempt.expect_err("a static reference with no mcp/root claim must be rejected");
+    assert!(
+        orphan_error
+            .downcast_ref::<NamedSecretClaimConflict>()
+            .is_some(),
+        "the static-reference backstop must fail closed: {orphan_error:#}"
+    );
+}
+
+/// Ownership is validated for EVERY `credential_ref` in the submitted config,
+/// not only for staged entries. An owner who references an existing
+/// provider-owned `$secret:` name with an EMPTY staged map must be rejected
+/// BEFORE any vault mutation or config publication, so the MCP server can never
+/// silently consume the provider's secret (cross-kind boundary bypass). This is
+/// the non-staged sibling of `mcp_save_cannot_overwrite_a_provider_claimed_named_secret`.
+#[tokio::test]
+async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    // A provider owns a named secret in the shared vault namespace.
+    let victim = "provider-openai-018f0f2e-6c3b-7b42-ae1a-8e2b8a6f4d11-0";
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret(victim, "provider-real-value");
+    store.save().unwrap();
+    {
+        let victim_owned = victim.to_string();
+        let root_owned = root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'provider', ?2, ?3)",
+                    rusqlite::params![victim_owned, root_owned, 1i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // The owner crafts an MCP server referencing the provider's secret by name
+    // with NO staged value. The pre-fix ownership check ran only over staged
+    // entries (empty here), so the save would be accepted and the MCP server
+    // would consume the provider's live secret.
+    let config = serde_json::json!({
+        "servers": {"attacker": {
+            "transport": "streamable", "endpoint": "https://mcp.example.test",
+            "auth": {"kind": "header", "credential_ref": victim}
+        }}
+    });
+    let mut state = owner_state();
+    let result = handle_request(
+        Request::SaveMcpConfig {
+            project_root: root.clone(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            secret_values_json: "{}".into(),
+            cleanup_names_json: "[]".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await;
+
+    let error = result.expect_err("MCP save must reject an unstaged provider-owned reference");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+
+    // Fail-closed: no MCP config was published referencing the victim.
+    assert!(
+        !cockpit_dir.join("mcp.json").exists(),
+        "no MCP config may be written when the reference is rejected"
+    );
+
+    // The provider's vault value and claim are untouched.
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret(victim),
+        Some("provider-real-value"),
+        "provider vault value must be unchanged by the rejected MCP save"
+    );
+    let victim_q = victim.to_string();
+    let (provider_claims, mcp_claims): (i64, i64) = ctx
+        .db
+        .read(move |conn| {
+            let provider: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = 'provider'",
+                rusqlite::params![victim_q],
+                |row| row.get(0),
+            )?;
+            let mcp: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = 'mcp'",
+                rusqlite::params![victim_q],
+                |row| row.get(0),
+            )?;
+            Ok((provider, mcp))
+        })
+        .await
+        .unwrap();
+    assert_eq!(provider_claims, 1, "provider claim must survive");
+    assert_eq!(
+        mcp_claims, 0,
+        "the rejected save must not create an MCP claim on the provider's secret"
+    );
+}
+
+#[tokio::test]
+async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let root = tmp.path().to_string_lossy().into_owned();
+    trust_workspace_root(&ctx, tmp.path()).await;
+
+    // Precondition: the credential record the journal references does NOT
+    // exist in the vault (a later logout removed it after the save journaled).
+    assert!(
+        ctx.secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                "dead-cred",
+            )
+            .is_err(),
+        "dead credential reference must genuinely be absent"
+    );
+
+    // Stage a `save` journal whose entry republishes provider config pointing
+    // at that dead credential reference.
+    let entry = crate::config::providers::ProviderEntry {
+        url: "https://victim.example.test/v1".into(),
+        credential_ref: Some("dead-cred".into()),
+        ..Default::default()
+    };
+    let entry_json = serde_json::to_string(&entry).unwrap();
+    let journal_id = Uuid::now_v7().to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+    {
+        let journal_id = journal_id.clone();
+        let root_owned = root.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO provider_config_journals
+                     (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
+                     VALUES (?1, ?2, 'victim', 'save', ?3, '[]', '[]', ?4)",
+                    rusqlite::params![journal_id, root_owned, entry_json, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    // Recovery must run the create validation funnel and FAIL CLOSED rather
+    // than republishing config that references a dead credential.
+    let error = recover_provider_config_journals(&ctx, &root, Some("victim"))
+        .await
+        .expect_err("recovery must fail closed on a dead credential reference");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        error.message.contains("credential reference"),
+        "recovery must fail on the dead credential reference: {}",
+        error.message
+    );
+
+    // The journal is RETAINED (not retired) and no provider config was written.
+    let journal_q = journal_id.clone();
+    let remaining: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM provider_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_q],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1, "failed recovery must retain the journal");
+    assert!(
+        !cockpit_dir.join("providers").join("victim.json").exists(),
+        "dead-reference provider config must not be republished"
+    );
+}
+
+#[tokio::test]
+async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    std::fs::write(
+        cockpit_dir.join("mcp.json"),
+        serde_json::json!({
+            "servers": {"old": {
+                "transport": "streamable", "endpoint": "https://mcp.example.test",
+                "auth": {"kind": "header", "credential_ref": "mcp:old:header"}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let providers_dir = cockpit_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        providers_dir.join("shared.json"),
+        serde_json::json!({
+            "url": "https://provider.example.test",
+            "headers": [{"name": "Authorization", "value": "$secret:mcp:old:header"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret("mcp:old:header", "old-value");
+    store.set_named_secret("unrelated", "must-survive");
+    store.save().unwrap();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::SaveMcpConfig {
+            project_root: tmp.path().to_string_lossy().into_owned(),
+            config_json: serde_json::json!({"servers": {}}).to_string(),
+            secret_values_json: "{}".into(),
+            cleanup_names_json: serde_json::json!(["unrelated"]).to_string(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("MCP save succeeds");
+    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    assert_eq!(
+        store.named_secret("mcp:old:header"),
+        Some("old-value"),
+        "provider-layer reference must protect shared MCP named secret"
+    );
+    assert_eq!(store.named_secret("unrelated"), Some("must-survive"));
+}
+
+// `#[tokio::test]`: `persistent_test_ctx` spawns the daemon scheduler loop,
+// which needs a Tokio reactor at construction. The vault compare-and-restore
+// operations themselves are synchronous blocking DB calls.
+#[tokio::test]
+async fn mcp_save_compensation_preserves_a_newer_same_name_write() {
+    let ctx = persistent_test_ctx();
+    let staged = ctx
+        .secret_vault
+        .mutate_item(
+            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+            "mcp:race",
+            Some(b"staged"),
+        )
+        .unwrap();
+    ctx.secret_vault
+        .put_item(
+            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+            "mcp:race",
+            b"newer",
+        )
+        .unwrap();
+    let restored = ctx
+        .secret_vault
+        .restore_item_if_unchanged(
+            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+            "mcp:race",
+            &staged.after,
+            staged.prior.row.as_ref(),
+        )
+        .unwrap();
+    assert!(!restored);
+    assert_eq!(
+        ctx.secret_vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                "mcp:race"
+            )
+            .unwrap()
+            .as_slice(),
+        b"newer"
+    );
+}
+
+#[tokio::test]
+async fn owner_provider_rpc_rejects_subscription_ack_namespace_before_failure_injection() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut state = owner_state();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    let result = handle_request(
+        Request::PutProviderCredential {
+            provider_id: "subscription-oauth-ack:codex-oauth".into(),
+            record: r#"{"api_key":"must-not-store"}"#.into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("subscription acknowledgement namespace must be reserved");
+    ctx.set_force_daemon_redaction_refresh_failure(false);
+    assert_eq!(result.code, ErrorCode::BadRequest);
+    assert!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .get("subscription-oauth-ack:codex-oauth")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut state = owner_state();
+
+    let expect_failed = |result: Result<Response, ErrorPayload>| {
+        let error = result.expect_err("redaction publication failure must reject mutation");
+        assert_eq!(error.code, ErrorCode::Internal);
+    };
+
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(
+        handle_request(
+            Request::PutNamedSecret {
+                name: "rollback-named".into(),
+                value: "rollback-named-value".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await,
+    );
+    assert!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("rollback-named")
+            .is_none()
+    );
+    assert!(
+        crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub("rollback-named-value")
+            .contains("rollback-named-value"),
+        "a failed first write must not publish its value to redaction"
+    );
+
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set_named_secret("rollback-named", "old-named-value");
+    store.save().unwrap();
+    ctx.refresh_redaction_table().unwrap();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(
+        handle_request(
+            Request::DeleteNamedSecret {
+                name: "rollback-named".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await,
+    );
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("rollback-named"),
+        Some("old-named-value")
+    );
+    assert!(
+        !crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub("old-named-value")
+            .contains("old-named-value"),
+        "failed delete must preserve the prior redaction table"
+    );
+
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store.set(
+        "rollback-provider",
+        serde_json::json!({"api_key": "old-provider"}),
+    );
+    store.save().unwrap();
+    ctx.refresh_redaction_table().unwrap();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(
+        handle_request(
+            Request::PutProviderCredential {
+                provider_id: "rollback-provider".into(),
+                record: r#"{"api_key":"new-provider"}"#.into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await,
+    );
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .api_key("rollback-provider"),
+        Some("old-provider".into())
+    );
+    assert!(
+        !crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub("old-provider")
+            .contains("old-provider"),
+        "failed provider replacement must preserve the prior redaction table"
+    );
+    ctx.refresh_redaction_table().unwrap();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(
+        handle_request(
+            Request::DeleteProviderCredential {
+                provider_id: "rollback-provider".into(),
+                project_root: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await,
+    );
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .api_key("rollback-provider"),
+        Some("old-provider".into())
+    );
+    assert!(
+        !crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub("old-provider")
+            .contains("old-provider"),
+        "failed provider delete must preserve the prior redaction table"
+    );
+
+    let mut account = flycockpit_credential();
+    account.server_url = "http://127.0.0.1:9".into();
+    let account_token = account.instance_token.clone();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(
+        handle_request(
+            Request::StoreFlycockpitCredential {
+                credential: account.clone(),
+                force: true,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await,
+    );
+    assert!(ctx.load_flycockpit_credential().unwrap().is_none());
+    assert!(
+        crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub(&account_token)
+            .contains(&account_token),
+        "failed account write must not publish its token to redaction"
+    );
+    crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &account).unwrap();
+    ctx.refresh_redaction_table().unwrap();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    expect_failed(handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx).await);
+    assert_eq!(ctx.load_flycockpit_credential().unwrap(), Some(account));
+    assert!(
+        !crate::daemon::current_redaction(&ctx.global_redaction)
+            .scrub(&account_token)
+            .contains(&account_token),
+        "failed account clear must preserve the prior redaction table"
+    );
+}
+
+#[tokio::test]
+async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = vec![0_u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let body = r#"{"json":{}}"#;
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(raw.as_bytes()).await;
+    });
+
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut original = flycockpit_credential();
+    original.server_url = format!("http://{addr}");
+    crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &original)
+        .unwrap();
+
+    let clear_ctx = ctx.clone();
+    let clear_task = tokio::spawn(async move {
+        let mut state = owner_state();
+        handle_request(Request::ClearFlycockpitCredential, &mut state, &clear_ctx).await
+    });
+    started_rx.await.unwrap();
+
+    let mut replacement = original.clone();
+    replacement.display_name = Some("metadata-replacement".into());
+    let mut replacement_state = owner_state();
+    assert!(matches!(
+        handle_request(
+            Request::StoreFlycockpitCredential {
+                credential: replacement.clone(),
+                force: true,
+            },
+            &mut replacement_state,
+            &ctx,
+        )
+        .await
+        .unwrap(),
+        Response::FlycockpitStored
+    ));
+    let _ = release_tx.send(());
+    let response = clear_task.await.unwrap().unwrap();
+    assert!(matches!(
+        response,
+        Response::FlycockpitAlreadyLoggedIn { .. }
+    ));
+    assert_eq!(ctx.load_flycockpit_credential().unwrap(), Some(replacement));
+}
+
+#[tokio::test]
+async fn clear_credential_finishes_when_local_revoke_server_stalls() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    // This is deliberately a loopback-only controlled stall. The clear RPC
+    // must complete from its local vault transaction even though the
+    // best-effort revoke never produces an HTTP response.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = vec![0_u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+    });
+
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut credential = flycockpit_credential();
+    credential.server_url = format!("http://{addr}");
+    crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &credential)
+        .unwrap();
+
+    let clear_ctx = ctx.clone();
+    let clear_task = tokio::spawn(async move {
+        let mut state = owner_state();
+        handle_request(Request::ClearFlycockpitCredential, &mut state, &clear_ctx).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("revoke request reached controlled local stall")
+        .expect("stall server remained alive");
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(Duration::from_secs(4), clear_task)
+        .await
+        .expect("clear RPC must be bounded by revoke timeout")
+        .expect("clear task joined")
+        .expect("clear RPC succeeds despite revoke timeout");
+    assert!(matches!(response, Response::FlycockpitCleared { .. }));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(ctx.load_flycockpit_credential().unwrap().is_none());
+    let _ = release_tx.send(());
+}
+
+#[tokio::test]
+async fn remote_owner_credential_noops_commit_and_replay() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let credential = flycockpit_credential();
+    crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &credential)
+        .unwrap();
+    let operation = |operation_id| RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id,
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    };
+
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let store_request = Request::StoreFlycockpitCredential {
+        credential: credential.clone(),
+        force: false,
+    };
+    let store_operation = operation(Uuid::now_v7());
+    let mut effects = ClientRequestEffects::default();
+    // The dispatcher is intentionally a very large async state machine. The
+    // production remote path heap-pins it before polling; do the same here so
+    // this regression exercises that path instead of overflowing Tokio's test
+    // task stack while constructing the future.
+    let first = Box::pin(handle_serialized_request_with_remote_operation(
+        store_request.clone(),
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&store_operation),
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::FlycockpitAlreadyLoggedIn { .. }));
+    let replay = Box::pin(handle_serialized_request_with_remote_operation(
+        store_request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&store_operation),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+
+    crate::auth::flycockpit::clear_credential_in_vault(ctx.secret_vault.clone()).unwrap();
+    let clear_request = Request::ClearFlycockpitCredential;
+    let clear_operation = operation(Uuid::now_v7());
+    let first = Box::pin(handle_serialized_request_with_remote_operation(
+        clear_request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&clear_operation),
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::FlycockpitNotLoggedIn));
+    let replay = Box::pin(handle_serialized_request_with_remote_operation(
+        Request::ClearFlycockpitCredential,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&clear_operation),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn remote_provider_mutation_error_closes_the_durable_replay_record_unknown() {
+    let ctx = persistent_test_ctx();
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id: Uuid::now_v7(),
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    };
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device_id = operation.authenticated_device_id.to_string();
+    ctx.db
+        .begin_nonrepeatable_remote_operation(
+            crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                authenticated_device_id: &device_id,
+                authenticated_device_generation: operation.authenticated_device_generation,
+                operation_class:
+                    crate::db::remote_attachment_operations::RemoteOperationClass::NonrepeatableMutation,
+                request_hash: [7; 32],
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = super::dispatch::finish_remote_provider_mutation(
+        &operation,
+        &ctx,
+        "upsert_provider_config",
+        async {
+            Err(ErrorPayload {
+                code: ErrorCode::InvalidConfig,
+                message: "simulated config write failure after replacement".into(),
+            })
+        },
+    )
+    .await
+    .expect_err("a failed provider write is reported to the caller");
+    assert_eq!(error.code, ErrorCode::InvalidConfig);
+
+    let status = ctx
+        .db
+        .remote_operation_status(&attachment, &operation_id)
+        .await
+        .unwrap()
+        .expect("remote provider mutation keeps a durable replay record");
+    assert_eq!(status.state, "outcome_unknown");
+    assert_eq!(
+        status.safe_response.as_deref(),
+        Some(br#"{"outcome":"unknown"}"#.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger_together() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let operation = |operation_id| RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id,
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    };
+
+    let credential = flycockpit_credential();
+    let store = operation(Uuid::now_v7());
+    assert!(matches!(
+        Box::pin(handle_serialized_request_with_remote_operation(
+            Request::StoreFlycockpitCredential {
+                credential: credential.clone(),
+                force: true,
+            },
+            &mut state,
+            &shared,
+            &ctx,
+            &mut effects,
+            Some(&store),
+        ))
+        .await
+        .unwrap(),
+        Response::FlycockpitStored
+    ));
+    let store_status = ctx
+        .db
+        .remote_operation_status(
+            &store.logical_attachment_id.to_string(),
+            &store.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("store must have a replay record");
+    assert_eq!(store_status.state, "committed");
+    assert_eq!(
+        ctx.load_flycockpit_credential().unwrap(),
+        Some(credential.clone())
+    );
+
+    ctx.db
+        .upsert_org_sync_policy(
+            &credential.server_url,
+            "remote-credential-org",
+            None,
+            &serde_json::json!({}),
+            true,
+        )
+        .await
+        .unwrap();
+    let clear = operation(Uuid::now_v7());
+    assert!(matches!(
+        Box::pin(handle_serialized_request_with_remote_operation(
+            Request::ClearFlycockpitCredential,
+            &mut state,
+            &shared,
+            &ctx,
+            &mut effects,
+            Some(&clear),
+        ))
+        .await
+        .unwrap(),
+        Response::FlycockpitCleared { .. }
+    ));
+    let clear_status = ctx
+        .db
+        .remote_operation_status(
+            &clear.logical_attachment_id.to_string(),
+            &clear.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("clear must have a replay record");
+    assert_eq!(clear_status.state, "committed");
+    assert!(ctx.load_flycockpit_credential().unwrap().is_none());
+    assert!(
+        ctx.db
+            .list_org_sync_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.org_id == "remote-credential-org" && !row.enabled)
+    );
+}
+
+#[tokio::test]
+async fn remote_owner_named_secret_commits_vault_and_replay_ledger_together() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id: Uuid::now_v7(),
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    };
+    let request = Request::PutNamedSecret {
+        name: "atomic-remote-name".into(),
+        value: "atomic-remote-value".into(),
+    };
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let first = handle_serialized_request_with_remote_operation(
+        request.clone(),
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::Ack));
+    assert_eq!(
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+            .unwrap()
+            .named_secret("atomic-remote-name"),
+        Some("atomic-remote-value")
+    );
+    let replay = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("committed owner-secret operation");
+    assert_eq!(status.state, "committed");
+    assert!(status.safe_response.is_some());
+}
+
+#[tokio::test]
+async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then_poisons_daemon() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id: Uuid::now_v7(),
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    };
+    let request = Request::PutNamedSecret {
+        name: "poisoned-remote-name".into(),
+        value: "poisoned-remote-value".into(),
+    };
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    ctx.set_force_daemon_redaction_refresh_failure(true);
+    assert!(matches!(
+        handle_serialized_request_with_remote_operation(
+            request.clone(),
+            &mut state,
+            &shared,
+            &ctx,
+            &mut effects,
+            Some(&operation),
+        )
+        .await
+        .unwrap(),
+        Response::Ack
+    ));
+    assert!(ctx.redaction_publication_is_poisoned());
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("durable owner-secret outcome");
+    assert_eq!(status.state, "committed");
+    let error = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .expect_err("poisoned daemon refuses all later dispatch");
+    assert_eq!(error.code, ErrorCode::Internal);
 }
 
 #[tokio::test]
@@ -6296,6 +8494,73 @@ async fn ephemeral_daemon_rejects_persistent_secret_writes() {
     .expect_err("ephemeral daemon must reject forced persistent secret writes");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(err.message.contains("ephemeral daemons"));
+
+    for request in [
+        Request::PutNamedSecret {
+            name: "ephemeral-name".into(),
+            value: "ephemeral-value".into(),
+        },
+        Request::DeleteNamedSecret {
+            name: "ephemeral-name".into(),
+        },
+        Request::PutProviderCredential {
+            provider_id: "ephemeral-provider".into(),
+            record: "{\"api_key\":\"ephemeral-value\"}".into(),
+        },
+        Request::DeleteProviderCredential {
+            provider_id: "ephemeral-provider".into(),
+            project_root: None,
+        },
+        Request::SetFlycockpitConnectorEnabled { enabled: true },
+        Request::SyncFlycockpitOrgPolicy,
+        Request::EnrollFlycockpitOrgSync {
+            org_id: "ephemeral-org".into(),
+        },
+    ] {
+        let err = handle_request(request, &mut state, &ctx)
+            .await
+            .expect_err("ephemeral daemon must reject persistent secret mutation");
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("ephemeral daemons"));
+    }
+}
+
+#[tokio::test]
+async fn owner_secret_rpcs_reject_non_owner_principal() {
+    let ctx = persistent_test_ctx_with_credential_path(
+        tempfile::tempdir().unwrap().path().join("credentials.json"),
+    );
+    let mut state = remote_state_with_grants(Vec::new());
+    for request in [
+        Request::ListSecretInventory {
+            cursor: None,
+            limit: None,
+        },
+        Request::PutNamedSecret {
+            name: "name".into(),
+            value: "value".into(),
+        },
+        Request::DeleteNamedSecret {
+            name: "name".into(),
+        },
+        Request::PutProviderCredential {
+            provider_id: "provider".into(),
+            record: "{}".into(),
+        },
+        Request::DeleteProviderCredential {
+            provider_id: "provider".into(),
+            project_root: None,
+        },
+        Request::GetFlycockpitAccount,
+        Request::SetFlycockpitConnectorEnabled { enabled: true },
+        Request::SyncFlycockpitOrgPolicy,
+        Request::EnrollFlycockpitOrgSync {
+            org_id: "org".into(),
+        },
+    ] {
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Authorization);
+    }
 }
 
 #[tokio::test]
@@ -6505,7 +8770,10 @@ fn daemon_store_uses_injected_vault() {
     let store = source
         .split("fn store_flycockpit_credential")
         .nth(1)
-        .and_then(|rest| rest.split("fn clear_flycockpit_credential").next())
+        .and_then(|rest| {
+            rest.split("fn set_force_daemon_redaction_refresh_failure")
+                .next()
+        })
         .expect("store helper");
     assert!(
         !store.contains("Db::open_default"),
@@ -8930,6 +11198,19 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "clear_flycockpit_credential"
         | "set_goal_status"
         | "import_session_archive"
+        | "put_named_secret"
+        | "delete_named_secret"
+        | "put_provider_credential"
+        | "delete_provider_credential"
+        | "put_subscription_ack"
+        | "begin_provider_oauth"
+        | "complete_provider_oauth"
+        | "begin_mcp_oauth"
+        | "complete_mcp_oauth"
+        | "upsert_provider_config"
+        | "save_provider_config"
+        | "delete_provider_config"
+        | "set_provider_layer_metadata"
         // An unstaged transfer reference is a bad request, not an authz failure.
         | "read_bulk_transfer_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "terminal_ingress_begin"
@@ -8991,13 +11272,51 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "list_leak_reports" => AuthzAllowedOutcome::Response,
+        "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
+            AuthzAllowedOutcome::Response
+        }
+        // `cancel_mcp_oauth` is an idempotent cancel: its handler always returns
+        // `Ok(McpOAuthCancelled { cancelled })` (false for the matrix's unknown
+        // flow id), never an error, so the owner-allowed cell is a `Response`.
+        "cancel_mcp_oauth" => AuthzAllowedOutcome::Response,
+        "get_provider_catalog_snapshot" | "get_provider_usage_snapshot" => {
+            AuthzAllowedOutcome::Response
+        }
+        // `fetch_provider_models` persists refreshed model config, so the
+        // ephemeral matrix daemon rejects it with `bad_request` before any
+        // fetch, exactly like the sibling provider-config owner mutations.
+        "fetch_provider_models" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // These leak commands pass the owner-only gate, then the dispatch handler
         // maps a missing leak record (existence-hiding) to `Authorization`
         // "unauthorized" for the bogus report id used by the matrix request.
         "begin_leak_reveal" | "mark_leak_rotated" | "delete_leak_report" => {
             AuthzAllowedOutcome::Error(ErrorCode::Authorization)
         }
+        // Owner-remoted settings/policy reads project the effective config; the
+        // owner cell resolves to a `Response` like the other read snapshots.
+        "export_policy" | "get_image_spend_policy" => AuthzAllowedOutcome::Response,
+        // Owner-remoted settings/setup/flycockpit mutations validate their
+        // caller-supplied payload after the owner gate; the matrix request's
+        // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
+        // just like the sibling secret/provider owner mutations above. The
+        // ephemeral-daemon owner mutations (`setup_copilot_auth`,
+        // `save_mcp_config`, the flycockpit ones) reject via the ephemeral
+        // guard; `save_extended_config` rejects the non-`config.json` target;
+        // `save_image_spend_policy` rejects the malformed settings JSON.
+        "setup_copilot_auth"
+        | "save_mcp_config"
+        | "save_extended_config"
+        | "save_image_spend_policy"
+        | "set_flycockpit_connector_enabled"
+        | "sync_flycockpit_org_policy"
+        | "enroll_flycockpit_org_sync" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // `import_policy` and `apply_setup_wizard` validate their caller-supplied
+        // payload inside the owner handler, which maps every parse /
+        // unsupported-descriptor failure through `internal` (not `bad_request`),
+        // so the owner-allowed cell surfaces `Internal` for the matrix's bogus
+        // bundle / wizard id. (Both stay owner-only; only the post-auth error
+        // code differs from the sibling `bad_request` mutations above.)
+        "import_policy" | "apply_setup_wizard" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -9112,6 +11431,36 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("pin"),
         authz_owner_only("store_flycockpit_credential"),
         authz_owner_only("clear_flycockpit_credential"),
+        authz_owner_only("list_secret_inventory"),
+        authz_owner_only("put_named_secret"),
+        authz_owner_only("put_subscription_ack"),
+        authz_owner_only("delete_named_secret"),
+        authz_owner_only("put_provider_credential"),
+        authz_owner_only("delete_provider_credential"),
+        authz_owner_only("get_flycockpit_account"),
+        authz_owner_only("begin_provider_oauth"),
+        authz_owner_only("complete_provider_oauth"),
+        authz_owner_only("begin_mcp_oauth"),
+        authz_owner_only("complete_mcp_oauth"),
+        authz_owner_only("cancel_mcp_oauth"),
+        authz_owner_only("get_provider_catalog_snapshot"),
+        authz_owner_only("fetch_provider_models"),
+        authz_owner_only("get_provider_usage_snapshot"),
+        authz_owner_only("upsert_provider_config"),
+        authz_owner_only("save_provider_config"),
+        authz_owner_only("delete_provider_config"),
+        authz_owner_only("set_provider_layer_metadata"),
+        authz_owner_only("setup_copilot_auth"),
+        authz_owner_only("apply_setup_wizard"),
+        authz_owner_only("save_mcp_config"),
+        authz_owner_only("save_extended_config"),
+        authz_owner_only("export_policy"),
+        authz_owner_only("import_policy"),
+        authz_owner_only("get_image_spend_policy"),
+        authz_owner_only("save_image_spend_policy"),
+        authz_owner_only("set_flycockpit_connector_enabled"),
+        authz_owner_only("sync_flycockpit_org_policy"),
+        authz_owner_only("enroll_flycockpit_org_sync"),
         authz_owner_only("refresh_host_capabilities"),
         authz_owner_only("migrate_kek_placement"),
         authz_session_writer("refresh_env"),
@@ -9238,10 +11587,18 @@ async fn dispatch_authz_request_after(
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let text = format!("{error:#}");
-                // Unread attach/session events on the pair become RST when the
-                // client is dropped; the request already completed.
+                // The dispatched response was already received and captured
+                // above (asserted by the caller); dropping the client then tears
+                // the connection down. Two benign teardown races surface here
+                // depending on which server subtask the biased `select!` observes
+                // first: the reader sees the socket reset ("Connection reset"),
+                // or a peer subtask (writer/event) cleanly exits as its channel
+                // closes ("... task ended unexpectedly"). Neither is a request
+                // failure.
                 assert!(
-                    text.contains("Connection reset by peer") || text.contains("Connection reset"),
+                    text.contains("Connection reset by peer")
+                        || text.contains("Connection reset")
+                        || text.contains("ended unexpectedly"),
                     "server task succeeds: {text}"
                 );
             }
@@ -10327,6 +12684,74 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             force: false,
         },
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
+        "put_subscription_ack" => Request::PutSubscriptionAck {
+            provider_id: "codex-oauth".into(),
+        },
+        "begin_provider_oauth" => Request::BeginProviderOAuth {
+            provider_id: "codex-oauth".into(),
+        },
+        "complete_provider_oauth" => Request::CompleteProviderOAuth {
+            flow_id: "missing-flow".into(),
+            input: None,
+        },
+        "begin_mcp_oauth" => Request::BeginMcpOAuth {
+            project_root: root.clone(),
+            server: "missing-server".into(),
+        },
+        "complete_mcp_oauth" => Request::CompleteMcpOAuth {
+            flow_id: "missing-flow".into(),
+            input: None,
+        },
+        "cancel_mcp_oauth" => Request::CancelMcpOAuth {
+            flow_id: "missing-flow".into(),
+        },
+        "get_provider_catalog_snapshot" => Request::GetProviderCatalogSnapshot {
+            project_root: root.clone(),
+            provider_id: None,
+        },
+        "fetch_provider_models" => Request::FetchProviderModels {
+            project_root: root.clone(),
+            provider_id: None,
+            model_id: None,
+            deep: false,
+            on_unlisted: None,
+            allow_fallback: false,
+        },
+        "get_provider_usage_snapshot" => Request::GetProviderUsageSnapshot {
+            project_root: root.clone(),
+            provider_id: None,
+        },
+        "upsert_provider_config" => Request::UpsertProviderConfig {
+            project_root: root.clone(),
+            provider_id: "matrix-provider".into(),
+            // A semantically valid, credential-free provider URL so the request
+            // passes `validate_request_semantics` and reaches the authz gate
+            // (a default entry's empty URL is rejected as `BadRequest` before
+            // authz, which would mask the owner-only denial the matrix asserts).
+            entry: crate::config::providers::ProviderEntry {
+                url: "https://provider.example/v1".into(),
+                ..Default::default()
+            },
+        },
+        "save_provider_config" => Request::SaveProviderConfig {
+            project_root: root.clone(),
+            provider_id: "matrix-provider".into(),
+            entry: crate::config::providers::ProviderEntry {
+                url: "https://provider.example/v1".into(),
+                ..Default::default()
+            },
+            header_secrets: Vec::new(),
+        },
+        "delete_provider_config" => Request::DeleteProviderConfig {
+            project_root: root.clone(),
+            provider_id: "matrix-provider".into(),
+            delete_stored_secrets: false,
+        },
+        "set_provider_layer_metadata" => Request::SetProviderLayerMetadata {
+            project_root: root.clone(),
+            category_defaults_json: "{}".into(),
+            on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep,
+        },
         "refresh_host_capabilities" => Request::RefreshHostCapabilities,
         "migrate_kek_placement" => Request::MigrateKekPlacement {
             dest: cockpit_proto::SecretStorePlacement::Database,
@@ -10433,6 +12858,74 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             grace_secs: Some(1),
         },
         "restart_if_idle" => Request::RestartIfIdle,
+        "list_secret_inventory" => Request::ListSecretInventory {
+            cursor: None,
+            limit: None,
+        },
+        "get_flycockpit_account" => Request::GetFlycockpitAccount,
+        "put_named_secret" => Request::PutNamedSecret {
+            name: "matrix-secret".into(),
+            value: "matrix-value".into(),
+        },
+        "delete_named_secret" => Request::DeleteNamedSecret {
+            name: "matrix-secret".into(),
+        },
+        "put_provider_credential" => Request::PutProviderCredential {
+            provider_id: "matrix-provider".into(),
+            record: "{}".into(),
+        },
+        "delete_provider_credential" => Request::DeleteProviderCredential {
+            provider_id: "matrix-provider".into(),
+            project_root: None,
+        },
+        "save_mcp_config" => Request::SaveMcpConfig {
+            project_root: root.clone(),
+            config_json: "{}".into(),
+            secret_values_json: "{}".into(),
+            cleanup_names_json: "[]".into(),
+        },
+        "export_policy" => Request::ExportPolicy {
+            project_root: root.clone(),
+        },
+        "import_policy" => Request::ImportPolicy {
+            project_root: root.clone(),
+            bundle_json: "{}".into(),
+            replace: false,
+        },
+        "get_image_spend_policy" => Request::GetImageSpendPolicy {
+            project_key: root.clone(),
+        },
+        "save_image_spend_policy" => Request::SaveImageSpendPolicy {
+            project_key: root.clone(),
+            settings_json: "not json".into(),
+            expected_policy_version: None,
+        },
+        "save_extended_config" => Request::SaveExtendedConfig {
+            project_root: root.clone(),
+            path: "not-config.json".into(),
+            content: "{}".into(),
+            base_hash: None,
+        },
+        "setup_copilot_auth" => Request::SetupCopilotAuth {
+            project_root: root.clone(),
+            provider_id: "matrix-provider".into(),
+        },
+        "apply_setup_wizard" => Request::ApplySetupWizard {
+            project_root: root.clone(),
+            // A recognized wizard id ("security"/"model") so the request passes
+            // `validate_request_semantics` and reaches the authz gate; the empty
+            // answers then fail inside the owner handler (missing first-step
+            // answer) and surface `Internal`, which is the owner-allowed cell.
+            wizard_id: "security".into(),
+            answers_json: "{}".into(),
+        },
+        "enroll_flycockpit_org_sync" => Request::EnrollFlycockpitOrgSync {
+            org_id: "matrix-org".into(),
+        },
+        "set_flycockpit_connector_enabled" => {
+            Request::SetFlycockpitConnectorEnabled { enabled: true }
+        }
+        "sync_flycockpit_org_policy" => Request::SyncFlycockpitOrgPolicy,
         other => panic!("unhandled authz matrix request kind {other}"),
     }
 }
@@ -14929,6 +17422,80 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             }
             let _ = path;
         }
+        "set_flycockpit_connector_enabled" => {
+            let ctx = persistent_test_ctx_with_credential_path(
+                tempfile::tempdir().unwrap().path().join("credential.json"),
+            );
+            let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+            crate::auth::flycockpit::store_credential_in_vault(vault, &flycockpit_credential())
+                .unwrap();
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::SetFlycockpitConnectorEnabled { enabled: true },
+            )
+            .await
+            .expect("set connector enabled");
+            assert!(matches!(response, Response::Ack));
+            let state = ctx
+                .db
+                .connector_state("https://app.example.test", "inst-1")
+                .await
+                .unwrap()
+                .expect("connector state");
+            assert!(state.enabled);
+        }
+        "sync_flycockpit_org_policy" => {
+            // The daemon owns this network/policy operation. A test daemon
+            // without a credential proves the dispatch path is typed and
+            // secret-free without reaching an external service.
+            let ctx = persistent_test_ctx_with_credential_path(
+                tempfile::tempdir().unwrap().path().join("credential.json"),
+            );
+            let response = dispatch_matrix_request(&ctx, Request::SyncFlycockpitOrgPolicy)
+                .await
+                .expect("sync org policy without credential");
+            assert!(matches!(
+                response,
+                Response::FlycockpitOrgSync {
+                    outcome: proto::FlycockpitOrgSyncOutcome::NoCredential
+                }
+            ));
+        }
+        "enroll_flycockpit_org_sync" => {
+            let ctx = persistent_test_ctx_with_credential_path(
+                tempfile::tempdir().unwrap().path().join("credential.json"),
+            );
+            let credential = flycockpit_credential();
+            let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+            crate::auth::flycockpit::store_credential_in_vault(vault, &credential).unwrap();
+            ctx.db
+                .upsert_org_sync_policy(
+                    &credential.server_url,
+                    "org-fixture",
+                    Some("v1"),
+                    &serde_json::json!({"org_id":"org-fixture"}),
+                    false,
+                )
+                .await
+                .unwrap();
+            let response = dispatch_matrix_request(
+                &ctx,
+                Request::EnrollFlycockpitOrgSync {
+                    org_id: "org-fixture".into(),
+                },
+            )
+            .await
+            .expect("enroll org sync");
+            assert!(matches!(response, Response::Ack));
+            assert!(
+                ctx.db
+                    .org_sync_state(&credential.server_url, "org-fixture")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+        }
         "stop_daemon" => {
             let ctx = test_ctx();
             let response = dispatch_matrix_request(
@@ -15182,11 +17749,14 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         .collect();
     let expected = BTreeSet::from([
         "daemon_status",
+        "export_policy",
         "export_session_data",
         "fs_list",
         "fs_read",
         "fs_stat",
         "get_host_capabilities",
+        "get_image_spend_policy",
+        "get_provider_catalog_snapshot",
         "get_run_invocation_status",
         "get_usage_counts",
         "git_diff_file",
@@ -16269,6 +18839,62 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::ListSecretInventory {
+                cursor: None,
+                limit: None,
+            },
+            kind: "list_secret_inventory",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::PutNamedSecret {
+                name: "example".into(),
+                value: "secret".into(),
+            },
+            kind: "put_named_secret",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::DeleteNamedSecret {
+                name: "example".into(),
+            },
+            kind: "delete_named_secret",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::PutProviderCredential {
+                provider_id: "example".into(),
+                record: "{}".into(),
+            },
+            kind: "put_provider_credential",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::DeleteProviderCredential {
+                provider_id: "example".into(),
+                project_root: None,
+            },
+            kind: "delete_provider_credential",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetFlycockpitAccount,
+            kind: "get_flycockpit_account",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
             request: Request::DaemonStatus,
             kind: "daemon_status",
             session_id: None,
@@ -16849,6 +19475,30 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        CommandMetadataCase { request: Request::SetFlycockpitConnectorEnabled { enabled: true }, kind: "set_flycockpit_connector_enabled", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CompleteProviderOAuth { flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::CompleteMcpOAuth { flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { project_root: "/tmp/project".into(), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SetupCopilotAuth { project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
@@ -17008,6 +19658,29 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         Pin,
         StoreFlycockpitCredential,
         ClearFlycockpitCredential,
+        SetFlycockpitConnectorEnabled,
+        SyncFlycockpitOrgPolicy,
+        EnrollFlycockpitOrgSync,
+        ListSecretInventory,
+        PutNamedSecret,
+        PutSubscriptionAck,
+        DeleteNamedSecret,
+        PutProviderCredential,
+        DeleteProviderCredential,
+        BeginProviderOAuth,
+        CompleteProviderOAuth,
+        BeginMcpOAuth,
+        CompleteMcpOAuth,
+        CancelMcpOAuth,
+        GetFlycockpitAccount,
+        GetProviderCatalogSnapshot,
+        FetchProviderModels,
+        GetProviderUsageSnapshot,
+        UpsertProviderConfig,
+        SaveProviderConfig,
+        SaveMcpConfig,
+        DeleteProviderConfig,
+        SetProviderLayerMetadata,
         DaemonStatus,
         RefreshEnv,
         RefreshConfig,
@@ -17020,6 +19693,13 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GetHostCapabilities,
         RefreshHostCapabilities,
         MigrateKekPlacement,
+        SetupCopilotAuth,
+        ApplySetupWizard,
+        SaveExtendedConfig,
+        ExportPolicy,
+        ImportPolicy,
+        GetImageSpendPolicy,
+        SaveImageSpendPolicy,
     );
 
     let covered: HashSet<&'static str> = cases
@@ -18233,13 +20913,27 @@ async fn attachment_ledger_uses_authenticated_attached_project_identity() {
 async fn attachment_config_failure_leaves_no_pending_or_accounting_state() {
     let saw_trust_policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let saw_trust_policy_in_load = saw_trust_policy.clone();
+    // The daemon redaction table is built fail-closed at context construction
+    // (it loads config for `std::env::current_dir()`); that load must succeed
+    // so the context exists. Only the session/attachment config load (for the
+    // session's project root, never the process cwd) is injected to fail, so
+    // this test still exercises attachment admission's graceful failure.
+    let construction_cwd =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let source = crate::daemon::config_source::ConfigSource::new(
-        move |_cwd| {
-            saw_trust_policy_in_load.store(
-                crate::config::trust::current_workspace_trust_policy().is_some(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
-            Err(anyhow::anyhow!("injected attachment config failure"))
+        move |cwd| {
+            if cwd == construction_cwd {
+                Ok((
+                    crate::config::providers::ProvidersConfig::default(),
+                    crate::config::extended::ExtendedConfig::default(),
+                ))
+            } else {
+                saw_trust_policy_in_load.store(
+                    crate::config::trust::current_workspace_trust_policy().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Err(anyhow::anyhow!("injected attachment config failure"))
+            }
         },
         |_cwd, _provider_id| None,
         |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
@@ -20648,6 +23342,9 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
+        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_count: base.client_count.clone(),
         shutdown: base.shutdown.clone(),
@@ -20659,6 +23356,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
         secret_vault: base.secret_vault.clone(),
+        oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
@@ -20708,6 +23406,121 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     assert!(saw_lag, "in-process broadcast lag should emit typed event");
 }
 
+/// A `SaveExtendedConfig` that adds a `redact.denylist` entry must refresh the
+/// committed global redaction table, so the very next global broadcast scrubs
+/// the newly denylisted secret for non-owner clients. Without the post-save
+/// refresh, `broadcast_global` rebuilds only when the vault inventory
+/// generation advances (which a config-only change does not), so it would pin a
+/// STALE table and disclose the secret. This drives the real
+/// `Request::SaveExtendedConfig` dispatch over a file-backed config source.
+#[tokio::test]
+async fn save_extended_config_denylist_refreshes_broadcast_redaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+
+    // File-backed config source: `refresh_redaction_table` re-reads whatever
+    // `SaveExtendedConfig` last wrote to `config.json`, exactly as the on-disk
+    // daemon source does. It ignores the process cwd so the test does not depend
+    // on `std::env::current_dir()`.
+    let config_path_for_source = config_path.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            let extended =
+                crate::config::extended::ExtendedConfigDoc::load(&config_path_for_source)
+                    .map(|doc| doc.config())
+                    .unwrap_or_default();
+            Ok((
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+
+    let secret = "DENYLIST-SECRET-b7c1e2f3a4d5";
+    let mut events = ctx.subscribe_global();
+
+    // Precondition / non-vacuity: before the save, the committed table does NOT
+    // redact the secret, so any later redaction is caused by the save's refresh.
+    ctx.broadcast_global(proto::Event::LspNotice {
+        text: secret.to_string(),
+    });
+    let pre = recv_lsp_notice(&mut events).await;
+    assert_eq!(
+        pre.redact.scrub(secret),
+        secret,
+        "secret must not be redacted before it is denylisted"
+    );
+
+    // Write a complete extended config carrying the denylist entry through the
+    // real dispatch path.
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.enabled = true;
+    extended.redact.denylist = vec![secret.to_string()];
+    let content = serde_json::to_string(&extended).unwrap();
+    let mut state = owner_state();
+    handle_request(
+        Request::SaveExtendedConfig {
+            project_root: tmp.path().to_string_lossy().into_owned(),
+            path: "config.json".into(),
+            content,
+            base_hash: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("save extended config with denylist");
+
+    // The next global broadcast must pin a table that redacts the secret.
+    ctx.broadcast_global(proto::Event::LspNotice {
+        text: secret.to_string(),
+    });
+    let post = recv_lsp_notice(&mut events).await;
+    // The placeholder the committed table substitutes for the denylisted
+    // secret. Derived from the table itself, so the test does not hardcode the
+    // daemon's placeholder string.
+    let placeholder = post.redact.scrub(secret);
+    assert_ne!(
+        placeholder, secret,
+        "committed table must redact the denylisted secret after SaveExtendedConfig"
+    );
+
+    // The event a non-owner client would observe is scrubbed identically.
+    let scrubbed = scrub_event_for_principal(&remote_principal(), post)
+        .expect("non-owner receives the scrubbed event");
+    let proto::Event::LspNotice { text } = scrubbed else {
+        panic!("expected LspNotice");
+    };
+    assert!(
+        !text.contains(secret),
+        "broadcast event leaked the denylisted secret: {text}"
+    );
+    assert_eq!(
+        text, placeholder,
+        "broadcast event text must be scrubbed exactly as the pinned table dictates"
+    );
+}
+
+/// Drain global-bus envelopes until an `LspNotice` arrives, tolerating any
+/// unrelated startup/state events on the shared bus.
+async fn recv_lsp_notice(
+    events: &mut crate::daemon::EventReceiver,
+) -> crate::daemon::EventEnvelope {
+    loop {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("global event within timeout")
+            .expect("global event bus open");
+        if matches!(envelope.event, proto::Event::LspNotice { .. }) {
+            return envelope;
+        }
+    }
+}
+
 // Real time (no `start_paused`): this test drives `request_ok(DaemonStatus)`,
 // whose handler reads the database on a `spawn_blocking` worker. Under a paused
 // clock the runtime auto-advances virtual time to the `request()` REQUEST_TIMEOUT
@@ -20733,6 +23546,9 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         caffeinate: base.caffeinate.clone(),
         global_events,
         global_redaction: base.global_redaction.clone(),
+        redaction_generation: std::sync::atomic::AtomicU64::new(0),
+        redaction_refresh_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        redaction_publication_poisoned: std::sync::atomic::AtomicBool::new(false),
         terminal_host: base.terminal_host.clone(),
         client_count: base.client_count.clone(),
         shutdown: base.shutdown.clone(),
@@ -20744,6 +23560,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
         secret_vault: base.secret_vault.clone(),
+        oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,

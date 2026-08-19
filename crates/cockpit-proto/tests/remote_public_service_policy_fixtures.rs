@@ -15,8 +15,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-const RAW: &str =
-    include_str!("../../../packages/cockpit-protocol/fixtures/remote/public-service-policy-v1.json");
+const RAW: &str = include_str!(
+    "../../../packages/cockpit-protocol/fixtures/remote/public-service-policy-v1.json"
+);
 
 #[derive(Debug, Deserialize)]
 struct Fixture {
@@ -210,7 +211,11 @@ fn remote_public_service_policy_jws_verify_vectors() {
         let result = policy::verify_policy_jws(&v.compact, &ring, usage_of(&v.usage));
         match v.expect.as_str() {
             "accept" => {
-                assert!(result.is_ok(), "vector {} expected accept: {result:?}", v.id);
+                assert!(
+                    result.is_ok(),
+                    "vector {} expected accept: {result:?}",
+                    v.id
+                );
                 accepts += 1;
             }
             "reject" => {
@@ -221,7 +226,10 @@ fn remote_public_service_policy_jws_verify_vectors() {
         }
     }
     // Both a valid and an invalid branch must exist, or the corpus proves nothing.
-    assert!(accepts > 0 && rejects > 0, "need both accept and reject vectors");
+    assert!(
+        accepts > 0 && rejects > 0,
+        "need both accept and reject vectors"
+    );
 }
 
 #[test]
@@ -236,7 +244,11 @@ fn remote_public_service_policy_import_window_vectors() {
         let import_time: i64 = v.import_time.parse().expect("importTime i64");
         let result = v.policy.validate_for_import(import_time);
         match v.expect.as_str() {
-            "accept" => assert!(result.is_ok(), "window {} expected accept: {result:?}", v.id),
+            "accept" => assert!(
+                result.is_ok(),
+                "window {} expected accept: {result:?}",
+                v.id
+            ),
             "reject" => assert!(result.is_err(), "window {} expected reject", v.id),
             other => panic!("unknown expect {other}"),
         }
@@ -293,10 +305,20 @@ fn remote_public_service_policy_payload_digests() {
 #[test]
 fn remote_public_service_policy_classification_vectors() {
     let fx = load();
-    assert!(!fx.classification_vectors.is_empty(), "nonzero classification vectors");
-    let class_ids: Vec<&str> = fx.classification_vectors.iter().map(|v| v.id.as_str()).collect();
+    assert!(
+        !fx.classification_vectors.is_empty(),
+        "nonzero classification vectors"
+    );
+    let class_ids: Vec<&str> = fx
+        .classification_vectors
+        .iter()
+        .map(|v| v.id.as_str())
+        .collect();
     for required in ["narrowing", "widening", "mixed"] {
-        assert!(class_ids.contains(&required), "missing classification family {required}");
+        assert!(
+            class_ids.contains(&required),
+            "missing classification family {required}"
+        );
     }
     let mut mixed = 0;
     for v in &fx.classification_vectors {
@@ -328,11 +350,25 @@ fn remote_public_service_policy_ceiling_and_transport_vectors() {
         "trailing_byte",
         "one_byte_mutation",
     ] {
-        assert!(ceiling_ids.contains(&required), "missing ceiling family {required}");
+        assert!(
+            ceiling_ids.contains(&required),
+            "missing ceiling family {required}"
+        );
     }
-    let ceiling_accepts = fx.ceiling_vectors.iter().filter(|v| v.expect == "accept").count();
-    let ceiling_rejects = fx.ceiling_vectors.iter().filter(|v| v.expect == "reject").count();
-    assert!(ceiling_accepts > 0 && ceiling_rejects > 0, "ceiling needs both branches");
+    let ceiling_accepts = fx
+        .ceiling_vectors
+        .iter()
+        .filter(|v| v.expect == "accept")
+        .count();
+    let ceiling_rejects = fx
+        .ceiling_vectors
+        .iter()
+        .filter(|v| v.expect == "reject")
+        .count();
+    assert!(
+        ceiling_accepts > 0 && ceiling_rejects > 0,
+        "ceiling needs both branches"
+    );
     for v in &fx.ceiling_vectors {
         match (v.kind.as_str(), v.expect.as_str()) {
             ("struct", "accept") => {
@@ -352,11 +388,18 @@ fn remote_public_service_policy_ceiling_and_transport_vectors() {
                     v.id
                 );
                 // Round-trips through decode.
-                assert_eq!(RemotePermissionCeilingV1::decode(&bytes).expect("decode"), ceiling);
+                assert_eq!(
+                    RemotePermissionCeilingV1::decode(&bytes).expect("decode"),
+                    ceiling
+                );
             }
             ("struct", "reject") => {
                 let ceiling = build_ceiling(v);
-                assert!(ceiling.encode().is_err(), "ceiling {} expected encode reject", v.id);
+                assert!(
+                    ceiling.encode().is_err(),
+                    "ceiling {} expected encode reject",
+                    v.id
+                );
             }
             ("bytes", "reject") => {
                 let bytes = from_hex(v.bytes_hex.as_ref().expect("bytesHex"));
@@ -370,13 +413,32 @@ fn remote_public_service_policy_ceiling_and_transport_vectors() {
         }
     }
 
-    assert!(!fx.transport_bit_vectors.is_empty(), "nonzero transport vectors");
-    let transport_accepts = fx.transport_bit_vectors.iter().filter(|v| v.expect == "accept").count();
-    let transport_rejects = fx.transport_bit_vectors.iter().filter(|v| v.expect == "reject").count();
-    assert!(transport_accepts > 0 && transport_rejects > 0, "transport needs both branches");
+    assert!(
+        !fx.transport_bit_vectors.is_empty(),
+        "nonzero transport vectors"
+    );
+    let transport_accepts = fx
+        .transport_bit_vectors
+        .iter()
+        .filter(|v| v.expect == "accept")
+        .count();
+    let transport_rejects = fx
+        .transport_bit_vectors
+        .iter()
+        .filter(|v| v.expect == "reject")
+        .count();
+    assert!(
+        transport_accepts > 0 && transport_rejects > 0,
+        "transport needs both branches"
+    );
     for v in &fx.transport_bit_vectors {
         let ok = policy::validate_transport_bits(v.bits).is_ok();
-        assert_eq!(ok, v.expect == "accept", "transport bits {} verdict", v.bits);
+        assert_eq!(
+            ok,
+            v.expect == "accept",
+            "transport bits {} verdict",
+            v.bits
+        );
     }
 }
 
@@ -413,7 +475,10 @@ fn policy_hex(bytes: &[u8]) -> String {
 #[test]
 fn remote_public_service_policy_tuple_set_vectors() {
     let fx = load();
-    assert!(!fx.tuple_set_vectors.is_empty(), "nonzero tuple set vectors");
+    assert!(
+        !fx.tuple_set_vectors.is_empty(),
+        "nonzero tuple set vectors"
+    );
     let tuple_ids: Vec<&str> = fx.tuple_set_vectors.iter().map(|v| v.id.as_str()).collect();
     for required in [
         "valid_v1",
@@ -422,7 +487,10 @@ fn remote_public_service_policy_tuple_set_vectors() {
         "unknown_tuple",
         "zero_revoked",
     ] {
-        assert!(tuple_ids.contains(&required), "missing tuple family {required}");
+        assert!(
+            tuple_ids.contains(&required),
+            "missing tuple family {required}"
+        );
     }
     let mut revoked_reject = 0;
     for v in &fx.tuple_set_vectors {
@@ -447,7 +515,11 @@ fn remote_public_service_policy_tuple_set_vectors() {
                 let set = RemoteAuthorizedTupleSetV1 {
                     tuple_ids: v.tuple_ids.clone(),
                 };
-                assert!(set.encode(&v.revoked).is_err(), "tuple {} expected encode reject", v.id);
+                assert!(
+                    set.encode(&v.revoked).is_err(),
+                    "tuple {} expected encode reject",
+                    v.id
+                );
                 if v.revoked.contains(&1) {
                     revoked_reject += 1;
                 }
@@ -468,11 +540,18 @@ fn remote_public_service_policy_tuple_set_vectors() {
     }
     // The revoked-member rejection must fail against the pre-change codec (which
     // ignored revocation) — proving the new branch is real.
-    assert!(revoked_reject > 0, "corpus must include a revoked-member rejection");
+    assert!(
+        revoked_reject > 0,
+        "corpus must include a revoked-member rejection"
+    );
 }
 
 fn ser_name<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v).unwrap().as_str().unwrap().to_string()
+    serde_json::to_value(v)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -517,15 +596,30 @@ fn remote_public_service_policy_vocabulary_pins() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(consumers, fx.vocabulary.critical_consumer_ids);
-    assert_eq!(policy::CONVERGENCE_TIMEOUT_SECONDS, fx.vocabulary.timing.convergence_timeout_seconds);
-    assert_eq!(policy::REPLICA_LEASE_RENEW_SECONDS, fx.vocabulary.timing.replica_lease_renew_seconds);
-    assert_eq!(policy::REPLICA_LEASE_TTL_SECONDS, fx.vocabulary.timing.replica_lease_ttl_seconds);
-    assert_eq!(policy::STALE_REAP_GRACE_SECONDS, fx.vocabulary.timing.stale_reap_grace_seconds);
+    assert_eq!(
+        policy::CONVERGENCE_TIMEOUT_SECONDS,
+        fx.vocabulary.timing.convergence_timeout_seconds
+    );
+    assert_eq!(
+        policy::REPLICA_LEASE_RENEW_SECONDS,
+        fx.vocabulary.timing.replica_lease_renew_seconds
+    );
+    assert_eq!(
+        policy::REPLICA_LEASE_TTL_SECONDS,
+        fx.vocabulary.timing.replica_lease_ttl_seconds
+    );
+    assert_eq!(
+        policy::STALE_REAP_GRACE_SECONDS,
+        fx.vocabulary.timing.stale_reap_grace_seconds
+    );
 
     // ChangeClass round-trips through the pinned names too.
     assert_eq!(
         serde_json::to_string(&ChangeClass::NarrowingOrEqual).unwrap(),
         "\"narrowing_or_equal\""
     );
-    assert_eq!(serde_json::to_string(&ChangeClass::Widening).unwrap(), "\"widening\"");
+    assert_eq!(
+        serde_json::to_string(&ChangeClass::Widening).unwrap(),
+        "\"widening\""
+    );
 }

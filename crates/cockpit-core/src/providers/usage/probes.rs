@@ -25,19 +25,22 @@ pub async fn fetch_all_provider_usage(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
-    fetch_all_provider_usage_with_store(config, provider_filter, None).await
+    fetch_all_provider_usage_with_store(config, provider_filter, None, std::env::vars().collect())
+        .await
 }
 
 pub async fn fetch_all_provider_usage_with_store(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
     store: Option<crate::credentials::CredentialStore>,
+    env: std::collections::HashMap<String, String>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
     fetch_all_provider_usage_with_registry_and_store(
         config,
         provider_filter,
         ProviderRegistry::standard(),
         store,
+        env,
     )
     .await
 }
@@ -47,7 +50,14 @@ pub async fn fetch_all_provider_usage_with_registry(
     provider_filter: Option<&str>,
     registry: ProviderRegistry,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
-    fetch_all_provider_usage_with_registry_and_store(config, provider_filter, registry, None).await
+    fetch_all_provider_usage_with_registry_and_store(
+        config,
+        provider_filter,
+        registry,
+        None,
+        std::env::vars().collect(),
+    )
+    .await
 }
 
 async fn fetch_all_provider_usage_with_registry_and_store(
@@ -55,6 +65,7 @@ async fn fetch_all_provider_usage_with_registry_and_store(
     provider_filter: Option<&str>,
     registry: ProviderRegistry,
     store: Option<crate::credentials::CredentialStore>,
+    env: std::collections::HashMap<String, String>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
     let providers: Vec<(String, ProviderEntry)> = if let Some(filter) = provider_filter {
         let Some((id, entry)) = config.providers.get_key_value(filter) else {
@@ -84,12 +95,13 @@ async fn fetch_all_provider_usage_with_registry_and_store(
     for (provider_id, entry) in providers {
         let registry = registry.clone();
         let store = store.clone();
+        let env = env.clone();
         pending.push(async move {
             let usage = async {
                 if registry.provider_for(&provider_id, &entry).id()
                     == crate::auth::codex_oauth::CREDENTIAL_KEY
                 {
-                    match fetch_codex_usage_with_store(&provider_id, &entry, store).await {
+                    match fetch_codex_usage_with_store(&provider_id, &entry, store, env).await {
                         Ok((plan, windows, details)) => fetched_snapshot(
                             &provider_id,
                             &entry,
@@ -160,13 +172,14 @@ async fn fetch_codex_usage(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<(Option<String>, Vec<UsageWindow>, Vec<String>)> {
-    fetch_codex_usage_with_store(provider_id, entry, None).await
+    fetch_codex_usage_with_store(provider_id, entry, None, std::env::vars().collect()).await
 }
 
 async fn fetch_codex_usage_with_store(
     provider_id: &str,
     entry: &ProviderEntry,
     store: Option<crate::credentials::CredentialStore>,
+    env: std::collections::HashMap<String, String>,
 ) -> Result<(Option<String>, Vec<UsageWindow>, Vec<String>)> {
     let resolved = match store {
         Some(store) => {
@@ -174,7 +187,7 @@ async fn fetch_codex_usage_with_store(
                 provider_id,
                 entry,
                 store,
-                |name| std::env::var(name).ok(),
+                |name| env.get(name).cloned(),
             )
             .await?
         }

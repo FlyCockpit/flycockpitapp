@@ -1,10 +1,14 @@
-use std::path::Path;
-
 use anyhow::{Result, anyhow, bail};
 
 use crate::cli::{ProviderAddArgs, ProviderLogoutArgs, ProvidersCommand, ProvidersUsageArgs};
+#[cfg(test)]
 use crate::config::providers::{AuthKind, ProviderEntry, ProvidersConfig};
+#[cfg(test)]
 use crate::credentials::CredentialStore;
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{ProviderUsageAvailabilityView, Request, Response};
+#[cfg(test)]
+use std::path::Path;
 
 pub async fn run(cmd: ProvidersCommand) -> Result<()> {
     match cmd {
@@ -16,7 +20,7 @@ pub async fn run(cmd: ProvidersCommand) -> Result<()> {
             Ok(())
         }
         ProvidersCommand::Add(args) => add(args).await,
-        ProvidersCommand::Logout(args) => logout(args),
+        ProvidersCommand::Logout(args) => logout(args).await,
         ProvidersCommand::Usage(args) => usage(args).await,
     }
 }
@@ -25,22 +29,46 @@ async fn add(args: ProviderAddArgs) -> Result<()> {
     crate::commands::setup::run_provider_add(args.template).await
 }
 
-fn logout(args: ProviderLogoutArgs) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let cfg = crate::secret_ref::load_effective(&cwd);
-    match logout_configured_provider(&cfg, &args.provider, None)? {
-        ProviderLogout::SignedOut => println!("signed out `{}`", args.provider),
-        ProviderLogout::AlreadySignedOut => println!("`{}` was already signed out", args.provider),
+async fn logout(args: ProviderLogoutArgs) -> Result<()> {
+    let project_root = std::env::current_dir()
+        .map_err(|error| anyhow!("resolving provider logout workspace: {error}"))?
+        .display()
+        .to_string();
+    let daemon = ensure_persistent_daemon()
+        .await
+        .map_err(|error| anyhow!("starting persistent daemon for provider logout: {error}"))?;
+    let response = daemon
+        .client
+        .request(Request::DeleteProviderCredential {
+            provider_id: args.provider.clone(),
+            project_root: Some(project_root),
+        })
+        .await
+        .map_err(|error| anyhow!("provider logout RPC failed: {error}"))?
+        .map_err(|error| anyhow!("daemon rejected provider logout request: {error}"))?;
+    match response {
+        Response::ProviderCredentialDeleted { deleted: true, .. } => {
+            println!("signed out `{}`", args.provider)
+        }
+        Response::ProviderCredentialDeleted { deleted: false, .. } => {
+            println!("`{}` was already signed out", args.provider)
+        }
+        Response::Ack => println!("signed out `{}`", args.provider),
+        other => {
+            bail!("daemon returned unexpected response to provider logout request: {other:?}")
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderLogout {
     SignedOut,
     AlreadySignedOut,
 }
 
+#[cfg(test)]
 pub(crate) fn logout_configured_provider(
     cfg: &ProvidersConfig,
     provider_id: &str,
@@ -80,6 +108,7 @@ pub(crate) fn logout_configured_provider(
     })
 }
 
+#[cfg(test)]
 fn oauth_credential_ref<'a>(provider_id: &str, entry: &'a ProviderEntry) -> Result<&'a str> {
     if entry.auth != Some(AuthKind::OAuth) {
         bail!("provider `{provider_id}` is not an OAuth provider");
@@ -90,10 +119,12 @@ fn oauth_credential_ref<'a>(provider_id: &str, entry: &'a ProviderEntry) -> Resu
         .ok_or_else(|| anyhow!("OAuth provider `{provider_id}` has no credential_ref"))
 }
 
+#[cfg(test)]
 fn credential_record_exists(credential_ref: &str, store_path: Option<&Path>) -> Result<bool> {
     Ok(open_store(store_path)?.get(credential_ref).is_some())
 }
 
+#[cfg(test)]
 fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
     if let Some(path) = store_path {
         #[cfg(test)]
@@ -106,31 +137,101 @@ fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
             anyhow::bail!("explicit credential store path is test-only")
         }
     }
-    let db = crate::db::Db::open_default()?;
-    let vault = cockpit_core::secure_key::open_for_db(&db)
-        .map_err(|e| anyhow::anyhow!("opening providers vault: {e}"))?;
-    CredentialStore::from_vault(vault)
+    unreachable!("test callers always provide a credential-store path")
 }
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let cfg = crate::secret_ref::load_effective(&cwd);
-    let store = open_store(None).ok();
-    let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
-        &cfg,
-        args.provider.as_deref(),
-        store,
-    )
-    .await?;
-    for (idx, row) in rows.iter().enumerate() {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .map_err(|error| anyhow!("starting persistent daemon for provider usage: {error}"))?;
+    let response = daemon
+        .client
+        .request(Request::GetProviderUsageSnapshot {
+            project_root: cwd.display().to_string(),
+            provider_id: args.provider,
+        })
+        .await
+        .map_err(|error| anyhow!("provider usage RPC failed: {error}"))?
+        .map_err(|error| anyhow!("daemon rejected provider usage request: {error}"))?;
+    let Response::ProviderUsageSnapshot { snapshots } = response else {
+        bail!("daemon returned unexpected response to provider usage request: {response:?}");
+    };
+    for (idx, row) in snapshots.iter().enumerate() {
         if idx > 0 {
             println!();
         }
-        for line in crate::providers::usage::render_usage_lines(row) {
+        for line in render_provider_usage_wire(row) {
             println!("{line}");
         }
     }
     Ok(())
+}
+
+fn render_provider_usage_wire(
+    row: &crate::daemon::proto::ProviderUsageSnapshotView,
+) -> Vec<String> {
+    match &row.availability {
+        ProviderUsageAvailabilityView::Fetched {
+            plan,
+            windows,
+            details,
+            ..
+        } => {
+            let mut lines = vec![
+                match plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
+                    Some(plan) => {
+                        format!("{} ({}) — plan: {plan}", row.display_name, row.provider_id)
+                    }
+                    None => format!("{} ({})", row.display_name, row.provider_id),
+                },
+            ];
+            if windows.is_empty() && details.is_empty() {
+                lines.push("  No usage windows returned.".into());
+            }
+            for window in windows {
+                let mut line = format!("  {}: ", window.label);
+                match window.used_percent {
+                    Some(used) => line.push_str(&format!(
+                        "{:.0}% remaining ({:.0}% used)",
+                        (100.0 - used.clamp(0.0, 100.0)).max(0.0).round(),
+                        used.clamp(0.0, 100.0).round()
+                    )),
+                    None => line.push_str("usage not reported"),
+                }
+                if let Some(reset_at) = window.reset_at {
+                    line.push_str(&format!("; resets {}", reset_at.to_rfc3339()));
+                }
+                if let Some(detail) = window
+                    .detail
+                    .as_deref()
+                    .filter(|detail| !detail.trim().is_empty())
+                {
+                    line.push_str(&format!(" — {detail}"));
+                }
+                lines.push(line);
+            }
+            lines.extend(details.iter().map(|detail| format!("  {detail}")));
+            lines
+        }
+        ProviderUsageAvailabilityView::Unsupported { reason } => vec![format!(
+            "{} ({}) — unsupported: {reason}",
+            row.display_name, row.provider_id
+        )],
+        ProviderUsageAvailabilityView::Unavailable { reason, hint_url } => vec![format!(
+            "{} ({}) — unavailable: {reason}{}",
+            row.display_name,
+            row.provider_id,
+            hint_url
+                .as_ref()
+                .map(|url| format!(" {url}"))
+                .unwrap_or_default()
+        )],
+        ProviderUsageAvailabilityView::Error { message } => vec![format!(
+            "{} ({}) — error: {message}",
+            row.display_name, row.provider_id
+        )],
+    }
 }
 
 #[cfg(test)]

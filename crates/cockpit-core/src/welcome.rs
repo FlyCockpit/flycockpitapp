@@ -135,6 +135,22 @@ pub fn load_bundle_bootstrap(project: Option<&Path>, fetch_git: bool) -> LaunchB
     }
 }
 
+/// Bootstrap projection for the TUI. Provider credential-bearing fields are
+/// removed before the bundle crosses into the presentation crate; detached
+/// mode still gets model/catalog metadata from the local config.
+pub fn load_bundle_bootstrap_redacted(project: Option<&Path>, fetch_git: bool) -> LaunchBundle {
+    let mut bundle = load_bundle_bootstrap(project, fetch_git);
+    for provider in bundle.providers.providers.values_mut() {
+        provider.credential_ref = None;
+        for header in &mut provider.headers {
+            if !header.value.trim().is_empty() {
+                header.value = "********".to_string();
+            }
+        }
+    }
+    bundle
+}
+
 fn build_launch_info(
     cwd: PathBuf,
     fetch_git: bool,

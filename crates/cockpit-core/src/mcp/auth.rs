@@ -9,14 +9,15 @@
 //!   at launch. Becomes extra child env.
 //! - **oauth** — OAuth 2.1 authorization-code + PKCE (RFC 7636). The
 //!   interactive flow opens the browser to a loopback redirect, exchanges
-//!   the code, and stores the `{access,refresh}` tokens via
-//!   [`crate::credentials`] under `mcp:<server>`. At call time the stored
+//!   the code, and stores the `{access,refresh}` tokens in the vault's
+//!   named-secret compartment under `mcp:<server>`. At call time the stored
 //!   token is refreshed if expired and sent as `Authorization: Bearer …`.
 //! - **none** — public; no header, no env. Warned at add-time.
 //!
 //! Tokens never enter model context; they live only in the request layer.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -25,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::{Auth, OauthAuth, ServerConfig};
+
+const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The credential-store key for a server's OAuth tokens.
 pub fn cred_key(server: &str) -> String {
@@ -176,6 +180,13 @@ fn credential_value(
     store: &crate::credentials::CredentialStore,
     credential_ref: &str,
 ) -> Option<String> {
+    // MCP header and env values are written by the daemon's named-secret
+    // owner RPCs. Keep the older credential-record lookup as a read-only
+    // compatibility path for existing installations, but never make a new
+    // MCP setup depend on that separate compartment.
+    if let Some(value) = store.named_secret(credential_ref) {
+        return Some(value.to_string());
+    }
     let value = store.get(credential_ref)?;
     if let Some(s) = value.as_str() {
         return Some(s.to_string());
@@ -209,21 +220,37 @@ pub async fn oauth_bearer_with_store(
         None => anyhow::bail!("MCP server `{server}` requires an injected credential store"),
     };
     let key = cred_key(server);
-    let Some(raw) = store.get(&key).cloned() else {
-        bail!("MCP server `{server}` requires OAuth — run `authenticate` in /settings → MCP first");
-    };
-    let mut tokens: StoredTokens =
-        serde_json::from_value(raw).context("parsing stored MCP OAuth tokens")?;
+    let mut tokens = stored_tokens_from_store(store, &key)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP server `{server}` requires OAuth — run `authenticate` in /settings → MCP first"
+        )
+    })?;
     if tokens.is_expired(now_unix()) {
         let refresh = tokens
             .refresh_token
             .clone()
             .context("stored MCP token expired and no refresh token is available")?;
         tokens = refresh_token(oauth, &refresh).await?;
-        store.set(&key, serde_json::to_value(&tokens)?);
-        store.save()?;
+        store.set_named_secret_and_save_published(&key, serde_json::to_string(&tokens)?)?;
     }
     Ok(Some(format!("Bearer {}", tokens.access_token)))
+}
+
+fn stored_tokens_from_store(
+    store: &crate::credentials::CredentialStore,
+    key: &str,
+) -> Result<Option<StoredTokens>> {
+    if let Some(raw) = store.named_secret(key) {
+        return serde_json::from_str(raw)
+            .with_context(|| format!("parsing stored MCP OAuth tokens for {key}"))
+            .map(Some);
+    }
+    store
+        .get(key)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .with_context(|| format!("parsing legacy MCP OAuth credential record for {key}"))
 }
 
 fn now_unix() -> i64 {
@@ -236,6 +263,16 @@ struct Pkce {
     challenge: String,
 }
 
+/// Daemon-owned state for one MCP OAuth browser flow. The listener, PKCE
+/// verifier, and CSRF state never cross the daemon protocol boundary.
+pub struct McpOAuthFlow {
+    oauth: OauthAuth,
+    verifier: String,
+    state: String,
+    redirect_uri: String,
+    listener: tokio::net::TcpListener,
+}
+
 fn generate_pkce() -> Pkce {
     let mut bytes = [0u8; 64];
     rand::rng().fill_bytes(&mut bytes);
@@ -246,6 +283,54 @@ fn generate_pkce() -> Pkce {
         verifier,
         challenge,
     }
+}
+
+/// Start an MCP OAuth flow and return only the daemon-held flow plus the
+/// display-safe authorization URL.
+pub async fn begin_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<(McpOAuthFlow, String)> {
+    let Auth::Oauth(oauth) = &cfg.auth else {
+        bail!("MCP server `{server}` is not configured for OAuth");
+    };
+    let pkce = generate_pkce();
+    let mut state_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut state_bytes);
+    let state = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_bytes);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let url = build_authorize_url(oauth, &redirect_uri, &pkce.challenge, &state)?;
+    // Do NOT log the authorize URL. It carries flow parameters (`state`,
+    // `code_challenge`) and spewing it to daemon/CLI logs is unnecessary: the
+    // URL is returned to the owner-only caller for display, and the browser is
+    // opened directly below.
+    let _ = crate::browser::open(&url);
+    Ok((
+        McpOAuthFlow {
+            oauth: oauth.clone(),
+            verifier: pkce.verifier,
+            state,
+            redirect_uri,
+            listener,
+        },
+        url,
+    ))
+}
+
+/// Complete a daemon-owned MCP OAuth flow. The optional callback is a
+/// display-layer convenience; it carries only an authorization code and CSRF
+/// state, never an access or refresh token.
+pub async fn complete_oauth_flow(
+    flow: McpOAuthFlow,
+    callback: Option<&str>,
+) -> Result<StoredTokens> {
+    let (code, got_state) = match callback {
+        Some(callback) => parse_callback_target(callback),
+        None => Ok(wait_for_callback(flow.listener).await?),
+    }?;
+    if got_state != flow.state {
+        bail!("OAuth state mismatch (possible CSRF)");
+    }
+    exchange_code(&flow.oauth, &code, &flow.verifier, &flow.redirect_uri).await
 }
 
 /// Build the authorization URL for the loopback PKCE flow.
@@ -323,7 +408,7 @@ async fn exchange_code(
         ("client_id", client_id),
         ("code_verifier", verifier),
     ]);
-    let resp = reqwest::Client::new()
+    let resp = oauth_http_client()?
         .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
@@ -331,8 +416,7 @@ async fn exchange_code(
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("OAuth token exchange failed ({status}): {body}");
+        return Err(oauth_token_endpoint_error("exchange", status));
     }
     Ok(into_stored(resp.json::<TokenResp>().await?))
 }
@@ -349,7 +433,7 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         ("refresh_token", refresh),
         ("client_id", client_id),
     ]);
-    let resp = reqwest::Client::new()
+    let resp = oauth_http_client()?
         .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
@@ -357,8 +441,7 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("OAuth token refresh failed ({status}): {body}");
+        return Err(oauth_token_endpoint_error("refresh", status));
     }
     let mut tokens = into_stored(resp.json::<TokenResp>().await?);
     // Some servers omit the refresh token on refresh — keep the old one.
@@ -366,6 +449,19 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         tokens.refresh_token = Some(refresh.to_string());
     }
     Ok(tokens)
+}
+
+fn oauth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(OAUTH_CONNECT_TIMEOUT)
+        .timeout(OAUTH_TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building MCP OAuth HTTP client")
+}
+
+fn oauth_token_endpoint_error(operation: &str, status: reqwest::StatusCode) -> anyhow::Error {
+    anyhow::anyhow!("MCP OAuth token {operation} failed ({status})")
 }
 
 /// Run the interactive OAuth 2.1 + PKCE flow for a server: spin a
@@ -377,33 +473,9 @@ pub async fn run_oauth_flow(
     cfg: &ServerConfig,
     store: &mut crate::credentials::CredentialStore,
 ) -> Result<StoredTokens> {
-    let Auth::Oauth(oauth) = &cfg.auth else {
-        bail!("MCP server `{server}` is not configured for OAuth");
-    };
-    let pkce = generate_pkce();
-    let state = {
-        let mut b = [0u8; 16];
-        rand::rng().fill_bytes(&mut b);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-    };
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let url = build_authorize_url(oauth, &redirect_uri, &pkce.challenge, &state)?;
-
-    eprintln!("Opening browser for MCP server `{server}` OAuth…");
-    eprintln!("If it doesn't open, visit:\n  {url}");
-    let _ = crate::browser::open(&url);
-
-    let (code, got_state) = wait_for_callback(listener).await?;
-    if got_state != state {
-        bail!("OAuth state mismatch (possible CSRF)");
-    }
-    let tokens = exchange_code(oauth, &code, &pkce.verifier, &redirect_uri).await?;
-
-    store.set(cred_key(server), serde_json::to_value(&tokens)?);
-    store.save()?;
+    let (flow, _) = begin_oauth_flow(server, cfg).await?;
+    let tokens = complete_oauth_flow(flow, None).await?;
+    store.set_named_secret_and_save_published(cred_key(server), serde_json::to_string(&tokens)?)?;
     Ok(tokens)
 }
 
@@ -418,7 +490,20 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     let first = req.lines().next().unwrap_or("");
     // `GET /callback?code=…&state=… HTTP/1.1`
     let target = first.split_whitespace().nth(1).unwrap_or("");
-    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let (code, state) = parse_callback_target(target)?;
+    let body = "<html><body>Authentication complete. You can close this tab.</body></html>";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+    Ok((code, state))
+}
+
+fn parse_callback_target(target: &str) -> Result<(String, String)> {
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or(target);
     let mut code = None;
     let mut state = None;
     for pair in query.split('&') {
@@ -433,14 +518,6 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
             }
         }
     }
-    let body = "<html><body>Authentication complete. You can close this tab.</body></html>";
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(resp.as_bytes()).await;
-    let _ = stream.flush().await;
     let code = code.context("OAuth callback missing `code`")?;
     let state = state.unwrap_or_default();
     Ok((code, state))
@@ -489,6 +566,58 @@ mod tests {
             expires_at: 0,
         };
         assert!(!never.is_expired(i64::MAX), "0 means never expires");
+    }
+
+    #[test]
+    fn oauth_token_endpoint_errors_never_include_response_body() {
+        let error = oauth_token_endpoint_error("refresh", reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.to_string(),
+            "MCP OAuth token refresh failed (400 Bad Request)"
+        );
+        assert!(!error.to_string().contains("access_token"));
+    }
+
+    #[test]
+    fn oauth_http_client_has_bounded_timeout_and_no_redirects() {
+        let _ = oauth_http_client().expect("MCP OAuth HTTP client builds");
+        assert_eq!(OAUTH_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(OAUTH_TOTAL_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_mock_error_body_is_not_returned() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock token endpoint");
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let secret_body = "provider-secret-access-token-body";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept token request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                secret_body.len(),
+                secret_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write mock token error");
+        });
+
+        let oauth = OauthAuth {
+            token_url: Some(endpoint),
+            ..OauthAuth::default()
+        };
+        let error = exchange_code(&oauth, "code", "verifier", "http://127.0.0.1/callback")
+            .await
+            .expect_err("mock token endpoint must fail");
+        server.await.expect("mock token endpoint task");
+        assert!(!error.to_string().contains(secret_body));
     }
 
     #[test]
@@ -547,10 +676,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
-        store.set(
-            "mcp-header-secret",
-            serde_json::json!("header-secret-value"),
-        );
+        store.set_named_secret("mcp-header-secret", "header-secret-value");
         store.save().unwrap();
         assert!(
             !crate::credentials::default_path().unwrap().exists(),
@@ -567,6 +693,29 @@ mod tests {
         assert_eq!(
             resolved.headers.get("X-Key").map(String::as_str),
             Some("header-secret-value")
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_tokens_use_named_secret_compartment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let mut store = crate::credentials::CredentialStore::open_default().unwrap();
+        let tokens = StoredTokens {
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: 0,
+        };
+        let key = cred_key("example");
+        store.set_named_secret(&key, serde_json::to_string(&tokens).unwrap());
+        store.save().unwrap();
+
+        let resolved = stored_tokens_from_store(&store, &key).unwrap().unwrap();
+        assert_eq!(resolved.access_token, "access-token");
+        assert_eq!(resolved.refresh_token.as_deref(), Some("refresh-token"));
+        assert!(
+            store.get(&key).is_none(),
+            "OAuth must not require credential_record"
         );
     }
 }

@@ -818,9 +818,7 @@ async fn build_zip_with_options_and_env(
     };
     let store = vault
         .as_ref()
-        .map(|vault| {
-            crate::credentials::CredentialStore::from_vault(std::sync::Arc::clone(vault))
-        })
+        .map(|vault| crate::credentials::CredentialStore::from_vault(std::sync::Arc::clone(vault)))
         .transpose()?;
     let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {

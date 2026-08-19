@@ -3207,7 +3207,7 @@ impl App {
             launch,
             providers,
             extended,
-        } = welcome::load_bundle_bootstrap(project, false);
+        } = welcome::load_bundle_bootstrap_redacted(project, false);
         let config_snapshot = HeldConfig::from_view(
             0,
             false,

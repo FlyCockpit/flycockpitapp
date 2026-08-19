@@ -24,6 +24,183 @@ where
     Ok(value)
 }
 
+fn deserialize_bounded_string<'de, const MAX: usize, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX {
+        return Err(serde::de::Error::custom(format!(
+            "string exceeds maximum length of {MAX} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_bounded_optional_string<'de, const MAX: usize, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        if value.len() > MAX {
+            Err(serde::de::Error::custom(format!(
+                "string exceeds maximum length of {MAX} bytes"
+            )))
+        } else {
+            Ok(Some(value))
+        }
+    })
+}
+
+fn deserialize_bounded_optional_limit<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u16>::deserialize(deserializer)?;
+    if value.is_some_and(|value| value == 0 || value as usize > MAX_OWNER_INVENTORY_PAGE_ENTRIES) {
+        return Err(serde::de::Error::custom(format!(
+            "inventory page limit must be between 1 and {}",
+            MAX_OWNER_INVENTORY_PAGE_ENTRIES
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_inventory_cursor<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_optional_string::<MAX_OWNER_INVENTORY_CURSOR_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_secret_name<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_SECRET_NAME_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_secret_value<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_SECRET_VALUE_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_provider_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_ID_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_provider_record<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_RECORD_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_project_root<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROJECT_ROOT_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_optional_project_root<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_optional_string::<MAX_OWNER_PROJECT_ROOT_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_org_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_ORG_ID_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_optional_provider_id<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_optional_string::<MAX_OWNER_PROVIDER_ID_BYTES, D>(deserializer)
+}
+
+fn validate_owner_identifier(label: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.trim().is_empty() || value.contains('\0') || value.len() > max {
+        return Err(format!("{label} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_owner_project_root(value: &str) -> Result<(), String> {
+    validate_owner_identifier("project root", value, MAX_OWNER_PROJECT_ROOT_BYTES)
+}
+
+/// Provider endpoints are configuration, never a credential transport. Keep
+/// this check in one shared helper so every owner ingress (including the
+/// staged SaveProviderConfig path) rejects URL userinfo and covert query or
+/// fragment credentials before the value can be journaled.
+fn validate_credential_free_provider_url(url: &str) -> Result<(), String> {
+    if url.len() > MAX_OWNER_PROVIDER_URL_BYTES {
+        return Err("provider URL exceeds maximum length".to_string());
+    }
+    let parsed =
+        url::Url::parse(url).map_err(|_| "provider URL must be an absolute URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("provider URL must use HTTP or HTTPS".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("provider URL must not include credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("provider URL must not include a query string or fragment".to_string());
+    }
+    Ok(())
+}
+
+fn deserialize_owner_optional_model_id<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_optional_string::<MAX_OWNER_PROVIDER_MODEL_ID_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_provider_metadata_json<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+}
+
+fn deserialize_owner_mcp_json<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+}
+
 /// Client-owned immutable options attached to a `cockpit run` submission.
 ///
 /// Presence of this object (including every field `None`) is the run marker
@@ -50,7 +227,7 @@ pub struct RunInvocationOptions {
 
 /// Client → daemon RPCs. The daemon answers each with a matching
 /// [`Response`] keyed by envelope id, or an [`ErrorPayload`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", content = "params")]
 pub enum Request {
     /// Attach to an existing session by id, or create a new one.
@@ -1062,6 +1239,307 @@ pub enum Request {
     /// ephemeral daemons reject it.
     ClearFlycockpitCredential,
 
+    /// Enable or disable the daemon-owned relay connector for the current
+    /// FlyCockpit account. The daemon resolves the account from its vault.
+    SetFlycockpitConnectorEnabled {
+        enabled: bool,
+    },
+
+    /// Fetch and apply the current organization session-log policy for the
+    /// daemon-owned FlyCockpit account. No credential material is returned.
+    SyncFlycockpitOrgPolicy,
+
+    /// Persist the owner's explicit organization session-log enrollment.
+    /// The daemon resolves the account and server URL from its vault.
+    EnrollFlycockpitOrgSync {
+        #[serde(deserialize_with = "deserialize_owner_org_id")]
+        org_id: String,
+    },
+
+    /// Return names and safe metadata for daemon-owned secret entries.
+    ListSecretInventory {
+        /// Opaque cursor returned by the preceding page.
+        #[serde(default, deserialize_with = "deserialize_inventory_cursor")]
+        cursor: Option<String>,
+        /// Desired page size. The daemon applies the same hard upper bound
+        /// when an in-process caller constructs this request directly.
+        #[serde(default, deserialize_with = "deserialize_bounded_optional_limit")]
+        limit: Option<u16>,
+    },
+
+    /// Store one named secret in the daemon vault.
+    PutNamedSecret {
+        #[serde(deserialize_with = "deserialize_owner_secret_name")]
+        name: String,
+        #[serde(deserialize_with = "deserialize_owner_secret_value")]
+        value: String,
+    },
+
+    /// Record that the owner explicitly acknowledged the subscription OAuth
+    /// disclosure.  This has a distinct vault kind and a typed JSON `true`
+    /// payload; it is not a named secret and is never returned over the wire.
+    PutSubscriptionAck {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+    },
+
+    /// Remove one named secret from the daemon vault.
+    DeleteNamedSecret {
+        #[serde(deserialize_with = "deserialize_owner_secret_name")]
+        name: String,
+    },
+
+    /// Store one provider credential record as canonical JSON in the daemon
+    /// vault. The JSON string is intentionally opaque to the wire contract.
+    PutProviderCredential {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_record")]
+        record: String,
+    },
+
+    /// Begin a daemon-owned provider OAuth exchange. The daemon retains PKCE,
+    /// device-code polling state, and eventual tokens; the client receives
+    /// only display-safe instructions and an opaque flow id.
+    #[serde(rename = "begin_provider_oauth")]
+    BeginProviderOAuth {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+    },
+
+    /// Complete or poll a daemon-owned provider OAuth exchange. `input` is
+    /// limited to the pasted browser callback for browser flows; device flows
+    /// ignore it and poll using state retained by the daemon.
+    #[serde(rename = "complete_provider_oauth")]
+    CompleteProviderOAuth {
+        flow_id: String,
+        #[serde(default)]
+        input: Option<String>,
+    },
+
+    /// Begin daemon-owned MCP OAuth. The daemon retains PKCE and loopback
+    /// callback state; the client receives only an opaque flow id and URL.
+    #[serde(rename = "begin_mcp_oauth")]
+    BeginMcpOAuth {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        server: String,
+    },
+
+    /// Complete or poll daemon-owned MCP OAuth. `input` may carry a callback
+    /// URL/code supplied by a UI, but never a token.
+    #[serde(rename = "complete_mcp_oauth")]
+    CompleteMcpOAuth {
+        flow_id: String,
+        #[serde(default)]
+        input: Option<String>,
+    },
+
+    /// Cancel an in-progress daemon-owned MCP OAuth flow.
+    #[serde(rename = "cancel_mcp_oauth")]
+    CancelMcpOAuth {
+        flow_id: String,
+    },
+
+    /// Remove one provider credential record from the daemon vault.
+    DeleteProviderCredential {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+        /// When supplied, `provider_id` is a configured provider identifier.
+        /// The daemon resolves its credential reference privately before
+        /// deleting. Omitted preserves the direct credential-record form for
+        /// owner callers that already hold a vault record identifier.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_project_root"
+        )]
+        project_root: Option<String>,
+    },
+
+    /// Return redacted Flycockpit account metadata, never the instance token.
+    GetFlycockpitAccount,
+
+    /// Return the daemon-owned, redacted provider catalog/config projection.
+    GetProviderCatalogSnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_provider_id"
+        )]
+        provider_id: Option<String>,
+    },
+
+    /// Resolve credentials, fetch provider models, and persist resulting
+    /// provider metadata in the daemon. The response never contains secrets.
+    FetchProviderModels {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_provider_id"
+        )]
+        provider_id: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_model_id"
+        )]
+        model_id: Option<String>,
+        #[serde(default)]
+        deep: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch>,
+        /// When a live catalog is unavailable, explicitly activate the
+        /// daemon's built-in fallback catalog.  Keeping this decision on the
+        /// request makes an accepted fallback a durable daemon retry rather
+        /// than a client-side merge.
+        #[serde(default)]
+        allow_fallback: bool,
+    },
+
+    /// Fetch daemon-owned provider quota/usage snapshots.
+    GetProviderUsageSnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_owner_optional_provider_id"
+        )]
+        provider_id: Option<String>,
+    },
+
+    /// Persist non-secret provider configuration through the daemon's
+    /// trust-aware config writer.
+    UpsertProviderConfig {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+        entry: cockpit_config::config::providers::ProviderEntry,
+    },
+
+    /// Atomically stage private provider-header material in the daemon vault
+    /// and persist the corresponding reference-only provider configuration.
+    /// `header_secrets` is positional with `entry.headers`; only the daemon
+    /// assigns durable vault record names.
+    SaveProviderConfig {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+        entry: cockpit_config::config::providers::ProviderEntry,
+        header_secrets: Vec<Option<String>>,
+    },
+
+    /// Ask the daemon to acquire Copilot credentials from its own environment
+    /// and persist them through the provider-config owner path.  The response
+    /// is status-only; the credential never crosses the RPC boundary.
+    SetupCopilotAuth {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+    },
+
+    /// Apply the security or model setup wizard through the daemon owner.
+    /// Answers are validated against the daemon's current descriptor; the
+    /// descriptor itself never crosses the wire.
+    ApplySetupWizard {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        wizard_id: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
+        answers_json: String,
+    },
+
+    /// Atomically persist one daemon-owned MCP config layer and its named
+    /// secret changes. Secret values and cleanup names are JSON envelopes so
+    /// the wire never exposes the core MCP implementation type.
+    SaveMcpConfig {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
+        config_json: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
+        secret_values_json: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
+        cleanup_names_json: String,
+    },
+
+    /// Atomically persist a rendered extended settings layer. The daemon
+    /// validates the target as a config.json layer, reloads it under the
+    /// config mutation lock, and rejects stale `base_hash` writes.
+    SaveExtendedConfig {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        path: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_hash: Option<String>,
+    },
+
+    /// Export the daemon-owned portable policy bundle for a project.
+    ExportPolicy {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+    },
+
+    /// Import a portable policy bundle through the daemon owner boundary.
+    ImportPolicy {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
+        bundle_json: String,
+        #[serde(default)]
+        replace: bool,
+    },
+
+    /// Return the current daemon-owned image spend policy.
+    GetImageSpendPolicy {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        project_key: String,
+    },
+
+    /// Validate and persist an image spend policy through the daemon owner.
+    SaveImageSpendPolicy {
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        project_key: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        settings_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_policy_version: Option<u64>,
+    },
+
+    /// Remove a provider entry through the daemon's trust-aware writer.
+    DeleteProviderConfig {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        provider_id: String,
+        /// Delete only secrets no longer referenced by another provider.
+        /// Cleanup is performed by the daemon before removing the config so
+        /// a retry cannot strand a credential when either phase fails.
+        #[serde(default)]
+        delete_stored_secrets: bool,
+    },
+
+    /// Persist layer-wide non-secret provider metadata through the daemon.
+    SetProviderLayerMetadata {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        category_defaults_json: String,
+        on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch,
+    },
+
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
 
@@ -1176,6 +1654,18 @@ pub enum Request {
     Unknown,
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Requests can carry plaintext credentials. Keep diagnostics useful
+        // for routing while making accidental `{:?}` logging secret-free.
+        formatter
+            .debug_struct("Request")
+            .field("wire_tag", &self.wire_tag())
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
 impl Request {
     /// Validate semantic invariants independently of Serde.
     ///
@@ -1194,6 +1684,11 @@ impl Request {
         }
 
         match self {
+            Self::StoreFlycockpitCredential { credential, .. } => {
+                credential
+                    .validate()
+                    .map_err(|error| format!("invalid Flycockpit credential: {error}"))?;
+            }
             Self::BeginAttachmentUpload { byte_len, .. } => {
                 usize::try_from(*byte_len)
                     .map_err(|_| "byte_len exceeds daemon platform capacity".to_string())?;
@@ -1299,6 +1794,351 @@ impl Request {
                         );
                     }
                 }
+            }
+            Self::ListSecretInventory { cursor, limit } => {
+                if cursor
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_OWNER_INVENTORY_CURSOR_BYTES)
+                {
+                    return Err("inventory cursor exceeds maximum length".to_string());
+                }
+                if limit.is_some_and(|value| {
+                    value == 0 || value as usize > MAX_OWNER_INVENTORY_PAGE_ENTRIES
+                }) {
+                    return Err(format!(
+                        "inventory page limit must be between 1 and {MAX_OWNER_INVENTORY_PAGE_ENTRIES}"
+                    ));
+                }
+            }
+            Self::PutNamedSecret { name, value } => {
+                if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
+                    return Err("named secret name exceeds maximum length".to_string());
+                }
+                if value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
+                    return Err("named secret value exceeds maximum length".to_string());
+                }
+            }
+            Self::PutSubscriptionAck { provider_id } => {
+                if provider_id.trim().is_empty() {
+                    return Err("subscription provider id must not be empty".to_string());
+                }
+                if provider_id.contains('\0') {
+                    return Err("subscription provider id contains NUL".to_string());
+                }
+                if provider_id.len() > MAX_OWNER_PROVIDER_ID_BYTES {
+                    return Err("subscription provider id exceeds maximum length".to_string());
+                }
+            }
+            Self::EnrollFlycockpitOrgSync { org_id } => {
+                validate_owner_identifier("organization id", org_id, MAX_OWNER_ORG_ID_BYTES)?;
+            }
+            Self::DeleteNamedSecret { name } => {
+                if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
+                    return Err("named secret name exceeds maximum length".to_string());
+                }
+            }
+            Self::PutProviderCredential {
+                provider_id,
+                record,
+            } => {
+                if provider_id.len() > MAX_OWNER_PROVIDER_ID_BYTES {
+                    return Err("provider id exceeds maximum length".to_string());
+                }
+                if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
+                {
+                    return Err("provider id namespace is reserved".to_string());
+                }
+                if record.len() > MAX_OWNER_PROVIDER_RECORD_BYTES {
+                    return Err("provider credential record exceeds maximum length".to_string());
+                }
+            }
+            Self::BeginProviderOAuth { provider_id } => {
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if !matches!(provider_id.as_str(), "grok-oauth" | "codex-oauth") {
+                    return Err("provider OAuth is only available for Grok or Codex".to_string());
+                }
+            }
+            Self::CompleteProviderOAuth { flow_id, input } => {
+                if flow_id.is_empty()
+                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
+                    || flow_id.contains('\0')
+                {
+                    return Err("OAuth flow id is invalid".to_string());
+                }
+                if input
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_OWNER_SECRET_VALUE_BYTES)
+                {
+                    return Err("OAuth callback input exceeds maximum length".to_string());
+                }
+            }
+            Self::BeginMcpOAuth {
+                project_root,
+                server,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("MCP server", server, MAX_OWNER_PROVIDER_ID_BYTES)?;
+            }
+            Self::CompleteMcpOAuth { flow_id, input } => {
+                if flow_id.is_empty()
+                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
+                    || flow_id.contains('\0')
+                {
+                    return Err("MCP OAuth flow id is invalid".to_string());
+                }
+                if input
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_OWNER_SECRET_VALUE_BYTES)
+                {
+                    return Err("MCP OAuth callback input exceeds maximum length".to_string());
+                }
+            }
+            Self::CancelMcpOAuth { flow_id } => {
+                if flow_id.is_empty()
+                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
+                    || flow_id.contains('\0')
+                {
+                    return Err("MCP OAuth flow id is invalid".to_string());
+                }
+            }
+            Self::DeleteProviderCredential {
+                provider_id,
+                project_root,
+            } => {
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
+                    || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
+                {
+                    return Err("provider id namespace is reserved".to_string());
+                }
+                if let Some(project_root) = project_root {
+                    validate_owner_project_root(project_root)?;
+                }
+            }
+            Self::UpsertProviderConfig {
+                project_root,
+                provider_id,
+                entry,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                let entry_size = serde_json::to_vec(entry)
+                    .map_err(|_| "provider entry must be serializable".to_string())?
+                    .len();
+                if entry_size > MAX_OWNER_PROVIDER_ENTRY_BYTES {
+                    return Err("provider entry exceeds maximum length".to_string());
+                }
+                validate_credential_free_provider_url(&entry.url)?;
+                cockpit_config::config::providers::validate_provider_headers(
+                    provider_id,
+                    &entry.headers,
+                )
+                .map_err(|error| error.to_string())?;
+                for header in &entry.headers {
+                    let value = header.value.trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    // Owner RPCs never accept arbitrary literal header values:
+                    // callers must materialize private values through the vault
+                    // RPCs first.  Existing on-disk config remains readable;
+                    // this is an ingress-only custody boundary.
+                    if !cockpit_config::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        value,
+                    ) {
+                        return Err(format!(
+                            "header `{}` must use a $secret: or environment reference, not a literal value",
+                            header.name
+                        ));
+                    }
+                    if value.contains("$secret:") {
+                        for reference in value.split("$secret:").skip(1) {
+                            let name = reference
+                                .chars()
+                                .take_while(|ch| {
+                                    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
+                                })
+                                .collect::<String>();
+                            if name.is_empty() {
+                                return Err(format!(
+                                    "header `{}` has an invalid $secret reference",
+                                    header.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Self::SaveProviderConfig {
+                project_root,
+                provider_id,
+                entry,
+                header_secrets,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if header_secrets.len() != entry.headers.len() {
+                    return Err("provider header secret count does not match headers".to_string());
+                }
+                let entry_size = serde_json::to_vec(entry)
+                    .map_err(|_| "provider entry must be serializable".to_string())?
+                    .len();
+                if entry_size > MAX_OWNER_PROVIDER_ENTRY_BYTES {
+                    return Err("provider entry exceeds maximum length".to_string());
+                }
+                validate_credential_free_provider_url(&entry.url)?;
+                for value in header_secrets.iter().flatten() {
+                    if value.is_empty() || value.len() > MAX_OWNER_SECRET_VALUE_BYTES {
+                        return Err("provider header secret exceeds maximum length".to_string());
+                    }
+                }
+                cockpit_config::config::providers::validate_provider_headers(
+                    provider_id,
+                    &entry.headers,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Self::SetupCopilotAuth {
+                project_root,
+                provider_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
+            }
+            Self::ApplySetupWizard {
+                project_root,
+                wizard_id,
+                answers_json,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if !matches!(wizard_id.as_str(), "security" | "model") {
+                    return Err("setup wizard must be security or model".to_string());
+                }
+                if answers_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("setup wizard answers exceed maximum length".to_string());
+                }
+            }
+            Self::FetchProviderModels {
+                project_root,
+                provider_id,
+                model_id,
+                ..
+            } => {
+                validate_owner_project_root(project_root)?;
+                if let Some(provider_id) = provider_id {
+                    validate_owner_identifier(
+                        "provider id",
+                        provider_id,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                }
+                if let Some(model_id) = model_id {
+                    validate_owner_identifier(
+                        "model id",
+                        model_id,
+                        MAX_OWNER_PROVIDER_MODEL_ID_BYTES,
+                    )?;
+                }
+            }
+            Self::SaveMcpConfig {
+                project_root,
+                config_json,
+                secret_values_json,
+                cleanup_names_json,
+            } => {
+                validate_owner_project_root(project_root)?;
+                for (label, value) in [
+                    ("MCP config", config_json),
+                    ("MCP secret values", secret_values_json),
+                    ("MCP cleanup names", cleanup_names_json),
+                ] {
+                    if value.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                        return Err(format!("{label} JSON exceeds maximum length"));
+                    }
+                }
+            }
+            Self::SaveExtendedConfig {
+                project_root,
+                path,
+                content,
+                base_hash,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if path.is_empty()
+                    || path.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES
+                    || path.starts_with('/')
+                    || path.contains("..")
+                    || path.contains('\0')
+                {
+                    return Err("extended config path must name a config.json layer".to_string());
+                }
+                if content.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("extended config content exceeds maximum length".to_string());
+                }
+                if base_hash.as_ref().is_some_and(|hash| hash.len() > 128) {
+                    return Err("extended config base hash exceeds maximum length".to_string());
+                }
+            }
+            Self::ExportPolicy { project_root } => validate_owner_project_root(project_root)?,
+            Self::ImportPolicy {
+                project_root,
+                bundle_json,
+                ..
+            } => {
+                validate_owner_project_root(project_root)?;
+                if bundle_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("policy bundle exceeds maximum length".to_string());
+                }
+            }
+            Self::GetImageSpendPolicy { project_key } => {
+                validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
+            }
+            Self::SaveImageSpendPolicy {
+                project_key,
+                settings_json,
+                ..
+            } => {
+                validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
+                if settings_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("image spend settings exceed maximum length".to_string());
+                }
+            }
+            Self::GetProviderCatalogSnapshot {
+                project_root,
+                provider_id,
+            }
+            | Self::GetProviderUsageSnapshot {
+                project_root,
+                provider_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                if let Some(provider_id) = provider_id {
+                    validate_owner_identifier(
+                        "provider id",
+                        provider_id,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                }
+            }
+            Self::SetProviderLayerMetadata {
+                project_root,
+                category_defaults_json,
+                ..
+            } => {
+                validate_owner_project_root(project_root)?;
+                if category_defaults_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("provider metadata exceeds maximum length".to_string());
+                }
+            }
+            Self::DeleteProviderConfig {
+                project_root,
+                provider_id,
+                ..
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
             Self::GetRunInvocationStatus {
                 client_submission_id,
@@ -1444,6 +2284,36 @@ macro_rules! request_variants {
             (Request::Pin { .. }, "pin");
             (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential");
+            (Request::SetFlycockpitConnectorEnabled { .. }, "set_flycockpit_connector_enabled");
+            (Request::SyncFlycockpitOrgPolicy, "sync_flycockpit_org_policy");
+            (Request::EnrollFlycockpitOrgSync { .. }, "enroll_flycockpit_org_sync");
+            (Request::ListSecretInventory { .. }, "list_secret_inventory");
+            (Request::PutNamedSecret { .. }, "put_named_secret");
+            (Request::PutSubscriptionAck { .. }, "put_subscription_ack");
+            (Request::DeleteNamedSecret { .. }, "delete_named_secret");
+            (Request::PutProviderCredential { .. }, "put_provider_credential");
+            (Request::BeginProviderOAuth { .. }, "begin_provider_oauth");
+            (Request::CompleteProviderOAuth { .. }, "complete_provider_oauth");
+            (Request::BeginMcpOAuth { .. }, "begin_mcp_oauth");
+            (Request::CompleteMcpOAuth { .. }, "complete_mcp_oauth");
+            (Request::CancelMcpOAuth { .. }, "cancel_mcp_oauth");
+            (Request::DeleteProviderCredential { .. }, "delete_provider_credential");
+            (Request::GetFlycockpitAccount, "get_flycockpit_account");
+            (Request::GetProviderCatalogSnapshot { .. }, "get_provider_catalog_snapshot");
+            (Request::FetchProviderModels { .. }, "fetch_provider_models");
+            (Request::GetProviderUsageSnapshot { .. }, "get_provider_usage_snapshot");
+            (Request::UpsertProviderConfig { .. }, "upsert_provider_config");
+            (Request::SaveProviderConfig { .. }, "save_provider_config");
+            (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
+            (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
+            (Request::SaveMcpConfig { .. }, "save_mcp_config");
+            (Request::SaveExtendedConfig { .. }, "save_extended_config");
+            (Request::ExportPolicy { .. }, "export_policy");
+            (Request::ImportPolicy { .. }, "import_policy");
+            (Request::GetImageSpendPolicy { .. }, "get_image_spend_policy");
+            (Request::SaveImageSpendPolicy { .. }, "save_image_spend_policy");
+            (Request::DeleteProviderConfig { .. }, "delete_provider_config");
+            (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
             (Request::RefreshEnv { .. }, "refresh_env");
             (Request::RefreshConfig, "refresh_config");
@@ -1548,7 +2418,7 @@ macro_rules! command {
             (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid", [project_root: String => project_root, id: Uuid => param]);
             (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
             (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
-            (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, local_only, none, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
@@ -1627,8 +2497,44 @@ macro_rules! command {
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
-            (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, local_only, none, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
-            (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
+            (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::SetFlycockpitConnectorEnabled { enabled }, "set_flycockpit_connector_enabled", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "enabled:bool", [enabled: bool => param]);
+            (Request::SyncFlycockpitOrgPolicy, "sync_flycockpit_org_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            (Request::EnrollFlycockpitOrgSync { org_id }, "enroll_flycockpit_org_sync", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "org_id:String", [org_id: String => param]);
+            (Request::ListSecretInventory { cursor, limit }, "list_secret_inventory", owner_only, none, false, read_only, none, serialized, none, "cursor:Option<String>|limit:Option<u16>", [cursor: Option<String> => param, limit: Option<u16> => param]);
+            (Request::PutNamedSecret { name, value }, "put_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|value:String", [name: String => param, value: String => param]);
+            (Request::PutSubscriptionAck { provider_id }, "put_subscription_ack", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String", [provider_id: String => param]);
+            (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
+            (Request::PutProviderCredential { provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|record:String", [provider_id: String => param, record: String => param]);
+            // OAuth handshakes retain daemon-process PKCE/device state. They
+            // cannot be safely replayed through a remote durable ledger after
+            // reconnect/restart; only the final vault mutation is durable.
+            (Request::BeginProviderOAuth { provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "provider_id:String", [provider_id: String => param]);
+            (Request::CompleteProviderOAuth { flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
+            (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
+            (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
+            (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
+            (Request::DeleteProviderCredential { provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|project_root:Option<String>", [provider_id: String => param, project_root: Option<String> => param]);
+            (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
+            (Request::GetProviderCatalogSnapshot { project_root, provider_id }, "get_provider_catalog_snapshot", owner_only, none, false, read_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
+            (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
+            (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
+            (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);
+            (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<String>> => param]);
+            (Request::SetupCopilotAuth { project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|provider_id:String", [project_root: String => project_root, provider_id: String => param]);
+            (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
+            // Composite MCP publication is reserved in the remote ledger
+            // before dispatch. The daemon's journal + staged vault commit
+            // makes the nonrepeatable outcome replay-safe.
+            (Request::SaveMcpConfig { project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
+            (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
+            (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
+            (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
+            (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, local_only, none, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
+            (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
+            (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
@@ -1698,10 +2604,11 @@ pub enum AttachmentPurpose {
 /// The `command!` table (and the shared classification fixture) additionally
 /// carry two non-remote class tokens, `local_only` and `rejected`, which
 /// [`remote_class_value!`] maps to `None`: they never reserve a remote
-/// operation. `owner_only` tags are always one of those two (see
-/// `remote_operation_classification_is_exhaustive`), so a remote principal can
-/// never obtain `Some(RemoteOperationClass)` for owner-bound work — authz stays
-/// the barrier, class alone is not sufficient.
+/// operation. Most `owner_only` tags are one of those two. The explicit
+/// owner-remoted allowlist in `remote_operation_classification_is_exhaustive`
+/// instead carries a remote class for future authenticated-owner transports.
+/// A class defines retry semantics, not authority: authorization remains the
+/// barrier and current remote principals are denied owner-only work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteOperationClass {
@@ -1954,8 +2861,10 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<bool>" => "option<bool>",
         "Option<i64>" => "option<i64>",
         "Option<u32>" => "option<u32>",
+        "Option<u16>" => "option<u16>",
         "Option<u64>" => "option<u64>",
         "Vec<Uuid>" => "list<uuid>",
+        "Vec<Option<String>>" => "list<option<string>>",
         "Vec<(String,String)>" => "list<tuple<string,string>>",
         "HashMap<String,String>" => "map<string,string>",
         "Vec<ImageAttachmentRef>" => "list<struct:ImageAttachmentRef:v1>",
@@ -1970,6 +2879,19 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<cockpit_config::config::providers::ActiveModelRef>" => {
             "option<struct:ActiveModelRef:v1>"
         }
+        "Option<cockpit_config::config::providers::OnUnlistedModelsFetch>" => {
+            "option<enum16:OnUnlistedModelsFetch>"
+        }
+        // Bare (non-`Option`) fully-path-qualified external enum maps to its short
+        // canonical `enum16:<Name>` form (crate paths never leak into the
+        // cross-language canonical identifier), matching the short-spelling
+        // `OnUnlistedModelsFetch` arm below.
+        "cockpit_config::config::providers::OnUnlistedModelsFetch" => {
+            "enum16:OnUnlistedModelsFetch"
+        }
+        "cockpit_config::config::providers::ProviderEntry" | "ProviderEntry" => {
+            "struct:ProviderEntry:v1"
+        }
         "ActiveModelSwitchTrigger"
         | "AppFlagKey"
         | "ApprovalMode"
@@ -1982,6 +2904,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "GoalDisposition"
         | "LeakRotationDisposition"
         | "LlmMode"
+        | "OnUnlistedModelsFetch"
         | "LspControlAction"
         | "SecretStorePlacement"
         | "UsageKind"
@@ -2251,6 +3174,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_validation_rechecks_in_process_owner_credential() {
+        let mut invalid = crate::StoredFlycockpitCredential {
+            server_url: "http://not-loopback.example.test".into(),
+            instance_id: "instance".into(),
+            instance_token: "token".into(),
+            account: crate::AccountInfo {
+                user_id: "user".into(),
+                email: "user@example.test".into(),
+            },
+            display_name: None,
+            relay_choice: None,
+        };
+        let request = Request::StoreFlycockpitCredential {
+            credential: invalid.clone(),
+            force: true,
+        };
+        assert!(request.validate_semantics().is_err());
+
+        invalid.server_url = "https://cockpit.example.test".into();
+        invalid.relay_choice = Some(crate::RelayChoice {
+            relay_id: String::new(),
+            region: None,
+            ws_url: "wss://relay.example.test/ws".into(),
+            rtt_ms: None,
+            chosen_at: 1,
+        });
+        assert!(
+            Request::StoreFlycockpitCredential {
+                credential: invalid,
+                force: true,
+            }
+            .validate_semantics()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_validation_reserves_flycockpit_provider_credential_key() {
+        for request in [
+            Request::PutProviderCredential {
+                provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
+                record: "{}".to_string(),
+            },
+            Request::DeleteProviderCredential {
+                provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
+                project_root: None,
+            },
+        ] {
+            assert!(request.validate_semantics().is_err());
+        }
+    }
+
+    #[test]
+    fn provider_credential_delete_keeps_direct_ref_compatibility_and_can_bind_a_workspace() {
+        let direct = Request::DeleteProviderCredential {
+            provider_id: "legacy-record-ref".into(),
+            project_root: None,
+        };
+        let direct_wire = serde_json::to_value(&direct).expect("serialize direct delete");
+        assert!(direct_wire["params"].get("project_root").is_none());
+
+        let configured = Request::DeleteProviderCredential {
+            provider_id: "custom-oauth".into(),
+            project_root: Some("/workspace".into()),
+        };
+        let configured_wire =
+            serde_json::to_value(&configured).expect("serialize configured delete");
+        assert_eq!(configured_wire["params"]["project_root"], "/workspace");
+    }
+
     macro_rules! command_tags {
         (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             vec![$($tag),+]
@@ -2457,6 +3451,35 @@ mod tests {
         for (tag, audit_mutating, authz, declared_class) in rows {
             let class = remote_operation_class_for_tag(tag);
             if authz == "owner_only" {
+                let owner_remoted = matches!(
+                    tag,
+                    "store_flycockpit_credential"
+                        | "clear_flycockpit_credential"
+                        | "set_flycockpit_connector_enabled"
+                        | "sync_flycockpit_org_policy"
+                        | "enroll_flycockpit_org_sync"
+                        | "get_startup_disclosures"
+                        | "list_secret_inventory"
+                        | "put_named_secret"
+                        | "put_subscription_ack"
+                        | "delete_named_secret"
+                        | "put_provider_credential"
+                        | "delete_provider_credential"
+                        | "get_flycockpit_account"
+                        | "get_provider_catalog_snapshot"
+                        | "fetch_provider_models"
+                        | "get_provider_usage_snapshot"
+                        | "upsert_provider_config"
+                        | "save_provider_config"
+                        | "save_mcp_config"
+                        | "delete_provider_config"
+                        | "set_provider_layer_metadata"
+                );
+                if owner_remoted {
+                    assert_ne!(declared_class, "local_only");
+                    assert!(class.is_some(), "{tag} must reserve a remote operation");
+                    continue;
+                }
                 assert_eq!(
                     declared_class,
                     if tag == "unknown" {
@@ -2532,6 +3555,151 @@ mod tests {
             fixture["rows"], rows,
             "the shared Rust/TypeScript classification fixture must match every command column exactly"
         );
+    }
+
+    #[test]
+    fn owner_secret_wire_projections_and_debug_never_include_plaintext() {
+        let unique = "owner_rpc_plaintext_must_not_escape";
+        let inventory = serde_json::to_string(&Response::SecretInventory {
+            entries: vec![SecretInventoryEntry {
+                name: unique.to_string(),
+                kind: SecretInventoryKind::NamedSecret,
+                configured: true,
+            }],
+            next_cursor: None,
+        })
+        .unwrap();
+        assert!(inventory.contains(unique));
+        assert!(!inventory.contains("secret-value"));
+
+        let account = serde_json::to_string(&Response::FlycockpitAccount {
+            account: Some(FlycockpitAccountView {
+                server_url: "https://app.example.test".into(),
+                instance_id: "instance".into(),
+                account: AccountInfo {
+                    user_id: "user".into(),
+                    email: "user@example.test".into(),
+                },
+                display_name: None,
+                relay_choice: None,
+                token_fingerprint: "fingerprint".into(),
+            }),
+        })
+        .unwrap();
+        assert!(!account.contains("refresh-token"));
+        assert!(account.contains("fingerprint"));
+
+        let request = Request::PutNamedSecret {
+            name: unique.into(),
+            value: "secret-value".into(),
+        };
+        assert!(!format!("{request:?}").contains(unique));
+        assert!(!format!("{request:?}").contains("secret-value"));
+    }
+
+    #[test]
+    fn owner_provider_rpcs_bound_typed_and_wire_ingress() {
+        let oversized_provider_id = "p".repeat(MAX_OWNER_PROVIDER_ID_BYTES + 1);
+        assert!(
+            Request::PutSubscriptionAck {
+                provider_id: oversized_provider_id.clone(),
+            }
+            .validate_semantics()
+            .is_err()
+        );
+
+        let oversized_metadata = "x".repeat(MAX_OWNER_PROVIDER_METADATA_JSON_BYTES + 1);
+        assert!(
+            Request::SetProviderLayerMetadata {
+                project_root: "/repo".into(),
+                category_defaults_json: oversized_metadata.clone(),
+                on_unlisted_models_fetch:
+                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
+            }
+            .validate_semantics()
+            .is_err()
+        );
+        assert!(
+            Request::SetProviderLayerMetadata {
+                project_root: "".into(),
+                category_defaults_json: "{}".into(),
+                on_unlisted_models_fetch:
+                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
+            }
+            .validate_semantics()
+            .is_err()
+        );
+        assert!(
+            Request::FetchProviderModels {
+                project_root: "/repo".into(),
+                provider_id: Some("p".repeat(MAX_OWNER_PROVIDER_ID_BYTES + 1)),
+                model_id: None,
+                deep: false,
+                on_unlisted: None,
+                allow_fallback: false,
+            }
+            .validate_semantics()
+            .is_err()
+        );
+        assert!(
+            Request::FetchProviderModels {
+                project_root: "/repo".into(),
+                provider_id: Some("provider".into()),
+                model_id: Some("m".repeat(MAX_OWNER_PROVIDER_MODEL_ID_BYTES + 1)),
+                deep: false,
+                on_unlisted: None,
+                allow_fallback: false,
+            }
+            .validate_semantics()
+            .is_err()
+        );
+        let metadata_wire = serde_json::json!({
+            "request": "set_provider_layer_metadata",
+            "params": {
+                "project_root": "/repo",
+                "category_defaults_json": oversized_metadata,
+                "on_unlisted_models_fetch": "keep"
+            }
+        });
+        assert!(serde_json::from_value::<Request>(metadata_wire).is_err());
+
+        let fetch_wire = serde_json::json!({
+            "request": "fetch_provider_models",
+            "params": {
+                "project_root": "/repo",
+                "provider_id": oversized_provider_id,
+                "deep": false,
+                "allow_fallback": false
+            }
+        });
+        assert!(serde_json::from_value::<Request>(fetch_wire).is_err());
+    }
+
+    #[test]
+    fn provider_config_owner_ingress_rejects_credential_bearing_urls() {
+        let request = Request::UpsertProviderConfig {
+            project_root: "/repo".into(),
+            provider_id: "custom".into(),
+            entry: cockpit_config::config::providers::ProviderEntry {
+                url: "https://user:secret@api.example.test/v1?key=secret".into(),
+                ..Default::default()
+            },
+        };
+        let error = request.validate_semantics().unwrap_err();
+        assert!(error.contains("credentials"));
+        assert!(!error.contains("secret"));
+
+        let request = Request::UpsertProviderConfig {
+            project_root: "/repo".into(),
+            provider_id: "custom".into(),
+            entry: cockpit_config::config::providers::ProviderEntry {
+                url: "https://api.example.test/v1?key=secret".into(),
+                ..Default::default()
+            },
+        };
+        let error = request.validate_semantics().unwrap_err();
+        assert!(error.contains("query string"));
+        assert!(!error.contains("secret"));
     }
 
     #[test]

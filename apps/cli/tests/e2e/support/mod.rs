@@ -98,10 +98,6 @@ impl IsolatedHome {
         self.data_home.join("cockpit").join("cockpit.db")
     }
 
-    pub fn credentials_path(&self) -> PathBuf {
-        self.state_home.join("cockpit").join("credentials.json")
-    }
-
     pub fn config_dir(&self) -> PathBuf {
         self._root.path().join(".config").join("cockpit")
     }

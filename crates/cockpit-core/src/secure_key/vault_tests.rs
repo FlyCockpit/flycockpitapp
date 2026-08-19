@@ -44,6 +44,47 @@ fn missing_probe() -> KeyringProbeResult {
     }
 }
 
+#[test]
+fn owner_mutation_publishes_and_rolls_back_on_redaction_failure() {
+    let (_tmp, db, kek) = file_env();
+    let vault = Arc::new(init_vault(&db, kek));
+    let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let publications_for_hook = publications.clone();
+    vault.install_owner_redaction_publisher(Arc::new(move || {
+        publications_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }));
+
+    vault
+        .mutate_owner_item(
+            SecretVaultKind::NamedSecret,
+            "mcp:example",
+            Some(br#"{"access_token":"fresh-access-token-value"}"#),
+        )
+        .unwrap();
+    assert_eq!(publications.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    vault.install_owner_redaction_publisher(Arc::new(|| {
+        Err("injected publication failure".to_string())
+    }));
+    assert!(
+        vault
+            .mutate_owner_item(
+                SecretVaultKind::NamedSecret,
+                "mcp:example",
+                Some(br#"{"access_token":"replacement-access-token-value"}"#),
+            )
+            .is_err()
+    );
+    let restored = vault
+        .get_item(SecretVaultKind::NamedSecret, "mcp:example")
+        .unwrap();
+    assert_eq!(
+        restored.as_slice(),
+        br#"{"access_token":"fresh-access-token-value"}"#
+    );
+}
+
 fn file_env() -> (tempfile::TempDir, Db, Arc<MemoryKekStore>) {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
@@ -1260,6 +1301,20 @@ fn walk_skipping_comments(root: &std::path::Path, needles: &[String], hits: &mut
         if path.extension().and_then(|e| e.to_str()) != Some("rs")
             && path.extension().and_then(|e| e.to_str()) != Some("sql")
         {
+            continue;
+        }
+        // Guard tests legitimately name the forbidden symbols inside their
+        // assertions (e.g. the sibling `unify_remaining_stores_stays_gone`).
+        // Only production/SQL source may revive the dual-store importer, so
+        // exclude test sources to keep the two guards mutually satisfiable.
+        let is_test_source = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+            || path
+                .components()
+                .any(|component| component.as_os_str() == "tests");
+        if is_test_source {
             continue;
         }
         let text = std::fs::read_to_string(&path)

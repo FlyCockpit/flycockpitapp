@@ -4995,9 +4995,52 @@ CREATE TABLE secret_vault_items (
     ciphertext    BLOB    NOT NULL CHECK (length(ciphertext) >= 16),
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
+    revision      INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
     PRIMARY KEY (kind, item_id)
 );
 CREATE UNIQUE INDEX secret_vault_items_key_nonce ON secret_vault_items(key_version, nonce);
+
+CREATE TABLE secret_vault_item_revisions (
+    kind       TEXT NOT NULL,
+    item_id    TEXT NOT NULL,
+    revision   INTEGER NOT NULL CHECK (revision >= 0),
+    PRIMARY KEY (kind, item_id)
+);
+INSERT INTO secret_vault_item_revisions (kind, item_id, revision)
+SELECT kind, item_id, revision FROM secret_vault_items;
+
+-- Durable owner-inventory cursor generation. Triggers advance this token for
+-- every visible secret-vault mutation, including writes from another process.
+CREATE TABLE secret_vault_inventory_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL CHECK (generation >= 1)
+);
+INSERT INTO secret_vault_inventory_state (id, generation) VALUES (1, 1);
+CREATE TRIGGER secret_vault_inventory_insert_generation
+AFTER INSERT ON secret_vault_items
+WHEN NEW.kind IN ('named_secret', 'credential_record', 'subscription_ack')
+BEGIN
+    UPDATE secret_vault_inventory_state
+    SET generation = generation + 1
+    WHERE id = 1;
+END;
+CREATE TRIGGER secret_vault_inventory_update_generation
+AFTER UPDATE ON secret_vault_items
+WHEN NEW.kind IN ('named_secret', 'credential_record', 'subscription_ack')
+     OR OLD.kind IN ('named_secret', 'credential_record', 'subscription_ack')
+BEGIN
+    UPDATE secret_vault_inventory_state
+    SET generation = generation + 1
+    WHERE id = 1;
+END;
+CREATE TRIGGER secret_vault_inventory_delete_generation
+AFTER DELETE ON secret_vault_items
+WHEN OLD.kind IN ('named_secret', 'credential_record', 'subscription_ack')
+BEGIN
+    UPDATE secret_vault_inventory_state
+    SET generation = generation + 1
+    WHERE id = 1;
+END;
 
 -- Durable KEK-placement migrate. Coordination only; no secret bytes.
 CREATE TABLE secret_vault_sagas (
@@ -5014,3 +5057,57 @@ CREATE TABLE secret_vault_sagas (
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
 );
+
+-- Recoverable bridge between the SQLite-backed owner vault and provider
+-- configuration files.  The entry payload contains only $secret references;
+-- private bytes are staged in secret_vault_items in the same transaction.
+CREATE TABLE provider_config_journals (
+    journal_id       TEXT PRIMARY KEY,
+    project_root     TEXT NOT NULL,
+    provider_id      TEXT NOT NULL,
+    action           TEXT NOT NULL CHECK (action IN ('save', 'delete')),
+    entry_json       TEXT,
+    cleanup_named_json TEXT NOT NULL,
+    cleanup_credential_json TEXT NOT NULL,
+    created_at       INTEGER NOT NULL
+);
+CREATE INDEX provider_config_journals_scope
+ON provider_config_journals(project_root, provider_id, created_at);
+
+-- Recoverable bridge between the owner vault and the MCP configuration file.
+-- `config_json` is reference-only; private bytes remain in vault rows.
+CREATE TABLE mcp_config_journals (
+    journal_id        TEXT PRIMARY KEY,
+    project_root      TEXT NOT NULL,
+    config_path       TEXT NOT NULL,
+    config_json       TEXT NOT NULL,
+    cleanup_names_json TEXT NOT NULL,
+    phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX mcp_config_journals_scope
+ON mcp_config_journals(project_root, created_at);
+
+-- Durable ownership claims for daemon-generated provider/MCP named secrets.
+-- Claims survive journal retirement so cleanup decisions do not depend on a
+-- pending write being present. Multiple roots may claim a shared reference;
+-- cleanup must retain it until every claim is retired.
+CREATE TABLE secret_named_ownership (
+    item_id       TEXT NOT NULL,
+    owner_kind    TEXT NOT NULL CHECK (owner_kind IN ('provider', 'mcp')),
+    project_root  TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (item_id, owner_kind, project_root)
+);
+CREATE INDEX secret_named_ownership_item ON secret_named_ownership(item_id);
+
+CREATE TABLE secret_credential_ownership (
+    item_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (item_id, provider_id, project_root)
+);
+
+CREATE INDEX secret_credential_ownership_item
+ON secret_credential_ownership(item_id);

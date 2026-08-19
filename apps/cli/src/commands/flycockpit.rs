@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 
+#[cfg(test)]
+use crate::auth::flycockpit::ConnectionStatus;
 use crate::auth::flycockpit::{
-    ConnectionStatus, DEFAULT_SERVER_URL, FlycockpitClient, StoredFlycockpitCredential,
-    default_display_name, load_credential_from_vault,
+    DEFAULT_SERVER_URL, FlycockpitClient, StoredFlycockpitCredential, default_display_name,
 };
 use crate::cli::LoginArgs;
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, Response};
-use crate::db::connector::ConnectorDisclosure;
-use crate::db::org_sync::OrgSyncDisclosure;
+use cockpit_core::daemon::proto::{ConnectorDisclosure, OrgSyncDisclosure};
 
 pub async fn login(args: LoginArgs) -> Result<()> {
     let client = FlycockpitClient::new(if args.server.trim().is_empty() {
@@ -58,37 +58,25 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     );
     println!("Instance: {}", credential.instance_id);
     let enable_remote_access = remote_access_choice(&args)?;
-    let db = crate::db::Db::open_default().ok();
-    if let Some(db) = db.as_ref() {
-        if let Err(error) = db
-            .set_connector_enabled(
-                &credential.server_url,
-                &credential.instance_id,
-                enable_remote_access,
-            )
-            .await
-        {
-            tracing::warn!(error = %error, "FlyCockpit account login: updating remote access setting failed");
-        } else if enable_remote_access {
-            println!("Remote access: enabled (use `cockpit connect off` to disable)");
-        } else {
-            println!("Remote access: disabled (use `cockpit connect on` to enable)");
-        }
+    if let Err(error) = set_connector_enabled_via_daemon(enable_remote_access).await {
+        tracing::warn!(error = %error, "FlyCockpit account login: updating remote access setting failed");
+    } else if enable_remote_access {
+        println!("Remote access: enabled (use `cockpit connect off` to disable)");
+    } else {
+        println!("Remote access: disabled (use `cockpit connect on` to enable)");
     }
-    if let Some(db) = db.as_ref() {
-        match crate::daemon::org_sync::sync_credential_once(db, credential.clone()).await {
-            Ok(crate::daemon::org_sync::OrgSyncOnceOutcome::EnrollmentRequired { org_id }) => {
-                if org_logging_enrollment_choice()? {
-                    db.set_org_sync_enrolled(&credential.server_url, &org_id)
-                        .await?;
-                    let _ = crate::daemon::org_sync::sync_credential_once(db, credential.clone())
-                        .await?;
-                }
+    match sync_org_policy_via_daemon().await {
+        Ok(cockpit_core::daemon::proto::FlycockpitOrgSyncOutcome::EnrollmentRequired {
+            org_id,
+        }) => {
+            if org_logging_enrollment_choice()? {
+                enroll_org_sync_via_daemon(&org_id).await?;
+                let _ = sync_org_policy_via_daemon().await;
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(error = %error, "FlyCockpit account login: best-effort org sync policy check failed")
-            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "FlyCockpit account login: best-effort org sync policy check failed")
         }
     }
     Ok(())
@@ -100,23 +88,11 @@ pub async fn logout() -> Result<()> {
             println!("Not logged in to FlyCockpit.");
             Ok(())
         }
-        ClearCredentialOutcome::Cleared { server_url } => {
-            if let Ok(db) = crate::db::Db::open_default()
-                && let Err(error) = db.mark_org_sync_disabled(&server_url).await
-            {
-                tracing::warn!(error = %error, "FlyCockpit account logout: disabling org sync state failed");
-            }
+        ClearCredentialOutcome::Cleared => {
             println!("Logged out of FlyCockpit.");
             Ok(())
         }
     }
-}
-
-fn open_cli_flycockpit_credential() -> Result<StoredFlycockpitCredential> {
-    let db = crate::db::Db::open_default().context("opening cockpit DB for whoami")?;
-    let vault = cockpit_core::secure_key::vault_for_db(&db)
-        .map_err(|e| anyhow::anyhow!("opening whoami vault: {e}"))?;
-    load_credential_from_vault(vault)
 }
 
 enum StoreCredentialOutcome {
@@ -125,7 +101,7 @@ enum StoreCredentialOutcome {
 }
 
 enum ClearCredentialOutcome {
-    Cleared { server_url: String },
+    Cleared,
     NotLoggedIn,
 }
 
@@ -165,9 +141,7 @@ async fn clear_credential_via_daemon() -> Result<ClearCredentialOutcome> {
         .request(Request::ClearFlycockpitCredential)
         .await
     {
-        Ok(Ok(Response::FlycockpitCleared { server_url })) => {
-            Ok(ClearCredentialOutcome::Cleared { server_url })
-        }
+        Ok(Ok(Response::FlycockpitCleared { .. })) => Ok(ClearCredentialOutcome::Cleared),
         Ok(Ok(Response::FlycockpitNotLoggedIn)) => Ok(ClearCredentialOutcome::NotLoggedIn),
         Ok(Ok(other)) => anyhow::bail!(
             "daemon returned unexpected response to FlyCockpit credential clear: {other:?}"
@@ -177,44 +151,143 @@ async fn clear_credential_via_daemon() -> Result<ClearCredentialOutcome> {
     }
 }
 
+async fn set_connector_enabled_via_daemon(enabled: bool) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit remote access")?;
+    match daemon
+        .client
+        .request(Request::SetFlycockpitConnectorEnabled { enabled })
+        .await
+    {
+        Ok(Ok(Response::Ack)) => Ok(()),
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit remote access update: {other:?}"
+        ),
+        Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit remote access update: {error}"),
+        Err(error) => anyhow::bail!("FlyCockpit remote access update RPC failed: {error}"),
+    }
+}
+
+async fn sync_org_policy_via_daemon()
+-> Result<cockpit_core::daemon::proto::FlycockpitOrgSyncOutcome> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit organization policy")?;
+    match daemon
+        .client
+        .request(Request::SyncFlycockpitOrgPolicy)
+        .await
+    {
+        Ok(Ok(Response::FlycockpitOrgSync { outcome })) => Ok(outcome),
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit organization policy sync: {other:?}"
+        ),
+        Ok(Err(error)) => {
+            anyhow::bail!("daemon rejected FlyCockpit organization policy sync: {error}")
+        }
+        Err(error) => anyhow::bail!("FlyCockpit organization policy sync RPC failed: {error}"),
+    }
+}
+
+async fn enroll_org_sync_via_daemon(org_id: &str) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit organization enrollment")?;
+    match daemon
+        .client
+        .request(Request::EnrollFlycockpitOrgSync {
+            org_id: org_id.to_string(),
+        })
+        .await
+    {
+        Ok(Ok(Response::Ack)) => Ok(()),
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit organization enrollment: {other:?}"
+        ),
+        Ok(Err(error)) => {
+            anyhow::bail!("daemon rejected FlyCockpit organization enrollment: {error}")
+        }
+        Err(error) => anyhow::bail!("FlyCockpit organization enrollment RPC failed: {error}"),
+    }
+}
+
 pub async fn whoami() -> Result<()> {
-    let credential = match open_cli_flycockpit_credential() {
-        Ok(credential) => credential,
-        Err(_) => {
-            println!("Not logged in to FlyCockpit.");
-            return Ok(());
-        }
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit whoami")?;
+    let account = match daemon.client.request(Request::GetFlycockpitAccount).await {
+        Ok(Ok(Response::FlycockpitAccount { account })) => account,
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit account query: {other:?}"
+        ),
+        Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit account query: {error}"),
+        Err(error) => anyhow::bail!("FlyCockpit account RPC failed: {error}"),
     };
-    let status = match FlycockpitClient::new(&credential.server_url) {
-        Ok(client) => client.connection_status(&credential).await,
-        Err(error) => ConnectionStatus::Error(error.to_string()),
+    let Some(account) = account else {
+        println!("Not logged in to FlyCockpit.");
+        return Ok(());
     };
-    let (sync, connector) = match crate::db::Db::open_default() {
-        Ok(db) => {
-            let sync = db
-                .org_sync_disclosure_for_server(&credential.server_url)
-                .await
-                .ok()
-                .flatten();
-            let connector = db
-                .connector_disclosure(&credential.server_url, &credential.instance_id)
-                .await
-                .ok()
-                .flatten();
-            (sync, connector)
-        }
-        Err(_) => (None, None),
+    let (sync, connector) = match daemon
+        .client
+        .request(Request::GetStartupDisclosures {
+            project_root: std::env::current_dir()
+                .context("getting current directory for account disclosures")?
+                .display()
+                .to_string(),
+        })
+        .await
+    {
+        Ok(Ok(Response::StartupDisclosures {
+            org_sync,
+            connector,
+            ..
+        })) => (org_sync, connector),
+        _ => (None, None),
     };
     print!(
         "{}",
-        render_whoami_with_sync_and_connector(
-            &credential,
-            &status,
-            sync.as_ref(),
-            connector.as_ref(),
-        )
+        render_whoami_account_view(&account, sync.as_ref(), connector.as_ref())
     );
     Ok(())
+}
+
+fn render_whoami_account_view(
+    account: &cockpit_core::daemon::proto::FlycockpitAccountView,
+    sync: Option<&OrgSyncDisclosure>,
+    connector: Option<&ConnectorDisclosure>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("FlyCockpit account\n");
+    out.push_str(&format!("  server:     {}\n", account.server_url));
+    out.push_str(&format!("  account:    {}\n", account.account.email));
+    out.push_str(&format!("  user id:    {}\n", account.account.user_id));
+    out.push_str(&format!("  instance:   {}\n", account.instance_id));
+    if let Some(name) = account.display_name.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str(&format!("  name:       {name}\n"));
+    }
+    out.push_str("  connection: unknown (daemon account metadata only)\n");
+    if let Some(connector) = connector {
+        let label = if connector.enabled {
+            match connector.relay_url.as_deref() {
+                Some(url) if connector.status == "connected" => format!("connected ({url})"),
+                _ => connector.status.clone(),
+            }
+        } else {
+            "off".to_string()
+        };
+        out.push_str(&format!("  remote:     {label}\n"));
+        if let Some(error) = connector.last_error.as_deref() {
+            out.push_str(&format!("  remote err: {error}\n"));
+        }
+    }
+    if let Some(sync) = sync {
+        out.push_str(&format!(
+            "  org sync:   active (org {}, cursor {})\n",
+            sync.org_id, sync.cursor_seq
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +304,7 @@ pub fn render_whoami_with_sync(
     render_whoami_with_sync_and_connector(credential, status, sync, None)
 }
 
+#[cfg(test)]
 pub fn render_whoami_with_sync_and_connector(
     credential: &StoredFlycockpitCredential,
     status: &ConnectionStatus,
@@ -347,6 +421,7 @@ fn parse_remote_access_answer(answer: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn status_label(status: &ConnectionStatus) -> String {
     match status {
         ConnectionStatus::Unknown => "unknown".to_string(),
@@ -495,43 +570,71 @@ mod tests {
         assert!(production.contains("StoreFlycockpitCredential"));
         assert!(production.contains("ClearFlycockpitCredential"));
         assert!(production.contains("FlycockpitAlreadyLoggedIn"));
-        assert!(production.contains("Db::open_default"));
+        assert!(!production.contains("Db::open_default"));
         let login_body = production
             .split("pub async fn login(")
             .nth(1)
             .and_then(|rest| rest.split("pub async fn logout(").next())
             .expect("login body");
         assert!(
-            login_body.contains("sync_credential_once"),
-            "login org-sync must use the in-memory credential"
+            login_body.contains("sync_org_policy_via_daemon"),
+            "login org-sync must use the daemon-owned account"
         );
         assert!(
-            !login_body.contains("sync_current_credential_once"),
-            "login must not reload the vault via org-sync"
+            login_body.contains("set_connector_enabled_via_daemon"),
+            "login remote access must use the daemon-owned account"
         );
+        assert!(production.contains("SyncFlycockpitOrgPolicy"));
+        assert!(production.contains("SetFlycockpitConnectorEnabled"));
+        assert!(production.contains("EnrollFlycockpitOrgSync"));
         assert!(
             login_body.contains("revoke_instance"),
             "unforced AlreadyLoggedIn must revoke the just-registered instance"
         );
+        // Isolate the `whoami` body (bounded to the next function) rather than
+        // grepping the rest of production: an unbounded search would still pass
+        // if `whoami` regressed to a vault read while `GetFlycockpitAccount`
+        // survived elsewhere in the file.
         let whoami = production
             .split("pub async fn whoami()")
             .nth(1)
-            .expect("whoami remains");
-        assert!(whoami.contains("open_cli_flycockpit_credential"));
+            .and_then(|rest| rest.split("\nfn render_whoami_account_view").next())
+            .expect("whoami body");
+        assert!(
+            whoami.contains("GetFlycockpitAccount"),
+            "whoami must resolve the account through the daemon RPC"
+        );
+        // Spellings are split with `concat!` so this test's own forbidden list
+        // does not trip sibling whole-file source-grep tests.
+        for forbidden in [
+            concat!("maybe_load", "_credential"),
+            concat!("load_credential", "_from_vault"),
+            concat!("CredentialStore", "::open"),
+            concat!("secret", "_vault"),
+            concat!("flycockpit::store", "_credential"),
+            concat!("flycockpit::clear", "_credential"),
+        ] {
+            assert!(
+                !whoami.contains(forbidden),
+                "whoami must not touch the vault/store directly: {forbidden}"
+            );
+        }
     }
 
     #[test]
     fn whoami_stays_on_allow_list() {
         let source = include_str!("flycockpit.rs");
         assert!(source.contains("pub async fn whoami()"));
-        assert!(source.contains("load_credential_from_vault"));
-        assert!(!source.contains(concat!("GetFlycockpit", "Account")));
+        // Split so this assertion's own literal does not self-match the
+        // whole-file `contains` grep (as the `GetFlycockpitAccount` check does).
+        assert!(!source.contains(concat!("load_credential", "_from_vault")));
+        assert!(source.contains(concat!("GetFlycockpit", "Account")));
         let whoami = source
             .split("pub async fn whoami()")
             .nth(1)
             .and_then(|rest| rest.split("pub fn render_whoami").next())
             .expect("whoami body");
-        assert!(whoami.contains("Db::open_default"));
+        assert!(whoami.contains("ensure_persistent_daemon"));
     }
 
     #[test]

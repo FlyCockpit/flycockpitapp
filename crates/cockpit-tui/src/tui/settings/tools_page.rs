@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as ConfigWebProvider};
-use cockpit_core::credentials::CredentialStore;
+use cockpit_core::daemon::proto::{Request, Response, SecretInventoryKind};
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
@@ -352,6 +352,7 @@ impl SettingsCx {
                     cursor: 0,
                     status: None,
                     delete_pending: false,
+                    oauth: None,
                 })));
             }
             ToolRow::Reset => {
@@ -431,15 +432,17 @@ impl SettingsCx {
         self.extended.web = WebConfig::default();
     }
 
-    fn credential_store(&self) -> Result<CredentialStore, String> {
-        super::cockpit_credential_store().map_err(|e| e.to_string())
-    }
-
     fn stored_web_key(&self, provider: WebKeyProvider) -> Option<String> {
-        self.credential_store()
-            .ok()
-            .and_then(|store| store.api_key(web_key_provider_id(provider)))
-            .filter(|value| !value.trim().is_empty())
+        // Inventory deliberately exposes only existence metadata. The editor
+        // never needs the plaintext value: a configured key is rendered as a
+        // mask and replacing it sends a new daemon-owned credential record.
+        let provider_id = web_key_provider_id(provider);
+        self.cached_secret_inventory_contains(
+            provider_id,
+            Some(SecretInventoryKind::CredentialRecord),
+        )
+        .unwrap_or(false)
+        .then(|| MASKED_VALUE.to_string())
     }
 
     fn web_key_status(&self, provider: WebKeyProvider) -> Option<WebKeyStatus> {
@@ -451,13 +454,36 @@ impl SettingsCx {
     }
 
     fn save_web_api_key(&self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
-        let store = self.credential_store()?;
-        store
-            .save_record_merged(
+        let provider_id = web_key_provider_id(provider).to_string();
+        let record = serde_json::json!({ "api_key": key }).to_string();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let client = crate::tui::settings::settings_daemon_client()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match client
+                    .request(Request::PutProviderCredential {
+                        provider_id,
+                        record,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Ok(Response::Ack) => Ok(()),
+                    Ok(other) => Err(format!(
+                        "daemon returned unexpected web credential response: {other:?}"
+                    )),
+                    Err(error) => Err(format!("daemon rejected web credential: {error}")),
+                }
+            })
+        });
+        if result.is_ok() {
+            self.invalidate_secret_inventory_entry(
                 web_key_provider_id(provider),
-                serde_json::json!({ "api_key": key }),
-            )
-            .map_err(|e| e.to_string())
+                Some(SecretInventoryKind::CredentialRecord),
+            );
+        }
+        result
     }
 
     fn tools_page_rows(&self) -> Vec<ToolRow> {

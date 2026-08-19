@@ -55,11 +55,63 @@ fn app_for_provider(root: &std::path::Path) -> App {
     )
 }
 
+/// Trust `root` in the promoted daemon. The redacted provider snapshot fetched
+/// when opening the auth-failure recovery surface is trust-gated on the daemon
+/// side (DB-owned), so the local `with_workspace_trust_policy` override is not
+/// enough — the daemon reads its own store. The transient runtime only carries
+/// the request; the promoted daemon context persists across the reducers'
+/// per-call runtimes.
+fn seed_daemon_workspace_trust(root: &std::path::Path) {
+    use cockpit_core::daemon::proto::{Request, Response, WorkspaceTrustMode};
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("auth-recovery trust seed runtime");
+    runtime.block_on(async {
+        let client = crate::tui::settings::settings_daemon_client()
+            .await
+            .expect("settings daemon client for trust seed");
+        let project_root = root.display().to_string();
+        let expected_config_generation = match client
+            .request(Request::GetWorkspaceTrust {
+                project_root: project_root.clone(),
+            })
+            .await
+            .expect("trust read transport")
+            .expect("trust read response")
+        {
+            Response::WorkspaceTrust {
+                config_generation, ..
+            } => config_generation,
+            other => panic!("unexpected trust read: {other:?}"),
+        };
+        match client
+            .request(Request::SetWorkspaceTrust {
+                project_root,
+                mode: WorkspaceTrustMode::Trust,
+                expected_config_generation,
+            })
+            .await
+            .expect("trust set transport")
+            .expect("trust set response")
+        {
+            Response::WorkspaceTrustSet { .. } => {}
+            other => panic!("unexpected trust set: {other:?}"),
+        }
+    });
+}
+
 #[test]
 fn auth_failure_notice_actions() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    // Opening the provider edit surface fetches the daemon's redacted provider
+    // snapshot; promote an isolated in-process daemon so that RPC resolves
+    // in-memory instead of timing out on a real socket.
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
     write_provider(tmp.path(), None, "https://example.test/v1");
+    seed_daemon_workspace_trust(tmp.path());
     let mut app = app_for_provider(tmp.path());
     app.daemon_prompt = None;
     app.apply_event(auth_event(AuthFailureKind::CredentialsRejected {
@@ -177,11 +229,16 @@ fn annotation_cleared_on_provider_auth_structure_change() {
 fn oauth_expired_notice_deep_links() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    // Opening the OAuth provider surface fetches the daemon's redacted provider
+    // snapshot; promote an isolated in-process daemon so that RPC resolves
+    // in-memory instead of timing out on a real socket.
+    let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
     write_provider(
         tmp.path(),
         Some("codex"),
         "https://chatgpt.com/backend-api/codex",
     );
+    seed_daemon_workspace_trust(tmp.path());
     let mut app = app_for_provider(tmp.path());
     app.apply_event(auth_event(AuthFailureKind::OAuthExpired {
         provider: "p".into(),

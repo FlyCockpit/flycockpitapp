@@ -1,15 +1,15 @@
 use super::super::pointer_actions::OAuthFlowId;
 use super::*;
+#[cfg(test)]
+use cockpit_core::auth::{codex_oauth, xai_oauth};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-    let yellow = Style::default().fg(Color::Yellow);
     let red = Style::default().fg(Color::Red);
     let green = Style::default().fg(Color::Green);
-    let cyan = Style::default().fg(Color::Cyan);
 
     if let Some(outcome) = &s.outcome {
         match outcome {
@@ -24,107 +24,25 @@ pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSet
         return;
     }
 
-    match (s.shell, &s.rc_path, s.already_configured) {
-        (Some(shell), Some(rc_path), false) => {
-            lines.push(Line::from(Span::styled(
-                format!("Detected shell: {}", shell.name()),
-                muted,
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("Will append to: ".to_string(), muted),
-                Span::styled(rc_path.display().to_string(), cyan),
-            ]));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Lines to be added:".to_string(),
-                muted,
-            )));
-            for line in copilot_setup::append_block(shell).lines() {
-                if line.is_empty() {
-                    lines.push(Line::default());
-                } else {
-                    lines.push(Line::from(Span::styled(format!("    {line}"), cyan)));
-                }
-            }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "We'll also run `gh auth token` once and store its token in Cockpit credentials so Copilot works without restarting.".to_string(),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter to apply, Esc to cancel.".to_string(),
-                yellow,
-            )));
-        }
-        (Some(shell), Some(rc_path), true) => {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} already contains the cockpit Copilot-auth export.",
-                    rc_path.display()
-                ),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "To re-apply: remove the marker block from your {} and try again.",
-                    shell.rc_filename()
-                ),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter or Esc to return.".to_string(),
-                yellow,
-            )));
-        }
-        _ => {
-            lines.push(Line::from(Span::styled(
-                "Couldn't detect a supported shell ($SHELL is unset, or it's not zsh/bash/fish). Set GH_TOKEN manually with one of:".to_string(),
-                muted,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "  POSIX shell (zsh/bash/sh):".to_string(),
-                muted,
-            )));
-            lines.push(Line::from(Span::styled(
-                "    export GH_TOKEN=$(gh auth token)".to_string(),
-                cyan,
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled("  fish:".to_string(), muted)));
-            lines.push(Line::from(Span::styled(
-                "    set -Ux GH_TOKEN (gh auth token)".to_string(),
-                cyan,
-            )));
-            if cfg!(windows) {
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "  Windows PowerShell ($PROFILE):".to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    $env:GH_TOKEN = (gh auth token)".to_string(),
-                    cyan,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  Windows persistent (User scope):".to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    [Environment]::SetEnvironmentVariable(\"GH_TOKEN\", (gh auth token), \"User\")".to_string(),
-                    cyan,
-                )));
-            }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter or Esc to return.".to_string(),
-                yellow,
-            )));
-        }
-    }
+    lines.push(Line::from(Span::styled(
+        "Copilot authentication is managed by the Cockpit daemon.".to_string(),
+        muted,
+    )));
+    lines.push(Line::from(Span::styled(
+        "The TUI does not inspect or copy credentials and never edits shell startup files."
+            .to_string(),
+        muted,
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Ensure the daemon's environment already contains the approved Copilot credential, then retry the provider request.".to_string(),
+        muted,
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "Press Enter or Esc to return.".to_string(),
+        muted,
+    )));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -141,22 +59,27 @@ pub(crate) struct OAuthFlowRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthFlowOp {
+    Acknowledge,
     Begin,
-    Poll(codex_oauth::DeviceLogin),
-    Complete {
-        login: xai_oauth::ManualLogin,
-        input: String,
-    },
+    Poll { flow_id: String },
+    Complete { flow_id: String, input: String },
     Cancel,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum OAuthBeginResult {
-    Device(Result<codex_oauth::DeviceLogin, String>),
-    Browser(Result<OAuthBrowserBegin, String>),
+    Public(Result<OAuthPublicBegin, String>),
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct OAuthPublicBegin {
+    pub(crate) flow_id: String,
+    pub(crate) authorize_url: String,
+    pub(crate) user_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct OAuthBrowserBegin {
     pub(crate) login: xai_oauth::ManualLogin,
     listening: bool,
@@ -165,6 +88,7 @@ pub(crate) struct OAuthBrowserBegin {
     ssh: bool,
 }
 
+#[cfg(test)]
 #[cfg(test)]
 impl OAuthBrowserBegin {
     pub(crate) fn for_test(listening: bool, ssh: bool) -> Self {
@@ -178,6 +102,7 @@ impl OAuthBrowserBegin {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct GrokBrowserStart {
     pub(crate) begin: OAuthBrowserBegin,
     pub(crate) listener: Option<tokio::net::TcpListener>,
@@ -189,6 +114,7 @@ pub(crate) struct OAuthEffects {
         fn(&str) -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
     pub(super) is_ssh: fn() -> bool,
     pub(super) open: fn(&str) -> anyhow::Result<()>,
+    #[cfg(test)]
     pub(super) bind: fn(u16) -> anyhow::Result<tokio::net::TcpListener>,
 }
 
@@ -229,6 +155,7 @@ impl OAuthEffects {
             copy: copy_plain_no_recovery,
             is_ssh: cockpit_core::sysinfo::is_ssh,
             open: cockpit_core::browser::open,
+            #[cfg(test)]
             bind: cockpit_core::auth::xai_oauth::bind_callback_listener,
         }
     }
@@ -335,6 +262,7 @@ impl OAuthOption {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_grok_browser_start(
     login: xai_oauth::ManualLogin,
     effects: OAuthEffects,
@@ -384,10 +312,14 @@ enum FlowShape {
 enum OAuthSession {
     None,
     Browser {
-        login: xai_oauth::ManualLogin,
+        flow_id: String,
         authorize_url: String,
     },
-    Device(codex_oauth::DeviceLogin),
+    Device {
+        flow_id: String,
+        verification_uri: String,
+        user_code: String,
+    },
 }
 
 pub(crate) struct OAuthFlowState {
@@ -446,17 +378,16 @@ impl OAuthFlowState {
     #[cfg(test)]
     pub(crate) fn set_browser_session_for_test(&mut self, authorize_url: &str) {
         self.logged_in = false;
-        let login = xai_oauth::ManualLogin::for_test(authorize_url);
         self.session = OAuthSession::Browser {
+            flow_id: self.flow_id.0.to_string(),
             authorize_url: authorize_url.to_string(),
-            login,
         };
     }
 
     #[cfg(test)]
     pub(crate) fn browser_state_for_test(&self) -> Option<&str> {
         match &self.session {
-            OAuthSession::Browser { login, .. } => Some(login.state_for_test()),
+            OAuthSession::Browser { authorize_url, .. } => Some(authorize_url),
             _ => None,
         }
     }
@@ -464,30 +395,26 @@ impl OAuthFlowState {
     #[cfg(test)]
     pub(crate) fn set_device_login_for_test(&mut self, login: codex_oauth::DeviceLogin) {
         self.logged_in = false;
-        self.session = OAuthSession::Device(login);
-    }
-
-    fn vault_logged_in(provider: OAuthProvider) -> bool {
-        let Ok(store) = crate::tui::settings::cockpit_credential_store() else {
-            return false;
+        self.session = OAuthSession::Device {
+            flow_id: self.flow_id.0.to_string(),
+            verification_uri: login.verification_uri,
+            user_code: login.user_code,
         };
-        match provider {
-            OAuthProvider::Grok => xai_oauth::is_logged_in_in(&store),
-            OAuthProvider::Codex => codex_oauth::is_logged_in_in(&store),
-        }
     }
 
     pub(super) fn new_with_effects(provider: OAuthProvider, effects: OAuthEffects) -> Self {
-        let (shape, logged_in) = match provider {
-            OAuthProvider::Grok => (FlowShape::BrowserCallback, Self::vault_logged_in(provider)),
-            OAuthProvider::Codex => (FlowShape::DeviceCode, Self::vault_logged_in(provider)),
+        let shape = match provider {
+            OAuthProvider::Grok => FlowShape::BrowserCallback,
+            OAuthProvider::Codex => FlowShape::DeviceCode,
         };
         Self {
             flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
             provider,
             shape,
             cursor: 0,
-            logged_in,
+            // Inventory is hydrated by SettingsCx's non-blocking cache refresh.
+            // OAuth construction and rendering must never wait on the daemon.
+            logged_in: false,
             status: None,
             paste_focused: false,
             manual_input: TextField::default(),
@@ -497,7 +424,8 @@ impl OAuthFlowState {
             polling: false,
             ssh: (effects.is_ssh)(),
             spinner_tick: 0,
-            acknowledgement_required: acknowledgement_required(provider),
+            // Fail closed until the asynchronous inventory answer arrives.
+            acknowledgement_required: true,
             copy_operation: super::super::shell::PointerOperationGate::default(),
             effects,
         }
@@ -518,9 +446,9 @@ impl OAuthFlowState {
             super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
                 let login = self.device_login();
                 (
-                    login.map(|login| login.user_code.clone()),
+                    login.map(|(_, _, code)| code.to_string()),
                     (!self.ssh)
-                        .then(|| login.map(|login| login.verification_uri.clone()))
+                        .then(|| login.map(|(_, uri, _)| uri.to_string()))
                         .flatten(),
                 )
             }
@@ -626,9 +554,13 @@ impl OAuthFlowState {
         matches!(self.session, OAuthSession::Browser { .. })
     }
 
-    pub(super) fn device_login(&self) -> Option<&codex_oauth::DeviceLogin> {
+    pub(super) fn device_login(&self) -> Option<(&str, &str, &str)> {
         match &self.session {
-            OAuthSession::Device(login) if !self.confirming() => Some(login),
+            OAuthSession::Device {
+                flow_id,
+                verification_uri,
+                user_code,
+            } if !self.confirming() => Some((flow_id, verification_uri, user_code)),
             _ => None,
         }
     }
@@ -638,9 +570,10 @@ impl OAuthFlowState {
         result: OAuthBeginResult,
         effects: OAuthEffects,
     ) -> Option<OAuthFlowRequest> {
-        match (self.provider, result) {
-            (OAuthProvider::Codex, OAuthBeginResult::Device(Ok(login))) => {
-                let copy_result = (effects.copy)(&login.user_code);
+        match result {
+            OAuthBeginResult::Public(Ok(begin)) if self.provider == OAuthProvider::Codex => {
+                let code = begin.user_code.unwrap_or_default();
+                let copy_result = (effects.copy)(&code);
                 let copied = copy_result.is_ok();
                 // `copied` alone used to collapse Confirmed and Unverified
                 // into the same "Code copied" wording — the same gap
@@ -658,7 +591,7 @@ impl OAuthFlowState {
                     .is_ok_and(|r| crate::clipboard::feedback::classify(r).is_unverified());
                 let ssh = (effects.is_ssh)();
                 self.ssh = ssh;
-                let opened = ssh || (effects.open)(&login.verification_uri).is_ok();
+                let opened = ssh || (effects.open)(&begin.authorize_url).is_ok();
                 let copied_suffix = if unverified {
                     " (unverified — also shown above if the paste doesn't work)"
                 } else {
@@ -686,52 +619,41 @@ impl OAuthFlowState {
                 };
                 self.polling = true;
                 self.status = Some(Ok(status));
-                self.session = OAuthSession::Device(login.clone());
+                self.session = OAuthSession::Device {
+                    flow_id: begin.flow_id.clone(),
+                    verification_uri: begin.authorize_url,
+                    user_code: code,
+                };
                 Some(OAuthFlowRequest {
                     provider: OAuthProvider::Codex,
-                    op: OAuthFlowOp::Poll(login),
+                    op: OAuthFlowOp::Poll {
+                        flow_id: begin.flow_id,
+                    },
                 })
             }
-            (OAuthProvider::Codex, OAuthBeginResult::Device(Err(e))) => {
+            OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Codex => {
                 self.polling = false;
                 self.status = Some(Err(e));
                 None
             }
-            (OAuthProvider::Grok, OAuthBeginResult::Browser(Ok(begin))) => {
+            OAuthBeginResult::Public(Ok(begin)) if self.provider == OAuthProvider::Grok => {
                 let focus_paste_after_begin = std::mem::take(&mut self.focus_paste_after_begin);
-                let OAuthBrowserBegin {
-                    login,
-                    listening,
-                    browser_error,
-                    listener_error,
-                    ssh,
-                } = begin;
                 self.session = OAuthSession::Browser {
-                    authorize_url: login.authorize_url.clone(),
-                    login,
+                    flow_id: begin.flow_id,
+                    authorize_url: begin.authorize_url.clone(),
                 };
-                self.ssh = ssh;
-                self.paste_focused = focus_paste_after_begin || !listening;
-                self.pending = listening;
-                self.status = Some(Ok(match (listener_error, browser_error, ssh) {
-                    (Some(listener), Some(browser), _) => format!(
-                        "Could not listen for callback ({listener}); could not open browser ({browser}). Open the URL manually and paste callback URL or code."
-                    ),
-                    (Some(listener), None, _) => format!(
-                        "Could not listen for callback ({listener}). Complete authorization and paste callback URL or code."
-                    ),
-                    (None, Some(browser), false) => format!(
-                        "Could not open browser ({browser}); open the URL manually. Waiting for callback; paste callback/code here if needed."
-                    ),
-                    (None, None, false) if listening => {
-                        "Opened browser; waiting for callback. Paste callback/code here if needed."
-                            .to_string()
-                    }
-                    _ => "SSH detected; open the URL manually and paste callback/code.".to_string(),
+                self.ssh = (effects.is_ssh)();
+                let opened = self.ssh || (effects.open)(&begin.authorize_url).is_ok();
+                self.paste_focused = focus_paste_after_begin || !opened;
+                self.pending = false;
+                self.status = Some(Ok(if opened {
+                    "Opened browser; paste callback/code here when complete.".into()
+                } else {
+                    "Open the URL manually and paste callback/code here.".into()
                 }));
                 None
             }
-            (OAuthProvider::Grok, OAuthBeginResult::Browser(Err(e))) => {
+            OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Grok => {
                 self.pending = false;
                 self.focus_paste_after_begin = false;
                 self.status = Some(Err(e));
@@ -748,8 +670,7 @@ impl OAuthFlowState {
         match self.provider {
             OAuthProvider::Codex => {
                 self.polling = false;
-                self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || Self::vault_logged_in(OAuthProvider::Codex);
+                self.logged_in = result.as_ref().copied().unwrap_or(false);
                 self.status = Some(result.map(|_| "Codex OAuth login complete".to_string()));
                 if self.logged_in {
                     self.session = OAuthSession::None;
@@ -757,14 +678,41 @@ impl OAuthFlowState {
             }
             OAuthProvider::Grok => {
                 self.pending = false;
-                self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || Self::vault_logged_in(OAuthProvider::Grok);
+                self.logged_in = result.as_ref().copied().unwrap_or(false);
                 self.status = Some(result.map(|_| "xAI OAuth login complete".to_string()));
                 if self.logged_in {
                     self.paste_focused = false;
                     self.manual_input.set("");
                     self.session = OAuthSession::None;
                 }
+            }
+        }
+    }
+
+    /// Apply metadata-only inventory answers obtained by SettingsCx. `None`
+    /// means the async refresh is still in flight and deliberately leaves the
+    /// previous state intact.
+    pub(crate) fn refresh_inventory_state(
+        &mut self,
+        logged_in: Option<bool>,
+        acknowledged: Option<bool>,
+    ) {
+        if let Some(logged_in) = logged_in {
+            self.logged_in = logged_in;
+        }
+        if let Some(acknowledged) = acknowledged {
+            self.acknowledgement_required = !acknowledged;
+        }
+    }
+
+    pub(crate) fn apply_acknowledgement(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.acknowledgement_required = false;
+                self.status = Some(Ok("Subscription OAuth risk acknowledged.".to_string()));
+            }
+            Err(error) => {
+                self.status = Some(Err(format!("Could not record acknowledgement: {error}")));
             }
         }
     }
@@ -864,7 +812,7 @@ pub(super) fn handle_oauth_flow_key_with(
                 return OAuthKeyOutcome::stay(None);
             }
             KeyCode::Enter => {
-                let OAuthSession::Browser { login, .. } = &s.session else {
+                let OAuthSession::Browser { flow_id, .. } = &s.session else {
                     s.status = Some(Err(
                         "start login or manual paste first so a PKCE session can be created".into(),
                     ));
@@ -881,7 +829,7 @@ pub(super) fn handle_oauth_flow_key_with(
                 return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
                     provider: OAuthProvider::Grok,
                     op: OAuthFlowOp::Complete {
-                        login: login.clone(),
+                        flow_id: flow_id.clone(),
                         input,
                     },
                 }));
@@ -901,14 +849,11 @@ pub(super) fn handle_oauth_flow_key_with(
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
             if s.ssh {
-                let url = s.device_login().map(|login| login.verification_uri.clone());
+                let url = s.device_login().map(|(_, url, _)| url.to_string());
                 s.submit_copy(url.as_deref(), None, effects);
             } else {
                 let (code, url) = match s.device_login() {
-                    Some(login) => (
-                        Some(login.user_code.clone()),
-                        Some(login.verification_uri.clone()),
-                    ),
+                    Some((_, url, code)) => (Some(code.to_string()), Some(url.to_string())),
                     None => (None, None),
                 };
                 s.submit_device_code(code.as_deref(), url.as_deref(), effects);
@@ -916,7 +861,7 @@ pub(super) fn handle_oauth_flow_key_with(
             return OAuthKeyOutcome::stay(None);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
-            let code = s.device_login().map(|login| login.user_code.clone());
+            let code = s.device_login().map(|(_, _, code)| code.to_string());
             s.submit_device_code(code.as_deref(), None, effects);
             return OAuthKeyOutcome::stay(None);
         }
@@ -969,21 +914,13 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
 
     match (s.provider, option) {
         (_, OAuthOption::Acknowledge) => {
-            match crate::tui::settings::cockpit_credential_store().and_then(|mut store| {
-                cockpit_core::auth::subscription_ack::record_in(
-                    &mut store,
-                    oauth_acknowledgement_provider(s.provider),
-                )
-            }) {
-                Ok(()) => {
-                    s.acknowledgement_required = false;
-                    s.status = Some(Ok("Subscription OAuth risk acknowledged.".to_string()));
-                }
-                Err(error) => {
-                    s.status = Some(Err(format!("Could not record acknowledgement: {error}")));
-                }
-            }
-            OAuthKeyOutcome::stay(None)
+            s.status = Some(Ok(
+                "Recording subscription OAuth acknowledgement...".to_string()
+            ));
+            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
+                provider: s.provider,
+                op: OAuthFlowOp::Acknowledge,
+            }))
         }
         (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
         (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
@@ -1034,7 +971,7 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
             }))
         }
         (OAuthProvider::Codex, OAuthOption::Poll) => {
-            let Some(login) = s.device_login().cloned() else {
+            let Some((flow_id, _, _)) = s.device_login() else {
                 s.polling = true;
                 s.status = Some(Ok("Requesting Codex device code...".to_string()));
                 return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
@@ -1042,33 +979,16 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
                     op: OAuthFlowOp::Begin,
                 }));
             };
+            let flow_id = flow_id.to_string();
             s.polling = true;
             s.status = Some(Ok("Waiting for Codex approval...".to_string()));
             OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
                 provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Poll(login),
+                op: OAuthFlowOp::Poll { flow_id },
             }))
         }
         _ => OAuthKeyOutcome::stay(None),
     }
-}
-
-fn oauth_acknowledgement_provider(provider: OAuthProvider) -> &'static str {
-    match provider {
-        OAuthProvider::Grok => cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER,
-        OAuthProvider::Codex => cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER,
-    }
-}
-
-fn acknowledgement_required(provider: OAuthProvider) -> bool {
-    crate::tui::settings::cockpit_credential_store()
-        .map(|store| {
-            !cockpit_core::auth::subscription_ack::acknowledged_in(
-                &store,
-                oauth_acknowledgement_provider(provider),
-            )
-        })
-        .unwrap_or(true)
 }
 
 fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAuthOption> {
@@ -1394,7 +1314,7 @@ fn render_device_code_session(
     yellow: Style,
     _cyan: Style,
 ) {
-    if let Some(login) = s.device_login() {
+    if let Some((_, verification_uri, user_code)) = s.device_login() {
         lines.push(Line::from(Span::styled(
             "Open this URL in any browser, including a different machine from this terminal."
                 .to_string(),
@@ -1403,7 +1323,7 @@ fn render_device_code_session(
         lines.push(Line::from(vec![
             Span::styled("Open: ", muted),
             Span::styled(
-                login.verification_uri.clone(),
+                verification_uri.to_string(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::UNDERLINED),
@@ -1411,7 +1331,7 @@ fn render_device_code_session(
         ]));
         lines.push(Line::from(vec![
             Span::styled("Code: ", muted),
-            Span::styled(login.user_code.clone(), yellow.add_modifier(Modifier::BOLD)),
+            Span::styled(user_code.to_string(), yellow.add_modifier(Modifier::BOLD)),
         ]));
         let hint = if s.ssh {
             "Polling starts automatically. c copies the URL; y copies the user code."

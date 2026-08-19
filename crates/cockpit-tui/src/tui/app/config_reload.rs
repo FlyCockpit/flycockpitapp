@@ -47,7 +47,7 @@ impl App {
             launch: fresh,
             providers,
             extended,
-        } = welcome::load_bundle_bootstrap(Some(&self.launch.cwd), false);
+        } = welcome::load_bundle_bootstrap_redacted(Some(&self.launch.cwd), false);
         self.config_snapshot = HeldConfig::from_view(
             self.config_snapshot.generation,
             false,

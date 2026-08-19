@@ -1,3 +1,8 @@
+// Fixture mirror structs below deserialize the shared JSON corpus; several
+// fields exist only to assert schema shape and are not all read back, so the
+// file opts into the codebase's sanctioned module-scoped dead-code allowance.
+#![allow(dead_code)]
+
 use cockpit_proto::remote_connection_metadata::{
     self, BytesBucket, COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_TENANT, DOMAIN_ACCOUNT,
     DOMAIN_TENANT, DurationBucket, MetadataError, Outcome, PseudonymComponent, Region, RouteClass,

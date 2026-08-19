@@ -1230,6 +1230,12 @@ impl Envelope {
     }
 }
 
+// `Body::Request` is inherently the largest variant: it flattens the full
+// `Request` command enum (hundreds of bytes) whereas `Event`/`Error` are
+// small. This is a frozen wire type — boxing the flattened field would
+// perturb the serde(flatten) shape — so the size skew is accepted by design
+// rather than restructured.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Body {
@@ -2678,14 +2684,13 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
             // remains v9-compatible, but the new optional field bumps the
             // required version when present so a v9 envelope carrying the
             // extended body is rejected by the gate.
-            if version == 9 {
-                if let Request::ListSessions {
+            if version == 9
+                && let Request::ListSessions {
                     assistant_id: Some(_),
                     ..
                 } = request
-                {
-                    return (10, tag);
-                }
+            {
+                return (10, tag);
             }
             (version, tag)
         }
@@ -2718,12 +2723,11 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
             // tag remains v9-compatible, but the new optional field bumps the
             // required version when present so a v9 envelope carrying the
             // extended body is rejected by the gate.
-            if version == 9 {
-                if let Response::SessionLiveStatus { statuses } = &**response
-                    && statuses.iter().any(|status| status.project_root.is_some())
-                {
-                    return (10, tag);
-                }
+            if version == 9
+                && let Response::SessionLiveStatus { statuses } = &**response
+                && statuses.iter().any(|status| status.project_root.is_some())
+            {
+                return (10, tag);
             }
             (version, tag)
         }

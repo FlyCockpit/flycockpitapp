@@ -696,7 +696,9 @@ async fn project_note_list_preserves_sidebar_order() {
 
 #[tokio::test]
 async fn upsert_assistant_rpc_parity_with_direct_db_call() {
-    let ctx = test_ctx();
+    // `upsert_assistant` is now an owner-remoted persistent mutation, so it is
+    // dispatched against a persistent (non-ephemeral) daemon.
+    let ctx = persistent_test_ctx();
     let mut state = owner_state();
     let response = handle_request(
         Request::UpsertAssistant {
@@ -717,6 +719,372 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
         "hash"
+    );
+}
+
+#[tokio::test]
+async fn list_packages_rejects_non_owner_principal() {
+    // AC4: owner-remoted reads reject a non-owner principal.
+    let ctx = test_ctx();
+    let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
+        scope: crate::daemon::principal::PrincipalScope::Agent,
+        project_root: Some("/repo".into()),
+    }]);
+    let error = handle_request(Request::ListPackages, &mut state, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Authorization);
+}
+
+#[tokio::test]
+async fn list_packages_response_carries_no_planted_secret() {
+    // AC3: a `list_*` response contains no secret bytes. Plant a unique
+    // credential secret in the daemon vault; the package list must never echo
+    // it. Precondition-assert the secret is really stored first (L7/L8).
+    let ctx = persistent_test_ctx();
+    let mut state = owner_state();
+    let mut credential = flycockpit_credential();
+    credential.instance_token = "fci_planted_list_packages_secret".into();
+    let token = credential.instance_token.clone();
+    handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: credential.clone(),
+            force: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    // Precondition: the secret really lives in the daemon vault.
+    assert_eq!(
+        ctx.load_flycockpit_credential()
+            .unwrap()
+            .unwrap()
+            .instance_token,
+        token
+    );
+    crate::packages::add_local(&ctx.db, "fixture-pkg", std::env::temp_dir().as_path())
+        .await
+        .unwrap();
+    let response = handle_request(Request::ListPackages, &mut state, &ctx)
+        .await
+        .unwrap();
+    let Response::Packages { packages_json } = response else {
+        panic!("expected packages response")
+    };
+    // Positive control: the package IS surfaced (so an empty response can't
+    // vacuously pass the secret-absence check).
+    assert!(
+        packages_json.contains("fixture-pkg"),
+        "package must be listed"
+    );
+    assert!(
+        !serde_json::to_string(&Response::Packages { packages_json })
+            .unwrap()
+            .contains(&token),
+        "list_packages response must not leak a vault secret"
+    );
+}
+
+#[tokio::test]
+async fn get_connector_state_omits_credential_secret() {
+    // AC3: the connector snapshot carries no secret bytes.
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx =
+        persistent_test_ctx_with_credential_path(tmp.path().join("state/cockpit/credentials.json"));
+    let mut state = owner_state();
+    let mut credential = flycockpit_credential();
+    credential.instance_token = "fci_planted_connector_secret".into();
+    let token = credential.instance_token.clone();
+    handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: credential.clone(),
+            force: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    // Precondition: the secret really lives in the daemon vault.
+    assert_eq!(
+        ctx.load_flycockpit_credential()
+            .unwrap()
+            .unwrap()
+            .instance_token,
+        token
+    );
+    ctx.db
+        .set_connector_enabled(&credential.server_url, &credential.instance_id, true)
+        .await
+        .unwrap();
+    let response = handle_request(Request::GetConnectorState, &mut state, &ctx)
+        .await
+        .unwrap();
+    let Response::ConnectorState { connector_json } = response else {
+        panic!("expected connector state")
+    };
+    // Positive control: the snapshot really resolved the enabled connector.
+    assert!(connector_json.contains("\"enabled\":true"));
+    assert!(
+        !serde_json::to_string(&Response::ConnectorState { connector_json })
+            .unwrap()
+            .contains(&token),
+        "connector snapshot must not leak the credential token"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_daemon_rejects_new_persistent_mutations() {
+    // AC5: an ephemeral daemon rejects every new persistent mutation.
+    let ctx = test_ctx();
+    assert!(ctx.paths.ephemeral);
+    let mutations = vec![
+        Request::AddPackage {
+            project_root: "/repo".into(),
+            identifier: "tokio".into(),
+            git: None,
+            local_path: Some("/tmp/pkg".into()),
+            branch: None,
+            deep: false,
+        },
+        Request::ImportPackage {
+            project_root: "/repo".into(),
+            dir: Some("deps".into()),
+            package: None,
+            id: None,
+            as_path: false,
+        },
+        Request::PrunePackages {
+            project_root: "/repo".into(),
+            days: 30,
+            dry_run: false,
+        },
+        Request::ImportKclPackages {
+            project_root: "/repo".into(),
+        },
+        Request::PurgeEndedSessions { before: 0 },
+        Request::DeleteAssistant {
+            name: "helper-bot".into(),
+        },
+        Request::RepairMediaReservation {
+            scope: "session".into(),
+            id: "abc".into(),
+            expected_block_generation: 1,
+            repair_plan_digest: "digest".into(),
+            idempotency_key: "key".into(),
+        },
+        Request::UpsertAssistant {
+            name: "helper-bot".into(),
+            home_dir: "/tmp/helper".into(),
+            config_json: "{}".into(),
+            content_hash: "hash".into(),
+        },
+    ];
+    for request in mutations {
+        let mut state = owner_state();
+        let tag = request.wire_tag();
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert!(
+            error.message.contains("ephemeral daemons"),
+            "{tag} must be rejected on an ephemeral daemon, got: {}",
+            error.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_session_compactions_returns_complete_list() {
+    // AC9: every planted compaction event appears in one response, and
+    // non-compaction events are excluded.
+    let ctx = persistent_test_ctx();
+    let mut state = owner_state();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let session_id = session.session_id;
+    let mut planted_seqs = Vec::new();
+    for index in 0..3 {
+        // Interleave a non-compaction event to prove the filter.
+        ctx.db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                None,
+                None,
+                &serde_json::json!({ "text": format!("msg-{index}") }),
+            )
+            .await
+            .unwrap();
+        let seq = ctx
+            .db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::SessionCompacted,
+                None,
+                None,
+                &serde_json::json!({ "tokens_before": 100 + index, "tokens_after": 10 }),
+            )
+            .await
+            .unwrap();
+        planted_seqs.push(seq);
+    }
+    let response = handle_request(
+        Request::GetSessionCompactions { session_id },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::SessionCompactions {
+        session_id: got_id,
+        compactions_json,
+    } = response
+    else {
+        panic!("expected session compactions")
+    };
+    assert_eq!(got_id, session_id);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&compactions_json).unwrap();
+    assert_eq!(
+        parsed.len(),
+        planted_seqs.len(),
+        "every planted compaction must appear exactly once"
+    );
+    let seqs: std::collections::BTreeSet<i64> = parsed
+        .iter()
+        .map(|entry| entry["seq"].as_i64().unwrap())
+        .collect();
+    for seq in &planted_seqs {
+        assert!(seqs.contains(seq), "compaction seq {seq} missing");
+    }
+}
+
+#[tokio::test]
+async fn list_failed_tool_calls_response_scrubs_vault_secret() {
+    // FINDING 1 / L8: the redaction backstop must strip a vaulted-secret value
+    // out of raw tool I/O carried by `list_failed_tool_calls`, exactly like the
+    // sibling transcript/history responses.
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let marker = "fci_planted_failed_tool_secret";
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    let event = crate::db::tool_calls::ToolCallEvent {
+        event_id: Uuid::new_v4(),
+        session_id: session.session_id,
+        call_id: "call-1".into(),
+        parent_call_id: None,
+        parent_child_index: None,
+        provider_item_id: None,
+        provider_call_id: None,
+        provider_call_id_source: None,
+        wire_api: None,
+        provider_family: None,
+        timestamp: chrono::Utc::now().timestamp(),
+        model: "m".into(),
+        provider: "p".into(),
+        project_id: "proj".into(),
+        project_root: "/repo".into(),
+        agent: "Build".into(),
+        tool: "read".into(),
+        mcp_server: None,
+        path: None,
+        recovery: crate::db::tool_calls::Recovery::Clean,
+        hard_fail: true,
+        exit_code: Some(1),
+        sandbox_enabled: false,
+        sandboxed: false,
+        sandbox_unavailable_reason: None,
+        original_input_json: serde_json::json!({ "arg": marker }),
+        wire_input_json: serde_json::json!({}),
+        output: format!("tool failed with token {marker}"),
+        truncated: false,
+        duration_ms: 0,
+        cockpit_version: None,
+        llm_mode: None,
+        shape_fingerprint: None,
+        hint: None,
+    };
+    ctx.db.insert_tool_call(&event).await.unwrap();
+    // Precondition: the persisted row really carries the marker.
+    let rows = ctx
+        .db
+        .list_failed_tool_calls(crate::db::tool_calls::FailedCallsFilter {
+            since_epoch: 0,
+            tool: None,
+            model: None,
+            project_id: None,
+            include_recovered: true,
+            limit: 50,
+        })
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|row| row.output.contains(marker)),
+        "precondition: stored failed-call row must contain the marker"
+    );
+
+    let mut response = handle_request(
+        Request::ListFailedToolCalls {
+            since_epoch: 0,
+            tool: None,
+            model: None,
+            project_id: None,
+            include_recovered: true,
+            limit: 50,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    // Positive control: the raw response surfaces the marker before scrubbing.
+    assert!(
+        serde_json::to_string(&response).unwrap().contains(marker),
+        "raw response must surface the tool-call marker"
+    );
+    scrub_response_free_text(&mut response, &table_for(marker));
+    assert!(
+        !serde_json::to_string(&response).unwrap().contains(marker),
+        "redaction backstop must strip the vaulted secret from failed-tool-call I/O"
+    );
+}
+
+#[tokio::test]
+async fn get_session_compactions_response_scrubs_vault_secret() {
+    // FINDING 1 / L8: the compaction event `data` payload is free text; a
+    // vaulted secret in it must be stripped by the redaction backstop.
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let marker = "fci_planted_compaction_secret";
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    ctx.db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::SessionCompacted,
+            None,
+            None,
+            &serde_json::json!({ "handoff_text": format!("carrying {marker}") }),
+        )
+        .await
+        .unwrap();
+
+    let mut response = handle_request(
+        Request::GetSessionCompactions {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    // Positive control: the raw response surfaces the marker before scrubbing.
+    assert!(
+        serde_json::to_string(&response).unwrap().contains(marker),
+        "raw response must surface the compaction marker"
+    );
+    scrub_response_free_text(&mut response, &table_for(marker));
+    assert!(
+        !serde_json::to_string(&response).unwrap().contains(marker),
+        "redaction backstop must strip the vaulted secret from compaction data"
     );
 }
 
@@ -11689,8 +12057,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "list_sealed_values"
         | "delete_sealed_value"
         | "list_project_notes"
-        | "create_project_note"
-        | "upsert_assistant" => AuthzAllowedOutcome::Response,
+        | "create_project_note" => AuthzAllowedOutcome::Response,
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -11840,6 +12207,29 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // dedicated `delete_session_rejects_active_session` /
         // `delete_session_v9_envelope_does_not_reject_active_session` tests.)
         "delete_session" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
+        // v10 owner-remoted CLI-surface reads project non-secret state, so the
+        // owner cell resolves to a `Response`. `get_session_compactions` reads
+        // the seeded matrix session (empty compaction list);
+        // `diagnose_media_reservation` uses the valid `session` scope.
+        "list_packages"
+        | "get_connector_state"
+        | "get_org_sync_status"
+        | "list_failed_tool_calls"
+        | "get_assistant"
+        | "get_session_compactions"
+        | "diagnose_media_reservation"
+        | "get_doctor_snapshot" => AuthzAllowedOutcome::Response,
+        // v10 owner-remoted persistent mutations (including the reclassified
+        // `upsert_assistant`) reject on the ephemeral matrix daemon before any
+        // work, exactly like the sibling ephemeral-guarded owner mutations.
+        "upsert_assistant"
+        | "add_package"
+        | "import_package"
+        | "prune_packages"
+        | "import_kcl_packages"
+        | "purge_ended_sessions"
+        | "delete_assistant"
+        | "repair_media_reservation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -11954,6 +12344,22 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("pin"),
         authz_owner_only("store_flycockpit_credential"),
         authz_owner_only("clear_flycockpit_credential"),
+        // v10 owner-remoted CLI-surface RPCs.
+        authz_owner_only("list_packages"),
+        authz_owner_only("add_package"),
+        authz_owner_only("import_package"),
+        authz_owner_only("prune_packages"),
+        authz_owner_only("import_kcl_packages"),
+        authz_owner_only("get_connector_state"),
+        authz_owner_only("get_org_sync_status"),
+        authz_owner_only("list_failed_tool_calls"),
+        authz_owner_only("get_session_compactions"),
+        authz_owner_only("purge_ended_sessions"),
+        authz_owner_only("get_assistant"),
+        authz_owner_only("delete_assistant"),
+        authz_owner_only("diagnose_media_reservation"),
+        authz_owner_only("repair_media_reservation"),
+        authz_owner_only("get_doctor_snapshot"),
         authz_owner_only("list_secret_inventory"),
         authz_owner_only("put_named_secret"),
         authz_owner_only("put_subscription_ack"),
@@ -13449,6 +13855,64 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             Request::SetFlycockpitConnectorEnabled { enabled: true }
         }
         "sync_flycockpit_org_policy" => Request::SyncFlycockpitOrgPolicy,
+        "list_packages" => Request::ListPackages,
+        "add_package" => Request::AddPackage {
+            project_root: root.clone(),
+            identifier: "matrix-pkg".into(),
+            git: None,
+            branch: None,
+            local_path: Some(root.clone()),
+            deep: false,
+        },
+        "import_package" => Request::ImportPackage {
+            project_root: root.clone(),
+            dir: Some("deps".into()),
+            package: None,
+            id: None,
+            as_path: false,
+        },
+        "prune_packages" => Request::PrunePackages {
+            project_root: root.clone(),
+            days: 30,
+            dry_run: false,
+        },
+        "import_kcl_packages" => Request::ImportKclPackages {
+            project_root: root.clone(),
+        },
+        "get_connector_state" => Request::GetConnectorState,
+        "get_org_sync_status" => Request::GetOrgSyncStatus,
+        "list_failed_tool_calls" => Request::ListFailedToolCalls {
+            since_epoch: 0,
+            tool: None,
+            model: None,
+            project_id: None,
+            include_recovered: false,
+            limit: 50,
+        },
+        "get_session_compactions" => Request::GetSessionCompactions { session_id },
+        "purge_ended_sessions" => Request::PurgeEndedSessions { before: 0 },
+        "get_assistant" => Request::GetAssistant {
+            name: "helper-bot".into(),
+        },
+        "delete_assistant" => Request::DeleteAssistant {
+            name: "helper-bot".into(),
+        },
+        "diagnose_media_reservation" => Request::DiagnoseMediaReservation {
+            scope: "session".into(),
+            id: session_id.to_string(),
+        },
+        "repair_media_reservation" => Request::RepairMediaReservation {
+            scope: "session".into(),
+            id: session_id.to_string(),
+            expected_block_generation: 1,
+            repair_plan_digest: "digest".into(),
+            idempotency_key: "key".into(),
+        },
+        "get_doctor_snapshot" => Request::GetDoctorSnapshot {
+            project_root: Some(root.clone()),
+            no_sandbox: true,
+            offline: true,
+        },
         other => panic!("unhandled authz matrix request kind {other}"),
     }
 }
@@ -20228,6 +20692,21 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImportPolicy,
         GetImageSpendPolicy,
         SaveImageSpendPolicy,
+        ListPackages,
+        AddPackage,
+        ImportPackage,
+        PrunePackages,
+        ImportKclPackages,
+        GetConnectorState,
+        GetOrgSyncStatus,
+        ListFailedToolCalls,
+        GetSessionCompactions,
+        PurgeEndedSessions,
+        GetAssistant,
+        DeleteAssistant,
+        DiagnoseMediaReservation,
+        RepairMediaReservation,
+        GetDoctorSnapshot,
     );
 
     let covered: HashSet<&'static str> = cases

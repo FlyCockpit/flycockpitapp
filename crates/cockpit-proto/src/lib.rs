@@ -2677,7 +2677,22 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "export_policy"
                 | "import_policy"
                 | "get_image_spend_policy"
-                | "save_image_spend_policy" => 10,
+                | "save_image_spend_policy"
+                | "list_packages"
+                | "add_package"
+                | "import_package"
+                | "prune_packages"
+                | "import_kcl_packages"
+                | "get_connector_state"
+                | "get_org_sync_status"
+                | "list_failed_tool_calls"
+                | "get_session_compactions"
+                | "purge_ended_sessions"
+                | "get_assistant"
+                | "delete_assistant"
+                | "diagnose_media_reservation"
+                | "repair_media_reservation"
+                | "get_doctor_snapshot" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 tags: the base tag
@@ -2716,7 +2731,22 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "policy_exported"
                 | "policy_imported"
                 | "image_spend_policy"
-                | "image_spend_policy_saved" => 10,
+                | "image_spend_policy_saved"
+                | "packages"
+                | "package_added"
+                | "package_imported"
+                | "packages_pruned"
+                | "kcl_packages_imported"
+                | "connector_state"
+                | "org_sync_status"
+                | "failed_tool_calls"
+                | "session_compactions"
+                | "ended_sessions_purged"
+                | "assistant"
+                | "assistant_deleted"
+                | "media_reservation_diagnosis"
+                | "media_reservation_repaired"
+                | "doctor_snapshot" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 response tags: the base
@@ -5950,6 +5980,171 @@ mod tests {
                 10
             );
         }
+    }
+
+    #[test]
+    fn every_new_cli_surface_shape_requires_v10() {
+        for request in [
+            Request::ListPackages,
+            Request::AddPackage {
+                project_root: "/tmp/project".into(),
+                identifier: "tokio".into(),
+                git: None,
+                branch: None,
+                local_path: Some("/tmp/pkg".into()),
+                deep: false,
+            },
+            Request::ImportPackage {
+                project_root: "/tmp/project".into(),
+                dir: Some("deps".into()),
+                package: None,
+                id: None,
+                as_path: false,
+            },
+            Request::PrunePackages {
+                project_root: "/tmp/project".into(),
+                days: 30,
+                dry_run: false,
+            },
+            Request::ImportKclPackages {
+                project_root: "/tmp/project".into(),
+            },
+            Request::GetConnectorState,
+            Request::GetOrgSyncStatus,
+            Request::ListFailedToolCalls {
+                since_epoch: 0,
+                tool: None,
+                model: None,
+                project_id: None,
+                include_recovered: false,
+                limit: 50,
+            },
+            Request::GetSessionCompactions {
+                session_id: Uuid::nil(),
+            },
+            Request::PurgeEndedSessions { before: 0 },
+            Request::GetAssistant {
+                name: "helper-bot".into(),
+            },
+            Request::DeleteAssistant {
+                name: "helper-bot".into(),
+            },
+            Request::DiagnoseMediaReservation {
+                scope: "session".into(),
+                id: "abc".into(),
+            },
+            Request::RepairMediaReservation {
+                scope: "session".into(),
+                id: "abc".into(),
+                expected_block_generation: 1,
+                repair_plan_digest: "digest".into(),
+                idempotency_key: "key".into(),
+            },
+            Request::GetDoctorSnapshot {
+                project_root: None,
+                no_sandbox: false,
+                offline: false,
+            },
+        ] {
+            let tag = request.wire_tag();
+            assert_eq!(
+                body_required_protocol_version(&Body::Request {
+                    id: Uuid::nil(),
+                    operation: None,
+                    request,
+                })
+                .0,
+                10,
+                "{tag} must be gated to v10"
+            );
+        }
+        for response in [
+            Response::Packages {
+                packages_json: "[]".into(),
+            },
+            Response::PackageAdded {
+                package_json: "{}".into(),
+            },
+            Response::PackageImported {
+                summary_json: "{}".into(),
+            },
+            Response::PackagesPruned {
+                report_json: "{}".into(),
+            },
+            Response::KclPackagesImported {
+                result_json: "{}".into(),
+            },
+            Response::ConnectorState {
+                connector_json: "null".into(),
+            },
+            Response::OrgSyncStatus {
+                org_states_json: "[]".into(),
+                audit_states_json: "[]".into(),
+            },
+            Response::FailedToolCalls {
+                calls_json: "[]".into(),
+            },
+            Response::SessionCompactions {
+                session_id: Uuid::nil(),
+                compactions_json: "[]".into(),
+            },
+            Response::EndedSessionsPurged {
+                purged: 0,
+                session_ids_json: "[]".into(),
+            },
+            Response::Assistant { assistant: None },
+            Response::AssistantDeleted { deleted: true },
+            Response::MediaReservationDiagnosis {
+                diagnosis_json: "{}".into(),
+            },
+            Response::MediaReservationRepaired {
+                outcome: "accounting_repair_committed".into(),
+            },
+            Response::DoctorSnapshot {
+                rendered: String::new(),
+                has_failures: false,
+            },
+        ] {
+            let tag = response.wire_tag();
+            assert_eq!(
+                body_required_protocol_version(&Body::Response {
+                    id: Uuid::nil(),
+                    response: Box::new(response),
+                })
+                .0,
+                10,
+                "{tag} must be gated to v10"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_get_doctor_snapshot_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope {
+            v: 9,
+            body: Body::Request {
+                id,
+                operation: None,
+                request: Request::GetDoctorSnapshot {
+                    project_root: None,
+                    no_sandbox: false,
+                    offline: false,
+                },
+            },
+        };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
     }
 
     #[tokio::test]

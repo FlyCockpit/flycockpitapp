@@ -1867,5 +1867,99 @@
       "policy_version": 8
     },
     "response": "image_spend_policy_saved"
+  },
+  "packages": {
+    "data": {
+      "packages_json": "[]"
+    },
+    "response": "packages"
+  },
+  "package_added": {
+    "data": {
+      "package_json": "{}"
+    },
+    "response": "package_added"
+  },
+  "package_imported": {
+    "data": {
+      "summary_json": "{}"
+    },
+    "response": "package_imported"
+  },
+  "packages_pruned": {
+    "data": {
+      "report_json": "{}"
+    },
+    "response": "packages_pruned"
+  },
+  "kcl_packages_imported": {
+    "data": {
+      "result_json": "{}"
+    },
+    "response": "kcl_packages_imported"
+  },
+  "connector_state": {
+    "data": {
+      "connector_json": "null"
+    },
+    "response": "connector_state"
+  },
+  "org_sync_status": {
+    "data": {
+      "org_states_json": "[]",
+      "audit_states_json": "[]"
+    },
+    "response": "org_sync_status"
+  },
+  "failed_tool_calls": {
+    "data": {
+      "calls_json": "[]"
+    },
+    "response": "failed_tool_calls"
+  },
+  "session_compactions": {
+    "data": {
+      "session_id": "11111111-2222-4333-8444-555555555555",
+      "compactions_json": "[]"
+    },
+    "response": "session_compactions"
+  },
+  "ended_sessions_purged": {
+    "data": {
+      "purged": 0,
+      "session_ids_json": "[]"
+    },
+    "response": "ended_sessions_purged"
+  },
+  "assistant": {
+    "data": {
+      "assistant": null
+    },
+    "response": "assistant"
+  },
+  "assistant_deleted": {
+    "data": {
+      "deleted": true
+    },
+    "response": "assistant_deleted"
+  },
+  "media_reservation_diagnosis": {
+    "data": {
+      "diagnosis_json": "{}"
+    },
+    "response": "media_reservation_diagnosis"
+  },
+  "media_reservation_repaired": {
+    "data": {
+      "outcome": "accounting_repair_committed"
+    },
+    "response": "media_reservation_repaired"
+  },
+  "doctor_snapshot": {
+    "data": {
+      "rendered": "",
+      "has_failures": false
+    },
+    "response": "doctor_snapshot"
   }
 }

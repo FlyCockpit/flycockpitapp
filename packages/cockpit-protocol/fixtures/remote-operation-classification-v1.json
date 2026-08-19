@@ -935,7 +935,7 @@
       "tag": "list_assistants"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "name:string|home_dir:string|config_json:string|content_hash:string",
       "fcorRoles": [
@@ -961,7 +961,7 @@
         }
       ],
       "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "upsert_assistant"
     },
     {
@@ -3405,6 +3405,328 @@
       "fcorSchema": "dest:SecretStorePlacement",
       "strategy": "none",
       "tag": "migrate_kek_placement"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "list_packages"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|identifier:string|git:option<string>|branch:option<string>|local_path:option<string>|deep:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "identifier",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "git",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "branch",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "local_path",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "deep",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:String|identifier:String|git:Option<String>|branch:Option<String>|local_path:Option<String>|deep:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "add_package"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|dir:option<string>|package:option<string>|id:option<string>|as_path:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "dir",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "package",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "id",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "as_path",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:String|dir:Option<String>|package:Option<String>|id:Option<String>|as_path:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "import_package"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|days:u32|dry_run:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "days",
+          "role": "param",
+          "type": "u32"
+        },
+        {
+          "field": "dry_run",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:String|days:u32|dry_run:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "prune_packages"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "import_kcl_packages"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_connector_state"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_org_sync_status"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "since_epoch:i64|tool:option<string>|model:option<string>|project_id:option<string>|include_recovered:bool|limit:u32",
+      "fcorRoles": [
+        {
+          "field": "since_epoch",
+          "role": "param",
+          "type": "i64"
+        },
+        {
+          "field": "tool",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "model",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "project_id",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "include_recovered",
+          "role": "param",
+          "type": "bool"
+        },
+        {
+          "field": "limit",
+          "role": "param",
+          "type": "u32"
+        }
+      ],
+      "fcorSchema": "since_epoch:i64|tool:Option<String>|model:Option<String>|project_id:Option<String>|include_recovered:bool|limit:u32",
+      "strategy": "none",
+      "tag": "list_failed_tool_calls"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "get_session_compactions"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "before:i64",
+      "fcorRoles": [
+        {
+          "field": "before",
+          "role": "param",
+          "type": "i64"
+        }
+      ],
+      "fcorSchema": "before:i64",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "purge_ended_sessions"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "name:string",
+      "fcorRoles": [
+        {
+          "field": "name",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "name:String",
+      "strategy": "none",
+      "tag": "get_assistant"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "name:string",
+      "fcorRoles": [
+        {
+          "field": "name",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "name:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "delete_assistant"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "scope:string|id:string",
+      "fcorRoles": [
+        {
+          "field": "scope",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "scope:String|id:String",
+      "strategy": "none",
+      "tag": "diagnose_media_reservation"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "scope:string|id:string|expected_block_generation:u64|repair_plan_digest:string|idempotency_key:string",
+      "fcorRoles": [
+        {
+          "field": "scope",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_block_generation",
+          "role": "param",
+          "type": "u64"
+        },
+        {
+          "field": "repair_plan_digest",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "idempotency_key",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "repair_media_reservation"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:option<string>|no_sandbox:bool|offline:bool",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "no_sandbox",
+          "role": "param",
+          "type": "bool"
+        },
+        {
+          "field": "offline",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "project_root:Option<String>|no_sandbox:bool|offline:bool",
+      "strategy": "none",
+      "tag": "get_doctor_snapshot"
     },
     {
       "class": "rejected",

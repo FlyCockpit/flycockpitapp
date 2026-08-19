@@ -688,6 +688,74 @@ pub enum Response {
         snapshot: crate::HostCapabilitySnapshot,
     },
 
+    // ---- v10-only owner-remoted CLI-surface responses ------------------
+    // JSON-string payloads (no secret bytes) so the daemon owns assembly
+    // and persistence; the CLI renders. Mirrors `PolicyExported`.
+    /// Registered package list, JSON array of `{identifier,display_name,...}`.
+    Packages {
+        packages_json: String,
+    },
+    /// A single registered package row as JSON.
+    PackageAdded {
+        package_json: String,
+    },
+    /// Package import summary as JSON.
+    PackageImported {
+        summary_json: String,
+    },
+    /// Package prune report as JSON.
+    PackagesPruned {
+        report_json: String,
+    },
+    /// kcl import result as JSON.
+    KclPackagesImported {
+        result_json: String,
+    },
+    /// FlyCockpit connector state for the current account (JSON, or `null`).
+    ConnectorState {
+        connector_json: String,
+    },
+    /// Org-sync and remote-audit-upload state lists as JSON.
+    OrgSyncStatus {
+        org_states_json: String,
+        audit_states_json: String,
+    },
+    /// Failed/recovered tool-call rows as a JSON array.
+    FailedToolCalls {
+        calls_json: String,
+    },
+    /// The complete compaction-event list for a session as a JSON array.
+    SessionCompactions {
+        session_id: Uuid,
+        compactions_json: String,
+    },
+    /// Result of purging ended sessions.
+    EndedSessionsPurged {
+        purged: u32,
+        session_ids_json: String,
+    },
+    /// A single assistant registry row, or `None` when not found.
+    Assistant {
+        assistant: Option<AssistantSummary>,
+    },
+    /// Result of deleting an assistant registry row.
+    AssistantDeleted {
+        deleted: bool,
+    },
+    /// Media reservation accounting diagnosis as JSON.
+    MediaReservationDiagnosis {
+        diagnosis_json: String,
+    },
+    /// Media reservation accounting repair outcome code.
+    MediaReservationRepaired {
+        outcome: String,
+    },
+    /// Rendered doctor diagnostics snapshot plus the failure flag.
+    DoctorSnapshot {
+        rendered: String,
+        has_failures: bool,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1021,6 +1089,21 @@ macro_rules! response_variants {
             (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::HostCapabilities { .. }, "host_capabilities");
+            (Response::Packages { .. }, "packages");
+            (Response::PackageAdded { .. }, "package_added");
+            (Response::PackageImported { .. }, "package_imported");
+            (Response::PackagesPruned { .. }, "packages_pruned");
+            (Response::KclPackagesImported { .. }, "kcl_packages_imported");
+            (Response::ConnectorState { .. }, "connector_state");
+            (Response::OrgSyncStatus { .. }, "org_sync_status");
+            (Response::FailedToolCalls { .. }, "failed_tool_calls");
+            (Response::SessionCompactions { .. }, "session_compactions");
+            (Response::EndedSessionsPurged { .. }, "ended_sessions_purged");
+            (Response::Assistant { .. }, "assistant");
+            (Response::AssistantDeleted { .. }, "assistant_deleted");
+            (Response::MediaReservationDiagnosis { .. }, "media_reservation_diagnosis");
+            (Response::MediaReservationRepaired { .. }, "media_reservation_repaired");
+            (Response::DoctorSnapshot { .. }, "doctor_snapshot");
             (Response::Unknown, "__unknown");
         ] }
     };

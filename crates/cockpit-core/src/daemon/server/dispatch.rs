@@ -2885,14 +2885,417 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             home_dir,
             config_json,
             content_hash,
-        } => ctx
-            .db
-            .upsert_assistant(&name, &home_dir, &config_json, &content_hash)
-            .await
-            .map(|row| Response::AssistantUpserted {
+        } => {
+            let request = Request::UpsertAssistant {
+                name: name.clone(),
+                home_dir: home_dir.clone(),
+                config_json: config_json.clone(),
+                content_hash: content_hash.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent assistant writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let row = ctx
+                .db
+                .upsert_assistant(&name, &home_dir, &config_json, &content_hash)
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            let response = Response::AssistantUpserted {
                 assistant: assistant_to_proto(row),
-            })
-            .map_err(|error| bad_request(error.to_string())),
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "upsert_assistant", response).await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::AddPackage {
+            project_root,
+            identifier,
+            git,
+            branch,
+            local_path,
+            deep,
+        } => {
+            let request = Request::AddPackage {
+                project_root: project_root.clone(),
+                identifier: identifier.clone(),
+                git: git.clone(),
+                branch: branch.clone(),
+                local_path: local_path.clone(),
+                deep,
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept package registry writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let cwd = PathBuf::from(&project_root);
+            let shallow = !deep;
+            let row = if let Some(url) = git.as_deref() {
+                crate::packages::add_git(
+                    &ctx.db,
+                    &cwd,
+                    &identifier,
+                    url,
+                    branch.as_deref(),
+                    shallow,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?
+            } else if let Some(path) = local_path.as_deref() {
+                crate::packages::add_local(&ctx.db, &identifier, std::path::Path::new(path))
+                    .await
+                    .map_err(|error| bad_request(error.to_string()))?
+            } else {
+                return Err(bad_request(
+                    "add_package needs either a git url or a local path",
+                ));
+            };
+            let response = Response::PackageAdded {
+                package_json: serde_json::to_string(&package_row_json(&row)).map_err(internal)?,
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "add_package", response).await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::ImportPackage {
+            project_root,
+            dir,
+            package,
+            id,
+            as_path,
+        } => {
+            let request = Request::ImportPackage {
+                project_root: project_root.clone(),
+                dir: dir.clone(),
+                package: package.clone(),
+                id: id.clone(),
+                as_path,
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept package registry writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let cwd = PathBuf::from(&project_root);
+            let summary = if let Some(dir) = dir.as_deref() {
+                crate::packages::import_package_directory(
+                    &ctx.db,
+                    &cwd,
+                    std::path::Path::new(dir),
+                    as_path,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?
+            } else if let Some(package_dir) = package.as_deref() {
+                crate::packages::import_package(
+                    &ctx.db,
+                    &cwd,
+                    std::path::Path::new(package_dir),
+                    id.as_deref(),
+                    as_path,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?
+            } else {
+                return Err(bad_request(
+                    "import_package needs either a directory or a single package path",
+                ));
+            };
+            let response = Response::PackageImported {
+                summary_json: serde_json::to_string(&package_import_summary_json(&summary))
+                    .map_err(internal)?,
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "import_package", response).await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::PrunePackages {
+            project_root,
+            days,
+            dry_run,
+        } => {
+            let request = Request::PrunePackages {
+                project_root: project_root.clone(),
+                days,
+                dry_run,
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept package registry writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let cwd = PathBuf::from(&project_root);
+            let report = crate::packages::prune_package_clones(
+                &ctx.db,
+                &cwd,
+                &crate::packages::PackagePruneOptions { days, dry_run },
+            )
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
+            let response = Response::PackagesPruned {
+                report_json: serde_json::to_string(&package_prune_report_json(&report))
+                    .map_err(internal)?,
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "prune_packages", response).await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::ImportKclPackages { project_root } => {
+            let request = Request::ImportKclPackages {
+                project_root: project_root.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept package registry writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let cwd = PathBuf::from(&project_root);
+            let result = crate::packages::import_from_kcl(&ctx.db, &cwd)
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            let value = match result {
+                crate::packages::KclImport::Imported(count) => serde_json::json!({
+                    "imported": count,
+                }),
+                crate::packages::KclImport::NoKclDb(path) => serde_json::json!({
+                    "no_kcl_db": path.display().to_string(),
+                }),
+            };
+            let response = Response::KclPackagesImported {
+                result_json: serde_json::to_string(&value).map_err(internal)?,
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "import_kcl_packages", response)
+                        .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::PurgeEndedSessions { before } => {
+            let request = Request::PurgeEndedSessions { before };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent session purges",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let session_ids = ctx
+                .db
+                .read(move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT session_id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+                    )?;
+                    statement
+                        .query_map([before], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(Into::into)
+                })
+                .await
+                .map_err(internal)?;
+            let mut purged = 0u32;
+            for id in &session_ids {
+                if let Ok(session_id) = Uuid::parse_str(id) {
+                    ctx.db.delete_session(session_id).await.map_err(internal)?;
+                    purged = purged.saturating_add(1);
+                }
+            }
+            let response = Response::EndedSessionsPurged {
+                purged,
+                session_ids_json: serde_json::to_string(&session_ids).map_err(internal)?,
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "purge_ended_sessions", response)
+                        .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::DeleteAssistant { name } => {
+            let request = Request::DeleteAssistant { name: name.clone() };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent assistant writes",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let deleted = ctx.db.delete_assistant(&name).await.map_err(internal)?;
+            let response = Response::AssistantDeleted { deleted };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "delete_assistant", response).await
+                }
+                None => Ok(response),
+            }
+        }
+
+        Request::RepairMediaReservation {
+            scope,
+            id,
+            expected_block_generation,
+            repair_plan_digest,
+            idempotency_key,
+        } => {
+            let request = Request::RepairMediaReservation {
+                scope: scope.clone(),
+                id: id.clone(),
+                expected_block_generation,
+                repair_plan_digest: repair_plan_digest.clone(),
+                idempotency_key: idempotency_key.clone(),
+            };
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept media reservation repairs",
+                ));
+            }
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let outcome = ctx
+                .media_ledger
+                .repair_accounting(
+                    crate::media_reservation::AccountingRepairRequest {
+                        attempt_id: Uuid::new_v4().to_string(),
+                        scope_kind: scope,
+                        scope_id: id,
+                        expected_block_generation,
+                        repair_plan_digest,
+                        idempotency_key,
+                        wall_ms: chrono::Utc::now()
+                            .timestamp_millis()
+                            .try_into()
+                            .unwrap_or(0),
+                    },
+                    &state.principal,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            let response = Response::MediaReservationRepaired {
+                outcome: outcome.code().to_string(),
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "repair_media_reservation",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
+        }
+
+        // The following owner-remoted reads are `read_only`/concurrent and are
+        // dispatched on the concurrent path; the serialized match is also
+        // exhaustive over `Request`, so they delegate to the shared helpers.
+        Request::ListPackages => list_packages_response(ctx).await,
+        Request::GetConnectorState => get_connector_state_response(ctx).await,
+        Request::GetOrgSyncStatus => get_org_sync_status_response(ctx).await,
+        Request::ListFailedToolCalls {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit,
+        } => {
+            list_failed_tool_calls_response(
+                ctx,
+                since_epoch,
+                tool,
+                model,
+                project_id,
+                include_recovered,
+                limit,
+            )
+            .await
+        }
+        Request::GetSessionCompactions { session_id } => {
+            get_session_compactions_response(ctx, session_id).await
+        }
+        Request::GetAssistant { name } => get_assistant_response(ctx, name).await,
+        Request::DiagnoseMediaReservation { scope, id } => {
+            diagnose_media_reservation_response(ctx, scope, id).await
+        }
+        Request::GetDoctorSnapshot {
+            project_root,
+            no_sandbox,
+            offline,
+        } => get_doctor_snapshot_response(project_root, no_sandbox, offline).await,
 
         Request::CreateAssistantSession {
             name,
@@ -7820,6 +8223,40 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             project_root,
             provider_id,
         } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
+        Request::ListPackages => list_packages_response(&ctx).await,
+        Request::GetConnectorState => get_connector_state_response(&ctx).await,
+        Request::GetOrgSyncStatus => get_org_sync_status_response(&ctx).await,
+        Request::ListFailedToolCalls {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit,
+        } => {
+            list_failed_tool_calls_response(
+                &ctx,
+                since_epoch,
+                tool,
+                model,
+                project_id,
+                include_recovered,
+                limit,
+            )
+            .await
+        }
+        Request::GetSessionCompactions { session_id } => {
+            get_session_compactions_response(&ctx, session_id).await
+        }
+        Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
+        Request::DiagnoseMediaReservation { scope, id } => {
+            diagnose_media_reservation_response(&ctx, scope, id).await
+        }
+        Request::GetDoctorSnapshot {
+            project_root,
+            no_sandbox,
+            offline,
+        } => get_doctor_snapshot_response(project_root, no_sandbox, offline).await,
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("request `{request_kind}` is not marked concurrent"),
@@ -11617,6 +12054,310 @@ pub(super) fn assistant_to_proto(
         config_json: row.config_json,
         content_hash: row.content_hash,
     }
+}
+
+/// Non-secret JSON projection of a registered package row for the
+/// owner-remoted `list_packages` / `add_package` responses.
+fn package_row_json(row: &crate::db::packages::PackageRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "identifier": row.identifier,
+        "display_name": row.display_name,
+        "source_type": row.source_type.as_str(),
+        "source_url": row.source_url,
+        "source_branch": row.source_branch,
+        "path": row.path,
+        "shallow": row.shallow,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+/// Non-secret JSON projection of the FlyCockpit connector state.
+fn connector_state_json(state: &crate::db::connector::ConnectorState) -> serde_json::Value {
+    serde_json::json!({
+        "server_url": state.server_url,
+        "instance_id": state.instance_id,
+        "enabled": state.enabled,
+        "status": state.status,
+        "relay_url": state.relay_url,
+        "relay_id": state.relay_id,
+        "relay_region": state.relay_region,
+        "last_connected_at_ms": state.last_connected_at_ms,
+        "last_error": state.last_error,
+    })
+}
+
+/// Non-secret JSON projection of one org-policy sync state row.
+fn org_sync_state_json(state: &crate::db::org_sync::OrgSyncState) -> serde_json::Value {
+    serde_json::json!({
+        "server_url": state.server_url,
+        "org_id": state.org_id,
+        "cursor_seq": state.cursor_seq,
+        "policy_version": state.policy_version,
+        "enabled": state.enabled,
+        "last_synced_at_ms": state.last_synced_at_ms,
+        "last_error": state.last_error,
+        "updated_at_ms": state.updated_at_ms,
+    })
+}
+
+/// Non-secret JSON projection of one remote-audit upload cursor row.
+fn audit_upload_state_json(
+    state: &crate::db::remote_audit_upload::RemoteAuditUploadState,
+) -> serde_json::Value {
+    serde_json::json!({
+        "server_url": state.server_url,
+        "instance_id": state.instance_id,
+        "cursor_audit_id": state.cursor_audit_id,
+        "last_uploaded_at_ms": state.last_uploaded_at_ms,
+        "last_error": state.last_error,
+        "updated_at_ms": state.updated_at_ms,
+    })
+}
+
+/// JSON projection of one failed/recovered tool-call row. Mirrors the shape
+/// `cockpit debug failed-calls --json` renders. Carries tool inputs/outputs
+/// (never vault secrets).
+fn failed_tool_call_json(row: &crate::db::tool_calls::ToolCallEvent) -> serde_json::Value {
+    let (kind, stage) = row.recovery.raw_db_fields();
+    serde_json::json!({
+        "event_id": row.event_id,
+        "session_id": row.session_id,
+        "timestamp": row.timestamp,
+        "model": row.model,
+        "provider": row.provider,
+        "project_id": row.project_id,
+        "agent": row.agent,
+        "tool": row.tool,
+        "path": row.path,
+        "hard_fail": row.hard_fail,
+        "shape_fingerprint": row.shape_fingerprint,
+        "recovery_kind": kind,
+        "recovery_stage": stage,
+        "original_input": row.original_input_json,
+        "wire_input": row.wire_input_json,
+        "output": row.output,
+        "truncated": row.truncated,
+        "duration_ms": row.duration_ms,
+    })
+}
+
+/// JSON projection of one `session_compacted` event; carries the complete
+/// event payload (no secret bytes).
+fn session_compaction_json(event: &crate::db::session_log::SessionEventRow) -> serde_json::Value {
+    serde_json::json!({
+        "seq": event.seq,
+        "ts_ms": event.ts_ms,
+        "data": event.data,
+    })
+}
+
+/// JSON projection of a package import summary.
+fn package_import_summary_json(
+    summary: &crate::packages::PackageImportSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "imported": summary.imported,
+        "deduped": summary.deduped,
+        "skipped": summary.skipped,
+        "failed": summary.failed(),
+        "warnings": summary.warnings,
+        "failures": summary
+            .failures
+            .iter()
+            .map(|failure| serde_json::json!({
+                "path": failure.path.display().to_string(),
+                "reason": failure.reason,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+// ---- Owner-remoted CLI-surface reads -------------------------------------
+// These `read_only` requests route to the concurrent path, but the serialized
+// match is also exhaustive over `Request`, so both dispatch sites call these
+// shared helpers.
+
+async fn list_packages_response(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let packages = ctx.db.list_packages().await.map_err(internal)?;
+    let rows: Vec<serde_json::Value> = packages.iter().map(package_row_json).collect();
+    Ok(Response::Packages {
+        packages_json: serde_json::to_string(&rows).map_err(internal)?,
+    })
+}
+
+async fn get_connector_state_response(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let value = match ctx.load_flycockpit_credential().map_err(internal)? {
+        Some(credential) => match ctx
+            .db
+            .connector_state(&credential.server_url, &credential.instance_id)
+            .await
+            .map_err(internal)?
+        {
+            Some(state) => connector_state_json(&state),
+            None => serde_json::Value::Null,
+        },
+        None => serde_json::Value::Null,
+    };
+    Ok(Response::ConnectorState {
+        connector_json: serde_json::to_string(&value).map_err(internal)?,
+    })
+}
+
+async fn get_org_sync_status_response(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let org_states = ctx.db.list_org_sync_states().await.map_err(internal)?;
+    let audit_states = ctx
+        .db
+        .list_remote_audit_upload_states()
+        .await
+        .map_err(internal)?;
+    let org: Vec<serde_json::Value> = org_states.iter().map(org_sync_state_json).collect();
+    let audit: Vec<serde_json::Value> = audit_states.iter().map(audit_upload_state_json).collect();
+    Ok(Response::OrgSyncStatus {
+        org_states_json: serde_json::to_string(&org).map_err(internal)?,
+        audit_states_json: serde_json::to_string(&audit).map_err(internal)?,
+    })
+}
+
+async fn list_failed_tool_calls_response(
+    ctx: &Arc<DaemonContext>,
+    since_epoch: i64,
+    tool: Option<String>,
+    model: Option<String>,
+    project_id: Option<String>,
+    include_recovered: bool,
+    limit: u32,
+) -> std::result::Result<Response, ErrorPayload> {
+    let rows = ctx
+        .db
+        .list_failed_tool_calls(crate::db::tool_calls::FailedCallsFilter {
+            since_epoch,
+            tool,
+            model,
+            project_id,
+            include_recovered,
+            limit: limit as usize,
+        })
+        .await
+        .map_err(internal)?;
+    let calls: Vec<serde_json::Value> = rows.iter().map(failed_tool_call_json).collect();
+    Ok(Response::FailedToolCalls {
+        calls_json: serde_json::to_string(&calls).map_err(internal)?,
+    })
+}
+
+async fn get_session_compactions_response(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    let events = ctx
+        .db
+        .read(move |conn| {
+            crate::db::Db::get_session_conn(conn, session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+            Ok(crate::db::Db::list_session_events_conn(conn, session_id)?
+                .into_iter()
+                .filter(|event| event.kind == "session_compacted")
+                .collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    let compactions: Vec<serde_json::Value> = events.iter().map(session_compaction_json).collect();
+    Ok(Response::SessionCompactions {
+        session_id,
+        compactions_json: serde_json::to_string(&compactions).map_err(internal)?,
+    })
+}
+
+async fn get_assistant_response(
+    ctx: &Arc<DaemonContext>,
+    name: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let row = ctx.db.get_assistant(&name).await.map_err(internal)?;
+    Ok(Response::Assistant {
+        assistant: row.map(assistant_to_proto),
+    })
+}
+
+async fn diagnose_media_reservation_response(
+    ctx: &Arc<DaemonContext>,
+    scope: String,
+    id: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let diagnosis = ctx
+        .media_ledger
+        .diagnose_accounting(&scope, &id)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Response::MediaReservationDiagnosis {
+        diagnosis_json: serde_json::to_string(&diagnosis).map_err(internal)?,
+    })
+}
+
+async fn get_doctor_snapshot_response(
+    project_root: Option<String>,
+    no_sandbox: bool,
+    offline: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    // `cli_snapshot` assembles a `!Send` future (it holds provider/config state
+    // across `.await`). Drive it to completion on a dedicated current-thread
+    // runtime inside `spawn_blocking` so it never crosses the concurrent
+    // dispatch task's `Send` boundary. Only the rendered `String` and the
+    // failure flag (both `Send`) leave the closure.
+    let (rendered, has_failures) = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let path = project_root.map(PathBuf::from);
+        let snapshot = runtime
+            .block_on(crate::diagnostics::cli_snapshot(
+                path.as_deref(),
+                no_sandbox,
+                offline,
+            ))
+            .map_err(|error| error.to_string())?;
+        Ok::<(String, bool), String>((crate::diagnostics::render(&snapshot), snapshot.has_failures))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(bad_request)?;
+    Ok(Response::DoctorSnapshot {
+        rendered,
+        has_failures,
+    })
+}
+
+/// JSON projection of a package prune report.
+fn package_prune_report_json(report: &crate::packages::PackagePruneReport) -> serde_json::Value {
+    serde_json::json!({
+        "deleted": report
+            .deleted
+            .iter()
+            .map(|entry| serde_json::json!({
+                "path": entry.path.display().to_string(),
+                "bytes": entry.bytes,
+            }))
+            .collect::<Vec<_>>(),
+        "bytes_reclaimed": report.bytes_reclaimed(),
+        "skipped_groups": report.skipped_groups,
+        "missing_dirs": report.missing_dirs,
+        "failures": report
+            .failures
+            .iter()
+            .map(|failure| serde_json::json!({
+                "path": failure.path.display().to_string(),
+                "reason": failure.reason,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn pinned_message_to_proto(row: crate::db::pins::PinnedMessage) -> proto::PinnedMessage {

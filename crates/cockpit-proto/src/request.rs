@@ -1656,6 +1656,103 @@ pub enum Request {
         dest: SecretStorePlacement,
     },
 
+    // ---- v10-only owner-remoted CLI-surface RPCs -----------------------
+    // Every variant below is a NEW wire shape gated to protocol v10 by
+    // `body_required_protocol_version`. Responses carry no secret bytes.
+    /// List registered packages through the daemon-owned registry.
+    ListPackages,
+
+    /// Register a package clone (git or local) through the daemon.
+    AddPackage {
+        project_root: String,
+        identifier: String,
+        git: Option<String>,
+        branch: Option<String>,
+        local_path: Option<String>,
+        deep: bool,
+    },
+
+    /// Import one or more packages from a directory or single package dir.
+    ImportPackage {
+        project_root: String,
+        dir: Option<String>,
+        package: Option<String>,
+        id: Option<String>,
+        as_path: bool,
+    },
+
+    /// Prune stale package clones through the daemon-owned registry.
+    PrunePackages {
+        project_root: String,
+        days: u32,
+        dry_run: bool,
+    },
+
+    /// Import packages from a local kcl install through the daemon.
+    ImportKclPackages {
+        project_root: String,
+    },
+
+    /// Read the FlyCockpit connector state for the current account.
+    GetConnectorState,
+
+    /// Read org-policy session-log sync state and audit upload cursors.
+    GetOrgSyncStatus,
+
+    /// List recent failed/recovered tool calls (owner-remoted read).
+    ListFailedToolCalls {
+        since_epoch: i64,
+        tool: Option<String>,
+        model: Option<String>,
+        project_id: Option<String>,
+        include_recovered: bool,
+        limit: u32,
+    },
+
+    /// Return the complete compaction-event list for a session. Distinct
+    /// from `ReadHistoryPage`: no pagination, no event-kind ambiguity.
+    GetSessionCompactions {
+        session_id: Uuid,
+    },
+
+    /// Purge every ended session whose end time is before `before`
+    /// (unix-epoch seconds).
+    PurgeEndedSessions {
+        before: i64,
+    },
+
+    /// Read a single assistant registry row by name.
+    GetAssistant {
+        name: String,
+    },
+
+    /// Delete an assistant registry row by name (home dir left intact).
+    DeleteAssistant {
+        name: String,
+    },
+
+    /// Diagnose a media reservation accounting scope (owner-remoted read).
+    DiagnoseMediaReservation {
+        scope: String,
+        id: String,
+    },
+
+    /// Repair a media reservation accounting scope (owner-remoted mutation).
+    RepairMediaReservation {
+        scope: String,
+        id: String,
+        expected_block_generation: u64,
+        repair_plan_digest: String,
+        idempotency_key: String,
+    },
+
+    /// Assemble the doctor diagnostics snapshot through the daemon.
+    GetDoctorSnapshot {
+        project_root: Option<String>,
+        no_sandbox: bool,
+        offline: bool,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -2343,6 +2440,21 @@ macro_rules! request_variants {
             (Request::GetHostCapabilities, "get_host_capabilities");
             (Request::RefreshHostCapabilities, "refresh_host_capabilities");
             (Request::MigrateKekPlacement { .. }, "migrate_kek_placement");
+            (Request::ListPackages, "list_packages");
+            (Request::AddPackage { .. }, "add_package");
+            (Request::ImportPackage { .. }, "import_package");
+            (Request::PrunePackages { .. }, "prune_packages");
+            (Request::ImportKclPackages { .. }, "import_kcl_packages");
+            (Request::GetConnectorState, "get_connector_state");
+            (Request::GetOrgSyncStatus, "get_org_sync_status");
+            (Request::ListFailedToolCalls { .. }, "list_failed_tool_calls");
+            (Request::GetSessionCompactions { .. }, "get_session_compactions");
+            (Request::PurgeEndedSessions { .. }, "purge_ended_sessions");
+            (Request::GetAssistant { .. }, "get_assistant");
+            (Request::DeleteAssistant { .. }, "delete_assistant");
+            (Request::DiagnoseMediaReservation { .. }, "diagnose_media_reservation");
+            (Request::RepairMediaReservation { .. }, "repair_media_reservation");
+            (Request::GetDoctorSnapshot { .. }, "get_doctor_snapshot");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -2429,7 +2541,7 @@ macro_rules! command {
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
-            (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, local_only, none, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
+            (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts }, "export_session_data", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param]);
@@ -2572,6 +2684,21 @@ macro_rules! command {
             (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::MigrateKekPlacement { dest }, "migrate_kek_placement", owner_only, none, true, local_only, none, serialized, none, "dest:SecretStorePlacement", [dest: SecretStorePlacement => param]);
+            (Request::ListPackages, "list_packages", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::AddPackage { project_root, identifier, git, branch, local_path, deep }, "add_package", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|identifier:String|git:Option<String>|branch:Option<String>|local_path:Option<String>|deep:bool", [project_root: String => param, identifier: String => param, git: Option<String> => param, branch: Option<String> => param, local_path: Option<String> => param, deep: bool => param]);
+            (Request::ImportPackage { project_root, dir, package, id, as_path }, "import_package", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|dir:Option<String>|package:Option<String>|id:Option<String>|as_path:bool", [project_root: String => param, dir: Option<String> => param, package: Option<String> => param, id: Option<String> => param, as_path: bool => param]);
+            (Request::PrunePackages { project_root, days, dry_run }, "prune_packages", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|days:u32|dry_run:bool", [project_root: String => param, days: u32 => param, dry_run: bool => param]);
+            (Request::ImportKclPackages { project_root }, "import_kcl_packages", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String", [project_root: String => param]);
+            (Request::GetConnectorState, "get_connector_state", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::GetOrgSyncStatus, "get_org_sync_status", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::ListFailedToolCalls { since_epoch, tool, model, project_id, include_recovered, limit }, "list_failed_tool_calls", owner_only, none, false, read_only, none, concurrent, none, "since_epoch:i64|tool:Option<String>|model:Option<String>|project_id:Option<String>|include_recovered:bool|limit:u32", [since_epoch: i64 => param, tool: Option<String> => param, model: Option<String> => param, project_id: Option<String> => param, include_recovered: bool => param, limit: u32 => param]);
+            (Request::GetSessionCompactions { session_id }, "get_session_compactions", owner_only, none, false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => param]);
+            (Request::PurgeEndedSessions { before }, "purge_ended_sessions", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "before:i64", [before: i64 => param]);
+            (Request::GetAssistant { name }, "get_assistant", owner_only, none, false, read_only, none, concurrent, none, "name:String", [name: String => param]);
+            (Request::DeleteAssistant { name }, "delete_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
+            (Request::DiagnoseMediaReservation { scope, id }, "diagnose_media_reservation", owner_only, none, false, read_only, none, concurrent, none, "scope:String|id:String", [scope: String => param, id: String => param]);
+            (Request::RepairMediaReservation { scope, id, expected_block_generation, repair_plan_digest, idempotency_key }, "repair_media_reservation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String", [scope: String => param, id: String => param, expected_block_generation: u64 => param, repair_plan_digest: String => param, idempotency_key: String => param]);
+            (Request::GetDoctorSnapshot { project_root, no_sandbox, offline }, "get_doctor_snapshot", owner_only, none, false, read_only, none, concurrent, none, "project_root:Option<String>|no_sandbox:bool|offline:bool", [project_root: Option<String> => param, no_sandbox: bool => param, offline: bool => param]);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };
@@ -3507,10 +3634,27 @@ mod tests {
                         | "get_workspace_trust"
                         | "resolve_assistant_session"
                         | "list_assistants"
+                        | "upsert_assistant"
                         | "create_assistant_session"
                         | "import_session_archive"
                         | "curator"
                         | "stats_rollup"
+                        // v10-only owner-remoted CLI-surface RPCs.
+                        | "list_packages"
+                        | "add_package"
+                        | "import_package"
+                        | "prune_packages"
+                        | "import_kcl_packages"
+                        | "get_connector_state"
+                        | "get_org_sync_status"
+                        | "list_failed_tool_calls"
+                        | "get_session_compactions"
+                        | "purge_ended_sessions"
+                        | "get_assistant"
+                        | "delete_assistant"
+                        | "diagnose_media_reservation"
+                        | "repair_media_reservation"
+                        | "get_doctor_snapshot"
                 );
                 if owner_remoted {
                     assert_ne!(declared_class, "local_only");
@@ -3879,6 +4023,93 @@ mod tests {
         };
         assert_eq!(request.wire_tag(), "upsert_assistant");
         assert!(crate::command!(command_tags).contains(&request.wire_tag()));
+    }
+
+    #[test]
+    fn upsert_assistant_is_owner_remoted() {
+        // AC6: reclassified away from `local_only`; reserves a remote op.
+        assert_eq!(
+            remote_operation_class_for_tag("upsert_assistant"),
+            Some(RemoteOperationClass::NonrepeatableMutation)
+        );
+    }
+
+    #[test]
+    fn repair_media_reservation_is_owner_remoted() {
+        // AC7: owner-remoted serialized mutation, not `local_only`.
+        assert_eq!(
+            remote_operation_class_for_tag("repair_media_reservation"),
+            Some(RemoteOperationClass::NonrepeatableMutation)
+        );
+    }
+
+    #[test]
+    fn get_workspace_trust_is_required_owner_remoted() {
+        // AC8: the existing workspace-trust tag is the owner-remoted read;
+        // `GetStartupDisclosures` is unchanged and is NOT the trust read.
+        assert_eq!(
+            remote_operation_class_for_tag("get_workspace_trust"),
+            Some(RemoteOperationClass::ReadOnly)
+        );
+        assert_ne!("get_workspace_trust", "get_startup_disclosures");
+        assert_eq!(
+            remote_operation_class_for_tag("get_startup_disclosures"),
+            Some(RemoteOperationClass::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn new_cli_surface_rpcs_are_owner_remoted_never_local_only() {
+        // AC1: every new row exists and is not `local_only` (None class).
+        for tag in [
+            "list_packages",
+            "get_connector_state",
+            "get_org_sync_status",
+            "list_failed_tool_calls",
+            "get_session_compactions",
+            "get_assistant",
+            "diagnose_media_reservation",
+            "get_doctor_snapshot",
+        ] {
+            assert_eq!(
+                remote_operation_class_for_tag(tag),
+                Some(RemoteOperationClass::ReadOnly),
+                "{tag} must be an owner-remoted read"
+            );
+        }
+        for tag in [
+            "add_package",
+            "import_package",
+            "prune_packages",
+            "import_kcl_packages",
+            "purge_ended_sessions",
+            "delete_assistant",
+            "repair_media_reservation",
+        ] {
+            assert_eq!(
+                remote_operation_class_for_tag(tag),
+                Some(RemoteOperationClass::NonrepeatableMutation),
+                "{tag} must be an owner-remoted mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn get_session_compactions_is_a_distinct_tag_from_read_history_page() {
+        // AC9 (proto half): a dedicated tag, never `ReadHistoryPage`.
+        assert_eq!(
+            Request::GetSessionCompactions {
+                session_id: Uuid::nil()
+            }
+            .wire_tag(),
+            "get_session_compactions"
+        );
+        assert_ne!("get_session_compactions", "read_history_page");
+        // ReadHistoryPage is unchanged (still a read).
+        assert_eq!(
+            remote_operation_class_for_tag("read_history_page"),
+            Some(RemoteOperationClass::ReadOnly)
+        );
     }
 
     #[test]

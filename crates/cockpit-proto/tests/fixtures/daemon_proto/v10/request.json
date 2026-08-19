@@ -1479,5 +1479,109 @@
       "expected_policy_version": 7
     },
     "request": "save_image_spend_policy"
+  },
+  "list_packages": {
+    "request": "list_packages"
+  },
+  "add_package": {
+    "params": {
+      "project_root": "/tmp/project",
+      "identifier": "tokio",
+      "git": "https://github.com/tokio-rs/tokio",
+      "branch": null,
+      "local_path": null,
+      "deep": false
+    },
+    "request": "add_package"
+  },
+  "import_package": {
+    "params": {
+      "project_root": "/tmp/project",
+      "dir": "deps",
+      "package": null,
+      "id": null,
+      "as_path": false
+    },
+    "request": "import_package"
+  },
+  "prune_packages": {
+    "params": {
+      "project_root": "/tmp/project",
+      "days": 30,
+      "dry_run": false
+    },
+    "request": "prune_packages"
+  },
+  "import_kcl_packages": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "import_kcl_packages"
+  },
+  "get_connector_state": {
+    "request": "get_connector_state"
+  },
+  "get_org_sync_status": {
+    "request": "get_org_sync_status"
+  },
+  "list_failed_tool_calls": {
+    "params": {
+      "since_epoch": 1700000000,
+      "tool": null,
+      "model": null,
+      "project_id": null,
+      "include_recovered": false,
+      "limit": 50
+    },
+    "request": "list_failed_tool_calls"
+  },
+  "get_session_compactions": {
+    "params": {
+      "session_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "request": "get_session_compactions"
+  },
+  "purge_ended_sessions": {
+    "params": {
+      "before": 1700000000
+    },
+    "request": "purge_ended_sessions"
+  },
+  "get_assistant": {
+    "params": {
+      "name": "helper-bot"
+    },
+    "request": "get_assistant"
+  },
+  "delete_assistant": {
+    "params": {
+      "name": "helper-bot"
+    },
+    "request": "delete_assistant"
+  },
+  "diagnose_media_reservation": {
+    "params": {
+      "scope": "session",
+      "id": "abc"
+    },
+    "request": "diagnose_media_reservation"
+  },
+  "repair_media_reservation": {
+    "params": {
+      "scope": "session",
+      "id": "abc",
+      "expected_block_generation": 1,
+      "repair_plan_digest": "digest",
+      "idempotency_key": "key"
+    },
+    "request": "repair_media_reservation"
+  },
+  "get_doctor_snapshot": {
+    "params": {
+      "project_root": null,
+      "no_sandbox": false,
+      "offline": false
+    },
+    "request": "get_doctor_snapshot"
   }
 }

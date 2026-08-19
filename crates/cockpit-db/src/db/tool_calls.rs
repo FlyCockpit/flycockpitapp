@@ -17,6 +17,13 @@ use crate::db::{
     sql::{PredicateBuilder, SqlColumn},
 };
 
+/// Upper bound on rows a single `list_failed_tool_calls` read returns. Each
+/// row carries raw tool I/O (individually storage-capped), so a bounded row
+/// count keeps the response small by construction — matching the interactive
+/// read cap (`READ_SESSION_MESSAGES_MAX_LIMIT`) and honoring the `Bounded`
+/// wire classification of the owner-remoted `list_failed_tool_calls` RPC.
+pub const FAILED_TOOL_CALLS_MAX_LIMIT: usize = 200;
+
 /// What a tool-input repair pass did. One row per dispatched tool call,
 /// persisted to `tool_call_events.recovery_kind` + `recovery_stage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,7 +298,10 @@ impl Db {
             if let Some(p) = filter.project_id {
                 where_sql.push_eq(SqlColumn::ProjectId, p);
             }
-            let limit_placeholder = where_sql.push_param(filter.limit as i64);
+            // Clamp the row count so the response is bounded by construction
+            // regardless of the caller-supplied limit (e.g. `u32::MAX`).
+            let limit = filter.limit.min(FAILED_TOOL_CALLS_MAX_LIMIT);
+            let limit_placeholder = where_sql.push_param(limit as i64);
             let (pred, params_vec) = where_sql.finish();
 
             let sql = format!(
@@ -1206,5 +1216,35 @@ mod tests {
                 other => panic!("expected TextEmbedded, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn list_failed_tool_calls_clamps_limit_to_bounded_maximum() {
+        // A caller-supplied `u32::MAX` limit must be clamped so the read is
+        // bounded by construction (honoring the `Bounded` wire classification).
+        let db = Db::open_in_memory().unwrap();
+        let sid = fixture(&db).await;
+        let total = FAILED_TOOL_CALLS_MAX_LIMIT + 25;
+        for i in 0..total {
+            let mut ev = tool_call_fixture(sid, &format!("call-{i}"), "read", i as i64);
+            ev.hard_fail = true;
+            db.insert_tool_call(&ev).await.unwrap();
+        }
+        let rows = db
+            .list_failed_tool_calls(FailedCallsFilter {
+                since_epoch: 0,
+                tool: None,
+                model: None,
+                project_id: None,
+                include_recovered: false,
+                limit: u32::MAX as usize,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            FAILED_TOOL_CALLS_MAX_LIMIT,
+            "an unbounded caller limit must clamp to the bounded maximum"
+        );
     }
 }

@@ -176,6 +176,41 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        // Metadata-only owner-remoted CLI-surface responses: package registry
+        // metadata, connector/org-sync state, counts, deletion flags, and
+        // structured media-accounting facts carry no free text where a vaulted
+        // secret value could hide, so the redaction backstop is a no-op here.
+        proto::Response::Packages { .. }
+        | proto::Response::PackageAdded { .. }
+        | proto::Response::PackageImported { .. }
+        | proto::Response::PackagesPruned { .. }
+        | proto::Response::KclPackagesImported { .. }
+        | proto::Response::ConnectorState { .. }
+        | proto::Response::OrgSyncStatus { .. }
+        | proto::Response::EndedSessionsPurged { .. }
+        | proto::Response::AssistantDeleted { .. }
+        | proto::Response::MediaReservationDiagnosis { .. }
+        | proto::Response::MediaReservationRepaired { .. } => {}
+        // Free-text-bearing owner-remoted reads: the vaulted-secret redaction
+        // backstop scrubs a value that later becomes a credential out of raw
+        // tool I/O, compaction event payloads, assistant config, and rendered
+        // doctor diagnostics — exactly like the sibling transcript/history
+        // responses above. Scrubbing the serialized JSON string replaces any
+        // literal secret substring in place and keeps the payload valid JSON.
+        proto::Response::FailedToolCalls { calls_json } => scrub_string(calls_json, redact),
+        proto::Response::SessionCompactions {
+            session_id: _,
+            compactions_json,
+        } => scrub_string(compactions_json, redact),
+        proto::Response::Assistant { assistant } => {
+            if let Some(assistant) = assistant {
+                scrub_assistant_summary(assistant, redact);
+            }
+        }
+        proto::Response::DoctorSnapshot {
+            rendered,
+            has_failures: _,
+        } => scrub_string(rendered, redact),
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
         | proto::Response::RetainedHttpsMedia(..)

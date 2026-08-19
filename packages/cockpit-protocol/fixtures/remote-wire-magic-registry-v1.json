@@ -217,7 +217,7 @@
   },
   {
     "magic": "FCRN",
-    "symbolicType": "RemoteRelayNonceV1",
+    "symbolicType": "RemoteNegotiationTranscriptV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },

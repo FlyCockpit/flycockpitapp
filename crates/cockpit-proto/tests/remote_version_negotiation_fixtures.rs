@@ -13,7 +13,12 @@ use serde::Deserialize;
 struct Fixture {
     #[allow(dead_code)]
     version: u8,
-    protocol_version: u16,
+    // NOTE: the application version (`protocolVersion` / `v1Application`) is
+    // deliberately absent from this fixture. It is not part of the
+    // cross-language transcript byte corpus, and its single authority is the
+    // PROTOCOL_VERSION constant. Embedding it here would be a second
+    // hand-maintained authority that a constant bump would silently desync
+    // (guarded by `remote_version_no_hardcoded_application_version`).
     registry: RegistryFixture,
     selection_cases: Vec<SelectionCase>,
     upgrade_cases: Vec<UpgradeCase>,
@@ -22,13 +27,12 @@ struct Fixture {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RegistryFixture {
     v1_tuple_id: u16,
     v1_signaling: u16,
     v1_authorization: u16,
     v1_transport: u16,
-    v1_application: u16,
     v1_security_rank: u16,
     v1_feature_count: u8,
 }
@@ -112,8 +116,9 @@ fn remote_version_negotiation_cross_language_fixtures() {
     assert_eq!(reg.v1_transport, 1);
     assert_eq!(reg.v1_security_rank, 100);
     assert_eq!(reg.v1_feature_count, 0);
-    // application sourced from PROTOCOL_VERSION constant — verify it matches.
-    assert_eq!(reg.v1_application, fixture.protocol_version);
+    // The application version is intentionally not in the fixture; its sole
+    // authority is PROTOCOL_VERSION, asserted against the live registry in the
+    // `remote_version` unit tests.
 
     // Selection cases.
     for case in &fixture.selection_cases {
@@ -228,9 +233,16 @@ fn remote_version_negotiation_cross_language_fixtures() {
     );
     let registry = cockpit_proto::remote_wire_magic_registry::parse_registry(registry_json)
         .expect("wire magic registry parses");
+    // FCRN maps to the real transcript codec, not the phantom relay-nonce type.
     cockpit_proto::remote_wire_magic_registry::assert_registered(
         &registry,
-        &[("FCRN", "RemoteRelayNonceV1")],
+        &[("FCRN", "RemoteNegotiationTranscriptV1")],
     )
     .unwrap();
+    // The phantom `RemoteRelayNonceV1` type (which has no codec anywhere) must
+    // appear nowhere in the shared registry.
+    assert!(
+        !registry_json.contains("RemoteRelayNonceV1"),
+        "phantom RemoteRelayNonceV1 must not be registered"
+    );
 }

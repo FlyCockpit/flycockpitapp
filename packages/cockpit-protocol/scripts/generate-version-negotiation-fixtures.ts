@@ -1,7 +1,8 @@
 /**
  * Generates `fixtures/remote/version-negotiation-v1.json` from the live
- * registry and transcript codec. Reads the PROTOCOL_VERSION constant at
- * generation time; no fixture value hardcodes the application version.
+ * registry and transcript codec. The fixture carries no application-version
+ * field: the application version's sole authority is the PROTOCOL_VERSION
+ * constant, and it is not part of the cross-language transcript byte corpus.
  */
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
@@ -9,7 +10,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   encodeTranscript,
-  PROTOCOL_VERSION,
   type RemoteNegotiationTranscriptV1,
   type SelectionInputs,
   select,
@@ -337,13 +337,16 @@ for (const c of upgradeCases) {
 
 const fixture = {
   version: 1,
-  protocolVersion: PROTOCOL_VERSION,
+  // The application version is deliberately NOT emitted: it is not part of the
+  // cross-language transcript byte corpus, and its single authority is the
+  // PROTOCOL_VERSION constant (read live by the registry in each language).
+  // Embedding it here would create a second hand-maintained authority that a
+  // constant bump would silently desync.
   registry: {
     v1TupleId: V1_TUPLE_ID,
     v1Signaling: 1,
     v1Authorization: 1,
     v1Transport: 1,
-    v1Application: PROTOCOL_VERSION,
     v1SecurityRank: 100,
     v1FeatureCount: 0,
   },

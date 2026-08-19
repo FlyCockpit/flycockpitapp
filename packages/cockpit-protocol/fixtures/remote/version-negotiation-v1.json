@@ -1,12 +1,10 @@
 {
   "version": 1,
-  "protocolVersion": 9,
   "registry": {
     "v1TupleId": 1,
     "v1Signaling": 1,
     "v1Authorization": 1,
     "v1Transport": 1,
-    "v1Application": 9,
     "v1SecurityRank": 100,
     "v1FeatureCount": 0
   },

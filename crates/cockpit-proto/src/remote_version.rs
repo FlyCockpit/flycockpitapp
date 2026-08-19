@@ -113,7 +113,10 @@ pub fn v1_tuple() -> CompatibleTuple {
         signaling: V1_SIGNALING,
         authorization: V1_AUTHORIZATION,
         transport: V1_TRANSPORT,
-        application: PROTOCOL_VERSION as u16,
+        // Sourced from PROTOCOL_VERSION; fail closed (registry construction
+        // panics at boot/test) rather than silently truncate on overflow.
+        application: u16::try_from(PROTOCOL_VERSION)
+            .expect("PROTOCOL_VERSION exceeds u16; registry cannot encode application component"),
         security_rank: V1_SECURITY_RANK,
         critical_features: Vec::new(),
     }
@@ -397,7 +400,10 @@ pub fn upgrade_required(
 
     Ok(UpgradeRequired {
         code: "remote_upgrade_required",
-        protocol_version: PROTOCOL_VERSION as u16,
+        // Envelope/transcript protocol version class — never the application
+        // constant. Disclosing PROTOCOL_VERSION would leak the daemon's
+        // application version to an unauthenticated peer.
+        protocol_version: 1,
         upgrade_side,
         client_supported: filter_sort(inputs.client),
         daemon_supported: filter_sort(inputs.daemon),
@@ -411,7 +417,9 @@ pub fn upgrade_required(
 pub fn invalid_input_error() -> UpgradeRequired {
     UpgradeRequired {
         code: "remote_protocol_invalid",
-        protocol_version: PROTOCOL_VERSION as u16,
+        // Envelope/transcript protocol version class — never the application
+        // constant.
+        protocol_version: 1,
         upgrade_side: UpgradeSide::ServerPolicy,
         client_supported: Vec::new(),
         daemon_supported: Vec::new(),
@@ -774,7 +782,7 @@ mod tests {
         assert_eq!(v1.security_rank, V1_SECURITY_RANK);
         assert!(v1.critical_features.is_empty());
         // application sourced from PROTOCOL_VERSION constant, not hardcoded.
-        assert_eq!(v1.application, PROTOCOL_VERSION as u16);
+        assert_eq!(v1.application, u16::try_from(PROTOCOL_VERSION).unwrap());
         // Nonzero unique IDs.
         let ids: Vec<u16> = registry.iter().map(|t| t.tuple_id).collect();
         assert!(ids.iter().all(|&id| id != 0));
@@ -1225,8 +1233,15 @@ mod tests {
         assert_eq!(err.upgrade_side, UpgradeSide::Multiple);
         assert_eq!(err.recommended_tuple_id, Some(V1_TUPLE_ID));
 
-        // Case 6: protocol_version field equals PROTOCOL_VERSION.
-        assert_eq!(err.protocol_version, PROTOCOL_VERSION as u16);
+        // Case 6: protocol_version is the fixed envelope version 1, NOT the
+        // application constant (which is > 1 pre-release, so this rejects the
+        // old leak).
+        assert_eq!(err.protocol_version, 1);
+        assert_ne!(
+            err.protocol_version,
+            u16::try_from(PROTOCOL_VERSION).unwrap(),
+            "upgrade error must not disclose the application PROTOCOL_VERSION"
+        );
     }
 
     #[test]
@@ -1238,6 +1253,12 @@ mod tests {
         assert!(err.daemon_supported.is_empty());
         assert!(err.server_allowed.is_empty());
         assert_eq!(err.recommended_tuple_id, None);
+        // Envelope version 1, never the application constant.
+        assert_eq!(err.protocol_version, 1);
+        assert_ne!(
+            err.protocol_version,
+            u16::try_from(PROTOCOL_VERSION).unwrap()
+        );
     }
 
     #[test]
@@ -1308,12 +1329,67 @@ mod tests {
         assert_eq!(manual, enabled_registry_digest());
     }
 
+    /// Read this module's own source for the ownership/import guards below.
+    fn module_source() -> String {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/remote_version.rs"
+        ))
+        .expect("remote_version.rs source is readable at test time")
+    }
+
     #[test]
     fn remote_version_static_guards() {
-        // The module must not import relay-protocol, parse legacy envelopes,
-        // or define environment-based tuples. This is enforced structurally:
-        // the module only depends on crate::PROTOCOL_VERSION and sha2.
-        // We verify the magic is "FCRN" and unique.
+        // Real source scans (not tautologies): this module owns exactly one
+        // transcript codec and one registry table, imports no relay-protocol,
+        // and defines no environment-driven tuples.
+        //
+        // Every needle is assembled from fragments so it does not appear
+        // verbatim in this test's own source (which the scan reads), avoiding a
+        // self-match that would corrupt the counts.
+        let src = module_source();
+
+        // No relay-protocol coupling. The doc comment names it with a hyphen
+        // ("relay-protocol"); a real Rust import would use the underscore path,
+        // which must appear nowhere.
+        assert!(
+            !src.contains(concat!("relay", "_protocol")),
+            "negotiation module must not import the relay protocol path"
+        );
+
+        // No environment-defined tuples / no legacy-envelope sniffing.
+        assert!(
+            !src.contains(concat!("std::", "env")),
+            "no environment-driven tuples"
+        );
+        assert!(
+            !src.contains(concat!("env", "::var")),
+            "no environment-driven tuples"
+        );
+
+        // Exactly one transcript magic definition and one registry table.
+        assert_eq!(
+            src.matches(concat!("pub const TRANSCRIPT_", "MAGIC:"))
+                .count(),
+            1,
+            "exactly one transcript magic definition"
+        );
+        assert_eq!(
+            src.matches(concat!("pub fn enabled_", "registry(")).count(),
+            1,
+            "exactly one enabled-registry table"
+        );
+
+        // Exactly one negotiation-digest definition (transcript_digest); the
+        // only other digest is the distinct enabled-registry digest. No third
+        // (e.g. SDP-based) negotiation digest is introduced.
+        assert_eq!(
+            src.matches(concat!("pub fn transcript_", "digest("))
+                .count(),
+            1,
+            "transcript_digest is the sole negotiation digest"
+        );
+
         assert_eq!(TRANSCRIPT_MAGIC, b"FCRN");
         assert_eq!(std::str::from_utf8(TRANSCRIPT_MAGIC).unwrap(), "FCRN");
 
@@ -1330,12 +1406,34 @@ mod tests {
             revoked: &revoked,
         };
         assert!(select(&inputs).unwrap().is_none());
+    }
 
-        // The registry has no environment-defined tuples: v1_tuple() is a
-        // pure function with no I/O.
-        let t1 = v1_tuple();
-        let t2 = v1_tuple();
-        assert_eq!(t1, t2);
+    #[test]
+    fn remote_version_no_hardcoded_application_version() {
+        // The application version has a single authority: the PROTOCOL_VERSION
+        // constant, read live by v1_tuple(). It is not part of the
+        // cross-language transcript byte corpus, so the shared fixture must not
+        // embed it as a second hand-maintained authority. A re-added
+        // protocolVersion / v1Application field (which a constant bump would
+        // silently desync) fails this guard.
+        let fixture = include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote/version-negotiation-v1.json"
+        );
+        assert!(
+            !fixture.contains("protocolVersion"),
+            "fixture must not embed a second application-version authority (protocolVersion)"
+        );
+        assert!(
+            !fixture.contains("v1Application"),
+            "fixture must not embed a second application-version authority (v1Application)"
+        );
+
+        // Non-vacuous: prove the production registry derives its application
+        // component from PROTOCOL_VERSION (the sole authority).
+        assert_eq!(
+            v1_tuple().application,
+            u16::try_from(PROTOCOL_VERSION).unwrap()
+        );
     }
 
     #[test]

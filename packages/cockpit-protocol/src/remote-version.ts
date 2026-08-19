@@ -309,7 +309,11 @@ export function upgradeRequired(inputs: SelectionInputs): UpgradeRequired {
 
   return {
     code: "remote_upgrade_required",
-    protocolVersion: PROTOCOL_VERSION,
+    // Envelope/transcript protocol version class — never the application
+    // constant. Disclosing PROTOCOL_VERSION would leak the daemon's
+    // application version to an unauthenticated pre-negotiation peer (and
+    // disagree with the Rust pair, which also emits 1).
+    protocolVersion: TRANSCRIPT_VERSION,
     upgradeSide,
     clientSupported: filterSort(inputs.client),
     daemonSupported: filterSort(inputs.daemon),
@@ -323,7 +327,9 @@ export function upgradeRequired(inputs: SelectionInputs): UpgradeRequired {
 export function invalidInputError(): UpgradeRequired {
   return {
     code: "remote_protocol_invalid",
-    protocolVersion: PROTOCOL_VERSION,
+    // Envelope/transcript protocol version class — never the application
+    // constant.
+    protocolVersion: TRANSCRIPT_VERSION,
     upgradeSide: "server_policy",
     clientSupported: [],
     daemonSupported: [],

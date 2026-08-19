@@ -41,13 +41,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fixturePath = join(here, "../fixtures/remote/version-negotiation-v1.json");
 const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as {
   version: number;
-  protocolVersion: number;
   registry: {
     v1TupleId: number;
     v1Signaling: number;
     v1Authorization: number;
     v1Transport: number;
-    v1Application: number;
     v1SecurityRank: number;
     v1FeatureCount: number;
   };
@@ -125,25 +123,41 @@ describe("remote_version_tuple_registry_v1_fixture", () => {
     // No maxima synthesis: only one tuple.
     expect(registry.length).toBe(1);
 
-    // Fixture registry matches live registry.
+    // Fixture registry structural fields match live registry (these do not
+    // change on a PROTOCOL_VERSION bump).
     expect(fixture.registry.v1TupleId).toBe(V1_TUPLE_ID);
-    expect(fixture.registry.v1Application).toBe(PROTOCOL_VERSION);
+    expect(fixture.registry.v1SecurityRank).toBe(V1_SECURITY_RANK);
+    expect(fixture.registry.v1FeatureCount).toBe(0);
+  });
+});
+
+describe("remote_version_no_hardcoded_application_version", () => {
+  it("fixture carries no second hand-maintained application-version authority", () => {
+    // The application version is NOT part of the cross-language transcript byte
+    // corpus and its sole authority is the PROTOCOL_VERSION constant. The
+    // shared fixture must not re-embed it (a `protocolVersion` / `v1Application`
+    // field), which a constant bump would silently desync — the exact failure
+    // mode AC-1 exists to prevent.
+    const rawFixture = readFileSync(fixturePath, "utf8");
+    expect(rawFixture).not.toContain("protocolVersion");
+    expect(rawFixture).not.toContain("v1Application");
+    const parsed = JSON.parse(rawFixture) as Record<string, unknown> & {
+      registry?: Record<string, unknown>;
+    };
+    expect(parsed.protocolVersion).toBeUndefined();
+    expect(parsed.registry?.v1Application).toBeUndefined();
+
+    // No checked-in registry digest either (computed live in both languages).
+    expect(rawFixture).not.toContain("registryDigestHex");
   });
 
-  it("guard: no fixture or test hardcodes an application version literal", () => {
-    // The fixture's protocolVersion must equal the live constant.
-    expect(fixture.protocolVersion).toBe(PROTOCOL_VERSION);
-    expect(fixture.registry.v1Application).toBe(PROTOCOL_VERSION);
-    // No digest comparison is checked in — the registry digest is computed at
-    // test time from the live registry, never compared against a checked-in
-    // value.
-    const liveDigest = enabledRegistryDigest();
-    expect(liveDigest.length).toBe(32);
-    expect(enabledRegistryDigest()).toEqual(liveDigest);
-    // Guard: the raw fixture file must not contain a checked-in registry
-    // digest field.
-    const rawFixture = readFileSync(fixturePath, "utf8");
-    expect(rawFixture).not.toContain("registryDigestHex");
+  it("the live registry sources the application version from PROTOCOL_VERSION", () => {
+    // Non-vacuous: the production registry derives application from the single
+    // constant authority, so there is exactly one source of truth.
+    const v1 = enabledRegistry()[0]!;
+    expect(v1.application).toBe(PROTOCOL_VERSION);
+    // The registry digest is a live computation, never a checked-in literal.
+    expect(enabledRegistryDigest().length).toBe(32);
   });
 });
 
@@ -359,7 +373,10 @@ describe("remote_version_upgrade_required_shape", () => {
       expect(err.serverAllowed, `upgrade case server_allowed: ${c.name}`).toEqual(
         c.expectedServerAllowed,
       );
-      expect(err.protocolVersion).toBe(PROTOCOL_VERSION);
+      // Envelope/transcript version 1, never the application constant (which is
+      // > 1 pre-release, so this rejects the old application-version leak).
+      expect(err.protocolVersion).toBe(1);
+      expect(err.protocolVersion).not.toBe(PROTOCOL_VERSION);
     }
   });
 
@@ -370,6 +387,9 @@ describe("remote_version_upgrade_required_shape", () => {
     expect(err.daemonSupported).toEqual([]);
     expect(err.serverAllowed).toEqual([]);
     expect(err.recommendedTupleId).toBeNull();
+    // Envelope version 1, never the application constant.
+    expect(err.protocolVersion).toBe(1);
+    expect(err.protocolVersion).not.toBe(PROTOCOL_VERSION);
   });
 });
 
@@ -426,13 +446,38 @@ describe("remote_version_replica_registry_digest", () => {
 });
 
 describe("remote_version_static_guards", () => {
-  it("proves no legacy-envelope parsing/sniffing/alias/fallback/relay import", () => {
-    // The module imports only PROTOCOL_VERSION from ./index and node:crypto.
-    // No relay-protocol import, no environment-defined tuples, no permissive
-    // default. We verify structurally:
-    // - TRANSCRIPT_MAGIC is "FCRN"
+  // Read the negotiation module's own source for the ownership/import scans.
+  const moduleSource = readFileSync(join(here, "remote-version.ts"), "utf8");
+
+  it("scans the source: no relay-protocol import, no env-driven tuples", () => {
+    // No relay-protocol coupling. The doc comment names it with a hyphen, so we
+    // match the actual import FORM, not the bare substring.
+    expect(moduleSource).not.toMatch(/from\s+["'][^"']*relay-protocol["']/);
+    // The module imports only from node:crypto and ./index — nothing else.
+    const imports = [...moduleSource.matchAll(/from\s+["']([^"']+)["']/g)].map((m) => m[1]);
+    expect(imports.length).toBeGreaterThan(0);
+    expect(new Set(imports)).toEqual(new Set(["node:crypto", "./index"]));
+    // No environment-driven tuples / legacy-envelope sniffing.
+    expect(moduleSource).not.toContain("process.env");
+  });
+
+  it("scans the source: exactly one transcript codec, table, and negotiation digest", () => {
+    const count = (needle: RegExp): number => (moduleSource.match(needle) ?? []).length;
+    // Exactly one transcript magic definition.
+    expect(count(/export const TRANSCRIPT_MAGIC =/g)).toBe(1);
+    // Exactly one transcript codec (encode + decode).
+    expect(count(/export function encodeTranscript\(/g)).toBe(1);
+    expect(count(/export function decodeTranscript\(/g)).toBe(1);
+    // Exactly one enabled-registry table.
+    expect(count(/export function enabledRegistry\(/g)).toBe(1);
+    // Exactly one negotiation digest (transcriptDigest); the only other digest
+    // is the distinct enabledRegistryDigest. No third (e.g. SDP-based) digest.
+    expect(count(/export function transcriptDigest\(/g)).toBe(1);
+  });
+
+  it("proves no permissive fallback and pure registry behavior", () => {
     expect(TRANSCRIPT_MAGIC).toBe("FCRN");
-    // - No permissive default: empty intersection returns null, not a fallback.
+    // No permissive default: empty intersection returns null, not a fallback.
     const inputs: SelectionInputs = {
       client: [0x00fe],
       daemon: [0x00fe],
@@ -440,7 +485,7 @@ describe("remote_version_static_guards", () => {
       revoked: [],
     };
     expect(select(inputs)).toBeNull();
-    // - v1Tuple is a pure function with no I/O.
+    // v1Tuple is a pure function with no I/O.
     const reg = enabledRegistry();
     expect(reg.length).toBe(1);
     expect(registryTuple(V1_TUPLE_ID)?.tupleId).toBe(V1_TUPLE_ID);
@@ -462,14 +507,23 @@ describe("remote_version_v1_fixtures_corpus", () => {
     expect(fixture.malformedVectors.length).toBeGreaterThan(0);
   });
 
-  it("proves FCRN is registered in the global wire-magic registry", () => {
+  it("proves FCRN is registered to the real transcript codec, not the phantom", () => {
     const registryPath = join(here, "../fixtures/remote-wire-magic-registry-v1.json");
-    const registryJson = JSON.parse(readFileSync(registryPath, "utf8"));
-    const registry = parseRemoteWireMagicRegistry(registryJson);
+    const rawRegistry = readFileSync(registryPath, "utf8");
+    const registry = parseRemoteWireMagicRegistry(JSON.parse(rawRegistry));
+    // FCRN maps to RemoteNegotiationTranscriptV1 (which has a real codec here).
+    expect(() =>
+      assertRegisteredProductionMagics(registry, [
+        { magic: "FCRN", symbolicType: "RemoteNegotiationTranscriptV1" },
+      ]),
+    ).not.toThrow();
+    // The phantom relay-nonce type (no codec anywhere) must appear nowhere.
+    expect(rawRegistry).not.toContain("RemoteRelayNonceV1");
+    // And the old phantom claim must now be rejected for FCRN.
     expect(() =>
       assertRegisteredProductionMagics(registry, [
         { magic: "FCRN", symbolicType: "RemoteRelayNonceV1" },
       ]),
-    ).not.toThrow();
+    ).toThrow();
   });
 });

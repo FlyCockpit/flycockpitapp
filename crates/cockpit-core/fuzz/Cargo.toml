@@ -1,0 +1,40 @@
+# cargo-fuzz harness for the closed-policy generated-SVG sanitizer and its
+# independent structural verifier.
+#
+# This is a DETACHED workspace (note the empty `[workspace]` table below): it is
+# deliberately not a member of the root Cargo workspace, so `cargo build`,
+# `cargo check --workspace` and `cargo nextest run --workspace` never touch it
+# and it never perturbs the root `Cargo.lock`. It is built and run only through
+# `cargo fuzz` (nightly). See README.md for how to run, including the hard
+# allocation / input-size / time caps.
+[package]
+name = "cockpit-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.cockpit-core]
+path = ".."
+
+[[bin]]
+name = "sanitize_generated_svg"
+path = "fuzz_targets/sanitize_generated_svg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_canonical_svg"
+path = "fuzz_targets/verify_canonical_svg.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace.
+[workspace]

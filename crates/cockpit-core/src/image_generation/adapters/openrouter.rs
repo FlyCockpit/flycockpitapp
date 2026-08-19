@@ -1404,11 +1404,19 @@ pub fn parse_response(body: &[u8]) -> Result<ParsedImageResponse, ResponseParseE
                 return Err(ResponseParseError::MediaTypeConflict);
             }
         }
-        // Raster formats pass canonical validation; SVG passes the sanitizer.
-        if detected == "image/svg+xml" {
+        // Raster formats pass canonical validation. SVG is sanitized once and
+        // the sanitizer's CANONICAL output is retained in place of the raw
+        // provider bytes: the sanitizer transforms (strips a leading XML
+        // declaration, comments, and any non-canonical form), so retaining the
+        // raw bytes would leak un-sanitized content past the boundary. Never
+        // sanitize-then-discard.
+        let bytes = if detected == "image/svg+xml" {
             crate::generated_svg::sanitize_generated_svg(&bytes)
-                .map_err(|_| ResponseParseError::SvgSanitizationFailed)?;
-        }
+                .map_err(|_| ResponseParseError::SvgSanitizationFailed)?
+                .into_bytes()
+        } else {
+            bytes
+        };
         outputs.push(ParsedOutput {
             bytes,
             media_type: detected,

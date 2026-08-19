@@ -327,7 +327,7 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
     if raw.len() > MAX_RAW_BYTES {
         return Err(SvgSanitizeError::new(SvgSanitizeCode::RawBytes, "document"));
     }
-    let accepted = parse_validate(raw, false, false)?;
+    let accepted = parse_validate(raw, false)?;
     let canonical = canonicalize(accepted)?;
     if canonical.len() > MAX_CANONICAL_BYTES {
         return Err(SvgSanitizeError::new(
@@ -348,7 +348,7 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
     verify_defense_output(&canonical, hush.as_slice())?;
     verify::verify_canonical_svg(&canonical)?;
     let verified = canonicalize(
-        parse_validate(&canonical, true, false)
+        parse_validate(&canonical, true)
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?,
     )?;
     if verified != canonical {
@@ -358,6 +358,19 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
         ));
     }
     Ok(SanitizedSvgArtifact(canonical))
+}
+
+/// Fuzz-harness entry point for the independent structural verifier.
+///
+/// The verifier itself is deliberately module-private so no production caller
+/// can reuse it to certify sanitizer output; this thin, `#[doc(hidden)]`
+/// wrapper exists only so the `fuzz/` harness (and its in-crate smoke test) can
+/// drive `verify::verify_canonical_svg` over arbitrary bytes. It swallows the
+/// result on purpose: the fuzzing invariant is "never panics / never aborts",
+/// not any particular accept/reject decision.
+#[doc(hidden)]
+pub fn fuzz_verify_canonical_svg(bytes: &[u8]) {
+    let _ = verify::verify_canonical_svg(bytes);
 }
 
 struct BoundedBytes {
@@ -405,7 +418,7 @@ impl Write for BoundedBytes {
 
 fn verify_defense_output(canonical: &[u8], hush: &[u8]) -> Result<()> {
     let hush_canonical = canonicalize(
-        parse_validate(hush, false, true)
+        parse_validate(hush, false)
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?,
     )
     .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?;
@@ -418,7 +431,7 @@ fn verify_defense_output(canonical: &[u8], hush: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> Result<Node> {
+fn parse_validate(raw: &[u8], canonical_pass: bool) -> Result<Node> {
     let mut reader = Reader::from_reader(raw);
     reader.config_mut().check_end_names = true;
     reader.config_mut().allow_unmatched_ends = false;
@@ -426,11 +439,18 @@ fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> 
     let mut root = None;
     let mut counts = Counts::default();
     let mut saw_root = false;
+    // A single XML declaration is interoperable with real provider output, but
+    // only as the very first event: a declaration that follows any other event
+    // (content, a prior declaration, whitespace) is rejected. All other
+    // processing instructions, DTDs, comments and CData stay rejected.
+    let mut first_event = true;
     loop {
-        match reader
+        let event = reader
             .read_event()
-            .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "document"))?
-        {
+            .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "document"))?;
+        let is_first_event = first_event;
+        first_event = false;
+        match event {
             Event::Start(e) => {
                 start_node(&e, &mut stack, &mut root, &mut counts, &mut saw_root, false)?
             }
@@ -460,12 +480,12 @@ fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> 
                     .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "entity"))?;
                 add_text(&decode_reference(&decoded)?, &mut stack, &mut counts)?;
             }
-            Event::Decl(_) if allow_declaration => {}
-            Event::CData(_)
-            | Event::Comment(_)
-            | Event::Decl(_)
-            | Event::PI(_)
-            | Event::DocType(_) => {
+            Event::Decl(_) => {
+                if !is_first_event {
+                    return Err(SvgSanitizeError::new(SvgSanitizeCode::Xml, "declaration"));
+                }
+            }
+            Event::CData(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_) => {
                 return Err(SvgSanitizeError::new(SvgSanitizeCode::Xml, "construct"));
             }
             Event::Eof => break,
@@ -546,7 +566,11 @@ fn start_node(
         }
         let name = std::str::from_utf8(a.key.as_ref())
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Attribute, "attribute"))?;
-        let limit = if name == "d" {
+        // The oversized path-data budget is only for the `d` attribute of a
+        // `path` element. A stray `d` on any other element (e.g. `<rect d=…>`)
+        // must not borrow the path budget before it is rejected on allowlist or
+        // parent rules; it is bounded by the ordinary attribute ceiling.
+        let limit = if name == "d" && kind == ElementKind::Path {
             MAX_PATH_ATTRIBUTE_BYTES
         } else {
             MAX_ATTRIBUTE_BYTES
@@ -893,7 +917,14 @@ fn validate_node(
         node.kind,
         ElementKind::LinearGradient | ElementKind::RadialGradient
     ) {
-        let n = node.children.len();
+        // Cardinality counts only `stop` element nodes, never text or any other
+        // non-node child, so interspersed character data can never inflate or
+        // deflate the stop total.
+        let n = node
+            .children
+            .iter()
+            .filter(|child| matches!(child, Child::Node(_)))
+            .count();
         if !(1..=256).contains(&n) {
             return Err(SvgSanitizeError::new(
                 SvgSanitizeCode::ParentChild,

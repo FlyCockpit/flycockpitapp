@@ -294,7 +294,10 @@ fn generated_svg_url_css_policy() {
 fn generated_svg_malicious_corpus() {
     for raw in [
         r##"<!DOCTYPE svg><svg/>"##,
-        r##"<?xml version="1.0"?><svg/>"##,
+        // A single leading declaration is now interoperable (see
+        // generated_svg_xml_declaration_policy), so the malicious variant is a
+        // second declaration, which must still reject.
+        r##"<?xml version="1.0"?><?xml version="1.0"?><svg/>"##,
         r##"<svg>&xxe;</svg>"##,
         r##"<svg xmlns="urn:evil"/>"##,
         r##"<svg xmlns:xlink="http://www.w3.org/1999/xlink"/>"##,
@@ -511,9 +514,9 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
             "</g>".repeat(depth - 1)
         )
     };
-    assert!(parse_validate(document_at_depth(MAX_DEPTH).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(document_at_depth(MAX_DEPTH).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(document_at_depth(MAX_DEPTH + 1).as_bytes(), false, false)
+        parse_validate(document_at_depth(MAX_DEPTH + 1).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::Depth
@@ -521,9 +524,9 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
 
     let sibling_document =
         |elements: usize| format!("<svg>{}</svg>", "<path/>".repeat(elements - 1));
-    assert!(parse_validate(sibling_document(MAX_ELEMENTS).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(sibling_document(MAX_ELEMENTS).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(sibling_document(MAX_ELEMENTS + 1).as_bytes(), false, false)
+        parse_validate(sibling_document(MAX_ELEMENTS + 1).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::ElementCount
@@ -537,9 +540,9 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(parse_validate(id_document(MAX_IDS).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(id_document(MAX_IDS).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(id_document(MAX_IDS + 1).as_bytes(), false, false)
+        parse_validate(id_document(MAX_IDS + 1).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::IdCount
@@ -569,15 +572,11 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(parse_validate(reference_document(MAX_REFERENCES).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(reference_document(MAX_REFERENCES).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(
-            reference_document(MAX_REFERENCES + 1).as_bytes(),
-            false,
-            false
-        )
-        .unwrap_err()
-        .code(),
+        parse_validate(reference_document(MAX_REFERENCES + 1).as_bytes(), false)
+            .unwrap_err()
+            .code(),
         SvgSanitizeCode::ReferenceCount
     );
 
@@ -594,9 +593,9 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(parse_validate(text_document(MAX_TEXT_SCALARS).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(text_document(MAX_TEXT_SCALARS).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(text_document(MAX_TEXT_SCALARS + 1).as_bytes(), false, false)
+        parse_validate(text_document(MAX_TEXT_SCALARS + 1).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::TextScalars
@@ -614,18 +613,10 @@ fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(
-        parse_validate(
-            unicode_text_document(MAX_TEXT_SCALARS).as_bytes(),
-            false,
-            false
-        )
-        .is_ok()
-    );
+    assert!(parse_validate(unicode_text_document(MAX_TEXT_SCALARS).as_bytes(), false).is_ok());
     assert_eq!(
         parse_validate(
             unicode_text_document(MAX_TEXT_SCALARS + 1).as_bytes(),
-            false,
             false
         )
         .unwrap_err()
@@ -646,7 +637,7 @@ fn generated_svg_raw_attribute_and_path_aggregate_ceilings_are_exact() {
         ),
         13_333,
     );
-    assert!(parse_validate(equal.as_bytes(), false, false).is_ok());
+    assert!(parse_validate(equal.as_bytes(), false).is_ok());
     let above = attributes_document(
         &format!(
             "xmlns=\"{SVG_NS}\" id=\"root\" width=\"1\" height=\"1\" viewBox=\"0 0 1 1\" preserveAspectRatio=\"none\""
@@ -654,9 +645,7 @@ fn generated_svg_raw_attribute_and_path_aggregate_ceilings_are_exact() {
         13_333,
     );
     assert_eq!(
-        parse_validate(above.as_bytes(), false, false)
-            .unwrap_err()
-            .code(),
+        parse_validate(above.as_bytes(), false).unwrap_err().code(),
         SvgSanitizeCode::TotalAttributeCount
     );
 
@@ -675,9 +664,9 @@ fn generated_svg_raw_attribute_and_path_aggregate_ceilings_are_exact() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(parse_validate(path_document(false).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(path_document(false).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(path_document(true).as_bytes(), false, false)
+        parse_validate(path_document(true).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::PathBytes
@@ -699,9 +688,9 @@ fn generated_svg_path_command_ceiling_is_exact_across_attributes() {
         raw.push_str("</svg>");
         raw
     };
-    assert!(parse_validate(document(MAX_PATH_COMMANDS).as_bytes(), false, false).is_ok());
+    assert!(parse_validate(document(MAX_PATH_COMMANDS).as_bytes(), false).is_ok());
     assert_eq!(
-        parse_validate(document(MAX_PATH_COMMANDS + 1).as_bytes(), false, false)
+        parse_validate(document(MAX_PATH_COMMANDS + 1).as_bytes(), false)
             .unwrap_err()
             .code(),
         SvgSanitizeCode::PathCommands
@@ -756,4 +745,290 @@ fn generated_svg_canonical_number_color_and_reference_fixtures_are_source_indepe
     assert!(canonical.contains("id=\"svg_000002\""));
     assert!(canonical.contains("fill=\"url(#svg_000001)\""));
     assert!(canonical.contains("stop-color=\"#aabbcc\""));
+}
+
+#[test]
+fn generated_svg_xml_declaration_policy() {
+    // AC1: a single leading XML declaration is accepted and discarded — with an
+    // encoding, with a standalone flag, and bare — and the canonical output
+    // never re-emits a declaration.
+    for decl in [
+        r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<?xml version="1.0"?>"#,
+    ] {
+        let raw = format!(
+            r#"{decl}<svg xmlns="{SVG_NS}" width="10" height="10"><rect width="1" height="1"/></svg>"#
+        );
+        let artifact = sanitize_generated_svg(raw.as_bytes()).unwrap();
+        let text = std::str::from_utf8(artifact.as_bytes()).unwrap();
+        assert!(
+            !text.contains("<?xml"),
+            "declaration must not survive canonicalization: {text}"
+        );
+        assert!(text.starts_with("<svg"), "{text}");
+    }
+
+    // AC2 + AC6: a second declaration, a mid-stream declaration, a declaration
+    // after the root, a processing instruction, a DTD, and CData all reject with
+    // the stable `Xml` code.
+    for raw in [
+        // second declaration, immediately following the first
+        format!(r#"<?xml version="1.0"?><?xml version="1.0"?><svg xmlns="{SVG_NS}"/>"#),
+        // second declaration after intervening whitespace
+        format!(r#"<?xml version="1.0"?> <?xml version="1.0"?><svg xmlns="{SVG_NS}"/>"#),
+        // declaration nested inside the root element
+        format!(r#"<svg xmlns="{SVG_NS}"><?xml version="1.0"?></svg>"#),
+        // processing instruction (quick-xml emits PI, not Decl, for `xml-...`)
+        format!(r#"<?xml-stylesheet href="x.css"?><svg xmlns="{SVG_NS}"/>"#),
+        // DTD / DocType
+        format!(r#"<!DOCTYPE svg><svg xmlns="{SVG_NS}"/>"#),
+        // CData
+        format!(r#"<svg xmlns="{SVG_NS}"><![CDATA[x]]></svg>"#),
+    ] {
+        assert_eq!(
+            sanitize_generated_svg(raw.as_bytes()).unwrap_err().code(),
+            SvgSanitizeCode::Xml,
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn generated_svg_non_path_d_attribute_does_not_consume_path_budget() {
+    // AC3: a `d` attribute is granted the oversized path-data budget only on a
+    // `path` element. On a `rect` it is bounded by the ordinary attribute
+    // ceiling, so a `d` just over that ceiling (but well under the path ceiling)
+    // now fails with `AttributeBytes`. Under the old name-only budget keying it
+    // decoded fine and was only rejected later as a disallowed attribute
+    // (`Attribute`), so this input distinguishes the two behaviours.
+    const { assert!(MAX_ATTRIBUTE_BYTES + 1 < MAX_PATH_ATTRIBUTE_BYTES) };
+    let oversized = "0".repeat(MAX_ATTRIBUTE_BYTES + 1);
+    let rect = format!(r#"<svg xmlns="{SVG_NS}"><rect d="{oversized}"/></svg>"#);
+    assert_eq!(
+        sanitize_generated_svg(rect.as_bytes()).unwrap_err().code(),
+        SvgSanitizeCode::AttributeBytes
+    );
+
+    // A genuine `path` `d` of the same oversized length — larger than the
+    // ordinary attribute ceiling — still succeeds precisely because the path
+    // element keeps the larger path-data budget.
+    let commands = "L 0 0 ".repeat(20_000);
+    assert!(commands.len() > MAX_ATTRIBUTE_BYTES && commands.len() < MAX_PATH_ATTRIBUTE_BYTES);
+    let path = format!(r#"<svg xmlns="{SVG_NS}"><path d="M 0 0 {commands}"/></svg>"#);
+    assert!(sanitize_generated_svg(path.as_bytes()).is_ok());
+}
+
+#[test]
+fn generated_svg_gradient_stop_count_ignores_non_node_children() {
+    // AC4: gradient stop cardinality counts only `stop` element nodes, never any
+    // non-node (text) child. The production parser cannot itself place a
+    // `Child::Text` under a gradient (character data is only retained under
+    // title/desc), so this defence-in-depth invariant is exercised by driving
+    // the real `validate_node` entry point with a tree that carries injected
+    // text children — the exact shape a serializer/parser regression could one
+    // day produce.
+    let stop = |index: usize| Node {
+        kind: ElementKind::Stop,
+        attrs: BTreeMap::new(),
+        children: Vec::new(),
+        source_index: index,
+    };
+    let gradient_with = |stops: usize, texts: usize| {
+        let mut node = Node {
+            kind: ElementKind::LinearGradient,
+            attrs: BTreeMap::from([("id".to_owned(), "grad".to_owned())]),
+            children: Vec::new(),
+            source_index: 0,
+        };
+        for index in 0..stops {
+            node.children.push(Child::Node(stop(index + 1)));
+        }
+        for _ in 0..texts {
+            node.children.push(Child::Text(" ".to_owned()));
+        }
+        node
+    };
+    let run = |mut node: Node| -> Result<()> {
+        let mut ids = HashMap::new();
+        let mut refs: Vec<Reference> = Vec::new();
+        let mut counts = Counts::default();
+        let mut defs_seen = false;
+        validate_node(
+            &mut node,
+            Some(ElementKind::Defs),
+            None,
+            false,
+            &mut ids,
+            &mut refs,
+            &mut counts,
+            &mut defs_seen,
+        )
+    };
+
+    // 256 stop nodes plus 8 text children: only the 256 stops count, so this is
+    // in range. Counting `children.len()` (264) would over-count and reject.
+    assert!(run(gradient_with(256, 8)).is_ok());
+    // Text-only children never satisfy the minimum: the stop count is 0, so an
+    // otherwise-empty gradient padded with text still rejects. Counting
+    // `children.len()` would treat the text as stops and wrongly accept it.
+    assert_eq!(
+        run(gradient_with(0, 5)).unwrap_err().code(),
+        SvgSanitizeCode::ParentChild
+    );
+    // 257 real stop nodes still exceeds the ceiling on node count.
+    assert_eq!(
+        run(gradient_with(257, 0)).unwrap_err().code(),
+        SvgSanitizeCode::ParentChild
+    );
+
+    // Front-door robustness: a gradient whose stops are separated by whitespace
+    // text sanitizes, and 256 stops with interspersed whitespace stays in range.
+    let stops = "\n  <stop/>".repeat(256);
+    assert!(
+        sanitize_generated_svg(
+            format!(
+                r#"<svg xmlns="{SVG_NS}"><defs><linearGradient id="g">{stops}
+</linearGradient></defs></svg>"#
+            )
+            .as_bytes()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn generated_svg_fuzz_harness_smoke() {
+    // `-runs=0`-equivalent smoke for the cargo-fuzz targets under
+    // `crates/cockpit-core/fuzz/`: replay seed corpus and structural mutations
+    // through the exact entry points the libfuzzer targets drive and assert the
+    // fuzzing invariant — no input panics, aborts, or hangs.
+    let mut seeds: Vec<Vec<u8>> = [
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="1" height="1"/></svg>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg"><path d="M 0 0 L 1 1 Z"/></svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" onload="x"><script>alert(1)</script></svg>"#,
+        r#"<!DOCTYPE svg [<!ENTITY x "y">]><svg>&x;</svg>"#,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="99999999999999999999999"/></svg>"#,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" height="10" width="10"><rect fill="#00000000" height="1" id="svg_000001" width="1"/></svg>"##,
+        r#"<svg"#,
+        "",
+    ]
+    .iter()
+    .map(|seed| seed.as_bytes().to_vec())
+    .collect();
+    // Deeply nested (but unterminated) structural mutation.
+    let mut deep = br#"<svg xmlns="http://www.w3.org/2000/svg">"#.to_vec();
+    for _ in 0..1_000 {
+        deep.extend_from_slice(b"<g>");
+    }
+    seeds.push(deep);
+    // Non-UTF-8 bytes must be handled without panicking.
+    seeds.push(vec![0xff, 0xfe, 0x3c, 0x73, 0x76, 0x67, 0x3e, 0x00]);
+
+    for seed in &seeds {
+        let _ = sanitize_generated_svg(seed);
+        fuzz_verify_canonical_svg(seed);
+    }
+}
+
+#[test]
+fn generated_svg_sentinel_raw_malicious_svg_cannot_reach_artifact_boundary() {
+    // The provider-response ingestion boundary
+    // (`image_generation::adapters::openrouter::parse_response`) admits an SVG
+    // output only after it passes the closed-policy sanitizer, and the artifact
+    // serving route (`image_generation_artifact_routes`) serves exactly those
+    // admitted bytes. This is the concrete serialization boundary the sanitizer
+    // guards, so a sentinel-bearing malicious SVG must never survive to a
+    // retained `ParsedOutput`.
+    use crate::image_generation::adapters::openrouter::parse_response;
+    use base64::Engine as _;
+
+    const SENTINEL: &str = "SVG_RAW_SENTINEL_MUST_NOT_SERIALIZE";
+
+    let malicious = [
+        format!(r#"<svg xmlns="{SVG_NS}"><script>{SENTINEL}</script></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}" onload="{SENTINEL}"/>"#),
+        format!(r#"<?xml-stylesheet href="{SENTINEL}"?><svg xmlns="{SVG_NS}"/>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path fill="url(javascript:{SENTINEL})"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><foreignObject>{SENTINEL}</foreignObject></svg>"#),
+    ];
+
+    for svg in malicious {
+        // Precondition: the raw bytes really do carry the sentinel we claim to
+        // keep off the boundary.
+        assert!(svg.contains(SENTINEL), "{svg}");
+        // The single sanitizer funnel every boundary shares rejects it.
+        assert!(sanitize_generated_svg(svg.as_bytes()).is_err(), "{svg}");
+
+        // The real ingestion boundary must reject before any retention, so no
+        // `ParsedOutput` ever carries the sentinel bytes.
+        let body = serde_json::json!({
+            "data": [{
+                "b64_json": base64::engine::general_purpose::STANDARD.encode(svg.as_bytes()),
+            }],
+        })
+        .to_string();
+        match parse_response(body.as_bytes()) {
+            Err(_) => {}
+            Ok(parsed) => {
+                for output in &parsed.outputs {
+                    assert!(
+                        !output
+                            .bytes
+                            .windows(SENTINEL.len())
+                            .any(|window| window == SENTINEL.as_bytes()),
+                        "sentinel reached serialization boundary: {svg}"
+                    );
+                }
+                panic!("malicious SVG was admitted to the artifact boundary: {svg}");
+            }
+        }
+    }
+
+    // A benign provider output — including one with a leading XML declaration —
+    // is admitted, and the retained bytes carry no sentinel.
+    let benign = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><svg xmlns="{SVG_NS}" width="10" height="10"><rect width="1" height="1"/></svg>"#
+    );
+    let body = serde_json::json!({
+        "data": [{
+            "b64_json": base64::engine::general_purpose::STANDARD.encode(benign.as_bytes()),
+        }],
+    })
+    .to_string();
+    // Precondition: the raw provider payload really carries a leading
+    // declaration that the boundary must transform away, not retain.
+    assert!(benign.contains("<?xml"));
+    let parsed = parse_response(body.as_bytes()).expect("benign SVG must be admitted");
+    assert_eq!(parsed.outputs.len(), 1);
+    assert_eq!(parsed.outputs[0].media_type, "image/svg+xml");
+    // The boundary retains the sanitizer's CANONICAL output, not the raw bytes:
+    // the stored bytes are byte-identical to the sanitized artifact, carry no
+    // XML declaration, and begin at the `<svg` root — proving the sanitizer
+    // transformed the leading-declaration input rather than merely gating it.
+    let sanitized = sanitize_generated_svg(benign.as_bytes()).unwrap();
+    assert_eq!(parsed.outputs[0].bytes, sanitized.as_bytes());
+    assert!(
+        !parsed.outputs[0]
+            .bytes
+            .windows(5)
+            .any(|window| window == b"<?xml")
+    );
+    assert!(
+        std::str::from_utf8(&parsed.outputs[0].bytes)
+            .unwrap()
+            .starts_with("<svg")
+    );
+    assert!(
+        !parsed.outputs[0]
+            .bytes
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes())
+    );
+    // The sanitizer itself also never emits the sentinel for benign input.
+    assert!(
+        !std::str::from_utf8(sanitized.as_bytes())
+            .unwrap()
+            .contains(SENTINEL)
+    );
 }

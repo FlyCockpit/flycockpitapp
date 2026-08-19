@@ -1090,3 +1090,312 @@ pub fn enrollment_confirmation_signing_digest(
     h.update(unsigned_confirmation);
     Ok(h.finalize().into())
 }
+
+#[cfg(test)]
+mod ownership_guard_tests {
+    //! `remote_identity_protocol_current_ownership_guard` — a failing source
+    //! scan. This module is the SOLE owner of the FCIP/FCEN/FCCE/FCPC/FCPP/FCCF
+    //! wire layouts, their binary struct definitions, and the possession /
+    //! enrollment-confirmation signing-domain literals. Any SECOND definition of
+    //! a magic value, a codec struct, or a domain literal anywhere else in the
+    //! Rust workspace is an ownership violation (drift / signature-domain
+    //! collision risk) and fails this test. It ALSO guards the single audited
+    //! canonical-JSON algorithm (AC4): a reintroduced `canonical_json_value`
+    //! fork, or a second recursive `serde_json::Value` canonicalizer inside the
+    //! identity-adjacent public-service-policy trust domain, fails the scan.
+
+    /// Returns `Some(reason)` when `source` introduces a second definition of a
+    /// guarded identity magic value, codec struct, or signing-domain literal.
+    /// Usages, imports, and enum re-uses of shared vocabulary are not matched.
+    fn scan_for_second_identity_definition(source: &str) -> Option<String> {
+        // Signing-domain separators live only in this module. A second literal
+        // anywhere is a domain collision that could cross-wire signatures.
+        const DOMAINS: &[&str] = &[
+            "flycockpit.remote.identity-possession-challenge.",
+            "flycockpit.remote.identity-possession-proof.",
+            "flycockpit.remote.enrollment-confirmation.",
+        ];
+        for domain in DOMAINS {
+            if source.contains(domain) {
+                return Some(format!("second identity signing-domain literal `{domain}`"));
+            }
+        }
+        // The six uniquely-named binary layout structs.
+        const STRUCTS: &[&str] = &[
+            "Proposal",
+            "EnrollmentTranscript",
+            "CustodyEvidence",
+            "PossessionContext",
+            "PossessionProof",
+            "EnrollmentConfirmation",
+        ];
+        const MAGICS: &[&[u8]] = &[b"FCIP", b"FCEN", b"FCCE", b"FCPC", b"FCPP", b"FCCF"];
+        // Match a magic by literal VALUE (`b"FCIP"` / `"FCIP"` / `*b"FCIP"`) as
+        // well as by name — a name-only scan is trivially bypassed by a rename.
+        fn lit_matches_magic(expr: &syn::Expr) -> bool {
+            const MAGICS: &[&[u8]] = &[b"FCIP", b"FCEN", b"FCCE", b"FCPC", b"FCPP", b"FCCF"];
+            let bytes: Vec<u8> = match expr {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::ByteStr(bs),
+                    ..
+                }) => bs.value(),
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => s.value().into_bytes(),
+                syn::Expr::Reference(r) => return lit_matches_magic(&r.expr),
+                syn::Expr::Unary(u) => return lit_matches_magic(&u.expr),
+                syn::Expr::Group(g) => return lit_matches_magic(&g.expr),
+                _ => return false,
+            };
+            MAGICS.contains(&bytes.as_slice())
+        }
+        let Ok(file) = syn::parse_file(source) else {
+            return None;
+        };
+        for item in &file.items {
+            let flagged = match item {
+                syn::Item::Struct(item) if STRUCTS.contains(&item.ident.to_string().as_str()) => {
+                    Some(format!("second identity codec struct `{}`", item.ident))
+                }
+                syn::Item::Const(item)
+                    if MAGICS.contains(&item.ident.to_string().as_bytes())
+                        || lit_matches_magic(&item.expr) =>
+                {
+                    Some(format!("second identity magic `{}`", item.ident))
+                }
+                syn::Item::Static(item)
+                    if MAGICS.contains(&item.ident.to_string().as_bytes())
+                        || lit_matches_magic(&item.expr) =>
+                {
+                    Some(format!("second identity magic `{}`", item.ident))
+                }
+                _ => None,
+            };
+            if flagged.is_some() {
+                return flagged;
+            }
+        }
+        None
+    }
+
+    /// Source text of a fn body, whitespace-stripped so `quote`'s token spacing
+    /// (`a :: b`, `x . sort ()`) can be substring-matched deterministically.
+    fn compact_body(block: &syn::Block) -> String {
+        quote::quote!(#block)
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+    /// Recursively collect every fn definition (free fns, impl methods, trait
+    /// default methods, and any nested in inline modules) as `(name, compact_body)`.
+    fn collect_fns(items: &[syn::Item], out: &mut Vec<(String, String)>) {
+        for item in items {
+            match item {
+                syn::Item::Fn(f) => out.push((f.sig.ident.to_string(), compact_body(&f.block))),
+                syn::Item::Impl(im) => {
+                    for ii in &im.items {
+                        if let syn::ImplItem::Fn(m) = ii {
+                            out.push((m.sig.ident.to_string(), compact_body(&m.block)));
+                        }
+                    }
+                }
+                syn::Item::Trait(t) => {
+                    for ti in &t.items {
+                        if let syn::TraitItem::Fn(f) = ti
+                            && let Some(block) = &f.default
+                        {
+                            out.push((f.sig.ident.to_string(), compact_body(block)));
+                        }
+                    }
+                }
+                syn::Item::Mod(m) => {
+                    if let Some((_, sub)) = &m.content {
+                        collect_fns(sub, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Returns `Some(reason)` when `source` re-forks the single audited
+    /// canonical-JSON algorithm that AC4 converged on. Two cases are flagged:
+    /// (1) the exact removed symbol `canonical_json_value` reintroduced ANYWHERE
+    /// without forwarding to the audited canonicalizer; (2) any other recursive
+    /// `serde_json::Value` canonicalizer defined INSIDE an identity-adjacent
+    /// trust-domain module (the public-service-policy family, whose signed
+    /// digests must all flow through the one audited canonicalizer). Thin
+    /// adapters that forward to the audited canonicalizer are allow-listed.
+    /// Separate trust domains (attempt grants, approval store, image generation,
+    /// …) keep their own audited canonicalizers and are intentionally NOT in
+    /// scope here.
+    fn scan_for_reforked_canonicalizer(file_name: &str, source: &str) -> Option<String> {
+        const TRUST_DOMAIN: &[&str] = &[
+            "remote_public_service_policy.rs",
+            "remote_tenant_authority_protocol.rs",
+            "remote_turn_ice_policy.rs",
+            "remote_enterprise_connection_policy.rs",
+        ];
+        let in_trust_domain = TRUST_DOMAIN.contains(&file_name);
+        // Fast path: only the removed symbol (case 1) or a trust-domain file
+        // (case 2) can trip this scan; skip parsing everything else.
+        if !in_trust_domain && !source.contains("canonical_json_value") {
+            return None;
+        }
+        let Ok(file) = syn::parse_file(source) else {
+            return None;
+        };
+        let mut fns = Vec::new();
+        collect_fns(&file.items, &mut fns);
+        for (name, body) in &fns {
+            // Allow-list: a thin adapter forwarding to the audited canonicalizer
+            // (directly, or via the allow-listed `canonical_json_value` adapter —
+            // but NOT a self-recursive re-fork that merely shares that name).
+            let forwards = body.contains("remote_identity_protocol::canonical_json")
+                || (name != "canonical_json_value" && body.contains("canonical_json_value("));
+            if forwards {
+                continue;
+            }
+            // (1) The exact removed fork symbol, reintroduced without forwarding.
+            if name == "canonical_json_value" {
+                return Some(format!(
+                    "reintroduced forked `canonical_json_value` (not forwarding to the audited canonicalizer) in {file_name}"
+                ));
+            }
+            // (2) A differently-named recursive canonical-JSON algorithm inside
+            // the identity-adjacent trust domain.
+            let reimplements = body.contains("Value::Object")
+                && (body.contains(".sort()")
+                    || body.contains(".sort_unstable()")
+                    || body.contains(".sort_by(")
+                    || body.contains("BTreeMap"))
+                && body.contains(&format!("{name}("));
+            if in_trust_domain && reimplements {
+                return Some(format!(
+                    "second identity-adjacent canonical-JSON implementation `{name}` in {file_name}"
+                ));
+            }
+        }
+        None
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_identity_protocol_current_ownership_guard() {
+        // (b) Non-vacuity: each guarded definition class is detected, while a
+        // usage / import / shared-vocabulary enum re-use is not.
+        assert!(
+            scan_for_second_identity_definition("pub struct PossessionProof { a: [u8; 16] }")
+                .is_some()
+        );
+        assert!(scan_for_second_identity_definition("const FCEN: [u8; 4] = *b\"FCEN\";").is_some());
+        // A magic re-defined under a DIFFERENT name (same bytes) is caught by value.
+        assert!(scan_for_second_identity_definition("const ALT: &[u8] = b\"FCIP\";").is_some());
+        assert!(scan_for_second_identity_definition("static ALT2: &str = \"FCCF\";").is_some());
+        assert!(
+            scan_for_second_identity_definition(
+                "fn d() -> String { \"flycockpit.remote.identity-possession-proof.x.v1\".into() }"
+            )
+            .is_some()
+        );
+        assert!(
+            scan_for_second_identity_definition(
+                "use crate::remote_identity_protocol::PossessionProof;"
+            )
+            .is_none()
+        );
+        // Shared-vocabulary enums (e.g. a separate CustodyClass) are NOT guarded.
+        assert!(
+            scan_for_second_identity_definition("pub enum CustodyClass { OriginProtected = 1 }")
+                .is_none()
+        );
+
+        // (b') Non-vacuity for the canonical-JSON re-fork scan (AC4).
+        let recursive_fork = |name: &str| {
+            format!(
+                "fn {name}(v: &Value) -> String {{ if let Value::Object(m) = v {{ let mut k: Vec<_> = m.keys().collect(); k.sort(); return {name}(v); }} String::new() }}"
+            )
+        };
+        // The exact removed symbol, reintroduced without forwarding, is caught anywhere.
+        assert!(
+            scan_for_reforked_canonicalizer(
+                "some_consumer.rs",
+                &recursive_fork("canonical_json_value")
+            )
+            .is_some()
+        );
+        // A differently-named recursive canonicalizer INSIDE the trust domain is caught.
+        assert!(
+            scan_for_reforked_canonicalizer("remote_turn_ice_policy.rs", &recursive_fork("jcs"))
+                .is_some()
+        );
+        // The thin adapter that forwards to the audited canonicalizer is allow-listed.
+        assert!(
+            scan_for_reforked_canonicalizer(
+                "remote_public_service_policy.rs",
+                "pub fn canonical_json_value(v: &Value) -> Result<String> { crate::remote_identity_protocol::canonical_json(v).map_err(|e| RemotePublicPolicyError::Invalid(e.to_string())) }"
+            )
+            .is_none()
+        );
+        // A method forwarding to the adapter (by call, not re-implementation) is allowed.
+        assert!(
+            scan_for_reforked_canonicalizer(
+                "remote_enterprise_connection_policy.rs",
+                "impl P { pub fn canonical_json(&self) -> Result<String> { canonical_json_value(&self.to_value()?) } }"
+            )
+            .is_none()
+        );
+        // A SEPARATE trust domain's own recursive canonicalizer (different name,
+        // outside the identity-adjacent modules) is intentionally NOT flagged.
+        assert!(
+            scan_for_reforked_canonicalizer("remote_attempt.rs", &recursive_fork("canonical_json"))
+                .is_none()
+        );
+
+        // (a) The real workspace carries no second definition anywhere in
+        // `crates/` or `apps/cli/src`, except this owning module.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root");
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root.join("crates"), &mut files);
+        collect_rs_files(&repo_root.join("apps").join("cli").join("src"), &mut files);
+        assert!(!files.is_empty(), "ownership scan found no source files");
+        for file in &files {
+            if file.file_name().and_then(|n| n.to_str()) == Some("remote_identity_protocol.rs") {
+                continue; // the sole owning module
+            }
+            let content = std::fs::read_to_string(file).unwrap_or_default();
+            if let Some(reason) = scan_for_second_identity_definition(&content) {
+                panic!("{reason} found in {}", file.display());
+            }
+            let file_name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if let Some(reason) = scan_for_reforked_canonicalizer(file_name, &content) {
+                panic!("{reason} found in {}", file.display());
+            }
+        }
+    }
+}

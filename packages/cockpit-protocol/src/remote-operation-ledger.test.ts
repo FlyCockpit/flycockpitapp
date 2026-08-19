@@ -39,10 +39,33 @@ describe("remote operation classification fixture", () => {
         evidence: null,
       });
     }
-    for (const tag of ["mark_app_flag_seen", "resolve_assistant_session", "set_workspace_trust"]) {
+    for (const tag of ["mark_app_flag_seen"]) {
       expect(byTag.get(tag)).toMatchObject({
         class: "local_only",
         strategy: "none",
+        evidence: null,
+      });
+    }
+    // Reclassified from local_only to owner-remoted by cli-existing-rpc-commands-via-daemon:
+    // these consumed product RPCs now reserve a remote operation.
+    for (const tag of ["resolve_assistant_session", "set_workspace_trust"]) {
+      expect(byTag.get(tag)).toMatchObject({
+        class: "transactional_mutation",
+        strategy: "sql_transaction",
+        evidence: null,
+      });
+    }
+    for (const tag of ["list_assistants", "stats_rollup"]) {
+      expect(byTag.get(tag)).toMatchObject({
+        class: "read_only",
+        strategy: "none",
+        evidence: null,
+      });
+    }
+    for (const tag of ["create_assistant_session", "import_session_archive", "curator"]) {
+      expect(byTag.get(tag)).toMatchObject({
+        class: "transactional_mutation",
+        strategy: "sql_transaction",
         evidence: null,
       });
     }

@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 
-use crate::daemon::client::DaemonClient;
+use crate::daemon::client::{DaemonClient, ensure_persistent_daemon};
 use crate::daemon::proto::{Request, Response};
-use crate::daemon::{DaemonStatus, discover};
 
 use crate::cli::ImportArgs;
-use crate::db::Db;
 
 /// Push an archive into daemon-side bulk staging and return its reference.
 ///
@@ -69,35 +67,28 @@ async fn push_bulk_transfer(
 }
 
 pub async fn run(args: ImportArgs) -> Result<()> {
-    let daemon = discover().await;
-    let imported = if matches!(daemon.status, DaemonStatus::Running) {
-        let paths = daemon.paths;
-        let client = DaemonClient::connect(&paths.socket)
-            .await
-            .context("connecting to running daemon for session import")?;
-        let bytes = std::fs::read(&args.file)
-            .with_context(|| format!("reading import archive {}", args.file.display()))?;
-        // The archive never rides one frame: push it as bounded bulk chunks,
-        // then hand the daemon a reference it can verify.
-        let transfer = push_bulk_transfer(&client, &bytes).await?;
-        match client
-            .request_ok(Request::ImportSessionArchive {
-                transfer,
-                as_new: args.as_new,
-            })
-            .await?
-        {
-            Response::ImportSessionArchive { imported, redacted } => {
-                cockpit_core::session::import::ImportResult { imported, redacted }
-            }
-            other => {
-                anyhow::bail!("daemon returned unexpected response to session import: {other:?}")
-            }
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for session import")?;
+    let client = daemon.client.clone();
+    let bytes = std::fs::read(&args.file)
+        .with_context(|| format!("reading import archive {}", args.file.display()))?;
+    // The archive never rides one frame: push it as bounded bulk chunks,
+    // then hand the daemon a reference it can verify.
+    let transfer = push_bulk_transfer(&client, &bytes).await?;
+    let imported = match client
+        .request_ok(Request::ImportSessionArchive {
+            transfer,
+            as_new: args.as_new,
+        })
+        .await?
+    {
+        Response::ImportSessionArchive { imported, redacted } => {
+            cockpit_core::session::import::ImportResult { imported, redacted }
         }
-    } else {
-        let archive = cockpit_core::session::import::read_archive(&args.file)?;
-        let db = Db::open_default()?;
-        cockpit_core::session::import::import_archive(&db, archive, args.as_new).await?
+        other => {
+            anyhow::bail!("daemon returned unexpected response to session import: {other:?}")
+        }
     };
     println!(
         "Imported {} session{}{}.",

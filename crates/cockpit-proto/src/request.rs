@@ -798,11 +798,17 @@ pub enum Request {
     ///   browser, GOALS §17f).
     /// - `project_id = _, parent_session_id = Some(s)` — direct forks
     ///   of session `s` (the right-arrow descent in `/sessions`).
+    ///
+    /// `assistant_id` is a v10-only extended filter: when `Some(name)`,
+    /// only sessions belonging to that assistant are returned. A v9
+    /// envelope carrying this field is rejected by the version gate.
     ListSessions {
         #[serde(default)]
         project_id: Option<String>,
         #[serde(default)]
         parent_session_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_id: Option<String>,
     },
 
     /// Read a paginated page of plain user/agent messages for a session.
@@ -2416,21 +2422,21 @@ macro_rules! command {
             (Request::SetProjectNoteContent { project_root, id, content }, "set_project_note_content", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid|content:String", [project_root: String => project_root, id: Uuid => param, content: String => param]);
             (Request::RenameProjectNote { project_root, id, name }, "rename_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid|name:String", [project_root: String => project_root, id: Uuid => param, name: String => param]);
             (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid", [project_root: String => project_root, id: Uuid => param]);
-            (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
-            (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
+            (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
-            (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, local_only, none, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
-            (Request::ListAssistants, "list_assistants", owner_only, none, false, local_only, none, concurrent, none, "-", []);
+            (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
+            (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, local_only, none, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
-            (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, local_only, none, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
+            (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts }, "export_session_data", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param]);
-            (Request::ImportSessionArchive { transfer, as_new }, "import_session_archive", owner_only, none, true, local_only, none, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, as_new: bool => param]);
+            (Request::ImportSessionArchive { transfer, as_new }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, as_new: bool => param]);
             (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", owner_only, none, true, local_only, none, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
             (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, local_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
-            (Request::Curator { project_root, action }, "curator", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
+            (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
             (Request::FsStat { project_root, path }, "fs_stat", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
@@ -2452,7 +2458,7 @@ macro_rules! command {
             (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
-            (Request::ListSessions { project_id, parent_session_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param]);
+            (Request::ListSessions { project_id, parent_session_id, assistant_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param, assistant_id: Option<String> => param]);
             (Request::ReadSessionMessages { session_id, before_seq, limit }, "read_session_messages", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadClientSubmissionReceipt { session_id, client_submission_id }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid", [session_id: Uuid => session, client_submission_id: Uuid => param]);
             (Request::ReadHistoryPage { session_id, before_seq, limit }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
@@ -2548,7 +2554,7 @@ macro_rules! command {
             (Request::RefreshConfig, "refresh_config", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::RecordUsage { kind, key, project_id }, "record_usage", owner_only, none, true, local_only, none, serialized, none, "kind:UsageKind|key:String|project_id:Option<String>", [kind: UsageKind => param, key: String => param, project_id: Option<String> => project]);
             (Request::GetUsageCounts { project_id }, "get_usage_counts", owner_only, none, false, local_only, none, concurrent, none, "project_id:Option<String>", [project_id: Option<String> => project]);
-            (Request::StatsRollup { project_id, range, by_role }, "stats_rollup", owner_only, none, false, local_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool", [project_id: Option<String> => project, range: StatsRange => param, by_role: bool => param]);
+            (Request::StatsRollup { project_id, range, by_role }, "stats_rollup", owner_only, none, false, read_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool", [project_id: Option<String> => project, range: StatsRange => param, by_role: bool => param]);
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
@@ -3497,6 +3503,14 @@ mod tests {
                         | "complete_provider_oauth"
                         | "begin_mcp_oauth"
                         | "complete_mcp_oauth"
+                        | "set_workspace_trust"
+                        | "get_workspace_trust"
+                        | "resolve_assistant_session"
+                        | "list_assistants"
+                        | "create_assistant_session"
+                        | "import_session_archive"
+                        | "curator"
+                        | "stats_rollup"
                 );
                 if owner_remoted {
                     assert_ne!(declared_class, "local_only");
@@ -3547,7 +3561,10 @@ mod tests {
             remote_adapter_recovery_strategy_for_tag("set_default_model"),
             None
         );
-        assert_eq!(remote_operation_class_for_tag("set_workspace_trust"), None);
+        assert_eq!(
+            remote_operation_class_for_tag("set_workspace_trust"),
+            Some(RemoteOperationClass::TransactionalMutation)
+        );
         assert_eq!(
             remote_adapter_recovery_contract_for_tag("set_workspace_trust"),
             None

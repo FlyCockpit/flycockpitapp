@@ -26,7 +26,7 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -48,24 +48,135 @@ struct RunUsageError(String);
 #[error("{0}")]
 struct RunTurnFailure(String);
 
-async fn emit_org_logging_indicator(db: &crate::db::Db) {
-    let Some(credential) = cockpit_core::secure_key::vault_for_db(db)
-        .ok()
-        .and_then(crate::auth::flycockpit::maybe_load_credential_from_vault)
-    else {
-        return;
+async fn emit_org_logging_indicator_via_daemon(
+    client: &crate::daemon::client::DaemonClient,
+    cwd: &Path,
+) {
+    let project_root = cwd.display().to_string();
+    let response = client
+        .request(crate::daemon::proto::Request::GetStartupDisclosures { project_root })
+        .await;
+    let disclosures = match response {
+        Ok(Ok(crate::daemon::proto::Response::StartupDisclosures {
+            org_sync: Some(disclosure),
+            ..
+        })) => disclosure,
+        _ => return,
     };
-    match db
-        .org_sync_disclosure_for_server(&credential.server_url)
+    eprintln!(
+        "Organization logging is active for {}: session content may be uploaded.",
+        disclosures.org_id
+    );
+}
+
+async fn enforce_noninteractive_workspace_trust_via_daemon(
+    client: &crate::daemon::client::DaemonClient,
+    cwd: &Path,
+) -> Result<()> {
+    let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
+    let project_root = trust_root.root.display().to_string();
+    let response = client
+        .request(crate::daemon::proto::Request::GetWorkspaceTrust { project_root })
         .await
-    {
-        Ok(Some(disclosure)) => eprintln!(
-            "Organization logging is active for {}: session content may be uploaded.",
-            disclosure.org_id
-        ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(error = %error, "reading organization logging disclosure"),
+        .context("requesting workspace trust from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust request: {error}"))?;
+    let mode = match response {
+        crate::daemon::proto::Response::WorkspaceTrust {
+            mode: Some(mode), ..
+        } => mode,
+        crate::daemon::proto::Response::WorkspaceTrust { mode: None, .. } => {
+            bail!(
+                "workspace trust is not set for {}; run `cockpit trust set` first",
+                trust_root.root.display()
+            )
+        }
+        other => bail!("daemon returned unexpected response to workspace trust: {other:?}"),
+    };
+    use crate::daemon::proto::WorkspaceTrustMode as ProtoMode;
+    let runtime_mode = match mode {
+        ProtoMode::Trust => crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        ProtoMode::IgnoreConfig => crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
+        ProtoMode::Untrusted => {
+            bail!(
+                "workspace {} is untrusted; run `cockpit trust set` to trust it",
+                trust_root.root.display()
+            )
+        }
+    };
+    crate::config::trust::set_runtime_policy(trust_root, runtime_mode);
+    Ok(())
+}
+
+async fn resolve_requested_session_via_daemon(
+    args: &RunArgs,
+    client: &crate::daemon::client::DaemonClient,
+    root: &Path,
+) -> Result<Option<Uuid>> {
+    if let Some(session) = &args.session {
+        let session_id = Uuid::parse_str(session).context("parsing --session")?;
+        // Validate via the daemon's session lookup RPC.
+        let response = client
+            .request(crate::daemon::proto::Request::SessionLiveStatus {
+                session_ids: vec![session_id],
+            })
+            .await
+            .context("looking up --session via daemon")?
+            .map_err(|error| anyhow::anyhow!("daemon rejected session lookup: {error}"))?;
+        let statuses = match response {
+            crate::daemon::proto::Response::SessionLiveStatus { statuses } => statuses,
+            other => bail!("daemon returned unexpected response to session lookup: {other:?}"),
+        };
+        if statuses.is_empty() {
+            anyhow::bail!("unknown session {session_id}");
+        }
+        // Validate the session's project root matches the requested cwd/project
+        // (Finding 4): `cockpit run --session <id>` from workspace B must not
+        // attach to a session created for workspace A. The v10
+        // SessionLiveStatus response carries the session's canonical
+        // project_root for this check.
+        let status = &statuses[0];
+        if let Some(session_project_root) = &status.project_root {
+            let requested_root = root
+                .canonicalize()
+                .with_context(|| format!("canonicalizing run cwd {}", root.display()))?;
+            let session_root = Path::new(session_project_root)
+                .canonicalize()
+                .with_context(|| {
+                    format!("canonicalizing session project root {session_project_root}")
+                })?;
+            if session_root != requested_root {
+                anyhow::bail!(
+                    "session {session_id} belongs to {}, not {}; \
+                     run from that workspace or drop --session",
+                    session_root.display(),
+                    requested_root.display()
+                );
+            }
+        }
+        return Ok(Some(session_id));
     }
+    if !args.continue_session {
+        return Ok(None);
+    }
+    // For --continue, list sessions and find the most recent for this project.
+    let project_id = crate::session::project_id_for(root);
+    let response = client
+        .request(crate::daemon::proto::Request::ListSessions {
+            project_id: Some(project_id),
+            parent_session_id: None,
+            assistant_id: None,
+        })
+        .await
+        .context("listing sessions for --continue via daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected session list: {error}"))?;
+    let sessions = match response {
+        crate::daemon::proto::Response::Sessions { sessions } => sessions,
+        other => bail!("daemon returned unexpected response to session list: {other:?}"),
+    };
+    sessions
+        .first()
+        .map(|s| Some(s.session_id))
+        .ok_or_else(|| anyhow::anyhow!("no previous session for workspace {}", root.display()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,29 +211,6 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     if let Err(error) = validate_prompt(&prompt) {
         exit_run_error(format, 2, "empty_prompt", &error.to_string());
     }
-    let db = match crate::db::Db::open_default().context("opening cockpit DB") {
-        Ok(db) => db,
-        Err(error) => exit_run_error(format, 2, "configuration", &format!("{error:#}")),
-    };
-    emit_org_logging_indicator(&db).await;
-    if let Err(error) =
-        crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd).await
-    {
-        exit_run_error(format, 3, "workspace_trust", &error.to_string());
-    }
-
-    let requested_session = match resolve_requested_session(&args, &db, &cwd).await {
-        Ok(session) => session,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_files = match resolve_attachment_paths(&cwd, &args.file) {
-        Ok(paths) => paths,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_data = match load_and_validate_images(&image_files) {
-        Ok(images) => images,
-        Err(error) => exit_run_error(format, 2, "invalid_attachment", &format!("{error:#}")),
-    };
 
     let mode = if args.ephemeral {
         LifecycleMode::AlwaysEphemeral
@@ -135,6 +223,25 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         Err(error) => exit_run_error(format, 4, "daemon_connection", &format!("{error:#}")),
     };
     let client = daemon.client.clone();
+
+    // Preflight via daemon RPCs — the CLI never opens SQLite.
+    emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+    if let Err(error) = enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd).await {
+        exit_run_error(format, 3, "workspace_trust", &error.to_string());
+    }
+
+    let requested_session = match resolve_requested_session_via_daemon(&args, &client, &cwd).await {
+        Ok(session) => session,
+        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
+    };
+    let image_files = match resolve_attachment_paths(&cwd, &args.file) {
+        Ok(paths) => paths,
+        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
+    };
+    let image_data = match load_and_validate_images(&image_files) {
+        Ok(images) => images,
+        Err(error) => exit_run_error(format, 2, "invalid_attachment", &format!("{error:#}")),
+    };
 
     // Layer A: arm the shutdown backstop *only* when we own the daemon.
     // Held across every `?` below so an error return still reaps it.
@@ -521,41 +628,6 @@ fn resolve_run_cwd(cwd: Option<&Path>, project_alias: Option<&Path>) -> Result<P
     selected
         .canonicalize()
         .with_context(|| format!("canonicalizing run cwd {}", selected.display()))
-}
-
-async fn resolve_requested_session(
-    args: &RunArgs,
-    db: &crate::db::Db,
-    root: &Path,
-) -> Result<Option<Uuid>> {
-    if let Some(session) = &args.session {
-        let session_id = Uuid::parse_str(session).context("parsing --session")?;
-        let stored = db
-            .get_session(session_id)
-            .await
-            .context("looking up --session")?
-            .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
-        let stored_root = Path::new(&stored.project_root)
-            .canonicalize()
-            .with_context(|| format!("canonicalizing session root {}", stored.project_root))?;
-        if stored_root != root {
-            anyhow::bail!(
-                "session {session_id} belongs to {}; --cwd/--project selected {}",
-                stored_root.display(),
-                root.display()
-            );
-        }
-        return Ok(Some(session_id));
-    }
-    if !args.continue_session {
-        return Ok(None);
-    }
-
-    db.most_recent_session_for_root_by_message(&root.to_string_lossy())
-        .await
-        .context("selecting latest session for --continue")?
-        .map(|session| Some(session.session_id))
-        .ok_or_else(|| anyhow::anyhow!("no previous session for workspace {}", root.display()))
 }
 
 fn resolve_attachment_paths(root: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>> {

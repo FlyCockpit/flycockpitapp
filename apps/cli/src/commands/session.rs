@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::proto::{InterruptQuestion, Request, ResolveResponse, Response};
+use crate::daemon::client::{LifecycleMode, ensure_persistent_daemon, probe_or_spawn};
+use crate::daemon::proto::{Request, ResolveResponse, Response};
 use crate::db::Db;
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
@@ -28,16 +28,24 @@ pub async fn run(cmd: SessionCommand) -> Result<()> {
 async fn delete(session: &str, yes: bool) -> Result<()> {
     confirm_destructive(yes, "Delete this session and all local data")?;
     let session_id = Uuid::parse_str(session).context("parsing session id")?;
-    refuse_direct_write_while_daemon_running().await?;
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let session = db
-        .get_session(session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-    if session.ended_at.is_none() {
-        bail!("session {session_id} is active; end it before deleting");
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for session delete")?;
+    let client = daemon.client.clone();
+    match client
+        .request(Request::DeleteSession { session_id })
+        .await
+        .context("requesting session delete from daemon")?
+    {
+        Ok(Response::Ack) => {}
+        Ok(other) => bail!("daemon returned unexpected response to session delete: {other:?}"),
+        Err(error) => {
+            // The daemon rejects an active session with a typed Conflict
+            // error. Surface it the same way the CLI's old direct-DB path
+            // did ("session is active; end it before deleting").
+            bail!("{error}");
+        }
     }
-    db.delete_session(session_id).await?;
     println!("deleted session {session_id} and all associated local data");
     Ok(())
 }
@@ -130,17 +138,22 @@ fn confirm_destructive_with_io(
 }
 
 async fn list(args: SessionListArgs) -> Result<()> {
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let sessions = if let Some(assistant) = args.assistant.as_deref() {
-        let assistant = assistant.to_string();
-        let assistant_label = assistant.clone();
-        db.write(move |conn| Db::list_sessions_for_assistant_conn(conn, &assistant, false, 100))
-            .await
-            .with_context(|| format!("listing sessions for assistant `{assistant_label}`"))?
-    } else {
-        db.write(move |conn| Db::list_sessions_conn(conn, false, 100))
-            .await
-            .context("listing sessions")?
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for session list")?;
+    let client = daemon.client.clone();
+    let response = client
+        .request(Request::ListSessions {
+            project_id: None,
+            parent_session_id: None,
+            assistant_id: args.assistant.clone(),
+        })
+        .await
+        .context("requesting session list from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected session list request: {error}"))?;
+    let sessions = match response {
+        Response::Sessions { sessions } => sessions,
+        other => bail!("daemon returned unexpected response to session list: {other:?}"),
     };
     if sessions.is_empty() {
         println!("no sessions");
@@ -256,33 +269,6 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let session_id = Uuid::parse_str(&args.session).context("parsing --session")?;
     let interrupt_id = Uuid::parse_str(&args.interrupt).context("parsing --interrupt")?;
     let response = response_from_args(args)?;
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let row = db
-        .get_interrupt(interrupt_id)
-        .await
-        .context("loading interrupt")?
-        .ok_or_else(|| anyhow::anyhow!("interrupt {interrupt_id} not found"))?;
-    if row.session_id != session_id {
-        bail!(
-            "interrupt {interrupt_id} belongs to session {}, not {session_id}",
-            row.session_id
-        );
-    }
-    if row.resolved_at.is_some() {
-        ensure_repeat_response_matches(interrupt_id, &row.response, &response)?;
-        if args.json {
-            emit_json(&json!({
-                "event": "interrupt_resolved",
-                "session_id": session_id,
-                "interrupt_id": interrupt_id,
-                "status": "already_resolved"
-            }))?;
-        } else {
-            println!("interrupt {interrupt_id} is already resolved");
-        }
-        return Ok(());
-    }
-    validate_response(&row, &response)?;
 
     let daemon = probe_or_spawn(LifecycleMode::AttachOrEphemeral).await?;
     let client = daemon.client.clone();
@@ -338,6 +324,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_repeat_response_matches(
     interrupt_id: Uuid,
     existing: &Option<ResolveResponse>,
@@ -447,6 +434,7 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("compact answer is missing `{key}`"))
 }
 
+#[cfg(test)]
 fn validate_response(
     row: &crate::db::needs_attention::NeedsAttentionRow,
     response: &ResolveResponse,
@@ -477,7 +465,12 @@ fn validate_response(
     Ok(())
 }
 
-fn validate_one(question: &InterruptQuestion, response: &ResolveResponse) -> Result<()> {
+#[cfg(test)]
+fn validate_one(
+    question: &crate::daemon::proto::InterruptQuestion,
+    response: &ResolveResponse,
+) -> Result<()> {
+    use crate::daemon::proto::InterruptQuestion;
     match (question, response) {
         (InterruptQuestion::Single { options, .. }, ResolveResponse::Single { selected_id }) => {
             validate_option(options, selected_id)
@@ -497,6 +490,7 @@ fn validate_one(question: &InterruptQuestion, response: &ResolveResponse) -> Res
     }
 }
 
+#[cfg(test)]
 fn validate_option(
     options: &[crate::daemon::proto::InterruptOption],
     selected_id: &str,
@@ -516,7 +510,7 @@ fn emit_json(value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::{InterruptOption, InterruptQuestionSet};
+    use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crate::session::Session;
 
     fn option(id: &str) -> InterruptOption {

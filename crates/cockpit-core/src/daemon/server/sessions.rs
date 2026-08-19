@@ -6,6 +6,7 @@ pub(super) async fn list_sessions(
     principal: &ClientPrincipal,
     project_id: Option<String>,
     parent_session_id: Option<Uuid>,
+    assistant_id: Option<String>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The row assembly (level selection, fork counts, read/unread inputs)
     // lives in one place — `Db::list_session_summaries` — so the daemon
@@ -25,6 +26,23 @@ pub(super) async fn list_sessions(
         })
         .await
         .map_err(internal)?;
+    // v10-only assistant_id filter: retain only sessions whose
+    // `assistant_name` matches. `SessionSummary` does not carry
+    // `assistant_name`, so we look up the matching session ids from the
+    // DB when the filter is present.
+    if let Some(assistant) = assistant_id {
+        let assistant_for_db = assistant.clone();
+        let matching_ids = db
+            .read(move |conn| {
+                crate::db::Db::list_sessions_for_assistant_conn(conn, &assistant_for_db, false, 100)
+            })
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect::<std::collections::HashSet<_>>();
+        sessions.retain(|summary| matching_ids.contains(&summary.session_id));
+    }
     if !principal.is_owner() {
         sessions.retain(|summary| {
             session_access_for_summary(principal, summary) != SessionAccess::None
@@ -392,9 +410,10 @@ pub(super) async fn record_session_note(
 pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
+    negotiated_protocol_version: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match ctx.db.get_session(session_id).await {
-        Ok(Some(_)) => {}
+    let session = match ctx.db.get_session(session_id).await {
+        Ok(Some(session)) => session,
         Ok(None) => {
             return Err(ErrorPayload {
                 code: ErrorCode::UnknownSession,
@@ -402,6 +421,21 @@ pub(super) async fn delete_session(
             });
         }
         Err(e) => return Err(internal(e)),
+    };
+    // v10-only: reject deleting an active session. The CLI's existing
+    // behavior bails with "session is active; end it before deleting";
+    // the daemon must match — it must NOT stop-and-delete the active
+    // session. The session row remains intact.
+    //
+    // v9 clients retain the frozen behavior: stop-and-delete proceeds
+    // regardless of the active state. The negotiated protocol version
+    // gates this so a v9 envelope carrying the unchanged DeleteSession
+    // tag does not get the new rejection behavior.
+    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at.is_none() {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: format!("session {session_id} is active; end it before deleting"),
+        });
     }
     // Don't delete out from under a running worker (GOALS §17h): stop any
     // live workers in the affected subtree first — that cancels their

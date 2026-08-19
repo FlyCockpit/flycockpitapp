@@ -811,7 +811,7 @@
       "tag": "delete_project_note"
     },
     {
-      "class": "local_only",
+      "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|mode:enum16:WorkspaceTrustMode|expected_config_generation:u64",
       "fcorRoles": [
@@ -832,11 +832,11 @@
         }
       ],
       "fcorSchema": "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64",
-      "strategy": "none",
+      "strategy": "sql_transaction",
       "tag": "set_workspace_trust"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string",
       "fcorRoles": [
@@ -901,7 +901,7 @@
       "tag": "mark_app_flag_seen"
     },
     {
-      "class": "local_only",
+      "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "assistant_id:string|project_root:string|mode:enum16:AssistantSessionResolutionMode",
       "fcorRoles": [
@@ -922,11 +922,11 @@
         }
       ],
       "fcorSchema": "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode",
-      "strategy": "none",
+      "strategy": "sql_transaction",
       "tag": "resolve_assistant_session"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
@@ -965,7 +965,7 @@
       "tag": "upsert_assistant"
     },
     {
-      "class": "local_only",
+      "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "name:string|project_root:string|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|env_snapshot:option<struct:EnvSnapshotWire:v1>",
       "fcorRoles": [
@@ -996,7 +996,7 @@
         }
       ],
       "fcorSchema": "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>",
-      "strategy": "none",
+      "strategy": "sql_transaction",
       "tag": "create_assistant_session"
     },
     {
@@ -1040,7 +1040,7 @@
       "tag": "export_session_data"
     },
     {
-      "class": "local_only",
+      "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|as_new:bool",
       "fcorRoles": [
@@ -1056,7 +1056,7 @@
         }
       ],
       "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool",
-      "strategy": "none",
+      "strategy": "sql_transaction",
       "tag": "import_session_archive"
     },
     {
@@ -1105,7 +1105,7 @@
       "tag": "read_bulk_transfer_chunk"
     },
     {
-      "class": "local_only",
+      "class": "transactional_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|action:enum16:CuratorAction",
       "fcorRoles": [
@@ -1121,7 +1121,7 @@
         }
       ],
       "fcorSchema": "project_root:String|action:CuratorAction",
-      "strategy": "none",
+      "strategy": "sql_transaction",
       "tag": "curator"
     },
     {
@@ -1601,7 +1601,7 @@
     {
       "class": "read_only",
       "evidence": null,
-      "fcorCanonicalSchema": "project_id:option<string>|parent_session_id:option<uuid>",
+      "fcorCanonicalSchema": "project_id:option<string>|parent_session_id:option<uuid>|assistant_id:option<string>",
       "fcorRoles": [
         {
           "field": "project_id",
@@ -1612,9 +1612,14 @@
           "field": "parent_session_id",
           "role": "param",
           "type": "Option<Uuid>"
+        },
+        {
+          "field": "assistant_id",
+          "role": "param",
+          "type": "Option<String>"
         }
       ],
-      "fcorSchema": "project_id:Option<String>|parent_session_id:Option<Uuid>",
+      "fcorSchema": "project_id:Option<String>|parent_session_id:Option<Uuid>|assistant_id:Option<String>",
       "strategy": "none",
       "tag": "list_sessions"
     },
@@ -3196,7 +3201,7 @@
       "tag": "get_usage_counts"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_id:option<string>|range:enum16:StatsRange|by_role:bool",
       "fcorRoles": [

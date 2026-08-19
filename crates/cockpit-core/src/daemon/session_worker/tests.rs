@@ -2837,7 +2837,7 @@ async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending
 
     let live = LiveState::default();
     let interrupts = crate::engine::interrupt::InterruptHub::detached();
-    let (active, pending_tool_count) =
+    let (active, pending_tool_count, _committed) =
         shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
 
     assert!(active, "blocked-only sessions must be paused on shutdown");

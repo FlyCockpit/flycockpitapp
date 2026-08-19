@@ -5,6 +5,14 @@ use super::*;
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
+/// Poll cadence for the graceful-shutdown park-drain loop
+/// (`daemon-lifecycle-replay-timing-robustness.md`, finding 2): after each
+/// re-park it waits at most this long for the driver task to exit before
+/// re-parking again, so a fresh interrupt the in-flight turn registers is
+/// caught promptly. Bounded work; the drain path force-aborts the worker at its
+/// own deadline regardless, so this never blocks shutdown indefinitely.
+const PARK_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 pub(super) fn persistent_llm_mode_control(
     mode: crate::config::extended::LlmMode,
 ) -> crate::engine::driver::DriverControl {
@@ -626,6 +634,7 @@ pub(super) async fn run_worker(
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
     _global_bus: Option<EventSender>,
+    park_commit: crate::engine::interrupt::ParkCommit,
 ) {
     let session_id = session.id;
 
@@ -1069,13 +1078,20 @@ pub(super) async fn run_worker(
     // interrupt and block on the answer. We keep the same `Arc` so the
     // `ResolveInterrupt` handler below can wake the blocked tool. The
     // hub must be installed before the driver loop starts.
-    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
-        event_tx.clone(),
-        redaction.clone(),
-        interactive_clients,
-        session.db.clone(),
-        session_id,
-    ));
+    let interrupts = Arc::new(
+        crate::engine::interrupt::InterruptHub::new(
+            event_tx.clone(),
+            redaction.clone(),
+            interactive_clients,
+            session.db.clone(),
+            session_id,
+        )
+        // Wire the shared park-commit rendezvous
+        // (`daemon-lifecycle-replay-timing-robustness.md`) so this worker's
+        // waiter registration and `SessionWork::Shutdown` park land the
+        // drain-path synchronization signal.
+        .with_park_commit(park_commit.clone()),
+    );
     driver.set_interrupt_hub(interrupts.clone());
 
     // Command/path approval driver (sandboxing part 2). Built on the
@@ -1235,6 +1251,14 @@ pub(super) async fn run_worker(
         );
     }
 
+    // Releasable, debug-build + env-gated pause point
+    // (`daemon-lifecycle-replay-timing-robustness.md`, §3 / criterion 1): hold
+    // the attach reconciliation BEFORE the crash-surviving `Open → Parked`
+    // write so a test can prove the attach path awaits the park-commit signal.
+    // Bounded (self-releasing) so the fixed code's reconciliation still lands
+    // within `INTERRUPT_PARK_COMMIT_DEADLINE`; not the irreversible
+    // `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING` loop. Unreachable in release.
+    test_injected_park_delay("COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS").await;
     match session.db.list_reconcilable_interrupts(session_id).await {
         Ok(rows) => {
             for row in rows {
@@ -1294,6 +1318,13 @@ pub(super) async fn run_worker(
             tracing::warn!(%error, "interrupt reconciliation failed");
         }
     }
+    // Publish the attach-path park-commit edge
+    // (`daemon-lifecycle-replay-timing-robustness.md`, §3): the crash-surviving
+    // `Open → Parked` reconciliation above has now committed (or there was
+    // nothing to reconcile), so a client that attached and is awaiting this
+    // signal can observe the durable `Parked` row. Always fired (even on the
+    // error/empty paths) so `attach` never blocks to the deadline needlessly.
+    park_commit.report_startup_reconciled();
 
     // Session-only redaction source overrides (`/toggle-redaction`). The
     // base config is reloaded at every turn boundary so dotenv/settings/SSH
@@ -1335,6 +1366,10 @@ pub(super) async fn run_worker(
         mpsc::channel::<ParkedReplayCompletion>(WORK_QUEUE_CAPACITY);
     let mut driver_failed = false;
     let mut driver_joined = false;
+    // Whether every registered interrupt's shutdown park committed durably.
+    // Seeded by the initial snapshot's sweep and refined by the post-drain
+    // park-drain loop; reported once after the driver quiesces (finding 2).
+    let mut shutdown_park_committed = true;
     let stop = loop {
         let input = tokio::select! {
             biased;
@@ -3097,8 +3132,9 @@ pub(super) async fn run_worker(
                     }
                 }
                 SessionWork::Shutdown { pause_for_resume } => {
-                    let (active, pending_tool_count) =
+                    let (active, pending_tool_count, initial_committed) =
                         shutdown_activity_snapshot(&session, session_id, &interrupts, &live).await;
+                    shutdown_park_committed = initial_committed;
                     break WorkerStop::Shutdown {
                         pause_for_resume,
                         active,
@@ -3112,12 +3148,60 @@ pub(super) async fn run_worker(
     // Drain: close the driver input → the driver finishes its current
     // turn (if any) and exits. Then the engine event channel closes
     // and the forwarder task exits.
+    //
+    // Registration barrier (`daemon-lifecycle-replay-timing-robustness.md`,
+    // finding 2): closing the input FIRST admits no new turn, so the in-flight
+    // turn can only run to completion or block on an interrupt. On a graceful
+    // (resumable) shutdown we then run a park-drain loop — re-parking any
+    // interrupt the in-flight turn registers (waking a blocked driver so its
+    // turn ends) until the driver task exits — and only THEN report the
+    // shutdown park-commit. This closes the TOCTOU where a turn registered a
+    // waiter after the drain's initial snapshot: `Committed` is published only
+    // once no further registration is possible. The loop is bounded: the input
+    // is closed so the turn must terminate, and the drain path force-aborts
+    // this worker at its deadline regardless.
     driver_input_queue.close().await;
-    if !driver_joined {
-        let outcome = driver_join_outcome(driver_handle.await);
-        if let Some(error) = outcome.failure_error() {
-            tracing::warn!(session_id = %session_id, error = %error, "driver ended during worker drain");
+    let graceful_park = matches!(
+        stop,
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            ..
         }
+    );
+    if !driver_joined {
+        if graceful_park {
+            loop {
+                // Park first so a driver blocked on an interrupt is woken
+                // immediately (its tool returns Parked → the turn ends).
+                let sweep = interrupts.park_all_registered_collect().await;
+                shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+                match tokio::time::timeout(PARK_DRAIN_POLL_INTERVAL, &mut driver_handle).await {
+                    Ok(join_result) => {
+                        let outcome = driver_join_outcome(join_result);
+                        if let Some(error) = outcome.failure_error() {
+                            tracing::warn!(session_id = %session_id, error = %error, "driver ended during worker drain");
+                        }
+                        break;
+                    }
+                    // Driver still running/blocked: re-park (catch a fresh
+                    // registration) and keep waiting for it to exit.
+                    Err(_) => continue,
+                }
+            }
+        } else {
+            let outcome = driver_join_outcome(driver_handle.await);
+            if let Some(error) = outcome.failure_error() {
+                tracing::warn!(session_id = %session_id, error = %error, "driver ended during worker drain");
+            }
+        }
+    }
+    if graceful_park {
+        // Final sweep: the driver task has exited, so no further interrupt can
+        // be registered. Report the shutdown park-commit exactly once, now that
+        // it is sound: every registered-or-registerable interrupt is parked.
+        let sweep = interrupts.park_all_registered_collect().await;
+        shutdown_park_committed = shutdown_park_committed && sweep.all_committed;
+        interrupts.report_shutdown_commit(shutdown_park_committed);
     }
     drop(driver_input_queue);
     drop(engine_event_notice_tx);
@@ -3226,24 +3310,56 @@ fn update_authoritative_active_model_state(
     }
 }
 
+/// Releasable, debug-build + env-gated injected pause point
+/// (`daemon-lifecycle-replay-timing-robustness.md`, matching
+/// `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING`'s `cfg!(debug_assertions)` +
+/// env shape). Sleeps `<var>` milliseconds so a test can force the worst-case
+/// drain interleaving deterministically — the park write lands *after* the
+/// `--grace` deadline would have fired on the pre-fix code — without relying on
+/// host CPU starvation. Bounded/self-releasing, so the fixed drain path still
+/// observes a committed park within `INTERRUPT_PARK_COMMIT_DEADLINE`.
+/// Compiled out of release binaries entirely.
+async fn test_injected_park_delay(_var: &str) {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(ms) =
+            std::env::var_os(_var).and_then(|raw| raw.to_str().and_then(|s| s.parse::<u64>().ok()))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+}
+
 pub(super) async fn shutdown_activity_snapshot(
     session: &Session,
     session_id: Uuid,
     interrupts: &crate::engine::interrupt::InterruptHub,
     live: &LiveState,
-) -> (bool, i64) {
-    let parked_count = interrupts.park_all_registered().await;
+) -> (bool, i64, bool) {
+    // Injected worst-case interleaving for criteria 2/3/8: delay the shutdown
+    // park commit so the pre-fix drain path (which released pid/socket at the
+    // `--grace` deadline) races ahead of it, while the fixed path awaits the
+    // park-commit signal below.
+    test_injected_park_delay("COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS").await;
+    // Initial sweep only — the shutdown park-commit is NOT reported here.
+    // The worker re-parks (finding 2 registration barrier) and reports once,
+    // after the driver task exits, so `Committed` cannot be observed while an
+    // in-flight turn could still register a fresh interrupt. The sweep's
+    // write-commit status is threaded out so a failed *initial* park (whose
+    // waiter is then gone from the map and cannot be re-detected by a later
+    // sweep) still surfaces as a non-clean terminal.
+    let sweep = interrupts.park_all_registered_collect().await;
     let pending_tool_count = session
         .db
         .list_open_interrupts(session_id)
         .await
         .map(|rows| rows.len() as i64)
-        .unwrap_or(parked_count as i64);
+        .unwrap_or(sweep.count as i64);
     let active = {
         let (has_schedules, processing) = (live.has_active_schedules(), live.processing());
         has_schedules || processing || pending_tool_count > 0
     };
-    (active, pending_tool_count)
+    (active, pending_tool_count, sweep.all_committed)
 }
 
 #[cfg(test)]

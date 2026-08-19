@@ -1450,7 +1450,23 @@ async fn run_foreground_inner_with_boot_db(
     // aborts whatever remains.
     let drain_grace = ctx.take_shutdown_grace_override().unwrap_or(drain_grace);
     spawn_force_timer(ctx.clone(), drain_grace);
-    let drained_clean = ctx.registry.drain_all(drain_grace).await;
+    // `drain_all` now returns BOTH the grace-bounded running-work result and the
+    // decoupled interrupt-park commit terminal
+    // (`daemon-lifecycle-replay-timing-robustness.md`). Crucially it does not
+    // return until the park-commit has resolved (committed, known-failed write,
+    // or its own product-owned deadline) — so `metadata_guard.cleanup()` below,
+    // which releases the pid/socket the restart command polls, cannot fire while
+    // a registered interrupt waiter's park is still un-committed. A restart then
+    // never reports success (or lets the successor bind) with an interrupt row
+    // left `Open`.
+    let drain_outcome = ctx.registry.drain_all(drain_grace).await;
+    if !drain_outcome.park_commit.is_clean() {
+        tracing::warn!(
+            park_commit = ?drain_outcome.park_commit,
+            "daemon shutdown: interrupt park did not commit cleanly; not a clean park success"
+        );
+    }
+    let drained_clean = drain_outcome.is_clean();
     // Generation-bound containment barrier: clean shutdown only when every
     // containment is ProvenEmpty. Deadline/failure leaves Uncertain/Stopping
     // rows durable for restart reconciliation.

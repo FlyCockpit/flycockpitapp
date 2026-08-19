@@ -459,6 +459,11 @@ impl LiveState {
     pub fn tool_running(&self) -> bool {
         self.tool_running.load(Ordering::Relaxed) > 0
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_processing_for_test(&self, processing: bool) {
+        self.processing.store(processing, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]

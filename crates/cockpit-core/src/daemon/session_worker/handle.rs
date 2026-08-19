@@ -50,6 +50,13 @@ pub struct SessionWorkerHandle {
     /// before the corresponding broadcast so a later attach cannot fall back
     /// to a config snapshot that still lags a successful default write.
     authoritative_active_model_state: Arc<RwLock<Option<proto::ActiveModelState>>>,
+    /// Shared park-commit rendezvous
+    /// (`daemon-lifecycle-replay-timing-robustness.md`). Created here, wired
+    /// into the worker's `InterruptHub`, and read by the registry's drain path
+    /// (to gate `metadata_guard.cleanup()` on every registered interrupt's park
+    /// commit) and by the attach path (to wait for the worker's startup
+    /// reconciliation pass before returning).
+    park_commit: crate::engine::interrupt::ParkCommit,
 }
 
 const RECENT_TURN_COMPLETION_CAPACITY: usize = 64;
@@ -726,6 +733,16 @@ impl SessionWorkerHandle {
         let (event_tx, _event_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let redaction: SharedRedactionTable =
             Arc::new(RwLock::new(Arc::new(RedactionTable::empty())));
+        // Simulate a fully-started worker: a real `run_worker` reports its
+        // startup crash-reconciliation pass complete early in its life, so a
+        // resume-attach reconciliation gate resolves immediately
+        // (`daemon-lifecycle-replay-timing-robustness.md`, finding 3). A bare
+        // test handle has no `run_worker` to fire that signal, so mark it here —
+        // otherwise every resume-attach to a test worker would block on the
+        // per-resume reconciliation deadline. (Independent of the SHUTDOWN
+        // park-commit signal, which tests still drive explicitly.)
+        let park_commit = crate::engine::interrupt::ParkCommit::new();
+        park_commit.report_startup_reconciled();
         let handle = Self {
             session_id: session.id,
             project_root: session.project_root.clone(),
@@ -761,6 +778,7 @@ impl SessionWorkerHandle {
                 &session,
                 &crate::config::providers::ProvidersConfig::default(),
             ))),
+            park_commit,
         };
         (handle, work_rx)
     }
@@ -953,6 +971,23 @@ impl SessionWorkerHandle {
             locks: self.locks.clone(),
             live: self.live.clone(),
         }
+    }
+
+    /// The worker's shared park-commit rendezvous
+    /// (`daemon-lifecycle-replay-timing-robustness.md`). The registry drain
+    /// path reads [`crate::engine::interrupt::ParkCommit::has_registered_waiters`]
+    /// and awaits [`crate::engine::interrupt::ParkCommit::await_shutdown_commit`]
+    /// before releasing pid/socket; the attach path awaits
+    /// [`crate::engine::interrupt::ParkCommit::await_startup_reconciled`].
+    pub fn park_commit(&self) -> crate::engine::interrupt::ParkCommit {
+        self.park_commit.clone()
+    }
+
+    /// Test-only: mark this worker as mid-turn so drain treats it as owing a
+    /// park-commit (finding 2 obligation extension), without a live driver.
+    #[cfg(test)]
+    pub(crate) fn set_processing_for_test(&self, processing: bool) {
+        self.live.set_processing_for_test(processing);
     }
 }
 
@@ -1753,6 +1788,11 @@ pub fn spawn(
         &session,
         &config_snapshot.providers,
     )));
+    // Park-commit rendezvous (`daemon-lifecycle-replay-timing-robustness.md`):
+    // shared by the handle (read by the registry drain/attach paths) and the
+    // worker task (wired into its `InterruptHub`, and signalled when its
+    // startup reconciliation pass completes).
+    let park_commit = crate::engine::interrupt::ParkCommit::new();
     let config_snapshot = Arc::new(RwLock::new(config_snapshot));
 
     let handle = SessionWorkerHandle {
@@ -1775,6 +1815,7 @@ pub fn spawn(
         foreground: foreground.clone(),
         config_snapshot: config_snapshot.clone(),
         authoritative_active_model_state: authoritative_active_model_state.clone(),
+        park_commit: park_commit.clone(),
     };
 
     handle.probe_sandbox_unavailable();
@@ -1813,6 +1854,7 @@ pub fn spawn(
             scheduler,
             write_scope,
             global_bus,
+            park_commit,
         ));
         crate::config::trust::scope_workspace_trust_policy(trust_policy, worker).await;
     });

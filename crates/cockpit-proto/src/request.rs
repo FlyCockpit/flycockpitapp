@@ -2510,10 +2510,18 @@ macro_rules! command {
             // OAuth handshakes retain daemon-process PKCE/device state. They
             // cannot be safely replayed through a remote durable ledger after
             // reconnect/restart; only the final vault mutation is durable.
-            (Request::BeginProviderOAuth { provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "provider_id:String", [provider_id: String => param]);
-            (Request::CompleteProviderOAuth { flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
-            (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
-            (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
+            // Provider/MCP OAuth is split for clean remoting: `begin_*` is a
+            // NON-DURABLE handshake that returns only the authorize URL (public
+            // `state` + `code_challenge`) to the authenticated owner, so it needs
+            // no remote-ledger reservation (`read_only`, non-mutating; the PKCE
+            // `code_verifier` never leaves the daemon). `complete_*` is the
+            // DURABLE completion: it accepts the callback code, exchanges it
+            // server-side, and stores the tokens in the vault, so it reserves a
+            // nonrepeatable remote operation and replays its safe response.
+            (Request::BeginProviderOAuth { provider_id }, "begin_provider_oauth", owner_only, none, false, read_only, none, serialized, none, "provider_id:String", [provider_id: String => param]);
+            (Request::CompleteProviderOAuth { flow_id, input }, "complete_provider_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
+            (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
+            (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
             (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
             (Request::DeleteProviderCredential { provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|project_root:Option<String>", [provider_id: String => param, project_root: Option<String> => param]);
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
@@ -2522,17 +2530,17 @@ macro_rules! command {
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<String>> => param]);
-            (Request::SetupCopilotAuth { project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|provider_id:String", [project_root: String => project_root, provider_id: String => param]);
-            (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
+            (Request::SetupCopilotAuth { project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String", [project_root: String => project_root, provider_id: String => param]);
+            (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
             (Request::SaveMcpConfig { project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
-            (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
+            (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
-            (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
+            (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
             (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
-            (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, local_only, none, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
+            (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
@@ -3474,6 +3482,21 @@ mod tests {
                         | "save_mcp_config"
                         | "delete_provider_config"
                         | "set_provider_layer_metadata"
+                        // Owner-remoted settings/setup/OAuth mutations: durable
+                        // config writes reserve a nonrepeatable remote operation;
+                        // the OAuth `begin_*` handshakes carry the non-durable
+                        // `read_only` remote class (they return only the public
+                        // authorize URL), and `complete_*` reserves the durable
+                        // token-exchange operation.
+                        | "save_extended_config"
+                        | "save_image_spend_policy"
+                        | "import_policy"
+                        | "apply_setup_wizard"
+                        | "setup_copilot_auth"
+                        | "begin_provider_oauth"
+                        | "complete_provider_oauth"
+                        | "begin_mcp_oauth"
+                        | "complete_mcp_oauth"
                 );
                 if owner_remoted {
                     assert_ne!(declared_class, "local_only");

@@ -876,10 +876,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
-    // OAuth flows are process-local state (`request.rs` marks every one
-    // `local_only`), but they remain wire variants and therefore need a
-    // bounded lane classification for exhaustive decoding.  This table never
-    // grants remote eligibility.
+    // OAuth flows: `begin_*` is a non-durable `read_only` handshake and
+    // `complete_*` a durable `nonrepeatable_mutation` in `request.rs`, but both
+    // are wire variants that still need a bounded transport-lane classification
+    // for exhaustive decoding.  This lane table is independent of the
+    // remote-operation eligibility axis and never grants it.
     row(
         "begin_provider_oauth",
         RemoteMessageClass::BoundedRequestResponse,
@@ -915,10 +916,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
-    // Setup/copilot, wizard-apply, extended-config, policy import/export, and
-    // image-spend policy are `local_only` in `request.rs` (they never gain
-    // remote eligibility here), but they remain wire variants and so need a
-    // bounded lane classification for exhaustive decoding.
+    // Setup/copilot, wizard-apply, extended-config, and image-spend policy are
+    // owner-remoted `nonrepeatable_mutation`s in `request.rs`; policy
+    // export/get stay `local_only` reads.  Regardless of that eligibility axis,
+    // every one is a wire variant that needs a bounded transport-lane
+    // classification for exhaustive decoding, which is all this table assigns.
     row(
         "setup_copilot_auth",
         RemoteMessageClass::BoundedRequestResponse,

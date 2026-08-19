@@ -305,14 +305,33 @@ struct Pkce {
     challenge: String,
 }
 
+/// Fixed loopback redirect used for the REMOTE begin path, where the daemon
+/// binds no listener. The remote client is responsible for capturing the
+/// provider's redirect and returning the callback code over `CompleteMcpOAuth`;
+/// the token exchange re-sends this exact value, so it stays consistent between
+/// the authorize request and the code exchange (PKCE + `state` carry the
+/// binding security, not the redirect liveness).
+const REMOTE_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1/callback";
+
 /// Daemon-owned state for one MCP OAuth browser flow. The listener, PKCE
 /// verifier, and CSRF state never cross the daemon protocol boundary.
+///
+/// `listener` is `None` for a remote-owner flow: the daemon binds no host
+/// loopback listener and the callback code arrives over the RPC instead.
 pub struct McpOAuthFlow {
     oauth: OauthAuth,
     verifier: String,
     state: String,
     redirect_uri: String,
-    listener: tokio::net::TcpListener,
+    listener: Option<tokio::net::TcpListener>,
+}
+
+#[cfg(test)]
+impl McpOAuthFlow {
+    /// Whether this flow bound a local loopback listener (local-owner path).
+    pub fn has_local_listener(&self) -> bool {
+        self.listener.is_some()
+    }
 }
 
 fn generate_pkce() -> Pkce {
@@ -329,7 +348,18 @@ fn generate_pkce() -> Pkce {
 
 /// Start an MCP OAuth flow and return only the daemon-held flow plus the
 /// display-safe authorization URL.
-pub async fn begin_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<(McpOAuthFlow, String)> {
+///
+/// `local_display` gates the two LOCAL-HOST side effects: only a local owner
+/// gets a host loopback listener bound and the host browser opened. For a
+/// remote caller the daemon binds no listener and opens no browser — it returns
+/// the authorize URL only, and the callback code arrives over `CompleteMcpOAuth`
+/// (a remote caller could otherwise drive unsolicited host browser launches and
+/// attacker-controlled local browser navigation).
+pub async fn begin_oauth_flow(
+    server: &str,
+    cfg: &ServerConfig,
+    local_display: bool,
+) -> Result<(McpOAuthFlow, String)> {
     let Auth::Oauth(oauth) = &cfg.auth else {
         bail!("MCP server `{server}` is not configured for OAuth");
     };
@@ -337,15 +367,22 @@ pub async fn begin_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<(McpOA
     let mut state_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut state_bytes);
     let state = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_bytes);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let (listener, redirect_uri) = if local_display {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        (Some(listener), redirect_uri)
+    } else {
+        (None, REMOTE_LOOPBACK_REDIRECT_URI.to_string())
+    };
     let url = build_authorize_url(oauth, &redirect_uri, &pkce.challenge, &state)?;
     // Do NOT log the authorize URL. It carries flow parameters (`state`,
     // `code_challenge`) and spewing it to daemon/CLI logs is unnecessary: the
-    // URL is returned to the owner-only caller for display, and the browser is
-    // opened directly below.
-    let _ = crate::browser::open(&url);
+    // URL is returned to the owner-only caller for display. Open the host
+    // browser ONLY for a local owner; a remote caller presents the URL itself.
+    if local_display {
+        let _ = crate::browser::open(&url);
+    }
     Ok((
         McpOAuthFlow {
             oauth: oauth.clone(),
@@ -365,10 +402,19 @@ pub async fn complete_oauth_flow(
     flow: McpOAuthFlow,
     callback: Option<&str>,
 ) -> Result<StoredTokens> {
-    let (code, got_state) = match callback {
-        Some(callback) => parse_callback_target(callback),
-        None => Ok(wait_for_callback(flow.listener).await?),
-    }?;
+    let (code, got_state) = match (callback, flow.listener) {
+        // Explicit callback (the remote-owner path, and a local convenience):
+        // parse the code + CSRF state the client returned over the RPC.
+        (Some(callback), _) => parse_callback_target(callback)?,
+        // No callback + a bound listener: the local-owner browser flow waits on
+        // the host loopback listener for the provider's redirect.
+        (None, Some(listener)) => wait_for_callback(listener).await?,
+        // No callback + no listener: a remote-owner flow was started URL-only,
+        // so it can only complete with the callback code supplied over the RPC.
+        (None, None) => bail!(
+            "this MCP OAuth flow was started for a remote client; complete it with the callback code"
+        ),
+    };
     if got_state != flow.state {
         bail!("OAuth state mismatch (possible CSRF)");
     }
@@ -515,7 +561,9 @@ pub async fn run_oauth_flow(
     cfg: &ServerConfig,
     store: &mut crate::credentials::CredentialStore,
 ) -> Result<StoredTokens> {
-    let (flow, _) = begin_oauth_flow(server, cfg).await?;
+    // The interactive local flow: bind the host loopback listener and open the
+    // host browser (`local_display = true`), then block on the listener.
+    let (flow, _) = begin_oauth_flow(server, cfg, true).await?;
     let tokens = complete_oauth_flow(flow, None).await?;
     store.set_named_secret_and_save_published(cred_key(server), serde_json::to_string(&tokens)?)?;
     Ok(tokens)
@@ -660,6 +708,42 @@ mod tests {
             .expect_err("mock token endpoint must fail");
         server.await.expect("mock token endpoint task");
         assert!(!error.to_string().contains(secret_body));
+    }
+
+    #[tokio::test]
+    async fn begin_oauth_flow_remote_owner_binds_no_local_listener_or_browser() {
+        // A remote-owner begin (`local_display = false`) must NOT bind a host
+        // loopback listener (and, in the same gated branch, must NOT open the
+        // host browser). It returns the authorize URL, carrying the fixed remote
+        // loopback redirect the client is contracted to capture.
+        let mut cfg = base_server();
+        cfg.auth = Auth::Oauth(OauthAuth {
+            authorize_url: Some("https://provider.example/authorize".into()),
+            token_url: Some("https://provider.example/token".into()),
+            client_id: Some("client".into()),
+            scopes: vec!["read".into()],
+        });
+        let (flow, url) = begin_oauth_flow("srv", &cfg, false)
+            .await
+            .expect("remote begin must succeed URL-only");
+        assert!(
+            !flow.has_local_listener(),
+            "a remote-owner flow must not bind a host loopback listener"
+        );
+        assert!(url.starts_with("https://provider.example/authorize?"));
+        assert!(url.contains("code_challenge="));
+        let encoded_redirect = urlencoding::encode(REMOTE_LOOPBACK_REDIRECT_URI).into_owned();
+        assert!(
+            url.contains(encoded_redirect.as_str()),
+            "remote authorize URL must carry the fixed remote loopback redirect: {url}"
+        );
+
+        // A remote-started flow (no listener) cannot complete by waiting on a
+        // host listener; it must be given the callback code over the RPC.
+        let err = complete_oauth_flow(flow, None)
+            .await
+            .expect_err("a listener-less remote flow cannot self-complete");
+        assert!(err.to_string().contains("remote client"), "{err}");
     }
 
     #[test]

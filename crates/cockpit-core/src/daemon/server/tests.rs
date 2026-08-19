@@ -8393,6 +8393,518 @@ async fn remote_owner_named_secret_commits_vault_and_replay_ledger_together() {
     assert!(status.safe_response.is_some());
 }
 
+/// A fresh, well-formed remote-operation identity for the owner-remoted
+/// settings/setup/OAuth dispatch tests below. Mirrors the fields
+/// `admit_remote_operation` validates on a live remote actor binding.
+fn remote_owner_operation() -> RemoteOperationContext {
+    RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::new_v4(),
+        operation_id: Uuid::now_v7(),
+        authenticated_device_id: Uuid::new_v4(),
+        authenticated_device_generation: 1,
+    }
+}
+
+/// SECURITY (High): `setup_copilot_auth` adopts the daemon HOST's ambient
+/// GitHub token and injects it into a caller-selected provider's `Authorization`
+/// header. A REMOTE caller must NOT be able to trigger that adoption (it could
+/// steer the host token to an attacker-controlled provider URL). The remote
+/// dispatch is refused before the ambient token is ever read; the local dispatch
+/// (same ambient token) proceeds past the token read, proving the gate is
+/// remote-specific and not a blanket failure.
+#[tokio::test]
+async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
+    let ctx = persistent_test_ctx();
+    // Plant an ambient host GitHub token so a broken gate WOULD read and inject
+    // it (non-vacuity: the secret really is present to be leaked).
+    let sentinel = "GHOST-AMBIENT-TOKEN-9a8b7c6d";
+    {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("GITHUB_TOKEN".to_string(), sentinel.to_string());
+        *ctx.env_baseline.write().unwrap() = crate::env_snapshot::EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            vars,
+        );
+    }
+    let project_root = tempfile::tempdir().unwrap();
+    let build = |remote: bool| {
+        (
+            Request::SetupCopilotAuth {
+                project_root: project_root.path().to_string_lossy().into_owned(),
+                provider_id: "attacker-controlled-provider".into(),
+            },
+            remote,
+        )
+    };
+
+    // REMOTE dispatch: failed closed with the local-only refusal, BEFORE the
+    // ambient token is read.
+    let (request, _) = build(true);
+    let operation = remote_owner_operation();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let remote_err = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .expect_err("remote copilot setup must be refused");
+    assert!(
+        remote_err.message.contains("local-only"),
+        "remote must be refused by the ambient-token local gate, got: {}",
+        remote_err.message
+    );
+    assert!(
+        !remote_err.message.contains(sentinel),
+        "the ambient token must never appear in an error"
+    );
+
+    // LOCAL dispatch (same ambient token, no remote-operation context): the gate
+    // does NOT fire, so the handler reads the token and fails LATER on the
+    // unconfigured provider — a different error, proving the remote refusal is
+    // specific to remote callers (and that the local path still reads the token).
+    let (request, _) = build(false);
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let local_err = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        None,
+    )
+    .await
+    .expect_err("local copilot setup fails on the unconfigured provider");
+    assert!(
+        !local_err.message.contains("local-only"),
+        "the local gate must not fire for a local owner: {}",
+        local_err.message
+    );
+    assert!(!local_err.message.contains(sentinel), "no token in errors");
+}
+
+/// `SaveImageSpendPolicy` is owner-remoted: a remote owner's dispatch performs
+/// the DB write once, commits the durable replay record, and a same-operation
+/// replay returns the cached response without a second write.
+#[tokio::test]
+async fn remote_owner_save_image_spend_policy_commits_and_replays() {
+    let ctx = persistent_test_ctx();
+    let operation = remote_owner_operation();
+    let project_key = "remote-image-project";
+    // A valid, minimal policy: all three budgets `unlimited` so
+    // `ImageSpendSettings::validate` passes and the dispatch reaches the DB
+    // write rather than a validation rejection.
+    let request = Request::SaveImageSpendPolicy {
+        project_key: project_key.into(),
+        settings_json: r#"{"request":"unlimited","session":"unlimited","project":"unlimited"}"#
+            .into(),
+        expected_policy_version: None,
+    };
+    // Precondition / non-vacuity: no policy is stored yet, so a committed row is
+    // caused by this remote dispatch and not a pre-existing value.
+    assert!(
+        ctx.db
+            .current_image_spend_policy(project_key.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let first = handle_serialized_request_with_remote_operation(
+        request.clone(),
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::ImageSpendPolicySaved { .. }));
+    assert!(
+        ctx.db
+            .current_image_spend_policy(project_key.to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "the remote dispatch must persist the image-spend policy"
+    );
+    let replay = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap(),
+        "a same-operation replay returns the cached response"
+    );
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("committed image-spend policy operation");
+    assert_eq!(status.state, "committed");
+    assert!(status.safe_response.is_some());
+}
+
+/// `SaveExtendedConfig` is owner-remoted: a remote owner's dispatch writes the
+/// config to disk once, commits the durable replay record, and a same-operation
+/// replay returns the cached response without rewriting the file.
+#[tokio::test]
+async fn remote_owner_save_extended_config_commits_and_replays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+    // File-backed config source so the post-save `refresh_redaction_table`
+    // re-reads exactly what the dispatch wrote, as the on-disk daemon source
+    // does; it ignores the process cwd.
+    let config_path_for_source = config_path.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            let extended =
+                crate::config::extended::ExtendedConfigDoc::load(&config_path_for_source)
+                    .map(|doc| doc.config())
+                    .unwrap_or_default();
+            Ok((
+                crate::config::providers::ProvidersConfig::default(),
+                extended,
+            ))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let operation = remote_owner_operation();
+
+    let marker = "REMOTE-SAVE-MARKER-4d5e6f70";
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.redact.enabled = true;
+    extended.redact.denylist = vec![marker.to_string()];
+    let content = serde_json::to_string(&extended).unwrap();
+    // Precondition / non-vacuity: the marker is not on disk before the save.
+    assert!(
+        !std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(marker)
+    );
+    let request = Request::SaveExtendedConfig {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        path: "config.json".into(),
+        content,
+        base_hash: None,
+    };
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let first = handle_serialized_request_with_remote_operation(
+        request.clone(),
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, Response::ExtendedConfigSaved { .. }));
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(marker),
+        "the remote dispatch must write the config to disk"
+    );
+    let replay = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap(),
+    );
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("committed save_extended_config operation");
+    assert_eq!(status.state, "committed");
+}
+
+/// `ImportPolicy` is owner-remoted AND keeps the batch's vault-only custody
+/// guarantee on the remote path: an imported literal credential is rejected
+/// before anything is written to config, and the reserved remote operation is
+/// closed `outcome_unknown` so a retry cannot re-run the partial import.
+#[tokio::test]
+async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger() {
+    let ctx = persistent_test_ctx();
+    let operation = remote_owner_operation();
+    let tmp = tempfile::tempdir().unwrap();
+    let literal_key = "LITERAL-REMOTE-APIKEY-8f7e6d5c";
+    // A hand-crafted bundle carrying a literal `Authorization` header — the same
+    // shape the local-path custody guard rejects (bundle version is 1).
+    let bundle = serde_json::json!({
+        "version": 1,
+        "providers": {
+            "providers": {
+                "custom": {
+                    "url": "https://p.example/v1",
+                    "headers": [
+                        {"name": "Authorization", "value": format!("Bearer {literal_key}")},
+                    ],
+                }
+            }
+        }
+    });
+    let request = Request::ImportPolicy {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        bundle_json: serde_json::to_string(&bundle).unwrap(),
+        replace: false,
+    };
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    let error = handle_serialized_request_with_remote_operation(
+        request.clone(),
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await
+    .expect_err("a literal-credential bundle must be rejected on the remote path");
+    assert!(
+        error.message.contains("literal credential"),
+        "rejection must be the vault-only custody guard, not an unrelated error: {}",
+        error.message
+    );
+    // Fail-closed: no config under the temp project may carry the literal.
+    let leaked = std::fs::read_to_string(tmp.path().join(".cockpit").join("config.json"))
+        .map(|written| written.contains(literal_key))
+        .unwrap_or(false);
+    assert!(!leaked, "import persisted a literal credential into config");
+    // The reserved remote operation is closed unknown so a retry cannot re-run
+    // the partially-validated import.
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("import_policy reserved a durable replay record on the remote path");
+    assert_eq!(status.state, "outcome_unknown");
+    // A same-operation retry is refused (never re-runs the mutation).
+    let replay = handle_serialized_request_with_remote_operation(
+        request,
+        &mut state,
+        &shared,
+        &ctx,
+        &mut effects,
+        Some(&operation),
+    )
+    .await;
+    assert!(replay.is_err(), "a closed operation must not re-run");
+}
+
+/// The three remaining owner-remoted setup/OAuth mutations are reachable by a
+/// remote owner (they reserve a durable replay record before dispatch) and are
+/// ledger-wired (a domain failure closes the record `outcome_unknown` and a
+/// same-operation retry is refused rather than re-run). Their happy paths need a
+/// live provider exchange / GitHub token that a unit test cannot supply, so this
+/// drives the reachable failure edge, which the dispatch wiring — not the domain
+/// outcome — determines.
+#[tokio::test]
+async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
+    for request in [
+        Request::ApplySetupWizard {
+            project_root: tempfile::tempdir()
+                .unwrap()
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+            // Recognized wizard id; empty answers fail inside the handler.
+            wizard_id: "security".into(),
+            answers_json: "{}".into(),
+        },
+        Request::SetupCopilotAuth {
+            project_root: tempfile::tempdir()
+                .unwrap()
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+            provider_id: "unconfigured-provider".into(),
+        },
+        Request::CompleteProviderOAuth {
+            flow_id: Uuid::new_v4().to_string(),
+            input: Some("https://callback.example/?code=unknown-flow".into()),
+        },
+        Request::CompleteMcpOAuth {
+            flow_id: Uuid::new_v4().to_string(),
+            input: Some("unknown-flow-code".into()),
+        },
+    ] {
+        let ctx = persistent_test_ctx();
+        let operation = remote_owner_operation();
+        let mut state = owner_state();
+        let shared = state.shared_snapshot();
+        let mut effects = ClientRequestEffects::default();
+        // Reachable: the dispatch is admitted and its domain step fails.
+        let outcome = handle_serialized_request_with_remote_operation(
+            request.clone(),
+            &mut state,
+            &shared,
+            &ctx,
+            &mut effects,
+            Some(&operation),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the unit-test failure edge must surface an error for {request:?}"
+        );
+        // Ledger-wired: the operation reserved a durable record and closed it
+        // unknown (proves `begin`/`finish` ran; absent wiring leaves no row).
+        let status = ctx
+            .db
+            .remote_operation_status(
+                &operation.logical_attachment_id.to_string(),
+                &operation.operation_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no durable replay record reserved for {request:?}"));
+        assert_eq!(status.state, "outcome_unknown", "{request:?}");
+        // A same-operation retry is refused, never re-running the mutation.
+        let replay = handle_serialized_request_with_remote_operation(
+            request.clone(),
+            &mut state,
+            &shared,
+            &ctx,
+            &mut effects,
+            Some(&operation),
+        )
+        .await;
+        assert!(
+            replay.is_err(),
+            "a closed operation must not re-run: {request:?}"
+        );
+    }
+}
+
+/// The OAuth wire shapes carry no PKCE verifier or token: `begin_*` returns only
+/// the public authorize URL (+ optional user code) and `complete_*` returns only
+/// a boolean outcome. This locks the response projection so a future field can't
+/// silently leak the daemon-held secret onto the protocol.
+#[tokio::test]
+async fn oauth_wire_shapes_carry_no_verifier_or_token() {
+    let verifier = "PKCE-VERIFIER-SENTINEL-1a2b3c4d";
+    let token = "ACCESS-TOKEN-SENTINEL-5e6f7a8b";
+    // Authorize URLs legitimately carry the PUBLIC state + code_challenge; build
+    // one and assert the projection carries the challenge, never the verifier.
+    let started = [
+        Response::ProviderOAuthStarted {
+            flow_id: Uuid::new_v4().to_string(),
+            authorize_url: "https://auth.example/authorize?state=abc&code_challenge=PUB-CHALLENGE&code_challenge_method=S256".into(),
+            user_code: Some("WXYZ-1234".into()),
+        },
+        Response::McpOAuthStarted {
+            flow_id: Uuid::new_v4().to_string(),
+            authorize_url: "https://mcp.example/authorize?state=def&code_challenge=PUB-CHALLENGE".into(),
+        },
+    ];
+    for response in &started {
+        let json = serde_json::to_string(response).unwrap();
+        assert!(
+            json.contains("code_challenge"),
+            "public challenge is expected: {json}"
+        );
+        assert!(
+            !json.contains(verifier),
+            "authorize projection leaked the verifier: {json}"
+        );
+        assert!(
+            !json.contains("code_verifier"),
+            "no verifier field may exist: {json}"
+        );
+        assert!(
+            !json.contains(token),
+            "authorize projection leaked a token: {json}"
+        );
+    }
+    let completed = [
+        Response::ProviderOAuthCompleted {
+            logged_in: true,
+            retry_after_seconds: None,
+        },
+        Response::McpOAuthCompleted {
+            authenticated: true,
+        },
+    ];
+    for response in &completed {
+        let json = serde_json::to_string(response).unwrap();
+        let debug = format!("{response:?}");
+        for text in [json, debug] {
+            assert!(
+                !text.contains(verifier),
+                "completion leaked the verifier: {text}"
+            );
+            assert!(!text.contains(token), "completion leaked a token: {text}");
+            assert!(
+                !text.contains("access_token"),
+                "no token field may exist: {text}"
+            );
+            assert!(
+                !text.contains("code_verifier"),
+                "no verifier field may exist: {text}"
+            );
+        }
+    }
+    // The durable `complete_*` request carries only the client-supplied flow id
+    // and callback input — never the server-held verifier — and its canonical
+    // remote-operation params encode exactly those two fields.
+    let request = Request::CompleteProviderOAuth {
+        flow_id: "flow-123".into(),
+        input: Some("https://callback.example/?code=abc".into()),
+    };
+    let params = request.canonical_remote_operation_params_v1().unwrap();
+    assert!(
+        !params
+            .windows(verifier.len())
+            .any(|w| w == verifier.as_bytes())
+    );
+}
+
 #[tokio::test]
 async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then_poisons_daemon() {
     let ctx = persistent_test_ctx_with_credential_path(
@@ -19479,9 +19991,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::CompleteProviderOAuth { flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::CompleteMcpOAuth { flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

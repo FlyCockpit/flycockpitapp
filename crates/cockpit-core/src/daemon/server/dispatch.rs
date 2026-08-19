@@ -207,6 +207,30 @@ fn oauth_owner(state: &MutableClientState) -> String {
         .unwrap_or_else(|| "local-owner".to_string())
 }
 
+/// Authentic "this request may perform LOCAL-HOST actions" signal for handlers
+/// that would otherwise open a host browser, bind a host loopback listener, or
+/// adopt the host's ambient environment secrets.
+///
+/// Both inputs are assigned by the daemon, never by the caller:
+/// - `state.principal` is set at connection authentication from the transport
+///   (a local unix-domain socket yields `ClientPrincipal::Owner`; a relay /
+///   attempt-grant connection yields `ClientPrincipal::Remote` via the daemon's
+///   verified constructors). A caller cannot present itself as `Owner`.
+/// - `remote_operation` is produced only by `admit_remote_operation` from a
+///   daemon-verified device actor binding; a genuine local owner always yields
+///   `None` (admission short-circuits on `is_owner()`), and it cannot be forged.
+///
+/// Requiring BOTH (`is_owner()` AND no remote-operation context) can only make
+/// the gate MORE restrictive, so it never downgrades a remote caller to local;
+/// it additionally treats a remote-operation ledger dispatch as remote even when
+/// the ledger path is exercised with an owner principal.
+fn is_local_owner_action(
+    state: &MutableClientState,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> bool {
+    state.principal.is_owner() && remote_operation.is_none()
+}
+
 #[cfg(test)]
 mod oauth_store_tests {
     use super::*;
@@ -3143,25 +3167,62 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             content,
             base_hash,
         } => {
-            let response =
-                crate::daemon::fs_api::save_extended_config(project_root, path, content, base_hash)
-                    .await?;
-            // The saved config can change `redact.denylist`. The committed
-            // global redaction table is otherwise rebuilt only when the vault
-            // inventory generation advances (see `broadcast_global`), so a
-            // config-only denylist change would leave the next global broadcast
-            // scrubbing against a STALE table and disclose a newly denylisted
-            // secret. Rebuild the table now — mirroring how owner-vault
-            // mutations publish theirs — so every subsequent broadcast uses the
-            // fresh denylist. This runs once per (rare) config mutation, never
-            // per broadcast, so it does not reintroduce the per-event fork/scan
-            // storm. A rebuild failure must not be swallowed: retaining the
-            // stale table could disclose the secret, so poison the daemon.
-            if let Err(error) = ctx.refresh_redaction_table() {
-                ctx.poison_redaction_publication(&error);
-                return Err(internal(error));
+            let request = Request::SaveExtendedConfig {
+                project_root: project_root.clone(),
+                path: path.clone(),
+                content: content.clone(),
+                base_hash: base_hash.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
             }
-            Ok(response)
+            // A durable config write. It touches the filesystem, so it cannot
+            // share the SQLite transaction that commits the remote replay
+            // record; `finish_remote_provider_mutation` closes the reserved
+            // operation as unknown on any error (an atomic replacement may have
+            // reached disk) so a retry never rewrites the config a second time.
+            let mutation = async {
+                let response = crate::daemon::fs_api::save_extended_config(
+                    project_root,
+                    path,
+                    content,
+                    base_hash,
+                )
+                .await?;
+                // The saved config can change `redact.denylist`. The committed
+                // global redaction table is otherwise rebuilt only when the
+                // vault inventory generation advances (see `broadcast_global`),
+                // so a config-only denylist change would leave the next global
+                // broadcast scrubbing against a STALE table and disclose a newly
+                // denylisted secret. Rebuild the table now — mirroring how
+                // owner-vault mutations publish theirs — so every subsequent
+                // broadcast uses the fresh denylist. This runs once per (rare)
+                // config mutation, never per broadcast, so it does not
+                // reintroduce the per-event fork/scan storm. A rebuild failure
+                // must not be swallowed: retaining the stale table could
+                // disclose the secret, so poison the daemon.
+                if let Err(error) = ctx.refresh_redaction_table() {
+                    ctx.poison_redaction_publication(&error);
+                    return Err(internal(error));
+                }
+                Ok(response)
+            };
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "save_extended_config",
+                        mutation,
+                    )
+                    .await
+                }
+                None => mutation.await,
+            }
         }
 
         Request::ExportPolicy { project_root } => {
@@ -3179,22 +3240,46 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             bundle_json,
             replace,
         } => {
+            let request = Request::ImportPolicy {
+                project_root: project_root.clone(),
+                bundle_json: bundle_json.clone(),
+                replace,
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            // Import stages any literal credentials into the vault (never into
+            // config) inside `crate::policy::import`; the vault handle is passed
+            // through unchanged on the remote path so the vault-only custody
+            // guarantee holds identically for a remote owner.
             let import_vault = ctx.secret_vault.clone();
-            let (target, provider_count) = tokio::task::spawn_blocking(move || {
-                crate::policy::import(
-                    std::path::Path::new(&project_root),
-                    &bundle_json,
-                    replace,
-                    Some(import_vault),
-                )
-            })
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
-            Ok(Response::PolicyImported {
-                target: target.display().to_string(),
-                provider_count,
-            })
+            let mutation = async move {
+                let (target, provider_count) = tokio::task::spawn_blocking(move || {
+                    crate::policy::import(
+                        std::path::Path::new(&project_root),
+                        &bundle_json,
+                        replace,
+                        Some(import_vault),
+                    )
+                })
+                .await
+                .map_err(internal)?
+                .map_err(internal)?;
+                Ok(Response::PolicyImported {
+                    target: target.display().to_string(),
+                    provider_count,
+                })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(operation, ctx, "import_policy", mutation).await
+                }
+                None => mutation.await,
+            }
         }
 
         Request::GetImageSpendPolicy { project_key } => {
@@ -3214,22 +3299,49 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             settings_json,
             expected_policy_version,
         } => {
-            let settings = serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: format!("invalid image spend settings: {error}"),
-            })?;
-            let saved = cockpit_config::config::image_spend::activate_saved_policy(
-                &ctx.db,
-                project_key,
-                settings,
+            let request = Request::SaveImageSpendPolicy {
+                project_key: project_key.clone(),
+                settings_json: settings_json.clone(),
                 expected_policy_version,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await
-            .map_err(internal)?;
-            Ok(Response::ImageSpendPolicySaved {
-                policy_version: saved.policy_version,
-            })
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let mutation = async {
+                let settings =
+                    serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: format!("invalid image spend settings: {error}"),
+                    })?;
+                let saved = cockpit_config::config::image_spend::activate_saved_policy(
+                    &ctx.db,
+                    project_key,
+                    settings,
+                    expected_policy_version,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+                Ok(Response::ImageSpendPolicySaved {
+                    policy_version: saved.policy_version,
+                })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "save_image_spend_policy",
+                        mutation,
+                    )
+                    .await
+                }
+                None => mutation.await,
+            }
         }
 
         Request::FsCreateDir { project_root, path } => {
@@ -5250,95 +5362,132 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            // Atomically claim the one-shot flow before any provider network
-            // exchange. A second concurrent completion therefore fails at
-            // lookup instead of issuing another token set. Restore only when
-            // validation or the pre-persistence exchange fails; once the
-            // provider has exchanged the code, replay must remain rejected.
-            let owner = oauth_owner(state);
-            let flow = ctx
-                .oauth_flows
-                .take_provider(&flow_id, &owner)
-                .await
-                .ok_or_else(|| {
-                    bad_request("provider OAuth flow is unknown or already completed")
-                })?;
-            let ready = match flow {
-                ProviderOAuthFlow::Ready(ready) => ready,
-                ProviderOAuthFlow::Completing => {
-                    return Err(bad_request("provider OAuth flow is already completing"));
-                }
+            let request = Request::CompleteProviderOAuth {
+                flow_id: flow_id.clone(),
+                input: input.clone(),
             };
-            let exchange_ready = ready.clone();
-            let exchange = match exchange_ready {
-                ProviderOAuthReady::Grok(login) => {
-                    let Some(callback) = input.as_deref() else {
-                        ctx.oauth_flows
-                            .restore_provider(
-                                flow_id,
-                                owner.clone(),
-                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
-                            )
-                            .await;
-                        return Err(bad_request(
-                            "Grok OAuth completion requires a callback URL or code",
-                        ));
-                    };
-                    crate::auth::xai_oauth::complete_manual_login_unpersisted(login, callback)
-                        .await
-                        .map_err(internal)
-                        .and_then(|tokens| {
-                            serde_json::to_vec(&tokens)
-                                .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
-                                .map_err(internal)
-                        })
-                }
-                ProviderOAuthReady::Codex(login) => {
-                    if input.is_some() {
-                        ctx.oauth_flows
-                            .restore_provider(
-                                flow_id,
-                                owner.clone(),
-                                ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
-                            )
-                            .await;
-                        return Err(bad_request(
-                            "Codex device OAuth does not accept callback input",
-                        ));
+            // The durable completion reserves a nonrepeatable remote operation
+            // before the one-shot exchange so an authenticated remote owner can
+            // retry it idempotently: a replay returns the cached safe response
+            // (which carries no token) without re-running the exchange. The PKCE
+            // verifier and the exchanged tokens stay server-side / in the vault
+            // and never enter the ledger's safe response or any log.
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let mutation = async {
+                // Atomically claim the one-shot flow before any provider network
+                // exchange. A second concurrent completion therefore fails at
+                // lookup instead of issuing another token set. Restore only when
+                // validation or the pre-persistence exchange fails; once the
+                // provider has exchanged the code, replay must remain rejected.
+                let owner = oauth_owner(state);
+                let flow = ctx
+                    .oauth_flows
+                    .take_provider(&flow_id, &owner)
+                    .await
+                    .ok_or_else(|| {
+                        bad_request("provider OAuth flow is unknown or already completed")
+                    })?;
+                let ready = match flow {
+                    ProviderOAuthFlow::Ready(ready) => ready,
+                    ProviderOAuthFlow::Completing => {
+                        return Err(bad_request("provider OAuth flow is already completing"));
                     }
-                    crate::auth::codex_oauth::complete_device_code_login_unpersisted(login)
-                        .await
-                        .map_err(internal)
-                        .and_then(|tokens| {
-                            serde_json::to_vec(&tokens)
-                                .map(|record| (crate::auth::codex_oauth::CREDENTIAL_KEY, record))
-                                .map_err(internal)
-                        })
-                }
+                };
+                let exchange_ready = ready.clone();
+                let exchange = match exchange_ready {
+                    ProviderOAuthReady::Grok(login) => {
+                        let Some(callback) = input.as_deref() else {
+                            ctx.oauth_flows
+                                .restore_provider(
+                                    flow_id,
+                                    owner.clone(),
+                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
+                                )
+                                .await;
+                            return Err(bad_request(
+                                "Grok OAuth completion requires a callback URL or code",
+                            ));
+                        };
+                        crate::auth::xai_oauth::complete_manual_login_unpersisted(login, callback)
+                            .await
+                            .map_err(internal)
+                            .and_then(|tokens| {
+                                serde_json::to_vec(&tokens)
+                                    .map(|record| (crate::auth::xai_oauth::CREDENTIAL_KEY, record))
+                                    .map_err(internal)
+                            })
+                    }
+                    ProviderOAuthReady::Codex(login) => {
+                        if input.is_some() {
+                            ctx.oauth_flows
+                                .restore_provider(
+                                    flow_id,
+                                    owner.clone(),
+                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+                                )
+                                .await;
+                            return Err(bad_request(
+                                "Codex device OAuth does not accept callback input",
+                            ));
+                        }
+                        crate::auth::codex_oauth::complete_device_code_login_unpersisted(login)
+                            .await
+                            .map_err(internal)
+                            .and_then(|tokens| {
+                                serde_json::to_vec(&tokens)
+                                    .map(|record| {
+                                        (crate::auth::codex_oauth::CREDENTIAL_KEY, record)
+                                    })
+                                    .map_err(internal)
+                            })
+                    }
+                };
+                let (provider_id, record) = match exchange {
+                    Ok(value) => value,
+                    Err(error) => {
+                        ctx.oauth_flows
+                            .restore_provider(
+                                flow_id,
+                                owner.clone(),
+                                ProviderOAuthFlow::Ready(ready),
+                            )
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    provider_id,
+                    Some(&record),
+                )
+                .map_err(internal)?;
+                // The token record is now durable; consuming the one-time flow
+                // prevents a duplicate exchange after a successful completion.
+                ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
+                Ok(Response::ProviderOAuthCompleted {
+                    logged_in: true,
+                    retry_after_seconds: None,
+                })
             };
-            let (provider_id, record) = match exchange {
-                Ok(value) => value,
-                Err(error) => {
-                    ctx.oauth_flows
-                        .restore_provider(flow_id, owner.clone(), ProviderOAuthFlow::Ready(ready))
-                        .await;
-                    return Err(error);
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(
+                        operation,
+                        ctx,
+                        "complete_provider_oauth",
+                        mutation,
+                    )
+                    .await
                 }
-            };
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            ctx.mutate_owner_vault_item(
-                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                provider_id,
-                Some(&record),
-            )
-            .map_err(internal)?;
-            // The token record is now durable; consuming the one-time flow
-            // prevents a duplicate exchange after a successful completion.
-            ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
-            Ok(Response::ProviderOAuthCompleted {
-                logged_in: true,
-                retry_after_seconds: None,
-            })
+                None => mutation.await,
+            }
         }
 
         Request::BeginMcpOAuth {
@@ -5376,9 +5525,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 [crate::mcp::auth::cred_key(&server)],
             )
             .await?;
-            let (flow, authorize_url) = crate::mcp::auth::begin_oauth_flow(&server, server_config)
-                .await
-                .map_err(internal)?;
+            // Only a LOCAL owner may have the daemon open a host browser and
+            // bind a host loopback listener for the callback. For a remote
+            // caller the daemon returns the authorize URL only (no browser, no
+            // listener); the remote client presents it and returns the callback
+            // code over `CompleteMcpOAuth`. `is_local_owner_action` derives this
+            // from daemon-assigned signals the caller cannot forge.
+            let local_display = is_local_owner_action(state, remote_operation);
+            let (flow, authorize_url) =
+                crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
+                    .await
+                    .map_err(internal)?;
             let flow_id = uuid::Uuid::new_v4().to_string();
             ctx.oauth_flows
                 .insert_mcp(
@@ -5403,71 +5560,97 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
             }
-            let owner = oauth_owner(state);
-            let pending = ctx
-                .oauth_flows
-                .take_mcp(&flow_id, &owner)
-                .await
-                .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
-            // Once claimed, this flow is one-shot. A provider exchange may have
-            // consumed its authorization code even if vault persistence fails,
-            // so it must not be reinserted for a second exchange.
-            let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
-                .await
-                .map_err(internal)?;
-            let record = serde_json::to_vec(&tokens).map_err(internal)?;
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            let credential_key = crate::mcp::auth::cred_key(&pending.server);
-            let owner_root = pending.project_root.clone();
-            let vault = ctx.secret_vault.clone();
-            ctx.db
-                .transaction(move |conn| {
-                    // ATOMIC cross-kind admission for the flow-managed OAuth
-                    // token key. The `ensure_mcp_ownership_available` check ran
-                    // back at `StartMcpOAuth`; a provider (or another workspace)
-                    // could have claimed `mcp:<server>` during the OAuth round
-                    // trip. Re-check INSIDE this `BEGIN IMMEDIATE` transaction so
-                    // the completion cannot overwrite a foreign-owned secret. A
-                    // conflict fails closed (the token must be re-authorized)
-                    // rather than clobbering another owner's live value.
-                    reject_conflicting_named_ownership_on_conn(
-                        conn,
-                        &credential_key,
-                        "mcp",
-                        &owner_root,
-                    )?;
-                    vault
-                        .mutate_item_on_conn(
+            let request = Request::CompleteMcpOAuth {
+                flow_id: flow_id.clone(),
+                input: input.clone(),
+            };
+            // Durable MCP OAuth completion: reserve a nonrepeatable remote
+            // operation before the one-shot exchange so a remote owner can retry
+            // idempotently (a replay returns the cached, token-free safe
+            // response). The exchanged tokens are staged into the vault inside
+            // the BEGIN IMMEDIATE transaction below and never enter the ledger
+            // safe response or any log.
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let mutation = async {
+                let owner = oauth_owner(state);
+                let pending = ctx
+                    .oauth_flows
+                    .take_mcp(&flow_id, &owner)
+                    .await
+                    .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
+                // Once claimed, this flow is one-shot. A provider exchange may have
+                // consumed its authorization code even if vault persistence fails,
+                // so it must not be reinserted for a second exchange.
+                let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
+                    .await
+                    .map_err(internal)?;
+                let record = serde_json::to_vec(&tokens).map_err(internal)?;
+                let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                let credential_key = crate::mcp::auth::cred_key(&pending.server);
+                let owner_root = pending.project_root.clone();
+                let vault = ctx.secret_vault.clone();
+                ctx.db
+                    .transaction(move |conn| {
+                        // ATOMIC cross-kind admission for the flow-managed OAuth
+                        // token key. The `ensure_mcp_ownership_available` check ran
+                        // back at `StartMcpOAuth`; a provider (or another workspace)
+                        // could have claimed `mcp:<server>` during the OAuth round
+                        // trip. Re-check INSIDE this `BEGIN IMMEDIATE` transaction so
+                        // the completion cannot overwrite a foreign-owned secret. A
+                        // conflict fails closed (the token must be re-authorized)
+                        // rather than clobbering another owner's live value.
+                        reject_conflicting_named_ownership_on_conn(
                             conn,
-                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
                             &credential_key,
-                            Some(&record),
-                        )
-                        .map_err(|error| anyhow::anyhow!(error))?;
-                    conn.execute(
-                        "INSERT OR IGNORE INTO secret_named_ownership
+                            "mcp",
+                            &owner_root,
+                        )?;
+                        vault
+                            .mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                                &credential_key,
+                                Some(&record),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        conn.execute(
+                            "INSERT OR IGNORE INTO secret_named_ownership
                          (item_id, owner_kind, project_root, created_at)
                          VALUES (?1, 'mcp', ?2, ?3)",
-                        rusqlite::params![
-                            credential_key,
-                            owner_root,
-                            chrono::Utc::now().timestamp_millis()
-                        ],
-                    )?;
-                    Ok(())
+                            rusqlite::params![
+                                credential_key,
+                                owner_root,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(map_named_secret_tx_error)?;
+                if let Err(error) = ctx.publish_owner_redaction_table() {
+                    // Vault + ownership are committed. The exchange is one-shot,
+                    // so rollback could orphan the already-authorized token;
+                    // poison and fail closed until the daemon is restarted.
+                    ctx.poison_redaction_publication(&error);
+                    return Err(internal(error));
+                }
+                Ok(Response::McpOAuthCompleted {
+                    authenticated: true,
                 })
-                .await
-                .map_err(map_named_secret_tx_error)?;
-            if let Err(error) = ctx.publish_owner_redaction_table() {
-                // Vault + ownership are committed. The exchange is one-shot,
-                // so rollback could orphan the already-authorized token;
-                // poison and fail closed until the daemon is restarted.
-                ctx.poison_redaction_publication(&error);
-                return Err(internal(error));
+            };
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(operation, ctx, "complete_mcp_oauth", mutation)
+                        .await
+                }
+                None => mutation.await,
             }
-            Ok(Response::McpOAuthCompleted {
-                authenticated: true,
-            })
         }
 
         Request::CancelMcpOAuth { flow_id } => {
@@ -5754,11 +5937,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
+            // A local unix-socket owner (`ClientPrincipal::Owner`, no
+            // remote-operation ledger context) may adopt the host's ambient
+            // GitHub token; any remote caller is failed closed inside
+            // `setup_copilot_auth`. `is_local_owner` is derived only from
+            // daemon-assigned signals — see `is_local_owner_action`.
+            let is_local_owner = is_local_owner_action(state, remote_operation);
             let operation_result = setup_copilot_auth(
                 ctx,
                 &project_root,
                 &provider_id,
                 provider_env_snapshot(ctx, state),
+                is_local_owner,
             )
             .await;
             let operation_result = operation_result.map(|_| Response::Ack);
@@ -5778,18 +5968,39 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             wizard_id,
             answers_json,
         } => {
-            let result = crate::wizard::apply_setup_wizard_answers_authoritative(
-                std::path::Path::new(&project_root),
-                &wizard_id,
-                &answers_json,
-            )
-            .await
-            .map_err(internal)?;
-            Ok(Response::SetupWizardApplied {
-                changed: result.0,
-                model_file_written: result.1,
-                default_scope: result.2,
-            })
+            let request = Request::ApplySetupWizard {
+                project_root: project_root.clone(),
+                wizard_id: wizard_id.clone(),
+                answers_json: answers_json.clone(),
+            };
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
+            let mutation = async {
+                let result = crate::wizard::apply_setup_wizard_answers_authoritative(
+                    std::path::Path::new(&project_root),
+                    &wizard_id,
+                    &answers_json,
+                )
+                .await
+                .map_err(internal)?;
+                Ok(Response::SetupWizardApplied {
+                    changed: result.0,
+                    model_file_written: result.1,
+                    default_scope: result.2,
+                })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    finish_remote_provider_mutation(operation, ctx, "apply_setup_wizard", mutation)
+                        .await
+                }
+                None => mutation.await,
+            }
         }
 
         Request::SaveMcpConfig {
@@ -8512,7 +8723,22 @@ async fn setup_copilot_auth(
     project_root: &str,
     provider_id: &str,
     env: std::collections::HashMap<String, String>,
+    is_local_owner: bool,
 ) -> std::result::Result<(), ErrorPayload> {
+    // Adopting the daemon HOST's ambient GitHub token (`COPILOT_GITHUB_TOKEN` /
+    // `GH_TOKEN` / `GITHUB_TOKEN`) and injecting it into a caller-selected
+    // provider's `Authorization` header is a local-host action: the chosen
+    // provider's base URL is caller-controllable, so a REMOTE owner could steer
+    // the host's ambient token to an attacker endpoint (the token would then
+    // leave the host on every later request to that provider). Gate the ambient
+    // adoption on the authentic local-owner signal and fail closed for a remote
+    // caller BEFORE the token is ever read — a remote owner must authenticate
+    // the provider through the explicit OAuth flow instead.
+    if !is_local_owner {
+        return Err(bad_request(
+            "adopting the daemon host's ambient GitHub token is local-only; a remote owner must authenticate the provider through the explicit OAuth flow",
+        ));
+    }
     let token = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
         .into_iter()
         .find_map(|name| env.get(name).filter(|value| !value.trim().is_empty()))

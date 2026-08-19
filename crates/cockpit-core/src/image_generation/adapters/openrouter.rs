@@ -22,6 +22,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::providers::registry::ResolvedProviderOrigin;
+
 /// Maximum number of output images a single request may ask for (OpenRouter
 /// Image API global bound). Individual endpoints may advertise a tighter cap.
 pub const MAX_N: u8 = 10;
@@ -1515,35 +1517,56 @@ impl fmt::Display for ResponseParseError {
 impl std::error::Error for ResponseParseError {}
 
 // ---------------------------------------------------------------------------
-// Attribution headers (reuses openrouter-attribution-headers contract).
+// Attribution headers (reuses the shared openrouter-attribution contract).
 // ---------------------------------------------------------------------------
+//
+// The canonical `HTTP-Referer` / `X-OpenRouter-Title` pair and the collision-safe
+// merge live in `crate::providers::openrouter_attribution`. This adapter does
+// NOT define its own attribution constants; it calls the shared helper so
+// rotating the referer URL or title stays in sync with chat/catalog.
 
-/// The canonical OpenRouter attribution header pair, merged collision-safe.
-/// Every discovery, submission, and same-origin follow-up uses this contract.
-pub fn attribution_headers() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("HTTP-Referer", "https://flycockpit.dev"),
-        ("X-OpenRouter-Title", "FlyCockpit"),
-    ]
+/// Validate provider-supplied header overrides before building a request
+/// description. Names must be valid HTTP header names; non-empty values must
+/// be valid HTTP header values; duplicate names (case-insensitive) are
+/// rejected. Empty values are valid suppression markers (they suppress the
+/// matching attribution default). Invalid headers fail before building a
+/// description with a stable redacted error — no secret value is surfaced.
+fn validate_provider_header_overrides(
+    provider_headers: &[(String, String)],
+) -> Result<(), RuntimeError> {
+    let mut names = std::collections::BTreeSet::new();
+    for (name, value) in provider_headers {
+        let normalized = name.to_ascii_lowercase();
+        if !names.insert(normalized)
+            || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            || (!value.is_empty() && reqwest::header::HeaderValue::from_str(value).is_err())
+        {
+            return Err(RuntimeError::InvalidHeaders);
+        }
+    }
+    Ok(())
 }
 
-/// Merge attribution headers into a resolved header set collision-safe: a
-/// non-empty configured value is preserved; an empty configured value is reset
-/// to the canonical default (attribution is always present); a missing header
-/// gets the canonical default. This mirrors the `openrouter-attribution-headers`
-/// contract.
-pub fn merge_attribution(headers: &mut Vec<(String, String)>) {
-    for (name, default) in attribution_headers() {
-        match headers
-            .iter()
-            .position(|(n, _)| n.eq_ignore_ascii_case(name))
-        {
-            Some(index) if headers[index].1.is_empty() => {
-                headers[index].1 = default.to_string();
-            }
-            Some(_) => {}
-            None => headers.push((name.to_string(), default.to_string())),
-        }
+/// The single attribution-enforcing constructor for this adapter.
+///
+/// All three request builders ([`build_submit_request`],
+/// [`build_discovery_request`], [`build_endpoint_request`]) route their
+/// header assembly through this function. It is the **only** call site of
+/// the shared `merge_openrouter_attribution_pairs` helper in the adapter, and
+/// it gates on the resolved provider origin: attribution is merged **only**
+/// when `provider_origin` is `ResolvedProviderOrigin::Template("openrouter")`.
+///
+/// Identity is decided here, not at the merger: a non-template origin (e.g. a
+/// custom OpenAI-compatible endpoint, or a special provider like Codex/Copilot
+/// that happens to share the OpenRouter image base URL) gets no OpenRouter
+/// attribution headers. This matches the chat/catalog gate in `models_fetch`
+/// (`origin.is_template("openrouter")`).
+fn apply_openrouter_attribution(
+    provider_origin: &ResolvedProviderOrigin,
+    headers: &mut Vec<(String, String)>,
+) {
+    if provider_origin.is_template("openrouter") {
+        crate::providers::openrouter_attribution::merge_openrouter_attribution_pairs(headers);
     }
 }
 
@@ -1551,45 +1574,92 @@ pub fn merge_attribution(headers: &mut Vec<(String, String)>) {
 /// for the configured origin. Non-streaming; no `/images/generations`,
 /// Responses, Chat, server-tool, streaming, remote-output URL, or
 /// active-model fallback path.
-pub fn build_submit_request(
+///
+/// `provider_headers` carries validated user/provider header overrides. The
+/// canonical OpenRouter attribution pair is merged collision-safe via the
+/// shared helper: a non-empty override wins; an empty override suppresses
+/// that header; a missing header gets the canonical default.
+///
+/// Attribution is applied **only** when `provider_origin` is
+/// `ResolvedProviderOrigin::Template("openrouter")`, matching the chat/catalog
+/// identity gate in `models_fetch`. A non-template origin gets no OpenRouter
+/// attribution headers.
+pub(crate) fn build_submit_request(
     origin: &str,
+    provider_origin: &ResolvedProviderOrigin,
     request: &OpenrouterImageRequest,
+    provider_headers: &[(String, String)],
 ) -> Result<SubmitRequestDescription, RuntimeError> {
+    validate_provider_header_overrides(provider_headers)?;
     let origin = origin.trim_end_matches('/');
     let url = format!("{origin}{SUBMIT_PATH}");
     let body = serde_json::to_value(request).map_err(|_| RuntimeError::Serialization)?;
+    let mut headers: Vec<(String, String)> = provider_headers
+        .iter()
+        .map(|(n, v)| (n.clone(), v.clone()))
+        .collect();
+    apply_openrouter_attribution(provider_origin, &mut headers);
     Ok(SubmitRequestDescription {
         url,
         method: "POST".to_string(),
         body,
         streaming: false,
+        headers,
     })
 }
 
 /// Build the canonical `GET /api/v1/images/models` discovery request
 /// description.
-pub fn build_discovery_request(origin: &str) -> Result<DiscoveryRequestDescription, RuntimeError> {
+///
+/// `provider_headers` carries validated user/provider header overrides; the
+/// canonical attribution pair is merged via the shared helper when
+/// `provider_origin` is `ResolvedProviderOrigin::Template("openrouter")`.
+pub(crate) fn build_discovery_request(
+    origin: &str,
+    provider_origin: &ResolvedProviderOrigin,
+    provider_headers: &[(String, String)],
+) -> Result<DiscoveryRequestDescription, RuntimeError> {
+    validate_provider_header_overrides(provider_headers)?;
     let origin = origin.trim_end_matches('/');
     let url = format!("{origin}{DISCOVERY_MODELS_PATH}");
+    let mut headers: Vec<(String, String)> = provider_headers
+        .iter()
+        .map(|(n, v)| (n.clone(), v.clone()))
+        .collect();
+    apply_openrouter_attribution(provider_origin, &mut headers);
     Ok(DiscoveryRequestDescription {
         url,
         method: "GET".to_string(),
         streaming: false,
+        headers,
     })
 }
 
 /// Build the canonical same-origin endpoint follow-up request description for
 /// a selected model.
-pub fn build_endpoint_request(
+///
+/// `provider_headers` carries validated user/provider header overrides; the
+/// canonical attribution pair is merged via the shared helper when
+/// `provider_origin` is `ResolvedProviderOrigin::Template("openrouter")`.
+pub(crate) fn build_endpoint_request(
     origin: &str,
+    provider_origin: &ResolvedProviderOrigin,
     model: &ModelId,
+    provider_headers: &[(String, String)],
 ) -> Result<EndpointRequestDescription, RuntimeError> {
+    validate_provider_header_overrides(provider_headers)?;
     let origin = origin.trim_end_matches('/');
     let url = format!("{}{}", origin, model.endpoint_link());
+    let mut headers: Vec<(String, String)> = provider_headers
+        .iter()
+        .map(|(n, v)| (n.clone(), v.clone()))
+        .collect();
+    apply_openrouter_attribution(provider_origin, &mut headers);
     Ok(EndpointRequestDescription {
         url,
         method: "GET".to_string(),
         streaming: false,
+        headers,
     })
 }
 
@@ -1600,6 +1670,7 @@ pub struct SubmitRequestDescription {
     pub method: String,
     pub body: serde_json::Value,
     pub streaming: bool,
+    pub headers: Vec<(String, String)>,
 }
 
 /// Read-only request description for `GET /api/v1/images/models`.
@@ -1608,6 +1679,7 @@ pub struct DiscoveryRequestDescription {
     pub url: String,
     pub method: String,
     pub streaming: bool,
+    pub headers: Vec<(String, String)>,
 }
 
 /// Read-only request description for the selected model's endpoint link.
@@ -1616,18 +1688,26 @@ pub struct EndpointRequestDescription {
     pub url: String,
     pub method: String,
     pub streaming: bool,
+    pub headers: Vec<(String, String)>,
 }
 
 /// A local runtime error for the adapter contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     Serialization,
+    /// Invalid or duplicate provider header overrides. No secret value is
+    /// surfaced; the error is a stable redacted class.
+    InvalidHeaders,
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Serialization => write!(f, "request serialization failed"),
+            Self::InvalidHeaders => write!(
+                f,
+                "provider header overrides are invalid or duplicate; edit provider headers before retrying."
+            ),
         }
     }
 }
@@ -1662,22 +1742,133 @@ pub enum AttemptStatus {
     RedirectFailure,
 }
 
-/// Redact secrets from a provider error payload. Bounded and secret-redacted.
-pub fn redact_provider_error(payload: &str) -> String {
-    let mut redacted = payload.to_string();
-    // Redact bearer tokens.
-    let bearer = regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9._\-]+").unwrap();
-    redacted = bearer
-        .replace_all(&redacted, "Bearer [redacted]")
-        .to_string();
-    // Redact API-key-like patterns.
-    let key = regex::Regex::new(r"(?i)(sk-[A-Za-z0-9]{20,})").unwrap();
-    redacted = key.replace_all(&redacted, "[redacted]").to_string();
-    // Bound the output.
-    if redacted.len() > 4096 {
-        redacted.truncate(4096);
+/// A bounded, structured, secret-free summary of a provider error response.
+///
+/// Aligned with the OpenAI and Gemini image adapters: a stable error class
+/// plus a short non-secret detail. The raw provider body is never retained;
+/// no API key, bearer token, response body, or reference image bytes cross
+/// this boundary. Detail is a stable, class-derived string — it is NOT
+/// extracted from the raw provider response, so it can never leak a secret
+/// that the provider echoed back in an error message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterRedactedSummary {
+    /// Stable machine-readable error class (never contains secrets).
+    pub class: OpenRouterErrorClass,
+    /// Bounded human-readable detail (stable, class-derived, never contains
+    /// a raw secret or raw response body).
+    pub detail: &'static str,
+}
+
+/// Stable error classes for OpenRouter provider responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRouterErrorClass {
+    /// HTTP 4xx — the request was rejected (auth, quota, validation, etc.).
+    ClientError,
+    /// HTTP 5xx — the server failed or is unavailable.
+    ServerError,
+    /// HTTP 3xx — redirect rejected (credentials/attribution cannot cross
+    /// origins).
+    RedirectRejected,
+    /// The response was not valid JSON or did not match the expected shape.
+    Unparseable,
+    /// A timeout or transport-level failure.
+    Transport,
+    /// Any other failure not covered above.
+    Unknown,
+}
+
+impl fmt::Display for OpenRouterErrorClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientError => write!(f, "client_error"),
+            Self::ServerError => write!(f, "server_error"),
+            Self::RedirectRejected => write!(f, "redirect_rejected"),
+            Self::Unparseable => write!(f, "unparseable"),
+            Self::Transport => write!(f, "transport"),
+            Self::Unknown => write!(f, "unknown"),
+        }
     }
-    redacted
+}
+
+/// Maximum length of the `detail` field in a [`OpenRouterRedactedSummary`].
+pub const REDACTED_DETAIL_MAX_CHARS: usize = 512;
+
+/// Typed failure cause for provider-response redaction.
+///
+/// Carries the kind of failure that produced a redacted summary so the
+/// classifier can distinguish a transport failure, an HTTP-status-based
+/// classification, and a decode failure (a 2xx body that did not parse into
+/// the expected shape). The former two were already representable via
+/// `Option<u16>`; the decode-failure cause is what makes
+/// [`OpenRouterErrorClass::Unparseable`] producible — a bare non-3xx/4xx/5xx
+/// status (e.g. a 2xx that arrived but was never decoded) maps to
+/// [`OpenRouterErrorClass::Unknown`], while an actual decode failure maps to
+/// `Unparseable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionCause {
+    /// An HTTP response was received; classify by status code. A 2xx here
+    /// (with no decode failure) maps to [`OpenRouterErrorClass::Unknown`]
+    /// since there is no error body to redact.
+    Status(u16),
+    /// A transport-level failure (no HTTP response, timeout, connection
+    /// reset). Maps to [`OpenRouterErrorClass::Transport`].
+    Transport,
+    /// The response body could not be parsed into the expected shape — e.g.
+    /// malformed JSON on a 2xx, or a body that did not match the contract.
+    /// Maps to [`OpenRouterErrorClass::Unparseable`] regardless of status.
+    DecodeFailure,
+}
+
+/// Build a bounded, structured, secret-free summary of a provider error.
+///
+/// Replaces the former regex-over-raw-text scrubbing. The typed
+/// [`RedactionCause`] is classified into a stable [`OpenRouterErrorClass`]
+/// and a short, stable, class-derived detail. No raw body is retained; no
+/// API key, bearer token, or secret-bearing substring survives into the
+/// summary — the detail is a fixed string per class, never extracted from
+/// the provider response, so a secret echoed back in an error message cannot
+/// leak.
+///
+/// Classification:
+/// - [`RedactionCause::Status`] with 3xx → [`RedirectRejected`], 4xx →
+///   [`ClientError`], 5xx → [`ServerError`], any other status (incl. 2xx
+///   without a decode failure) → [`Unknown`].
+/// - [`RedactionCause::Transport`] → [`Transport`].
+/// - [`RedactionCause::DecodeFailure`] → [`Unparseable`] (this is the only
+///   way to produce `Unparseable`; a bare 2xx status is `Unknown`).
+///
+/// [`RedirectRejected`]: OpenRouterErrorClass::RedirectRejected
+/// [`ClientError`]: OpenRouterErrorClass::ClientError
+/// [`ServerError`]: OpenRouterErrorClass::ServerError
+/// [`Unknown`]: OpenRouterErrorClass::Unknown
+/// [`Transport`]: OpenRouterErrorClass::Transport
+/// [`Unparseable`]: OpenRouterErrorClass::Unparseable
+pub fn redact_provider_error(cause: RedactionCause, _payload: &str) -> OpenRouterRedactedSummary {
+    let class = match cause {
+        RedactionCause::DecodeFailure => OpenRouterErrorClass::Unparseable,
+        RedactionCause::Transport => OpenRouterErrorClass::Transport,
+        RedactionCause::Status(s) if (300..400).contains(&s) => {
+            OpenRouterErrorClass::RedirectRejected
+        }
+        RedactionCause::Status(s) if (400..500).contains(&s) => OpenRouterErrorClass::ClientError,
+        RedactionCause::Status(s) if (500..600).contains(&s) => OpenRouterErrorClass::ServerError,
+        RedactionCause::Status(_) => OpenRouterErrorClass::Unknown,
+    };
+
+    let detail = match class {
+        OpenRouterErrorClass::ClientError => {
+            "provider rejected the request (auth, quota, or validation)"
+        }
+        OpenRouterErrorClass::ServerError => "provider server error or unavailable",
+        OpenRouterErrorClass::RedirectRejected => {
+            "redirect rejected; credentials and attribution cannot cross origins"
+        }
+        OpenRouterErrorClass::Unparseable => "provider response was not parseable",
+        OpenRouterErrorClass::Transport => "transport-level failure or timeout",
+        OpenRouterErrorClass::Unknown => "unknown provider failure",
+    };
+
+    OpenRouterRedactedSummary { class, detail }
 }
 
 /// Determine whether a blind second request is forbidden after an ambiguous
@@ -1769,7 +1960,9 @@ mod tests {
                 allow_fallbacks: true,
             }),
         };
-        let desc = build_submit_request("https://openrouter.ai", &request).unwrap();
+        let desc =
+            build_submit_request("https://openrouter.ai", &openrouter_origin(), &request, &[])
+                .unwrap();
         assert_eq!(desc.method, "POST");
         assert!(desc.url.ends_with("/api/v1/images"));
         assert!(!desc.url.contains("/images/generations"));
@@ -2111,12 +2304,15 @@ mod tests {
     #[test]
     fn image_generation_openrouter_discovery() {
         // exact model and endpoint routes.
-        let discovery = build_discovery_request("https://openrouter.ai").unwrap();
+        let discovery =
+            build_discovery_request("https://openrouter.ai", &openrouter_origin(), &[]).unwrap();
         assert_eq!(discovery.method, "GET");
         assert!(discovery.url.ends_with(DISCOVERY_MODELS_PATH));
 
         let model = ModelId::parse("qwen/qwen-image-3-pro").unwrap();
-        let endpoint_req = build_endpoint_request("https://openrouter.ai", &model).unwrap();
+        let endpoint_req =
+            build_endpoint_request("https://openrouter.ai", &openrouter_origin(), &model, &[])
+                .unwrap();
         assert_eq!(endpoint_req.method, "GET");
         assert!(
             endpoint_req
@@ -2852,36 +3048,6 @@ mod tests {
 
     #[test]
     fn image_generation_openrouter_attempt_safety() {
-        // canonical attribution.
-        let headers = attribution_headers();
-        assert!(headers.iter().any(|(n, _)| *n == "HTTP-Referer"));
-        assert!(headers.iter().any(|(n, _)| *n == "X-OpenRouter-Title"));
-
-        // attribution merge: collision-safe.
-        let mut merged = vec![("HTTP-Referer".to_string(), "".to_string())];
-        merge_attribution(&mut merged);
-        // empty value removed, then default added.
-        assert!(
-            merged
-                .iter()
-                .any(|(n, v)| n == "HTTP-Referer" && v == "https://flycockpit.dev")
-        );
-
-        let mut merged = vec![("HTTP-Referer".to_string(), "https://custom.dev".to_string())];
-        merge_attribution(&mut merged);
-        // non-empty configured value preserved.
-        assert!(
-            merged
-                .iter()
-                .any(|(n, v)| n == "HTTP-Referer" && v == "https://custom.dev")
-        );
-
-        // secret redaction.
-        let redacted = redact_provider_error("Bearer sk-abcdef1234567890abcdef1234567890 error");
-        assert!(redacted.contains("[redacted]"));
-        assert!(!redacted.contains("sk-abcdef1234567890abcdef1234567890"));
-        assert!(redacted.len() <= 4096);
-
         // all 3xx statuses are stable failures.
         for status in [300u16, 301, 302, 303, 304, 305, 307, 308] {
             assert_eq!(classify_status(status), AttemptStatus::RedirectFailure);
@@ -2955,6 +3121,372 @@ mod tests {
         // returns a deterministic bool.
         let dispatched = !blind_retry_forbidden(AttemptStatus::DefinitivelyRejected);
         assert!(dispatched); // a definitive rejection allows exactly one dispatch.
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceptance: openrouter_image_submit_request_carries_attribution
+    // -------------------------------------------------------------------------
+
+    fn minimal_submit_request() -> OpenrouterImageRequest {
+        OpenrouterImageRequest {
+            model: "qwen/qwen-image-3-pro".into(),
+            prompt: "a red cube".into(),
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            quality: None,
+            output_format: None,
+            background: None,
+            output_compression: None,
+            seed: None,
+            n: 1,
+            input_references: vec![],
+            provider: None,
+        }
+    }
+
+    fn openrouter_origin() -> ResolvedProviderOrigin {
+        ResolvedProviderOrigin::template("openrouter")
+    }
+
+    fn non_template_origin() -> ResolvedProviderOrigin {
+        ResolvedProviderOrigin::default()
+    }
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn openrouter_image_submit_request_carries_attribution() {
+        // No overrides: both canonical headers present with default values.
+        let request = minimal_submit_request();
+        let desc =
+            build_submit_request("https://openrouter.ai", &openrouter_origin(), &request, &[])
+                .unwrap();
+        assert_eq!(
+            header_value(&desc.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&desc.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceptance: openrouter_image_discovery_and_endpoint_carry_attribution
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn openrouter_image_discovery_and_endpoint_carry_attribution() {
+        let discovery =
+            build_discovery_request("https://openrouter.ai", &openrouter_origin(), &[]).unwrap();
+        assert_eq!(
+            header_value(&discovery.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&discovery.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        let model = ModelId::parse("qwen/qwen-image-3-pro").unwrap();
+        let endpoint_req =
+            build_endpoint_request("https://openrouter.ai", &openrouter_origin(), &model, &[])
+                .unwrap();
+        assert_eq!(
+            header_value(&endpoint_req.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&endpoint_req.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceptance: openrouter_image_header_override_and_empty_suppress
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn openrouter_image_header_override_and_empty_suppress() {
+        let request = minimal_submit_request();
+        let origin = openrouter_origin();
+
+        // Non-empty override replaces the default.
+        let overrides = vec![("HTTP-Referer".to_string(), "https://custom.dev".to_string())];
+        let desc =
+            build_submit_request("https://openrouter.ai", &origin, &request, &overrides).unwrap();
+        assert_eq!(
+            header_value(&desc.headers, "HTTP-Referer"),
+            Some("https://custom.dev")
+        );
+        // Title still gets the default.
+        assert_eq!(
+            header_value(&desc.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        // Empty value suppresses that header only.
+        let suppress = vec![("HTTP-Referer".to_string(), String::new())];
+        let desc =
+            build_submit_request("https://openrouter.ai", &origin, &request, &suppress).unwrap();
+        assert!(header_value(&desc.headers, "HTTP-Referer").is_none());
+        // Title is unaffected.
+        assert_eq!(
+            header_value(&desc.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        // Unrelated headers are preserved.
+        let unrelated = vec![
+            ("X-Custom".to_string(), "value".to_string()),
+            ("HTTP-Referer".to_string(), "https://custom.dev".to_string()),
+        ];
+        let desc =
+            build_submit_request("https://openrouter.ai", &origin, &request, &unrelated).unwrap();
+        assert_eq!(header_value(&desc.headers, "X-Custom"), Some("value"));
+        assert_eq!(
+            header_value(&desc.headers, "HTTP-Referer"),
+            Some("https://custom.dev")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceptance: openrouter_image_redaction_is_structured
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn openrouter_image_redaction_is_structured() {
+        // A fake provider error payload containing a bearer token and an
+        // sk-style API key, plus a long body. The redaction API returns a
+        // structured summary with a stable class, bounded detail, and no
+        // substring of the raw secret.
+        let secret = "sk-1234567890abcdef1234567890abcdef";
+        let bearer = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret.part";
+        let long_body = "x".repeat(8192);
+        let payload = serde_json::json!({
+            "error": {
+                "message": format!("auth failed: {bearer} {secret}"),
+                "body": long_body,
+            }
+        })
+        .to_string();
+
+        let summary = redact_provider_error(RedactionCause::Status(401), &payload);
+
+        // Stable class derived from HTTP status.
+        assert_eq!(summary.class, OpenRouterErrorClass::ClientError);
+
+        // Detail is bounded.
+        assert!(summary.detail.len() <= REDACTED_DETAIL_MAX_CHARS);
+
+        // No substring of the raw secret survives into the summary.
+        assert!(!summary.detail.contains(secret));
+        assert!(!summary.detail.contains(bearer));
+        assert!(
+            !summary
+                .detail
+                .contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
+        );
+
+        // The raw body is not retained.
+        assert!(!summary.detail.contains(&long_body));
+
+        // Detail is a stable, class-derived string (not the raw error.message).
+        assert!(!summary.detail.contains("auth failed"));
+
+        // Server error class.
+        let server_summary = redact_provider_error(RedactionCause::Status(503), &payload);
+        assert_eq!(server_summary.class, OpenRouterErrorClass::ServerError);
+        assert!(!server_summary.detail.contains(secret));
+
+        // Redirect rejected class.
+        let redirect_summary = redact_provider_error(RedactionCause::Status(301), &payload);
+        assert_eq!(
+            redirect_summary.class,
+            OpenRouterErrorClass::RedirectRejected
+        );
+        assert!(!redirect_summary.detail.contains(secret));
+
+        // Transport failure (no status).
+        let transport_summary = redact_provider_error(RedactionCause::Transport, &payload);
+        assert_eq!(transport_summary.class, OpenRouterErrorClass::Transport);
+        assert!(!transport_summary.detail.contains(secret));
+
+        // A bare 2xx status (no decode failure) maps to Unknown, NOT
+        // Unparseable — there is no error body to redact.
+        let bare_2xx = redact_provider_error(RedactionCause::Status(200), &payload);
+        assert_eq!(bare_2xx.class, OpenRouterErrorClass::Unknown);
+        assert!(!bare_2xx.detail.contains(secret));
+
+        // The raw free-text regex function is gone: redact_provider_error
+        // returns a structured summary, not a String.
+        // (This is enforced by the return type — the old `-> String` signature
+        // no longer compiles.)
+    }
+
+    /// Finding 3: a decode failure (malformed 2xx output) must classify as
+    /// `Unparseable`, not `Unknown`. The typed `RedactionCause::DecodeFailure`
+    /// is the only way to produce `Unparseable`; a bare 2xx status stays
+    /// `Unknown`. The summary still carries no secret substring.
+    #[test]
+    fn openrouter_image_redaction_classifies_decode_failure_as_unparseable() {
+        let secret = "***********************************";
+        let bearer = "Bearer ************************************************";
+        // A malformed 2xx body: not valid JSON, and it echoes a secret.
+        let malformed_body = format!("{{ not json: {bearer} {secret} }}");
+
+        let summary = redact_provider_error(RedactionCause::DecodeFailure, &malformed_body);
+
+        assert_eq!(summary.class, OpenRouterErrorClass::Unparseable);
+        assert!(summary.detail.len() <= REDACTED_DETAIL_MAX_CHARS);
+        // No secret substring survives into the class-derived detail.
+        assert!(!summary.detail.contains(secret));
+        assert!(!summary.detail.contains(bearer));
+        assert!(!summary.detail.contains("not json"));
+        assert_eq!(summary.detail, "provider response was not parseable");
+
+        // Even a decode failure on a 2xx-shaped status must be Unparseable:
+        // the cause is what decides the class, not the status.
+        let cause_with_status = RedactionCause::DecodeFailure;
+        let summary2 = redact_provider_error(cause_with_status, &malformed_body);
+        assert_eq!(summary2.class, OpenRouterErrorClass::Unparseable);
+    }
+
+    // -------------------------------------------------------------------------
+    // Acceptance: openrouter_adapter_cannot_bypass_shared_attribution
+    // -------------------------------------------------------------------------
+
+    /// Finding 2 conformance: replace the source-grep test with executable
+    /// conformance. All three builders route header assembly through the
+    /// single `apply_openrouter_attribution` constructor, which is the only
+    /// call site of the shared `merge_openrouter_attribution_pairs` helper in
+    /// this adapter. This test exercises the builders' actual output to prove
+    /// attribution is enforced (for the openrouter template origin) and
+    /// withheld (for a non-template origin) — it cannot be satisfied by an
+    /// uncalled helper.
+    #[test]
+    fn openrouter_adapter_cannot_bypass_shared_attribution() {
+        // Positive conformance: every builder, with the openrouter template
+        // origin, must carry the canonical attribution pair. A builder that
+        // bypassed `apply_openrouter_attribution` would emit no attribution
+        // headers and fail here.
+        let request = minimal_submit_request();
+        let origin = openrouter_origin();
+
+        let submit = build_submit_request("https://openrouter.ai", &origin, &request, &[]).unwrap();
+        assert_eq!(
+            header_value(&submit.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&submit.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        let discovery = build_discovery_request("https://openrouter.ai", &origin, &[]).unwrap();
+        assert_eq!(
+            header_value(&discovery.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&discovery.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        let model = ModelId::parse("qwen/qwen-image-3-pro").unwrap();
+        let endpoint =
+            build_endpoint_request("https://openrouter.ai", &origin, &model, &[]).unwrap();
+        assert_eq!(
+            header_value(&endpoint.headers, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            header_value(&endpoint.headers, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+
+        // The single constructor is itself the gate: with a non-template
+        // origin it must NOT add attribution headers, even on an
+        // openrouter.ai-shaped base URL. This is the identity decision
+        // (Finding 1): attribution follows the resolved provider origin,
+        // not the URL string.
+        let non_template = non_template_origin();
+        let mut headers: Vec<(String, String)> = Vec::new();
+        apply_openrouter_attribution(&non_template, &mut headers);
+        assert!(
+            headers.is_empty(),
+            "non-template origin must not get attribution"
+        );
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        apply_openrouter_attribution(&origin, &mut headers);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, "HTTP-Referer");
+        assert_eq!(headers[0].1, "https://flycockpit.dev");
+        assert_eq!(headers[1].0, "X-OpenRouter-Title");
+        assert_eq!(headers[1].1, "FlyCockpit");
+
+        // Structural conformance (AC6 anti-duplication clause): the behavioral
+        // assertions above prove attribution reaches built requests, but they
+        // would still pass if a builder locally hard-coded the canonical
+        // constants and merged them inline (bypassing the shared helper). Guard
+        // against that by scanning the adapter's *production* source (everything
+        // before the `#[cfg(test)]` module, so this test's own literals are
+        // excluded): it must not reintroduce the canonical attribution literals.
+        // All attribution flows through `providers::openrouter_attribution`, so
+        // any reintroduced default constant here fails the build. A deliberate
+        // bypass — e.g. a builder emitting `("HTTP-Referer",
+        // "https://flycockpit.dev")` directly instead of calling
+        // `apply_openrouter_attribution` — would put one of these literals back
+        // into production code and trip this scan.
+        let source = include_str!("openrouter.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("adapter source has a production region before its test module");
+        for forbidden in [
+            "https://flycockpit.dev",
+            "\"FlyCockpit\"",
+            "\"HTTP-Referer\"",
+            "\"X-OpenRouter-Title\"",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "openrouter image adapter production code must not hardcode the attribution \
+                 literal {forbidden}; route attribution through \
+                 providers::openrouter_attribution's shared helper instead"
+            );
+        }
+    }
+
+    /// Finding 1 negative test: a non-template origin must not receive
+    /// OpenRouter attribution headers from any builder, even when the base
+    /// URL looks like openrouter.ai. Identity is decided by the resolved
+    /// provider origin, not by the URL string.
+    #[test]
+    fn openrouter_image_builders_skip_attribution_for_non_template_origin() {
+        let request = minimal_submit_request();
+        let origin = non_template_origin();
+
+        let submit = build_submit_request("https://openrouter.ai", &origin, &request, &[]).unwrap();
+        assert!(header_value(&submit.headers, "HTTP-Referer").is_none());
+        assert!(header_value(&submit.headers, "X-OpenRouter-Title").is_none());
+
+        let discovery = build_discovery_request("https://openrouter.ai", &origin, &[]).unwrap();
+        assert!(header_value(&discovery.headers, "HTTP-Referer").is_none());
+        assert!(header_value(&discovery.headers, "X-OpenRouter-Title").is_none());
+
+        let model = ModelId::parse("qwen/qwen-image-3-pro").unwrap();
+        let endpoint =
+            build_endpoint_request("https://openrouter.ai", &origin, &model, &[]).unwrap();
+        assert!(header_value(&endpoint.headers, "HTTP-Referer").is_none());
+        assert!(header_value(&endpoint.headers, "X-OpenRouter-Title").is_none());
     }
 
     impl InputReferenceWire {

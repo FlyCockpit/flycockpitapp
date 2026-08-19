@@ -25,7 +25,7 @@ pub(crate) enum ProviderRequestKind {
 pub(crate) struct ResolvedProviderOrigin(Option<&'static str>);
 
 impl ResolvedProviderOrigin {
-    fn template(id: &'static str) -> Self {
+    pub(crate) fn template(id: &'static str) -> Self {
         Self(Some(id))
     }
 

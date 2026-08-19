@@ -543,7 +543,7 @@ fn resolve_provider_request_inner_with_sources(
 
     validate_resolved_provider_headers(provider_id, &headers)?;
     if origin.is_template("openrouter") {
-        merge_openrouter_attribution(&mut headers);
+        crate::providers::openrouter_attribution::merge_openrouter_attribution(&mut headers);
     }
 
     Ok(ResolvedRequest {
@@ -567,27 +567,6 @@ fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHead
         }
     }
     Ok(())
-}
-
-fn merge_openrouter_attribution(headers: &mut Vec<ResolvedHeader>) {
-    for (name, default) in [
-        ("HTTP-Referer", "https://flycockpit.dev"),
-        ("X-OpenRouter-Title", "FlyCockpit"),
-    ] {
-        match headers
-            .iter()
-            .position(|header| header.name.eq_ignore_ascii_case(name))
-        {
-            Some(index) if headers[index].value.is_empty() => {
-                headers.remove(index);
-            }
-            Some(_) => {}
-            None => headers.push(ResolvedHeader {
-                name: name.to_string(),
-                value: default.to_string(),
-            }),
-        }
-    }
 }
 
 pub(crate) fn resolve_codex_model_list_request(
@@ -2199,15 +2178,31 @@ mod tests {
         assert!(!format!("{error:#}").contains("secret"));
     }
 
+    /// Finding 5: do not call `merge_openrouter_attribution` directly here.
+    /// Test through the resolved OpenRouter-template request path and assert
+    /// the resulting headers, so the test exercises the same identity gate
+    /// (`origin.is_template("openrouter")`) that production uses.
     #[test]
     fn openrouter_attribution_merge_fixture() {
-        let mut headers = Vec::new();
-        merge_openrouter_attribution(&mut headers);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].name, "HTTP-Referer");
-        assert_eq!(headers[0].value, "https://flycockpit.dev");
-        assert_eq!(headers[1].name, "X-OpenRouter-Title");
-        assert_eq!(headers[1].value, "FlyCockpit");
+        let entry = ProviderEntry {
+            template: Some("openrouter".into()),
+            url: "https://openrouter.ai/api/v1".into(),
+            ..ProviderEntry::default()
+        };
+        let resolved =
+            resolve_provider_request_with_sources("renamed-openrouter", &entry, |_| None, |_| None)
+                .unwrap();
+        assert_eq!(
+            resolved_header_value(&resolved, "HTTP-Referer"),
+            Some("https://flycockpit.dev")
+        );
+        assert_eq!(
+            resolved_header_value(&resolved, "X-OpenRouter-Title"),
+            Some("FlyCockpit")
+        );
+        // No auth header is configured, so the only headers are the
+        // attribution pair.
+        assert_eq!(resolved.headers.len(), 2);
     }
 
     #[tokio::test]

@@ -2881,33 +2881,145 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return None;
+        }
+        (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+    }
+
+    #[cfg(unix)]
+    fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let mut count = 0;
+        let mut i = 0;
+        while i + needle.len() <= haystack.len() {
+            if &haystack[i..i + needle.len()] == needle {
+                count += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// Accumulate the `TerminalOutput` bytes the host actually emits on its own
+    /// outbound event stream for `terminal_id`, until `terminator` appears.
+    /// Returns `Err(collected)` on timeout. This observes real production output
+    /// — the bytes the host wrote to its PTY and read back — not a test double.
+    #[cfg(unix)]
+    fn collect_terminal_output_until(
+        rx: &mut broadcast::Receiver<cockpit_core::daemon::EventEnvelope>,
+        terminal_id: Uuid,
+        terminator: &[u8],
+        timeout: Duration,
+    ) -> std::result::Result<Vec<u8>, Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        let mut collected = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(envelope) => {
+                    if let proto::Event::TerminalOutput {
+                        terminal_id: id,
+                        bytes,
+                    } = envelope.event
+                        && id == terminal_id
+                    {
+                        collected.extend_from_slice(&bytes);
+                        if find_subslice(&collected, terminator).is_some() {
+                            return Ok(collected);
+                        }
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        Err(collected)
+    }
+
+    /// AC12 — the terminal-ingress acceptance test proves what its name claims:
+    /// production's real `ingress_finish` delivers the bracketed-paste frame for
+    /// the committed image path ONTO THE TERMINAL'S OWN PTY, and the assertion is
+    /// made against the bytes the host actually emits on its outbound event
+    /// stream — not a frame the test re-derives and injects. The test uses the
+    /// real terminal input path (`input`) to turn the terminal's own child into a
+    /// raw reflector so production's delivered bytes become observable: with echo
+    /// off a `cat` receiver copies them back; with echo on the line discipline
+    /// echoes them (`-echoctl`, so ESC survives). Because production is the sole
+    /// source of the observed frame, the test fails if production stops
+    /// enqueueing it, changes its bytes, or targets the wrong terminal. The
+    /// Cockpit-TUI path-probe leg recovers the private-image path from the
+    /// delivered literal, as the TUI ingress consumer does.
+    #[cfg(unix)]
     #[test]
     fn terminal_ingress_general_agent_integration() {
-        let (tx, _rx) = broadcast::channel(32);
-        let tmp = tempfile::tempdir().unwrap();
-        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
-        let Response::TerminalOpened {
-            terminal_id,
-            binding,
-            ..
-        } = host
-            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
-            .unwrap()
-        else {
-            panic!()
-        };
-        let fixtures: &[(TerminalImageType, &[u8])] = &[
-            (TerminalImageType::Png, b"\x89PNG\r\n\x1a\nreal-png"),
-            (TerminalImageType::Jpeg, b"\xff\xd8\xff\xe0real-jpeg"),
-            (TerminalImageType::Gif, b"GIF89areal-gif"),
-            (TerminalImageType::Webp, b"RIFF0000WEBPreal-webp"),
-        ];
-        for (index, (media_type, bytes)) in fixtures.iter().enumerate() {
+        for echo in [false, true] {
+            let (tx, mut rx) = broadcast::channel(4096);
+            let tmp = tempfile::tempdir().unwrap();
+            let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+            let Response::TerminalOpened {
+                terminal_id,
+                binding,
+                ..
+            } = host
+                .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+                .unwrap()
+            else {
+                panic!()
+            };
+
+            // Configure the terminal's own child, through the REAL input path,
+            // into a raw reflector, so whatever production later writes on
+            // ingress_finish is surfaced on the host's outbound event stream.
+            //
+            // Two subtleties, both handled below:
+            //  * The readiness sentinel is quote-split in the setup command
+            //    (`RDY_''SENTINEL_7f3`) so the shell echoing the typed command
+            //    line — which happens before `stty` disables echo — cannot
+            //    contain the sentinel contiguously; only the executed `printf`
+            //    output does. We therefore wait for the EXECUTED sentinel, not
+            //    the shell's command echo.
+            //  * An interactive shell flushes type-ahead while it initialises,
+            //    which can silently discard a command sent too early. So we
+            //    re-send (prefixed with a kill-line and terminated with CR, the
+            //    real Enter key) until the executed sentinel actually appears.
+            let sentinel: &[u8] = b"RDY_SENTINEL_7f3";
+            let setup: &[u8] = if echo {
+                b"\x15stty -icanon echo -echoctl min 1 time 0; printf 'RDY_''SENTINEL_7f3'; exec sleep 30\r"
+            } else {
+                b"\x15stty raw -echo; printf 'RDY_''SENTINEL_7f3'; exec cat\r"
+            };
+            let ready_deadline = Instant::now() + Duration::from_secs(20);
+            let mut ready = false;
+            while !ready && Instant::now() < ready_deadline {
+                host.input(terminal_id, setup.to_vec()).unwrap();
+                ready = collect_terminal_output_until(
+                    &mut rx,
+                    terminal_id,
+                    sentinel,
+                    Duration::from_secs(2),
+                )
+                .is_ok();
+            }
+            assert!(
+                ready,
+                "echo={echo}: terminal reflector never signalled ready"
+            );
+
+            // Drive the real ingress to a committed, on-disk private image.
+            let bytes = b"\x89PNG\r\n\x1a\nreal-agent-png";
             let operation_id = Uuid::new_v4();
             let metadata = TerminalIngressMetadata {
                 operation_id,
                 size: bytes.len() as u64,
-                media_type: *media_type,
+                media_type: TerminalImageType::Png,
                 sha256: sha256_hex(bytes),
             };
             host.ingress_begin(terminal_id, binding, metadata).unwrap();
@@ -2919,16 +3031,69 @@ mod tests {
             else {
                 panic!()
             };
-            assert_eq!(receipt.input_sequence, Some((index + 1) as u64));
+            assert_eq!(receipt.state, TerminalIngressState::Committed);
+            assert_eq!(receipt.input_sequence, Some(1));
+
             let terminal = host.get_terminal(terminal_id).unwrap();
-            let path = crate::sync::lock_or_recover(&terminal).ingress[&operation_id]
+            let committed_path = crate::sync::lock_or_recover(&terminal).ingress[&operation_id]
                 .path
                 .as_ref()
                 .unwrap()
                 .clone();
-            assert_eq!(std::fs::read(&path).unwrap(), *bytes);
-            std::fs::write(&path, b"foreground mutation").unwrap();
-            std::fs::remove_file(&path).unwrap();
+            assert_eq!(std::fs::read(&committed_path).unwrap(), bytes);
+            let path_text = committed_path.to_str().unwrap();
+
+            // What production ACTUALLY delivered onto the terminal PTY at finish,
+            // read back off the host's own outbound stream.
+            let observed = collect_terminal_output_until(
+                &mut rx,
+                terminal_id,
+                BRACKETED_PASTE_END,
+                Duration::from_secs(10),
+            )
+            .unwrap_or_else(|got| {
+                panic!(
+                    "echo={echo}: production never delivered a bracketed-paste frame onto the pty; observed {got:x?}"
+                )
+            });
+
+            // The expected frame is computed ONLY to compare against production's
+            // real output; it is never the delivery source.
+            let literal = shell_path_literal(path_text, host_shell_dialect()).unwrap();
+            let expected = bracketed_paste_bytes(&literal);
+            assert_eq!(
+                count_subslice(&observed, BRACKETED_PASTE_START),
+                1,
+                "echo={echo}: exactly one bracketed-paste start expected, got {observed:x?}"
+            );
+            assert_eq!(
+                count_subslice(&observed, BRACKETED_PASTE_END),
+                1,
+                "echo={echo}: exactly one bracketed-paste end expected"
+            );
+            let start = find_subslice(&observed, BRACKETED_PASTE_START).unwrap();
+            let end = find_subslice(&observed, BRACKETED_PASTE_END).unwrap();
+            let delivered = &observed[start..end + BRACKETED_PASTE_END.len()];
+            assert_eq!(
+                delivered,
+                expected.as_slice(),
+                "echo={echo}: production-delivered frame must equal the bracketed-paste frame for the ingress path"
+            );
+            assert!(
+                find_subslice(delivered, path_text.as_bytes()).is_some(),
+                "echo={echo}: delivered frame must embed the ingress path bytes"
+            );
+            // Cockpit-TUI path-probe leg.
+            assert_eq!(
+                cockpit_tui::tui::structured_paste::parse_private_image_path_literal(&literal),
+                Some(committed_path.clone()),
+                "echo={echo}: TUI path probe must recover the committed path"
+            );
+
+            // The committed receipt is stable even if the on-disk file is later
+            // mutated or removed out from under the daemon.
+            std::fs::write(&committed_path, b"foreground mutation").unwrap();
+            std::fs::remove_file(&committed_path).unwrap();
             let Response::TerminalIngress { receipt: replay } = host
                 .ingress_status(terminal_id, binding, operation_id)
                 .unwrap()
@@ -2936,8 +3101,9 @@ mod tests {
                 panic!()
             };
             assert_eq!(replay, receipt);
+
+            let _ = host.close(terminal_id);
         }
-        let _ = host.close(terminal_id);
     }
 
     #[test]
@@ -3033,22 +3199,400 @@ mod tests {
         }
     }
 
+    // AC-Windows — no-reparse behavioral proof for the ingress publish path.
+    //
+    // The string-search stand-in that once lived here is gone. The ingress
+    // publish primitive `write_terminal_ingress_private_file` routes through
+    // `cockpit_config::config::files::{prepare_atomic_write, commit_noreplace}`
+    // and reads back via `read_file_nofollow_with_identity`; the Windows
+    // no-reparse/no-junction semantics of those exact primitives are owned by
+    // the non-ignored, path-stable behavioral tests in
+    // `crates/cockpit-config/src/config/files.rs` module `windows_tests`:
+    //   - `atomic_write_rejects_preexisting_intermediate_reparse_point`
+    //   - `prepared_atomic_write_stays_bound_to_open_parent_across_junction_swap`
+    //   - `private_file_refuses_a_reparse_point_parent_and_replaces_in_place`
+    //   - `read_file_nofollow_refuses_a_reparse_point_and_reports_absence`
+    //   - `prepared_file_removal_rejects_preexisting_intermediate_reparse_point`
+    // The test below additionally drives the ingress-facing wrapper end to end
+    // so a regression in the terminal-ingress publish path (not just the shared
+    // primitive) is caught on Windows.
+    //
+    // ENV-DEFERRED: this `#[cfg(windows)]` body is compiled and executed only on
+    // the Windows CI leg (`x86_64-pc-windows-msvc`); it cannot be compiled on a
+    // Linux/macOS host, so it is not exercised by this workspace's Linux gate.
+    #[cfg(windows)]
     #[test]
     fn terminal_ingress_windows_no_reparse() {
-        let source = include_str!("../../../crates/cockpit-config/src/config/files.rs");
-        for required in [
-            "NtCreateFile",
-            "RootDirectory",
-            "FILE_OPEN_REPARSE_POINT",
-            "FILE_CREATE",
-            "FILE_SHARE_DELETE",
-        ] {
-            assert!(
-                source.contains(required),
-                "missing hardened Windows primitive {required}"
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = tempfile::tempdir().unwrap();
+        let binding_dir = temp.path().join("binding");
+        std::fs::create_dir(&binding_dir).unwrap();
+        cockpit_config::config::ensure_terminal_ingress_private_dir(&binding_dir).unwrap();
+
+        // A pre-existing junction on the publish parent must never redirect the
+        // ingress write outside the intended private directory.
+        let attacker = temp.path().join("attacker");
+        std::fs::create_dir(&attacker).unwrap();
+        let junction = temp.path().join("linked-binding");
+        symlink_dir(&attacker, &junction).unwrap();
+
+        let bytes = b"\x89PNG\r\n\x1a\nwin-ingress";
+        let redirected = junction.join("paste.png");
+        let error = cockpit_config::config::write_terminal_ingress_private_file(&redirected, bytes)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reparse-point component"),
+            "ingress publish must reject a reparse-point/junction component: {error:#}"
+        );
+        assert!(
+            !attacker.join("paste.png").exists(),
+            "a junction must never redirect the ingress publish outside its private dir"
+        );
+
+        // The honest write to a real private directory still commits in place.
+        let final_path = binding_dir.join("paste.png");
+        let identity =
+            cockpit_config::config::write_terminal_ingress_private_file(&final_path, bytes)
+                .unwrap();
+        assert_eq!(identity.links, 1);
+        assert_eq!(std::fs::read(&final_path).unwrap(), bytes);
+    }
+
+    /// AC11 — the ingress control surface carries no reusable authority and no
+    /// addressing that can escape a binding lineage. Every operation is keyed by
+    /// a `(binding_id, binding_epoch)` issued for one terminal; a binding from
+    /// another terminal, a forged binding, and a released binding are all
+    /// rejected, and the published object is confined to the binding's
+    /// server-generated private directory (the wire protocol carries no path, so
+    /// a caller can never name a target).
+    #[cfg(unix)]
+    #[test]
+    fn terminal_ingress_no_reusable_authority_or_sensitive_control_plane() {
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+
+        let Response::TerminalOpened {
+            terminal_id: term_a,
+            binding: binding_a,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Response::TerminalOpened {
+            terminal_id: term_b,
+            binding: binding_b,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_ne!(term_a, term_b);
+
+        let bytes = b"\x89PNG\r\n\x1a\nlineage";
+        let operation_id = Uuid::new_v4();
+        let metadata = TerminalIngressMetadata {
+            operation_id,
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Png,
+            sha256: sha256_hex(bytes),
+        };
+        host.ingress_begin(term_a, binding_a, metadata).unwrap();
+        host.ingress_chunk(term_a, binding_a, operation_id, 0, bytes.to_vec())
+            .unwrap();
+
+        // A binding issued for a DIFFERENT terminal cannot address term_a's
+        // operation on any verb.
+        assert_eq!(
+            host.ingress_chunk(term_a, binding_b, operation_id, 0, bytes.to_vec())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+        assert_eq!(
+            host.ingress_status(term_a, binding_b, operation_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+        assert_eq!(
+            host.ingress_finish(term_a, binding_b, operation_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+
+        // A forged binding (never issued) is rejected, including for opening a
+        // fresh operation.
+        let forged = TerminalBinding {
+            binding_id: Uuid::new_v4(),
+            binding_epoch: binding_a.binding_epoch + 999,
+        };
+        assert_eq!(
+            host.ingress_status(term_a, forged, operation_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+        let forged_meta = TerminalIngressMetadata {
+            operation_id: Uuid::new_v4(),
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Png,
+            sha256: sha256_hex(bytes),
+        };
+        assert_eq!(
+            host.ingress_begin(term_a, forged, forged_meta)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+
+        // The legitimate lineage completes, and the published object is confined
+        // to the terminal's private root.
+        let Response::TerminalIngress { receipt } = host
+            .ingress_finish(term_a, binding_a, operation_id)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(receipt.state, TerminalIngressState::Committed);
+        let terminal_a = host.get_terminal(term_a).unwrap();
+        let (committed_path, temp_dir) = {
+            let state = crate::sync::lock_or_recover(&terminal_a);
+            (
+                state.ingress[&operation_id].path.as_ref().unwrap().clone(),
+                state.temp_dir.clone(),
+            )
+        };
+        // Resolve BOTH paths through the filesystem so the containment is
+        // physical, not lexical: a symlink/reparse component beneath temp_dir
+        // that redirected the file outside the private root would fail this,
+        // whereas a bare `starts_with` on the un-resolved paths would not.
+        let committed_real = std::fs::canonicalize(&committed_path).unwrap();
+        let root_real = std::fs::canonicalize(&temp_dir).unwrap();
+        assert!(
+            committed_real.starts_with(&root_real),
+            "committed ingress path {committed_real:?} escaped the terminal private root {root_real:?}"
+        );
+
+        // A released binding is not reusable authority.
+        host.release_viewer(term_b, binding_b);
+        let after_meta = TerminalIngressMetadata {
+            operation_id: Uuid::new_v4(),
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Png,
+            sha256: sha256_hex(bytes),
+        };
+        assert_eq!(
+            host.ingress_begin(term_b, binding_b, after_meta)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidIngress
+        );
+
+        let _ = host.close(term_a);
+        let _ = host.close(term_b);
+    }
+
+    /// Read `/proc/<pid>/fd` and report whether any descriptor the child holds
+    /// resolves to `target`.
+    #[cfg(target_os = "linux")]
+    fn child_holds_fd_to(pid: u32, target: &Path) -> bool {
+        let dir = PathBuf::from(format!("/proc/{pid}/fd"));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if let Ok(link) = std::fs::read_link(entry.path())
+                && let Ok(resolved) = std::fs::canonicalize(&link)
+                && resolved == target
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Parse `/proc/<pid>/environ` (the frozen exec-time environment) into a map.
+    #[cfg(target_os = "linux")]
+    fn read_proc_environ(pid: u32) -> std::collections::HashMap<String, String> {
+        let raw = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        raw.split(|&b| b == 0)
+            .filter(|slice| !slice.is_empty())
+            .filter_map(|slice| {
+                let text = std::str::from_utf8(slice).ok()?;
+                let (key, value) = text.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Block until the child's post-`execve` image is installed, detected by the
+    /// `COCKPIT_REMOTE` override (which the parent test process does not carry)
+    /// appearing in the child's frozen exec-time environment. This is the only
+    /// reliable barrier: portable_pty closes the stray descriptors in `pre_exec`
+    /// (so the fd table is already clean BEFORE `execve`), while the environment
+    /// overrides only land AT `execve` — so observing the fd table clean does
+    /// not imply the environment is post-exec. The caller asserts the parent
+    /// lacks `COCKPIT_REMOTE`, which makes this a valid, non-tautological gate.
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_exec(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if read_proc_environ(pid).contains_key("COCKPIT_REMOTE") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// AC11 negative case — a committed ingress holds an open private-file
+    /// descriptor; a subsequently spawned terminal child must not inherit it,
+    /// and the spawn must add no environment beyond the enumerated allowlist.
+    /// The terminal spawn path closes every descriptor above stderr before exec
+    /// (portable_pty `close_random_fds`) and the ingress handle is close-on-exec,
+    /// so nothing leaks. The control at the end proves the detector is
+    /// non-vacuous and the closure is load-bearing: the SAME non-`CLOEXEC`
+    /// descriptor DOES leak through a naive spawn that lacks that fd hygiene.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_ingress_child_inheritance_closed() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (tx, _rx) = broadcast::channel(16);
+        let tmp = tempfile::tempdir().unwrap();
+        let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
+
+        let Response::TerminalOpened {
+            terminal_id,
+            binding,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let bytes = b"\x89PNG\r\n\x1a\ninherit";
+        let operation_id = Uuid::new_v4();
+        let metadata = TerminalIngressMetadata {
+            operation_id,
+            size: bytes.len() as u64,
+            media_type: TerminalImageType::Png,
+            sha256: sha256_hex(bytes),
+        };
+        host.ingress_begin(terminal_id, binding, metadata).unwrap();
+        host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
+            .unwrap();
+        host.ingress_finish(terminal_id, binding, operation_id)
+            .unwrap();
+        let terminal = host.get_terminal(terminal_id).unwrap();
+        let committed_path = crate::sync::lock_or_recover(&terminal).ingress[&operation_id]
+            .path
+            .as_ref()
+            .unwrap()
+            .clone();
+        let committed_real = std::fs::canonicalize(&committed_path).unwrap();
+
+        // Spawn a fresh terminal child AFTER the ingress descriptor is held.
+        let Response::TerminalOpened {
+            terminal_id: child_term,
+            ..
+        } = host
+            .open(Some(tmp.path().to_string_lossy().into_owned()), 80, 24)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let child_pid = {
+            let child_terminal = host.get_terminal(child_term).unwrap();
+            let state = crate::sync::lock_or_recover(&child_terminal);
+            state
+                .child
+                .as_ref()
+                .unwrap()
+                .process_id()
+                .expect("child pid")
+        };
+        // The wait barrier below keys on COCKPIT_REMOTE being a post-exec-only
+        // marker, so the parent must not carry it.
+        assert!(
+            std::env::var_os("COCKPIT_REMOTE").is_none(),
+            "test harness must not set COCKPIT_REMOTE"
+        );
+        wait_for_child_exec(child_pid);
+        assert!(
+            !child_holds_fd_to(child_pid, &committed_real),
+            "terminal child inherited the close-on-exec ingress descriptor"
+        );
+
+        // The spawn adds only the enumerated env overrides; every other var is
+        // the parent's value, unchanged. An injected secret env would appear as
+        // an added/altered key outside the allowlist.
+        let child_env = read_proc_environ(child_pid);
+        assert_eq!(
+            child_env.get("COCKPIT_REMOTE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            child_env.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        let parent_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let allowlist = ["TERM", "COCKPIT_REMOTE", "SHELL"];
+        for (key, value) in &child_env {
+            if allowlist.contains(&key.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                parent_env.get(key),
+                Some(value),
+                "terminal child env var {key} was injected or altered outside the allowlist"
             );
         }
-        assert!(source.contains("commit_noreplace"));
+
+        // Non-vacuity control: open a descriptor to the SAME file WITHOUT
+        // close-on-exec and spawn a plain child that performs no fd hygiene. It
+        // inherits the descriptor, proving both that the detector really fires
+        // on a leaked fd and that the terminal spawn's closure above is a real,
+        // load-bearing property rather than a tautology.
+        let leaked = unsafe {
+            let path = std::ffi::CString::new(committed_real.as_os_str().as_bytes()).unwrap();
+            libc::open(path.as_ptr(), libc::O_RDONLY)
+        };
+        assert!(leaked >= 0, "open leak fixture");
+        let mut naive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn naive control child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut leaked_inherited = false;
+        while Instant::now() < deadline {
+            if child_holds_fd_to(naive.id(), &committed_real) {
+                leaked_inherited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = naive.kill();
+        let _ = naive.wait();
+        unsafe {
+            libc::close(leaked);
+        }
+        assert!(
+            leaked_inherited,
+            "a non-CLOEXEC descriptor must leak through a spawn without fd hygiene — \
+             the inheritance detector is vacuous otherwise"
+        );
+
+        let _ = host.close(terminal_id);
+        let _ = host.close(child_term);
     }
 
     #[test]

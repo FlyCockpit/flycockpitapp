@@ -2,6 +2,7 @@ import { z } from "zod";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
 export * from "./dependency-health";
+export * from "./remote-attempt-grants";
 export * from "./remote-connection-metadata";
 export * from "./remote-device-identity-enrollment";
 export * from "./remote-identity-custody-provider";

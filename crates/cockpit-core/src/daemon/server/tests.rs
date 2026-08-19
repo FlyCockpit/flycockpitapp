@@ -11755,7 +11755,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "resolve_interrupt"
         | "archive_session"
         | "discard_session"
-        | "delete_session"
         | "set_active_model"
         | "set_agent"
         | "set_tool_surface_override"
@@ -11832,6 +11831,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // bundle / wizard id. (Both stay owner-only; only the post-auth error
         // code differs from the sibling `bad_request` mutations above.)
         "import_policy" | "apply_setup_wizard" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // v10 `delete_session` rejects an active session with a typed `Conflict`
+        // ("end it before deleting") before any deletion. The matrix's
+        // cross-session-paused-work scenario keeps the target session active, so
+        // the owner-allowed cell surfaces `Conflict` — not the `Internal` shared
+        // by the other session-writer mutations above. (v9 envelopes retain the
+        // old delete-active behavior; the version gate is exercised by the
+        // dedicated `delete_session_rejects_active_session` /
+        // `delete_session_v9_envelope_does_not_reject_active_session` tests.)
+        "delete_session" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }

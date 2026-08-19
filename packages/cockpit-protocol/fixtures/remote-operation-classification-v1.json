@@ -2634,7 +2634,7 @@
       "tag": "put_provider_credential"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "provider_id:string",
       "fcorRoles": [
@@ -2649,7 +2649,7 @@
       "tag": "begin_provider_oauth"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "flow_id:string|input:option<string>",
       "fcorRoles": [
@@ -2665,11 +2665,11 @@
         }
       ],
       "fcorSchema": "flow_id:String|input:Option<String>",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "complete_provider_oauth"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|server:string",
       "fcorRoles": [
@@ -2689,7 +2689,7 @@
       "tag": "begin_mcp_oauth"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "flow_id:string|input:option<string>",
       "fcorRoles": [
@@ -2705,7 +2705,7 @@
         }
       ],
       "fcorSchema": "flow_id:String|input:Option<String>",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "complete_mcp_oauth"
     },
     {
@@ -2888,7 +2888,7 @@
       "tag": "save_provider_config"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|provider_id:string",
       "fcorRoles": [
@@ -2904,11 +2904,11 @@
         }
       ],
       "fcorSchema": "project_root:String|provider_id:String",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "setup_copilot_auth"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|wizard_id:string|answers_json:string",
       "fcorRoles": [
@@ -2929,7 +2929,7 @@
         }
       ],
       "fcorSchema": "project_root:String|wizard_id:String|answers_json:String",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "apply_setup_wizard"
     },
     {
@@ -2963,7 +2963,7 @@
       "tag": "save_mcp_config"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|path:string|content:string|base_hash:option<string>",
       "fcorRoles": [
@@ -2989,7 +2989,7 @@
         }
       ],
       "fcorSchema": "project_root:String|path:String|content:String|base_hash:Option<String>",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "save_extended_config"
     },
     {
@@ -3008,7 +3008,7 @@
       "tag": "export_policy"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|bundle_json:string|replace:bool",
       "fcorRoles": [
@@ -3029,7 +3029,7 @@
         }
       ],
       "fcorSchema": "project_root:String|bundle_json:String|replace:bool",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "import_policy"
     },
     {
@@ -3048,7 +3048,7 @@
       "tag": "get_image_spend_policy"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_key:string|settings_json:string|expected_policy_version:option<u64>",
       "fcorRoles": [
@@ -3069,7 +3069,7 @@
         }
       ],
       "fcorSchema": "project_key:String|settings_json:String|expected_policy_version:Option<u64>",
-      "strategy": "none",
+      "strategy": "nonrepeatable_dispatch",
       "tag": "save_image_spend_policy"
     },
     {

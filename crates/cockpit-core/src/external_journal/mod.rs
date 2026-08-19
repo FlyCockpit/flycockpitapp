@@ -393,6 +393,33 @@ pub struct ExternalJournal {
     fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool,
+    /// Test-only ordering barrier: when installed, `begin_dispatch` parks inside
+    /// the durable-commit critical section until released, letting a test prove
+    /// no provider handoff happens until the journal authorizes it.
+    #[cfg(test)]
+    dispatch_gate: std::sync::Mutex<Option<DispatchGate>>,
+}
+
+/// Test handle that parks the journal inside [`ExternalJournal::begin_dispatch`]
+/// so a caller can observe that the provider handoff has not happened yet.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct DispatchGate {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl DispatchGate {
+    /// Resolve once `begin_dispatch` has entered the parked critical section.
+    pub(crate) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the parked `begin_dispatch` proceed to its durable commit.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl std::fmt::Debug for ExternalJournal {
@@ -414,6 +441,18 @@ impl ExternalJournal {
             Spool::open_at(root, SpoolAccess::Create).expect("open test external journal spool"),
             SpoolKeyRing::for_test(&[(1, [0x51; 32])], 1).expect("test spool keys"),
         )
+    }
+
+    /// Install (or replace) the `begin_dispatch` ordering barrier and return its
+    /// handle. Used by ordering tests to prove journal-commit-before-handoff.
+    #[cfg(test)]
+    pub(crate) fn install_dispatch_gate(&self) -> DispatchGate {
+        let gate = DispatchGate {
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.dispatch_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
     /// Open the owner-private namespace used by remote operation recovery.
     /// Callers receive a held no-follow directory authority, never its path.
@@ -576,6 +615,8 @@ impl ExternalJournal {
             fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            dispatch_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -786,6 +827,20 @@ impl ExternalJournal {
         now_wall_ms: i64,
     ) -> Result<DispatchTicket, ExternalJournalError> {
         self.ensure_dispatch_allowed().await?;
+
+        // Test-only ordering barrier. Parking here — inside the only method
+        // whose `Ok` authorizes a provider handoff — lets a test observe that no
+        // provider call has happened while the journal has not yet committed
+        // `dispatching`. Cloned out of the lock so the guard is not held across
+        // the await.
+        #[cfg(test)]
+        {
+            let gate = self.dispatch_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.reached.notify_one();
+                gate.release.notified().await;
+            }
+        }
 
         let record = self
             .db

@@ -421,6 +421,7 @@ pub(crate) mod journal_fault {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static FAIL_AFTER_ARTIFACT_ROW: AtomicBool = AtomicBool::new(false);
+    static FAIL_PRIMARY_INFERENCE_INSERT: AtomicBool = AtomicBool::new(false);
 
     /// Arm/disarm the mid-transaction fault.
     pub(crate) fn set_fail_after_artifact_row(fail: bool) {
@@ -429,6 +430,17 @@ pub(crate) mod journal_fault {
 
     pub(super) fn should_fail_after_artifact_row() -> bool {
         FAIL_AFTER_ARTIFACT_ROW.load(Ordering::SeqCst)
+    }
+
+    /// Arm/disarm a failure of the plain primary inference-attempt insert (the
+    /// path taken by untrusted / unjournaled sessions). Used to drive the
+    /// dual-failure barrier test: no journal AND the primary audit row fails.
+    pub(crate) fn set_fail_primary_inference_insert(fail: bool) {
+        FAIL_PRIMARY_INFERENCE_INSERT.store(fail, Ordering::SeqCst);
+    }
+
+    pub(super) fn should_fail_primary_inference_insert() -> bool {
+        FAIL_PRIMARY_INFERENCE_INSERT.load(Ordering::SeqCst)
     }
 }
 
@@ -872,6 +884,10 @@ impl Session {
         // insert-only path, journal nothing. Untrusted payloads are already
         // post-redaction and must never create history rows.
         if !target_trusted || self.unjournaled_inference_allowed() {
+            #[cfg(test)]
+            if journal_fault::should_fail_primary_inference_insert() {
+                anyhow::bail!("injected primary inference audit insert failure (test seam)");
+            }
             return self
                 .db
                 .insert_inference_request(

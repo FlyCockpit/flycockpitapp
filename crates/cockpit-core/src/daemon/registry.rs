@@ -268,8 +268,10 @@ fn resolve_session_worker_model(
         let mut session_providers = providers_cfg.clone();
         session_providers.active_model = Some(active);
         let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-        let store =
-            crate::credentials::CredentialStore::from_vault(session.secret_vault().clone())?;
+        // Owner-scoped resolution: this provider request may only resolve
+        // `$secret:` names owned by (provider, this workspace root). See
+        // `named-secret-ownership-boundary`.
+        let store = session.provider_credential_store(&session_providers)?;
         let model =
             Model::from_config_with_store(&session_providers, redact.clone(), env_lookup, store)?;
         with_worker_model_runtime(model, shutdown, config_path.clone())
@@ -283,7 +285,7 @@ fn resolve_session_worker_model(
         return Ok(inherited_model);
     };
     let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
-    let store = crate::credentials::CredentialStore::from_vault(session.secret_vault().clone())?;
+    let store = session.provider_credential_store(providers_cfg)?;
     let secret_lookup = {
         let store = store.clone();
         move |name: &str| store.named_secret(name).map(str::to_string)

@@ -395,6 +395,32 @@ impl Session {
         crate::credentials::CredentialStore::from_vault(self.secret_vault.clone())
     }
 
+    /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]
+    /// (the comprehensive view used for redaction and inventory), this restricts
+    /// the resolvable `$secret:` names to those owned by (provider, this
+    /// session's project root), backfilling legacy references this provider
+    /// config actually uses. A provider request built from this store can never
+    /// resolve a secret owned by a different kind/workspace. See
+    /// `named-secret-ownership-boundary`.
+    pub(crate) fn provider_credential_store(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+    ) -> anyhow::Result<crate::credentials::CredentialStore> {
+        crate::credentials::CredentialStore::from_vault_owner_scoped(
+            self.secret_vault.clone(),
+            crate::secret_ownership::OWNER_KIND_PROVIDER,
+            &crate::secret_ownership::canonical_owner_root(
+                &self.project_root.display().to_string(),
+            ),
+            &crate::secret_ref::provider_named_secret_references(providers),
+            // The session boundary has no cross-config scan, so sole-ownership of
+            // an unclaimed legacy name is unprovable here: never lazily claim
+            // (fail closed on unclaimed). The daemon's provider settings paths
+            // establish ownership with a scan; already-owned names still resolve.
+            None,
+        )
+    }
+
     pub fn allow_unjournaled_inference(&self) {
         self.allow_unjournaled_inference
             .store(true, std::sync::atomic::Ordering::Release);

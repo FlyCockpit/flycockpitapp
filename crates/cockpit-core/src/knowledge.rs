@@ -1039,7 +1039,9 @@ async fn production_embedder(
         }
         Err(error) => return Err(error).context("resolving embedding model for knowledge"),
     };
-    let store = session.credential_store()?;
+    // Owner-scoped resolution: the embedding provider request may only resolve
+    // `$secret:` names owned by (provider, this session's project root).
+    let store = session.provider_credential_store(&providers)?;
     let embedder =
         OpenAiCompatEmbedder::for_resolved_model_with_store(&providers, &resolved, redact, store)
             .await?;

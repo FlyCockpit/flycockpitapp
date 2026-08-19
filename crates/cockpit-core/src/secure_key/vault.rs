@@ -115,6 +115,86 @@ impl SecretVault {
         Ok(())
     }
 
+    /// Guarded owner mutation for a named secret: the cross-kind/foreign-owner
+    /// ownership guard, the AEAD mutate, and the ownership claim run in ONE
+    /// `BEGIN IMMEDIATE` transaction, so a write that does not own the name fails
+    /// closed (no vault mutation, no claim) rather than stomping a secret owned by
+    /// a different kind/workspace. On success the owner redaction table is
+    /// published, compensating the vault write if publication fails — matching
+    /// [`Self::mutate_owner_item`]. This is the funnel MCP OAuth token refresh
+    /// uses (a refresh must own the name it rotates).
+    pub fn mutate_owner_named_secret_guarded(
+        &self,
+        item_id: &str,
+        plaintext: &[u8],
+        owner_kind: &str,
+        project_root: &str,
+    ) -> Result<(), SecureKeyError> {
+        let item_id_owned = item_id.to_owned();
+        let plaintext_owned = plaintext.to_vec();
+        let owner_kind_owned = owner_kind.to_owned();
+        let project_root_owned = project_root.to_owned();
+        let vault = self.clone();
+        let mutation = self
+            .db
+            .blocking_write_for_sync_maintenance(move |conn| {
+                ensure_inventory_generation_conn(conn).map_err(map_db_err)?;
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                let result = (|| -> Result<SecretVaultMutation, SecureKeyError> {
+                    // Fail closed if a foreign kind/workspace owns this name.
+                    crate::secret_ownership::reject_conflicting_named_ownership_on_conn(
+                        conn,
+                        &item_id_owned,
+                        &owner_kind_owned,
+                        &project_root_owned,
+                    )
+                    .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                    let mutation = vault.mutate_item_on_conn(
+                        conn,
+                        SecretVaultKind::NamedSecret,
+                        &item_id_owned,
+                        Some(&plaintext_owned),
+                    )?;
+                    crate::secret_ownership::claim_named_reference_on_conn(
+                        conn,
+                        &item_id_owned,
+                        &owner_kind_owned,
+                        &project_root_owned,
+                    )
+                    .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                    Ok(mutation)
+                })();
+                match result {
+                    Ok(mutation) => {
+                        conn.execute_batch("COMMIT;")
+                            .map_err(|error| SecureKeyError::Internal(error.to_string()))?;
+                        Ok(mutation)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        Err(error.into())
+                    }
+                }
+            })
+            .map_err(map_db_err)?;
+        if let Err(error) = self.publish_owner_redaction() {
+            self.restore_item_if_unchanged(
+                SecretVaultKind::NamedSecret,
+                item_id,
+                &mutation.after,
+                mutation.prior.row.as_ref(),
+            )
+            .map_err(|rollback| {
+                SecureKeyError::Internal(format!(
+                    "owner redaction publication failed: {error:?}; vault rollback failed: {rollback:?}"
+                ))
+            })?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Compute a daemon-held keyed identity for replay ledgers. The digest is
     /// stable for this daemon/vault key and request bytes, but unlike a plain
     /// SHA-256 it is not an offline verifier for secret-bearing requests.

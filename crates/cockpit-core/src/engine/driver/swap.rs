@@ -1126,7 +1126,9 @@ impl Driver {
         let mut providers = self.live_providers_config()?;
         providers.active_model = Some(active.clone());
         let env_overlay = self.stack[0].agent.env_overlay.clone();
-        let store = self.session.credential_store()?;
+        // Owner-scoped: a swapped-in provider model may only resolve `$secret:`
+        // names owned by (provider, this session's project root).
+        let store = self.session.provider_credential_store(&providers)?;
         let mut built = crate::engine::model::Model::for_provider_with_store(
             &providers,
             &active.provider,

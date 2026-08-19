@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -100,7 +101,12 @@ pub fn export(cwd: &Path) -> Result<String> {
     .context("serializing portable policy bundle")
 }
 
-pub fn import(cwd: &Path, bundle_json: &str, replace: bool) -> Result<(PathBuf, u32)> {
+pub fn import(
+    cwd: &Path,
+    bundle_json: &str,
+    replace: bool,
+    vault: Option<Arc<crate::secure_key::SecretVault>>,
+) -> Result<(PathBuf, u32)> {
     let bundle: PolicyBundle =
         serde_json::from_str(bundle_json).context("parsing policy bundle")?;
     anyhow::ensure!(
@@ -145,6 +151,22 @@ pub fn import(cwd: &Path, bundle_json: &str, replace: bool) -> Result<(PathBuf, 
     // (guidance L8) an opaque blob cannot be selectively scrubbed — OMIT it.
     // Clear every such field on this import funnel before persisting.
     strip_opaque_provider_fields_in(&mut providers);
+    // A structurally valid `$secret:NAME` reference can still name a secret owned
+    // by a DIFFERENT kind (an MCP `mcp:` token) or a different workspace. The
+    // header reference gate above only checks reference SHAPE, not OWNERSHIP.
+    // Re-check AND claim every imported provider reference atomically under one
+    // `BEGIN IMMEDIATE` writer transaction IMMEDIATELY before publishing the
+    // config: a foreign/cross-kind name fails the whole import closed (nothing is
+    // written), and a valid legacy/unclaimed name is claimed here so a concurrent
+    // foreign claim cannot interpose between the check and the publish. The claim
+    // keys on the canonical workspace root, matching later owner-scoped
+    // resolution. Owner-scoped resolution (gap 1) remains a defense-in-depth
+    // backstop.
+    if let Some(vault) = vault.as_ref() {
+        let canonical_root =
+            crate::secret_ownership::canonical_owner_root(&cwd.display().to_string());
+        claim_imported_provider_references(&providers, vault, &canonical_root)?;
+    }
     current.write(&providers)?;
 
     let mut extended_doc = ExtendedConfigDoc::load(&target)?;
@@ -179,6 +201,59 @@ fn reject_literal_provider_credentials(providers: &ProvidersConfig) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Atomically re-check AND claim every imported provider `$secret:NAME`
+/// reference for `(provider, project_root)` under one `BEGIN IMMEDIATE` writer
+/// transaction, immediately before the config is published.
+///
+/// [`crate::secret_ownership::claim_named_reference_on_conn`] rejects any name
+/// already owned by a foreign kind/workspace (the whole import rolls back with
+/// no config written) and `INSERT OR IGNORE`s the claim for this workspace
+/// otherwise — so a valid legacy/unclaimed name is durably claimed here and a
+/// concurrent foreign claim cannot interpose between an earlier read-only check
+/// and the publish. An already-same-owner reference is a no-op. `project_root`
+/// must already be the canonical owner root.
+fn claim_imported_provider_references(
+    providers: &ProvidersConfig,
+    vault: &crate::secure_key::SecretVault,
+    project_root: &str,
+) -> Result<()> {
+    let names = crate::secret_ref::provider_named_secret_references(providers);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let project_root = project_root.to_string();
+    let names: Vec<String> = names.into_iter().collect();
+    vault.db().blocking_write_for_sync_maintenance(move |conn| {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            for name in &names {
+                crate::secret_ownership::claim_named_reference_on_conn(
+                    conn,
+                    name,
+                    crate::secret_ownership::OWNER_KIND_PROVIDER,
+                    &project_root,
+                )
+                .map_err(|conflict| {
+                    anyhow::anyhow!(
+                        "imported provider references secret `{name}` owned by a different kind or workspace: {conflict}"
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    })
 }
 
 /// Strip credential-bearing components (user-info, query string, fragment)
@@ -458,7 +533,7 @@ mod tests {
         });
         let bundle_json = serde_json::to_string(&bundle).unwrap();
 
-        let error = import(tmp.path(), &bundle_json, false)
+        let error = import(tmp.path(), &bundle_json, false, None)
             .expect_err("import must reject a literal credential header");
         assert!(
             error.to_string().contains("literal credential"),
@@ -474,6 +549,151 @@ mod tests {
                 "import persisted a literal credential into the config:\n{written}"
             );
         }
+    }
+
+    /// A structurally valid `$secret:NAME` reference can still name a secret owned
+    /// by a different kind/workspace. The import path must reject such a bundle
+    /// (fail fast) rather than making a provider consume a foreign-owned vault
+    /// value. Drives the real `import` entry point with a daemon vault whose
+    /// ownership table already attributes `shared` to a FOREIGN workspace, and
+    /// asserts the import fails closed and writes nothing referencing the name.
+    #[test]
+    fn import_rejects_provider_reference_owned_by_foreign_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(&config_path, "{}\n").unwrap();
+        env.set_cockpit_config(&config_path);
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        // `shared` is owned by a DIFFERENT workspace (foreign to this import cwd).
+        db.blocking_write_for_sync_maintenance(|conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES ('shared', 'provider', '/foreign/workspace', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let bundle = serde_json::json!({
+            "version": POLICY_BUNDLE_VERSION,
+            "providers": {
+                "providers": {
+                    "custom": {
+                        "url": "https://p.example/v1",
+                        "headers": [
+                            {"name": "Authorization", "value": "$secret:shared"},
+                        ],
+                    }
+                }
+            }
+        });
+        let bundle_json = serde_json::to_string(&bundle).unwrap();
+
+        // Precondition: the bundle's reference is SHAPE-valid — `$secret:shared`
+        // passes the literal-credential gate — so the rejection below is the
+        // ownership guard, not an unrelated shape error. (Only ONE TestEnvGuard may
+        // be alive at a time; the global lock is held for this whole test, so we
+        // cannot spin up a second isolated home — instead we assert directly that
+        // the shape gate accepts the reference and the ownership guard is what
+        // rejects.)
+        assert!(
+            reject_literal_provider_credentials(&{
+                let mut p = ProvidersConfig::default();
+                p.providers.insert(
+                    "custom".to_string(),
+                    ProviderEntry {
+                        url: "https://p.example/v1".to_string(),
+                        headers: vec![crate::config::providers::HeaderSpec {
+                            name: "Authorization".to_string(),
+                            value: "$secret:shared".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                );
+                p
+            })
+            .is_ok(),
+            "precondition: `$secret:shared` is a shape-valid reference"
+        );
+
+        let error = import(tmp.path(), &bundle_json, false, Some(vault))
+            .expect_err("import must reject a foreign-owned provider reference");
+        assert!(
+            error
+                .to_string()
+                .contains("owned by a different kind or workspace"),
+            "rejection must be the ownership guard, not an unrelated error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("shared"),
+            "rejection must name the foreign-owned reference: {error:#}"
+        );
+
+        // Fail-closed: nothing referencing `shared` may have been persisted.
+        let target = policy_write_target(tmp.path()).unwrap();
+        if let Ok(written) = std::fs::read_to_string(&target) {
+            assert!(
+                !written.contains("$secret:shared"),
+                "import persisted a foreign-owned reference into the config:\n{written}"
+            );
+        }
+    }
+
+    // Gap 6: import atomically CLAIMS a valid unclaimed provider reference for
+    // this workspace (immediately before publishing the config), so a concurrent
+    // foreign claim cannot interpose between the check and the publish. The old
+    // read-only reject left the name unclaimed.
+    #[test]
+    fn import_claims_unclaimed_provider_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let config_path = tmp.path().join("config.json");
+        std::fs::write(&config_path, "{}\n").unwrap();
+        env.set_cockpit_config(&config_path);
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+
+        let bundle = serde_json::json!({
+            "version": POLICY_BUNDLE_VERSION,
+            "providers": {
+                "providers": {
+                    "custom": {
+                        "url": "https://p.example/v1",
+                        "headers": [
+                            {"name": "Authorization", "value": "$secret:fresh"},
+                        ],
+                    }
+                }
+            }
+        });
+        let bundle_json = serde_json::to_string(&bundle).unwrap();
+
+        // Import succeeds AND publishes (the count reflects the imported provider).
+        let (_target, count) = import(tmp.path(), &bundle_json, false, Some(vault))
+            .expect("import of an unclaimed reference must succeed");
+        assert_eq!(count, 1, "the provider must be published");
+
+        // The reference is now durably CLAIMED for (provider, this canonical root).
+        // The pre-fix read-only check left it UNCLAIMED (owned == 0); the atomic
+        // recheck-and-claim before publish is what makes this 1.
+        let canonical =
+            crate::secret_ownership::canonical_owner_root(&tmp.path().display().to_string());
+        let owned: i64 = db
+            .blocking_read_for_sync_ui(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM secret_named_ownership
+                     WHERE item_id = 'fresh' AND owner_kind = 'provider' AND project_root = ?1",
+                    rusqlite::params![canonical],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(owned, 1, "import must claim the unclaimed reference");
     }
 
     /// A hand-crafted policy bundle whose provider base URL embeds a credential
@@ -517,7 +737,7 @@ mod tests {
         // did not, wherever the daemon chose to store it.
         for replace in [true, false] {
             let (_target, count) =
-                import(tmp.path(), &bundle_json, replace).expect("import policy bundle");
+                import(tmp.path(), &bundle_json, replace, None).expect("import policy bundle");
             assert_eq!(
                 count, 1,
                 "the crafted provider must be imported (replace={replace})"
@@ -633,7 +853,7 @@ mod tests {
 
         for replace in [true, false] {
             let (_target, count) =
-                import(tmp.path(), &bundle_json, replace).expect("import policy bundle");
+                import(tmp.path(), &bundle_json, replace, None).expect("import policy bundle");
             assert_eq!(
                 count, 1,
                 "the crafted provider must be imported (replace={replace})"

@@ -35,6 +35,33 @@ pub fn cred_key(server: &str) -> String {
     format!("mcp:{server}")
 }
 
+/// Every named-secret id this server's auth references: header/env credential
+/// refs plus the flow-managed OAuth token key. Used to scope owner-scoped
+/// resolution (`owner_kind = mcp`) so legacy backfill only ever claims names the
+/// MCP server config actually uses. All such names are `mcp:`-prefixed.
+pub fn named_secret_references(
+    server: &str,
+    cfg: &ServerConfig,
+) -> std::collections::BTreeSet<String> {
+    let mut refs: std::collections::BTreeSet<String> =
+        cfg.env_credential_refs.values().cloned().collect();
+    match &cfg.auth {
+        Auth::Header(header) => {
+            if let Some(name) = &header.credential_ref {
+                refs.insert(name.clone());
+            }
+        }
+        Auth::Env(env) => {
+            refs.extend(env.credential_refs.values().cloned());
+        }
+        Auth::Oauth(_) => {
+            refs.insert(cred_key(server));
+        }
+        Auth::None => {}
+    }
+    refs
+}
+
 pub fn header_cred_key(server: &str) -> String {
     format!("mcp:{server}:header")
 }
@@ -204,13 +231,14 @@ fn credential_value(
 /// `Ok(None)` when the server's auth isn't OAuth. Errors when OAuth is
 /// configured but no token is stored (the user must authenticate first).
 pub async fn oauth_bearer(server: &str, cfg: &ServerConfig) -> Result<Option<String>> {
-    oauth_bearer_with_store(server, cfg, None).await
+    oauth_bearer_with_store(server, cfg, None, None).await
 }
 
 pub async fn oauth_bearer_with_store(
     server: &str,
     cfg: &ServerConfig,
     store: Option<&mut crate::credentials::CredentialStore>,
+    project_root: Option<&str>,
 ) -> Result<Option<String>> {
     let Auth::Oauth(oauth) = &cfg.auth else {
         return Ok(None);
@@ -231,7 +259,21 @@ pub async fn oauth_bearer_with_store(
             .clone()
             .context("stored MCP token expired and no refresh token is available")?;
         tokens = refresh_token(oauth, &refresh).await?;
-        store.set_named_secret_and_save_published(&key, serde_json::to_string(&tokens)?)?;
+        let serialized = serde_json::to_string(&tokens)?;
+        // A refresh MUST own the name it rotates: route the write through the
+        // in-transaction ownership guard so a refresh can never mutate a
+        // foreign-owned `mcp:<server>` token. The daemon always supplies the
+        // owning project root; without it (non-daemon callers) fall back to the
+        // ungated publish, which cannot reach a foreign vault here anyway.
+        match project_root {
+            Some(project_root) => store.set_named_secret_owned_and_save_published(
+                &key,
+                serialized,
+                crate::secret_ownership::OWNER_KIND_MCP,
+                project_root,
+            )?,
+            None => store.set_named_secret_and_save_published(&key, serialized)?,
+        }
     }
     Ok(Some(format!("Bearer {}", tokens.access_token)))
 }

@@ -35,21 +35,28 @@ pub(super) fn prompt_summary(msg: &Message, max_chars: usize) -> FailedTurnPromp
 /// a hard-coded model. `None` when no backup is configured, the config can't be
 /// loaded, or the backup `(provider, model)` can't be built (each ⇒ no
 /// fallback / hard-fail, never a crash).
-pub(crate) fn resolve_backup_model_for_with_store(
+pub(crate) fn resolve_backup_model_for_session(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
-    store: Option<crate::credentials::CredentialStore>,
+    session: &crate::session::Session,
 ) -> Option<Arc<crate::engine::model::Model>> {
     let providers = config.providers();
+    // Build the backup/failover request from the OWNER-SCOPED store derived from
+    // the SAME pinned providers config used to build the model, so a failover
+    // model's `$secret:` header ref can only resolve a secret owned by (provider,
+    // this session's workspace) — never a foreign workspace's secret. See
+    // `named-secret-ownership-boundary`.
+    let store = session.provider_credential_store(&providers).ok();
     build_backup_model_with_store(&providers, model, store)
 }
 
-pub(crate) fn resolve_failover_models_for_with_store(
+pub(crate) fn resolve_failover_models_for_session(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
-    store: Option<crate::credentials::CredentialStore>,
+    session: &crate::session::Session,
 ) -> Vec<Arc<crate::engine::model::Model>> {
     let providers = config.providers();
+    let store = session.provider_credential_store(&providers).ok();
     build_failover_models_with_store(&providers, model, store)
 }
 

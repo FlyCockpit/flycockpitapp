@@ -282,14 +282,19 @@ async fn run_swarm_loop(
     // Resolve backup/failover under the child's PINNED config (never live
     // `ctx.config`), so failover/reposture/dispatch share the same generation the
     // child's identity/posture were built under.
-    let store = ctx.session.credential_store().ok();
-    let backup_model = crate::engine::driver::resolve_backup_model_for_with_store(
+    // Owner-scoped under the child's PINNED config: backup/failover are built
+    // from the store scoped to (provider, this workspace), so a swarm child's
+    // fallback can never resolve a foreign workspace's `$secret:`.
+    let backup_model = crate::engine::driver::resolve_backup_model_for_session(
         &pinned,
         &agent.model,
-        store.clone(),
+        &ctx.session,
     );
-    let fallback_models =
-        crate::engine::driver::resolve_failover_models_for_with_store(&pinned, &agent.model, store);
+    let fallback_models = crate::engine::driver::resolve_failover_models_for_session(
+        &pinned,
+        &agent.model,
+        &ctx.session,
+    );
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
@@ -490,6 +495,12 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
     // posture (it affects only the next spawn).
     let pinned = ctx.config.repin();
     let (extended, providers) = crate::engine::model_roles::load_model_role_config(&pinned);
+    // Owner-scoped store for this swarm child's model selection AND its delegated
+    // model construction, derived from the SAME pinned providers config: a
+    // model-authored `spawn.model` `$secret:` selector (or a header ref) can only
+    // resolve a secret owned by (provider, this workspace), never a foreign one.
+    // See `named-secret-ownership-boundary`.
+    let scoped_store = ctx.session.provider_credential_store(&providers).ok();
     // `spawn.model` is a model-authored selector exactly like
     // `task.payload.model`, so it takes the same custody-typed, forced
     // redacted-untrusted route with subagent-invokable and capability checks.
@@ -505,7 +516,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
                     &extended,
                     &providers,
                     &ctx.agent.model,
-                    ctx.session.credential_store().ok(),
+                    scoped_store.clone(),
                 )
             }
             // A model wrote this selector: forced redacted-untrusted custody.
@@ -516,7 +527,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
                     &extended,
                     &providers,
                     &ctx.agent.model,
-                    ctx.session.credential_store().ok(),
+                    scoped_store.clone(),
                 )
             }
         }
@@ -567,7 +578,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
-        credential_store: ctx.session.credential_store().ok(),
+        credential_store: scoped_store,
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
     // write-capable, parallel worker that may itself fan out deeper `bee`

@@ -770,7 +770,13 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
-        credential_store: session.credential_store().ok(),
+        // Owner-scoped store for delegated/computer-use model construction: a
+        // child's `$secret:` model/header ref can only resolve a secret owned by
+        // (provider, this session's workspace), never a foreign workspace's. See
+        // `named-secret-ownership-boundary`.
+        credential_store: session
+            .provider_credential_store(&start_config.providers)
+            .ok(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);
@@ -2948,7 +2954,7 @@ pub(super) async fn run_worker(
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        let store = match session.credential_store() {
+                        let store = match session.provider_credential_store(&providers_cfg) {
                             Ok(store) => store,
                             Err(e) => {
                                 send_current_session_event(

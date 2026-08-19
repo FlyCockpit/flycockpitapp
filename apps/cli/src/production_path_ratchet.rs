@@ -142,6 +142,10 @@ const CLI_DAEMON_ONLY_FILES: &[&str] = &[
     "apps/cli/src/commands/models.rs",
     "apps/cli/src/commands/fetch_models.rs",
     "apps/cli/src/commands/config.rs",
+    // `mcp add` publishes MCP config through the owner-remoted `SaveMcpConfig`
+    // RPC so it inherits the daemon's atomic cross-kind ownership guard rather
+    // than writing `.cockpit/mcp.json` directly.
+    "apps/cli/src/commands/mcp.rs",
 ];
 
 /// The two non-settings TUI app files the daemon-only inventory must also scan.

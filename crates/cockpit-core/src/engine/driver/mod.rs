@@ -43,8 +43,7 @@ pub(crate) use reports::{
     FailoverCustodyBlocked, FailoverCustodyRefusal, FailoverRefusalKind, build_backup_model,
     build_backup_model_with_diagnostics, build_backup_model_with_store, build_failover_models,
     build_failover_models_with_diagnostics, build_failover_models_with_store,
-    failover_custody_block, resolve_backup_model_for_with_store,
-    resolve_failover_models_for_with_store,
+    failover_custody_block, resolve_backup_model_for_session, resolve_failover_models_for_session,
 };
 use skills_seed::SkillPair;
 
@@ -5533,25 +5532,27 @@ impl Driver {
         model: &crate::engine::model::Model,
     ) -> Option<Arc<crate::engine::model::Model>> {
         // Honor the test-injected providers config when present (mirrors
-        // `active_providers_config`), else load from the cwd config chain.
-        let store = self.session.credential_store().ok();
+        // `active_providers_config`), else load from the cwd config chain. Either
+        // way the store is OWNER-SCOPED to the exact providers config so a backup
+        // model can never resolve a foreign workspace's `$secret:`.
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
+            let store = self.session.provider_credential_store(providers).ok();
             return build_backup_model_with_store(providers, model, store);
         }
-        resolve_backup_model_for_with_store(&self.config, model, store)
+        resolve_backup_model_for_session(&self.config, model, &self.session)
     }
 
     fn resolve_failover_models(
         &self,
         model: &crate::engine::model::Model,
     ) -> Vec<Arc<crate::engine::model::Model>> {
-        let store = self.session.credential_store().ok();
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
+            let store = self.session.provider_credential_store(providers).ok();
             return build_failover_models_with_store(providers, model, store);
         }
-        resolve_failover_models_for_with_store(&self.config, model, store)
+        resolve_failover_models_for_session(&self.config, model, &self.session)
     }
 
     /// Load the layered providers config plus the session's active
@@ -7999,7 +8000,14 @@ impl Driver {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
-            credential_store: self.session.credential_store().ok(),
+            // Owner-scoped store for delegated/computer-use model construction,
+            // derived from the driver's pinned providers config: a child can only
+            // resolve a `$secret:` owned by (provider, this workspace). See
+            // `named-secret-ownership-boundary`.
+            credential_store: self
+                .session
+                .provider_credential_store(&self.config.providers())
+                .ok(),
         }
     }
 

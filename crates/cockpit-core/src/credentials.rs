@@ -11,7 +11,7 @@
 //! Production login, refresh, logout, MCP, provider-header, `ask`, and setup
 //! paths use the injected vault handle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,6 +85,78 @@ impl CredentialStore {
     /// Production constructor: vault-backed facade.
     pub fn from_vault(vault: Arc<SecretVault>) -> Result<Self> {
         let (records, secrets) = load_from_vault(&vault)?;
+        Ok(Self {
+            backend: CredentialBackend::Vault(vault),
+            records,
+            secrets,
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
+    }
+
+    /// Owner-scoped resolution constructor (named-secret ownership boundary).
+    ///
+    /// Builds a vault-backed store whose named-secret view is restricted to the
+    /// secrets the referencing context `(owner_kind, project_root)` may resolve:
+    /// every name already owned by this context, plus any legacy (unclaimed)
+    /// name the config actually references that is prefix-legitimate for this
+    /// kind — those are atomically backfilled to this owner and then resolve.
+    /// A name owned by a DIFFERENT (kind, root) is dropped from the view, so a
+    /// `$secret:NAME` reference in a config owned by A can never resolve a secret
+    /// owned by B: `named_secret` returns `None` and the resolver fails closed
+    /// (it never forwards a literal). See [`crate::secret_ownership`].
+    ///
+    /// `referenced_names` is the set of named-secret ids the config references
+    /// (provider `$secret:` header names, or MCP credential/OAuth keys). Only
+    /// these are eligible for legacy backfill, so a construction never claims a
+    /// name the context does not actually use.
+    ///
+    /// `foreign_scope_references` gates legacy backfill against first-resolver-
+    /// steals (gap 4): `None` when sole-ownership is UNPROVABLE at this boundary
+    /// (session/MCP/policy resolution have no cross-config scan) — then no legacy
+    /// name is ever claimed and an unclaimed reference fails closed; `Some(set)`
+    /// when the daemon scanned every other known config and `set` holds the names
+    /// referenced under a DIFFERENT `(kind, root)`, so a referenced unclaimed name
+    /// is claimed only when it is the sole eligible owner. See
+    /// [`crate::secret_ownership::scope_named_secret_ownership`].
+    ///
+    /// The credential `records` view is scoped by the `secret_credential_ownership`
+    /// table too (gap 2): a record owned only by a DIFFERENT workspace is dropped
+    /// so the MCP resolver's record fallback cannot reach a foreign-owned
+    /// `mcp:<server>` blob. Unclaimed (legacy) and same-owner records still
+    /// resolve, preserving configure-then-authenticate and the never-claimed
+    /// Flycockpit global-account credential.
+    pub fn from_vault_owner_scoped(
+        vault: Arc<SecretVault>,
+        owner_kind: &str,
+        project_root: &str,
+        referenced_names: &BTreeSet<String>,
+        foreign_scope_references: Option<&BTreeSet<String>>,
+    ) -> Result<Self> {
+        let (all_records, all_secrets) = load_from_vault(&vault)?;
+        let present: BTreeSet<String> = all_secrets.keys().cloned().collect();
+        let scoped_names = crate::secret_ownership::scope_named_secret_ownership(
+            vault.db(),
+            owner_kind,
+            project_root,
+            &present,
+            referenced_names,
+            foreign_scope_references,
+        )?;
+        let secrets = all_secrets
+            .into_iter()
+            .filter(|(name, _)| scoped_names.contains(name))
+            .collect();
+        let present_records: BTreeSet<String> = all_records.keys().cloned().collect();
+        let scoped_records = crate::secret_ownership::scope_credential_records(
+            vault.db(),
+            project_root,
+            &present_records,
+        )?;
+        let records = all_records
+            .into_iter()
+            .filter(|(id, _)| scoped_records.contains(id))
+            .collect();
         Ok(Self {
             backend: CredentialBackend::Vault(vault),
             records,
@@ -303,6 +375,43 @@ impl CredentialStore {
             CredentialBackend::Vault(vault) => {
                 vault
                     .mutate_owner_item(SecretVaultKind::NamedSecret, &name, Some(value.as_bytes()))
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                self.secrets.insert(name, value);
+                self.record_mutations.clear();
+                self.secret_mutations.clear();
+                Ok(())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            CredentialBackend::LegacyFile { .. } => {
+                self.set_named_secret(name, value);
+                self.save()
+            }
+        }
+    }
+
+    /// Persist one named secret through the daemon owner-mutation seam, enforcing
+    /// the in-transaction ownership guard: the write fails closed if the name is
+    /// owned by a different (`owner_kind`, `project_root`). Used by MCP OAuth
+    /// token refresh so a refresh must own the name it rotates (a foreign-owned
+    /// name is never mutated). See [`crate::secret_ownership`].
+    pub fn set_named_secret_owned_and_save_published(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        owner_kind: &str,
+        project_root: &str,
+    ) -> Result<()> {
+        let name = name.into();
+        let value = value.into();
+        match &self.backend {
+            CredentialBackend::Vault(vault) => {
+                vault
+                    .mutate_owner_named_secret_guarded(
+                        &name,
+                        value.as_bytes(),
+                        owner_kind,
+                        project_root,
+                    )
                     .map_err(|error| anyhow::anyhow!(error))?;
                 self.secrets.insert(name, value);
                 self.record_mutations.clear();
@@ -623,6 +732,386 @@ fn repair_existing_file_permissions(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn vault_backed() -> (crate::db::Db, Arc<SecretVault>) {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        (db, vault)
+    }
+
+    fn put_named(vault: &Arc<SecretVault>, name: &str, value: &str) {
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+        store.set_named_secret(name, value);
+        store.save().unwrap();
+    }
+
+    fn insert_ownership(db: &crate::db::Db, item_id: &str, owner_kind: &str, project_root: &str) {
+        let item_id = item_id.to_string();
+        let owner_kind = owner_kind.to_string();
+        let project_root = project_root.to_string();
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![item_id, owner_kind, project_root],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn insert_credential_ownership(
+        db: &crate::db::Db,
+        item_id: &str,
+        provider_id: &str,
+        project_root: &str,
+    ) {
+        let item_id = item_id.to_string();
+        let provider_id = provider_id.to_string();
+        let project_root = project_root.to_string();
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_credential_ownership (item_id, provider_id, project_root, created_at)
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![item_id, provider_id, project_root],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn ownership_exists(
+        db: &crate::db::Db,
+        item_id: &str,
+        owner_kind: &str,
+        project_root: &str,
+    ) -> bool {
+        let item_id = item_id.to_string();
+        let owner_kind = owner_kind.to_string();
+        let project_root = project_root.to_string();
+        db.blocking_read_for_sync_ui(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3)",
+                rusqlite::params![item_id, owner_kind, project_root],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .unwrap()
+    }
+
+    // Gap 1: owner-scoped resolution. A `$secret:` owned by (provider, A) resolves
+    // ONLY in its owning context — not in an (mcp, A) or (provider, B) context.
+    #[test]
+    fn owner_scoped_store_resolves_only_owning_context() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "openai", "sk-provider-owned");
+        insert_ownership(&db, "openai", "provider", "/ws/a");
+        let referenced = BTreeSet::from(["openai".to_string()]);
+
+        let owner = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/a",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert_eq!(owner.named_secret("openai"), Some("sk-provider-owned"));
+
+        let cross_kind = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "mcp",
+            "/ws/a",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cross_kind.named_secret("openai"),
+            None,
+            "cross-kind context must fail closed"
+        );
+
+        let cross_root = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/b",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cross_root.named_secret("openai"),
+            None,
+            "cross-root context must fail closed"
+        );
+    }
+
+    // Gap 1 + gap 4 backfill: a legacy (unclaimed) reference that this context is
+    // the SOLE eligible owner of (empty foreign-reference set) resolves and is
+    // atomically claimed, so a DIFFERENT context then fails closed. A SECOND
+    // unclaimed secret that this config does NOT reference must NOT be claimed or
+    // resolved (gap 7: the backfill is targeted, not "claim every unowned name").
+    #[test]
+    fn owner_scoped_store_backfills_only_sole_owned_referenced_name() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "legacy", "sk-legacy");
+        // A distractor secret present in the vault but NOT referenced by this
+        // config and never claimed by anyone.
+        put_named(&vault, "unreferenced", "sk-unreferenced");
+        assert!(
+            !ownership_exists(&db, "legacy", "provider", "/ws/a"),
+            "precondition: legacy secret is unclaimed"
+        );
+        let referenced = BTreeSet::from(["legacy".to_string()]);
+        let no_foreign = BTreeSet::new();
+
+        let owner = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/a",
+            &referenced,
+            Some(&no_foreign),
+        )
+        .unwrap();
+        assert_eq!(owner.named_secret("legacy"), Some("sk-legacy"));
+        assert!(
+            ownership_exists(&db, "legacy", "provider", "/ws/a"),
+            "backfilled claim must persist"
+        );
+        // Gap 7: the unreferenced distractor must be neither resolved nor claimed.
+        assert_eq!(
+            owner.named_secret("unreferenced"),
+            None,
+            "an unreferenced secret must never enter the scoped view"
+        );
+        assert!(
+            !ownership_exists(&db, "unreferenced", "provider", "/ws/a"),
+            "backfill must not claim a name this config does not reference"
+        );
+
+        let other = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/b",
+            &referenced,
+            Some(&no_foreign),
+        )
+        .unwrap();
+        assert_eq!(
+            other.named_secret("legacy"),
+            None,
+            "once backfilled to A, B must fail closed"
+        );
+    }
+
+    // Gap 4: a legacy unclaimed name referenced by configs under two different
+    // scopes is AMBIGUOUS — neither context may auto-claim it. It is not resolved
+    // and no ownership row is written; the user must migrate explicitly.
+    #[test]
+    fn owner_scoped_store_does_not_steal_ambiguous_reference() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "shared", "sk-shared");
+        let referenced = BTreeSet::from(["shared".to_string()]);
+        // The daemon scan proved `shared` is ALSO referenced by a config under a
+        // different root, so it is foreign-scope-ambiguous for this context.
+        let foreign = BTreeSet::from(["shared".to_string()]);
+
+        let ws_a = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/a",
+            &referenced,
+            Some(&foreign),
+        )
+        .unwrap();
+        assert_eq!(
+            ws_a.named_secret("shared"),
+            None,
+            "an ambiguous name must fail closed, not be stolen"
+        );
+        assert!(
+            !ownership_exists(&db, "shared", "provider", "/ws/a"),
+            "an ambiguous name must not be claimed"
+        );
+
+        // The other referencing workspace is symmetrically blocked.
+        let ws_b = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/b",
+            &referenced,
+            Some(&foreign),
+        )
+        .unwrap();
+        assert_eq!(ws_b.named_secret("shared"), None);
+        assert!(!ownership_exists(&db, "shared", "provider", "/ws/b"));
+    }
+
+    // Gap 4: with sole-ownership UNPROVABLE (no cross-config scan available, e.g.
+    // the session/MCP resolution boundary), an unclaimed legacy name is never
+    // claimed and does not resolve — but an ALREADY-owned name still resolves.
+    #[test]
+    fn owner_scoped_store_without_scan_never_claims_but_resolves_owned() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "legacy", "sk-legacy");
+        put_named(&vault, "owned", "sk-owned");
+        insert_ownership(&db, "owned", "provider", "/ws/a");
+        let referenced = BTreeSet::from(["legacy".to_string(), "owned".to_string()]);
+
+        let store = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/a",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.named_secret("owned"),
+            Some("sk-owned"),
+            "an already-owned name resolves even without a scan"
+        );
+        assert_eq!(
+            store.named_secret("legacy"),
+            None,
+            "an unclaimed name is not claimed when sole-ownership is unprovable"
+        );
+        assert!(
+            !ownership_exists(&db, "legacy", "provider", "/ws/a"),
+            "the no-scan boundary must never write an ownership row"
+        );
+    }
+
+    // Gap 2: a credential RECORD owned for workspace A must NOT resolve for an
+    // owner-scoped store built for workspace B — the MCP resolver's record
+    // fallback (`store.get`) can no longer reach a foreign-owned `mcp:` blob.
+    #[test]
+    fn owner_scoped_store_drops_foreign_owned_record() {
+        let (db, vault) = vault_backed();
+        // A legacy MCP OAuth blob stored as a credential record and owned by A.
+        {
+            let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+            store.set(
+                "mcp:victim",
+                serde_json::json!({ "access_token": "A-token" }),
+            );
+            store.save().unwrap();
+        }
+        insert_credential_ownership(&db, "mcp:victim", "mcp", "/ws/a");
+
+        let referenced = BTreeSet::new();
+        // Workspace B builds an MCP owner-scoped store.
+        let ws_b = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "mcp",
+            "/ws/b",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert!(
+            ws_b.get("mcp:victim").is_none(),
+            "a record owned by workspace A must not resolve for workspace B"
+        );
+
+        // The owning workspace A still resolves it (configure-then-authenticate).
+        let ws_a = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "mcp",
+            "/ws/a",
+            &referenced,
+            None,
+        )
+        .unwrap();
+        assert!(
+            ws_a.get("mcp:victim").is_some(),
+            "the owning workspace must still resolve its own record"
+        );
+
+        // An UNCLAIMED (legacy) record resolves for any workspace — preserves the
+        // never-claimed Flycockpit global-account credential.
+        {
+            let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+            store.set("legacy-record", serde_json::json!({ "api_key": "k" }));
+            store.save().unwrap();
+        }
+        let any = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/c",
+            &BTreeSet::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            any.get("legacy-record").is_some(),
+            "an unclaimed legacy record must still resolve"
+        );
+    }
+
+    // Gap 1: an OAuth key (`mcp:<server>`) resolves for its MCP owner; a provider
+    // scope must NOT adopt an `mcp:`-prefixed name even when unclaimed.
+    #[test]
+    fn owner_scoped_store_oauth_key_resolves_for_mcp_owner_only() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "mcp:server", "oauth-token");
+        let referenced = BTreeSet::from(["mcp:server".to_string()]);
+
+        let no_foreign = BTreeSet::new();
+        // Provider scope must never claim/resolve an mcp: name.
+        let provider = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "provider",
+            "/ws/a",
+            &referenced,
+            Some(&no_foreign),
+        )
+        .unwrap();
+        assert_eq!(provider.named_secret("mcp:server"), None);
+        assert!(!ownership_exists(&db, "mcp:server", "provider", "/ws/a"));
+
+        // The MCP owner backfills + resolves it.
+        let mcp = CredentialStore::from_vault_owner_scoped(
+            vault.clone(),
+            "mcp",
+            "/ws/a",
+            &referenced,
+            Some(&no_foreign),
+        )
+        .unwrap();
+        assert_eq!(mcp.named_secret("mcp:server"), Some("oauth-token"));
+        assert!(ownership_exists(&db, "mcp:server", "mcp", "/ws/a"));
+    }
+
+    // Gap 4: a guarded owner write (the funnel MCP OAuth refresh routes through)
+    // fails closed against a foreign owner and never mutates the vault value.
+    #[test]
+    fn guarded_owner_write_rejects_foreign_owner_and_preserves_value() {
+        let (db, vault) = vault_backed();
+        put_named(&vault, "mcp:victim", "orig-token");
+        insert_ownership(&db, "mcp:victim", "mcp", "/ws/a");
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+
+        let err = store
+            .set_named_secret_owned_and_save_published("mcp:victim", "stolen", "mcp", "/ws/b")
+            .expect_err("a refresh from a foreign workspace must be rejected");
+        let _ = err;
+        let reread = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(
+            reread.named_secret("mcp:victim"),
+            Some("orig-token"),
+            "a rejected refresh must not mutate the foreign-owned value"
+        );
+
+        // The owning workspace can rotate it.
+        store
+            .set_named_secret_owned_and_save_published("mcp:victim", "rotated", "mcp", "/ws/a")
+            .expect("the owning workspace may rotate its own token");
+        let reread = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(reread.named_secret("mcp:victim"), Some("rotated"));
+    }
 
     #[test]
     fn provider_credential_entries_collect_nested_and_compact_credentials() {

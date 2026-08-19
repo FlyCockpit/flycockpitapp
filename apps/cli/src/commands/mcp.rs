@@ -4,15 +4,19 @@
 //! nearest project-local `.cockpit/mcp.json`; `list`/`test` read the
 //! discovered config for the cwd.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{McpAddArgs, McpCommand, McpTestArgs};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 use crate::mcp::config::{Auth, HeaderAuth, McpConfig, OauthAuth, ServerConfig, Transport};
 
 pub async fn run(cmd: McpCommand) -> Result<()> {
     match cmd {
         McpCommand::List => list().await,
-        McpCommand::Add(args) => add(args),
+        McpCommand::Add(args) => add(args).await,
         McpCommand::Test(args) => test(args).await,
     }
 }
@@ -55,7 +59,7 @@ fn build_auth(args: &McpAddArgs) -> Result<Auth> {
     }
 }
 
-fn add(args: McpAddArgs) -> Result<()> {
+async fn add(args: McpAddArgs) -> Result<()> {
     let transport = parse_transport(&args.transport)?;
     let auth = build_auth(&args)?;
 
@@ -66,6 +70,9 @@ fn add(args: McpAddArgs) -> Result<()> {
         .context("no writable .cockpit/ directory for the current dir")?;
     let path = dir.path.join("mcp.json");
 
+    // Merge into the nearest project-local config (the daemon's write target for
+    // this cwd) so publishing the full config through `SaveMcpConfig` preserves
+    // existing servers rather than replacing them.
     let mut cfg = if path.exists() {
         McpConfig::parse(&std::fs::read_to_string(&path)?)?
     } else {
@@ -104,13 +111,54 @@ fn add(args: McpAddArgs) -> Result<()> {
         }
     }
 
+    // A literal `--auth header` value is credential material: stage it so the
+    // daemon owner-mutation moves it into the vault under this server's header
+    // key. The daemon `SaveMcpConfig` path normalizes the literal to a
+    // reference. OAuth/env/none carry no literal secret at add time.
+    let mut secret_values: BTreeMap<String, String> = BTreeMap::new();
+    if let Auth::Header(header) = &server.auth {
+        let value = header.value.trim();
+        if !value.is_empty() {
+            secret_values.insert(
+                crate::mcp::auth::header_cred_key(&args.name),
+                value.to_string(),
+            );
+        }
+    }
+
     cfg.servers.insert(args.name.clone(), server);
-    cfg.write_private(&path)?;
+
+    // Route through the owner-remoted daemon RPC so the write inherits the
+    // atomic cross-kind ownership guard: `mcp add --auth oauth --name victim`
+    // cannot publish/consume an `mcp:victim` token owned by another kind or
+    // workspace. The daemon derives its own write target and cleanup set from
+    // `project_root`; `cleanup_names_json` is advisory and ignored server-side.
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for MCP config save")?;
+    let config_json = serde_json::to_string(&cfg).context("serializing MCP config")?;
+    let secret_values_json =
+        serde_json::to_string(&secret_values).context("serializing MCP secret values")?;
+    let cleanup_names_json = serde_json::to_string(&BTreeSet::<String>::new())
+        .context("serializing MCP cleanup names")?;
+    match daemon
+        .client
+        .request(Request::SaveMcpConfig {
+            project_root: cwd.display().to_string(),
+            config_json,
+            secret_values_json,
+            cleanup_names_json,
+        })
+        .await?
+    {
+        Ok(Response::McpConfigSaved { .. }) => {}
+        Ok(other) => bail!("daemon returned unexpected response to MCP config save: {other:?}"),
+        Err(error) => bail!("daemon rejected MCP config save: {error}"),
+    }
     println!(
-        "Added MCP server `{}` ({}) to {}",
+        "Added MCP server `{}` ({}) via the daemon.",
         args.name,
         transport.as_str(),
-        path.display()
     );
     Ok(())
 }
@@ -171,6 +219,24 @@ mod tests {
             header_name: None,
             disabled: false,
         }
+    }
+
+    // Gap 3: `mcp add` must publish MCP config through the owner-remoted
+    // `SaveMcpConfig` daemon RPC (inheriting the atomic cross-kind ownership
+    // guard) rather than writing `.cockpit/mcp.json` directly. The daemon-only
+    // ratchet (`production_path_ratchet::daemon_only_paths_have_no_local_secret_or_provider_resolution`)
+    // mechanically covers this file; this asserts the routing itself.
+    #[test]
+    fn mcp_add_publishes_through_the_daemon_ownership_guard() {
+        let src = include_str!("mcp.rs");
+        assert!(
+            src.contains("Request::SaveMcpConfig"),
+            "mcp add must publish via the SaveMcpConfig daemon RPC"
+        );
+        assert!(
+            src.contains("ensure_persistent_daemon"),
+            "mcp add must route through the persistent daemon owner"
+        );
     }
 
     #[test]

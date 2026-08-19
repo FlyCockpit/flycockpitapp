@@ -5,6 +5,15 @@ use super::sessions::*;
 use super::*;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
+// The named-secret ownership guard primitives were factored into the shared
+// `crate::secret_ownership` funnel so policy import, `cockpit mcp add`,
+// credential refresh, and owner-scoped resolution reuse the SAME model. Re-export
+// them here (`pub(crate)`) so this module's existing call sites and the
+// `daemon::server::tests` `use super::dispatch::*` glob keep resolving them.
+pub(crate) use crate::secret_ownership::{
+    NamedSecretClaimConflict, ensure_static_named_reference_owned_on_conn,
+    guard_mcp_reference_ownership_on_conn, reject_conflicting_named_ownership_on_conn,
+};
 use rusqlite::OptionalExtension;
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -3170,8 +3179,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             bundle_json,
             replace,
         } => {
+            let import_vault = ctx.secret_vault.clone();
             let (target, provider_count) = tokio::task::spawn_blocking(move || {
-                crate::policy::import(std::path::Path::new(&project_root), &bundle_json, replace)
+                crate::policy::import(
+                    std::path::Path::new(&project_root),
+                    &bundle_json,
+                    replace,
+                    Some(import_vault),
+                )
             })
             .await
             .map_err(internal)?
@@ -5335,6 +5350,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
             }
+            // Canonicalize once: the ownership pre-check here, the pending flow's
+            // stored root, and the in-transaction guard at `CompleteMcpOAuth` must
+            // all key on the same canonical workspace root as later resolution.
+            let project_root = crate::secret_ownership::canonical_owner_root(&project_root);
             let cwd = std::path::PathBuf::from(&project_root);
             let trust_policy =
                 crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
@@ -7917,8 +7936,25 @@ async fn provider_models_fetch(
             config: crate::secret_ref::redact_provider_view(&config),
         });
     }
-    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
-        .map_err(internal)?;
+    // Owner-scoped resolution: model-fetch requests may only resolve `$secret:`
+    // names owned by (provider, this project root). This daemon boundary can
+    // scan every other known config, so it proves sole-ownership before
+    // backfilling an unclaimed legacy name (gap 4). If the scan itself fails (a
+    // broken/removed foreign workspace config, or a DB fault), sole-ownership is
+    // UNPROVABLE: fall back to no-backfill (owned names still resolve; an
+    // unclaimed legacy name fails closed) rather than failing the whole request.
+    let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
+    let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
+        .await
+        .ok();
+    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+        ctx.secret_vault.clone(),
+        crate::secret_ownership::OWNER_KIND_PROVIDER,
+        &canonical_root,
+        &crate::secret_ref::provider_named_secret_references(&config),
+        foreign_refs.as_ref(),
+    )
+    .map_err(internal)?;
     let selected_policy = on_unlisted
         .or(config.on_unlisted_models_fetch)
         .unwrap_or(crate::config::providers::OnUnlistedModelsFetch::Keep);
@@ -8225,8 +8261,23 @@ async fn provider_usage_snapshot(
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
-    let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
-        .map_err(internal)?;
+    // Owner-scoped resolution: usage probes may only resolve `$secret:` names
+    // owned by (provider, this project root). This daemon boundary scans every
+    // other known config to prove sole-ownership before backfilling (gap 4). A
+    // scan failure makes sole-ownership unprovable, so fall back to no-backfill
+    // (owned names still resolve) rather than failing the whole request.
+    let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
+    let foreign_refs = foreign_provider_named_references(ctx, &canonical_root)
+        .await
+        .ok();
+    let store = crate::credentials::CredentialStore::from_vault_owner_scoped(
+        ctx.secret_vault.clone(),
+        crate::secret_ownership::OWNER_KIND_PROVIDER,
+        &canonical_root,
+        &crate::secret_ref::provider_named_secret_references(&config),
+        foreign_refs.as_ref(),
+    )
+    .map_err(internal)?;
     let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
         &config,
         provider_id,
@@ -8892,6 +8943,12 @@ async fn provider_config_save(
     mut header_secrets: Vec<Option<String>>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    // Canonicalize the workspace root once, at this daemon boundary, so every
+    // ownership claim, journal, recovery, and owner-scoped read below keys on the
+    // same symlink-resolved form the authz layer and resolution paths use — a
+    // symlink/trailing-slash spelling can't split the claim from resolution.
+    let project_root_canon = crate::secret_ownership::canonical_owner_root(project_root);
+    let project_root = project_root_canon.as_str();
     // Defense in depth: typed in-process callers must not be able to bypass
     // the protocol ingress validator and journal a credential-bearing URL.
     validate_daemon_provider_url(&entry.url)?;
@@ -9093,6 +9150,12 @@ async fn save_mcp_config(
     _cleanup_names_json: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    // Canonicalize the workspace root once at this daemon boundary so every
+    // ownership claim/guard/journal below (and later resolution) keys on the
+    // same symlink-resolved form. The CLI (`cockpit mcp add`) sends a raw cwd;
+    // canonicalizing here is what makes that raw wire spelling consistent.
+    let project_root_canon = crate::secret_ownership::canonical_owner_root(project_root);
+    let project_root = project_root_canon.as_str();
     recover_mcp_config_journals(ctx, project_root).await?;
     let mut config: crate::mcp::config::McpConfig =
         crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
@@ -9431,6 +9494,56 @@ fn provider_credential_references_for_root(
         .collect())
 }
 
+/// Named-secret references made by provider configs under every durably-known
+/// workspace root OTHER than `current_root` (which must already be the canonical
+/// owner root).
+///
+/// Owner-scoped provider resolution uses this to prove SOLE ownership before
+/// lazily backfilling an unclaimed legacy `$secret:` name (gap 4): a name in
+/// this set is referenced by a different workspace, so it is ambiguous and must
+/// never be auto-claimed. Roots come from the same durable tables the cleanup
+/// scanners use; per-root config loading is `config_source().load`.
+async fn foreign_provider_named_references(
+    ctx: &DaemonContext,
+    current_root: &str,
+) -> std::result::Result<std::collections::BTreeSet<String>, ErrorPayload> {
+    let current_root = current_root.to_owned();
+    let roots: std::collections::BTreeSet<String> = ctx
+        .db
+        .read(|conn| {
+            let mut roots = std::collections::BTreeSet::new();
+            for sql in [
+                "SELECT project_root FROM provider_config_journals",
+                "SELECT project_root FROM secret_named_ownership",
+            ] {
+                let mut statement = conn.prepare(sql)?;
+                for root in statement.query_map([], |row| row.get::<_, String>(0))? {
+                    roots.insert(root?);
+                }
+            }
+            Ok(roots)
+        })
+        .await
+        .map_err(internal)?;
+    let mut references = std::collections::BTreeSet::new();
+    for root in roots {
+        // Compare against the canonical current root; only OTHER workspaces
+        // contribute foreign references.
+        if crate::secret_ownership::canonical_owner_root(&root) == current_root {
+            continue;
+        }
+        let (providers, _) = ctx
+            .config_source()
+            .load(std::path::Path::new(&root))
+            .map_err(daemon_config_error)?;
+        for provider in providers.providers.values() {
+            let (named, _) = provider_owned_secret_references(provider);
+            references.extend(named);
+        }
+    }
+    Ok(references)
+}
+
 /// Credential records use a separate vault kind from named header secrets.
 /// Their cleanup must therefore be based on every durable provider config
 /// reference, not on the generated names used for staged header values.
@@ -9626,149 +9739,6 @@ async fn ensure_mcp_ownership_available(
                 "MCP credential name is already claimed by a provider or another workspace: {error}"
             ))
         })
-}
-
-/// Typed marker carried out of a vault-mutation transaction when the
-/// in-transaction cross-kind ownership guard rejects a named secret. It lets the
-/// async caller re-map a genuine ownership conflict to a `BadRequest` while a
-/// real DB fault still surfaces as `internal`.
-#[derive(Debug)]
-pub(super) struct NamedSecretClaimConflict {
-    item_id: String,
-}
-
-impl std::fmt::Display for NamedSecretClaimConflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "named secret `{}` is already claimed by a provider or another workspace",
-            self.item_id
-        )
-    }
-}
-
-impl std::error::Error for NamedSecretClaimConflict {}
-
-/// Reject any existing `secret_named_ownership` row for `item_id` that is not
-/// held by this exact (`owner_kind`, `project_root`) owner, using the SAME
-/// connection (and therefore the same `BEGIN IMMEDIATE` transaction) that then
-/// writes the vault value and inserts the claim.
-///
-/// This is the atomic core of the cross-kind admission check. The daemon's
-/// writer runs every `Db::transaction` under `BEGIN IMMEDIATE`, which holds the
-/// SQLite write lock for the whole closure; no other daemon process can commit
-/// an interposing claim between this SELECT and the subsequent write. Running
-/// the conflict check as a separate `Db::read` before the transaction (as the
-/// admission precheck does) leaves a cross-process TOCTOU window where a
-/// provider could claim the name after the check but before the mutation — this
-/// guard closes it. On conflict it returns [`NamedSecretClaimConflict`] so the
-/// enclosing transaction rolls back with no vault write and no claim insert.
-pub(super) fn reject_conflicting_named_ownership_on_conn(
-    conn: &rusqlite::Connection,
-    item_id: &str,
-    owner_kind: &str,
-    project_root: &str,
-) -> anyhow::Result<()> {
-    let conflict: Option<(String, String)> = conn
-        .query_row(
-            "SELECT owner_kind, project_root FROM secret_named_ownership
-             WHERE item_id = ?1 AND NOT (owner_kind = ?2 AND project_root = ?3)
-             LIMIT 1",
-            rusqlite::params![item_id, owner_kind, project_root],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if conflict.is_some() {
-        return Err(anyhow::Error::new(NamedSecretClaimConflict {
-            item_id: item_id.to_string(),
-        }));
-    }
-    Ok(())
-}
-
-/// Atomic in-transaction admission for a named reference that is NOT staged in
-/// this transaction (an existing static `credential_ref`): the value must
-/// already be owned by exactly this (`owner_kind`, `project_root`) AND back a
-/// live vault row, both verified on THIS connection (hence inside the same
-/// `BEGIN IMMEDIATE` transaction as the config publish). This is the atomic
-/// backstop for the pre-transaction `ensure_*_references_claimable` read: a
-/// cross-process actor could release/rotate the claim (or delete the vault row)
-/// between that read and this commit, so re-verifying here — under the writer
-/// lock, right before publish/journal — closes the TOCTOU window. A missing
-/// claim or vanished vault row fails closed as a [`NamedSecretClaimConflict`]
-/// so the enclosing transaction rolls back with no config publication.
-pub(super) fn ensure_static_named_reference_owned_on_conn(
-    conn: &rusqlite::Connection,
-    vault: &crate::secure_key::SecretVault,
-    reference: &str,
-    owner_kind: &str,
-    project_root: &str,
-) -> anyhow::Result<()> {
-    reject_conflicting_named_ownership_on_conn(conn, reference, owner_kind, project_root)?;
-    let claimed: bool = conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM secret_named_ownership
-             WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3
-         )",
-        rusqlite::params![reference, owner_kind, project_root],
-        |row| row.get(0),
-    )?;
-    if !claimed {
-        return Err(anyhow::Error::new(NamedSecretClaimConflict {
-            item_id: reference.to_string(),
-        }));
-    }
-    vault
-        .get_item_on_conn(
-            conn,
-            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
-            reference,
-        )
-        .map_err(|_| {
-            anyhow::Error::new(NamedSecretClaimConflict {
-                item_id: reference.to_string(),
-            })
-        })?;
-    Ok(())
-}
-
-/// Atomic in-transaction admission for the FULL normalized MCP reference set —
-/// staged names, existing static `credential_ref`s, AND flow-managed OAuth keys
-/// (`mcp:<server>`) — run on the SAME connection (hence the same
-/// `BEGIN IMMEDIATE` transaction) that publishes/journals the MCP config.
-///
-/// The pre-transaction `ensure_mcp_references_claimable` read validates the
-/// same set, but a cross-process actor can interpose a foreign claim on a
-/// non-staged or OAuth reference between that read and this commit (e.g.
-/// workspace B stages+claims `mcp:example` after workspace A's OAuth-server
-/// pre-check passes but before A commits). Because the staged-secret loop only
-/// re-checks the staged names, that interposed claim would otherwise never be
-/// re-examined and A would consume B's foreign secret. This guard re-checks
-/// EVERY reference here:
-///   * `all_refs` — every reference gets the cross-kind / foreign-owner
-///     rejection. A flow-managed OAuth key that is ABSENT (no ownership row)
-///     passes, keeping configure-then-authenticate permissive; only a foreign
-///     or cross-kind row is rejected.
-///   * `static_nonstaged_refs` — existing static references (neither staged in
-///     this transaction nor flow-managed OAuth) must additionally already be
-///     owned by this exact `mcp`/root and back a live vault row.
-///
-/// A conflict fails closed as [`NamedSecretClaimConflict`]; the enclosing
-/// transaction rolls back with no config publication and no journal row.
-pub(super) fn guard_mcp_reference_ownership_on_conn(
-    conn: &rusqlite::Connection,
-    vault: &crate::secure_key::SecretVault,
-    all_refs: &std::collections::BTreeSet<String>,
-    static_nonstaged_refs: &std::collections::BTreeSet<String>,
-    project_root: &str,
-) -> anyhow::Result<()> {
-    for reference in all_refs {
-        reject_conflicting_named_ownership_on_conn(conn, reference, "mcp", project_root)?;
-    }
-    for reference in static_nonstaged_refs {
-        ensure_static_named_reference_owned_on_conn(conn, vault, reference, "mcp", project_root)?;
-    }
-    Ok(())
 }
 
 /// Map an error returned from a vault-mutation transaction: a

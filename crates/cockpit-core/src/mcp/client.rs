@@ -27,6 +27,11 @@ pub struct McpConnectContext {
     approver: Option<Arc<Approver>>,
     approval_mode: ApprovalMode,
     vault: Option<Arc<crate::secure_key::SecretVault>>,
+    /// Owning workspace root for named-secret ownership scoping (`owner_kind =
+    /// mcp`). Present whenever `vault` is (the daemon always supplies it via
+    /// [`Self::from_tool_ctx`]); resolution then only sees `mcp:` secrets owned
+    /// by this server/root.
+    project_root: Option<String>,
 }
 
 impl McpConnectContext {
@@ -40,6 +45,7 @@ impl McpConnectContext {
             approver: ctx.approver.clone(),
             approval_mode: ctx.session.approval_mode(),
             vault: Some(ctx.session.secret_vault().clone()),
+            project_root: Some(ctx.session.project_root.display().to_string()),
         }
     }
 
@@ -109,18 +115,44 @@ pub async fn connect_with_context(
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
     context.authorize_connect(name, cfg).await?;
-    let mut store = match context.vault.as_ref() {
-        Some(vault) => Some(crate::credentials::CredentialStore::from_vault(
+    // Owner-scoped resolution: when the daemon supplies the owning workspace
+    // root, this MCP server may only resolve `mcp:` secrets owned by (mcp, that
+    // root) — a foreign/cross-kind name fails closed. Callers without a root
+    // (no vault or non-daemon) keep the unscoped view.
+    // Canonicalize the owning workspace root once (the same form every ownership
+    // claim/query uses) and reuse it for the scoped store and the OAuth refresh
+    // guard below, so a symlink/trailing-slash spelling can't split resolution
+    // from the claim.
+    let canonical_root = context
+        .project_root
+        .as_deref()
+        .map(crate::secret_ownership::canonical_owner_root);
+    let mut store = match (context.vault.as_ref(), canonical_root.as_deref()) {
+        (Some(vault), Some(project_root)) => Some(
+            crate::credentials::CredentialStore::from_vault_owner_scoped(
+                vault.clone(),
+                crate::secret_ownership::OWNER_KIND_MCP,
+                project_root,
+                &auth::named_secret_references(name, cfg),
+                // The MCP connect boundary has no cross-config scan; sole-ownership
+                // of an unclaimed legacy name is unprovable, so never lazily claim
+                // (fail closed on unclaimed). Owned `mcp:` names still resolve.
+                None,
+            )?,
+        ),
+        (Some(vault), None) => Some(crate::credentials::CredentialStore::from_vault(
             vault.clone(),
         )?),
-        None => None,
+        (None, _) => None,
     };
     if store.is_none() && server_requires_secret_store(cfg) {
         bail!("MCP server `{name}` requires an injected vault-backed store for credential refs");
     }
     let mut resolved = auth::resolve_static_for_server_with_store(name, cfg, store.as_ref());
     // OAuth bearer (async; refreshes if expired) → Authorization header.
-    if let Some(bearer) = auth::oauth_bearer_with_store(name, cfg, store.as_mut()).await? {
+    if let Some(bearer) =
+        auth::oauth_bearer_with_store(name, cfg, store.as_mut(), canonical_root.as_deref()).await?
+    {
         resolved.headers.insert("Authorization".to_string(), bearer);
     }
 

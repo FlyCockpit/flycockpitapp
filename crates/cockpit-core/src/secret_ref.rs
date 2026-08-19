@@ -33,6 +33,21 @@ impl SecretRefNotice {
     }
 }
 
+/// Every named-secret id (`$secret:NAME`) referenced by any provider header in
+/// this config. Used to scope owner-scoped resolution (`owner_kind = provider`)
+/// so legacy backfill only ever claims names the provider config actually uses.
+pub fn provider_named_secret_references(
+    providers: &ProvidersConfig,
+) -> std::collections::BTreeSet<String> {
+    providers
+        .providers
+        .values()
+        .flat_map(|entry| entry.headers.iter())
+        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+        .collect()
+}
+
 /// CLI-owned effective provider loader. The config crate keeps header values
 /// opaque; this boundary performs the credential-store migration before the
 /// values can be used by request construction.
@@ -146,7 +161,12 @@ fn migrate_effective_layers_once_with_store(
         return Ok(());
     }
 
-    match load_paths_with_secret_migration_store(&pending, Some(store)) {
+    // Every named secret the literal→`$secret:` migration mints is claimed for
+    // (provider, this canonical workspace root) through the in-transaction
+    // ownership guard. Canonicalize the root the same way every other ownership
+    // path does so the claim matches later owner-scoped resolution.
+    let project_root = crate::secret_ownership::canonical_owner_root(&cwd.display().to_string());
+    match load_paths_with_secret_migration_store(&pending, Some(store), &project_root) {
         Ok((_, Some(notice))) => eprintln!("{}", notice.render()),
         Ok((_, None)) => {}
         Err(error) => return Err(error),
@@ -175,15 +195,18 @@ fn load_paths_with_secret_migration(
     store_path: Option<&Path>,
 ) -> Result<(ProvidersConfig, Option<SecretRefNotice>)> {
     let mut store = open_secret_store(store_path)?;
-    load_paths_with_secret_migration_store(config_paths, Some(&mut store))
+    // Path-open is a test-only legacy-file store; its guarded write falls back to
+    // an ungated file write (no ownership tables), so the root is unused.
+    load_paths_with_secret_migration_store(config_paths, Some(&mut store), "")
 }
 
 fn load_paths_with_secret_migration_store(
     config_paths: &[PathBuf],
     store: Option<&mut CredentialStore>,
+    project_root: &str,
 ) -> Result<(ProvidersConfig, Option<SecretRefNotice>)> {
     let notice = match store {
-        Some(store) => migrate_provider_files_in_store(config_paths, store)?,
+        Some(store) => migrate_provider_files_in_store(config_paths, store, project_root)?,
         None => None,
     };
     // Same barrier as every other effective resolution, and fallible here so
@@ -274,12 +297,15 @@ fn migrate_provider_files(
     store_path: Option<&Path>,
 ) -> Result<Option<SecretRefNotice>> {
     let mut store = open_secret_store(store_path)?;
-    migrate_provider_files_in_store(config_paths, &mut store)
+    // Test-only path-open store: the guarded write is ungated on the legacy-file
+    // backend, so the root is unused here.
+    migrate_provider_files_in_store(config_paths, &mut store, "")
 }
 
 fn migrate_provider_files_in_store(
     config_paths: &[PathBuf],
     store: &mut CredentialStore,
+    project_root: &str,
 ) -> Result<Option<SecretRefNotice>> {
     let mut changed = Vec::new();
     let mut migrated = 0;
@@ -322,8 +348,20 @@ fn migrate_provider_files_in_store(
                 } else {
                     format!("{provider_id}-{ordinal}")
                 };
-                let name = migration_secret_name(&store, &preferred, &value);
-                store.set_named_secret(&name, &value);
+                let name = migration_secret_name(&*store, &preferred, &value);
+                // Route the migration write through the in-transaction ownership
+                // funnel: it fails closed on a foreign/cross-kind name and claims
+                // the provider name it mints for (provider, this workspace root),
+                // BEFORE the referencing config is republished below. On the
+                // production vault backend this is `mutate_owner_named_secret_
+                // guarded` (guard + AEAD write + claim in one `BEGIN IMMEDIATE`);
+                // on the test legacy-file backend it is an ungated file write.
+                store.set_named_secret_owned_and_save_published(
+                    &name,
+                    &value,
+                    crate::secret_ownership::OWNER_KIND_PROVIDER,
+                    project_root,
+                )?;
                 if let Some(object) = header.as_object_mut() {
                     object.insert(
                         "value".to_string(),
@@ -343,9 +381,11 @@ fn migrate_provider_files_in_store(
         return Ok(None);
     }
 
-    // Commit secrets first: a crash may leave an unreferenced secret, but can
-    // never leave config pointing at a value that was not durably stored.
-    store.save()?;
+    // Each migrated secret was already durably written AND claimed (crash-atomic)
+    // by `set_named_secret_owned_and_save_published` in the loop above, before any
+    // config file is rewritten below. A crash may leave an unreferenced-but-owned
+    // secret, but can never leave config pointing at a value that was not durably
+    // stored, nor a name claimed for a config that was never published.
     for (path, raw) in changed {
         let pretty = serde_json::to_string_pretty(&raw)?;
         std::fs::write(&path, format!("{pretty}\n"))
@@ -738,5 +778,98 @@ mod tests {
         let raw = std::fs::read_to_string(&provider_path).unwrap();
         assert!(raw.contains("$secret:openai"), "{raw}");
         assert!(!raw.contains(literal), "{raw}");
+    }
+
+    fn named_ownership_exists(
+        db: &crate::db::Db,
+        item_id: &str,
+        owner_kind: &str,
+        project_root: &str,
+    ) -> bool {
+        let item_id = item_id.to_string();
+        let owner_kind = owner_kind.to_string();
+        let project_root = project_root.to_string();
+        db.blocking_read_for_sync_ui(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM secret_named_ownership
+                 WHERE item_id = ?1 AND owner_kind = ?2 AND project_root = ?3)",
+                rusqlite::params![item_id, owner_kind, project_root],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .unwrap()
+    }
+
+    // Gap 3: the literal→`$secret:` migration claims the provider name it mints,
+    // for (provider, canonical workspace root), through the ownership funnel.
+    #[test]
+    fn migration_claims_generated_provider_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let literal = "Bearer sk-migration-owned-secret-123456";
+        let provider_path = write_provider(&config_path, "openai", literal);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let store = CredentialStore::from_vault(vault).unwrap();
+        crate::config::trust::with_workspace_trust_policy(policy, || {
+            prepare_effective_layers_with_store(tmp.path(), Some(store)).expect("vault prepare");
+        });
+
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(raw.contains("$secret:openai"), "{raw}");
+        let canonical =
+            crate::secret_ownership::canonical_owner_root(&tmp.path().display().to_string());
+        assert!(
+            named_ownership_exists(&db, "openai", "provider", &canonical),
+            "migration must claim the name it mints for this workspace"
+        );
+    }
+
+    // Gap 3: the migration write is guarded — a name already owned by a foreign
+    // (kind, root) fails the migration CLOSED, and the referencing config is NOT
+    // republished (no `$secret:` pointing at a foreign-owned value).
+    #[test]
+    fn migration_fails_closed_on_foreign_owned_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let literal = "Bearer sk-foreign-owned-secret-123456";
+        let provider_path = write_provider(&config_path, "openai", literal);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        // A DIFFERENT workspace already owns the name the migration would mint.
+        db.blocking_write_for_sync_maintenance(|conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES ('openai', 'provider', '/foreign/ws', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let store = CredentialStore::from_vault(vault).unwrap();
+
+        let result = crate::config::trust::with_workspace_trust_policy(policy, || {
+            prepare_effective_layers_with_store(tmp.path(), Some(store))
+        });
+        assert!(
+            result.is_err(),
+            "a foreign-owned generated name must fail the migration closed"
+        );
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(
+            raw.contains(literal),
+            "the config must NOT be rewritten to reference a foreign-owned name: {raw}"
+        );
+        assert!(!raw.contains("$secret:openai"), "{raw}");
     }
 }

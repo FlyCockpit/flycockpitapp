@@ -1272,8 +1272,14 @@ fn harness_lines(
                 "NOT on PATH".to_string()
             };
             let default = harness.default_model.as_deref().unwrap_or("none");
+            // Surface the resolved custody posture per harness, read from the
+            // SAME `HarnessConfig.trust` field production spawn resolves
+            // (`crate::harness::run::run_harness`). Shown even when the
+            // workspace trust root is unresolved, so the configured enum is
+            // always visible and labeled consistently.
+            let trust = harness.trust.as_str();
             format!(
-                "{id}: {path}, command `{}`, default {default}, {} model(s)",
+                "{id}: trust={trust}, {path}, command `{}`, default {default}, {} model(s)",
                 harness.command,
                 harness.models.len()
             )
@@ -1432,6 +1438,51 @@ mod tests {
             snapshot.harnesses
         );
         crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    /// AC1: the harness diagnostics section surfaces each harness's resolved
+    /// custody posture (`trust=trusted|untrusted`), read from the same
+    /// `HarnessConfig.trust` field production spawn resolves. Pre-change
+    /// behavior emitted no trust token, so every `trust=` assertion here
+    /// rejects it.
+    #[test]
+    fn harness_lines_surface_resolved_trust_per_harness() {
+        use crate::config::extended::HarnessConfig;
+        let trusted: HarnessConfig =
+            serde_json::from_str(r#"{"command":"codex","trust":"trusted"}"#).unwrap();
+        // Omitting `trust` must resolve to the untrusted default.
+        let untrusted: HarnessConfig = serde_json::from_str(r#"{"command":"claude"}"#).unwrap();
+        assert_eq!(
+            trusted.trust,
+            crate::config::extended::HarnessTrust::Trusted,
+            "precondition: the trusted fixture is actually trusted"
+        );
+        assert_eq!(
+            untrusted.trust,
+            crate::config::extended::HarnessTrust::Untrusted,
+            "precondition: an unconfigured harness defaults to untrusted"
+        );
+
+        let mut harnesses = std::collections::HashMap::new();
+        harnesses.insert("aye".to_string(), trusted);
+        harnesses.insert("bee".to_string(), untrusted);
+
+        let resolved = harness_lines(&harnesses, true).join("\n");
+        assert!(resolved.contains("aye: trust=trusted,"), "{resolved}");
+        assert!(resolved.contains("bee: trust=untrusted,"), "{resolved}");
+
+        // Edge case: when the workspace trust root is unresolved, the path is
+        // trust-blocked but the configured custody enum is still shown and
+        // labeled the same way.
+        let unresolved = harness_lines(&harnesses, false).join("\n");
+        assert!(
+            unresolved.contains("aye: trust=trusted, trust-blocked,"),
+            "{unresolved}"
+        );
+        assert!(
+            unresolved.contains("bee: trust=untrusted, trust-blocked,"),
+            "{unresolved}"
+        );
     }
 
     #[test]

@@ -915,6 +915,14 @@ pub struct RedactionTable {
     protected: ProtectedPaths,
     /// Forced-secret origins that intentionally override protected paths.
     protected_path_conflicts: Vec<String>,
+    /// Test-only fault injection: when set, [`Self::enforced_checked`] returns
+    /// an error, so a caller's fail-closed-before-side-effect path (e.g. the
+    /// external-harness runner constructing its scrub view before spawning a
+    /// subprocess) can be exercised without any environment mutation. This
+    /// field only exists in unit-test builds and is compiled out of every
+    /// shipped build.
+    #[cfg(test)]
+    fail_enforced_view: bool,
 }
 
 impl std::fmt::Debug for RedactionTable {
@@ -1227,6 +1235,8 @@ impl RedactionTable {
                 unsupported_files,
                 protected,
                 protected_path_conflicts,
+                #[cfg(test)]
+                fail_enforced_view: false,
             });
         }
         let patterns: Vec<&str> = entries.iter().map(|entry| entry.value.as_str()).collect();
@@ -1250,6 +1260,8 @@ impl RedactionTable {
             unsupported_files,
             protected,
             protected_path_conflicts,
+            #[cfg(test)]
+            fail_enforced_view: false,
         })
     }
 
@@ -1380,6 +1392,8 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            #[cfg(test)]
+            fail_enforced_view: self.fail_enforced_view,
         }
     }
 
@@ -1585,7 +1599,37 @@ impl RedactionTable {
             unsupported_files: self.unsupported_files.clone(),
             protected: self.protected.clone(),
             protected_path_conflicts: self.protected_path_conflicts.clone(),
+            #[cfg(test)]
+            fail_enforced_view: self.fail_enforced_view,
         }
+    }
+
+    /// [`Self::enforced`] wrapped in a `Result`.
+    ///
+    /// IMPORTANT: in shipped builds this is INFALLIBLE — `enforced()` cannot
+    /// fail, so this never returns `Err` in production. It is deliberately NOT
+    /// an advertised production fail-closed contract. The `Result` exists so a
+    /// caller (the external-harness runner) has a single seam through which a
+    /// future fallible scrub-view construction step would fail closed BEFORE
+    /// any irreversible side effect (a subprocess spawn), and so that unit
+    /// tests can drive that seam to prove the ordering: the scrub view is
+    /// built, and on failure the runner is never reached. The failure branch
+    /// is reachable only in unit-test builds, where a table is marked via
+    /// [`Self::with_forced_enforced_view_failure`].
+    pub fn enforced_checked(&self) -> Result<Self> {
+        #[cfg(test)]
+        if self.fail_enforced_view {
+            anyhow::bail!("redaction enforced-view construction failed (injected test fault)");
+        }
+        Ok(self.enforced())
+    }
+
+    /// Test-only: mark this table so [`Self::enforced_checked`] fails, letting a
+    /// fail-closed-before-side-effect path be driven with a would-be-bad input.
+    #[cfg(test)]
+    pub fn with_forced_enforced_view_failure(mut self) -> Self {
+        self.fail_enforced_view = true;
+        self
     }
 
     /// [`Self::enforced`] over a shared table, reusing the existing allocation
@@ -1622,6 +1666,8 @@ impl RedactionTable {
             unsupported_files: Vec::new(),
             protected: ProtectedPaths::default(),
             protected_path_conflicts: Vec::new(),
+            #[cfg(test)]
+            fail_enforced_view: false,
         }
     }
 

@@ -2870,12 +2870,11 @@ fn pointer_harness_field_actions_dispatch_from_fresh_sources() {
                 assert!(state.editing.is_none());
                 assert_eq!(after.always_allow, !before.always_allow);
             }
-            HarnessField::AuthEnvVars => {
-                // `AuthEnvVars` is a stale pointer-id name for the harness
-                // `trust` custody row (`HarnessConfig.trust: HarnessTrust`);
-                // there is no `auth_env_vars` config field. It is a cycled
-                // enum (Untrusted↔Trusted), not a text editor, so activating
-                // it flips trust in place rather than opening an edit buffer.
+            HarnessField::Trust => {
+                // The harness `trust` custody row (`HarnessConfig.trust:
+                // HarnessTrust`) is a cycled enum (Untrusted↔Trusted), not a
+                // text editor, so activating it flips trust in place rather
+                // than opening an edit buffer.
                 assert!(state.editing.is_none());
                 assert_ne!(after.trust, before.trust);
             }

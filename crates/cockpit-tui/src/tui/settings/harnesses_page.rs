@@ -123,7 +123,7 @@ impl Field {
             Self::SupportsAgentFile => P::SupportsAgentFile,
             Self::AgentFileArgs => P::AgentFileArgs,
             Self::AgentFileEnv => P::AgentFileEnv,
-            Self::Trust => P::AuthEnvVars,
+            Self::Trust => P::Trust,
             Self::AuthProbeArgs => P::AuthProbeArgs,
             Self::Timeout => P::Timeout,
             Self::AlwaysAllow => P::AlwaysAllow,

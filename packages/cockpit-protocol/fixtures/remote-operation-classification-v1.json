@@ -586,39 +586,223 @@
       "tag": "pinned_message_state"
     },
     {
-      "class": "local_only",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "session_id:uuid",
+      "fcorCanonicalSchema": "disposition:string|record_id:option<string>|name:option<string>|description:option<string>|scope_kind:option<string>|scope_key:option<string>",
       "fcorRoles": [
         {
-          "field": "session_id",
-          "role": "session",
-          "type": "Uuid"
-        }
-      ],
-      "fcorSchema": "session_id:Uuid",
-      "strategy": "none",
-      "tag": "list_sealed_values"
-    },
-    {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "session_id:uuid|value_id:string",
-      "fcorRoles": [
-        {
-          "field": "session_id",
-          "role": "session",
-          "type": "Uuid"
+          "field": "disposition",
+          "role": "param",
+          "type": "String"
         },
         {
-          "field": "value_id",
+          "field": "record_id",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "name",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "description",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "scope_kind",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "scope_key",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "disposition:String|record_id:Option<String>|name:Option<String>|description:Option<String>|scope_kind:Option<String>|scope_key:Option<String>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "begin_sealed_owner_operation"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "capability_id:string|literal:option<redacted>",
+      "fcorRoles": [
+        {
+          "field": "capability_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "literal",
+          "role": "param",
+          "type": "Option<SensitiveWireLiteral>"
+        }
+      ],
+      "fcorSchema": "capability_id:String|literal:Option<SensitiveWireLiteral>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "apply_sealed_owner_operation"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "capability_id:string",
+      "fcorRoles": [
+        {
+          "field": "capability_id",
           "role": "param",
           "type": "String"
         }
       ],
-      "fcorSchema": "session_id:Uuid|value_id:String",
+      "fcorSchema": "capability_id:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "cancel_sealed_owner_operation"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "scope_kind:option<string>|scope_key:option<string>",
+      "fcorRoles": [
+        {
+          "field": "scope_kind",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "scope_key",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "scope_kind:Option<String>|scope_key:Option<String>",
       "strategy": "none",
-      "tag": "delete_sealed_value"
+      "tag": "sealed_owner_inventory"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "record_id:string|description:string",
+      "fcorRoles": [
+        {
+          "field": "record_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "description",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "record_id:String|description:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "edit_sealed_owner_description"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "list_sealed_actions"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "kind_id:string|project_id:string|description:string|origin_id:string|projection_id:string",
+      "fcorRoles": [
+        {
+          "field": "kind_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "project_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "description",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "origin_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "projection_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "kind_id:String|project_id:String|description:String|origin_id:String|projection_id:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "create_sealed_action"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "action_id:string|description:string",
+      "fcorRoles": [
+        {
+          "field": "action_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "description",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "action_id:String|description:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "revise_sealed_action_description"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "action_id:string|enabled:bool",
+      "fcorRoles": [
+        {
+          "field": "action_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "enabled",
+          "role": "param",
+          "type": "bool"
+        }
+      ],
+      "fcorSchema": "action_id:String|enabled:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "revise_sealed_action_enabled"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "action_id:string|confirm:string",
+      "fcorRoles": [
+        {
+          "field": "action_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "confirm",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "action_id:String|confirm:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "retire_sealed_action"
     },
     {
       "class": "local_only",

@@ -352,13 +352,56 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    // v10-only owner-remoted sealed-owner sensitive channel. Small, bounded
+    // params. The apply request carries at most one MAX_SENSITIVE_FRAME_BYTES
+    // (16 KiB) literal, well within the bounded inline payload cap.
     row(
-        "list_sealed_values",
+        "begin_sealed_owner_operation",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "delete_sealed_value",
+        "apply_sealed_owner_operation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "cancel_sealed_owner_operation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_owner_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "edit_sealed_owner_description",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "list_sealed_actions",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "create_sealed_action",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "revise_sealed_action_description",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "revise_sealed_action_enabled",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "retire_sealed_action",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1341,8 +1384,55 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    // v10-only owner-remoted sealed-owner sensitive channel responses. The
+    // recover-apply success carries at most one 16 KiB literal; every other
+    // response is small safe metadata. The two collection responses
+    // (`sealed_owner_inventory`, `sealed_actions`) are clamped to
+    // `MAX_SEALED_OWNER_INVENTORY_ROWS` bounded rows by their constructors
+    // (`Response::sealed_owner_inventory` / `Response::sealed_actions`), keeping
+    // the frame under the Bounded 512 KiB ceiling by construction.
     row(
-        "sealed_values",
+        "sealed_owner_operation_begun",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_owner_operation_applied",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_owner_operation_cancelled",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_owner_inventory",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_owner_description_edited",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_actions",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_action_created",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_action_revised",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "sealed_action_retired",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2490,8 +2580,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 191);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 134);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 199);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 142);
         assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }
 

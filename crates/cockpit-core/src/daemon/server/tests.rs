@@ -178,73 +178,151 @@ async fn pin_rpc_parity_with_direct_db_calls() {
     assert!(matches!(response, Response::PinChanged { changed: true }));
 }
 
-#[tokio::test]
-async fn sealed_value_metadata_round_trips_through_daemon_without_literal() {
-    let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
-    ctx.db
-        .upsert_sealed_value(
-            session.session_id,
-            "prod_token",
-            "very-secret-literal",
-            "deployment credential",
-            "user",
-        )
-        .await
-        .unwrap();
-    let mut state = owner_state();
-    let response = handle_request(
-        Request::ListSealedValues {
-            session_id: session.session_id,
+fn sealed_owner_channel_requests() -> Vec<Request> {
+    vec![
+        Request::BeginSealedOwnerOperation {
+            disposition: "recover".into(),
+            record_id: Some(crate::sealed::identity::SealedRecordId::generate().to_string()),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
         },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .unwrap();
-    let Response::SealedValues { values } = response else {
-        panic!("expected sealed metadata")
-    };
-    assert_eq!(values.len(), 1);
-    assert_eq!(values[0].value_id, "prod_token");
-    assert_eq!(values[0].reason, "deployment credential");
-    assert!(!format!("{:?}", values[0]).contains("very-secret-literal"));
-    handle_request(
-        Request::DeleteSealedValue {
-            session_id: session.session_id,
-            value_id: "prod_token".into(),
+        Request::ApplySealedOwnerOperation {
+            capability_id: "cap-123".into(),
+            literal: Some(proto::SensitiveWireLiteral::new("s3cr3t".into())),
         },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .unwrap();
-    assert!(
-        ctx.db
-            .list_sealed_value_metadata(session.session_id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+        Request::CancelSealedOwnerOperation {
+            capability_id: "cap-123".into(),
+        },
+        Request::SealedOwnerInventory {
+            scope_kind: None,
+            scope_key: None,
+        },
+        Request::EditSealedOwnerDescription {
+            record_id: crate::sealed::identity::SealedRecordId::generate().to_string(),
+            description: "new safe description".into(),
+        },
+        Request::ListSealedActions,
+        Request::CreateSealedAction {
+            kind_id: "https.notify".into(),
+            project_id: "proj".into(),
+            description: "notify".into(),
+            origin_id: "0".into(),
+            projection_id: "http_status_and_ok".into(),
+        },
+        Request::ReviseSealedActionDescription {
+            action_id: "act-1".into(),
+            description: "revised".into(),
+        },
+        Request::ReviseSealedActionEnabled {
+            action_id: "act-1".into(),
+            enabled: false,
+        },
+        Request::RetireSealedAction {
+            action_id: "act-1".into(),
+            confirm: "act-1".into(),
+        },
+    ]
 }
 
 #[tokio::test]
-async fn sealed_value_rpcs_reject_non_owner_principal() {
+async fn non_owner_rejected() {
+    // AC4: every sealed-owner RPC fails closed with an Authorization error for a
+    // remote (non-owner) principal, before any handler logic runs.
     let ctx = test_ctx();
-    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     let mut state = remote_state_with_grants(Vec::new());
-    for request in [
-        Request::ListSealedValues {
-            session_id: session.session_id,
-        },
-        Request::DeleteSealedValue {
-            session_id: session.session_id,
-            value_id: "prod_token".into(),
-        },
-    ] {
+    for request in sealed_owner_channel_requests() {
+        let tag = request.wire_tag();
         let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::Authorization);
+        assert_eq!(
+            error.code,
+            ErrorCode::Authorization,
+            "{tag} must reject a non-owner"
+        );
     }
+}
+
+#[tokio::test]
+async fn sealed_owner_rpcs_are_owner_remoted_and_fail_closed() {
+    // AC3: an authenticated owner request TRAVERSES dispatch (it is NOT rejected
+    // at authorization). Because the durable directory / capability-table backing
+    // is owned by the persistence sibling, each arm fails closed with a
+    // content-free Internal error — never an Authorization error, and never a
+    // leaked literal.
+    let ctx = test_ctx();
+    for request in sealed_owner_channel_requests() {
+        let tag = request.wire_tag();
+        let mut state = owner_state();
+        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
+        assert_ne!(
+            error.code,
+            ErrorCode::Authorization,
+            "{tag} owner request must traverse dispatch, not be authorization-rejected"
+        );
+        assert!(
+            !error.message.contains("s3cr3t"),
+            "{tag} fail-closed error must not leak the apply literal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn action_admin_unknown_ids_reject_before_persist() {
+    // AC9: unknown kind_id / origin_id / projection_id are rejected as a
+    // BadRequest BEFORE the fail-closed persist. Positive control: a fully
+    // resolvable request reaches the (content-free) fail-closed backing instead,
+    // proving the ids really were resolved before the persist boundary.
+    let ctx = test_ctx();
+
+    let unknown_cases = [
+        ("bogus.kind", "0", "none"),
+        ("https.notify", "99", "none"), // origin index out of range
+        ("https.notify", "0", "bogus_projection"),
+    ];
+    for (kind_id, origin_id, projection_id) in unknown_cases {
+        let mut state = owner_state();
+        let error = handle_request(
+            Request::CreateSealedAction {
+                kind_id: kind_id.into(),
+                project_id: "proj".into(),
+                description: "notify".into(),
+                origin_id: origin_id.into(),
+                projection_id: projection_id.into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            ErrorCode::BadRequest,
+            "unknown ids ({kind_id}/{origin_id}/{projection_id}) must reject before persist"
+        );
+    }
+
+    // Positive control: all ids resolve, so the request passes the closed lookup
+    // and reaches the fail-closed backing (a distinct Internal error).
+    let mut state = owner_state();
+    let error = handle_request(
+        Request::CreateSealedAction {
+            kind_id: "https.notify".into(),
+            project_id: "proj".into(),
+            description: "notify".into(),
+            origin_id: "0".into(),
+            projection_id: "http_status_and_ok".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert_ne!(
+        error.code,
+        ErrorCode::BadRequest,
+        "a fully-resolved create must pass the closed lookup and fail closed at the backing"
+    );
 }
 
 #[tokio::test]
@@ -11582,11 +11660,6 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             observation: "pin state is toggled",
         },
         MutatingDispatchCase {
-            kind: "delete_sealed_value",
-            effect_class: Durable,
-            observation: "sealed value row is deleted",
-        },
-        MutatingDispatchCase {
             kind: "create_project_note",
             effect_class: Durable,
             observation: "project note row is created",
@@ -12140,10 +12213,22 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
-        | "list_sealed_values"
-        | "delete_sealed_value"
         | "list_project_notes"
         | "create_project_note" => AuthzAllowedOutcome::Response,
+        // v10-only owner-remoted sealed-owner channel: the durable directory /
+        // capability-table backing is the persistence sibling's, so an
+        // authorized owner request traverses dispatch and fails closed with a
+        // content-free Internal error.
+        "begin_sealed_owner_operation"
+        | "apply_sealed_owner_operation"
+        | "cancel_sealed_owner_operation"
+        | "sealed_owner_inventory"
+        | "edit_sealed_owner_description"
+        | "list_sealed_actions"
+        | "create_sealed_action"
+        | "revise_sealed_action_description"
+        | "revise_sealed_action_enabled"
+        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -12354,8 +12439,16 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("list_pinned_message_seqs"),
         authz_session_reader("list_pinned_messages_with_text"),
         authz_session_reader("pinned_message_state"),
-        authz_owner_only("list_sealed_values"),
-        authz_owner_only("delete_sealed_value"),
+        authz_owner_only("begin_sealed_owner_operation"),
+        authz_owner_only("apply_sealed_owner_operation"),
+        authz_owner_only("cancel_sealed_owner_operation"),
+        authz_owner_only("sealed_owner_inventory"),
+        authz_owner_only("edit_sealed_owner_description"),
+        authz_owner_only("list_sealed_actions"),
+        authz_owner_only("create_sealed_action"),
+        authz_owner_only("revise_sealed_action_description"),
+        authz_owner_only("revise_sealed_action_enabled"),
+        authz_owner_only("retire_sealed_action"),
         authz_owner_only("list_project_notes"),
         authz_owner_only("create_project_note"),
         authz_owner_only("set_project_note_content"),
@@ -13068,13 +13161,6 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
         .await
         .unwrap();
 
-    if kind == "delete_sealed_value" {
-        ctx.db
-            .upsert_sealed_value(session_id, "value", "seeded-sealed-value", "test", "test")
-            .await
-            .unwrap();
-    }
-
     let needs_attached = authz_kind_needs_attached_state(kind, level);
     let revokes_session_access = needs_attached && level == AuthzLevel::NoAccess;
     let principal_level = if revokes_session_access {
@@ -13354,10 +13440,48 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_pinned_message_seqs" => Request::ListPinnedMessageSeqs { session_id },
         "list_pinned_messages_with_text" => Request::ListPinnedMessagesWithText { session_id },
         "pinned_message_state" => Request::PinnedMessageState { session_id },
-        "list_sealed_values" => Request::ListSealedValues { session_id },
-        "delete_sealed_value" => Request::DeleteSealedValue {
-            session_id,
-            value_id: "value".into(),
+        "begin_sealed_owner_operation" => Request::BeginSealedOwnerOperation {
+            disposition: "recover".into(),
+            record_id: Some(crate::sealed::identity::SealedRecordId::generate().to_string()),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
+        },
+        "apply_sealed_owner_operation" => Request::ApplySealedOwnerOperation {
+            capability_id: "cap-authz".into(),
+            literal: Some(proto::SensitiveWireLiteral::new("s3cr3t".into())),
+        },
+        "cancel_sealed_owner_operation" => Request::CancelSealedOwnerOperation {
+            capability_id: "cap-authz".into(),
+        },
+        "sealed_owner_inventory" => Request::SealedOwnerInventory {
+            scope_kind: None,
+            scope_key: None,
+        },
+        "edit_sealed_owner_description" => Request::EditSealedOwnerDescription {
+            record_id: crate::sealed::identity::SealedRecordId::generate().to_string(),
+            description: "safe description".into(),
+        },
+        "list_sealed_actions" => Request::ListSealedActions,
+        "create_sealed_action" => Request::CreateSealedAction {
+            kind_id: "https.notify".into(),
+            project_id: "proj".into(),
+            description: "notify".into(),
+            origin_id: "0".into(),
+            projection_id: "http_status_and_ok".into(),
+        },
+        "revise_sealed_action_description" => Request::ReviseSealedActionDescription {
+            action_id: "act-authz".into(),
+            description: "revised".into(),
+        },
+        "revise_sealed_action_enabled" => Request::ReviseSealedActionEnabled {
+            action_id: "act-authz".into(),
+            enabled: false,
+        },
+        "retire_sealed_action" => Request::RetireSealedAction {
+            action_id: "act-authz".into(),
+            confirm: "act-authz".into(),
         },
         "list_project_notes" => Request::ListProjectNotes {
             project_root: root.clone(),
@@ -14982,7 +15106,6 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         | "delete_project_note"
         | "list_project_notes"
         | "upsert_assistant" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
-        "delete_sealed_value" => assert_new_daemon_rpc_mutating_happy(case.kind).await,
         "create_assistant_session" => assert_create_assistant_session_happy().await,
         "auto_title" => assert_auto_title_mutating_happy().await,
         "import_session_archive" => assert_import_session_archive_happy().await,
@@ -15162,8 +15285,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "rename_project_note"
         | "delete_project_note"
         | "list_project_notes"
-        | "upsert_assistant"
-        | "delete_sealed_value" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
+        | "upsert_assistant" => assert_new_daemon_rpc_mutating_malformed(case.kind).await,
         "create_assistant_session" => {
             let ctx = test_ctx();
             let err = dispatch_matrix_request(
@@ -17509,18 +17631,6 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         .await
         .unwrap();
     let note = ctx.db.create_project_note("/repo", "old").await.unwrap();
-    if kind == "delete_sealed_value" {
-        ctx.db
-            .upsert_sealed_value(
-                session.session_id,
-                "value",
-                "seeded-sealed-value",
-                "test",
-                "test",
-            )
-            .await
-            .unwrap();
-    }
     if matches!(kind, "unpin_message" | "toggle_pinned_message") {
         ctx.db.pin_message(session.session_id, seq).await.unwrap();
     }
@@ -17536,10 +17646,6 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         "toggle_pinned_message" => Request::TogglePinnedMessage {
             session_id: session.session_id,
             seq,
-        },
-        "delete_sealed_value" => Request::DeleteSealedValue {
-            session_id: session.session_id,
-            value_id: "value".into(),
         },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
@@ -17575,10 +17681,7 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         .expect("new RPC happy");
     assert!(
         !matches!(response, Response::Ack)
-            || matches!(
-                kind,
-                "set_project_note_content" | "delete_project_note" | "delete_sealed_value"
-            )
+            || matches!(kind, "set_project_note_content" | "delete_project_note")
     );
 }
 
@@ -17589,10 +17692,6 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
         "pin_message" | "unpin_message" | "toggle_pinned_message" => Request::PinMessage {
             session_id: Uuid::new_v4(),
             seq: 1,
-        },
-        "delete_sealed_value" => Request::DeleteSealedValue {
-            session_id: Uuid::new_v4(),
-            value_id: "value".into(),
         },
         "create_project_note" => Request::CreateProjectNote {
             project_root: "/repo".into(),
@@ -18861,7 +18960,8 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
         "list_scheduled_jobs",
-        "list_sealed_values",
+        "sealed_owner_inventory",
+        "list_sealed_actions",
         "list_sessions",
         "count_pinned_messages",
         "pinned_message_state",
@@ -20158,19 +20258,105 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::ListSealedValues { session_id },
-            kind: "list_sealed_values",
-            session_id: Some(session_id),
+            request: Request::BeginSealedOwnerOperation {
+                disposition: "recover".into(),
+                record_id: Some("rec".into()),
+                name: None,
+                description: None,
+                scope_kind: None,
+                scope_key: None,
+            },
+            kind: "begin_sealed_owner_operation",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ApplySealedOwnerOperation {
+                capability_id: "cap".into(),
+                literal: None,
+            },
+            kind: "apply_sealed_owner_operation",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CancelSealedOwnerOperation {
+                capability_id: "cap".into(),
+            },
+            kind: "cancel_sealed_owner_operation",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SealedOwnerInventory {
+                scope_kind: None,
+                scope_key: None,
+            },
+            kind: "sealed_owner_inventory",
+            session_id: None,
             audit_path: None,
             mutating: false,
         },
         CommandMetadataCase {
-            request: Request::DeleteSealedValue {
-                session_id,
-                value_id: "value".into(),
+            request: Request::EditSealedOwnerDescription {
+                record_id: "rec".into(),
+                description: "desc".into(),
             },
-            kind: "delete_sealed_value",
-            session_id: Some(session_id),
+            kind: "edit_sealed_owner_description",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ListSealedActions,
+            kind: "list_sealed_actions",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::CreateSealedAction {
+                kind_id: "k".into(),
+                project_id: "p".into(),
+                description: "d".into(),
+                origin_id: "0".into(),
+                projection_id: "none".into(),
+            },
+            kind: "create_sealed_action",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ReviseSealedActionDescription {
+                action_id: "a".into(),
+                description: "d".into(),
+            },
+            kind: "revise_sealed_action_description",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ReviseSealedActionEnabled {
+                action_id: "a".into(),
+                enabled: false,
+            },
+            kind: "revise_sealed_action_enabled",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RetireSealedAction {
+                action_id: "a".into(),
+                confirm: "a".into(),
+            },
+            kind: "retire_sealed_action",
+            session_id: None,
             audit_path: None,
             mutating: true,
         },
@@ -20684,8 +20870,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ListPinnedMessageSeqs,
         ListPinnedMessagesWithText,
         PinnedMessageState,
-        ListSealedValues,
-        DeleteSealedValue,
+        BeginSealedOwnerOperation,
+        ApplySealedOwnerOperation,
+        CancelSealedOwnerOperation,
+        SealedOwnerInventory,
+        EditSealedOwnerDescription,
+        ListSealedActions,
+        CreateSealedAction,
+        ReviseSealedActionDescription,
+        ReviseSealedActionEnabled,
+        RetireSealedAction,
         ListLeakReports,
         BeginLeakReveal,
         MarkLeakRotated,

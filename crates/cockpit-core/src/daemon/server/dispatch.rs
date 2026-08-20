@@ -2580,46 +2580,133 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 state: proto::PinState { count, seqs },
             })
         }
-        Request::ListSealedValues { session_id } => ctx
-            .db
-            .list_sealed_value_metadata(session_id)
-            .await
-            .map(|values| Response::SealedValues {
-                values: values
-                    .into_iter()
-                    .map(sealed_value_metadata_to_proto)
-                    .collect(),
-            })
-            .map_err(internal),
-        Request::DeleteSealedValue {
-            session_id,
-            value_id,
+        // ---- v10-only owner-remoted sealed-owner sensitive channel ------
+        // Non-owner callers are rejected by the central owner-only authorizer
+        // before reaching these arms. The live directory / capability-table
+        // backing (RwLock registry, persistence) is installed by the
+        // `sealed-owner-persistence-and-executor` sibling; until then every arm
+        // that would touch durable state or a literal fails CLOSED here — no
+        // literal, no capability minted, no unjournaled persist.
+        Request::BeginSealedOwnerOperation {
+            disposition,
+            record_id,
+            name,
+            description,
+            scope_kind,
+            scope_key,
         } => {
-            // Both arms must go through the scoped delete: a session-scope
-            // scoped value is dual-written, so removing only the legacy
-            // `sealed_values` row would ack a delete that left the record
-            // resolvable with no literal behind it.
-            let deleted = if let Some(handle) = ctx.registry.live_handle(session_id) {
-                handle
-                    .delete_sealed_value(&value_id)
-                    .await
-                    .map_err(internal)?
-            } else {
-                ctx.db
-                    .delete_sealed_value_for_session(
-                        session_id.to_string(),
-                        value_id.clone(),
-                        chrono::Utc::now().timestamp_millis(),
-                    )
-                    .await
-                    .map_err(internal)?
-            };
-            if !deleted {
-                return Err(internal(anyhow::anyhow!(
-                    "sealed value `{value_id}` is unknown"
-                )));
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            // Validate the closed disposition + per-disposition field presence
+            // (a distinct, content-free rejection) before the fail-closed
+            // backing. Never echoes a literal — begin is secret-free.
+            validate_sealed_begin_shape(
+                &disposition,
+                record_id.as_deref(),
+                name.as_deref(),
+                description.as_deref(),
+                scope_kind.as_deref(),
+                scope_key.as_deref(),
+            )
+            .map_err(|error| bad_request(error.to_string()))?;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if capability_id.trim().is_empty() {
+                return Err(bad_request("capability id must not be empty".to_string()));
             }
-            Ok(Response::Ack)
+            // Fail closed: no capability table, so the literal is dropped
+            // (zeroized on drop) and no store/reveal occurs.
+            drop(literal);
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::CancelSealedOwnerOperation { capability_id } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if capability_id.trim().is_empty() {
+                return Err(bad_request("capability id must not be empty".to_string()));
+            }
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::SealedOwnerInventory {
+            scope_kind,
+            scope_key,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if let Some(kind) = scope_kind.as_deref() {
+                parse_sealed_owner_scope_kind(kind)
+                    .map_err(|error| bad_request(error.to_string()))?;
+            }
+            let _ = scope_key;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::EditSealedOwnerDescription {
+            record_id,
+            description,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if record_id.trim().is_empty() {
+                return Err(bad_request("record id must not be empty".to_string()));
+            }
+            crate::sealed::identity::SealedDescription::parse(&description)
+                .map_err(|error| bad_request(error.to_string()))?;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::ListSealedActions => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::CreateSealedAction {
+            kind_id,
+            project_id,
+            description,
+            origin_id,
+            projection_id,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            // Resolve the three closed-lookup ids to a compiled action kind and
+            // parse the safe fields FIRST. An unknown id / unsafe field is
+            // rejected here, before any persist. Only a fully-resolved request
+            // reaches the fail-closed backing.
+            let _kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+                .map_err(|error| bad_request(error.to_string()))?;
+            crate::sealed::identity::SealedDescription::parse(&description)
+                .map_err(|error| bad_request(error.to_string()))?;
+            if project_id.trim().is_empty() {
+                return Err(bad_request("project id must not be empty".to_string()));
+            }
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::ReviseSealedActionDescription {
+            action_id,
+            description,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if action_id.trim().is_empty() {
+                return Err(bad_request("action id must not be empty".to_string()));
+            }
+            crate::sealed::identity::SealedDescription::parse(&description)
+                .map_err(|error| bad_request(error.to_string()))?;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::ReviseSealedActionEnabled { action_id, enabled } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if action_id.trim().is_empty() {
+                return Err(bad_request("action id must not be empty".to_string()));
+            }
+            let _ = enabled;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::RetireSealedAction { action_id, confirm } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if action_id != confirm {
+                return Err(bad_request(
+                    "retire confirmation must exactly match the action id".to_string(),
+                ));
+            }
+            Err(sealed_owner_backing_unavailable())
         }
 
         Request::ListProjectNotes { project_root } => ctx
@@ -7856,17 +7943,25 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                 state: proto::PinState { count, seqs },
             })
         }
-        Request::ListSealedValues { session_id } => ctx
-            .db
-            .list_sealed_value_metadata(session_id)
-            .await
-            .map(|values| Response::SealedValues {
-                values: values
-                    .into_iter()
-                    .map(sealed_value_metadata_to_proto)
-                    .collect(),
-            })
-            .map_err(internal),
+        // v10-only owner-remoted sealed-owner reads (concurrent). Non-owner is
+        // rejected by the central authorizer; the live directory backing is
+        // installed by the persistence sibling, so these fail closed here.
+        Request::SealedOwnerInventory {
+            scope_kind,
+            scope_key,
+        } => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            if let Some(kind) = scope_kind.as_deref() {
+                parse_sealed_owner_scope_kind(kind)
+                    .map_err(|error| bad_request(error.to_string()))?;
+            }
+            let _ = scope_key;
+            Err(sealed_owner_backing_unavailable())
+        }
+        Request::ListSealedActions => {
+            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            Err(sealed_owner_backing_unavailable())
+        }
         Request::ExportSessionData {
             session_id,
             kind,
@@ -12569,16 +12664,135 @@ fn project_note_to_proto(row: crate::db::project_notes::ProjectNote) -> proto::P
     }
 }
 
-fn sealed_value_metadata_to_proto(
-    row: crate::db::sealed_values::SealedValueMetadata,
-) -> proto::SealedValueMetadata {
-    proto::SealedValueMetadata {
-        value_id: row.value_id,
-        reason: row.reason,
-        origin: row.origin,
-        created_at: row.created_at,
-        origin_session_id: row.origin_session_id,
+/// The sealed-owner directory / capability-table backing is installed by the
+/// `sealed-owner-persistence-and-executor` sibling. Until then every sealed-owner
+/// operation that would touch durable state or a literal fails CLOSED through
+/// this content-free error — no literal, no capability minted, no unjournaled
+/// persist, no second in-process directory invented here.
+fn sealed_owner_backing_unavailable() -> ErrorPayload {
+    internal(anyhow::anyhow!(
+        "sealed-owner channel backing is not installed on this daemon build"
+    ))
+}
+
+/// Parse the closed sealed-owner scope kind. Rejects anything outside the fixed
+/// `session|project|global` set.
+fn parse_sealed_owner_scope_kind(
+    raw: &str,
+) -> anyhow::Result<crate::db::sealed_scope::SealedScopeKind> {
+    match raw {
+        "session" => Ok(crate::db::sealed_scope::SealedScopeKind::Session),
+        "project" => Ok(crate::db::sealed_scope::SealedScopeKind::Project),
+        "global" => Ok(crate::db::sealed_scope::SealedScopeKind::Global),
+        other => {
+            anyhow::bail!("scope kind must be `session`, `project`, or `global`, got `{other}`")
+        }
     }
+}
+
+/// Validate the closed `BeginSealedOwnerOperation` disposition and its
+/// per-disposition field presence. Create requires name + description +
+/// scope_kind + scope_key and no record id; replace/rotate/recover require a
+/// record id and none of the create fields. This is the content-free pre-persist
+/// shape gate; it never touches a literal.
+fn validate_sealed_begin_shape(
+    disposition: &str,
+    record_id: Option<&str>,
+    name: Option<&str>,
+    description: Option<&str>,
+    scope_kind: Option<&str>,
+    scope_key: Option<&str>,
+) -> anyhow::Result<()> {
+    match disposition {
+        "create" => {
+            if record_id.is_some() {
+                anyhow::bail!("create begin must not carry a record id");
+            }
+            let name = name.context("create begin requires a name")?;
+            crate::sealed::identity::SealedName::canonical(name)?;
+            let description = description.context("create begin requires a description")?;
+            crate::sealed::identity::SealedDescription::parse(description)?;
+            let scope_kind = scope_kind.context("create begin requires a scope kind")?;
+            parse_sealed_owner_scope_kind(scope_kind)?;
+            // `scope_key` is required for session/project; global uses an empty
+            // key. Presence (possibly empty) is required so the wire is explicit.
+            scope_key.context("create begin requires a scope key field")?;
+        }
+        "replace" | "rotate" | "recover" => {
+            let record_id = record_id.context("this disposition requires a record id")?;
+            crate::sealed::identity::SealedRecordId::parse(record_id)?;
+            if name.is_some()
+                || description.is_some()
+                || scope_kind.is_some()
+                || scope_key.is_some()
+            {
+                anyhow::bail!("replace/rotate/recover begin must carry only a record id");
+            }
+        }
+        other => anyhow::bail!(
+            "disposition must be `create`, `replace`, `rotate`, or `recover`, got `{other}`"
+        ),
+    }
+    Ok(())
+}
+
+/// The closed server-side catalog that resolves the three `CreateSealedAction`
+/// ids to a compiled [`SealedActionKind`].
+///
+/// The ids are closed lookups, never free-form payloads: `kind_id` selects a
+/// builtin kind template (a fixed origin allowlist, credential placement, path
+/// template, and parameter specs — all host-owned, never on the wire),
+/// `origin_id` indexes into that template's allowlist, and `projection_id`
+/// selects the fixed projection. Any unknown id is rejected here, before any
+/// persist. The builtin catalog is intentionally small; the persistence sibling
+/// installs the durable action directory that these snapshots are written to.
+fn resolve_sealed_action_kind(
+    kind_id: &str,
+    origin_id: &str,
+    projection_id: &str,
+) -> anyhow::Result<crate::sealed::action_admin::SealedActionKind> {
+    use crate::sealed::action_admin::{
+        HttpsCredentialPlacement, HttpsOriginAllowlist, SealedActionKind, SealedProjectionId,
+    };
+
+    // Closed builtin kind templates. Each entry is a fixed, host-owned template;
+    // the wire never supplies an origin URL, header, or path.
+    struct KindTemplate {
+        origins: &'static [&'static str],
+        header_name: &'static str,
+        path_template: &'static str,
+    }
+    // `origin_id` selects one origin from the template's allowlist by index.
+    let template = match kind_id {
+        "https.notify" => KindTemplate {
+            origins: &[
+                "https://api.deploy.example.com",
+                "https://api.deploy-staging.example.com",
+            ],
+            header_name: "X-Deploy-Key",
+            path_template: "/v1/notify",
+        },
+        other => anyhow::bail!("unknown sealed action kind id: `{other}`"),
+    };
+
+    let index: usize = origin_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("origin id must be a non-negative index"))?;
+    if index >= template.origins.len() {
+        anyhow::bail!("origin id `{origin_id}` is out of range for kind `{kind_id}`");
+    }
+    // The compiled kind carries the SELECTED origin only.
+    let origins = HttpsOriginAllowlist::from_raw(&[template.origins[index]])?;
+    let projection = SealedProjectionId::parse(projection_id)?;
+    Ok(SealedActionKind::Https {
+        origins,
+        credential_placement: HttpsCredentialPlacement::Header {
+            header_name: template.header_name.to_string(),
+        },
+        path_template: template.path_template.to_string(),
+        projection,
+        parameters: std::collections::BTreeMap::new(),
+    })
 }
 
 async fn ensure_project_note_member(

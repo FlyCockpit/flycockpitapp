@@ -516,13 +516,29 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_string(&mut pin.text, redact);
             }
         }
-        proto::Response::SealedValues { values } => {
-            for value in values {
-                scrub_string(&mut value.value_id, redact);
-                scrub_string(&mut value.reason, redact);
-                scrub_string(&mut value.origin, redact);
-            }
+        // Sealed-owner sensitive channel responses. The recover-apply success
+        // `revealed_literal` is the ONE legitimate remoted plaintext, revealed
+        // only to the owner session that minted the capability; it is a
+        // redacting/zeroizing literal that must NOT be run through the free-text
+        // scrubber (that would corrupt the exact value the owner asked to
+        // recover), so this variant's literal field is deliberately OMITTED from
+        // scrubbing. Every other sealed-owner response is safe metadata only:
+        // capability ids, counts, record/action ids, revisions, enabled flags,
+        // and safe descriptions carry no vaulted-secret free text, so the
+        // redaction backstop is a no-op. Inventory `name`/`description` are safe
+        // Owner-authored metadata (never the literal), matching the
+        // secret-free precedent of the sibling leak-report metadata responses.
+        proto::Response::SealedOwnerOperationApplied {
+            revealed_literal: _,
         }
+        | proto::Response::SealedOwnerOperationBegun { .. }
+        | proto::Response::SealedOwnerOperationCancelled { .. }
+        | proto::Response::SealedOwnerInventory { .. }
+        | proto::Response::SealedOwnerDescriptionEdited { .. }
+        | proto::Response::SealedActions { .. }
+        | proto::Response::SealedActionCreated { .. }
+        | proto::Response::SealedActionRevised { .. }
+        | proto::Response::SealedActionRetired { .. } => {}
         // Leak responses are secret-free by construction: plaintext, ciphertext,
         // prefix, length, and fingerprint never ride these frames (the reveal
         // plaintext travels only on the protected local sensitive channel), so

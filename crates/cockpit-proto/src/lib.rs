@@ -2250,16 +2250,162 @@ mod tui_ownership_rpc_contract_tests {
     }
 }
 
-/// Metadata for a session sealed value.  The literal is deliberately absent
-/// from this wire type.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SealedValueMetadata {
-    pub value_id: String,
-    pub reason: String,
-    pub origin: String,
-    pub created_at: i64,
-    pub origin_session_id: Uuid,
+/// The maximum sealed-value plaintext literal carried on one sensitive wire
+/// frame, in bytes. Mirrors
+/// `cockpit_core::sealed::owner::MAX_SENSITIVE_FRAME_BYTES`; a larger literal
+/// fails closed on deserialize before it reaches any handler.
+pub const MAX_SENSITIVE_FRAME_BYTES: usize = 16 * 1024;
+
+/// A sealed-value plaintext literal on the sensitive owner channel.
+///
+/// It rides exactly two wire frames and nowhere else: the apply request
+/// (owner → daemon) for create/replace/rotate, and the recover-apply success
+/// response (daemon → owner). It never appears on inventory, begin, cancel,
+/// edit-description, action-admin, or error payloads. The newtype:
+///
+/// * **redacts** its own `Debug` (prints only a byte length, never the
+///   plaintext) — so a `{:?}` of any enclosing `Request`/`Response` is
+///   secret-free by construction;
+/// * **zeroizes** its backing buffer on drop; and
+/// * is **bounded** by [`MAX_SENSITIVE_FRAME_BYTES`] on deserialize — a larger
+///   frame fails closed at the single wire construction funnel, before any
+///   handler runs.
+#[derive(Clone)]
+pub struct SensitiveWireLiteral(zeroize::Zeroizing<String>);
+
+impl SensitiveWireLiteral {
+    /// Wrap an in-process literal. In-process requests bypass deserialization,
+    /// so callers must independently honor [`MAX_SENSITIVE_FRAME_BYTES`]
+    /// (`Request::validate_semantics` enforces it before dispatch).
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    /// The plaintext, borrowed. Never log this.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The plaintext byte length. Safe to log.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the literal is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Move the plaintext out inside a zeroizing buffer, with no intermediate
+    /// plaintext copy.
+    pub fn into_zeroizing(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
 }
+
+impl fmt::Debug for SensitiveWireLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SensitiveWireLiteral([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for SensitiveWireLiteral {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveWireLiteral {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() > MAX_SENSITIVE_FRAME_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "sensitive frame literal exceeds {MAX_SENSITIVE_FRAME_BYTES} bytes"
+            )));
+        }
+        Ok(Self(zeroize::Zeroizing::new(value)))
+    }
+}
+
+/// A fixed, content-free placeholder canonicalized in place of a sealed-value
+/// literal. It carries no plaintext and no length, so the sealed plaintext never
+/// enters the (non-zeroizing) FCOR canonical digest buffer, its staging buffers,
+/// or the bytes handed to the hasher.
+const SEALED_LITERAL_FCOR_PLACEHOLDER: &[u8] = b"[sealed-literal-redacted-from-fcor]";
+
+// The apply request is an owner-remoted nonrepeatable mutation, so its params
+// are canonicalized for the remote-operation key. Unlike `put_named_secret`
+// (whose `value` IS the operation's identity), the apply's replay/dedup identity
+// is the single-use `capability_id` + the atomic CAS, so the literal is
+// redundant in the FCOR key. We therefore deliberately EXCLUDE the plaintext
+// from canonicalization — encoding only a fixed placeholder — so the sealed
+// plaintext is never copied into the plain `Vec<u8>` canonical buffer (which
+// frees without zeroizing). This keeps the zeroization guarantee intact end to
+// end; the redacted disposition is reflected in the `option<redacted>` canonical
+// codec (see `canonical_fcor_codec_for_rust_type`).
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWireLiteral {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> Result<()> {
+        out.push_bytes(SEALED_LITERAL_FCOR_PLACEHOLDER)
+    }
+}
+
+/// The safe scope kind of a sealed value, for the sealed-owner begin and
+/// inventory wire shapes. Carries no key material; the key is a separate
+/// `scope_key` field (a session id or canonical project key).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SealedOwnerScopeKind {
+    Session,
+    Project,
+    Global,
+}
+
+/// One safe row of the sealed-owner inventory. The plaintext literal is
+/// deliberately absent from this wire type; a recover apply is the only path
+/// that reveals a literal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SealedOwnerInventoryItem {
+    pub record_id: String,
+    pub name: String,
+    pub description: String,
+    pub scope_kind: SealedOwnerScopeKind,
+    pub scope_key: String,
+    pub active_version: u32,
+    pub created_at_ms: i64,
+}
+
+/// Safe metadata for one sealed action instance. Carries no origin allowlist,
+/// path template, credential placement, or projection blob — only the owner
+/// inventory projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SealedActionSummaryWire {
+    pub action_id: String,
+    pub revision: u32,
+    pub enabled: bool,
+    pub description: String,
+    pub project_key: String,
+}
+
+/// Maximum rows carried in one `SealedOwnerInventory` / `SealedActions`
+/// response. Each row is bounded metadata (a 64-scalar name and a 512-scalar
+/// description at most), so this cap keeps the worst-case frame well under the
+/// `BoundedRequestResponse` 512 KiB ceiling. The daemon directory funnel clamps
+/// to this via [`Response::sealed_owner_inventory`] /
+/// [`Response::sealed_actions`], making the `Bounded` classification honest by
+/// construction.
+pub const MAX_SEALED_OWNER_INVENTORY_ROWS: usize = 128;
 
 /// The closed rotation plan proposed for a leak record. Derived from the
 /// closed report `source`, `category`, and connector ID enums only; the Owner
@@ -2347,21 +2493,45 @@ pub struct LeakRevealCapability {
 }
 
 #[cfg(test)]
-mod sealed_value_tests {
+mod sensitive_wire_literal_tests {
     use super::*;
 
     #[test]
-    fn sealed_value_metadata_wire_shape_has_no_literal_field() {
-        let metadata = SealedValueMetadata {
-            value_id: "prod_token".into(),
-            reason: "deploy".into(),
-            origin: "user".into(),
-            created_at: 1,
-            origin_session_id: Uuid::nil(),
-        };
-        let encoded = serde_json::to_string(&metadata).unwrap();
-        assert!(!encoded.contains("value\""));
-        assert!(!encoded.contains("secret"));
+    fn sensitive_wire_literal_debug_redacts_the_plaintext() {
+        let marker = "PLAINTEXT-MARKER-must-not-print";
+        let literal = SensitiveWireLiteral::new(marker.to_string());
+        let debug = format!("{literal:?}");
+        assert!(
+            !debug.contains(marker),
+            "Debug of a sensitive literal must never print the plaintext: {debug}"
+        );
+        assert!(debug.contains("REDACTED"));
+        // The plaintext is still available through the explicit accessor.
+        assert_eq!(literal.as_str(), marker);
+    }
+
+    #[test]
+    fn sensitive_wire_literal_serializes_as_a_plain_string() {
+        let literal = SensitiveWireLiteral::new("s3cr3t".to_string());
+        assert_eq!(serde_json::to_string(&literal).unwrap(), "\"s3cr3t\"");
+        let back: SensitiveWireLiteral = serde_json::from_str("\"s3cr3t\"").unwrap();
+        assert_eq!(back.as_str(), "s3cr3t");
+    }
+
+    #[test]
+    fn sensitive_wire_literal_over_the_bound_fails_closed_on_deserialize() {
+        let oversized = "x".repeat(MAX_SENSITIVE_FRAME_BYTES + 1);
+        let json = serde_json::to_string(&oversized).unwrap();
+        let parsed: std::result::Result<SensitiveWireLiteral, _> = serde_json::from_str(&json);
+        assert!(
+            parsed.is_err(),
+            "a literal larger than MAX_SENSITIVE_FRAME_BYTES must be rejected at deserialize"
+        );
+        // The exact-bound literal is accepted.
+        let at_bound = "y".repeat(MAX_SENSITIVE_FRAME_BYTES);
+        let json = serde_json::to_string(&at_bound).unwrap();
+        let parsed: SensitiveWireLiteral = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), MAX_SENSITIVE_FRAME_BYTES);
     }
 }
 
@@ -2693,7 +2863,17 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "diagnose_media_reservation"
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
-                | "docs_ask" => 10,
+                | "docs_ask"
+                | "begin_sealed_owner_operation"
+                | "apply_sealed_owner_operation"
+                | "cancel_sealed_owner_operation"
+                | "sealed_owner_inventory"
+                | "edit_sealed_owner_description"
+                | "list_sealed_actions"
+                | "create_sealed_action"
+                | "revise_sealed_action_description"
+                | "revise_sealed_action_enabled"
+                | "retire_sealed_action" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 tags: the base tag
@@ -2748,7 +2928,16 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "media_reservation_diagnosis"
                 | "media_reservation_repaired"
                 | "doctor_snapshot"
-                | "docs_answer" => 10,
+                | "docs_answer"
+                | "sealed_owner_operation_begun"
+                | "sealed_owner_operation_applied"
+                | "sealed_owner_operation_cancelled"
+                | "sealed_owner_inventory"
+                | "sealed_owner_description_edited"
+                | "sealed_actions"
+                | "sealed_action_created"
+                | "sealed_action_revised"
+                | "sealed_action_retired" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 response tags: the base
@@ -6172,6 +6361,138 @@ mod tests {
                     question: "how do tasks work?".into(),
                     package: Some("tokio".into()),
                     project_root: None,
+                },
+            },
+        };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[test]
+    fn every_new_sealed_owner_shape_requires_v10() {
+        // AC1/AC3: every new sealed-owner request and response shape is gated to
+        // protocol v10 (a v9 envelope carrying it is rejected — see the
+        // `recv_rejects_v10_only_*` test below).
+        for request in [
+            Request::BeginSealedOwnerOperation {
+                disposition: "create".into(),
+                record_id: None,
+                name: Some("token".into()),
+                description: Some("safe".into()),
+                scope_kind: Some("global".into()),
+                scope_key: Some(String::new()),
+            },
+            Request::ApplySealedOwnerOperation {
+                capability_id: "cap".into(),
+                literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
+            },
+            Request::CancelSealedOwnerOperation {
+                capability_id: "cap".into(),
+            },
+            Request::SealedOwnerInventory {
+                scope_kind: None,
+                scope_key: None,
+            },
+            Request::EditSealedOwnerDescription {
+                record_id: "rec".into(),
+                description: "desc".into(),
+            },
+            Request::ListSealedActions,
+            Request::CreateSealedAction {
+                kind_id: "k".into(),
+                project_id: "p".into(),
+                description: "d".into(),
+                origin_id: "0".into(),
+                projection_id: "none".into(),
+            },
+            Request::ReviseSealedActionDescription {
+                action_id: "a".into(),
+                description: "d".into(),
+            },
+            Request::ReviseSealedActionEnabled {
+                action_id: "a".into(),
+                enabled: false,
+            },
+            Request::RetireSealedAction {
+                action_id: "a".into(),
+                confirm: "a".into(),
+            },
+        ] {
+            let tag = request.wire_tag();
+            assert_eq!(
+                body_required_protocol_version(&Body::Request {
+                    id: Uuid::nil(),
+                    operation: None,
+                    request,
+                })
+                .0,
+                10,
+                "{tag} must be gated to v10"
+            );
+        }
+        for response in [
+            Response::SealedOwnerOperationBegun {
+                capability_id: "cap".into(),
+                expires_at_ms: 1,
+            },
+            Response::SealedOwnerOperationApplied {
+                revealed_literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
+            },
+            Response::SealedOwnerOperationCancelled { spent: true },
+            Response::SealedOwnerInventory { items: Vec::new() },
+            Response::SealedOwnerDescriptionEdited {
+                record_id: "rec".into(),
+            },
+            Response::SealedActions {
+                actions: Vec::new(),
+            },
+            Response::SealedActionCreated {
+                action_id: "a".into(),
+                revision: 1,
+            },
+            Response::SealedActionRevised {
+                action_id: "a".into(),
+                revision: 2,
+            },
+            Response::SealedActionRetired {
+                action_id: "a".into(),
+                retired: true,
+            },
+        ] {
+            let tag = response.wire_tag();
+            assert_eq!(
+                body_required_protocol_version(&Body::Response {
+                    id: Uuid::nil(),
+                    response: Box::new(response),
+                })
+                .0,
+                10,
+                "{tag} must be gated to v10"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_apply_sealed_owner_operation_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope {
+            v: 9,
+            body: Body::Request {
+                id,
+                operation: None,
+                request: Request::ApplySealedOwnerOperation {
+                    capability_id: "cap".into(),
+                    literal: Some(SensitiveWireLiteral::new("s3cr3t".into())),
                 },
             },
         };

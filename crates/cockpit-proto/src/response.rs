@@ -210,8 +210,54 @@ pub enum Response {
     PinState {
         state: PinState,
     },
-    SealedValues {
-        values: Vec<SealedValueMetadata>,
+    // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
+    // The plaintext literal appears ONLY on `SealedOwnerOperationApplied` for a
+    // recover success (`revealed_literal`); every other response below is
+    // secret-free by construction.
+    /// A sealed-owner capability was minted. Carries no literal.
+    SealedOwnerOperationBegun {
+        capability_id: String,
+        expires_at_ms: i64,
+    },
+    /// A sealed-owner apply succeeded. For a create/replace/rotate write there
+    /// is no literal (`revealed_literal: None`); for a recover, this is the ONLY
+    /// remoted payload that reveals the plaintext, to the authenticated owner
+    /// session that minted the capability. The literal is the redacting,
+    /// zeroizing [`crate::SensitiveWireLiteral`].
+    SealedOwnerOperationApplied {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revealed_literal: Option<crate::SensitiveWireLiteral>,
+    },
+    /// A sealed-owner capability was cancelled (its single-use CAS spent).
+    SealedOwnerOperationCancelled {
+        spent: bool,
+    },
+    /// The safe sealed-value inventory. Never carries a literal.
+    SealedOwnerInventory {
+        items: Vec<crate::SealedOwnerInventoryItem>,
+    },
+    /// A sealed value's safe description was edited.
+    SealedOwnerDescriptionEdited {
+        record_id: String,
+    },
+    /// Safe summaries of sealed action instances. No origins/templates/creds.
+    SealedActions {
+        actions: Vec<crate::SealedActionSummaryWire>,
+    },
+    /// A sealed action instance was created; the daemon minted `action_id`.
+    SealedActionCreated {
+        action_id: String,
+        revision: u32,
+    },
+    /// A sealed action instance was revised to a new revision.
+    SealedActionRevised {
+        action_id: String,
+        revision: u32,
+    },
+    /// A sealed action instance was retired.
+    SealedActionRetired {
+        action_id: String,
+        retired: bool,
     },
 
     /// `/leaks` list response: a page of safe leak-report metadata. Never
@@ -1015,7 +1061,15 @@ macro_rules! response_variants {
             (Response::PinSeqs { .. }, "pin_seqs");
             (Response::PinsWithText { .. }, "pins_with_text");
             (Response::PinState { .. }, "pin_state");
-            (Response::SealedValues { .. }, "sealed_values");
+            (Response::SealedOwnerOperationBegun { .. }, "sealed_owner_operation_begun");
+            (Response::SealedOwnerOperationApplied { .. }, "sealed_owner_operation_applied");
+            (Response::SealedOwnerOperationCancelled { .. }, "sealed_owner_operation_cancelled");
+            (Response::SealedOwnerInventory { .. }, "sealed_owner_inventory");
+            (Response::SealedOwnerDescriptionEdited { .. }, "sealed_owner_description_edited");
+            (Response::SealedActions { .. }, "sealed_actions");
+            (Response::SealedActionCreated { .. }, "sealed_action_created");
+            (Response::SealedActionRevised { .. }, "sealed_action_revised");
+            (Response::SealedActionRetired { .. }, "sealed_action_retired");
             (Response::LeakReports { .. }, "leak_reports");
             (Response::LeakRevealCapability { .. }, "leak_reveal_capability");
             (Response::LeakRotationUpdated { .. }, "leak_rotation_updated");
@@ -1129,6 +1183,26 @@ impl Response {
         }
         response_variants!(wire_tag)
     }
+
+    /// Build a `SealedOwnerInventory` response clamped to
+    /// [`crate::MAX_SEALED_OWNER_INVENTORY_ROWS`] rows so the frame stays within
+    /// the `BoundedRequestResponse` class by construction. The daemon directory
+    /// funnel MUST build the response through this constructor rather than the
+    /// bare variant.
+    pub fn sealed_owner_inventory(mut items: Vec<crate::SealedOwnerInventoryItem>) -> Self {
+        items.truncate(crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
+        Self::SealedOwnerInventory { items }
+    }
+
+    /// Build a `SealedActions` response clamped to
+    /// [`crate::MAX_SEALED_OWNER_INVENTORY_ROWS`] rows so the frame stays within
+    /// the `BoundedRequestResponse` class by construction. The daemon directory
+    /// funnel MUST build the response through this constructor rather than the
+    /// bare variant.
+    pub fn sealed_actions(mut actions: Vec<crate::SealedActionSummaryWire>) -> Self {
+        actions.truncate(crate::MAX_SEALED_OWNER_INVENTORY_ROWS);
+        Self::SealedActions { actions }
+    }
 }
 
 #[cfg(test)]
@@ -1233,11 +1307,174 @@ mod tests {
     }
 
     #[test]
-    fn sealed_values_response_is_registered() {
+    fn sealed_owner_responses_are_registered() {
         assert_eq!(
-            Response::SealedValues { values: Vec::new() }.wire_tag(),
-            "sealed_values"
+            Response::SealedOwnerOperationBegun {
+                capability_id: "cap".into(),
+                expires_at_ms: 1,
+            }
+            .wire_tag(),
+            "sealed_owner_operation_begun"
         );
+        assert_eq!(
+            Response::SealedOwnerOperationApplied {
+                revealed_literal: None,
+            }
+            .wire_tag(),
+            "sealed_owner_operation_applied"
+        );
+        assert_eq!(
+            Response::SealedOwnerInventory { items: Vec::new() }.wire_tag(),
+            "sealed_owner_inventory"
+        );
+        assert_eq!(
+            Response::SealedActions {
+                actions: Vec::new()
+            }
+            .wire_tag(),
+            "sealed_actions"
+        );
+    }
+
+    #[test]
+    fn only_recover_apply_response_reveals_a_planted_literal() {
+        // AC1 / AC6 (proto boundary): a sealed-value plaintext appears ONLY on
+        // the recover-apply success response's `revealed_literal`. Plant a unique
+        // marker as the would-be literal into EVERY non-recover response that
+        // could plausibly carry it, and prove the marker is absent from both the
+        // serialized wire form AND the Debug form of each — while the recover
+        // success carries it on the wire (positive control) but redacts it in
+        // Debug.
+        let marker = "RECOVER-REVEAL-PLAINTEXT-marker-9f3a";
+
+        // Positive control: the recover success reveals the marker on the wire
+        // (daemon -> owner) and redacts it in Debug.
+        let recover = Response::SealedOwnerOperationApplied {
+            revealed_literal: Some(crate::SensitiveWireLiteral::new(marker.into())),
+        };
+        assert!(
+            serde_json::to_string(&recover).unwrap().contains(marker),
+            "the recover-apply success must reveal the literal on the wire"
+        );
+        assert!(
+            !format!("{recover:?}").contains(marker),
+            "the recover-apply Debug must redact the literal"
+        );
+
+        // Negative control: a recover-apply with NO literal (a write success)
+        // never carries the marker — proving `revealed_literal` is the sole
+        // carrier, not the variant itself.
+        assert!(
+            !serde_json::to_string(&Response::SealedOwnerOperationApplied {
+                revealed_literal: None,
+            })
+            .unwrap()
+            .contains(marker)
+        );
+
+        // Drive real construction of every OTHER sealed-owner response with
+        // benign safe metadata. Because none has a literal field, the sealed
+        // plaintext marker cannot ride them: assert it is absent from BOTH the
+        // serialized wire form AND the Debug form of each. (If a future change
+        // added a literal-bearing field to any of these, or routed the recovered
+        // plaintext into one, this fails.)
+        let non_recover = [
+            Response::SealedOwnerOperationBegun {
+                capability_id: "cap-1".into(),
+                expires_at_ms: 1,
+            },
+            Response::SealedOwnerOperationApplied {
+                revealed_literal: None,
+            },
+            Response::SealedOwnerOperationCancelled { spent: true },
+            Response::sealed_owner_inventory(vec![crate::SealedOwnerInventoryItem {
+                record_id: "rec-1".into(),
+                name: "deploy_token".into(),
+                description: "safe description".into(),
+                scope_kind: crate::SealedOwnerScopeKind::Global,
+                scope_key: String::new(),
+                active_version: 1,
+                created_at_ms: 0,
+            }]),
+            Response::SealedOwnerDescriptionEdited {
+                record_id: "rec-1".into(),
+            },
+            Response::sealed_actions(vec![crate::SealedActionSummaryWire {
+                action_id: "act-1".into(),
+                revision: 1,
+                enabled: true,
+                description: "safe description".into(),
+                project_key: "proj".into(),
+            }]),
+            Response::SealedActionCreated {
+                action_id: "act-1".into(),
+                revision: 1,
+            },
+            Response::SealedActionRevised {
+                action_id: "act-1".into(),
+                revision: 2,
+            },
+            Response::SealedActionRetired {
+                action_id: "act-1".into(),
+                retired: true,
+            },
+        ];
+        for response in non_recover {
+            let tag = response.wire_tag();
+            assert!(
+                !serde_json::to_string(&response).unwrap().contains(marker),
+                "{tag} must not serialize the sealed-value plaintext"
+            );
+            assert!(
+                !format!("{response:?}").contains(marker),
+                "{tag} must not Debug-print the sealed-value plaintext"
+            );
+            // No non-recover response embeds a sensitive literal type at all.
+            assert!(
+                !format!("{response:?}").contains("SensitiveWireLiteral"),
+                "{tag} must not embed a sensitive literal"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_owner_collection_responses_are_clamped_to_the_bound() {
+        // FINDING 2: the collection constructors clamp to
+        // MAX_SEALED_OWNER_INVENTORY_ROWS so the frame stays within the Bounded
+        // class by construction.
+        let over = crate::MAX_SEALED_OWNER_INVENTORY_ROWS + 25;
+        let items = (0..over)
+            .map(|i| crate::SealedOwnerInventoryItem {
+                record_id: format!("rec-{i}"),
+                name: "n".into(),
+                description: "d".into(),
+                scope_kind: crate::SealedOwnerScopeKind::Global,
+                scope_key: String::new(),
+                active_version: 1,
+                created_at_ms: 0,
+            })
+            .collect();
+        match Response::sealed_owner_inventory(items) {
+            Response::SealedOwnerInventory { items } => {
+                assert_eq!(items.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS)
+            }
+            other => panic!("expected inventory, got {}", other.wire_tag()),
+        }
+        let actions = (0..over)
+            .map(|i| crate::SealedActionSummaryWire {
+                action_id: format!("act-{i}"),
+                revision: 1,
+                enabled: true,
+                description: "d".into(),
+                project_key: "p".into(),
+            })
+            .collect();
+        match Response::sealed_actions(actions) {
+            Response::SealedActions { actions } => {
+                assert_eq!(actions.len(), crate::MAX_SEALED_OWNER_INVENTORY_ROWS)
+            }
+            other => panic!("expected actions, got {}", other.wire_tag()),
+        }
     }
 
     #[test]

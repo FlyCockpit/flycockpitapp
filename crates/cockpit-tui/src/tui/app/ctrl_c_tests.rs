@@ -383,13 +383,3 @@ fn note_without_session_shows_send_first_error() {
         "no note row is added without a session"
     );
 }
-
-#[test]
-fn sealed_without_daemon_requires_running_session_and_sends_no_request() {
-    use super::{App, HistoryEntry};
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(Some(tmp.path()), false);
-    app.handle_sealed_command("");
-    assert!(app.history.iter().any(|entry| matches!(entry, HistoryEntry::Plain { line } if line.contains("running session is required"))));
-    assert!(app.async_actions.pending_kinds().is_empty());
-}

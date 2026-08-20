@@ -491,12 +491,88 @@ pub enum Request {
     PinnedMessageState {
         session_id: Uuid,
     },
-    ListSealedValues {
-        session_id: Uuid,
+    // ---- v10-only owner-remoted sealed-owner sensitive channel ---------
+    // Every variant below is a NEW wire shape gated to protocol v10 by
+    // `body_required_protocol_version`. The plaintext literal rides ONLY the
+    // apply request (create/replace/rotate) and the recover-apply success
+    // response; it never appears on begin, cancel, inventory, edit-description,
+    // action-admin, or any error payload.
+    /// Begin a sealed-owner sensitive operation: mint a single-use,
+    /// capability bound to one exact disposition, owner principal, minting
+    /// session, and daemon-loaded scope/version. `disposition` is one of
+    /// `create|replace|rotate|recover`. Create carries `name`, `description`,
+    /// `scope_kind` (`session|project|global`), and `scope_key`;
+    /// replace/rotate/recover carry only `record_id`. Secret-free.
+    BeginSealedOwnerOperation {
+        disposition: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_key: Option<String>,
     },
-    DeleteSealedValue {
-        session_id: Uuid,
-        value_id: String,
+    /// Apply a sealed-owner operation against a minted capability. The `literal`
+    /// carries the plaintext for a create/replace/rotate write and is absent for
+    /// a recover. It is the redacting, zeroizing [`SensitiveWireLiteral`],
+    /// bounded by [`crate::MAX_SENSITIVE_FRAME_BYTES`]. Consumes the capability
+    /// through the shared compare-and-swap.
+    ApplySealedOwnerOperation {
+        capability_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        literal: Option<SensitiveWireLiteral>,
+    },
+    /// Cancel a minted sealed-owner capability, spending the same compare-and-swap
+    /// as apply without performing the operation. Secret-free.
+    CancelSealedOwnerOperation {
+        capability_id: String,
+    },
+    /// List the safe sealed-value inventory (machine-wide, or narrowed by an
+    /// optional safe scope filter). Never carries a literal.
+    SealedOwnerInventory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_key: Option<String>,
+    },
+    /// Edit the safe description of a sealed value. Metadata-only; no literal.
+    EditSealedOwnerDescription {
+        record_id: String,
+        description: String,
+    },
+    /// List sealed action instances as safe summaries. No origins, templates,
+    /// or credentials.
+    ListSealedActions,
+    /// Create a sealed action instance. The three ids (`kind_id`, `origin_id`,
+    /// `projection_id`) are closed server-side lookups the daemon resolves to a
+    /// compiled action kind; an unknown id is rejected before any persist. The
+    /// wire carries no origin URL, path template, or projection blob. The daemon
+    /// mints the `action_id`.
+    CreateSealedAction {
+        kind_id: String,
+        project_id: String,
+        description: String,
+        origin_id: String,
+        projection_id: String,
+    },
+    /// Revise a sealed action instance's safe description (new revision).
+    ReviseSealedActionDescription {
+        action_id: String,
+        description: String,
+    },
+    /// Enable or disable a sealed action instance (new revision).
+    ReviseSealedActionEnabled {
+        action_id: String,
+        enabled: bool,
+    },
+    /// Retire a sealed action instance. `confirm` must equal `action_id`.
+    RetireSealedAction {
+        action_id: String,
+        confirm: String,
     },
 
     /// `/leaks`: machine-wide Owner list of safe leak-report metadata,
@@ -1934,6 +2010,19 @@ impl Request {
                     return Err("named secret value exceeds maximum length".to_string());
                 }
             }
+            Self::ApplySealedOwnerOperation {
+                literal: Some(literal),
+                ..
+            } => {
+                // In-process apply requests bypass the wire newtype's bounding
+                // deserialize, so re-enforce the frame bound here (fail closed)
+                // before dispatch.
+                if literal.len() > MAX_SENSITIVE_FRAME_BYTES {
+                    return Err(
+                        "sealed-owner apply literal exceeds maximum frame length".to_string()
+                    );
+                }
+            }
             Self::PutSubscriptionAck { provider_id } => {
                 if provider_id.trim().is_empty() {
                     return Err("subscription provider id must not be empty".to_string());
@@ -2306,8 +2395,16 @@ macro_rules! request_variants {
             (Request::ListPinnedMessageSeqs { .. }, "list_pinned_message_seqs");
             (Request::ListPinnedMessagesWithText { .. }, "list_pinned_messages_with_text");
             (Request::PinnedMessageState { .. }, "pinned_message_state");
-            (Request::ListSealedValues { .. }, "list_sealed_values");
-            (Request::DeleteSealedValue { .. }, "delete_sealed_value");
+            (Request::BeginSealedOwnerOperation { .. }, "begin_sealed_owner_operation");
+            (Request::ApplySealedOwnerOperation { .. }, "apply_sealed_owner_operation");
+            (Request::CancelSealedOwnerOperation { .. }, "cancel_sealed_owner_operation");
+            (Request::SealedOwnerInventory { .. }, "sealed_owner_inventory");
+            (Request::EditSealedOwnerDescription { .. }, "edit_sealed_owner_description");
+            (Request::ListSealedActions, "list_sealed_actions");
+            (Request::CreateSealedAction { .. }, "create_sealed_action");
+            (Request::ReviseSealedActionDescription { .. }, "revise_sealed_action_description");
+            (Request::ReviseSealedActionEnabled { .. }, "revise_sealed_action_enabled");
+            (Request::RetireSealedAction { .. }, "retire_sealed_action");
             (Request::ListLeakReports { .. }, "list_leak_reports");
             (Request::BeginLeakReveal { .. }, "begin_leak_reveal");
             (Request::MarkLeakRotated { .. }, "mark_leak_rotated");
@@ -2537,8 +2634,16 @@ macro_rules! command {
             (Request::ListPinnedMessageSeqs { session_id }, "list_pinned_message_seqs", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListPinnedMessagesWithText { session_id }, "list_pinned_messages_with_text", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
-            (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
-            (Request::DeleteSealedValue { session_id, value_id }, "delete_sealed_value", owner_only, field(session_id), true, local_only, none, serialized, none, "session_id:Uuid|value_id:String", [session_id: Uuid => session, value_id: String => param]);
+            (Request::BeginSealedOwnerOperation { disposition, record_id, name, description, scope_kind, scope_key }, "begin_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "disposition:String|record_id:Option<String>|name:Option<String>|description:Option<String>|scope_kind:Option<String>|scope_key:Option<String>", [disposition: String => param, record_id: Option<String> => param, name: Option<String> => param, description: Option<String> => param, scope_kind: Option<String> => param, scope_key: Option<String> => param]);
+            (Request::ApplySealedOwnerOperation { capability_id, literal }, "apply_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String|literal:Option<SensitiveWireLiteral>", [capability_id: String => param, literal: Option<SensitiveWireLiteral> => param]);
+            (Request::CancelSealedOwnerOperation { capability_id }, "cancel_sealed_owner_operation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "capability_id:String", [capability_id: String => param]);
+            (Request::SealedOwnerInventory { scope_kind, scope_key }, "sealed_owner_inventory", owner_only, none, false, read_only, none, concurrent, none, "scope_kind:Option<String>|scope_key:Option<String>", [scope_kind: Option<String> => param, scope_key: Option<String> => param]);
+            (Request::EditSealedOwnerDescription { record_id, description }, "edit_sealed_owner_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "record_id:String|description:String", [record_id: String => param, description: String => param]);
+            (Request::ListSealedActions, "list_sealed_actions", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::CreateSealedAction { kind_id, project_id, description, origin_id, projection_id }, "create_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "kind_id:String|project_id:String|description:String|origin_id:String|projection_id:String", [kind_id: String => param, project_id: String => param, description: String => param, origin_id: String => param, projection_id: String => param]);
+            (Request::ReviseSealedActionDescription { action_id, description }, "revise_sealed_action_description", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|description:String", [action_id: String => param, description: String => param]);
+            (Request::ReviseSealedActionEnabled { action_id, enabled }, "revise_sealed_action_enabled", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|enabled:bool", [action_id: String => param, enabled: bool => param]);
+            (Request::RetireSealedAction { action_id, confirm }, "retire_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|confirm:String", [action_id: String => param, confirm: String => param]);
             (Request::ListLeakReports { cursor, limit, project_root, session_id, rotation }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>|rotation:Option<LeakRotationState>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param, rotation: Option<LeakRotationState> => param]);
             (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
@@ -3013,6 +3118,13 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Uuid" => "uuid",
         "Vec<u8>" => "bytes",
         "Option<String>" => "option<string>",
+        // The sealed-owner apply literal is a redacting/zeroizing newtype. Its
+        // plaintext is deliberately EXCLUDED from FCOR canonicalization (a fixed
+        // placeholder is encoded instead — see
+        // `SensitiveWireLiteral::encode_fcor_value_v1`), so the plaintext never
+        // reaches the non-zeroizing canonical buffer. The `redacted` codec makes
+        // that redaction explicit in the cross-language schema.
+        "Option<SensitiveWireLiteral>" => "option<redacted>",
         "Option<Uuid>" => "option<uuid>",
         "Option<bool>" => "option<bool>",
         "Option<i64>" => "option<i64>",
@@ -3671,6 +3783,17 @@ mod tests {
                         | "repair_media_reservation"
                         | "get_doctor_snapshot"
                         | "docs_ask"
+                        // v10-only owner-remoted sealed-owner sensitive channel.
+                        | "begin_sealed_owner_operation"
+                        | "apply_sealed_owner_operation"
+                        | "cancel_sealed_owner_operation"
+                        | "sealed_owner_inventory"
+                        | "edit_sealed_owner_description"
+                        | "list_sealed_actions"
+                        | "create_sealed_action"
+                        | "revise_sealed_action_description"
+                        | "revise_sealed_action_enabled"
+                        | "retire_sealed_action"
                 );
                 if owner_remoted {
                     assert_ne!(declared_class, "local_only");
@@ -4147,21 +4270,213 @@ mod tests {
     }
 
     #[test]
-    fn sealed_value_rpcs_are_registered_in_both_macro_tables() {
-        let session_id = Uuid::nil();
+    fn legacy_list_delete_sealed_removed() {
+        // AC2: the legacy session-scoped sealed list/delete tags are gone from
+        // both macro tables; no command row survives for them.
+        let command_tags = crate::command!(command_tags);
+        assert!(!command_tags.contains(&"list_sealed_values"));
+        assert!(!command_tags.contains(&"delete_sealed_value"));
+        // No `Request` variant serializes to the retired tags either.
+        assert_eq!(remote_operation_class_for_tag("list_sealed_values"), None);
+        assert_eq!(remote_operation_class_for_tag("delete_sealed_value"), None);
+    }
+
+    #[test]
+    fn sealed_owner_rpcs_are_registered_in_both_macro_tables() {
+        // AC3 (registration half): every new sealed-owner tag exists in the
+        // `request_variants!` and `command!` tables.
         let requests = [
-            Request::ListSealedValues { session_id },
-            Request::DeleteSealedValue {
-                session_id,
-                value_id: "prod_token".into(),
+            Request::BeginSealedOwnerOperation {
+                disposition: "recover".into(),
+                record_id: Some("rec".into()),
+                name: None,
+                description: None,
+                scope_kind: None,
+                scope_key: None,
+            },
+            Request::ApplySealedOwnerOperation {
+                capability_id: "cap".into(),
+                literal: None,
+            },
+            Request::CancelSealedOwnerOperation {
+                capability_id: "cap".into(),
+            },
+            Request::SealedOwnerInventory {
+                scope_kind: None,
+                scope_key: None,
+            },
+            Request::EditSealedOwnerDescription {
+                record_id: "rec".into(),
+                description: "desc".into(),
+            },
+            Request::ListSealedActions,
+            Request::CreateSealedAction {
+                kind_id: "k".into(),
+                project_id: "p".into(),
+                description: "d".into(),
+                origin_id: "0".into(),
+                projection_id: "none".into(),
+            },
+            Request::ReviseSealedActionDescription {
+                action_id: "a".into(),
+                description: "d".into(),
+            },
+            Request::ReviseSealedActionEnabled {
+                action_id: "a".into(),
+                enabled: true,
+            },
+            Request::RetireSealedAction {
+                action_id: "a".into(),
+                confirm: "a".into(),
             },
         ];
         let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
-        assert_eq!(tags, ["list_sealed_values", "delete_sealed_value"]);
+        assert_eq!(
+            tags,
+            [
+                "begin_sealed_owner_operation",
+                "apply_sealed_owner_operation",
+                "cancel_sealed_owner_operation",
+                "sealed_owner_inventory",
+                "edit_sealed_owner_description",
+                "list_sealed_actions",
+                "create_sealed_action",
+                "revise_sealed_action_description",
+                "revise_sealed_action_enabled",
+                "retire_sealed_action",
+            ]
+        );
         let command_tags = crate::command!(command_tags);
         for tag in tags {
             assert!(command_tags.contains(&tag), "missing command row for {tag}");
         }
+    }
+
+    #[test]
+    fn sealed_owner_rpcs_are_owner_remoted() {
+        // AC3: every new tag reserves a remote operation (not `local_only`,
+        // not `rejected`) — reads as `ReadOnly`, mutations as
+        // `NonrepeatableMutation`.
+        for tag in ["sealed_owner_inventory", "list_sealed_actions"] {
+            assert_eq!(
+                remote_operation_class_for_tag(tag),
+                Some(RemoteOperationClass::ReadOnly),
+                "{tag} must be an owner-remoted read"
+            );
+        }
+        for tag in [
+            "begin_sealed_owner_operation",
+            "apply_sealed_owner_operation",
+            "cancel_sealed_owner_operation",
+            "edit_sealed_owner_description",
+            "create_sealed_action",
+            "revise_sealed_action_description",
+            "revise_sealed_action_enabled",
+            "retire_sealed_action",
+        ] {
+            assert_eq!(
+                remote_operation_class_for_tag(tag),
+                Some(RemoteOperationClass::NonrepeatableMutation),
+                "{tag} must be an owner-remoted serialized mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_sealed_owner_operation_carries_bounded_zeroizing_literal() {
+        // AC1 / core security property: the plaintext rides the apply request
+        // frame as the redacting, zeroizing literal, and an over-bound literal
+        // fails closed at the wire funnel.
+        let marker = "APPLY-REQUEST-PLAINTEXT-marker";
+        let request = Request::ApplySealedOwnerOperation {
+            capability_id: "cap-1".into(),
+            literal: Some(crate::SensitiveWireLiteral::new(marker.into())),
+        };
+        // Debug of the whole request never prints the plaintext.
+        assert!(!format!("{request:?}").contains(marker));
+        // The literal round-trips on the wire (owner -> daemon).
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(
+            wire.contains(marker),
+            "the apply request carries the literal"
+        );
+        let back: Request = serde_json::from_str(&wire).unwrap();
+        match back {
+            Request::ApplySealedOwnerOperation { literal, .. } => {
+                assert_eq!(literal.unwrap().as_str(), marker);
+            }
+            other => panic!("expected apply, got {other:?}"),
+        }
+        // An over-bound literal on the apply request fails closed at deserialize.
+        let oversized = "z".repeat(crate::MAX_SENSITIVE_FRAME_BYTES + 1);
+        let forged = format!(
+            "{{\"request\":\"apply_sealed_owner_operation\",\"params\":{{\"capability_id\":\"c\",\"literal\":{}}}}}",
+            serde_json::to_string(&oversized).unwrap()
+        );
+        assert!(
+            serde_json::from_str::<Request>(&forged).is_err(),
+            "an apply request literal over MAX_SENSITIVE_FRAME_BYTES must fail closed"
+        );
+    }
+
+    #[test]
+    fn apply_literal_plaintext_never_enters_fcor_canonical_params() {
+        // FINDING 1: the sealed plaintext must never be copied into the
+        // non-zeroizing FCOR canonical digest buffer. The apply's dedup identity
+        // is the single-use capability_id + CAS, so the literal is excluded from
+        // canonicalization entirely (a fixed placeholder is encoded instead).
+        let marker = "FCOR-PLAINTEXT-marker-must-not-appear";
+        let with_literal = Request::ApplySealedOwnerOperation {
+            capability_id: "cap-1".into(),
+            literal: Some(crate::SensitiveWireLiteral::new(marker.into())),
+        };
+        let params = with_literal
+            .canonical_remote_operation_params_v1()
+            .expect("apply canonicalizes");
+        // Precondition: the marker really was in the request (positive control).
+        assert!(
+            serde_json::to_string(&with_literal)
+                .unwrap()
+                .contains(marker),
+            "precondition: the apply request carries the marker on the wire"
+        );
+        // The plaintext bytes must be absent from the canonical digest buffer.
+        assert!(
+            !params
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes()),
+            "sealed plaintext must not enter the FCOR canonical params"
+        );
+        // Present/absent is still distinguished (so the Option bit is honest):
+        // an apply with a literal canonicalizes differently from a recover apply
+        // with no literal.
+        let no_literal = Request::ApplySealedOwnerOperation {
+            capability_id: "cap-1".into(),
+            literal: None,
+        };
+        assert_ne!(
+            params,
+            no_literal
+                .canonical_remote_operation_params_v1()
+                .expect("recover apply canonicalizes"),
+            "present vs absent literal must canonicalize distinctly"
+        );
+        // Two different literals under the same capability canonicalize
+        // IDENTICALLY (the literal is redacted from the key), so no length or
+        // content oracle leaks through the digest.
+        let other_literal = Request::ApplySealedOwnerOperation {
+            capability_id: "cap-1".into(),
+            literal: Some(crate::SensitiveWireLiteral::new(
+                "a-different-secret".into(),
+            )),
+        };
+        assert_eq!(
+            params,
+            other_literal
+                .canonical_remote_operation_params_v1()
+                .expect("apply canonicalizes"),
+            "the literal content must not influence the FCOR key"
+        );
     }
 
     #[test]

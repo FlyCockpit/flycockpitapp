@@ -123,6 +123,23 @@ impl HttpsOrigin {
         {
             bail!("origin host must be lowercase alphanumeric with '.' or '-'");
         }
+        // Reject obviously non-public hostnames so an allowlisted origin cannot
+        // name loopback or an internal service directly. Origins are Owner-authored
+        // from a closed catalog, so this is defense in depth; a *public* name that
+        // resolves to a private address (DNS rebinding to a metadata service) is a
+        // residual that resolve-and-pin would close — a heavier follow-up.
+        if host == "localhost" {
+            bail!("origin host must not be localhost");
+        }
+        if !host.contains('.') {
+            bail!("origin host must be a fully-qualified domain name");
+        }
+        if [".local", ".internal", ".localhost"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        {
+            bail!("origin host must not use a private or internal TLD");
+        }
         Ok(Self { host, port })
     }
 
@@ -799,6 +816,8 @@ fn snapshot_from_row(
         retired_at_ms: row.retired_at_ms,
     })
 }
+
+pub mod executor;
 
 #[cfg(test)]
 mod tests;

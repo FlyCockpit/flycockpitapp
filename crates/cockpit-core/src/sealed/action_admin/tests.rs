@@ -72,6 +72,12 @@ fn https_origin_validates_and_rejects() {
     assert!(HttpsOrigin::parse("https://api.example.com?q=1").is_err());
     assert!(HttpsOrigin::parse("https://api.example.com#frag").is_err());
     assert!(HttpsOrigin::parse("https://API.EXAMPLE.COM").is_err());
+    // Non-public / internal hosts are rejected (defense in depth against an
+    // allowlisted origin naming loopback or an internal service directly).
+    assert!(HttpsOrigin::parse("https://localhost").is_err());
+    assert!(HttpsOrigin::parse("https://internal").is_err()); // single-label
+    assert!(HttpsOrigin::parse("https://svc.local").is_err());
+    assert!(HttpsOrigin::parse("https://metadata.internal").is_err());
 }
 
 #[test]

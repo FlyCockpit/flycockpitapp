@@ -448,6 +448,7 @@ mod tests {
             "list_scheduled_jobs",
             "list_sessions",
             "read_bulk_transfer_chunk",
+            "read_redacted_export_chunk",
             "read_client_submission_receipt",
             "read_history_page",
             "read_session_messages",

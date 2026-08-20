@@ -73,19 +73,28 @@ pub enum RemoteBulkMimeClass {
     ImageSet = 2,
     /// A session archive (import/export ZIP).
     Archive = 3,
-    /// Exported session data (transcript JSON or debug bundle).
+    /// Raw, unredacted exported session data. This is the explicit local
+    /// `cockpit export --include-sensitive` archive: it may carry raw secrets
+    /// and is served only over the owner-local generic bulk reader, never a
+    /// remoted reader.
     Export = 4,
     /// Any other opaque attachment.
     Opaque = 5,
+    /// Permanently-redacted exported session data (transcript JSON or debug
+    /// bundle). This is the ONLY export kind the owner-remoted type-bound
+    /// [`crate`] redacted-export reader will serve; a raw `Export` transfer is
+    /// refused by that reader.
+    RedactedExport = 6,
 }
 
 impl RemoteBulkMimeClass {
-    pub const ALL: [RemoteBulkMimeClass; 5] = [
+    pub const ALL: [RemoteBulkMimeClass; 6] = [
         RemoteBulkMimeClass::Image,
         RemoteBulkMimeClass::ImageSet,
         RemoteBulkMimeClass::Archive,
         RemoteBulkMimeClass::Export,
         RemoteBulkMimeClass::Opaque,
+        RemoteBulkMimeClass::RedactedExport,
     ];
 
     pub const fn code(self) -> u8 {
@@ -99,6 +108,7 @@ impl RemoteBulkMimeClass {
             3 => Some(RemoteBulkMimeClass::Archive),
             4 => Some(RemoteBulkMimeClass::Export),
             5 => Some(RemoteBulkMimeClass::Opaque),
+            6 => Some(RemoteBulkMimeClass::RedactedExport),
             _ => None,
         }
     }
@@ -110,6 +120,7 @@ impl RemoteBulkMimeClass {
             RemoteBulkMimeClass::Archive => "archive",
             RemoteBulkMimeClass::Export => "export",
             RemoteBulkMimeClass::Opaque => "opaque",
+            RemoteBulkMimeClass::RedactedExport => "redacted_export",
         }
     }
 
@@ -125,7 +136,8 @@ impl RemoteBulkMimeClass {
             RemoteBulkMimeClass::ImageSet => crate::MAX_TOTAL_IMAGE_BYTES as u64,
             RemoteBulkMimeClass::Archive
             | RemoteBulkMimeClass::Export
-            | RemoteBulkMimeClass::Opaque => MAX_TRANSFER_BYTES,
+            | RemoteBulkMimeClass::Opaque
+            | RemoteBulkMimeClass::RedactedExport => MAX_TRANSFER_BYTES,
         }
     }
 
@@ -1149,7 +1161,7 @@ mod tests {
                 Some(class)
             );
         }
-        for bad in [0u8, 6, 255] {
+        for bad in [0u8, 7, 255] {
             assert!(RemoteBulkMimeClass::from_code(bad).is_none());
         }
         // A begin whose maxTotalLength disagrees with its class fails.

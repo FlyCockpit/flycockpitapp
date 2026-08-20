@@ -861,6 +861,7 @@ export const REMOTE_BULK_MIME_CLASSES = [
   "archive",
   "export",
   "opaque",
+  "redacted_export",
 ] as const;
 export type RemoteBulkMimeClass = (typeof REMOTE_BULK_MIME_CLASSES)[number];
 
@@ -870,6 +871,7 @@ export const REMOTE_BULK_MIME_CLASS_CODES: Readonly<Record<RemoteBulkMimeClass, 
   archive: 3,
   export: 4,
   opaque: 5,
+  redacted_export: 6,
 };
 
 /**
@@ -886,6 +888,7 @@ export const REMOTE_BULK_MIME_CLASS_MAX_TOTAL_LENGTH: Readonly<
   archive: MAX_TRANSFER_BYTES,
   export: MAX_TRANSFER_BYTES,
   opaque: MAX_TRANSFER_BYTES,
+  redacted_export: MAX_TRANSFER_BYTES,
 };
 
 export const REMOTE_BULK_ABORT_REASONS = [

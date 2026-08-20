@@ -688,19 +688,33 @@ pub enum Request {
         session_id: Uuid,
     },
 
-    /// Return export-ready session data while leaving user-path file writing
-    /// to the client. Every RPC export is a permanently redacted, portable
-    /// artifact: this request carries no raw/bypass field, and the daemon
-    /// always assembles it through the enforced redaction path, so
+    /// Assemble export-ready session data into a staged bulk transfer and
+    /// return its reference; the client streams the bytes back with a chunk
+    /// reader and writes the user-path file itself.
+    ///
+    /// The default (`include_sensitive = false`) is a permanently redacted,
+    /// portable artifact assembled through the enforced redaction path, so
     /// `redact.enabled = false` and provider trust never relax export
-    /// redaction. The single unredacted export is the explicit local
-    /// `cockpit export --include-sensitive` CLI flag, which never travels over
-    /// this RPC.
+    /// redaction. It is staged as
+    /// [`crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport`]
+    /// and served over the owner-remoted type-bound
+    /// [`Request::ReadRedactedExportChunk`] reader.
+    ///
+    /// `include_sensitive = true` is the single UNREDACTED export — the
+    /// explicit local `cockpit export --include-sensitive` opt-in. It is
+    /// owner-LOCAL only: the daemon rejects it for any remoted caller (a
+    /// remote-operation dispatch), stages the raw bytes as the raw `Export`
+    /// class, and serves them ONLY over the owner-local generic
+    /// [`Request::ReadBulkTransferChunk`] reader — never a remoted reader.
     ExportSessionData {
         session_id: Uuid,
         kind: ExportSessionKind,
         #[serde(default)]
         include_generated_artifacts: bool,
+        /// v10-only: request the raw, unredacted archive. Owner-LOCAL only;
+        /// a remoted caller is rejected. Absent/`false` on v9 wires.
+        #[serde(default)]
+        include_sensitive: bool,
     },
 
     /// Import a ZIP archive through the daemon-owned database writer.
@@ -726,8 +740,24 @@ pub enum Request {
         data_base64: String,
     },
 
-    /// Pull one chunk of a staged bulk transfer.
+    /// Pull one chunk of a staged bulk transfer. Owner-LOCAL only (the generic
+    /// reader): a remoted caller is rejected, so raw `Export` bytes never leave
+    /// the host over this reader.
     ReadBulkTransferChunk {
+        transfer_id: crate::remote_protocol_id::RemoteTransferId,
+        chunk_index: u32,
+    },
+
+    /// v10-only owner-remoted type-bound reader for a REDACTED export transfer.
+    ///
+    /// Pull one chunk of a staged transfer, admitting it ONLY when its staged
+    /// kind is
+    /// [`crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport`].
+    /// A raw `Export` transfer id (or any other bulk kind) is rejected with no
+    /// bytes — this is what lets a remoted owner download a redacted export
+    /// while the raw archive stays owner-local behind
+    /// [`Request::ReadBulkTransferChunk`].
+    ReadRedactedExportChunk {
         transfer_id: crate::remote_protocol_id::RemoteTransferId,
         chunk_index: u32,
     },
@@ -2428,6 +2458,7 @@ macro_rules! request_variants {
             (Request::ImportSessionArchive { .. }, "import_session_archive");
             (Request::WriteBulkTransferChunk { .. }, "write_bulk_transfer_chunk");
             (Request::ReadBulkTransferChunk { .. }, "read_bulk_transfer_chunk");
+            (Request::ReadRedactedExportChunk { .. }, "read_redacted_export_chunk");
             (Request::Curator { .. }, "curator");
             (Request::CancelTurn, "cancel_turn");
             (Request::FsList { .. }, "fs_list");
@@ -2663,10 +2694,11 @@ macro_rules! command {
             (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
-            (Request::ExportSessionData { session_id, kind, include_generated_artifacts }, "export_session_data", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param]);
+            (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
             (Request::ImportSessionArchive { transfer, as_new }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, as_new: bool => param]);
             (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", owner_only, none, true, local_only, none, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
             (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, local_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
+            (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
@@ -3766,6 +3798,12 @@ mod tests {
                         | "import_session_archive"
                         | "curator"
                         | "stats_rollup"
+                        // v10-only owner-remoted redacted session export: the
+                        // redacted assemble and its type-bound reader are
+                        // owner-remoted `read_only`; the raw `--include-sensitive`
+                        // assemble and the generic bulk reader stay `local_only`.
+                        | "export_session_data"
+                        | "read_redacted_export_chunk"
                         // v10-only owner-remoted CLI-surface RPCs.
                         | "list_packages"
                         | "add_package"
@@ -4188,6 +4226,38 @@ mod tests {
         assert_eq!(
             remote_operation_class_for_tag("upsert_assistant"),
             Some(RemoteOperationClass::NonrepeatableMutation)
+        );
+    }
+
+    #[test]
+    fn export_session_data_is_owner_remoted() {
+        // AC4: the redacted session export is reclassified from `local_only` to
+        // owner-remoted `read_only` — it reserves a remote operation so a remoted
+        // owner can download it. The new type-bound redacted reader is likewise
+        // owner-remoted `read_only`.
+        assert_eq!(
+            remote_operation_class_for_tag("export_session_data"),
+            Some(RemoteOperationClass::ReadOnly)
+        );
+        assert_eq!(
+            remote_operation_class_for_tag("read_redacted_export_chunk"),
+            Some(RemoteOperationClass::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn raw_export_generic_reader_stays_local_only() {
+        // AC5/AC8: the generic bulk reader that serves the raw `--include-sensitive`
+        // archive stays `local_only` (no remote operation class), so a remote
+        // principal is refused it at admission — the sanctioned owner-local carve
+        // out. The write side is likewise local-only.
+        assert_eq!(
+            remote_operation_class_for_tag("read_bulk_transfer_chunk"),
+            None
+        );
+        assert_eq!(
+            remote_operation_class_for_tag("write_bulk_transfer_chunk"),
+            None
         );
     }
 

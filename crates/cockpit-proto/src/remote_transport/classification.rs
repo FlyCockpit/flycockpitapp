@@ -491,6 +491,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "read_redacted_export_chunk",
+        RemoteMessageClass::BulkChunk,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "curator",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2580,7 +2585,7 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 199);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 200);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 142);
         assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }

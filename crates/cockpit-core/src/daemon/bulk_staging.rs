@@ -78,6 +78,10 @@ pub enum BulkStagingError {
     ChunkTooLarge,
     #[error("bulk transfer exceeds its class limit")]
     ClassLimit,
+    #[error("bulk transfer is not of the required kind")]
+    WrongKind,
+    #[error("bulk transfer id is already staged")]
+    DuplicateTransfer,
 }
 
 #[derive(Debug)]
@@ -219,6 +223,12 @@ pub fn stage(
     let now = now_ms();
     let mut guard = store().lock().expect("bulk staging poisoned");
     guard.expire(now);
+    // A staged id is immutable identity: refuse to overwrite a live transfer.
+    // Silently replacing it would let a redacted-export id be restaged as a raw
+    // `Export` (or vice versa) under a reader that already verified its kind.
+    if guard.transfers.contains_key(&transfer_id_bytes) {
+        return Err(BulkStagingError::DuplicateTransfer);
+    }
     if guard.transfers.len() >= MAX_STAGED_TRANSFERS {
         return Err(BulkStagingError::CapacityExceeded);
     }
@@ -368,6 +378,55 @@ pub fn read_chunk(
     Ok((chunk, last))
 }
 
+/// Serve one chunk of a staged transfer, but ONLY when its staged MIME class is
+/// exactly `expected`. This is the type-bound read primitive: the redacted-export
+/// remoted reader admits a transfer solely because it was staged as
+/// [`RemoteBulkMimeClass::RedactedExport`], never merely "not raw". A transfer of
+/// any other kind (a raw `Export`, an `Archive`, an image, …) is rejected with
+/// [`BulkStagingError::WrongKind`] and NO bytes are returned or removed.
+///
+/// The kind check, chunk extraction, and terminal removal all happen under ONE
+/// lock acquisition: dropping the lock between the kind check and the read would
+/// let a concurrent restage swap the id to a raw `Export` between the two, so the
+/// redacted reader could return raw bytes for an id it just verified as redacted.
+/// Holding the lock across the whole operation closes that window; combined with
+/// [`stage`] refusing to overwrite a live id, a staged redacted-export id can
+/// never serve raw bytes.
+pub fn read_chunk_of_kind(
+    transfer_id_bytes: [u8; 16],
+    chunk_index: u32,
+    expected: RemoteBulkMimeClass,
+) -> Result<(Vec<u8>, bool), BulkStagingError> {
+    let now = now_ms();
+    let mut guard = store().lock().expect("bulk staging poisoned");
+    guard.expire(now);
+    let entry = guard
+        .transfers
+        .get_mut(&transfer_id_bytes)
+        .ok_or(BulkStagingError::UnknownTransfer)?;
+    // Kind gate first: a non-`expected` transfer is refused before any byte is
+    // read, and the entry is left untouched (never removed).
+    if entry.mime_class != expected {
+        return Err(BulkStagingError::WrongKind);
+    }
+    if !entry.complete {
+        return Err(BulkStagingError::Incomplete);
+    }
+    let total_chunks = chunk_count(entry.total_length);
+    if chunk_index >= total_chunks {
+        return Err(BulkStagingError::ChunkIndexGap);
+    }
+    entry.touched_ms = now;
+    let start = chunk_index as usize * STAGED_CHUNK_BYTES;
+    let end = (start + STAGED_CHUNK_BYTES).min(entry.bytes.len());
+    let chunk = entry.bytes[start..end].to_vec();
+    let last = chunk_index + 1 == total_chunks;
+    if last {
+        guard.remove(&transfer_id_bytes);
+    }
+    Ok((chunk, last))
+}
+
 /// Take a completed transfer's bytes, verifying length and digest first.
 pub fn take(reference: &RemoteBulkTransferRef) -> Result<Vec<u8>, BulkStagingError> {
     let key = *reference.transfer_id.as_bytes();
@@ -448,6 +507,41 @@ mod tests {
             take(&reference),
             Err(BulkStagingError::UnknownTransfer)
         ));
+    }
+
+    /// A staged redacted-export id can never be swapped for raw bytes under the
+    /// redacted reader: restaging the same id (to raw `Export`) is refused, and
+    /// the kind-checked read stays atomic so no raw bytes ever ride the reader.
+    #[test]
+    fn redacted_reader_never_serves_raw_bytes_after_restage_attempt() {
+        let redacted = b"redacted export payload".to_vec();
+        let raw = b"RAW SECRET payload sk-XXXX".to_vec();
+        let key = id(70);
+        stage(&redacted, RemoteBulkMimeClass::RedactedExport, key).unwrap();
+
+        // Restaging the same id to raw is rejected, not silently applied.
+        assert!(matches!(
+            stage(&raw, RemoteBulkMimeClass::Export, key),
+            Err(BulkStagingError::DuplicateTransfer)
+        ));
+
+        // The redacted reader still serves the ORIGINAL redacted bytes.
+        let (chunk, last) =
+            read_chunk_of_kind(key, 0, RemoteBulkMimeClass::RedactedExport).unwrap();
+        assert!(last);
+        assert_eq!(chunk, redacted);
+        assert_ne!(chunk, raw);
+
+        // A raw-kinded read of a redacted id is refused (and vice versa).
+        let other = id(71);
+        stage(&raw, RemoteBulkMimeClass::Export, other).unwrap();
+        assert!(matches!(
+            read_chunk_of_kind(other, 0, RemoteBulkMimeClass::RedactedExport),
+            Err(BulkStagingError::WrongKind)
+        ));
+        // Untouched: the raw transfer is still readable by the generic reader.
+        let (raw_chunk, _) = read_chunk(other, 0).unwrap();
+        assert_eq!(raw_chunk, raw);
     }
 
     /// Repeated full exports must not accumulate. Before the terminal release,

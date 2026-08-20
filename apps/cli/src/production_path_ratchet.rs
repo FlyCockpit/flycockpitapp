@@ -16,13 +16,13 @@ const FORBIDDEN: &[&str] = &[
 ];
 
 /// Cited production sites. Counts are after `#[cfg(test)]` modules are stripped.
-const ALLOWED: &[(&str, &str, usize)] = &[
-    // `ask` now drives the owner-remoted `DocsAsk` RPC (`cli-ask-via-daemon`),
-    // so it opens no SQLite/vault and is off this list. `export` is converted by
-    // the export rewrite; until it lands the CLI allow-list is NOT empty.
-    ("commands/export.rs", "Db::open_default", 1),
-    ("commands/export.rs", "vault_for_db", 1),
-];
+///
+/// This list is now empty. `ask` drives the owner-remoted `DocsAsk` RPC (see
+/// `cli-ask-via-daemon`) and `export` was converted to `ensure_persistent_daemon`
+/// plus the assemble/reader RPCs (see `export-redaction-journal-backed-and-rpc-custody`),
+/// so no CLI production file opens SQLite or a vault. Re-adding any entry here is a
+/// regression; fix the offending command to route through the daemon instead.
+const ALLOWED: &[(&str, &str, usize)] = &[];
 
 fn repo_src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")

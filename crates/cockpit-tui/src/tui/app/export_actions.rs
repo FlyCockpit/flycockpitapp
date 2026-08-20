@@ -103,6 +103,9 @@ impl App {
             session_id,
             kind,
             include_generated_artifacts: false,
+            // The TUI export is invariantly redacted; the raw opt-in is the
+            // local `cockpit export --include-sensitive` CLI path only.
+            include_sensitive: false,
         };
         self.async_actions.start_export(
             AsyncActionKind::Blocking(action),
@@ -340,7 +343,10 @@ async fn pull_bulk_transfer(
         let response = tokio::select! {
             biased;
             () = shutdown.cancelled() => return Err(format!("{command}: export cancelled by shutdown")),
-            response = attached_request.request(Request::ReadBulkTransferChunk {
+            // The TUI export is invariantly redacted, so its transfer is the
+            // type-bound `RedactedExport` kind: read it through the type-bound
+            // reader (not the generic bulk reader) for custody consistency.
+            response = attached_request.request(Request::ReadRedactedExportChunk {
                 transfer_id: transfer.transfer_id,
                 chunk_index,
             }) => response,
@@ -464,7 +470,7 @@ mod tests {
             transfer_id,
             bytes.len() as u64,
             digest_of(bytes),
-            proto_bulk::RemoteBulkMimeClass::Export,
+            proto_bulk::RemoteBulkMimeClass::RedactedExport,
         )
         .unwrap()
     }
@@ -491,8 +497,8 @@ mod tests {
     /// Answer the follow-up bulk pull with `bytes` as a single final chunk.
     async fn serve_bulk_chunk(rx: &mut mpsc::Receiver<AttachedRequest>, bytes: &[u8]) {
         let request = rx.recv().await.unwrap();
-        let Request::ReadBulkTransferChunk { chunk_index, .. } = request.request else {
-            panic!("expected a ReadBulkTransferChunk pull");
+        let Request::ReadRedactedExportChunk { chunk_index, .. } = request.request else {
+            panic!("expected a ReadRedactedExportChunk pull");
         };
         assert_eq!(chunk_index, 0);
         let _ = request.response_tx.send(Ok(Response::BulkTransferChunk {
@@ -656,6 +662,7 @@ mod tests {
                 session_id,
                 kind: ExportSessionKind::TranscriptJson,
                 include_generated_artifacts: false,
+                include_sensitive: false,
             },
             ExportSessionKind::TranscriptJson,
             "x".to_string(),

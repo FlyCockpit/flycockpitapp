@@ -2872,6 +2872,13 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
                 | "docs_ask"
+                // The reclassified session export now returns the v10-only
+                // `redacted_export` bulk kind and requires the v10-only
+                // `ReadRedactedExportChunk` reader, so the WHOLE tag is v10: a v9
+                // peer is refused rather than handed an enum value it cannot
+                // decode / a transfer it cannot read.
+                | "export_session_data"
+                | "read_redacted_export_chunk"
                 | "begin_sealed_owner_operation"
                 | "apply_sealed_owner_operation"
                 | "cancel_sealed_owner_operation"
@@ -2945,7 +2952,11 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "sealed_actions"
                 | "sealed_action_created"
                 | "sealed_action_revised"
-                | "sealed_action_retired" => 10,
+                | "sealed_action_retired"
+                // The export response carries the v10-only `redacted_export`
+                // bulk kind; refuse to hand a v9 peer a transfer reference it
+                // cannot read back through the v10-only reader.
+                | "export_session_data" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 response tags: the base
@@ -6105,6 +6116,78 @@ mod tests {
             })
             .0,
             10
+        );
+    }
+
+    #[test]
+    fn redacted_export_request_response_and_reader_require_v10() {
+        // #3: even the DEFAULT (redacted) export request is v10-only now — it
+        // returns the v10-only `redacted_export` bulk kind and requires the
+        // v10-only reader — so a v9 peer is refused rather than handed an
+        // undecodable enum value / an unreadable transfer.
+        let default_export = Request::ExportSessionData {
+            session_id: Uuid::nil(),
+            kind: ExportSessionKind::DebugBundle,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        };
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                operation: None,
+                request: default_export,
+            })
+            .0,
+            10,
+            "the default redacted export request must be v10-only"
+        );
+
+        let reader = Request::ReadRedactedExportChunk {
+            transfer_id: crate::remote_protocol_id::tag_protocol_id_bytes::<
+                crate::remote_protocol_id::kind::Transfer,
+            >([3u8; 16])
+            .unwrap(),
+            chunk_index: 0,
+        };
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                operation: None,
+                request: reader,
+            })
+            .0,
+            10
+        );
+
+        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
+            crate::remote_protocol_id::kind::Transfer,
+        >([7u8; 16])
+        .unwrap();
+        let response = Response::ExportSessionData {
+            data: ExportSessionData {
+                session_id: Uuid::nil(),
+                kind: ExportSessionKind::TranscriptJson,
+                filename_extension: "json".into(),
+                mime: "application/json".into(),
+                transfer: crate::remote_transport::bulk::RemoteBulkTransferRef::new(
+                    transfer_id,
+                    5,
+                    [0u8; 32],
+                    crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
+                )
+                .unwrap(),
+                session_count: Some(1),
+                redacted: true,
+            },
+        };
+        assert_eq!(
+            body_required_protocol_version(&Body::Response {
+                id: Uuid::nil(),
+                response: Box::new(response),
+            })
+            .0,
+            10,
+            "the export response carrying redacted_export must be v10-only"
         );
     }
 

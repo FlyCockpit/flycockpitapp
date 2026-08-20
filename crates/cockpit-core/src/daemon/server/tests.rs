@@ -4514,6 +4514,7 @@ async fn new_session_state_requests_are_classified() {
                 session_id,
                 kind: proto::ExportSessionKind::TranscriptJson,
                 include_generated_artifacts: false,
+                include_sensitive: false,
             },
             "export_session_data",
             Some(session_id),
@@ -4581,6 +4582,7 @@ async fn new_session_state_requests_enforce_authorization() {
             session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
             include_generated_artifacts: false,
+            include_sensitive: false,
         },
         Request::AutoTitle { session_id },
         Request::Curator {
@@ -6103,6 +6105,7 @@ async fn export_rpc_returns_redacted_data() {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
             include_generated_artifacts: false,
+            include_sensitive: false,
         },
         &mut state,
         &ctx,
@@ -6126,6 +6129,7 @@ async fn export_rpc_returns_redacted_data() {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::DebugBundle,
             include_generated_artifacts: false,
+            include_sensitive: false,
         },
         &mut state,
         &ctx,
@@ -6143,6 +6147,513 @@ async fn export_rpc_returns_redacted_data() {
         crate::daemon::bulk_staging::take(&data.transfer).expect("staged bundle bytes");
     assert_eq!(data.byte_len(), bundle_bytes.len() as u64);
     assert!(data.redacted);
+}
+
+#[tokio::test]
+async fn daemon_export_rpc_has_no_raw_bypass() {
+    // AC1/AC5: the ONLY principal that reaches the export handler is the local
+    // owner — a real `ClientPrincipal::Remote` is rejected at `owner_only`
+    // authz (proved by `export_and_redacted_reader_reject_a_real_remote_principal`),
+    // so raw output can never leave the host over the wire. For the local owner
+    // the `include_sensitive` flag selects raw-vs-redacted at the single funnel:
+    //   include_sensitive = true  -> unredacted archive (redacted: false)
+    //   include_sensitive = false -> redacted archive   (redacted: true)
+    // Both are dispatched through the real local-owner path (no remote-operation
+    // context — the state the local unix-socket owner actually produces).
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let raw = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::DebugBundle,
+            include_generated_artifacts: false,
+            include_sensitive: true,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("local owner raw export succeeds");
+    let Response::ExportSessionData { data } = raw else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(
+        !data.redacted,
+        "include_sensitive yields the unredacted archive for the local owner"
+    );
+    crate::daemon::bulk_staging::discard(*data.transfer.transfer_id.as_bytes());
+
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let redacted = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::DebugBundle,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("redacted export succeeds");
+    let Response::ExportSessionData { data } = redacted else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(data.redacted, "the default export is redacted");
+    crate::daemon::bulk_staging::discard(*data.transfer.transfer_id.as_bytes());
+}
+
+#[tokio::test]
+async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
+    use base64::Engine as _;
+    // AC7 (reachable path): the local owner — the real caller the export surface
+    // authorizes — assembles the redacted export and reads the COMPLETE archive
+    // back through the type-bound `ReadRedactedExportChunk` reader. This proves
+    // the redacted assemble + type-bound custody path works end to end for the
+    // principal that can actually reach it (a real remote is rejected at authz;
+    // see `export_and_redacted_reader_reject_a_real_remote_principal`).
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+    ctx.db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({"text": "an ordinary transcript line"}),
+        )
+        .await
+        .unwrap();
+
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let assembled = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("redacted assemble");
+    let Response::ExportSessionData { data } = assembled else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(data.redacted);
+    let expected_len = data.transfer.total_length_value();
+    let transfer_id = data.transfer.transfer_id;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk_index = 0u32;
+    loop {
+        let state = owner_state();
+        let shared = state.shared_snapshot();
+        let chunk_resp = handle_concurrent_request_with_remote_operation(
+            Request::ReadRedactedExportChunk {
+                transfer_id,
+                chunk_index,
+            },
+            shared,
+            ctx.clone(),
+            None,
+        )
+        .await
+        .expect("redacted chunk read");
+        let Response::BulkTransferChunk {
+            chunk_index: got,
+            data_base64,
+            last,
+        } = chunk_resp
+        else {
+            panic!("expected BulkTransferChunk response");
+        };
+        assert_eq!(got, chunk_index);
+        bytes.extend_from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(data_base64)
+                .unwrap(),
+        );
+        if last {
+            break;
+        }
+        chunk_index += 1;
+    }
+    assert_eq!(
+        bytes.len() as u64,
+        expected_len,
+        "the owner read the complete redacted archive"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value.to_string().contains("an ordinary transcript line"));
+}
+
+#[tokio::test]
+async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
+    // AC6/AC8: even for the LOCAL owner, the type-bound redacted reader refuses a
+    // raw `Export` transfer (wrong kind, no bytes) — the reader is bound to the
+    // RedactedExport kind, not "not raw". And a genuine `ClientPrincipal::Remote`
+    // is denied the generic owner-local reader at admission, so raw bytes never
+    // cross the boundary to a remote.
+    let ctx = test_ctx();
+    let raw_id = [0x71u8; 16];
+    let transfer = crate::daemon::bulk_staging::stage(
+        b"raw archive with s3cr3t",
+        proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        raw_id,
+    )
+    .expect("stage raw export");
+
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let refused = handle_concurrent_request_with_remote_operation(
+        Request::ReadRedactedExportChunk {
+            transfer_id: transfer.transfer_id,
+            chunk_index: 0,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect_err("redacted reader must reject a raw export id");
+    assert_eq!(refused.code, ErrorCode::BadRequest);
+
+    // AC6/AC8: a remote principal is denied the generic local-only reader before
+    // dispatch — no chunk bytes ever cross the boundary.
+    let denied = admit_remote_operation(
+        &remote_principal(),
+        Uuid::new_v4(),
+        None,
+        &Request::ReadBulkTransferChunk {
+            transfer_id: transfer.transfer_id,
+            chunk_index: 0,
+        },
+    );
+    assert!(
+        denied.is_err(),
+        "a remote principal must be denied the local-only generic reader"
+    );
+
+    // The raw bytes are untouched and still served to the local owner.
+    let (chunk, last) =
+        crate::daemon::bulk_staging::read_chunk(raw_id, 0).expect("raw still staged");
+    assert_eq!(chunk, b"raw archive with s3cr3t");
+    assert!(last);
+}
+
+#[tokio::test]
+async fn redacted_export_reader_rejects_non_export_transfer() {
+    // AC8b: the reader checks the staged transfer's redacted-export KIND, not
+    // merely "not raw" — a non-export bulk transfer (an import Archive) is
+    // rejected with no bytes and left untouched.
+    let ctx = test_ctx();
+    let archive_id = [0x72u8; 16];
+    let transfer = crate::daemon::bulk_staging::stage(
+        b"PK\x03\x04 import archive",
+        proto::remote_transport::bulk::RemoteBulkMimeClass::Archive,
+        archive_id,
+    )
+    .expect("stage archive");
+
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let refused = handle_concurrent_request_with_remote_operation(
+        Request::ReadRedactedExportChunk {
+            transfer_id: transfer.transfer_id,
+            chunk_index: 0,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect_err("redacted reader must reject a non-export transfer");
+    assert_eq!(refused.code, ErrorCode::BadRequest);
+
+    let (chunk, _) =
+        crate::daemon::bulk_staging::read_chunk(archive_id, 0).expect("archive still staged");
+    assert_eq!(chunk, b"PK\x03\x04 import archive");
+}
+
+#[tokio::test]
+async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() {
+    // AC9: a unique planted secret appears verbatim in the raw local archive and
+    // is absent from the redacted archive.
+    const SECRET: &str = "sk-planted-UNIQUE-a1b2c3d4e5f6";
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+
+    // Persist a session redaction inventory that classifies the planted secret,
+    // without mutating the process environment (a named-secret literal is added
+    // to the table verbatim and folded into the export redactor).
+    let table = crate::redact::RedactionTable::build_with_env_and_secrets(
+        &crate::config::extended::RedactConfig::default(),
+        std::path::Path::new("/repo"),
+        &std::collections::HashMap::new(),
+        [("PLANTED_API_KEY".to_string(), SECRET.to_string())],
+    )
+    .unwrap();
+    ctx.db
+        .set_session_redaction_table_json(
+            session.session_id,
+            Some(table.to_persisted_json().unwrap()),
+        )
+        .await
+        .unwrap();
+    ctx.db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": format!("here is the key {SECRET}") }),
+        )
+        .await
+        .unwrap();
+
+    // RAW local export carries the secret verbatim (precondition + raw behavior).
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let raw = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: true,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("raw export");
+    let Response::ExportSessionData { data } = raw else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(!data.redacted);
+    let raw_bytes = crate::daemon::bulk_staging::take(&data.transfer).expect("raw staged bytes");
+    let raw_text = String::from_utf8_lossy(&raw_bytes);
+    assert!(
+        raw_text.contains(SECRET),
+        "precondition: the raw archive really carries the planted secret"
+    );
+
+    // REDACTED export omits the secret.
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let redacted = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("redacted export");
+    let Response::ExportSessionData { data } = redacted else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(data.redacted);
+    let redacted_bytes =
+        crate::daemon::bulk_staging::take(&data.transfer).expect("redacted staged bytes");
+    let redacted_text = String::from_utf8_lossy(&redacted_bytes);
+    assert!(
+        !redacted_text.contains(SECRET),
+        "the redacted archive must not carry the planted secret"
+    );
+}
+
+#[tokio::test]
+async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
+    // AC2 / journal-fold: a disk-derived (.env) secret that was journaled into
+    // `protected_redaction_history` at record time but has since been ROTATED /
+    // DELETED — so it is gone from the live scan AND was never in the session's
+    // persisted redaction table — must STILL be scrubbed from the redacted
+    // export, recovered only from the encrypted journal. A deferred (journal
+    // less) redactor would leak it, so this test fails against that behavior.
+    const SECRET: &str = "sk-rotated-DISK-only-in-journal-42x";
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+
+    // Journal the secret. Deliberately DO NOT set the session's persisted
+    // redaction table and DO NOT plant it in any env, so the encrypted journal
+    // is the ONLY inventory that still holds it.
+    let resolver = ctx.redaction_key_resolver().unwrap();
+    let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+        &ctx.db,
+        resolver.as_ref(),
+    );
+    let literal = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+        SECRET.to_string(),
+        crate::redact::protected_redaction_history::RedactionHistorySource::Environment,
+        None,
+        None,
+    )
+    .unwrap();
+    history
+        .append_and_attach(&session.session_id.to_string(), literal, Vec::new())
+        .await
+        .unwrap();
+
+    // The secret is present in a durable artifact body.
+    ctx.db
+        .insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": format!("leaked {SECRET}") }),
+        )
+        .await
+        .unwrap();
+
+    // RAW export carries it verbatim (precondition + raw behavior).
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let raw = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: true,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("raw export");
+    let Response::ExportSessionData { data } = raw else {
+        panic!("expected ExportSessionData response");
+    };
+    let raw_bytes = crate::daemon::bulk_staging::take(&data.transfer).expect("raw staged bytes");
+    assert!(
+        String::from_utf8_lossy(&raw_bytes).contains(SECRET),
+        "precondition: the raw archive carries the journaled secret"
+    );
+
+    // REDACTED export omits it — recovered ONLY from the folded journal.
+    let state = owner_state();
+    let shared = state.shared_snapshot();
+    let redacted = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect("redacted export");
+    let Response::ExportSessionData { data } = redacted else {
+        panic!("expected ExportSessionData response");
+    };
+    assert!(data.redacted);
+    let redacted_bytes =
+        crate::daemon::bulk_staging::take(&data.transfer).expect("redacted staged bytes");
+    assert!(
+        !String::from_utf8_lossy(&redacted_bytes).contains(SECRET),
+        "the redacted archive must not carry the rotated journal secret"
+    );
+}
+
+#[tokio::test]
+async fn export_and_redacted_reader_reject_a_real_remote_principal() {
+    // #5 / honest authz model: a GENUINE `ClientPrincipal::Remote` (the only
+    // principal a real remote envelope can produce — a remote connection never
+    // becomes `Owner`) is rejected for BOTH the export assemble and the
+    // type-bound redacted reader, because both are owner-authorized. The
+    // redacted export is "owner-remoted" only in the ledger-classification sense
+    // (it reserves a remote operation, unlike the raw/generic reader), exactly
+    // like the v10 sealed-owner owner-remoted channel. Raw stays owner-local.
+    let ctx = test_ctx();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
+    );
+    let shared = state.shared_snapshot();
+    let export_err = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::TranscriptJson,
+            include_generated_artifacts: false,
+            include_sensitive: false,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect_err("a real remote principal cannot assemble the export");
+    assert_eq!(export_err.code, ErrorCode::Authorization);
+
+    // No raw bypass either: the raw `include_sensitive` request is refused for a
+    // real remote at the SAME owner gate, before the assemble funnel runs.
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
+    );
+    let shared = state.shared_snapshot();
+    let raw_err = handle_concurrent_request_with_remote_operation(
+        Request::ExportSessionData {
+            session_id: session.session_id,
+            kind: proto::ExportSessionKind::DebugBundle,
+            include_generated_artifacts: false,
+            include_sensitive: true,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect_err("a real remote principal cannot assemble the raw export");
+    assert_eq!(raw_err.code, ErrorCode::Authorization);
+
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
+    );
+    let shared = state.shared_snapshot();
+    let reader_err = handle_concurrent_request_with_remote_operation(
+        Request::ReadRedactedExportChunk {
+            transfer_id: archive_transfer_ref(b"redacted").transfer_id,
+            chunk_index: 0,
+        },
+        shared,
+        ctx.clone(),
+        None,
+    )
+    .await
+    .expect_err("a real remote principal cannot use the redacted reader");
+    assert_eq!(reader_err.code, ErrorCode::Authorization);
 }
 
 #[tokio::test]
@@ -12289,7 +12800,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "delete_provider_config"
         | "set_provider_layer_metadata"
         // An unstaged transfer reference is a bad request, not an authz failure.
-        | "read_bulk_transfer_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // The redacted-export reader rejects an unknown/wrong-kind transfer id
+        // the same way (no bytes) — a BadRequest, once past the owner gate.
+        | "read_bulk_transfer_chunk"
+        | "read_redacted_export_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "terminal_ingress_begin"
         | "terminal_ingress_chunk"
         | "terminal_ingress_finish"
@@ -12487,6 +13001,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("import_session_archive"),
         authz_owner_only("write_bulk_transfer_chunk"),
         authz_owner_only("read_bulk_transfer_chunk"),
+        authz_owner_only("read_redacted_export_chunk"),
         authz_owner_only("curator"),
         authz_session_writer("cancel_turn"),
         authz_project_files("fs_list"),
@@ -13552,6 +14067,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
             include_generated_artifacts: false,
+            include_sensitive: false,
         },
         "curator" => Request::Curator {
             project_root: root,
@@ -13702,6 +14218,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             data_base64: base64::engine::general_purpose::STANDARD.encode(b"chunk"),
         },
         "read_bulk_transfer_chunk" => Request::ReadBulkTransferChunk {
+            transfer_id: archive_transfer_ref(b"not-staged").transfer_id,
+            chunk_index: 0,
+        },
+        "read_redacted_export_chunk" => Request::ReadRedactedExportChunk {
             transfer_id: archive_transfer_ref(b"not-staged").transfer_id,
             chunk_index: 0,
         },
@@ -18990,6 +19510,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "count_pinned_messages",
         "pinned_message_state",
         "read_bulk_transfer_chunk",
+        "read_redacted_export_chunk",
         "read_client_submission_receipt",
         "read_history_page",
         "read_subagent_history_page",
@@ -19373,6 +19894,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 session_id: attached_session_id,
                 kind: proto::ExportSessionKind::DebugBundle,
                 include_generated_artifacts: false,
+                include_sensitive: false,
             },
             kind: "export_session_data",
             session_id: Some(attached_session_id),
@@ -19406,6 +19928,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 chunk_index: 0,
             },
             kind: "read_bulk_transfer_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::ReadRedactedExportChunk {
+                transfer_id: archive_transfer_ref(b"UEsDB").transfer_id,
+                chunk_index: 0,
+            },
+            kind: "read_redacted_export_chunk",
             session_id: None,
             audit_path: None,
             mutating: false,
@@ -20866,6 +21398,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
     request_variants!(
         WriteBulkTransferChunk,
         ReadBulkTransferChunk,
+        ReadRedactedExportChunk,
         Attach,
         SubagentTranscript,
         SendUserMessage,

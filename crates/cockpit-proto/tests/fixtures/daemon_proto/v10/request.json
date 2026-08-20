@@ -275,6 +275,7 @@
   "export_session_data": {
     "params": {
       "include_generated_artifacts": true,
+      "include_sensitive": true,
       "kind": "debug_bundle",
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
@@ -423,6 +424,13 @@
       "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
     },
     "request": "read_bulk_transfer_chunk"
+  },
+  "read_redacted_export_chunk": {
+    "params": {
+      "chunk_index": 7,
+      "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+    },
+    "request": "read_redacted_export_chunk"
   },
   "list_assistants": {
     "request": "list_assistants"

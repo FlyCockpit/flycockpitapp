@@ -2972,6 +2972,8 @@ async fn bundle_export_reloads_a_stale_caller_target_inside_its_snapshot() {
         &stale_target,
         false,
         &crate::secure_key::vault_for_db(&db).unwrap(),
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
     )
     .await
     .expect("export reloads its target by session id");
@@ -3063,6 +3065,10 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
     let db_for_files = db.clone();
     let vault = crate::secure_key::vault_for_db(&db).unwrap();
     let store = crate::credentials::CredentialStore::from_vault(vault.clone()).unwrap();
+    let resolver = crate::session::test_redaction_key_resolver();
+    crate::redact::protected_redaction_history::warm_all_redaction_key_versions(resolver.as_ref())
+        .await
+        .unwrap();
     let exported = db
         .read(move |conn| {
             assemble_bundle_snapshot_conn_with_after_collect(
@@ -3076,6 +3082,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                 &test_export_env(),
                 Some(vault.as_ref()),
                 Some(&store),
+                Some(resolver.as_ref()),
                 move || {
                     start_writer_tx
                         .send(())
@@ -4437,6 +4444,8 @@ async fn export_redaction_ignores_config_opt_out() {
         &target,
         false,
         &crate::secure_key::vault_for_db(&db).unwrap(),
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -4479,6 +4488,443 @@ async fn export_redaction_ignores_config_opt_out() {
 /// scrub to the same placeholder replace their whole containing object with the
 /// uniform terminal collision object `{"<placeholder>": "<placeholder>"}`; a
 /// single secret key scrubs to the placeholder while its value is preserved.
+/// #1 (redaction bypass): a classified secret planted in DIFFERENT artifact
+/// classes — the session title (→ `manifest.json`), a persisted approval grant
+/// (→ `approvals/grants.json`), and an event body (→ `events.json`) — must be
+/// ABSENT from EVERY member of the redacted archive and PRESENT in the raw one.
+/// This is exactly what the single scrub funnel guarantees: `manifest.json` and
+/// #A (TOCTOU): a DEBUG BUNDLE walks the fork/successor tree, so its
+/// protected-history fold must cover EVERY bundled session, not just the target.
+/// The fold now runs inside the SAME read snapshot that discovers and assembles
+/// the bundle, so a fork's journal-only secret cannot be assembled without being
+/// folded. Plant a journal-only secret on a FORK (present in neither the live
+/// scan nor any persisted table) and assert it is scrubbed from every redacted
+/// member of the target's debug bundle. Fails if the fold covers only the target
+/// (the pre-fix discover-then-assemble path folded a stale, target-only set).
+#[tokio::test]
+async fn debug_bundle_folds_a_forks_journal_only_secret_in_one_snapshot() {
+    const FORK_SECRET: &str = "sk-fork-journal-only-9z8y7x6w5v4u";
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let target = create_test_session(&db, "p", "/repo", "Build").await;
+    let fork = create_test_fork(&db, target.session_id).await;
+
+    // Journal the secret against the FORK only, via the same resolver the export
+    // uses, and place it in a fork event body. No persisted table, no env.
+    let resolver = crate::session::test_redaction_key_resolver();
+    let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+        &db,
+        resolver.as_ref(),
+    );
+    let literal = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+        FORK_SECRET.to_string(),
+        crate::redact::protected_redaction_history::RedactionHistorySource::Environment,
+        None,
+        None,
+    )
+    .unwrap();
+    history
+        .append_and_attach(&fork.session_id.to_string(), literal, Vec::new())
+        .await
+        .unwrap();
+    db.insert_session_event(
+        fork.session_id,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &serde_json::json!({ "text": format!("fork leaked {FORK_SECRET}") }),
+    )
+    .await
+    .unwrap();
+
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+    let redacted = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        resolver.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    // The fork IS in the bundle (non-vacuity) and its journal secret is scrubbed.
+    let names = entry_names(&redacted.bytes);
+    assert!(
+        names.iter().any(|n| n == "events.json"),
+        "bundle must contain events"
+    );
+    for name in &names {
+        let body = read_zip_entry(&redacted.bytes, name).unwrap_or_default();
+        assert!(
+            !body.contains(FORK_SECRET),
+            "redacted member `{name}` leaked the fork's journal-only secret"
+        );
+    }
+}
+
+/// #A (transcript TOCTOU): the single-session TRANSCRIPT export must read
+/// messages, fold protected history, and scrub in ONE snapshot. Plant a
+/// journal-only secret (absent from the live scan and every persisted table) in
+/// a session message, build the redacted transcript through the real in-snapshot
+/// builder, and assert it is scrubbed.
+///
+/// Scope of this test: it proves the fold is CORRECT — a journal-only literal is
+/// reachable ONLY through the in-snapshot history fold, so its scrubbing proves
+/// the fold ran against the same data the transcript shipped. It does NOT by
+/// itself prove ATOMICITY against a concurrent writer, because it commits the
+/// history row and the message before the builder runs. The single-snapshot
+/// (no-TOCTOU) property is instead enforced STRUCTURALLY: `build_redacted_
+/// transcript_json_bytes` opens exactly one `conn.unchecked_transaction()` and
+/// performs the message reads, the `rehydrate_session_literals_conn` fold, and
+/// the scrub against that one `tx` before committing — verified by inspection.
+/// Driving a writer between the read and the fold would require a production
+/// seam inside the blocking closure, which we deliberately do not add.
+#[tokio::test]
+async fn redacted_transcript_folds_journal_only_secret_in_one_snapshot() {
+    const SECRET: &str = "sk-transcript-journal-only-7q6w5e4r3t";
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", "/repo", "Build").await;
+    let resolver = crate::session::test_redaction_key_resolver();
+
+    let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+        &db,
+        resolver.as_ref(),
+    );
+    let literal = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+        SECRET.to_string(),
+        crate::redact::protected_redaction_history::RedactionHistorySource::Environment,
+        None,
+        None,
+    )
+    .unwrap();
+    history
+        .append_and_attach(&session.session_id.to_string(), literal, Vec::new())
+        .await
+        .unwrap();
+    db.insert_session_event(
+        session.session_id,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &serde_json::json!({ "text": format!("leaked {SECRET}") }),
+    )
+    .await
+    .unwrap();
+
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+    let bytes = build_redacted_transcript_json_bytes(
+        &db,
+        &session,
+        &vault,
+        resolver.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains(SECRET),
+        "the redacted transcript leaked the journal-only secret"
+    );
+    // Non-vacuity: the message really is in the transcript (its non-secret prefix
+    // survives the scrub), so the assertion above is not passing on an empty doc.
+    assert!(
+        text.contains("leaked"),
+        "the message must be present (scrubbed) in the transcript"
+    );
+}
+
+/// `approvals/grants.json` were emitted RAW before the funnel even though the
+/// archive was stamped `redacted: true`.
+#[tokio::test]
+async fn redacted_export_scrubs_secret_from_every_member_including_manifest_and_approvals() {
+    const SECRET: &str = "sk-EVERY-member-secret-9q8w7e6r5t";
+    let dir = tempfile::tempdir().unwrap();
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", &dir.path().to_string_lossy(), "Build").await;
+    let sid = session.session_id;
+
+    // Session title → manifest.json (a RAW member before the funnel).
+    db.write(move |conn| {
+        conn.execute(
+            "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
+            rusqlite::params![format!("titled-{SECRET}"), sid.to_string()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Persisted approval grant → approvals/grants.json (a RAW member before).
+    db.write(move |conn| {
+        conn.execute(
+            "INSERT INTO approval_grants \
+                 (session_id, grant_kind, grant_key, granted_at, risk_tier) \
+                 VALUES (?1, 'command', ?2, ?3, 'ordinary')",
+            rusqlite::params![sid.to_string(), format!("run {SECRET}"), 0i64],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Event body → events.json (scrubbed even pre-funnel; positive control).
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &serde_json::json!({ "text": format!("body {SECRET}") }),
+    )
+    .await
+    .unwrap();
+
+    // Classify the secret in the session's persisted redaction table.
+    let table = RedactionTable::build_with_env_and_secrets(
+        &crate::config::extended::RedactConfig::default(),
+        dir.path(),
+        &std::collections::HashMap::new(),
+        [("PLANTED".to_string(), SECRET.to_string())],
+    )
+    .unwrap();
+    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
+        .await
+        .unwrap();
+
+    let target = get_test_session(&db, sid).await;
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+
+    // RAW export: the secret is present in each member (precondition — proves
+    // the members really carry it, so the redacted scan below is non-vacuous).
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+        .await
+        .unwrap();
+    assert!(
+        read_zip_entry(&raw.bytes, "manifest.json")
+            .unwrap()
+            .contains(SECRET),
+        "raw manifest must carry the title secret"
+    );
+    assert!(
+        read_zip_entry(&raw.bytes, "approvals/grants.json")
+            .unwrap()
+            .contains(SECRET),
+        "raw approvals must carry the grant secret"
+    );
+    assert!(
+        read_zip_entry(&raw.bytes, "events.json")
+            .unwrap()
+            .contains(SECRET),
+        "raw events must carry the body secret"
+    );
+
+    // REDACTED export: the secret must be ABSENT from EVERY member.
+    let redacted = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let names = entry_names(&redacted.bytes);
+    for name in &names {
+        let body = read_zip_entry(&redacted.bytes, name).unwrap_or_default();
+        assert!(
+            !body.contains(SECRET),
+            "redacted member `{name}` must not contain the planted secret"
+        );
+    }
+    // The previously-raw members are actually present (non-vacuity).
+    for required in ["manifest.json", "approvals/grants.json", "events.json"] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "redacted archive must still contain `{required}`"
+        );
+    }
+}
+
+/// NEW-HIGH (env-scan safety net): a LIVE-ENVIRONMENT secret that surfaces in an
+/// exported member but was NEVER independently persisted, journaled, or vaulted
+/// must still be scrubbed from the redacted archive. The redacted builders scan
+/// the daemon environment supplied by the RPC (`ctx.env_baseline.vars()`); this
+/// test drives that seam with an explicit env map. It FAILS against the earlier
+/// empty-env regression (`&HashMap::new()`), where the export redaction table
+/// derived no env candidates and shipped the secret unredacted — the empty-env
+/// control below reproduces exactly that leak.
+#[tokio::test]
+async fn redacted_export_scrubs_live_env_secret_absent_from_vault_and_journal() {
+    const SECRET: &str = "sk-live-env-only-secret-7z6y5x4w3v2u";
+    let dir = tempfile::tempdir().unwrap();
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", &dir.path().to_string_lossy(), "Build").await;
+    let sid = session.session_id;
+
+    // The secret's only appearance in stored state is inside an exported event
+    // body. It is NOT in any persisted session redaction table, NOT in the
+    // `protected_redaction_history` journal, and NOT in the vault — so the ONLY
+    // thing that can classify it is the live-environment scan.
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &serde_json::json!({ "text": format!("ran with token {SECRET}") }),
+    )
+    .await
+    .unwrap();
+
+    let target = get_test_session(&db, sid).await;
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+
+    // The daemon environment the RPC would hand the builder: the secret lives in
+    // a normal (non-allowlisted) env var, exactly as a live daemon-env secret.
+    let mut env = HashMap::new();
+    env.insert("PLANTED_ENV_SECRET".to_string(), SECRET.to_string());
+
+    // RAW export ships everything, so the secret is present (precondition — the
+    // event member really carries it, so the redacted scan is non-vacuous).
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+        .await
+        .unwrap();
+    assert!(
+        read_zip_entry(&raw.bytes, "events.json")
+            .unwrap()
+            .contains(SECRET),
+        "raw events must carry the live-env secret"
+    );
+
+    // REDACTED export WITH the live env: the env scan classifies the secret and
+    // it is scrubbed from every member.
+    let redacted = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        crate::session::test_redaction_key_resolver(),
+        env.clone(),
+    )
+    .await
+    .unwrap();
+    let names = entry_names(&redacted.bytes);
+    assert!(
+        names.iter().any(|n| n == "events.json"),
+        "redacted archive must still contain events.json (non-vacuity)"
+    );
+    for name in &names {
+        let body = read_zip_entry(&redacted.bytes, name).unwrap_or_default();
+        assert!(
+            !body.contains(SECRET),
+            "redacted member `{name}` leaked the live-environment secret"
+        );
+    }
+
+    // Empty-env control: this is precisely the pre-fix `&HashMap::new()` path.
+    // With no env candidates and the secret absent from every other source, the
+    // export table cannot classify it and the archive leaks it — proving the env
+    // scan (not some other source) is what scrubs the secret above.
+    let leaked = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read_zip_entry(&leaked.bytes, "events.json")
+            .unwrap()
+            .contains(SECRET),
+        "control: with an empty env the pre-fix path leaks the live-env secret"
+    );
+}
+
+/// #D (single-scrub): the shared redaction table is left INTACT (no dropping of
+/// placeholder-substring literals — that would under-redact), and each export
+/// member is instead scrubbed EXACTLY ONCE. A classified literal that is a
+/// substring of the placeholder is still redacted where it appears, and the
+/// placeholder inserted for a normal secret survives intact. A SECOND scrub pass
+/// would re-match the literal INSIDE that placeholder and mangle it, so the clean
+/// placeholder's presence proves the single scrub. Fails against a double-scrub
+/// design (the placeholder would be corrupted).
+#[tokio::test]
+async fn single_scrub_redacts_placeholder_substring_literal_without_corrupting_output() {
+    const NORMAL: &str = "sk-normal-secret-value-abcdef123456";
+    let placeholder = crate::config::extended::RedactConfig::default().placeholder;
+    // A real substring of the default placeholder copy, above the minimum
+    // redaction-entry length. The table KEEPS it (no dropping).
+    let ph_literal = "REDACTED BY COCKPIT";
+    assert!(placeholder.contains(ph_literal));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = create_test_session(&db, "p", &dir.path().to_string_lossy(), "Build").await;
+    let sid = session.session_id;
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &serde_json::json!({ "text": format!("ALPHA {NORMAL} OMEGA {ph_literal} END") }),
+    )
+    .await
+    .unwrap();
+
+    // Classify BOTH the normal secret and the placeholder-substring literal; keep
+    // both in the table.
+    let table = RedactionTable::build_with_env_and_secrets(
+        &crate::config::extended::RedactConfig::default(),
+        dir.path(),
+        &std::collections::HashMap::new(),
+        [
+            ("NORMAL".to_string(), NORMAL.to_string()),
+            ("PH".to_string(), ph_literal.to_string()),
+        ],
+    )
+    .unwrap();
+    db.set_session_redaction_table_json(sid, Some(table.to_persisted_json().unwrap()))
+        .await
+        .unwrap();
+
+    let target = get_test_session(&db, sid).await;
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
+    let redacted = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &vault,
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let events = read_zip_entry(&redacted.bytes, "events.json").unwrap();
+
+    // The normal secret is redacted.
+    assert!(
+        !events.contains(NORMAL),
+        "the normal secret must be redacted"
+    );
+    // The placeholder-substring literal is redacted WHERE IT APPEARS: its raw
+    // occurrence after "OMEGA " is replaced by the placeholder.
+    assert!(
+        !events.contains(&format!("OMEGA {ph_literal} END")),
+        "the placeholder-substring literal must be redacted where it appears"
+    );
+    // The placeholder inserted for the normal secret is INTACT — single-scrub. A
+    // double-scrub would have re-matched the literal inside it and mangled it, so
+    // this clean "ALPHA <placeholder> OMEGA" substring would be absent.
+    assert!(
+        events.contains(&format!("ALPHA {placeholder} OMEGA")),
+        "the placeholder must be intact (each member scrubbed exactly once)"
+    );
+}
+
 #[tokio::test]
 async fn export_json_key_collision_is_terminal_and_uniform() {
     const SEC_A: &str = "KEYSENTINEL_ALPHA_0001XYZ";
@@ -4528,6 +4974,8 @@ async fn export_json_key_collision_is_terminal_and_uniform() {
         &target,
         false,
         &crate::secure_key::vault_for_db(&db).unwrap(),
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
     )
     .await
     .unwrap();

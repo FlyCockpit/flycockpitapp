@@ -52,7 +52,7 @@
   ],
   "counts": {
     "event": 77,
-    "request": 199,
+    "request": 200,
     "response": 142
   },
   "messages": {
@@ -844,6 +844,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "bulk",
         "tag": "read_bulk_transfer_chunk"
+      },
+      {
+        "class": "bulk_chunk",
+        "inlinePayloadBound": "bounded",
+        "lane": "bulk",
+        "tag": "read_redacted_export_chunk"
       },
       {
         "class": "bounded_request_response",

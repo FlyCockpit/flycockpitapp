@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 9 as const;
+export const PROTOCOL_VERSION = 10 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust
@@ -63,7 +63,7 @@ export const bulkTransferRefSchema = z
       .string()
       .length(64)
       .regex(/^[0-9a-f]{64}$/),
-    mime_class: z.enum(["image", "image_set", "archive", "export", "opaque"]),
+    mime_class: z.enum(["image", "image_set", "archive", "export", "opaque", "redacted_export"]),
   })
   .strict();
 export type BulkTransferRef = z.infer<typeof bulkTransferRefSchema>;
@@ -734,6 +734,13 @@ const requestParamSchemas = {
       chunk_index: u32Schema,
     })
     .strict(),
+  // v10-only owner-remoted type-bound reader for a REDACTED export transfer.
+  read_redacted_export_chunk: z
+    .object({
+      transfer_id: opaqueProtocolIdSchema,
+      chunk_index: u32Schema,
+    })
+    .strict(),
 } as const;
 
 type RequestParamSchemas = typeof requestParamSchemas;
@@ -777,6 +784,7 @@ const clientRequestVariants = [
   requestVariant("import_session_archive", requestParamSchemas.import_session_archive),
   requestVariant("write_bulk_transfer_chunk", requestParamSchemas.write_bulk_transfer_chunk),
   requestVariant("read_bulk_transfer_chunk", requestParamSchemas.read_bulk_transfer_chunk),
+  requestVariant("read_redacted_export_chunk", requestParamSchemas.read_redacted_export_chunk),
   requestVariant("attach", requestParamSchemas.attach),
   requestVariant("cancel_paused_work", requestParamSchemas.cancel_paused_work),
   requestVariant("delete_session", requestParamSchemas.delete_session),

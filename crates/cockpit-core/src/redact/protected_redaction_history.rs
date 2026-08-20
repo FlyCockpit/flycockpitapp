@@ -68,7 +68,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::db::Db;
 use crate::db::protected_redaction_history::{
     AppendHistoryResult, ProtectedRedactionHistoryAppend, ProtectedRedactionHistoryRow,
-    append_history_conn, attach_artifact_ref_conn, get_history_conn,
+    append_history_conn, attach_artifact_ref_conn, get_history_conn, list_history_conn,
     list_history_for_artifact_conn,
 };
 
@@ -798,28 +798,79 @@ impl<'a> ProtectedRedactionHistory<'a> {
     /// Rehydrate one history row into a literal. Fails closed on any error. The
     /// row's key version must already be warm in the resolver cache.
     fn rehydrate_row(&self, row: &ProtectedRedactionHistoryRow) -> Result<RehydratedLiteral> {
-        if row.retired_at_ms.is_some() {
-            bail!("cannot rehydrate retired protected redaction history row");
-        }
-        let key = self.key_resolver.resolve(row.key_version)?;
-        let enc_key = derive_subkey(key.as_bytes(), KDF_ENCRYPT_LABEL);
-        let mac_key = derive_subkey(key.as_bytes(), KDF_FINGERPRINT_LABEL);
-        let aad = compute_aad(&row.session_id, row.source, row.key_version);
-        let frame = decrypt_to_frame(&*enc_key, &row.nonce, &aad, &row.ciphertext)?;
-        let plaintext = strip_frame(&frame)?;
-
-        // Defense-in-depth: the keyed MAC must match after the AEAD tag.
-        let computed = keyed_fingerprint(&*mac_key, &plaintext);
-        if computed != row.fingerprint {
-            bail!("protected redaction history fingerprint mismatch (integrity failure)");
-        }
-
-        Ok(RehydratedLiteral {
-            literal: plaintext,
-            fingerprint: row.fingerprint.clone(),
-            source: row.source,
-        })
+        rehydrate_history_row(self.key_resolver, row)
     }
+}
+
+/// Decrypt one history row into a literal against the (already warm) resolver
+/// cache. Fails closed on any error. Free-standing so the export can rehydrate
+/// SYNCHRONOUSLY inside its read snapshot (see
+/// [`rehydrate_session_literals_conn`]) without holding a [`Db`] handle.
+fn rehydrate_history_row(
+    resolver: &dyn RedactionKeyResolver,
+    row: &ProtectedRedactionHistoryRow,
+) -> Result<RehydratedLiteral> {
+    if row.retired_at_ms.is_some() {
+        bail!("cannot rehydrate retired protected redaction history row");
+    }
+    let key = resolver.resolve(row.key_version)?;
+    let enc_key = derive_subkey(key.as_bytes(), KDF_ENCRYPT_LABEL);
+    let mac_key = derive_subkey(key.as_bytes(), KDF_FINGERPRINT_LABEL);
+    let aad = compute_aad(&row.session_id, row.source, row.key_version);
+    let frame = decrypt_to_frame(&*enc_key, &row.nonce, &aad, &row.ciphertext)?;
+    let plaintext = strip_frame(&frame)?;
+
+    // Defense-in-depth: the keyed MAC must match after the AEAD tag.
+    let computed = keyed_fingerprint(&*mac_key, &plaintext);
+    if computed != row.fingerprint {
+        bail!("protected redaction history fingerprint mismatch (integrity failure)");
+    }
+
+    Ok(RehydratedLiteral {
+        literal: plaintext,
+        fingerprint: row.fingerprint.clone(),
+        source: row.source,
+    })
+}
+
+/// Warm the resolver cache for EVERY historical key version (1..=active), so a
+/// later [`rehydrate_session_literals_conn`] can decrypt any row synchronously
+/// inside a read snapshot without an `await`. Fails closed if any version cannot
+/// be loaded (a missing historical key means a row cannot be rehydrated, and the
+/// export must refuse rather than ship it raw). Key rotation is rare, so
+/// `active` is tiny and this is cheap.
+pub async fn warm_all_redaction_key_versions(resolver: &dyn RedactionKeyResolver) -> Result<()> {
+    let active = resolver.ensure_active().await?;
+    for version in 1..=active {
+        resolver.ensure_version(version).await?;
+    }
+    Ok(())
+}
+
+/// SYNC in-snapshot rehydration: list every NON-retired history row for
+/// `session_id` on the provided `conn` and decrypt each literal against the
+/// (already warm) resolver cache. This runs INSIDE the export's read snapshot so
+/// the folded literals correspond exactly to the sessions the same snapshot
+/// assembles — closing the discover-then-assemble TOCTOU where a fork/successor
+/// committed between two snapshots would ship its journal-only secret
+/// unredacted. Call [`warm_all_redaction_key_versions`] before entering the
+/// snapshot. Fails closed on any resolver cache miss, integrity mismatch, or
+/// non-UTF-8 literal.
+pub fn rehydrate_session_literals_conn(
+    resolver: &dyn RedactionKeyResolver,
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<Zeroizing<String>>> {
+    let rows = list_history_conn(conn, session_id)?;
+    let mut literals = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.retired_at_ms.is_some() {
+            continue;
+        }
+        let literal = rehydrate_history_row(resolver, &row)?;
+        literals.push(literal.as_str()?);
+    }
+    Ok(literals)
 }
 
 #[cfg(test)]

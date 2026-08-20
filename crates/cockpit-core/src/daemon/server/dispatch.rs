@@ -231,6 +231,18 @@ fn is_local_owner_action(
     state.principal.is_owner() && remote_operation.is_none()
 }
 
+/// Concurrent-lane analogue of [`is_local_owner_action`] over a shared snapshot.
+/// Same semantics: a genuine local owner is the owner principal AND no
+/// remote-operation ledger dispatch. A remoted owner (an owner principal
+/// carrying a remote-operation context) is NOT a local-owner action, so it is
+/// refused the raw `--include-sensitive` export exactly like any other remote.
+fn is_local_owner_action_shared(
+    shared: &SharedClientState,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> bool {
+    shared.principal.is_owner() && remote_operation.is_none()
+}
+
 #[cfg(test)]
 mod oauth_store_tests {
     use super::*;
@@ -3675,7 +3687,23 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-        } => export_session_data(ctx, session_id, kind, include_generated_artifacts).await,
+            include_sensitive,
+        } => {
+            let local_owner_action = is_local_owner_action(state, remote_operation);
+            export_session_data(
+                ctx,
+                session_id,
+                kind,
+                include_generated_artifacts,
+                include_sensitive,
+                local_owner_action,
+            )
+            .await
+        }
+        Request::ReadRedactedExportChunk {
+            transfer_id,
+            chunk_index,
+        } => read_redacted_export_chunk(&transfer_id, chunk_index).await,
         Request::OperationStatus { operation_id } => {
             let ClientPrincipal::Remote(remote) = &shared.principal else {
                 return Err(ErrorPayload {
@@ -8038,7 +8066,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     ctx: Arc<DaemonContext>,
     remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if let Some(operation) = remote_operation {
+    if let Some(operation) = &remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
             operation_id = %operation.operation_id,
@@ -8216,7 +8244,20 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-        } => export_session_data(&ctx, session_id, kind, include_generated_artifacts).await,
+            include_sensitive,
+        } => {
+            let local_owner_action =
+                is_local_owner_action_shared(&shared, remote_operation.as_ref());
+            export_session_data(
+                &ctx,
+                session_id,
+                kind,
+                include_generated_artifacts,
+                include_sensitive,
+                local_owner_action,
+            )
+            .await
+        }
 
         Request::ImportSessionArchive { transfer, as_new } => {
             import_session_archive(&ctx, &transfer, as_new).await
@@ -8230,6 +8271,10 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             transfer_id,
             chunk_index,
         } => read_bulk_transfer_chunk(&transfer_id, chunk_index).await,
+        Request::ReadRedactedExportChunk {
+            transfer_id,
+            chunk_index,
+        } => read_redacted_export_chunk(&transfer_id, chunk_index).await,
         Request::FsList {
             project_root,
             path,
@@ -13279,8 +13324,16 @@ pub(super) async fn import_session_archive(
 }
 
 /// Stage exported bytes for bulk pull and return their bounded reference.
+///
+/// The `mime_class` is the transfer's identity: a REDACTED export is staged as
+/// [`RemoteBulkMimeClass::RedactedExport`] (served by the owner-remoted
+/// type-bound reader), a RAW export as [`RemoteBulkMimeClass::Export`] (served
+/// only by the owner-local generic reader). Passing the wrong class would let a
+/// raw archive be pulled by the remoted reader, so the class is chosen at the
+/// single assemble funnel below, never by the caller streaming it back.
 fn stage_export_bytes(
     bytes: &[u8],
+    mime_class: cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass,
 ) -> std::result::Result<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef, ErrorPayload>
 {
     use rand::RngExt as _;
@@ -13290,12 +13343,32 @@ fn stage_export_bytes(
     if transfer_id.iter().all(|b| *b == 0) {
         transfer_id[0] = 1;
     }
-    crate::daemon::bulk_staging::stage(
-        bytes,
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
-        transfer_id,
+    crate::daemon::bulk_staging::stage(bytes, mime_class, transfer_id).map_err(staging_error)
+}
+
+/// Serve one chunk of a REDACTED export transfer to an owner-remoted caller.
+///
+/// The type-bound reader admits a transfer ONLY when its staged kind is
+/// [`RemoteBulkMimeClass::RedactedExport`]; a raw `Export` id (or any other bulk
+/// kind, or an unknown/non-export transfer) is refused by
+/// [`crate::daemon::bulk_staging::read_chunk_of_kind`] with no bytes returned.
+/// This is what keeps the raw archive owner-local while a redacted export is
+/// downloadable over the wire.
+pub(super) async fn read_redacted_export_chunk(
+    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    chunk_index: u32,
+) -> std::result::Result<Response, ErrorPayload> {
+    let (chunk, last) = crate::daemon::bulk_staging::read_chunk_of_kind(
+        *transfer_id.as_bytes(),
+        chunk_index,
+        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
     )
-    .map_err(staging_error)
+    .map_err(staging_error)?;
+    Ok(Response::BulkTransferChunk {
+        chunk_index,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&chunk),
+        last,
+    })
 }
 
 pub(super) async fn export_session_data(
@@ -13303,7 +13376,24 @@ pub(super) async fn export_session_data(
     session_id: Uuid,
     kind: proto::ExportSessionKind,
     include_generated_artifacts: bool,
+    include_sensitive: bool,
+    local_owner_action: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
+    use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+    // AC1: the raw, unredacted export is owner-LOCAL only. A remoted caller (a
+    // remote-operation ledger dispatch, or any non-owner principal) is refused
+    // BEFORE any archive is assembled or staged, so the only remoted success
+    // path is the redacted one. This is the single dispatch funnel that decides
+    // raw-vs-redacted; a future caller cannot reach the raw assembler without
+    // passing this gate.
+    if include_sensitive && !local_owner_action {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "raw `--include-sensitive` export is owner-local only; a remoted \
+                      caller cannot request the unredacted archive"
+                .to_string(),
+        });
+    }
     let db = ctx.db.clone();
     let target = db
         .get_session(session_id)
@@ -13313,76 +13403,128 @@ pub(super) async fn export_session_data(
             code: ErrorCode::UnknownSession,
             message: format!("unknown session {session_id}"),
         })?;
+    // A redacted export rides the type-bound RedactedExport class (owner-remoted
+    // reader); the raw archive rides the plain Export class (owner-local generic
+    // reader only).
+    let mime_class = if include_sensitive {
+        RemoteBulkMimeClass::Export
+    } else {
+        RemoteBulkMimeClass::RedactedExport
+    };
     let data = match kind {
         proto::ExportSessionKind::TranscriptJson => {
-            let mut messages = Vec::new();
-            let mut before_seq = None;
-            loop {
-                let (mut page, has_more) = db
-                    .read_session_messages(session_id, before_seq, u32::MAX)
-                    .await
-                    .map_err(internal)?;
-                if page.is_empty() {
-                    break;
+            let bytes = if include_sensitive {
+                // Raw local transcript: the unredacted message bodies verbatim.
+                // No redaction and no history fold, so the multi-read is benign
+                // (the raw archive shows everything regardless).
+                let mut messages = Vec::new();
+                let mut before_seq = None;
+                loop {
+                    let (mut page, has_more) = db
+                        .read_session_messages(session_id, before_seq, u32::MAX)
+                        .await
+                        .map_err(internal)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    before_seq = page.first().map(|message| message.seq);
+                    messages.append(&mut page);
+                    if !has_more {
+                        break;
+                    }
                 }
-                before_seq = page.first().map(|message| message.seq);
-                messages.append(&mut page);
-                if !has_more {
-                    break;
-                }
-            }
-            messages.sort_by_key(|message| message.seq);
-            // The transcript JSON is a portable, permanently redacted
-            // artifact. It shares one export-redaction policy with the debug
-            // ZIP: scrub every message body before serialization so no sealed
-            // value, environment value, credential value, or contained leak
-            // reaches the staged transfer bytes. The redactor is built from
-            // the target session's project root and the durable
-            // credential/environment journals, never the inference-time
-            // provider-trust decision.
-            let env = crate::session::export::process_env_map_for_conn();
-            let export_redactor = crate::session::export::redaction_table_for_session(
-                &db,
-                &target,
-                &env,
-                &ctx.secret_vault,
-            )
-            .map_err(internal)?;
-            let mut messages_value = serde_json::to_value(&messages).map_err(internal)?;
-            crate::session::export::scrub_export_json_value(&mut messages_value, &export_redactor);
-            let bytes = serde_json::to_vec_pretty(&messages_value).map_err(internal)?;
-            let transfer = stage_export_bytes(&bytes)?;
-            Ok(proto::ExportSessionData {
+                messages.sort_by_key(|message| message.seq);
+                serde_json::to_vec_pretty(&messages).map_err(internal)?
+            } else {
+                // Redacted transcript: the message reads, the protected-history
+                // fold, and the scrub all run inside ONE read snapshot, so the
+                // transcribed message set and the folded-literal set come from
+                // the SAME snapshot — no discover-then-assemble TOCTOU. Fails
+                // closed on any resolver/integrity error (no partial artifact).
+                let resolver = ctx.redaction_key_resolver().map_err(internal)?;
+                // Feed the live daemon environment baseline into the export
+                // redaction table so an env-derived secret that surfaces in a
+                // transcript member is scrubbed even when it was never
+                // independently persisted or journaled (defense-in-depth: the
+                // same env source the live session redaction path uses).
+                let env = ctx
+                    .env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .vars()
+                    .clone();
+                crate::session::export::build_redacted_transcript_json_bytes(
+                    &db,
+                    &target,
+                    &ctx.secret_vault,
+                    resolver,
+                    env,
+                )
+                .await
+                .map_err(internal)?
+            };
+            let transfer = stage_export_bytes(&bytes, mime_class)?;
+            proto::ExportSessionData {
                 session_id,
                 kind,
                 filename_extension: "json".to_string(),
                 mime: "application/json".to_string(),
                 transfer,
                 session_count: Some(1),
-                redacted: true,
-            })
+                redacted: !include_sensitive,
+            }
         }
         proto::ExportSessionKind::DebugBundle => {
-            let bundle = crate::session::export::build_bundle_zip_bytes(
-                &db,
-                &target,
-                include_generated_artifacts,
-                &ctx.secret_vault,
-            )
-            .await
-            .map_err(internal)?;
-            let transfer = stage_export_bytes(&bundle.bytes)?;
-            Ok(proto::ExportSessionData {
+            let bundle = if include_sensitive {
+                crate::session::export::build_bundle_zip_bytes_raw_local(
+                    &db,
+                    &target,
+                    include_generated_artifacts,
+                )
+                .await
+                .map_err(internal)?
+            } else {
+                // The debug bundle folds protected-history literals IN the same
+                // read snapshot that discovers and assembles the bundle (the
+                // resolver is warmed then threaded into the assembly), so a fork
+                // or `/compact` successor committed concurrently can never be
+                // assembled without its journal literals folded — closing the
+                // discover-then-assemble TOCTOU. Fails closed on any
+                // resolver/integrity error.
+                let resolver = ctx.redaction_key_resolver().map_err(internal)?;
+                // Feed the live daemon environment baseline into the export
+                // redaction table (see the transcript branch): an env-derived
+                // secret embedded in a config/approval/artifact member is
+                // scrubbed even when it was never persisted or journaled.
+                let env = ctx
+                    .env_baseline
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .vars()
+                    .clone();
+                crate::session::export::build_bundle_zip_bytes(
+                    &db,
+                    &target,
+                    include_generated_artifacts,
+                    &ctx.secret_vault,
+                    resolver,
+                    env,
+                )
+                .await
+                .map_err(internal)?
+            };
+            let transfer = stage_export_bytes(&bundle.bytes, mime_class)?;
+            proto::ExportSessionData {
                 session_id,
                 kind,
                 filename_extension: "zip".to_string(),
                 mime: "application/zip".to_string(),
                 transfer,
                 session_count: Some(bundle.summary.session_count),
-                redacted: true,
-            })
+                redacted: !include_sensitive,
+            }
         }
-    }?;
+    };
     Ok(Response::ExportSessionData { data })
 }
 

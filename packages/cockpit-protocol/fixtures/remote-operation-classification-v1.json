@@ -1199,9 +1199,9 @@
       "tag": "auto_title"
     },
     {
-      "class": "local_only",
+      "class": "read_only",
       "evidence": null,
-      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool",
+      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
       "fcorRoles": [
         {
           "field": "session_id",
@@ -1217,9 +1217,14 @@
           "field": "include_generated_artifacts",
           "role": "param",
           "type": "bool"
+        },
+        {
+          "field": "include_sensitive",
+          "role": "param",
+          "type": "bool"
         }
       ],
-      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool",
+      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
       "strategy": "none",
       "tag": "export_session_data"
     },
@@ -1287,6 +1292,26 @@
       "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
       "strategy": "none",
       "tag": "read_bulk_transfer_chunk"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "transfer_id:struct:RemoteTransferId:v1|chunk_index:u32",
+      "fcorRoles": [
+        {
+          "field": "transfer_id",
+          "role": "param",
+          "type": "crate::remote_protocol_id::RemoteTransferId"
+        },
+        {
+          "field": "chunk_index",
+          "role": "param",
+          "type": "u32"
+        }
+      ],
+      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
+      "strategy": "none",
+      "tag": "read_redacted_export_chunk"
     },
     {
       "class": "transactional_mutation",

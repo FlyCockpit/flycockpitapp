@@ -39,7 +39,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -410,19 +410,31 @@ pub struct BundleBytes {
 /// only unredacted export is the explicit local
 /// [`build_bundle_zip_bytes_raw_local`] (`cockpit export --include-sensitive`),
 /// which is never reachable over the RPC or the TUI.
+///
+/// `env` is the live daemon environment (the RPC threads `ctx.env_baseline`) so
+/// the export redaction table's `scan_environment` pass keeps env-derived
+/// secrets scrubbed even when they were never persisted, journaled, or vaulted —
+/// the same env source the live per-session redaction path consumes.
 pub async fn build_bundle_zip_bytes(
     db: &Db,
     target: &SessionRow,
     include_generated_artifacts: bool,
     vault: &crate::secure_key::SecretVault,
+    resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    env: HashMap<String, String>,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
     let vault = vault.clone();
     let store =
         crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
+    // Warm EVERY historical key version before entering the read snapshot, so the
+    // in-snapshot protected-history fold can decrypt any bundled session's rows
+    // synchronously (the resolver `resolve` is warm-cache-only). Fails closed if
+    // a historical key is unavailable.
+    crate::redact::protected_redaction_history::warm_all_redaction_key_versions(resolver.as_ref())
+        .await?;
     db.read(move |conn| {
-        let env = process_env_map();
         assemble_bundle_snapshot_conn(
             &db_for_files,
             conn,
@@ -434,7 +446,81 @@ pub async fn build_bundle_zip_bytes(
             &env,
             Some(&vault),
             Some(&store),
+            Some(resolver.as_ref()),
         )
+    })
+    .await
+}
+
+/// Assemble the REDACTED transcript-JSON export inside ONE read snapshot: the
+/// message reads, the protected-history fold, and the scrub all run against the
+/// same `tx`, so the emitted transcript body and the folded-literal set come
+/// from the SAME snapshot by construction. A protected-history row classifying a
+/// literal that appears in the transcript, committed concurrently, is either
+/// visible to the snapshot (and folded) or invisible to it (and its message is
+/// not in the transcript either) — closing the discover-then-assemble TOCTOU the
+/// two-snapshot path had. Warms the resolver before the sync snapshot (its
+/// `resolve` is warm-cache-only). Fails closed on any resolver/integrity error.
+///
+/// `env` is the live daemon environment (the RPC threads `ctx.env_baseline`) so
+/// an env-derived secret surfacing in a transcript member is scrubbed by the
+/// table's `scan_environment` pass even when it was never persisted or journaled.
+pub async fn build_redacted_transcript_json_bytes(
+    db: &Db,
+    target: &SessionRow,
+    vault: &crate::secure_key::SecretVault,
+    resolver: std::sync::Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    env: HashMap<String, String>,
+) -> Result<Vec<u8>> {
+    let target_id = target.session_id;
+    let vault = vault.clone();
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
+    crate::redact::protected_redaction_history::warm_all_redaction_key_versions(resolver.as_ref())
+        .await?;
+    db.read(move |conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting transcript export read snapshot")?;
+        let conn: &Connection = &tx;
+        // Reload the target inside the snapshot so its rows and its history are
+        // read consistently with the messages below.
+        let target = Db::get_session_conn(conn, target_id)?
+            .with_context(|| format!("export target session `{target_id}` no longer exists"))?;
+
+        let mut messages = Vec::new();
+        let mut before_seq = None;
+        loop {
+            let (mut page, has_more) =
+                Db::read_session_messages_conn(conn, target_id, before_seq, u32::MAX)?;
+            if page.is_empty() {
+                break;
+            }
+            before_seq = page.first().map(|message| message.seq);
+            messages.append(&mut page);
+            if !has_more {
+                break;
+            }
+        }
+        messages.sort_by_key(|message| message.seq);
+
+        // Build the enforced redactor IN the snapshot, folding this session's
+        // protected-history literals from the same `tx`.
+        let export_redactor = export_redaction_table_for_sessions(
+            Some(&vault),
+            Some(&store),
+            Some(conn),
+            &target,
+            std::slice::from_ref(&target),
+            &env,
+            Some(resolver.as_ref()),
+        )?;
+        let mut messages_value = serde_json::to_value(&messages)?;
+        scrub_export_json_value(&mut messages_value, &export_redactor);
+        let bytes = serde_json::to_vec_pretty(&messages_value)?;
+        tx.commit()
+            .context("finishing transcript export read snapshot")?;
+        Ok(bytes)
     })
     .await
 }
@@ -460,7 +546,8 @@ pub async fn build_bundle_zip_bytes_raw_local(
     let db_for_files = db.clone();
     let target_id = target.session_id;
     db.read(move |conn| {
-        let env = process_env_map();
+        // Raw export: no redactor, and therefore no journal rehydration — the
+        // `None` resolver is never consulted (the redacted branch owns it).
         assemble_bundle_snapshot_conn(
             &db_for_files,
             conn,
@@ -469,7 +556,8 @@ pub async fn build_bundle_zip_bytes_raw_local(
                 include_generated_artifacts,
                 redacted: false,
             },
-            &env,
+            &HashMap::new(),
+            None,
             None,
             None,
         )
@@ -485,8 +573,14 @@ pub async fn build_bundle_zip_bytes_raw_local(
 /// `overwrite` controls the clobber policy: `false` refuses to replace
 /// an existing file (the CLI's no-clobber-without-`--force` guarantee);
 /// `true` replaces it unconditionally (the TUI path, which has no force
-/// flag and is specified to overwrite its own prior export). The CLI
-/// passes `args.force` here, so its guarantee is preserved.
+/// flag and is specified to overwrite its own prior export).
+///
+/// `#[cfg(test)]`-ONLY: the production CLI/TUI export exclusively through the
+/// daemon RPC (`build_bundle_zip_bytes`), which threads the real warm redaction
+/// key resolver so protected-history secrets are folded. Compile-gating this
+/// file-writing helper guarantees no production path can assemble a redacted
+/// archive with an inert (test) resolver.
+#[cfg(test)]
 pub async fn write_bundle_zip(
     db: &Db,
     target: &SessionRow,
@@ -502,55 +596,15 @@ pub async fn write_bundle_zip(
         );
     }
 
-    let bundle = build_bundle_zip_bytes(db, target, include_generated_artifacts, vault).await?;
-
-    if let Some(parent) = out_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        crate::private_fs::ensure_output_parent_private(parent)
-            .with_context(|| format!("securing export directory `{}`", parent.display()))?;
-    }
-    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
-        .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
-
-    Ok(bundle.summary)
-}
-
-pub fn write_bundle_zip_blocking_for_sync_cli(
-    db: &Db,
-    target: &SessionRow,
-    out_path: &std::path::Path,
-    overwrite: bool,
-    include_generated_artifacts: bool,
-    vault: &crate::secure_key::SecretVault,
-) -> Result<BundleSummary> {
-    if out_path.exists() && !overwrite {
-        anyhow::bail!(
-            "output path `{}` already exists — pass `--force` to overwrite",
-            out_path.display()
-        );
-    }
-
-    let db_for_files = db.clone();
-    let target_id = target.session_id;
-    let vault = vault.clone();
-    let store =
-        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
-    let bundle = db.blocking_for_sync_cli(move |conn| {
-        let env = process_env_map();
-        assemble_bundle_snapshot_conn(
-            &db_for_files,
-            conn,
-            target_id,
-            ExportBundleOptions {
-                include_generated_artifacts,
-                redacted: true,
-            },
-            &env,
-            Some(&vault),
-            Some(&store),
-        )
-    })?;
+    let bundle = build_bundle_zip_bytes(
+        db,
+        target,
+        include_generated_artifacts,
+        vault,
+        crate::session::test_redaction_key_resolver(),
+        HashMap::new(),
+    )
+    .await?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -605,6 +659,7 @@ pub async fn write_bundle_zip_raw_local(
 /// callers resolve a session before reaching this function, and that row may
 /// have changed (or disappeared) before the export worker checks out its
 /// connection.
+#[allow(clippy::too_many_arguments)]
 fn assemble_bundle_snapshot_conn(
     db: &Db,
     conn: &Connection,
@@ -613,6 +668,7 @@ fn assemble_bundle_snapshot_conn(
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
     store: Option<&crate::credentials::CredentialStore>,
+    resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
 ) -> Result<BundleBytes> {
     assemble_bundle_snapshot_conn_with_after_collect(
         db,
@@ -622,6 +678,7 @@ fn assemble_bundle_snapshot_conn(
         env,
         vault,
         store,
+        resolver,
         || Ok(()),
     )
 }
@@ -635,6 +692,7 @@ fn assemble_bundle_snapshot_conn_with_after_collect<F>(
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
     store: Option<&crate::credentials::CredentialStore>,
+    resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     after_collect: F,
 ) -> Result<BundleBytes>
 where
@@ -655,8 +713,9 @@ where
     // bundle discovery but before the export's later event/manifest queries.
     after_collect()?;
 
-    let bytes =
-        build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env, vault, store)?;
+    let bytes = build_zip_with_options_and_env_conn(
+        db, &tx, &target, &bundle, options, env, vault, store, resolver,
+    )?;
     let summary = BundleSummary {
         session_count: bundle.len(),
         byte_len: bytes.len(),
@@ -821,6 +880,18 @@ async fn build_zip_with_options_and_env(
         .as_ref()
         .map(|vault| crate::credentials::CredentialStore::from_vault(std::sync::Arc::clone(vault)))
         .transpose()?;
+    // Redacted test assemblies get a warmed test resolver so the in-snapshot
+    // protected-history fold can decrypt any rows synchronously (raw = None).
+    let resolver = if options.redacted {
+        let resolver = crate::session::test_redaction_key_resolver();
+        crate::redact::protected_redaction_history::warm_all_redaction_key_versions(
+            resolver.as_ref(),
+        )
+        .await?;
+        Some(resolver)
+    } else {
+        None
+    };
     let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {
         let build = || {
@@ -833,6 +904,7 @@ async fn build_zip_with_options_and_env(
                 &env,
                 vault.as_deref(),
                 store.as_ref(),
+                resolver.as_deref(),
             )
         };
         match trust_policy {
@@ -853,12 +925,18 @@ fn build_zip_with_options_and_env_conn(
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
     store: Option<&crate::credentials::CredentialStore>,
+    resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
 ) -> Result<Vec<u8>> {
     let export_redactor = if options.redacted {
         // Non-bypassable default: the enforced table unioned across every
-        // bundled session's persisted redaction-table union (column or vault).
-        // Fails closed if a persisted or vault table cannot be parsed.
-        export_redaction_table_for_bundle(vault, store, Some(conn), target, bundle, env)?
+        // bundled session's persisted redaction-table union (column or vault),
+        // then folded IN-SNAPSHOT with each bundled session's rehydrated
+        // protected-history literals (the resolver must be present and warm).
+        // Fails closed if a persisted/vault table cannot be parsed or a literal
+        // cannot be rehydrated.
+        let resolver =
+            resolver.context("a redacted export requires a warm redaction key resolver")?;
+        export_redaction_table_for_bundle(vault, store, Some(conn), target, bundle, env, resolver)?
     } else {
         // Explicit local raw export: a no-op table so every member body and
         // member path is emitted exactly as stored. No journal rehydration and
@@ -993,14 +1071,12 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             }));
         }
         for inference_call in Db::list_inference_calls_for_session_conn(conn, s.session_id)? {
-            let mut value = inference_call_export_json(&inference_call);
-            redact_value_for_export(&mut value, export_redactor);
-            inference_call_index.push(value);
+            // Collected RAW; scrubbed exactly once by the member funnel at write.
+            inference_call_index.push(inference_call_export_json(&inference_call));
         }
         for tool_call in Db::list_tool_calls_for_session_conn(conn, s.session_id)? {
-            let mut value = tool_call_export_json(&tool_call);
-            redact_value_for_export(&mut value, export_redactor);
-            tool_call_index.push(value);
+            // Collected RAW; scrubbed exactly once by the member funnel at write.
+            tool_call_index.push(tool_call_export_json(&tool_call));
             let identity = tool_provider_identity_json(&tool_call)?;
             tool_identity_by_call
                 .insert((tool_call.session_id, tool_call.call_id.clone()), identity);
@@ -1034,7 +1110,8 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             compressed_result_files.push((path, entry.content));
         }
         for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
-            let body = redact_string_for_export(row.body, export_redactor);
+            // Collected RAW (body embedded whole, no truncation); the whole index
+            // member is scrubbed exactly once by the funnel at write.
             delegation_steer_index.push(json!({
                 "id": row.id,
                 "task_call_id": row.task_call_id,
@@ -1042,7 +1119,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "session_id": s.session_id.to_string(),
                 "short_id": short,
                 "origin_principal": row.origin_principal,
-                "body": body,
+                "body": row.body,
                 "delivered": row.delivered,
                 "created_at": row.created_at,
                 "delivered_at": row.delivered_at,
@@ -1059,11 +1136,23 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             let loaded = load_task_delegation_payload_from_row(db, &row);
             let (excerpt, load_error, emit_file) = match loaded {
                 Ok(payload) => {
-                    let body = redact_string_for_export(payload.body, export_redactor);
-                    (Some(row.excerpt(&body)), None::<String>, Some(body))
+                    // Scrub the body ONCE to build a leak-safe excerpt: a raw
+                    // char-prefix could split a secret across the excerpt
+                    // boundary, which the whole-literal member funnel could not
+                    // match. The FILE body is emitted RAW below and scrubbed
+                    // exactly once by its text funnel.
+                    let scrubbed = redact_string_for_export(payload.body.clone(), export_redactor);
+                    (
+                        Some(row.excerpt(&scrubbed)),
+                        None::<String>,
+                        Some(payload.body),
+                    )
                 }
                 Err(e) => (None, Some(format!("{e:#}")), None),
             };
+            // Build the index entry with RAW metadata; the pre-scrubbed `excerpt`
+            // and the entry-name `file` (already `fs_safe_scrubbed`) are inserted
+            // AFTER the metadata scrub so they are never double-scrubbed.
             let mut meta = json!({
                 "task_call_id": row.task_call_id,
                 "function_call_id": row.function_call_id,
@@ -1077,14 +1166,23 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "created_at": row.created_at,
                 "delivered": row.delivered(),
                 "delivered_at": row.delivered_at,
-                "excerpt": excerpt,
-                "file": if emit_file.is_some() { Some(file.clone()) } else { None },
                 "source_sidecar": row.sidecar_path,
             });
             if let Some(load_error) = load_error
                 && let Some(obj) = meta.as_object_mut()
             {
                 obj.insert("load_error".to_string(), json!(load_error));
+            }
+            // Scrub the metadata (and load_error) EXACTLY once; the index is then
+            // written via the prescrubbed writer, so nothing here is re-scrubbed.
+            redact_value_for_export(&mut meta, export_redactor);
+            if let Some(obj) = meta.as_object_mut() {
+                if let Some(excerpt) = excerpt {
+                    obj.insert("excerpt".to_string(), json!(excerpt));
+                }
+                if emit_file.is_some() {
+                    obj.insert("file".to_string(), json!(file.clone()));
+                }
             }
             delegation_payload_index.push(meta);
             if let Some(body) = emit_file {
@@ -1191,7 +1289,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             value["file"] = json!(path);
             request_files.push((path, call_id.to_string(), ordinal));
         }
-        redact_value_for_export(&mut value, export_redactor);
+        // Collected RAW; scrubbed exactly once by the events.json funnel at write.
         event_values.push(value);
     }
 
@@ -1259,7 +1357,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             });
             tandem_files.push((path.clone(), file_body));
             // The timeline event mapping this tandem response to the main call.
-            let mut event = json!({
+            let event = json!({
                 // Sort immediately after the shadowed call's event.
                 "seq": parent_seq,
                 "ts_ms": rec.ts_ms,
@@ -1277,7 +1375,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 },
                 "file": path,
             });
-            redact_value_for_export(&mut event, export_redactor);
+            // Collected RAW; scrubbed exactly once by the events.json funnel.
             event_values.push(event);
         }
     }
@@ -1310,15 +1408,15 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         let opts =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        zw.start_file("manifest.json", opts)
-            .context("zip: manifest entry")?;
-        zw.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())
-            .context("zip: writing manifest")?;
+        write_redacted_json_member(&mut zw, opts, "manifest.json", &manifest, export_redactor)?;
 
-        zw.start_file("events.json", opts)
-            .context("zip: events entry")?;
-        zw.write_all(serde_json::to_string_pretty(&event_values)?.as_bytes())
-            .context("zip: writing events")?;
+        write_redacted_json_member(
+            &mut zw,
+            opts,
+            "events.json",
+            &Value::Array(event_values.clone()),
+            export_redactor,
+        )?;
 
         // One file per inference request, split across `inference_requests/`
         // (regular) and `inference_requests_utility/` (utility) by the
@@ -1326,7 +1424,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         // — no second redaction pass (the leak-detection use case wants the
         // exact wire form).
         for (path, call_id, ordinal) in &request_files {
-            let mut payload = match Db::get_inference_request_conn(conn, call_id, *ordinal)? {
+            let payload = match Db::get_inference_request_conn(conn, call_id, *ordinal)? {
                 // Envelope: the immutable `request` body, the dispatch-time
                 // lifecycle `status`, and the phase timestamps read from their
                 // dedicated columns — phases are NOT re-injected into `request`,
@@ -1350,11 +1448,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 // references always exists.
                 None => json!({ "error": "no captured request payload for this call_id" }),
             };
-            redact_value_for_export(&mut payload, export_redactor);
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: request entry `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())
-                .with_context(|| format!("zip: writing request `{path}`"))?;
+            write_redacted_json_member(&mut zw, opts, path, &payload, export_redactor)?;
         }
 
         // Model-comparison tandem (shadow) records: one file per (main call,
@@ -1362,102 +1456,100 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         // request at export time carries `status: "pending"` (its body's status
         // field) — the export does not block waiting for it.
         for (path, body) in &tandem_files {
-            let mut body = body.clone();
-            redact_value_for_export(&mut body, export_redactor);
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: tandem entry `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
-                .with_context(|| format!("zip: writing tandem `{path}`"))?;
+            write_redacted_json_member(&mut zw, opts, path, body, export_redactor)?;
         }
 
         for (path, body) in &tool_output_files {
-            let mut body = body.clone();
-            redact_value_for_export(&mut body, export_redactor);
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: tool output entry `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
-                .with_context(|| format!("zip: writing tool output `{path}`"))?;
+            write_redacted_json_member(&mut zw, opts, path, body, export_redactor)?;
         }
 
         if !inference_call_index.is_empty() {
-            let path = "inference_calls/index.json";
-            zw.start_file(path, opts)
-                .context("zip: inference call index")?;
-            zw.write_all(serde_json::to_string_pretty(&inference_call_index)?.as_bytes())
-                .context("zip: writing inference call index")?;
+            write_redacted_json_member(
+                &mut zw,
+                opts,
+                "inference_calls/index.json",
+                &Value::Array(inference_call_index.clone()),
+                export_redactor,
+            )?;
         }
         if !tool_call_index.is_empty() {
-            let path = "tool_calls/index.json";
-            zw.start_file(path, opts).context("zip: tool call index")?;
-            zw.write_all(serde_json::to_string_pretty(&tool_call_index)?.as_bytes())
-                .context("zip: writing tool call index")?;
+            write_redacted_json_member(
+                &mut zw,
+                opts,
+                "tool_calls/index.json",
+                &Value::Array(tool_call_index.clone()),
+                export_redactor,
+            )?;
         }
 
         if !compressed_result_index.is_empty() {
             let path = format!("{COMPRESSED_TOOL_RESULTS_DIR}/index.json");
-            zw.start_file(&path, opts)
-                .with_context(|| format!("zip: compressed result index `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&compressed_result_index)?.as_bytes())
-                .context("zip: writing compressed result index")?;
+            write_redacted_json_member(
+                &mut zw,
+                opts,
+                &path,
+                &Value::Array(compressed_result_index.clone()),
+                export_redactor,
+            )?;
         }
         for (path, body) in &compressed_result_files {
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: compressed result entry `{path}`"))?;
-            let body = redact_string_for_export(body.clone(), export_redactor);
-            zw.write_all(body.as_bytes())
-                .with_context(|| format!("zip: writing compressed result `{path}`"))?;
+            write_redacted_text_member(&mut zw, opts, path, body, export_redactor)?;
         }
 
         if !delegation_index.is_empty() {
             let path = format!("{DELEGATIONS_DIR}/index.json");
-            zw.start_file(&path, opts)
-                .with_context(|| format!("zip: delegation index `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&delegation_index)?.as_bytes())
-                .context("zip: writing delegation index")?;
+            write_redacted_json_member(
+                &mut zw,
+                opts,
+                &path,
+                &Value::Array(delegation_index.clone()),
+                export_redactor,
+            )?;
         }
 
         if !delegation_payload_index.is_empty() {
+            // PRESCRUBBED: each entry's metadata was scrubbed exactly once at
+            // collection, and its boundary-safe `excerpt` was inserted after that
+            // scrub, so this member must NOT be re-scrubbed by the funnel.
             let path = format!("{DELEGATION_PAYLOADS_DIR}/index.json");
-            zw.start_file(&path, opts)
-                .with_context(|| format!("zip: delegation payload index `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&delegation_payload_index)?.as_bytes())
-                .context("zip: writing delegation payload index")?;
+            write_prescrubbed_json_member(
+                &mut zw,
+                opts,
+                &path,
+                &Value::Array(delegation_payload_index.clone()),
+            )?;
         }
         if !delegation_steer_index.is_empty() {
             let path = format!("{DELEGATION_STEERS_DIR}/index.json");
-            zw.start_file(&path, opts)
-                .with_context(|| format!("zip: delegation steer index `{path}`"))?;
-            zw.write_all(serde_json::to_string_pretty(&delegation_steer_index)?.as_bytes())
-                .context("zip: writing delegation steer index")?;
+            write_redacted_json_member(
+                &mut zw,
+                opts,
+                &path,
+                &Value::Array(delegation_steer_index.clone()),
+                export_redactor,
+            )?;
         }
         for (path, body) in &delegation_payload_files {
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: delegation payload entry `{path}`"))?;
-            zw.write_all(body.as_bytes())
-                .with_context(|| format!("zip: writing delegation payload `{path}`"))?;
+            write_redacted_text_member(&mut zw, opts, path, body, export_redactor)?;
         }
 
         // Config copy: a deep-merged effective extended-config plus untouched
-        // raw per-layer trees, every file scrubbed through the same redaction
-        // table the inference bodies pass through (debug bundles must never
-        // leak credentials). Always writes at least a marker so `config/`
-        // exists even on a machine with no cockpit config on disk.
+        // raw per-layer trees. Each body was structurally sanitized AND value
+        // scrubbed exactly once at collection (`config_entries_from_layers`), so
+        // it is written PRESCRUBBED — the funnel must not re-scrub it. Always
+        // writes at least a marker so `config/` exists even on a machine with no
+        // cockpit config on disk.
         for (path, body) in &config_entries {
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: config entry `{path}`"))?;
-            zw.write_all(body.as_bytes())
-                .with_context(|| format!("zip: writing config `{path}`"))?;
+            write_prescrubbed_text_member(&mut zw, opts, path, body)?;
         }
 
         // Explicit approval snapshot: `events.json` records decisions as
         // they happened, but persisted grants are what explain why a later
         // tool did not prompt. Keep them separate from raw config copies so
-        // audits have a stable, direct place to inspect.
+        // audits have a stable, direct place to inspect. Scrubbed through the
+        // same funnel: a persisted grant can name a token-bearing command/path.
         for (path, body) in &approval_entries {
-            zw.start_file(path, opts)
-                .with_context(|| format!("zip: approvals entry `{path}`"))?;
-            zw.write_all(body.as_bytes())
-                .with_context(|| format!("zip: writing approvals `{path}`"))?;
+            write_redacted_text_member(&mut zw, opts, path, body, export_redactor)?;
         }
 
         zw.finish().context("zip: finalizing archive")?;
@@ -1735,65 +1827,6 @@ fn tool_provider_identity_json(tool_call: &ToolCallEvent) -> Result<Value> {
     }))
 }
 
-fn process_env_map() -> HashMap<String, String> {
-    std::env::vars_os()
-        .map(|(name, value)| {
-            (
-                name.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
-        .collect()
-}
-
-/// Public alias for [`process_env_map`] so the daemon dispatch can build the
-/// environment map inside a read connection without duplicating the env
-/// collection logic. The transcript JSON export shares this with the ZIP path.
-pub fn process_env_map_for_conn() -> HashMap<String, String> {
-    process_env_map()
-}
-
-/// Build the export redaction table for a single session. This is the same
-/// non-bypassable redactor used by the debug ZIP path; the transcript JSON
-/// export shares it so both artifacts consume one portable redaction policy.
-///
-/// The table is built from the target session's project root (its live
-/// dotenv / SSH-key / stored-credential scan) and the environment map passed
-/// in, unioned with the session's persisted redaction-table union (the
-/// `sessions.redaction_table_json` column, or the `redaction_table` vault item
-/// after activation), and returned as the **enforced** view so
-/// `redact.enabled = false` never disables export scrubbing and the
-/// inference-time provider-trust decision never relaxes it. Fails closed if
-/// the persisted or vault JSON cannot be parsed.
-///
-/// NOTE: `protected_redaction_history` journal rows are not yet folded in here.
-/// Doing so requires threading a `RedactionKeyResolver` through the export read
-/// transaction (and, for the RPC path, moving transcript assembly out of
-/// dispatch); that journal-backed inventory is a follow-up. Rotated/deleted
-/// secrets are covered here only insofar as they remain in the persisted union.
-pub fn redaction_table_for_session(
-    _db: &Db,
-    target: &SessionRow,
-    env: &HashMap<String, String>,
-    vault: &crate::secure_key::SecretVault,
-) -> Result<RedactionTable> {
-    let store =
-        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
-    export_redaction_table_with_env(Some(vault), Some(&store), None, target, env)
-}
-
-/// Compatibility wrapper: vault load happens on `db`, not the open connection,
-/// so this must not be called while holding a `db.read` lock.
-pub fn redaction_table_for_session_conn(
-    db: &Db,
-    _conn: &Connection,
-    target: &SessionRow,
-    env: &HashMap<String, String>,
-    vault: &crate::secure_key::SecretVault,
-) -> Result<RedactionTable> {
-    redaction_table_for_session(db, target, env, vault)
-}
-
 /// Recursively scrub every JSON string value (and nested object/array value)
 /// through the export redaction table. This is the same scrub the debug ZIP
 /// applies to every member; the transcript JSON export shares it so the RPC
@@ -1842,29 +1875,13 @@ fn session_persisted_or_vault_redaction_json(
     }
 }
 
-fn export_redaction_table_with_env(
-    vault: Option<&crate::secure_key::SecretVault>,
-    store: Option<&crate::credentials::CredentialStore>,
-    conn: Option<&Connection>,
-    target: &SessionRow,
-    env: &HashMap<String, String>,
-) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(
-        vault,
-        store,
-        conn,
-        target,
-        std::slice::from_ref(target),
-        env,
-    )
-}
-
 /// The non-bypassable export redactor for a whole bundle: the target project's
 /// live scan unioned with **every** bundled session's persisted redaction-table
 /// union, forced enforced. Every bundled session's historically-persisted
 /// entries are included, so a secret the bundle's sessions saw is scrubbed even
 /// if it has since been rotated out of the live environment. Fails closed on
 /// any unparseable persisted table.
+#[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_bundle(
     vault: Option<&crate::secure_key::SecretVault>,
     store: Option<&crate::credentials::CredentialStore>,
@@ -1872,10 +1889,14 @@ fn export_redaction_table_for_bundle(
     target: &SessionRow,
     bundle: &[SessionRow],
     env: &HashMap<String, String>,
+    resolver: &dyn crate::redact::protected_redaction_history::RedactionKeyResolver,
 ) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(vault, store, conn, target, bundle, env)
+    // The debug bundle folds history IN-SNAPSHOT via the resolver so the folded
+    // set equals the assembled set (`bundle` was discovered on the same `conn`).
+    export_redaction_table_for_sessions(vault, store, conn, target, bundle, env, Some(resolver))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_redaction_table_for_sessions(
     vault: Option<&crate::secure_key::SecretVault>,
     store: Option<&crate::credentials::CredentialStore>,
@@ -1883,6 +1904,7 @@ fn export_redaction_table_for_sessions(
     target: &SessionRow,
     sessions: &[SessionRow],
     env: &HashMap<String, String>,
+    resolver: Option<&dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
 ) -> Result<RedactionTable> {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
@@ -1908,6 +1930,41 @@ fn export_redaction_table_for_sessions(
         table = table
             .union(&persisted)
             .context("unioning persisted redaction table into export table")?;
+    }
+    // Fold the `protected_redaction_history` journal literals. This is what keeps
+    // a disk-derived (.env / SSH) secret scrubbed after it has been rotated or
+    // deleted from the live scan AND aged out of the persisted table: only the
+    // encrypted journal still holds it, and it is added here as a forced literal
+    // so it is scrubbed from every export member. The rehydration runs
+    // SYNCHRONOUSLY from the SAME read snapshot (`conn`) that discovered
+    // `sessions` and assembles them, so the folded literals correspond exactly to
+    // the sessions this snapshot ships — no discover-then-assemble TOCTOU. Both
+    // the debug bundle (multi-session) and the redacted transcript (single
+    // session) supply a warm `resolver`.
+    if let Some(resolver) = resolver {
+        let conn = conn.context("in-snapshot history fold requires a read connection")?;
+        for session in sessions {
+            let literals =
+                crate::redact::protected_redaction_history::rehydrate_session_literals_conn(
+                    resolver,
+                    conn,
+                    &session.session_id.to_string(),
+                )
+                .with_context(|| {
+                    format!(
+                        "rehydrating protected redaction history for session {}",
+                        session.session_id
+                    )
+                })?;
+            for literal in literals {
+                table = table
+                    .with_forced_literal(
+                        literal.to_string(),
+                        "protected_redaction_history".to_string(),
+                    )
+                    .context("folding protected redaction history literal into export table")?;
+            }
+        }
     }
     // Always the enforced view: `redact.enabled = false` never affects export
     // output. Config still supplies the placeholder, denylist, allowlist, and
@@ -1966,6 +2023,80 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
 
 fn redact_string_for_export(value: String, redactor: &RedactionTable) -> String {
     redactor.scrub(&value)
+}
+
+/// The scrub funnel for a JSON member whose content is collected RAW.
+///
+/// Recursively scrubs the value through `redactor` EXACTLY ONCE immediately
+/// before serialization, so no generated-artifact builder can emit a raw member
+/// while nothing is scrubbed twice. On the raw `--include-sensitive` path the
+/// redactor is [`RedactionTable::empty`] (a no-op matcher), so this is correct
+/// for both modes without a branch. The counterpart [`write_prescrubbed_json_member`]
+/// exists for content that MUST be scrubbed at collection (a truncated preview
+/// whose boundary a whole-literal matcher could not fix): route that content
+/// through the prescrubbed writer so it is not double-scrubbed here. Never write
+/// a JSON member with a raw `write_all(to_string_pretty(..))` — one of these two
+/// helpers must own every JSON member so it is scrubbed exactly once.
+fn write_redacted_json_member<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    opts: SimpleFileOptions,
+    path: &str,
+    value: &Value,
+    redactor: &RedactionTable,
+) -> Result<()> {
+    let mut value = value.clone();
+    redact_value_for_export(&mut value, redactor);
+    write_prescrubbed_json_member(zw, opts, path, &value)
+}
+
+/// Write a JSON member whose content was ALREADY scrubbed exactly once at
+/// collection. Skips the scrub so the content is not double-scrubbed (a second
+/// `replace_all` pass over an inserted placeholder could re-match a literal that
+/// is a substring of the placeholder and mangle it). The caller is responsible
+/// for having scrubbed every secret-bearing field of `value` exactly once.
+fn write_prescrubbed_json_member<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    opts: SimpleFileOptions,
+    path: &str,
+    value: &Value,
+) -> Result<()> {
+    zw.start_file(path, opts)
+        .with_context(|| format!("zip: entry `{path}`"))?;
+    zw.write_all(serde_json::to_string_pretty(value)?.as_bytes())
+        .with_context(|| format!("zip: writing `{path}`"))?;
+    Ok(())
+}
+
+/// Text-body analogue of [`write_redacted_json_member`] for members that are
+/// already serialized to a string (config copies, pre-rendered bodies, the
+/// approvals snapshot). The whole text is scrubbed through the same redactor so
+/// a secret literal embedded in a serialized body cannot ride out raw.
+fn write_redacted_text_member<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    opts: SimpleFileOptions,
+    path: &str,
+    body: &str,
+    redactor: &RedactionTable,
+) -> Result<()> {
+    let body = redact_string_for_export(body.to_string(), redactor);
+    write_prescrubbed_text_member(zw, opts, path, &body)
+}
+
+/// Text analogue of [`write_prescrubbed_json_member`]: write a body that was
+/// ALREADY scrubbed exactly once at collection (the config copies are structurally
+/// sanitized and value-scrubbed as they are read). Skips the scrub so the body is
+/// not double-scrubbed.
+fn write_prescrubbed_text_member<W: Write + Seek>(
+    zw: &mut ZipWriter<W>,
+    opts: SimpleFileOptions,
+    path: &str,
+    body: &str,
+) -> Result<()> {
+    zw.start_file(path, opts)
+        .with_context(|| format!("zip: entry `{path}`"))?;
+    zw.write_all(body.as_bytes())
+        .with_context(|| format!("zip: writing `{path}`"))?;
+    Ok(())
 }
 
 /// Format an epoch-seconds timestamp as an ISO-8601 / RFC 3339 UTC string.

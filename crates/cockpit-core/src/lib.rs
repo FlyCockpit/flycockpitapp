@@ -75,6 +75,7 @@ pub mod redact;
 pub mod remote_daemon_identity_custody;
 pub mod remote_webrtc_endpoint;
 pub mod sealed;
+pub mod secret_command;
 pub(crate) mod secret_ownership;
 pub mod secret_paths;
 pub mod secret_ref;

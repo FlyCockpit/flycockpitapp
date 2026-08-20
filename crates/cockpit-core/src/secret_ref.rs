@@ -705,6 +705,24 @@ mod tests {
         );
     }
 
+    // AC10: the daemon command-secret executor/cache is generic — a preset that
+    // maps a product toggle (e.g. "use the platform CLI token") to a concrete
+    // argv lives in the UI layer, never in the resolution module.
+    #[test]
+    fn secret_command_module_has_no_provider_preset_strings() {
+        let src = include_str!("secret_command.rs").to_ascii_lowercase();
+        assert!(
+            !src.contains("copilot"),
+            "secret_command.rs must not name a provider preset"
+        );
+        for token in src.split(|c: char| !c.is_ascii_alphanumeric()) {
+            assert_ne!(
+                token, "gh",
+                "secret_command.rs must not name the gh CLI; presets live in the UI"
+            );
+        }
+    }
+
     #[test]
     fn protect_literal_headers_without_candidates_does_not_open_store() {
         let mut providers = BTreeMap::from([(

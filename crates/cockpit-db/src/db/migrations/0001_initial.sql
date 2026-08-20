@@ -5043,6 +5043,7 @@ CREATE TABLE secret_vault_items (
         'sealed_state',
         'credential_record',
         'named_secret',
+        'command_secret',
         'subscription_ack',
         'sealed_compartment',
         'session_sealed_value',
@@ -5075,6 +5076,12 @@ CREATE TABLE secret_vault_inventory_state (
     generation INTEGER NOT NULL CHECK (generation >= 1)
 );
 INSERT INTO secret_vault_inventory_state (id, generation) VALUES (1, 1);
+-- `command_secret` is intentionally EXCLUDED from these inventory-generation
+-- triggers: it is storage-only until its wire kind + inventory read path land
+-- together (command-backed secret inc4). Nothing can enumerate a command secret
+-- yet, so its mutations must not advance the inventory cursor (which would churn
+-- the version / conflict paginated reads for an invisible kind). Add it to all
+-- three WHEN clauses in the same change that makes it inventory-visible.
 CREATE TRIGGER secret_vault_inventory_insert_generation
 AFTER INSERT ON secret_vault_items
 WHEN NEW.kind IN ('named_secret', 'credential_record', 'subscription_ack')

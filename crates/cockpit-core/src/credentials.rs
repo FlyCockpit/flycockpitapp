@@ -52,9 +52,39 @@ enum CredentialBackend {
 pub struct CredentialStore {
     backend: CredentialBackend,
     records: BTreeMap<String, Value>,
+    /// Resolved named-secret values: literal specs, plus any command-backed
+    /// output the daemon has injected in-memory for this session
+    /// (`inject_resolved_command_output`). Sync `$secret:` lookups read this
+    /// map, so an unresolved command secret is simply absent (= missing) and no
+    /// lookup ever executes a process.
     secrets: BTreeMap<String, String>,
+    /// Command-backed named-secret specs (argv). This is non-secret vault
+    /// metadata; it never carries the resolved output and is never fed to the
+    /// redaction table.
+    command_specs: BTreeMap<String, Vec<String>>,
     record_mutations: Vec<RecordMutation>,
     secret_mutations: Vec<SecretMutation>,
+}
+
+/// Serialize a command spec (argv) to the bytes stored under the
+/// [`SecretVaultKind::Command`] vault item. The payload is ONLY the argv — a
+/// non-secret spec — never the resolved output. The distinct vault kind (not a
+/// marker inside a `NamedSecret` payload) is what keeps a literal secret from
+/// ever being interpreted — and executed — as a command.
+fn command_spec_payload(command: &[String]) -> Result<Vec<u8>> {
+    serde_json::to_vec(command).context("serializing command-backed secret spec")
+}
+
+/// Parse the argv stored under a [`SecretVaultKind::Command`] vault item. Fails
+/// CLOSED: a malformed payload or an empty argv is an error, never a silent
+/// fallback to a usable secret value.
+fn parse_command_spec_payload(bytes: &[u8]) -> Result<Vec<String>> {
+    let argv: Vec<String> =
+        serde_json::from_slice(bytes).context("parsing command-backed secret spec")?;
+    if argv.is_empty() {
+        anyhow::bail!("command-backed secret spec has an empty argv");
+    }
+    Ok(argv)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -77,18 +107,29 @@ enum RecordMutation {
 
 #[derive(Debug, Clone)]
 enum SecretMutation {
+    /// Write a literal under [`SecretVaultKind::NamedSecret`].
     Set(String, String),
+    /// Write an argv spec under [`SecretVaultKind::Command`].
+    SetCommand(String, Vec<String>),
+    /// Delete the name under BOTH kinds (public `remove_named_secret`).
     Remove(String),
+    /// Delete the literal (`NamedSecret`) item only — used when a command spec
+    /// takes over a name that was previously a literal.
+    RemoveLiteral(String),
+    /// Delete the command (`Command`) item only — used when a literal takes over
+    /// a name that was previously command-backed.
+    RemoveCommand(String),
 }
 
 impl CredentialStore {
     /// Production constructor: vault-backed facade.
     pub fn from_vault(vault: Arc<SecretVault>) -> Result<Self> {
-        let (records, secrets) = load_from_vault(&vault)?;
+        let contents = load_from_vault(&vault)?;
         Ok(Self {
             backend: CredentialBackend::Vault(vault),
-            records,
-            secrets,
+            records: contents.records,
+            secrets: contents.secrets,
+            command_specs: contents.command_specs,
             record_mutations: Vec::new(),
             secret_mutations: Vec::new(),
         })
@@ -133,8 +174,19 @@ impl CredentialStore {
         referenced_names: &BTreeSet<String>,
         foreign_scope_references: Option<&BTreeSet<String>>,
     ) -> Result<Self> {
-        let (all_records, all_secrets) = load_from_vault(&vault)?;
-        let present: BTreeSet<String> = all_secrets.keys().cloned().collect();
+        let VaultContents {
+            records: all_records,
+            secrets: all_secrets,
+            command_specs: all_command_specs,
+        } = load_from_vault(&vault)?;
+        // Command-backed and literal named secrets share one ownership
+        // namespace, so scoping must consider both when deciding which names
+        // this owner may resolve.
+        let present: BTreeSet<String> = all_secrets
+            .keys()
+            .chain(all_command_specs.keys())
+            .cloned()
+            .collect();
         let scoped_names = crate::secret_ownership::scope_named_secret_ownership(
             vault.db(),
             owner_kind,
@@ -144,6 +196,10 @@ impl CredentialStore {
             foreign_scope_references,
         )?;
         let secrets = all_secrets
+            .into_iter()
+            .filter(|(name, _)| scoped_names.contains(name))
+            .collect();
+        let command_specs = all_command_specs
             .into_iter()
             .filter(|(name, _)| scoped_names.contains(name))
             .collect();
@@ -161,6 +217,7 @@ impl CredentialStore {
             backend: CredentialBackend::Vault(vault),
             records,
             secrets,
+            command_specs,
             record_mutations: Vec::new(),
             secret_mutations: Vec::new(),
         })
@@ -183,6 +240,9 @@ impl CredentialStore {
             backend: CredentialBackend::LegacyFile { path },
             records: data.records,
             secrets: data.secrets,
+            // The test-only leftover file has no vault-kind namespace, so it
+            // carries literal named secrets only; command specs are vault-only.
+            command_specs: BTreeMap::new(),
             record_mutations: Vec::new(),
             secret_mutations: Vec::new(),
         })
@@ -207,6 +267,7 @@ impl CredentialStore {
             backend: CredentialBackend::LegacyFile { path },
             records: data.records,
             secrets: data.secrets,
+            command_specs: BTreeMap::new(),
             record_mutations: Vec::new(),
             secret_mutations: Vec::new(),
         })
@@ -249,12 +310,75 @@ impl CredentialStore {
     pub fn set_named_secret(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
+        // Setting a literal replaces any command spec of the same name; delete
+        // the stale `Command` vault item so a name is only ever under one kind.
+        let was_command = self.command_specs.remove(&name).is_some();
         self.secrets.insert(name.clone(), value.clone());
+        if was_command {
+            self.secret_mutations
+                .push(SecretMutation::RemoveCommand(name.clone()));
+        }
         self.secret_mutations.push(SecretMutation::Set(name, value));
+    }
+
+    /// Stage a command-backed spec (argv) for `name`. The argv is non-secret
+    /// vault metadata; the resolved output is never stored. A well-formed spec
+    /// has at least a program.
+    pub fn set_named_secret_command(
+        &mut self,
+        name: impl Into<String>,
+        command: Vec<String>,
+    ) -> Result<()> {
+        let name = name.into();
+        if command.is_empty() {
+            anyhow::bail!("command-backed secret spec must have at least one argument");
+        }
+        // Setting a command spec replaces any literal (and any stale resolved
+        // output injected into `secrets`) of the same name; delete the stale
+        // `NamedSecret` vault item so a name is only ever under one kind.
+        let was_literal = self.secrets.remove(&name).is_some();
+        self.command_specs.insert(name.clone(), command.clone());
+        if was_literal {
+            self.secret_mutations
+                .push(SecretMutation::RemoveLiteral(name.clone()));
+        }
+        self.secret_mutations
+            .push(SecretMutation::SetCommand(name, command));
+        Ok(())
+    }
+
+    /// The command spec (argv) for `name`, if it is command-backed.
+    pub fn named_secret_command_spec(&self, name: &str) -> Option<&[String]> {
+        self.command_specs.get(name).map(Vec::as_slice)
+    }
+
+    /// Whether `name` is a command-backed secret.
+    pub fn is_command_secret(&self, name: &str) -> bool {
+        self.command_specs.contains_key(name)
+    }
+
+    /// Every command-backed secret name and its argv spec.
+    pub fn command_secret_specs(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.command_specs
+            .iter()
+            .map(|(name, argv)| (name.as_str(), argv.as_slice()))
+    }
+
+    /// Inject a resolved command-backed output into the in-memory secret view
+    /// so `$secret:<name>` header expansion and the redaction table can see it.
+    ///
+    /// This is IN-MEMORY ONLY: it never stages a mutation, so `save` can never
+    /// persist a resolved command output to the vault. The command spec remains
+    /// the durable record.
+    pub fn inject_resolved_command_output(&mut self, name: &str, value: String) {
+        if self.command_specs.contains_key(name) {
+            self.secrets.insert(name.to_string(), value);
+        }
     }
 
     pub fn remove_named_secret(&mut self, name: &str) {
         self.secrets.remove(name);
+        self.command_specs.remove(name);
         self.secret_mutations
             .push(SecretMutation::Remove(name.to_string()));
     }
@@ -315,9 +439,10 @@ impl CredentialStore {
         match &self.backend {
             CredentialBackend::Vault(vault) => {
                 save_mutations_to_vault(vault, &self.record_mutations, &self.secret_mutations)?;
-                let (records, secrets) = load_from_vault(vault)?;
-                self.records = records;
-                self.secrets = secrets;
+                let contents = load_from_vault(vault)?;
+                self.records = contents.records;
+                self.secrets = contents.secrets;
+                self.command_specs = contents.command_specs;
                 self.record_mutations.clear();
                 self.secret_mutations.clear();
                 Ok(())
@@ -340,12 +465,19 @@ impl CredentialStore {
                         }
                     }
                 }
+                // The leftover file is literal-only (no vault-kind namespace),
+                // so command specs are never persisted through this test-only
+                // backend; their mutations only affect the literal `$secrets`
+                // map by removing any shadowing literal.
                 for mutation in &self.secret_mutations {
                     match mutation {
                         SecretMutation::Set(name, value) => {
                             latest.secrets.insert(name.clone(), value.clone());
                         }
-                        SecretMutation::Remove(name) => {
+                        SecretMutation::SetCommand(_name, _command) => {}
+                        SecretMutation::Remove(name)
+                        | SecretMutation::RemoveLiteral(name)
+                        | SecretMutation::RemoveCommand(name) => {
                             latest.secrets.remove(name);
                         }
                     }
@@ -489,9 +621,14 @@ fn record_kind(id: &str) -> SecretVaultKind {
     }
 }
 
-fn load_from_vault(
-    vault: &SecretVault,
-) -> Result<(BTreeMap<String, Value>, BTreeMap<String, String>)> {
+/// The materialized contents of the vault relevant to the credential facade.
+struct VaultContents {
+    records: BTreeMap<String, Value>,
+    secrets: BTreeMap<String, String>,
+    command_specs: BTreeMap<String, Vec<String>>,
+}
+
+fn load_from_vault(vault: &SecretVault) -> Result<VaultContents> {
     let mut records = BTreeMap::new();
     for kind in [
         SecretVaultKind::CredentialRecord,
@@ -521,7 +658,28 @@ fn load_from_vault(
             .with_context(|| format!("named secret {id} is not UTF-8"))?;
         secrets.insert(id, value);
     }
-    Ok((records, secrets))
+    // Command-backed specs live under their own authenticated vault kind. Their
+    // resolved output is NEVER stored, so a command name never appears in
+    // `secrets` here — a sync lookup of an unresolved command secret is missing
+    // until the daemon injects a resolution. A malformed spec fails CLOSED (the
+    // load errors) rather than degrading into a usable literal.
+    let mut command_specs = BTreeMap::new();
+    for id in vault
+        .list_item_ids(SecretVaultKind::Command)
+        .map_err(|e| anyhow::anyhow!("listing command-secret vault items: {e}"))?
+    {
+        let secret = vault
+            .get_item(SecretVaultKind::Command, &id)
+            .map_err(|e| anyhow::anyhow!("reading command-secret vault item: {e}"))?;
+        let argv = parse_command_spec_payload(secret.as_slice())
+            .with_context(|| format!("parsing command secret {id}"))?;
+        command_specs.insert(id, argv);
+    }
+    Ok(VaultContents {
+        records,
+        secrets,
+        command_specs,
+    })
 }
 
 fn save_mutations_to_vault(
@@ -552,10 +710,33 @@ fn save_mutations_to_vault(
                     .put_item(SecretVaultKind::NamedSecret, name, value.as_bytes())
                     .map_err(|e| anyhow::anyhow!("writing named-secret vault item: {e}"))?;
             }
+            SecretMutation::SetCommand(name, command) => {
+                // The vault item carries ONLY the argv spec; the resolved output
+                // is never persisted.
+                let payload = command_spec_payload(command)?;
+                vault
+                    .put_item(SecretVaultKind::Command, name, &payload)
+                    .map_err(|e| anyhow::anyhow!("writing command-secret vault item: {e}"))?;
+            }
             SecretMutation::Remove(name) => {
+                // A name is only ever under one kind; delete from both so a
+                // public removal cannot leave a stale item behind.
                 vault
                     .delete_item(SecretVaultKind::NamedSecret, name)
                     .map_err(|e| anyhow::anyhow!("deleting named-secret vault item: {e}"))?;
+                vault
+                    .delete_item(SecretVaultKind::Command, name)
+                    .map_err(|e| anyhow::anyhow!("deleting command-secret vault item: {e}"))?;
+            }
+            SecretMutation::RemoveLiteral(name) => {
+                vault
+                    .delete_item(SecretVaultKind::NamedSecret, name)
+                    .map_err(|e| anyhow::anyhow!("deleting named-secret vault item: {e}"))?;
+            }
+            SecretMutation::RemoveCommand(name) => {
+                vault
+                    .delete_item(SecretVaultKind::Command, name)
+                    .map_err(|e| anyhow::anyhow!("deleting command-secret vault item: {e}"))?;
             }
         }
     }
@@ -743,6 +924,231 @@ mod tests {
         let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
         store.set_named_secret(name, value);
         store.save().unwrap();
+    }
+
+    #[test]
+    fn command_spec_persists_without_resolved_value() {
+        let (db, vault) = vault_backed();
+        // The value the command WOULD emit. It is never handed to storage.
+        let planted_token = "sk-resolved-plant-should-never-persist-999";
+        let argv = vec!["fetch-token-binary".to_string(), "--json".to_string()];
+
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+        store.set_named_secret_command("cmd", argv.clone()).unwrap();
+        store.save().unwrap();
+
+        // Reopen from the vault: the spec round-trips, and there is no resolved
+        // value (a command secret is unresolved until the daemon runs it).
+        let reopened = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(
+            reopened.named_secret_command_spec("cmd"),
+            Some(argv.as_slice())
+        );
+        assert_eq!(
+            reopened.named_secret("cmd"),
+            None,
+            "an unresolved command secret must be missing to a sync lookup"
+        );
+
+        // The spec lives under its own vault kind, and its decrypted payload
+        // carries the argv, never the token.
+        let payload = vault.get_item(SecretVaultKind::Command, "cmd").unwrap();
+        let payload_str = String::from_utf8(payload.as_slice().to_vec()).unwrap();
+        assert!(payload_str.contains("fetch-token-binary"), "{payload_str}");
+        assert!(!payload_str.contains(planted_token));
+        // There is NO literal `NamedSecret` item for this name — so a literal
+        // reader can never treat the spec as a value.
+        assert!(
+            vault.get_item(SecretVaultKind::NamedSecret, "cmd").is_err(),
+            "a command secret must not create a literal named-secret item"
+        );
+
+        // No raw DB row anywhere contains the planted token, and the row that
+        // holds the spec is tagged with the command kind (metadata visible
+        // without decrypting any literal).
+        let (rows_contain_token, kinds) = db
+            .blocking_read_for_sync_ui(move |conn| {
+                let mut stmt = conn.prepare("SELECT kind, ciphertext FROM secret_vault_items")?;
+                let mut any_token = false;
+                let mut kinds = Vec::new();
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let kind: String = row.get(0)?;
+                    let bytes: Vec<u8> = row.get(1)?;
+                    if bytes
+                        .windows(planted_token.len())
+                        .any(|w| w == planted_token.as_bytes())
+                    {
+                        any_token = true;
+                    }
+                    kinds.push(kind);
+                }
+                Ok((any_token, kinds))
+            })
+            .unwrap();
+        assert!(!rows_contain_token, "planted token must never reach the DB");
+        assert!(
+            kinds.iter().any(|k| k == "command_secret"),
+            "the spec row must carry the command_secret kind: {kinds:?}"
+        );
+    }
+
+    // The literal→command execution collision the reviewers flagged is
+    // structurally impossible now: a literal whose bytes happen to look like a
+    // command payload is stored under the NamedSecret kind and only ever loaded
+    // as a literal — never as an executable command spec.
+    #[test]
+    fn literal_that_looks_like_a_command_payload_never_becomes_a_command() {
+        let (_db, vault) = vault_backed();
+        // Exactly the JSON a command spec serializes to.
+        let literal = r#"["/bin/sh","-c","rm -rf /"]"#;
+        put_named(&vault, "trap", literal);
+        let store = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(
+            store.named_secret("trap"),
+            Some(literal),
+            "a literal must round-trip as its exact bytes"
+        );
+        assert!(
+            store.named_secret_command_spec("trap").is_none(),
+            "a literal must never be interpreted as a command spec"
+        );
+    }
+
+    #[test]
+    fn literal_replaces_command_and_deletes_the_command_item() {
+        let (_db, vault) = vault_backed();
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+        store
+            .set_named_secret_command("shared", vec!["prog".to_string()])
+            .unwrap();
+        store.save().unwrap();
+        // Now overwrite with a literal.
+        store.set_named_secret("shared", "now-a-literal-value-9999");
+        store.save().unwrap();
+        let reopened = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(
+            reopened.named_secret("shared"),
+            Some("now-a-literal-value-9999")
+        );
+        assert!(reopened.named_secret_command_spec("shared").is_none());
+        // The old command item must be gone (not two items for one name).
+        assert!(
+            vault.get_item(SecretVaultKind::Command, "shared").is_err(),
+            "switching to a literal must delete the stale command item"
+        );
+    }
+
+    #[test]
+    fn injected_command_output_is_visible_but_never_persisted() {
+        let (_db, vault) = vault_backed();
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+        store
+            .set_named_secret_command("cmd", vec!["prog".to_string()])
+            .unwrap();
+        store.save().unwrap();
+
+        let mut session = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(session.named_secret("cmd"), None);
+        session.inject_resolved_command_output("cmd", "resolved-xyz".to_string());
+        assert_eq!(
+            session.named_secret("cmd"),
+            Some("resolved-xyz"),
+            "an injected resolution must be visible to header expansion + redaction"
+        );
+
+        // Injection stages no mutation, so a save must not persist the output.
+        session.save().unwrap();
+        let reopened = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(
+            reopened.named_secret("cmd"),
+            None,
+            "a resolved command output must never be persisted"
+        );
+        assert!(reopened.named_secret_command_spec("cmd").is_some());
+    }
+
+    #[test]
+    fn literal_secret_stays_raw_bytes_and_is_not_a_command() {
+        let (_db, vault) = vault_backed();
+        put_named(&vault, "lit", "Bearer sk-plain-literal-value-123456");
+        let store = CredentialStore::from_vault(vault.clone()).unwrap();
+        assert_eq!(
+            store.named_secret("lit"),
+            Some("Bearer sk-plain-literal-value-123456")
+        );
+        assert!(store.named_secret_command_spec("lit").is_none());
+        // Backward-compat: a literal is still stored verbatim (no envelope).
+        let payload = vault.get_item(SecretVaultKind::NamedSecret, "lit").unwrap();
+        assert_eq!(
+            payload.as_slice(),
+            b"Bearer sk-plain-literal-value-123456".as_slice()
+        );
+    }
+
+    #[test]
+    fn command_replaces_literal_and_clears_resolved_view() {
+        let (_db, vault) = vault_backed();
+        let mut store = CredentialStore::from_vault(vault.clone()).unwrap();
+        store.set_named_secret("shared", "old-literal-value-abcdef");
+        store.save().unwrap();
+        assert_eq!(
+            store.named_secret("shared"),
+            Some("old-literal-value-abcdef")
+        );
+        store
+            .set_named_secret_command("shared", vec!["prog".to_string()])
+            .unwrap();
+        // Switching to a command spec drops the literal resolved view.
+        assert_eq!(store.named_secret("shared"), None);
+        assert!(store.named_secret_command_spec("shared").is_some());
+        store.save().unwrap();
+        let reopened = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(reopened.named_secret("shared"), None);
+        assert_eq!(
+            reopened.named_secret_command_spec("shared"),
+            Some(["prog".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn empty_command_spec_is_rejected() {
+        let (_db, vault) = vault_backed();
+        let mut store = CredentialStore::from_vault(vault).unwrap();
+        assert!(store.set_named_secret_command("cmd", Vec::new()).is_err());
+    }
+
+    // Fail-closed on the LOAD path: a corrupt command-spec payload written
+    // directly under the Command vault kind must error the load — it must NEVER
+    // silently degrade into a usable literal secret.
+    #[test]
+    fn malformed_command_payload_fails_closed_on_load() {
+        let (_db, vault) = vault_backed();
+        // Not valid JSON at all.
+        vault
+            .put_item(
+                SecretVaultKind::Command,
+                "corrupt",
+                b"not-json-\xff-garbage",
+            )
+            .unwrap();
+        assert!(
+            CredentialStore::from_vault(vault).is_err(),
+            "a malformed command spec must fail the load closed, not become a literal"
+        );
+    }
+
+    #[test]
+    fn empty_argv_command_payload_fails_closed_on_load() {
+        let (_db, vault) = vault_backed();
+        // Well-formed JSON, but an empty argv is not a runnable spec.
+        vault
+            .put_item(SecretVaultKind::Command, "empty", b"[]")
+            .unwrap();
+        assert!(
+            CredentialStore::from_vault(vault).is_err(),
+            "an empty-argv command spec must fail the load closed"
+        );
     }
 
     fn insert_ownership(db: &crate::db::Db, item_id: &str, owner_kind: &str, project_root: &str) {

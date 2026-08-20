@@ -45,6 +45,12 @@ pub enum SecretVaultKind {
     SealedState,
     CredentialRecord,
     NamedSecret,
+    /// Command-backed named secret: the encrypted payload holds ONLY the argv
+    /// spec (non-secret metadata). The resolved output is never persisted. The
+    /// kind is authenticated plaintext metadata, so inventory can distinguish a
+    /// command secret from a literal `NamedSecret` without decrypting any
+    /// literal value.
+    Command,
     SubscriptionAck,
     SealedCompartment,
     SessionSealedValue,
@@ -73,6 +79,7 @@ impl SecretVaultKind {
             Self::SealedState => "sealed_state",
             Self::CredentialRecord => "credential_record",
             Self::NamedSecret => "named_secret",
+            Self::Command => "command_secret",
             Self::SubscriptionAck => "subscription_ack",
             Self::SealedCompartment => "sealed_compartment",
             Self::SessionSealedValue => "session_sealed_value",
@@ -87,6 +94,7 @@ impl SecretVaultKind {
             "sealed_state" => Ok(Self::SealedState),
             "credential_record" => Ok(Self::CredentialRecord),
             "named_secret" => Ok(Self::NamedSecret),
+            "command_secret" => Ok(Self::Command),
             "subscription_ack" => Ok(Self::SubscriptionAck),
             "sealed_compartment" => Ok(Self::SealedCompartment),
             "session_sealed_value" => Ok(Self::SessionSealedValue),
@@ -833,6 +841,65 @@ mod tests {
                 [],
             );
             assert!(err.is_err(), "id != 1 must fail");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn command_kind_round_trips_and_is_storable() {
+        // The distinct command_secret kind must serialize, parse, and pass the
+        // 0001 CHECK constraint. A missing CHECK arm would make the insert fail.
+        assert_eq!(SecretVaultKind::Command.as_str(), "command_secret");
+        assert_eq!(
+            SecretVaultKind::parse("command_secret").unwrap(),
+            SecretVaultKind::Command
+        );
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            insert_key_conn(conn, 1, 1, &[5u8; 12], &[6u8; 48], true)?;
+            upsert_item_conn(conn, SecretVaultKind::Command, "cmd", 1, &[7; 12], &[0; 16])?;
+            let row = load_item_conn(conn, SecretVaultKind::Command, "cmd")?
+                .expect("stored command_secret row");
+            assert_eq!(row.kind, SecretVaultKind::Command);
+            // A literal named secret with the same id is a DIFFERENT item, so a
+            // command spec never shadows or is shadowed by a literal.
+            assert!(load_item_conn(conn, SecretVaultKind::NamedSecret, "cmd")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn command_kind_mutation_does_not_advance_inventory_generation() {
+        // command_secret is storage-only until its wire kind + inventory read
+        // path land together (inc4). Because nothing can enumerate it yet, its
+        // mutations must NOT advance the durable inventory cursor — otherwise an
+        // invisible kind would churn the inventory version / conflict paginated
+        // reads. A literal named_secret write in the same test proves the
+        // trigger is otherwise live.
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            ensure_inventory_generation_conn(conn)?;
+            insert_key_conn(conn, 1, 1, &[3u8; 12], &[4u8; 48], true)?;
+            let before = inventory_generation_conn(conn)?;
+            upsert_item_conn(conn, SecretVaultKind::Command, "cmd", 1, &[8; 12], &[1; 16])?;
+            assert_eq!(
+                inventory_generation_conn(conn)?,
+                before,
+                "a command-secret mutation must not advance the inventory cursor in inc1"
+            );
+            // Control: a literal named-secret mutation DOES advance it, proving
+            // the trigger is live and the command_secret exclusion is deliberate.
+            upsert_item_conn(
+                conn,
+                SecretVaultKind::NamedSecret,
+                "lit",
+                1,
+                &[9; 12],
+                &[2; 16],
+            )?;
+            assert!(inventory_generation_conn(conn)? > before);
             Ok(())
         })
         .unwrap();

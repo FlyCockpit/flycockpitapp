@@ -2281,6 +2281,14 @@ impl SensitiveWireLiteral {
         Self(zeroize::Zeroizing::new(value))
     }
 
+    /// Wrap an already-zeroizing literal by moving it, with no intermediate
+    /// plaintext copy. The recover reveal path resolves the literal into a
+    /// [`zeroize::Zeroizing`] buffer and hands it straight to the wire type this
+    /// way, so the plaintext never lands in a non-zeroizing `String`.
+    pub fn from_zeroizing(value: zeroize::Zeroizing<String>) -> Self {
+        Self(value)
+    }
+
     /// The plaintext, borrowed. Never log this.
     pub fn as_str(&self) -> &str {
         self.0.as_str()

@@ -2595,10 +2595,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             scope_kind,
             scope_key,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
             // Validate the closed disposition + per-disposition field presence
-            // (a distinct, content-free rejection) before the fail-closed
-            // backing. Never echoes a literal — begin is secret-free.
+            // (a distinct, content-free rejection) before touching the backing.
+            // Never echoes a literal — begin is secret-free.
             validate_sealed_begin_shape(
                 &disposition,
                 record_id.as_deref(),
@@ -2608,39 +2608,197 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 scope_key.as_deref(),
             )
             .map_err(|error| bad_request(error.to_string()))?;
-            Err(sealed_owner_backing_unavailable())
+            let input = build_begin_sensitive_input(
+                &disposition,
+                record_id,
+                name,
+                description,
+                scope_kind,
+                scope_key,
+            )
+            .map_err(|error| bad_request(error.to_string()))?;
+            let directory = sealed_value_directory(ctx);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // `begin` loads/binds the record under owner authority for non-create
+            // dispositions; a missing/foreign row or a name collision is a
+            // content-free client error (no capability is minted).
+            let result = crate::sealed::owner::BeginSensitiveOwnerOperation::begin(
+                owner, &directory, input, now_ms,
+            )
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
+            let capability_id = result.capability.capability_id().to_string();
+            let expires_at_ms = result.expires_at_ms;
+            // Bind the capability to the connection that minted it. Apply/Cancel
+            // from any other connection is rejected fail-closed (AC8). If the
+            // in-memory table is already full of still-valid capabilities, fail
+            // closed rather than grow it without bound: the just-minted
+            // capability is dropped (never stored), so it can never be applied.
+            let minting_session = state.terminal_context.client_instance_id;
+            let stored = ctx.sealed_owner_capabilities.lock().unwrap().insert(
+                result.capability,
+                minting_session,
+                now_ms,
+            );
+            if !stored {
+                return Err(bad_request(
+                    "too many outstanding sealed-owner operations; complete or cancel some first"
+                        .to_string(),
+                ));
+            }
+            Ok(Response::SealedOwnerOperationBegun {
+                capability_id,
+                expires_at_ms,
+            })
         }
         Request::ApplySealedOwnerOperation {
             capability_id,
             literal,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            if capability_id.trim().is_empty() {
-                return Err(bad_request("capability id must not be empty".to_string()));
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let capability_uuid = match uuid::Uuid::parse_str(capability_id.trim()) {
+                Ok(id) => id,
+                Err(_) => {
+                    // Drop the literal (zeroized on drop) before returning.
+                    drop(literal);
+                    return Err(bad_request(
+                        "capability id must be a valid uuid".to_string(),
+                    ));
+                }
+            };
+            // Look up (clone) the stored capability. The single-use flag is an
+            // `Arc<AtomicBool>`, so consuming the clone consumes the stored
+            // capability. An unknown/expired/consumed id fails closed.
+            let stored = ctx
+                .sealed_owner_capabilities
+                .lock()
+                .unwrap()
+                .get(capability_uuid);
+            let Some(stored) = stored else {
+                drop(literal);
+                return Err(bad_request(
+                    "unknown, expired, or already-used sealed-owner capability".to_string(),
+                ));
+            };
+            // AC8: the applying connection must be the minting connection. A
+            // cross-session apply is rejected WITHOUT spending the capability, so
+            // the legitimate minting session can still apply it.
+            if stored.minting_session != state.terminal_context.client_instance_id {
+                drop(literal);
+                return Err(bad_request(
+                    "sealed-owner capability was minted in a different session".to_string(),
+                ));
             }
-            // Fail closed: no capability table, so the literal is dropped
-            // (zeroized on drop) and no store/reveal occurs.
-            drop(literal);
-            Err(sealed_owner_backing_unavailable())
+            let directory = sealed_value_directory(ctx);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let frame_kind = stored.capability.operation().disposition.frame_kind();
+            let outcome = match frame_kind {
+                crate::sealed::owner::SensitiveFrameKind::Write => {
+                    let Some(literal) = literal else {
+                        return Err(bad_request(
+                            "a write/replace/rotate apply requires a literal".to_string(),
+                        ));
+                    };
+                    crate::sealed::owner::SensitiveOwnerFrame::for_write(
+                        &stored.capability,
+                        literal.into_zeroizing(),
+                    )
+                    .apply(owner, &directory, now_ms)
+                    .await
+                }
+                crate::sealed::owner::SensitiveFrameKind::Recover => {
+                    if literal.is_some() {
+                        return Err(bad_request(
+                            "a recover apply must not carry a literal".to_string(),
+                        ));
+                    }
+                    crate::sealed::owner::SensitiveOwnerFrame::for_recover(
+                        &stored.capability,
+                        stored.minting_session.to_string(),
+                    )
+                    .apply(owner, &directory, now_ms)
+                    .await
+                }
+            };
+            // The capability is spent whether the operation succeeded or failed
+            // (the compare-and-swap fired inside `apply`), so drop the table
+            // entry. A recover whose audit commit failed returns `Err` here — no
+            // literal is ever placed on the response (fail closed, AC2).
+            ctx.sealed_owner_capabilities
+                .lock()
+                .unwrap()
+                .remove(capability_uuid);
+            let outcome = outcome.map_err(|error| bad_request(error.to_string()))?;
+            match outcome {
+                crate::sealed::owner::SensitiveFrameOutcome::Contained { .. } => {
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: None,
+                    })
+                }
+                crate::sealed::owner::SensitiveFrameOutcome::Revealed { literal } => {
+                    // Move the resolved plaintext straight into the zeroizing wire
+                    // type; no intermediate non-zeroizing `String` copy.
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: Some(proto::SensitiveWireLiteral::from_zeroizing(
+                            literal,
+                        )),
+                    })
+                }
+            }
         }
         Request::CancelSealedOwnerOperation { capability_id } => {
             let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            if capability_id.trim().is_empty() {
-                return Err(bad_request("capability id must not be empty".to_string()));
+            let capability_uuid = uuid::Uuid::parse_str(capability_id.trim())
+                .map_err(|_| bad_request("capability id must be a valid uuid".to_string()))?;
+            let stored = ctx
+                .sealed_owner_capabilities
+                .lock()
+                .unwrap()
+                .get(capability_uuid);
+            let Some(stored) = stored else {
+                // Unknown/expired/already-spent: cancel is idempotent and safe.
+                return Ok(Response::SealedOwnerOperationCancelled { spent: false });
+            };
+            // Only the minting connection may cancel its capability (fail closed).
+            if stored.minting_session != state.terminal_context.client_instance_id {
+                return Err(bad_request(
+                    "sealed-owner capability was minted in a different session".to_string(),
+                ));
             }
-            Err(sealed_owner_backing_unavailable())
+            // Spend through the same compare-and-swap as apply; `true` only if
+            // this call consumed it (not a replay/double-cancel).
+            let spent = stored.capability.cancel();
+            ctx.sealed_owner_capabilities
+                .lock()
+                .unwrap()
+                .remove(capability_uuid);
+            Ok(Response::SealedOwnerOperationCancelled { spent })
         }
         Request::SealedOwnerInventory {
             scope_kind,
             scope_key,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            if let Some(kind) = scope_kind.as_deref() {
-                parse_sealed_owner_scope_kind(kind)
-                    .map_err(|error| bad_request(error.to_string()))?;
-            }
-            let _ = scope_key;
-            Err(sealed_owner_backing_unavailable())
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            // An optional scope filter narrows the inventory; absent, it is
+            // machine-wide. A malformed filter is a content-free client error.
+            let scope = match scope_kind {
+                Some(kind) => Some(
+                    build_sealed_scope_ref(Some(kind), scope_key)
+                        .map_err(|error| bad_request(error.to_string()))?,
+                ),
+                None => None,
+            };
+            let directory = sealed_value_directory(ctx);
+            let rows = directory
+                .inventory_records(owner, scope.as_ref())
+                .await
+                .map_err(internal)?;
+            let items = rows
+                .into_iter()
+                .map(sealed_record_row_to_inventory_item)
+                .collect();
+            // The funnel clamps the row count to the bounded wire ceiling.
+            Ok(Response::sealed_owner_inventory(items))
         }
         Request::EditSealedOwnerDescription {
             record_id,
@@ -7950,16 +8108,31 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             scope_kind,
             scope_key,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            if let Some(kind) = scope_kind.as_deref() {
-                parse_sealed_owner_scope_kind(kind)
-                    .map_err(|error| bad_request(error.to_string()))?;
-            }
-            let _ = scope_key;
-            Err(sealed_owner_backing_unavailable())
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            // An optional scope filter narrows the inventory; absent, it is
+            // machine-wide. A malformed filter is a content-free client error.
+            let scope = match scope_kind {
+                Some(kind) => Some(
+                    build_sealed_scope_ref(Some(kind), scope_key)
+                        .map_err(|error| bad_request(error.to_string()))?,
+                ),
+                None => None,
+            };
+            let directory = sealed_value_directory(&ctx);
+            let rows = directory
+                .inventory_records(owner, scope.as_ref())
+                .await
+                .map_err(internal)?;
+            let items = rows
+                .into_iter()
+                .map(sealed_record_row_to_inventory_item)
+                .collect();
+            // The funnel clamps the row count to the bounded wire ceiling.
+            Ok(Response::sealed_owner_inventory(items))
         }
         Request::ListSealedActions => {
             let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            // increment-2 action channel — still fail-closed.
             Err(sealed_owner_backing_unavailable())
         }
         Request::ExportSessionData {
@@ -12734,6 +12907,107 @@ fn validate_sealed_begin_shape(
         ),
     }
     Ok(())
+}
+
+/// Build the production sealed-value directory from daemon-held state.
+///
+/// The daemon's wrap-key vault backs the compartment (the same vault that stores
+/// session-sealed and compartment-scope literals), and the protected
+/// redaction-history key resolver, when the native secure-key actor has
+/// attached, is installed so session-scope create/rotate journal their adoption.
+/// Cheap to build per request: it clones the `Db` handle and the vault `Arc`.
+fn sealed_value_directory(ctx: &DaemonContext) -> crate::sealed::store::SealedValueDirectory {
+    let compartment =
+        crate::sealed::compartment::SealedCompartment::from_vault(ctx.secret_vault.clone());
+    let mut directory =
+        crate::sealed::store::SealedValueDirectory::new(ctx.db.clone(), compartment);
+    if let Some(resolver) = ctx.redaction_key_resolver.clone() {
+        directory = directory.with_redaction_resolver(resolver);
+    }
+    directory
+}
+
+/// Reconstruct a typed [`SealedScopeRef`] from the wire scope kind + key. Session
+/// scope requires a parseable session id; global ignores the key; project takes
+/// the canonical key verbatim.
+fn build_sealed_scope_ref(
+    scope_kind: Option<String>,
+    scope_key: Option<String>,
+) -> anyhow::Result<crate::sealed::identity::SealedScopeRef> {
+    use crate::sealed::identity::{SealedProjectKey, SealedScopeRef};
+    let kind =
+        parse_sealed_owner_scope_kind(scope_kind.as_deref().context("a scope kind is required")?)?;
+    let key = scope_key.unwrap_or_default();
+    match kind {
+        crate::db::sealed_scope::SealedScopeKind::Session => Ok(SealedScopeRef::Session(
+            uuid::Uuid::parse_str(&key).context("session scope key must be a session id")?,
+        )),
+        crate::db::sealed_scope::SealedScopeKind::Project => Ok(SealedScopeRef::Project(
+            SealedProjectKey::from_canonical(key),
+        )),
+        crate::db::sealed_scope::SealedScopeKind::Global => Ok(SealedScopeRef::Global),
+    }
+}
+
+/// Build the typed [`BeginSensitiveInput`] from the already-shape-validated wire
+/// fields. Shape validation ([`validate_sealed_begin_shape`]) has run, so the
+/// per-disposition fields are present; this only reparses them into the typed
+/// domain values the library `begin` consumes.
+fn build_begin_sensitive_input(
+    disposition: &str,
+    record_id: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    scope_kind: Option<String>,
+    scope_key: Option<String>,
+) -> anyhow::Result<crate::sealed::owner::BeginSensitiveInput> {
+    use crate::sealed::identity::{SealedDescription, SealedName, SealedRecordId};
+    use crate::sealed::owner::BeginSensitiveInput;
+    match disposition {
+        "create" => {
+            let name = SealedName::canonical(&name.context("create begin requires a name")?)?;
+            let description = SealedDescription::parse(
+                &description.context("create begin requires a description")?,
+            )?;
+            let scope = build_sealed_scope_ref(scope_kind, scope_key)?;
+            Ok(BeginSensitiveInput::Create {
+                scope,
+                name,
+                description,
+            })
+        }
+        "replace" => Ok(BeginSensitiveInput::Replace {
+            record_id: SealedRecordId::parse(&record_id.context("replace requires a record id")?)?,
+        }),
+        "rotate" => Ok(BeginSensitiveInput::Rotate {
+            record_id: SealedRecordId::parse(&record_id.context("rotate requires a record id")?)?,
+        }),
+        "recover" => Ok(BeginSensitiveInput::Recover {
+            record_id: SealedRecordId::parse(&record_id.context("recover requires a record id")?)?,
+        }),
+        other => anyhow::bail!("unknown sealed-owner disposition `{other}`"),
+    }
+}
+
+/// Project a persisted sealed-value record row into a safe wire inventory item.
+/// Carries no literal — only the owner-safe metadata the record row holds.
+fn sealed_record_row_to_inventory_item(
+    row: crate::db::sealed_scope::SealedValueRecordRow,
+) -> proto::SealedOwnerInventoryItem {
+    let scope_kind = match row.scope {
+        crate::db::sealed_scope::SealedScopeKind::Session => proto::SealedOwnerScopeKind::Session,
+        crate::db::sealed_scope::SealedScopeKind::Project => proto::SealedOwnerScopeKind::Project,
+        crate::db::sealed_scope::SealedScopeKind::Global => proto::SealedOwnerScopeKind::Global,
+    };
+    proto::SealedOwnerInventoryItem {
+        record_id: row.record_id,
+        name: row.name,
+        description: row.description,
+        scope_kind,
+        scope_key: row.scope_key,
+        active_version: u32::try_from(row.active_version).unwrap_or(0),
+        created_at_ms: row.created_at_ms,
+    }
 }
 
 /// The closed server-side catalog that resolves the three `CreateSealedAction`

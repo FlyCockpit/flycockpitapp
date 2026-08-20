@@ -244,26 +244,39 @@ async fn non_owner_rejected() {
 }
 
 #[tokio::test]
-async fn sealed_owner_rpcs_are_owner_remoted_and_fail_closed() {
+async fn sealed_owner_rpcs_are_owner_remoted_and_never_leak() {
     // AC3: an authenticated owner request TRAVERSES dispatch (it is NOT rejected
-    // at authorization). Because the durable directory / capability-table backing
-    // is owned by the persistence sibling, each arm fails closed with a
-    // content-free Internal error — never an Authorization error, and never a
-    // leaked literal.
+    // at authorization). The value-channel arms (begin/apply/cancel/inventory)
+    // are now wired to the durable directory + capability table: for these fixed
+    // inputs they return either a content-free client error (an unknown record,
+    // a malformed capability id) or a safe success (an empty inventory). The
+    // still-deferred action-channel + description-edit arms fail closed with a
+    // content-free Internal error. Across ALL of them: never an Authorization
+    // error once past the owner gate, and never a leaked apply literal.
     let ctx = test_ctx();
     for request in sealed_owner_channel_requests() {
         let tag = request.wire_tag();
         let mut state = owner_state();
-        let error = handle_request(request, &mut state, &ctx).await.unwrap_err();
-        assert_ne!(
-            error.code,
-            ErrorCode::Authorization,
-            "{tag} owner request must traverse dispatch, not be authorization-rejected"
-        );
-        assert!(
-            !error.message.contains("s3cr3t"),
-            "{tag} fail-closed error must not leak the apply literal"
-        );
+        match handle_request(request, &mut state, &ctx).await {
+            Ok(response) => {
+                let rendered = serde_json::to_string(&response).unwrap();
+                assert!(
+                    !rendered.contains("s3cr3t"),
+                    "{tag} response must not carry the apply literal"
+                );
+            }
+            Err(error) => {
+                assert_ne!(
+                    error.code,
+                    ErrorCode::Authorization,
+                    "{tag} owner request must traverse dispatch, not be authorization-rejected"
+                );
+                assert!(
+                    !error.message.contains("s3cr3t"),
+                    "{tag} error must not leak the apply literal"
+                );
+            }
+        }
     }
 }
 
@@ -6740,6 +6753,12 @@ fn terminal_grant() -> crate::daemon::principal::PrincipalGrant {
         scope: crate::daemon::principal::PrincipalScope::Terminal,
         project_root: None,
     }
+}
+
+fn owner_state_with_instance(client_instance_id: Uuid) -> MutableClientState {
+    let mut state = owner_state();
+    state.terminal_context.client_instance_id = client_instance_id;
+    state
 }
 
 fn owner_state() -> MutableClientState {
@@ -24684,6 +24703,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
         secret_vault: base.secret_vault.clone(),
+        sealed_owner_capabilities: base.sealed_owner_capabilities.clone(),
         oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
@@ -24888,6 +24908,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
         secret_vault: base.secret_vault.clone(),
+        sealed_owner_capabilities: base.sealed_owner_capabilities.clone(),
         oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
@@ -27073,4 +27094,213 @@ async fn remote_attempt_readonly_ceiling_denies_write() {
 
     // An attempt-grant principal is never Owner.
     assert!(!state.principal.is_owner());
+}
+
+// ---- sealed-owner value channel: production backing + session binding -------
+
+/// Drive one owner request through the serialized dispatch path.
+async fn dispatch_sealed_owner(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    request: Request,
+) -> std::result::Result<Response, ErrorPayload> {
+    let shared = state.shared_snapshot();
+    let mut effects = ClientRequestEffects::default();
+    handle_serialized_request_with_remote_operation(
+        request,
+        state,
+        &shared,
+        ctx,
+        &mut effects,
+        None,
+    )
+    .await
+}
+
+/// Create a project-scoped sealed value end-to-end and return its record id.
+async fn create_project_sealed_value(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    name: &str,
+    literal: &str,
+) -> String {
+    let begun = dispatch_sealed_owner(
+        ctx,
+        state,
+        Request::BeginSealedOwnerOperation {
+            disposition: "create".into(),
+            record_id: None,
+            name: Some(name.into()),
+            description: Some("Deploy token".into()),
+            scope_kind: Some("project".into()),
+            scope_key: Some("/repo".into()),
+        },
+    )
+    .await
+    .expect("begin create");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+    let applied = dispatch_sealed_owner(
+        ctx,
+        state,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: Some(proto::SensitiveWireLiteral::new(literal.into())),
+        },
+    )
+    .await
+    .expect("apply create write");
+    assert!(matches!(
+        applied,
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: None
+        }
+    ));
+
+    let inventory = dispatch_sealed_owner(
+        ctx,
+        state,
+        Request::SealedOwnerInventory {
+            scope_kind: Some("project".into()),
+            scope_key: Some("/repo".into()),
+        },
+    )
+    .await
+    .expect("inventory");
+    match inventory {
+        Response::SealedOwnerInventory { items } => {
+            let item = items
+                .iter()
+                .find(|item| item.name == name)
+                .expect("created value present in inventory");
+            item.record_id.clone()
+        }
+        other => panic!("expected inventory, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn production_directory_and_capability_table_installed() {
+    const LITERAL: &str = "sk-live-9f2c41ab77de4c0b83e5aa16d9c7b204";
+    let ctx = test_ctx();
+    let mut state = owner_state();
+
+    let record_id = create_project_sealed_value(&ctx, &mut state, "deploy_token", LITERAL).await;
+
+    // Recover succeeds only because the directory + capability table are wired.
+    let begun = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::BeginSealedOwnerOperation {
+            disposition: "recover".into(),
+            record_id: Some(record_id.clone()),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
+        },
+    )
+    .await
+    .expect("begin recover");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+    let applied = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: None,
+        },
+    )
+    .await
+    .expect("apply recover");
+    match applied {
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: Some(literal),
+        } => assert_eq!(literal.as_str(), LITERAL),
+        other => panic!("expected revealed literal, got {other:?}"),
+    }
+
+    // The recover audit committed before the reveal was returned.
+    let rows = ctx
+        .db
+        .sealed_recovery_audit_for_record(record_id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one revealed audit row");
+    assert_eq!(
+        rows[0].outcome,
+        crate::db::sealed_actions::SealedRecoveryOutcome::Revealed
+    );
+}
+
+#[tokio::test]
+async fn sealed_capability_minted_in_one_session_is_rejected_in_another() {
+    const LITERAL: &str = "sk-live-session-bound-6d9c7b204aa16";
+    let ctx = test_ctx();
+    let instance_a = Uuid::new_v4();
+    let instance_b = Uuid::new_v4();
+
+    let mut state_a = owner_state_with_instance(instance_a);
+    let record_id = create_project_sealed_value(&ctx, &mut state_a, "session_bound", LITERAL).await;
+
+    // Mint a recover capability in connection A.
+    let begun = dispatch_sealed_owner(
+        &ctx,
+        &mut state_a,
+        Request::BeginSealedOwnerOperation {
+            disposition: "recover".into(),
+            record_id: Some(record_id),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
+        },
+    )
+    .await
+    .expect("begin recover in A");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+
+    // Applying it from connection B is rejected fail-closed and reveals nothing.
+    let mut state_b = owner_state_with_instance(instance_b);
+    let err = dispatch_sealed_owner(
+        &ctx,
+        &mut state_b,
+        Request::ApplySealedOwnerOperation {
+            capability_id: capability_id.clone(),
+            literal: None,
+        },
+    )
+    .await
+    .expect_err("cross-session apply must be rejected");
+    assert!(
+        err.message.contains("different session"),
+        "unexpected error: {err:?}"
+    );
+
+    // The capability was NOT spent by the rejected cross-session apply: the
+    // minting connection A can still use it.
+    let applied = dispatch_sealed_owner(
+        &ctx,
+        &mut state_a,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: None,
+        },
+    )
+    .await
+    .expect("apply recover in A");
+    match applied {
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: Some(literal),
+        } => assert_eq!(literal.as_str(), LITERAL),
+        other => panic!("expected revealed literal, got {other:?}"),
+    }
 }

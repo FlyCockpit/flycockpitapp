@@ -40,14 +40,27 @@
 //!   frames map to Create/Replace/Rotate; recover frames map to Recover, and a
 //!   frame/disposition mismatch rejects before parse.
 //!
-//! The daemon capability table, recovery-audit persistence, proto Request /
+//! ## Recovery audit (audit-before-reveal)
+//!
+//! A recover apply commits a [`sealed_recovery_audit`](cockpit_db) row —
+//! carrying only safe metadata (record id, scope, version, owner principal,
+//! minting session, closed `revealed` outcome) and **never** the literal — and
+//! that write must succeed durably *before* the resolved plaintext is returned.
+//! An audit-commit failure propagates as an error, the ephemeral literal is
+//! dropped (zeroized), and no `Revealed` outcome is constructed; the capability
+//! is already spent, so the owner re-begins (fail closed).
+//!
+//! The daemon capability table (which enforces the minting-session match before
+//! building a recover frame and supplies its `minting_session`), proto Request /
 //! Response wiring, and the `/sealed` TUI live outside this module; this module
-//! supplies the protocol primitives and the Owner-facing operations only.
+//! supplies the protocol primitives, the Owner-facing operations, and the
+//! audit-before-reveal ordering.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
+use cockpit_db::db::sealed_actions::{SealedRecoveryAuditEntry, SealedRecoveryOutcome};
 use cockpit_db::db::sealed_scope::{SealedScopeKind, SealedValueRecordRow};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -487,6 +500,12 @@ pub struct SensitiveOwnerFrame<'a> {
     capability: &'a OneUseCapability,
     literal: Option<Zeroizing<String>>,
     kind: SensitiveFrameKind,
+    /// The minting session this recover attempt is bound to. `Some` only for a
+    /// recover frame: it is the connection identity that minted the capability,
+    /// recorded verbatim into the [`sealed_recovery_audit`](cockpit_db) row that
+    /// commits *before* the plaintext is revealed. A write frame carries `None`;
+    /// writes are not audited through this ledger.
+    minting_session: Option<String>,
 }
 
 impl<'a> SensitiveOwnerFrame<'a> {
@@ -497,16 +516,26 @@ impl<'a> SensitiveOwnerFrame<'a> {
             capability,
             literal: Some(literal),
             kind: SensitiveFrameKind::Write,
+            minting_session: None,
         }
     }
 
     /// Create a frame for a recover. No literal is supplied; the outcome reveals
     /// one.
-    pub fn for_recover(capability: &'a OneUseCapability) -> Self {
+    ///
+    /// `minting_session` is the connection identity the capability was minted
+    /// in. It is not re-checked here (the daemon capability table enforces the
+    /// minting-session match before building this frame); it is recorded into
+    /// the recovery-audit row that commits before the literal is revealed.
+    pub fn for_recover(
+        capability: &'a OneUseCapability,
+        minting_session: impl Into<String>,
+    ) -> Self {
         Self {
             capability,
             literal: None,
             kind: SensitiveFrameKind::Recover,
+            minting_session: Some(minting_session.into()),
         }
     }
 
@@ -638,6 +667,33 @@ impl<'a> SensitiveOwnerFrame<'a> {
                 let literal =
                     resolve_literal_for_recover(directory, owner, &record_id, &op.scope, expected)
                         .await?;
+                // Audit BEFORE reveal (publish-before-destroy). The literal is
+                // resolved but not yet returned; the `revealed` audit row must
+                // commit durably before it leaves this function. A failed audit
+                // write propagates here, the `Zeroizing` literal is dropped
+                // (zeroized), and no `Revealed` outcome is ever constructed — the
+                // capability is already spent, which is the fail-closed posture
+                // (the owner re-begins). The audit row carries only safe metadata
+                // and the closed `revealed` outcome; never the literal.
+                let minting_session = self.minting_session.clone().context(
+                    "recover frame requires a minting session to write the recovery-audit row",
+                )?;
+                let audit = SealedRecoveryAuditEntry {
+                    audit_id: Uuid::new_v4().to_string(),
+                    record_id: record_id.to_string(),
+                    scope: op.scope.kind().as_str().to_string(),
+                    scope_key: op.scope.scope_key(),
+                    version: i64::from(expected),
+                    owner_principal: self.capability.owner_principal.to_string(),
+                    minting_session,
+                    outcome: SealedRecoveryOutcome::Revealed,
+                    created_at_ms: now_ms,
+                };
+                directory
+                    .db()
+                    .insert_sealed_recovery_audit(audit)
+                    .await
+                    .context("recovery audit must commit before the literal is revealed")?;
                 Ok(SensitiveFrameOutcome::Revealed { literal })
             }
         }

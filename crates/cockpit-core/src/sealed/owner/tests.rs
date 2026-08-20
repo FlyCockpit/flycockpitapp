@@ -9,6 +9,7 @@
 //! implementation gives a different answer.
 
 use cockpit_db::db::Db;
+use cockpit_db::db::sealed_actions::SealedRecoveryOutcome;
 
 use super::*;
 use crate::sealed::action::OwnerAuthority;
@@ -21,6 +22,10 @@ use zeroize::Zeroizing;
 
 const TEST_LITERAL: &str = "sk-live-9f2c41ab77de4c0b83e5aa16d9c7b204";
 const MINT_MS: i64 = 1_000;
+/// The connection identity a recover capability is minted in. Recorded into the
+/// recovery-audit row; the daemon enforces the applying==minting match above
+/// this library layer.
+const MINT_SESSION: &str = "conn-a";
 
 struct OwnerFixture {
     directory: SealedValueDirectory,
@@ -149,7 +154,7 @@ async fn begin_recover_binds_live_version_and_reveals_literal() {
         SensitiveOwnerDisposition::Recover
     );
 
-    let frame = SensitiveOwnerFrame::for_recover(&result.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&result.capability, MINT_SESSION);
     let outcome = frame
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
@@ -423,7 +428,7 @@ async fn recover_frame_on_write_capability_is_rejected() {
     )
     .await
     .unwrap();
-    let frame = SensitiveOwnerFrame::for_recover(&result.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&result.capability, MINT_SESSION);
     let err = frame
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
@@ -475,7 +480,7 @@ async fn rotate_creates_new_version_then_recover_reveals_it() {
         recover.capability.operation().version,
         VersionBinding::Exact(2)
     );
-    let frame = SensitiveOwnerFrame::for_recover(&recover.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION);
     match frame
         .apply(OwnerFixture::owner(), fixture.directory(), 2_000)
         .await
@@ -527,7 +532,7 @@ async fn apply_rejects_wrong_owner() {
     .await
     .unwrap();
     assert_eq!(result.capability.owner_principal(), "alice");
-    let frame = SensitiveOwnerFrame::for_recover(&result.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&result.capability, MINT_SESSION);
     let err = frame
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
@@ -558,7 +563,7 @@ async fn apply_rejects_crafted_wrong_scope() {
         "owner",
         MINT_MS,
     );
-    let frame = SensitiveOwnerFrame::for_recover(&crafted);
+    let frame = SensitiveOwnerFrame::for_recover(&crafted, MINT_SESSION);
     let err = frame
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
@@ -582,7 +587,7 @@ async fn apply_rejects_crafted_wrong_version_no_zero_escape() {
         "owner",
         MINT_MS,
     );
-    let frame = SensitiveOwnerFrame::for_recover(&crafted);
+    let frame = SensitiveOwnerFrame::for_recover(&crafted, MINT_SESSION);
     let err = frame
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
@@ -628,7 +633,7 @@ async fn recover_after_racing_rotate_rejects_stale_version() {
         .await
         .unwrap();
 
-    let frame = SensitiveOwnerFrame::for_recover(&recover.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION);
     let err = frame
         .apply(OwnerFixture::owner(), fixture.directory(), 2_000)
         .await
@@ -664,7 +669,7 @@ async fn concurrent_rotate_never_lets_recover_reveal_newer_value() {
         recover.capability.operation().version,
         VersionBinding::Exact(1)
     );
-    let frame = SensitiveOwnerFrame::for_recover(&recover.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION);
 
     // Interleave an external rotate to v2 against the recover apply.
     let (rotate_result, recover_result) = tokio::join!(
@@ -738,7 +743,7 @@ async fn session_recover_reveals_bound_literal() {
         recover.capability.operation().version,
         VersionBinding::Exact(1)
     );
-    let outcome = SensitiveOwnerFrame::for_recover(&recover.capability)
+    let outcome = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION)
         .apply(OwnerAuthority::for_test("owner"), &dir, MINT_MS)
         .await
         .unwrap();
@@ -789,7 +794,7 @@ async fn concurrent_session_rotate_never_lets_recover_reveal_newer_value() {
         recover.capability.operation().version,
         VersionBinding::Exact(1)
     );
-    let frame = SensitiveOwnerFrame::for_recover(&recover.capability);
+    let frame = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION);
 
     let (rotate_result, recover_result) = tokio::join!(
         dir.rotate(
@@ -989,7 +994,7 @@ async fn contained_and_revealed_debug_never_render_literal() {
     )
     .await
     .unwrap();
-    let revealed = SensitiveOwnerFrame::for_recover(&recover.capability)
+    let revealed = SensitiveOwnerFrame::for_recover(&recover.capability, MINT_SESSION)
         .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
         .await
         .unwrap();
@@ -1020,4 +1025,111 @@ async fn begin_response_representation_carries_no_literal() {
     let debug = format!("{result:?}");
     assert!(!debug.contains(TEST_LITERAL));
     assert_eq!(result.expires_at_ms, MINT_MS + CAPABILITY_TTL_MS);
+}
+
+// ---- recovery audit: audit-before-reveal (AC1, AC2) ------------------------
+
+#[tokio::test]
+async fn sealed_recovery_audit_commits_before_reveal() {
+    let fixture = OwnerFixture::new().await;
+    let record_id = seed_project_value(&fixture, "deploy_token").await;
+
+    let result = BeginSensitiveOwnerOperation::begin(
+        OwnerFixture::owner(),
+        fixture.directory(),
+        BeginSensitiveInput::Recover { record_id },
+        MINT_MS,
+    )
+    .await
+    .unwrap();
+
+    let outcome = SensitiveOwnerFrame::for_recover(&result.capability, MINT_SESSION)
+        .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
+        .await
+        .unwrap();
+    match outcome {
+        SensitiveFrameOutcome::Revealed { literal } => assert_eq!(literal.as_str(), TEST_LITERAL),
+        _ => panic!("expected Revealed"),
+    }
+
+    // The audit row is durable by the time the reveal returned: `apply` committed
+    // it before constructing `Revealed`.
+    let rows = fixture
+        .directory()
+        .db()
+        .sealed_recovery_audit_for_record(record_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one revealed audit row");
+    let row = &rows[0];
+    assert_eq!(row.outcome, SealedRecoveryOutcome::Revealed);
+    assert_eq!(row.version, 1);
+    assert_eq!(row.minting_session, MINT_SESSION);
+    assert_eq!(row.owner_principal, "owner");
+    assert_eq!(row.scope, "project");
+    // The planted literal is absent from every stored field of the audit row.
+    for field in [
+        &row.audit_id,
+        &row.record_id,
+        &row.scope,
+        &row.scope_key,
+        &row.owner_principal,
+        &row.minting_session,
+    ] {
+        assert!(
+            !field.contains(TEST_LITERAL),
+            "audit row field leaked the literal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_commit_failure_returns_no_literal() {
+    let fixture = OwnerFixture::new().await;
+    let record_id = seed_project_value(&fixture, "deploy_token").await;
+
+    // Publish-before-destroy: force the recovery-audit INSERT to fail. The reveal
+    // must not proceed without a durable audit row.
+    fixture
+        .directory()
+        .db()
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_recovery_audit BEFORE INSERT ON sealed_recovery_audit \
+                 BEGIN SELECT RAISE(FAIL, 'injected recovery audit failure'); END;",
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .unwrap();
+
+    let result = BeginSensitiveOwnerOperation::begin(
+        OwnerFixture::owner(),
+        fixture.directory(),
+        BeginSensitiveInput::Recover { record_id },
+        MINT_MS,
+    )
+    .await
+    .unwrap();
+
+    let err = SensitiveOwnerFrame::for_recover(&result.capability, MINT_SESSION)
+        .apply(OwnerFixture::owner(), fixture.directory(), MINT_MS)
+        .await
+        .expect_err("audit commit failure must fail the recover");
+    let err = err.to_string();
+    assert!(
+        err.contains("audit"),
+        "error should name the audit failure, got: {err}"
+    );
+    // The capability is spent (fail closed): the owner must re-begin, and no
+    // second attempt can slip a reveal past the failed audit.
+    assert!(result.capability.is_consumed());
+    // No audit row was committed.
+    let rows = fixture
+        .directory()
+        .db()
+        .sealed_recovery_audit_for_record(record_id.to_string())
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "no audit row may persist on failure");
 }

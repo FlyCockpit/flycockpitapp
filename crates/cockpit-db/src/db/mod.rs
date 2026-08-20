@@ -68,6 +68,7 @@ pub mod remote_audit_upload;
 pub mod retention;
 pub mod run_invocations;
 pub mod scheduler;
+pub mod sealed_actions;
 pub mod sealed_scope;
 pub mod sealed_values;
 pub mod secret_vault;

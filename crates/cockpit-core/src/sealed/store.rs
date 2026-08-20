@@ -255,6 +255,26 @@ impl SealedValueDirectory {
         rows.iter().map(SealedValueSummary::from_row).collect()
     }
 
+    /// Owner-only inventory as raw record rows, for the sealed-owner dispatch
+    /// projection. `scope = Some` narrows to one scope; `None` returns every live
+    /// record across all scopes (machine-wide). Unlike [`Self::inventory`], the
+    /// rows keep their own scope key, so a fully-qualified wire inventory item
+    /// can be projected without re-deriving the key from the query.
+    pub async fn inventory_records(
+        &self,
+        _owner: OwnerAuthority,
+        scope: Option<&SealedScopeRef>,
+    ) -> Result<Vec<SealedValueRecordRow>> {
+        match scope {
+            Some(scope) => {
+                self.db
+                    .sealed_value_inventory(scope.kind(), scope.scope_key())
+                    .await
+            }
+            None => self.db.list_all_sealed_value_records().await,
+        }
+    }
+
     /// Exact Owner lookup of one record's safe metadata.
     pub async fn summary(
         &self,

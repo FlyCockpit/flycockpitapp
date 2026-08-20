@@ -1026,6 +1026,28 @@ impl Db {
         .await
     }
 
+    /// Owner-only: every live sealed value across every scope, oldest-first.
+    ///
+    /// This is the machine-wide inventory the sealed-owner channel serves when
+    /// no scope filter is given. Each row carries its own scope + scope key, so
+    /// the caller can project a fully-qualified inventory item. Deleted records
+    /// are excluded. Reachable only from the owner-gated dispatch path.
+    pub async fn list_all_sealed_value_records(&self) -> Result<Vec<SealedValueRecordRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {RECORD_COLUMNS} FROM sealed_value_records
+                  WHERE deleted_at_ms IS NULL
+                  ORDER BY created_at_ms ASC, record_id ASC"
+            ))?;
+            let rows = stmt
+                .query_map([], decode_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("listing all sealed value records")?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Owner-only: has this canonical name already been retired in this scope?
     /// Reachable only from the Owner lifecycle path, never from a use path.
     pub async fn sealed_value_name_retired(

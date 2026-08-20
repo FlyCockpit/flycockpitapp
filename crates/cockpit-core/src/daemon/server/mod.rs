@@ -1951,6 +1951,14 @@ pub struct DaemonContext {
     /// Daemon-held wrap-key vault. Flycockpit credential persist uses this
     /// handle; leftover `credentials.json` is never consulted.
     pub(crate) secret_vault: Arc<crate::secure_key::SecretVault>,
+    /// Daemon-owned, in-memory sealed-owner capability table. `Begin` mints a
+    /// capability here bound to the minting connection's `client_instance_id`;
+    /// `Apply`/`Cancel` enforce the minting-session match and drive the shared
+    /// compare-and-swap. In-memory only: a daemon restart invalidates every
+    /// outstanding capability (fail-closed), and no capability or literal ever
+    /// touches disk.
+    pub(crate) sealed_owner_capabilities:
+        Arc<StdMutex<sealed_capabilities::SealedOwnerCapabilityTable>>,
     /// Context-owned bounded OAuth state; never process-global.
     pub(crate) oauth_flows: Arc<dispatch::OAuthFlowStore>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
@@ -2208,6 +2216,9 @@ impl DaemonContext {
             scheduler,
             credential_store_path: None,
             secret_vault,
+            sealed_owner_capabilities: Arc::new(StdMutex::new(
+                sealed_capabilities::SealedOwnerCapabilityTable::default(),
+            )),
             oauth_flows: Arc::new(dispatch::OAuthFlowStore::new()),
             config_source,
             secure_key: None,
@@ -5098,6 +5109,7 @@ mod attachments;
 mod authz;
 mod dispatch;
 mod run_invocation;
+mod sealed_capabilities;
 pub use run_invocation::{
     RemainingRestart as RunInvocationRemaining,
     principal_digest as run_invocation_principal_digest,

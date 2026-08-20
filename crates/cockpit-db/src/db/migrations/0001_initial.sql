@@ -3343,6 +3343,65 @@ BEGIN
     SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
 END;
 
+-- ---- sealed action instances -----------------------------------------------
+-- The durable, immutable snapshot of one Owner-compiled action instance. This
+-- is the persisted backing for the in-memory action directory: it is the
+-- *only* source the HTTPS executor compiles an egress target from, so the
+-- origin allowlist, credential PLACEMENT (never the credential value, which is
+-- a separate sealed value), request path template, projection, and bounded
+-- non-secret parameters all live in `kind_json`. No agent/project/plugin/
+-- environment/remote/model input can add a row; every row is an explicit
+-- Owner record whose `action_id` is a daemon-minted UUID the caller never
+-- chooses.
+--
+-- One live row per `action_id`. A revise bumps `revision` and rewrites the
+-- snapshot in place; a retire stamps `retired_at_ms` and disables the row. In
+-- both cases the dependent grants are revoked in the SAME transaction that
+-- changes this row, so a crash can never leave a retired/revised action with a
+-- live grant (or a live action whose grants were already revoked).
+CREATE TABLE sealed_action_instances (
+    action_id     TEXT    PRIMARY KEY,
+    revision      INTEGER NOT NULL CHECK (revision >= 1),
+    -- The serialized closed `SealedActionKind` (origins, credential placement,
+    -- path template, projection, bounded params). Owner-authored; carries no
+    -- literal and no credential value.
+    kind_json     TEXT    NOT NULL,
+    -- Model-visible safe description. Never a destination, never a literal.
+    description   TEXT    NOT NULL,
+    -- Canonical project key the instance is scoped to.
+    project_key   TEXT    NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER
+);
+
+CREATE INDEX idx_sealed_action_instances_live
+    ON sealed_action_instances (retired_at_ms, action_id);
+
+-- ---- sealed recovery audit -------------------------------------------------
+-- A durable audit row committed BEFORE an Owner recover reveals the plaintext
+-- to the owner (publish-before-destroy). The reveal fails closed on an audit
+-- write failure: no literal is returned unless this row is durably committed
+-- first. The row carries only safe metadata and a closed outcome
+-- (`revealed`/`rejected`) — never the literal, its length, or any oracle over
+-- it.
+CREATE TABLE sealed_recovery_audit (
+    audit_id        TEXT    PRIMARY KEY,
+    record_id       TEXT    NOT NULL,
+    scope           TEXT    NOT NULL CHECK (scope IN ('session', 'project', 'global')),
+    scope_key       TEXT    NOT NULL,
+    version         INTEGER NOT NULL CHECK (version >= 1),
+    owner_principal TEXT    NOT NULL,
+    -- The minting session the recover capability was bound to (AC8). Safe to
+    -- store; it is a connection identity, never a secret.
+    minting_session TEXT    NOT NULL,
+    outcome         TEXT    NOT NULL CHECK (outcome IN ('revealed', 'rejected')),
+    created_at_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX idx_sealed_recovery_audit_record
+    ON sealed_recovery_audit (record_id, created_at_ms);
+
 -- ---- remote attachment operation ledger ----------------------------------
 -- Canonical request bytes and transport metadata are deliberately absent.
 -- The daemon retains only their SHA-256 digest and a bounded safe response.

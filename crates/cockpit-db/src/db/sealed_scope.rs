@@ -1048,6 +1048,30 @@ impl Db {
         .await
     }
 
+    /// Owner-only: edit the safe description of a live sealed value record.
+    /// Metadata only — never touches the literal, the name, the scope, or the
+    /// version. Returns `true` when a live (non-deleted) record was updated,
+    /// `false` when none matched.
+    pub async fn set_sealed_value_description(
+        &self,
+        record_id: String,
+        description: String,
+        now_ms: i64,
+    ) -> Result<bool> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE sealed_value_records
+                        SET description = ?2, updated_at_ms = ?3
+                      WHERE record_id = ?1 AND deleted_at_ms IS NULL",
+                    params![record_id, description, now_ms],
+                )
+                .context("editing sealed value description")?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
     /// Owner-only: has this canonical name already been retired in this scope?
     /// Reachable only from the Owner lifecycle path, never from a use path.
     pub async fn sealed_value_name_retired(

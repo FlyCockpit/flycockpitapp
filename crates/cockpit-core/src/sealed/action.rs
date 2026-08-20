@@ -651,34 +651,9 @@ impl fmt::Debug for SealedActionRegistry {
             .finish()
     }
 }
-
-/// The daemon's single compiled registry.
-///
-/// Install-once by construction. There is no replace, no clear, and no
-/// second slot, so nothing that loads after the daemon — project config, a
-/// plugin, an environment variable, a remote service, a tool, or a model
-/// argument — can add or retarget an action for the life of the process.
-static INSTALLED_REGISTRY: std::sync::OnceLock<Arc<SealedActionRegistry>> =
-    std::sync::OnceLock::new();
-
-/// Install the daemon's closed registry. Requires Owner authority and
-/// succeeds at most once per process.
-pub fn install_sealed_action_registry(
-    _owner: OwnerAuthority,
-    registry: Arc<SealedActionRegistry>,
-) -> Result<()> {
-    INSTALLED_REGISTRY
-        .set(registry)
-        .map_err(|_| anyhow::anyhow!("the sealed action registry is already installed"))
-}
-
-/// The installed registry, or an empty one.
-///
-/// An empty registry denies every use, which is the correct posture for a
-/// host that never compiled any action.
-pub fn installed_sealed_action_registry() -> Arc<SealedActionRegistry> {
-    INSTALLED_REGISTRY
-        .get()
-        .map(Arc::clone)
-        .unwrap_or_else(SealedActionRegistry::empty)
-}
+// The old process-global install-once `OnceLock` registry was retired
+// (`sealed-owner-persistence-and-executor` inc3b). The registry is no longer a
+// process-global installed once at boot; it is rebuilt on read from the current
+// persisted snapshots by `crate::sealed::action_admin::build_live_registry`,
+// which keeps it always live and per-database isolated. Use
+// [`SealedActionRegistry::empty`] where a deny-all registry is needed.

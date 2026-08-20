@@ -2808,9 +2808,26 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             if record_id.trim().is_empty() {
                 return Err(bad_request("record id must not be empty".to_string()));
             }
-            crate::sealed::identity::SealedDescription::parse(&description)
+            let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
-            Err(sealed_owner_backing_unavailable())
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            // Metadata-only update; the literal, name, scope, and version are
+            // untouched. An unknown/deleted record is a content-free client error.
+            let edited = ctx
+                .db
+                .set_sealed_value_description(
+                    record_id.clone(),
+                    description.as_str().to_string(),
+                    now_ms,
+                )
+                .await
+                .map_err(internal)?;
+            if !edited {
+                return Err(bad_request(
+                    "sealed value record does not exist".to_string(),
+                ));
+            }
+            Ok(Response::SealedOwnerDescriptionEdited { record_id })
         }
         Request::ListSealedActions => {
             let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
@@ -12895,17 +12912,6 @@ fn project_note_to_proto(row: crate::db::project_notes::ProjectNote) -> proto::P
         name: row.name,
         content: row.content,
     }
-}
-
-/// The sealed-owner directory / capability-table backing is installed by the
-/// `sealed-owner-persistence-and-executor` sibling. Until then every sealed-owner
-/// operation that would touch durable state or a literal fails CLOSED through
-/// this content-free error — no literal, no capability minted, no unjournaled
-/// persist, no second in-process directory invented here.
-fn sealed_owner_backing_unavailable() -> ErrorPayload {
-    internal(anyhow::anyhow!(
-        "sealed-owner channel backing is not installed on this daemon build"
-    ))
 }
 
 /// Parse the closed sealed-owner scope kind. Rejects anything outside the fixed

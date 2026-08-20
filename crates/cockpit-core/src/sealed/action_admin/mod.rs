@@ -819,5 +819,68 @@ fn snapshot_from_row(
 
 pub mod executor;
 
+/// The shared production HTTPS transport (a redirect-disabled, proxy-ignoring
+/// reqwest client). Cheap to clone; safe to share across every action and
+/// session. It carries no action definitions, credentials, or proxy config — only
+/// a connection/DNS pool — so a process-global is correct (nothing to clobber or
+/// cross-resolve between databases). Fallible so a client-build failure denies
+/// (via [`build_live_registry`]) rather than panicking the daemon.
+pub fn shared_https_transport() -> Result<std::sync::Arc<dyn executor::HttpsTransport>> {
+    static TRANSPORT: std::sync::OnceLock<std::sync::Arc<dyn executor::HttpsTransport>> =
+        std::sync::OnceLock::new();
+    if let Some(transport) = TRANSPORT.get() {
+        return Ok(transport.clone());
+    }
+    let transport: std::sync::Arc<dyn executor::HttpsTransport> =
+        std::sync::Arc::new(executor::ReqwestHttpsTransport::new()?);
+    // Cache the first successful build; a losing race just drops its own client.
+    Ok(TRANSPORT.get_or_init(|| transport).clone())
+}
+
+/// Build the live sealed-action registry from the persisted snapshots of ONE
+/// project.
+///
+/// The registry is a pure function of `sealed_action_instances`: every live +
+/// enabled snapshot **for `project_key`** compiles into an executable
+/// [`executor::HttpsSealedAction`] over the shared transport. Rebuilding on read
+/// — rather than caching an install-once (`OnceLock`) or shared-mutable registry
+/// — keeps it always live and per-database isolated: two daemons over two
+/// databases never see each other's actions, and there is no process-global
+/// mutable registry to race or clobber.
+///
+/// Scoping to the caller's `project_key` is a security boundary, not a
+/// convenience: an action is compiled for a fixed project endpoint, so a session
+/// in a different project must never resolve it (which would send that session's
+/// literal to another project's destination). A snapshot that fails to revalidate
+/// or compile is skipped (so only its own uses deny) rather than denying every
+/// action.
+pub async fn build_live_registry(
+    db: &cockpit_db::db::Db,
+    project_key: &str,
+) -> Result<std::sync::Arc<super::action::SealedActionRegistry>> {
+    let owner = super::action::OwnerAuthority::for_owner_request();
+    let transport = shared_https_transport()?;
+    let rows = db.list_sealed_action_instances().await?;
+    let mut builder = super::action::SealedActionRegistry::builder(owner);
+    for row in rows {
+        if row.retired_at_ms.is_some() || !row.enabled {
+            continue;
+        }
+        // Project boundary: only this project's actions are resolvable here.
+        if row.project_key != project_key {
+            continue;
+        }
+        let Ok(snapshot) = snapshot_from_row(&row) else {
+            continue;
+        };
+        let Ok(action) = executor::HttpsSealedAction::from_snapshot(&snapshot, transport.clone())
+        else {
+            continue;
+        };
+        builder = builder.with_action(std::sync::Arc::new(action))?;
+    }
+    Ok(builder.build())
+}
+
 #[cfg(test)]
 mod tests;

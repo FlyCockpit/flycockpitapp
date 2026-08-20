@@ -1108,7 +1108,17 @@ pub(crate) async fn run_turn(
     // to a stale marker, a raw literal, or a dispatch error. Trusted targets and
     // noninteractive egress (utility/tandem/embeddings, which never reach here)
     // are untouched.
-    let registry = crate::sealed::action::installed_sealed_action_registry();
+    // Rebuild the live sealed-action registry from this session's database,
+    // scoped to this session's project (no install-once OnceLock; cross-project
+    // actions are never resolvable). A build failure falls back to an empty
+    // registry — fail closed to "no callable actions", never a stale or bogus one.
+    let registry = crate::sealed::action_admin::build_live_registry(
+        &session.db,
+        crate::sealed::identity::SealedProjectKey::from_canonical(session.project_id.clone())
+            .as_str(),
+    )
+    .await
+    .unwrap_or_else(|_| crate::sealed::action::SealedActionRegistry::empty());
     let sealed_egress: Option<Arc<RedactionTable>> =
         crate::sealed::egress::derive_untrusted_interactive_sealed_egress(
             model,

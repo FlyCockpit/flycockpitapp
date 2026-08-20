@@ -64,14 +64,23 @@ impl UseSealedValueTool {
         }
     }
 
-    fn runtime_for(&self, ctx: &ToolCtx) -> Result<Arc<SealedRuntime>> {
+    async fn runtime_for(&self, ctx: &ToolCtx) -> Result<Arc<SealedRuntime>> {
         if let Some(runtime) = &self.runtime {
             return Ok(Arc::clone(runtime));
         }
+        // The live registry is rebuilt from THIS session's database, scoped to
+        // THIS session's project: it reflects every currently-persisted action
+        // for the project, with no install-once OnceLock and no shared mutable
+        // state (`sealed-owner-persistence-and-executor` inc3b). Cross-project
+        // actions are absent, so they can never resolve here.
+        let project_key = SealedProjectKey::from_canonical(ctx.session.project_id.clone());
+        let registry =
+            crate::sealed::action_admin::build_live_registry(&ctx.session.db, project_key.as_str())
+                .await?;
         Ok(Arc::new(SealedRuntime::new(
             ctx.session.db.clone(),
             SealedCompartment::from_vault(ctx.session.secret_vault().clone()),
-            crate::sealed::action::installed_sealed_action_registry(),
+            registry,
         )))
     }
 }
@@ -141,7 +150,14 @@ impl Tool for UseSealedValueTool {
             now_ms: chrono::Utc::now().timestamp_millis(),
         };
 
-        let runtime = self.runtime_for(ctx)?;
+        // A registry-build / DB failure must be INDISTINGUISHABLE from any other
+        // denial: return the same standard sealed-unavailable text, never a
+        // detailed error (which would leak internal failure detail and be a
+        // distinguishable response the caller could probe).
+        let runtime = match self.runtime_for(ctx).await {
+            Ok(runtime) => runtime,
+            Err(_) => return Ok(ToolOutput::text(SealedUseDenied.to_string())),
+        };
         let sink = SessionRedactionSink::new(ctx.interrupts.clone(), ctx.session.clone());
         match runtime
             .use_sealed_value(&request, &use_ctx, &sink, &trust)

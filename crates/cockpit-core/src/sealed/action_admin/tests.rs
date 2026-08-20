@@ -566,6 +566,63 @@ async fn corrupt_persisted_kind_fails_closed_on_read() {
     );
 }
 
+#[tokio::test]
+async fn build_live_registry_reflects_current_snapshots() {
+    // AC5: the sealed-action registry is rebuilt LIVE from the persisted
+    // snapshots — there is no install-once OnceLock. A created action resolves in
+    // a freshly built registry; once retired (or disabled) a fresh build no
+    // longer resolves it. Two builds over the same db are consistent; a build
+    // over an EMPTY db resolves nothing.
+    use crate::sealed::action::SealedActionId;
+
+    let (db, dir) = in_memory_directory();
+
+    let empty = build_live_registry(&db, "proj").await.unwrap();
+    let action_id = create_sample_action(&dir).await;
+    let id = SealedActionId::parse(&action_id).unwrap();
+    assert!(
+        empty.resolve(&id).is_none(),
+        "the registry built before the action existed does not resolve it"
+    );
+
+    let live = build_live_registry(&db, "proj").await.unwrap();
+    assert!(
+        live.resolve(&id).is_some(),
+        "a live action resolves in a freshly built registry"
+    );
+
+    // Project boundary: a registry built for a DIFFERENT project never resolves
+    // this project's action — a cross-project session cannot reach it (so it can
+    // never send its own literal to another project's endpoint).
+    let other_project = build_live_registry(&db, "other-project").await.unwrap();
+    assert!(
+        other_project.resolve(&id).is_none(),
+        "an action is invisible to a registry built for another project"
+    );
+
+    // Disable it → a fresh build no longer resolves it.
+    dir.revise(
+        owner(),
+        ReviseSealedAction::Enabled {
+            action_id: action_id.clone(),
+            enabled: false,
+        },
+        2_000,
+    )
+    .await
+    .unwrap();
+    let after_disable = build_live_registry(&db, "proj").await.unwrap();
+    assert!(
+        after_disable.resolve(&id).is_none(),
+        "a disabled action is absent from the live registry"
+    );
+
+    // Retiring it keeps it absent.
+    dir.retire(owner(), &action_id, 3_000).await.unwrap();
+    let after_retire = build_live_registry(&db, "proj").await.unwrap();
+    assert!(after_retire.resolve(&id).is_none());
+}
+
 // ---- AC3: snapshot is immutable and serializable ---------------------------
 
 #[test]

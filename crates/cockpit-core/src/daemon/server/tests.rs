@@ -27402,3 +27402,61 @@ async fn sealed_action_channel_create_list_revise_retire_roundtrip() {
     .expect_err("mismatched retire confirmation must reject");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
+
+#[tokio::test]
+async fn sealed_owner_edit_description_updates_inventory() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let record_id =
+        create_project_sealed_value(&ctx, &mut state, "deploy_token", "sk-live-edit-me").await;
+
+    let edited = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::EditSealedOwnerDescription {
+            record_id: record_id.clone(),
+            description: "rotated quarterly".into(),
+        },
+    )
+    .await
+    .expect("edit description");
+    assert!(matches!(
+        edited,
+        Response::SealedOwnerDescriptionEdited { .. }
+    ));
+
+    // Inventory reflects the new safe description.
+    let inventory = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::SealedOwnerInventory {
+            scope_kind: Some("project".into()),
+            scope_key: Some("/repo".into()),
+        },
+    )
+    .await
+    .expect("inventory");
+    match inventory {
+        Response::SealedOwnerInventory { items } => {
+            let item = items
+                .iter()
+                .find(|item| item.record_id == record_id)
+                .expect("record present");
+            assert_eq!(item.description, "rotated quarterly");
+        }
+        other => panic!("expected inventory, got {other:?}"),
+    }
+
+    // Editing an unknown record is a content-free bad request.
+    let err = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::EditSealedOwnerDescription {
+            record_id: uuid::Uuid::new_v4().to_string(),
+            description: "ignored".into(),
+        },
+    )
+    .await
+    .expect_err("editing an unknown record must reject");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}

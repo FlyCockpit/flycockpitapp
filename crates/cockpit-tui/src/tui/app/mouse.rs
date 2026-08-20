@@ -305,6 +305,17 @@ impl App {
             return;
         }
 
+        // The `/sealed` no-echo overlay is modal: a left-click dismisses it,
+        // which cancels the pending write and drops the minted capability (or
+        // hides a recover reveal). Handled before the `&mut self.overlay` match
+        // so the dismiss can call back into `self` to send the cancel RPC.
+        if matches!(self.overlay, Overlay::Sealed(_)) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.dismiss_sealed_overlay_via_pointer();
+            }
+            return;
+        }
+
         match &mut self.overlay {
             Overlay::Stats(pane) => {
                 match mouse.kind {
@@ -359,6 +370,8 @@ impl App {
                 return;
             }
             Overlay::Leaks(_) => return,
+            // Handled by the modal guard above; unreachable here.
+            Overlay::Sealed(_) => return,
             Overlay::ModelPicker(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)
@@ -837,6 +850,7 @@ impl App {
                     | Overlay::Context(_)
                     | Overlay::Notes(_)
                     | Overlay::Leaks(_)
+                    | Overlay::Sealed(_)
                     | Overlay::Diff(_)
             )
             || self.pane.is_some()

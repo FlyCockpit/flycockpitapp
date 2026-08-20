@@ -966,6 +966,37 @@ impl App {
                 }
                 return false;
             }
+            Overlay::Sealed(mut overlay) => {
+                use crate::tui::sealed_overlay::SealedOverlayOutcome;
+                let outcome = overlay.handle_key(key);
+                // Read the SAFE summary (disposition + label — never a literal)
+                // before the write overlay is dropped by a terminal outcome.
+                let summary = overlay.write_done_summary();
+                match outcome {
+                    SealedOverlayOutcome::Stay => {
+                        self.overlay = Overlay::Sealed(overlay);
+                    }
+                    SealedOverlayOutcome::Apply {
+                        capability_id,
+                        literal,
+                    } => {
+                        // Overlay closes (self.overlay is already None); send the
+                        // apply. The literal rides only the apply frame — never
+                        // the transcript, history, or an async payload.
+                        self.apply_sealed_write(&capability_id, literal, summary);
+                    }
+                    SealedOverlayOutcome::Cancel { capability_id } => {
+                        // Overlay closes; spend and drop the minted capability.
+                        self.cancel_sealed_capability(&capability_id);
+                    }
+                    SealedOverlayOutcome::Close => {
+                        // Recover reveal dismissed and already zeroized; force a
+                        // full clear so no stale plaintext cells survive.
+                        self.leaks_reveal_clear_pending = true;
+                    }
+                }
+                return false;
+            }
             Overlay::Diff(mut pane) => {
                 if !pane.handle_key(key) {
                     self.overlay = Overlay::Diff(pane);
@@ -3396,6 +3427,7 @@ impl App {
                     | Overlay::Quick(_)
                     | Overlay::Context(_)
                     | Overlay::Leaks(_)
+                    | Overlay::Sealed(_)
                     | Overlay::Diff(_)
                     | Overlay::Help(_)
             )
@@ -3616,6 +3648,7 @@ impl App {
                     | Overlay::Multireview(_)
                     | Overlay::Notes(_)
                     | Overlay::Leaks(_)
+                    | Overlay::Sealed(_)
                     | Overlay::Help(_)
             )
             && self.question_dialog.is_none()

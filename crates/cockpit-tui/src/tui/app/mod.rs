@@ -1188,6 +1188,7 @@ pub(super) enum Overlay {
     Context(crate::tui::context_pane::ContextPane),
     Notes(crate::tui::notes_pane::NotesPane),
     Leaks(crate::tui::leaks_pane::LeaksPane),
+    Sealed(crate::tui::sealed_overlay::SealedOverlay),
     Diff(crate::tui::diff_pane::DiffPane),
     Help(help_overlay::HelpOverlay),
 }
@@ -1225,6 +1226,7 @@ impl Overlay {
             | Self::GoalSettings(_)
             | Self::Context(_)
             | Self::Leaks(_)
+            | Self::Sealed(_)
             | Self::Help(_) => None,
         }
     }
@@ -3718,6 +3720,11 @@ impl App {
         }) {
             self.close_btw_pane();
         }
+        // Cancel-on-exit for a pending `/sealed` write: spend and drop any minted
+        // capability over the still-live attached binding before the runner/daemon
+        // teardown below, so a Ctrl-C×2 (or `/exit`) exit doesn't strand the
+        // capability until its server-side expiry.
+        self.teardown_sealed_overlay();
         self.drop_mouse_copy_ui_ownership();
         let async_shutdown = self.async_actions.shutdown_and_reap().await;
         if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
@@ -4234,6 +4241,7 @@ impl App {
 
     fn leaks_reveal_active(&self) -> bool {
         matches!(&self.overlay, Overlay::Leaks(pane) if pane.reveal_buffer().is_active())
+            || matches!(&self.overlay, Overlay::Sealed(overlay) if overlay.reveal_active())
     }
 
     /// Timed tick for the `/leaks` reveal buffer: expire the 30s TTL (even when
@@ -4241,11 +4249,18 @@ impl App {
     /// revealed plaintext cannot linger in the terminal backbuffer past 30s.
     /// Returns whether a redraw is needed.
     pub(super) fn tick_leaks_reveal(&mut self) -> bool {
-        let (expired, needs_clear) = if let Overlay::Leaks(pane) = &mut self.overlay {
-            let expired = pane.tick();
-            (expired, pane.take_pending_clear())
-        } else {
-            (false, false)
+        let (expired, needs_clear) = match &mut self.overlay {
+            Overlay::Leaks(pane) => {
+                let expired = pane.tick();
+                (expired, pane.take_pending_clear())
+            }
+            // The sealed recover reveal shares the same "force a full clear"
+            // flag so its 30s TTL scrubs the terminal backbuffer too.
+            Overlay::Sealed(overlay) => {
+                let expired = overlay.tick();
+                (expired, overlay.take_pending_clear())
+            }
+            _ => (false, false),
         };
         if needs_clear {
             self.leaks_reveal_clear_pending = true;

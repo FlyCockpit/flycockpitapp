@@ -539,6 +539,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "sealed",
+        description: "Manage sealed Owner values: list, create/rotate/replace (no-echo), recover, edit, action",
+        takes_args: true,
+        run: run_sealed,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "permissions",
         description: "View and delete persisted command/path approvals across project and global scopes",
         takes_args: false,
@@ -1149,6 +1157,11 @@ fn run_note(app: &mut App, args: &str) -> bool {
 
 fn run_leaks(app: &mut App, args: &str) -> bool {
     app.handle_leaks_command(args);
+    false
+}
+
+fn run_sealed(app: &mut App, args: &str) -> bool {
+    app.handle_sealed_command(args);
     false
 }
 
@@ -2468,6 +2481,242 @@ impl App {
             },
         );
     }
+
+    /// `/sealed` — the owner-remoted frontend over `parse_sealed_command`. Parses
+    /// locally, NEVER opens the vault, and routes only sealed-owner RPCs:
+    /// metadata commands render safe text; create/rotate/replace open a no-echo
+    /// overlay; recover reveals into an ephemeral overlay; delete has no owner RPC.
+    pub(super) fn handle_sealed_command(&mut self, args: &str) {
+        use crate::tui::sealed_overlay::{SealedDispatch, SealedScopeContext, plan_dispatch};
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        // Route through the redacting funnel: a parse failure surfaces ONLY a
+        // fixed, content-free message, so a mistyped secret on the command line
+        // never reaches the transcript, history, or exit tail.
+        let cmd = match crate::tui::sealed_overlay::parse_sealed_tokens(&tokens) {
+            Ok(cmd) => cmd,
+            Err(message) => {
+                self.push_plain(message.to_string());
+                return;
+            }
+        };
+        // Every sealed-owner operation rides the attached session's persistent
+        // daemon connection (one stable `client_instance_id`), so begin/apply/
+        // cancel share the minting connection the capability is bound to.
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            self.push_plain("/sealed: attach a session first".to_string());
+            return;
+        };
+        let ctx = SealedScopeContext {
+            session_id: runner.session_id().to_string(),
+            project_key: cockpit_core::sealed::identity::SealedProjectKey::canonical(
+                &self.launch.cwd,
+            )
+            .as_str()
+            .to_string(),
+        };
+        match plan_dispatch(&cmd, &ctx) {
+            SealedDispatch::Metadata(request) => self.dispatch_sealed_metadata(request),
+            SealedDispatch::Write(plan) => self.begin_sealed_write(plan),
+            SealedDispatch::Recover { record_id } => self.recover_sealed_into_overlay(record_id),
+            SealedDispatch::Unsupported(message) => self.push_plain(message),
+        }
+    }
+
+    /// The attached session's persistent request binding, or `None` when no
+    /// session is attached.
+    fn attached_sealed_binding(&self) -> Option<agent_runner::AttachedRequestBinding> {
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => Some(runner.attached_request_binding()),
+            _ => None,
+        }
+    }
+
+    /// Send a metadata-only sealed-owner RPC over the attached binding and render
+    /// its safe response text. Never carries or renders a literal.
+    fn dispatch_sealed_metadata(&mut self, request: cockpit_core::daemon::proto::Request) {
+        let Some(binding) = self.attached_sealed_binding() else {
+            self.push_plain("/sealed: attach a session first".to_string());
+            return;
+        };
+        let result = agent_runner::attached_request_blocking(&binding, request);
+        let text = crate::tui::sealed_overlay::sealed_response_text(result);
+        self.push_plain(text);
+    }
+
+    /// Begin a create/replace/rotate write: mint the single-use capability over
+    /// the attached binding, then open the no-echo overlay bound to it. The
+    /// literal is collected later, in the overlay, and never before.
+    fn begin_sealed_write(&mut self, plan: crate::tui::sealed_overlay::SealedWritePlan) {
+        use cockpit_core::daemon::proto::Response;
+        let Some(binding) = self.attached_sealed_binding() else {
+            self.push_plain("/sealed: attach a session first".to_string());
+            return;
+        };
+        match agent_runner::attached_request_blocking(&binding, plan.begin) {
+            Ok(Response::SealedOwnerOperationBegun {
+                capability_id,
+                expires_at_ms,
+            }) => {
+                self.overlay = Overlay::Sealed(crate::tui::sealed_overlay::SealedOverlay::Write(
+                    crate::tui::sealed_overlay::SealedWriteOverlay::new(
+                        capability_id,
+                        expires_at_ms,
+                        plan.disposition,
+                        plan.label,
+                    ),
+                ));
+            }
+            Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
+            Err(error) => self.push_plain(format!("/sealed: {error}")),
+        }
+    }
+
+    /// Apply a create/replace/rotate write. The `literal` (a zeroizing
+    /// `SensitiveWireLiteral`) is moved straight into the apply frame; it never
+    /// enters an `AsyncActionPayload`, the transcript, history, or a log.
+    pub(super) fn apply_sealed_write(
+        &mut self,
+        capability_id: &str,
+        literal: cockpit_core::daemon::proto::SensitiveWireLiteral,
+        summary: Option<String>,
+    ) {
+        use cockpit_core::daemon::proto::Response;
+        let Some(binding) = self.attached_sealed_binding() else {
+            // Drop the literal (zeroized on drop) — the capability expires unused.
+            drop(literal);
+            self.push_plain("/sealed: session detached; the capability will expire".to_string());
+            return;
+        };
+        let request = crate::tui::sealed_overlay::apply_write_request(capability_id, literal);
+        match agent_runner::attached_request_blocking(&binding, request) {
+            Ok(Response::SealedOwnerOperationApplied { .. }) => {
+                let summary = summary.unwrap_or_else(|| "stored".to_string());
+                self.push_plain(format!("/sealed: {summary}"));
+            }
+            Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
+            Err(error) => self.push_plain(format!("/sealed: {error}")),
+        }
+    }
+
+    /// Cancel a minted capability (dismiss): spend its single-use compare-and-swap
+    /// over the same binding without performing the operation.
+    pub(super) fn cancel_sealed_capability(&mut self, capability_id: &str) {
+        let Some(binding) = self.attached_sealed_binding() else {
+            // No binding to cancel over; the capability expires on its own TTL.
+            return;
+        };
+        let request = crate::tui::sealed_overlay::cancel_request(capability_id);
+        // Cancel is best-effort and idempotent; the capability is spent (or gone)
+        // regardless of how the daemon replies, so a failure needs no surfacing.
+        let _ = agent_runner::attached_request_blocking(&binding, request);
+    }
+
+    /// Exit/interrupt teardown for an open `/sealed` overlay. If a WRITE is
+    /// pending, zeroize its typed buffer and send a best-effort
+    /// `CancelSealedOwnerOperation` over the still-live attached binding BEFORE
+    /// the runner/daemon is torn down — otherwise a Ctrl-C×2 exit would leave the
+    /// minted capability live until its server-side expiry. Fail-safe: with no
+    /// session/binding it just drops (the buffer is already zeroized) and never
+    /// blocks exit. A recover reveal needs no cancel; its plaintext lives only in
+    /// the alt-screen buffer (never in history/exit-tail) and is scrubbed on drop.
+    pub(super) fn teardown_sealed_overlay(&mut self) {
+        let Overlay::Sealed(mut overlay) = std::mem::take(&mut self.overlay) else {
+            return;
+        };
+        if let Some(capability_id) = overlay.take_pending_write_capability() {
+            self.cancel_sealed_capability(&capability_id);
+        }
+        // `overlay` drops here, zeroizing any reveal/input buffer.
+    }
+
+    /// The pointer-dismiss entry: a left-click on an open `/sealed` overlay. Takes
+    /// the overlay out, dismisses it (cancel a pending write / hide a reveal), and
+    /// dispatches the resulting cancel exactly as a keyboard dismiss does.
+    pub(super) fn dismiss_sealed_overlay_via_pointer(&mut self) {
+        use crate::tui::sealed_overlay::SealedOverlayOutcome;
+        let Overlay::Sealed(mut overlay) = std::mem::take(&mut self.overlay) else {
+            return;
+        };
+        let outcome = overlay.pointer_dismiss();
+        match outcome {
+            SealedOverlayOutcome::Cancel { capability_id } => {
+                self.cancel_sealed_capability(&capability_id);
+            }
+            SealedOverlayOutcome::Close => {
+                self.leaks_reveal_clear_pending = true;
+            }
+            // A pointer dismiss never applies or stays.
+            SealedOverlayOutcome::Apply { .. } | SealedOverlayOutcome::Stay => {}
+        }
+    }
+
+    /// Recover: mint a recover capability and apply it over ONE connection, then
+    /// install the revealed plaintext directly into the reveal overlay. The
+    /// plaintext travels straight from the daemon response into the ephemeral
+    /// zeroizing buffer — it never crosses an `AsyncActionPayload`, the
+    /// transcript, or any cache.
+    pub(super) fn recover_sealed_into_overlay(&mut self, record_id: String) {
+        use cockpit_core::daemon::proto::{Request, Response};
+        let Some(binding) = self.attached_sealed_binding() else {
+            self.push_plain("/sealed: attach a session first".to_string());
+            return;
+        };
+        // Begin the recover capability.
+        let capability_id = match agent_runner::attached_request_blocking(
+            &binding,
+            Request::BeginSealedOwnerOperation {
+                disposition: "recover".to_string(),
+                record_id: Some(record_id.clone()),
+                name: None,
+                description: None,
+                scope_kind: None,
+                scope_key: None,
+            },
+        ) {
+            Ok(Response::SealedOwnerOperationBegun { capability_id, .. }) => capability_id,
+            Ok(_) => {
+                self.push_plain("/sealed: unexpected daemon response".to_string());
+                return;
+            }
+            Err(error) => {
+                self.push_plain(format!("/sealed: {error}"));
+                return;
+            }
+        };
+        // Apply the recover: the response is the ONLY payload that reveals the
+        // plaintext, to this owner session.
+        match agent_runner::attached_request_blocking(
+            &binding,
+            Request::ApplySealedOwnerOperation {
+                capability_id,
+                literal: None,
+            },
+        ) {
+            Ok(Response::SealedOwnerOperationApplied {
+                revealed_literal: Some(literal),
+            }) => {
+                // Move the plaintext straight into the reveal overlay's zeroizing
+                // buffer; the intermediate `SensitiveWireLiteral` is consumed here
+                // and never copied into a non-zeroizing string.
+                let overlay = crate::tui::sealed_overlay::SealedRevealOverlay::new(
+                    record_id,
+                    literal.into_zeroizing(),
+                );
+                self.overlay =
+                    Overlay::Sealed(crate::tui::sealed_overlay::SealedOverlay::Reveal(overlay));
+                // A new reveal is painted; force a full clear so any prior frame's
+                // cells don't linger.
+                self.leaks_reveal_clear_pending = true;
+            }
+            Ok(Response::SealedOwnerOperationApplied {
+                revealed_literal: None,
+            }) => {
+                self.push_plain("/sealed: recover returned no value".to_string());
+            }
+            Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
+            Err(error) => self.push_plain(format!("/sealed: {error}")),
+        }
+    }
 }
 
 /// Map a `/editor` argument to a pane side. Empty / unknown → fullscreen.
@@ -3196,11 +3445,12 @@ mod table_tests {
     }
 
     #[test]
-    fn legacy_sealed_slash_command_is_removed() {
-        // The legacy session-scoped `/sealed` list/delete path is deleted with
-        // its `ListSealedValues`/`DeleteSealedValue` wire tags; the owner-remoted
-        // `/sealed` rewrite is the `sealed-owner-tui-and-slash` sibling's.
-        assert!(slash_command_by_name("sealed").is_none());
+    fn sealed_slash_command_is_owner_remoted() {
+        // The legacy session-scoped `/sealed` list/delete path (with its
+        // `ListSealedValues`/`DeleteSealedValue` wire tags) is gone; `/sealed` is
+        // now the owner-remoted frontend over `parse_sealed_command` — registered
+        // again, but routing only sealed-owner RPCs.
+        assert!(slash_command_by_name("sealed").is_some());
     }
 
     fn leak_report_row(

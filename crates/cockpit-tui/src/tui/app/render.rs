@@ -1410,6 +1410,15 @@ impl App {
                     }
                     self.overlay = Overlay::Leaks(pane);
                 }
+                Overlay::Sealed(mut overlay) => {
+                    overlay.render(frame, rects.body);
+                    // A render-time TTL expiry on a recover reveal flags a full
+                    // clear so the plaintext cannot linger in the backbuffer.
+                    if overlay.take_pending_clear() {
+                        self.leaks_reveal_clear_pending = true;
+                    }
+                    self.overlay = Overlay::Sealed(overlay);
+                }
                 Overlay::Diff(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Diff(pane);

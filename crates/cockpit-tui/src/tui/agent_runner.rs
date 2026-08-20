@@ -2700,6 +2700,25 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
     })
 }
 
+/// Run one request-response RPC over the *attached* session's persistent daemon
+/// connection, blocking the current thread until the reply arrives.
+///
+/// Unlike [`daemon_request_at_blocking`] (which opens a FRESH connection per
+/// call, and so is assigned a fresh `client_instance_id`), this reuses the one
+/// connection the attached runner already owns. The sealed-owner capability
+/// channel binds each capability to its minting connection's
+/// `client_instance_id`, so `begin`, `apply`, and `cancel` MUST all travel this
+/// same binding — a fresh-connection apply would be rejected fail-closed as
+/// "minted in a different session".
+pub(crate) fn attached_request_blocking(
+    binding: &AttachedRequestBinding,
+    req: Request,
+) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    tokio::task::block_in_place(|| runtime.block_on(async { binding.request(req).await }))
+}
+
 /// Reveal a leak secret over the sensitive local channel (in-process handoff or
 /// the Unix peer-authenticated reveal socket, chosen off the control socket).
 /// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it

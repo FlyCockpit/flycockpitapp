@@ -2813,8 +2813,15 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             Err(sealed_owner_backing_unavailable())
         }
         Request::ListSealedActions => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            Err(sealed_owner_backing_unavailable())
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let actions = sealed_action_directory(ctx)
+                .list(owner)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_action_summary_to_wire)
+                .collect();
+            Ok(Response::sealed_actions(actions))
         }
         Request::CreateSealedAction {
             kind_id,
@@ -2823,48 +2830,95 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             origin_id,
             projection_id,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
             // Resolve the three closed-lookup ids to a compiled action kind and
             // parse the safe fields FIRST. An unknown id / unsafe field is
-            // rejected here, before any persist. Only a fully-resolved request
-            // reaches the fail-closed backing.
-            let _kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
+            // rejected here, before any persist.
+            let kind = resolve_sealed_action_kind(&kind_id, &origin_id, &projection_id)
                 .map_err(|error| bad_request(error.to_string()))?;
-            crate::sealed::identity::SealedDescription::parse(&description)
+            let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
             if project_id.trim().is_empty() {
                 return Err(bad_request("project id must not be empty".to_string()));
             }
-            Err(sealed_owner_backing_unavailable())
+            let project_key = crate::sealed::identity::SealedProjectKey::from_canonical(project_id);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let summary = sealed_action_directory(ctx)
+                .create(
+                    owner,
+                    crate::sealed::action_admin::CreateSealedAction {
+                        kind,
+                        description,
+                        project_key,
+                    },
+                    now_ms,
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::SealedActionCreated {
+                action_id: summary.action_id,
+                revision: summary.revision,
+            })
         }
         Request::ReviseSealedActionDescription {
             action_id,
             description,
         } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
             if action_id.trim().is_empty() {
                 return Err(bad_request("action id must not be empty".to_string()));
             }
-            crate::sealed::identity::SealedDescription::parse(&description)
+            let description = crate::sealed::identity::SealedDescription::parse(&description)
                 .map_err(|error| bad_request(error.to_string()))?;
-            Err(sealed_owner_backing_unavailable())
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let summary = sealed_action_directory(ctx)
+                .revise(
+                    owner,
+                    crate::sealed::action_admin::ReviseSealedAction::Description {
+                        action_id,
+                        description,
+                    },
+                    now_ms,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            Ok(Response::SealedActionRevised {
+                action_id: summary.action_id,
+                revision: summary.revision,
+            })
         }
         Request::ReviseSealedActionEnabled { action_id, enabled } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
             if action_id.trim().is_empty() {
                 return Err(bad_request("action id must not be empty".to_string()));
             }
-            let _ = enabled;
-            Err(sealed_owner_backing_unavailable())
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let summary = sealed_action_directory(ctx)
+                .revise(
+                    owner,
+                    crate::sealed::action_admin::ReviseSealedAction::Enabled { action_id, enabled },
+                    now_ms,
+                )
+                .await
+                .map_err(|error| bad_request(error.to_string()))?;
+            Ok(Response::SealedActionRevised {
+                action_id: summary.action_id,
+                revision: summary.revision,
+            })
         }
         Request::RetireSealedAction { action_id, confirm } => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
             if action_id != confirm {
                 return Err(bad_request(
                     "retire confirmation must exactly match the action id".to_string(),
                 ));
             }
-            Err(sealed_owner_backing_unavailable())
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let retired = sealed_action_directory(ctx)
+                .retire(owner, &action_id, now_ms)
+                .await
+                .map_err(internal)?;
+            Ok(Response::SealedActionRetired { action_id, retired })
         }
 
         Request::ListProjectNotes { project_root } => ctx
@@ -8131,9 +8185,15 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             Ok(Response::sealed_owner_inventory(items))
         }
         Request::ListSealedActions => {
-            let _owner = crate::sealed::action::OwnerAuthority::for_owner_request();
-            // increment-2 action channel — still fail-closed.
-            Err(sealed_owner_backing_unavailable())
+            let owner = crate::sealed::action::OwnerAuthority::for_owner_request();
+            let actions = sealed_action_directory(&ctx)
+                .list(owner)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(sealed_action_summary_to_wire)
+                .collect();
+            Ok(Response::sealed_actions(actions))
         }
         Request::ExportSessionData {
             session_id,
@@ -12925,6 +12985,27 @@ fn sealed_value_directory(ctx: &DaemonContext) -> crate::sealed::store::SealedVa
         directory = directory.with_redaction_resolver(resolver);
     }
     directory
+}
+
+/// Build the SQLite-backed sealed-action directory over the daemon database.
+/// Action instances are durable, so this holds only a cheap `Db` handle clone.
+fn sealed_action_directory(
+    ctx: &DaemonContext,
+) -> crate::sealed::action_admin::SealedActionDirectory {
+    crate::sealed::action_admin::SealedActionDirectory::new(ctx.db.clone())
+}
+
+/// Project a safe action-instance summary into its wire form.
+fn sealed_action_summary_to_wire(
+    summary: crate::sealed::action_admin::SealedActionInstanceSummary,
+) -> proto::SealedActionSummaryWire {
+    proto::SealedActionSummaryWire {
+        action_id: summary.action_id,
+        revision: summary.revision,
+        enabled: summary.enabled,
+        description: summary.description,
+        project_key: summary.project_key,
+    }
 }
 
 /// Reconstruct a typed [`SealedScopeRef`] from the wire scope kind + key. Session

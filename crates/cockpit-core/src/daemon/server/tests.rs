@@ -282,10 +282,10 @@ async fn sealed_owner_rpcs_are_owner_remoted_and_never_leak() {
 
 #[tokio::test]
 async fn action_admin_unknown_ids_reject_before_persist() {
-    // AC9: unknown kind_id / origin_id / projection_id are rejected as a
-    // BadRequest BEFORE the fail-closed persist. Positive control: a fully
-    // resolvable request reaches the (content-free) fail-closed backing instead,
-    // proving the ids really were resolved before the persist boundary.
+    // Unknown kind_id / origin_id / projection_id are rejected as a BadRequest
+    // BEFORE any persist. Positive control: a fully resolvable request passes the
+    // closed lookup and now persists a daemon-minted action instance (the backing
+    // is wired), proving the ids really were resolved before the persist boundary.
     let ctx = test_ctx();
 
     let unknown_cases = [
@@ -316,9 +316,9 @@ async fn action_admin_unknown_ids_reject_before_persist() {
     }
 
     // Positive control: all ids resolve, so the request passes the closed lookup
-    // and reaches the fail-closed backing (a distinct Internal error).
+    // and persists a daemon-minted action instance.
     let mut state = owner_state();
-    let error = handle_request(
+    let response = handle_request(
         Request::CreateSealedAction {
             kind_id: "https.notify".into(),
             project_id: "proj".into(),
@@ -330,12 +330,17 @@ async fn action_admin_unknown_ids_reject_before_persist() {
         &ctx,
     )
     .await
-    .unwrap_err();
-    assert_ne!(
-        error.code,
-        ErrorCode::BadRequest,
-        "a fully-resolved create must pass the closed lookup and fail closed at the backing"
-    );
+    .unwrap();
+    match response {
+        Response::SealedActionCreated {
+            action_id,
+            revision,
+        } => {
+            assert_eq!(revision, 1);
+            uuid::Uuid::parse_str(&action_id).expect("action id is a daemon-minted uuid");
+        }
+        other => panic!("expected SealedActionCreated, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -27303,4 +27308,97 @@ async fn sealed_capability_minted_in_one_session_is_rejected_in_another() {
         } => assert_eq!(literal.as_str(), LITERAL),
         other => panic!("expected revealed literal, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn sealed_action_channel_create_list_revise_retire_roundtrip() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+
+    // Create via the closed catalog id.
+    let created = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::CreateSealedAction {
+            kind_id: "https.notify".into(),
+            project_id: "proj".into(),
+            description: "notify deploy".into(),
+            origin_id: "0".into(),
+            projection_id: "http_status_and_ok".into(),
+        },
+    )
+    .await
+    .expect("create sealed action");
+    let action_id = match created {
+        Response::SealedActionCreated {
+            action_id,
+            revision,
+        } => {
+            assert_eq!(revision, 1);
+            uuid::Uuid::parse_str(&action_id).expect("daemon-minted uuid");
+            action_id
+        }
+        other => panic!("expected created, got {other:?}"),
+    };
+
+    // List reflects it, enabled at revision 1.
+    let listed = dispatch_sealed_owner(&ctx, &mut state, Request::ListSealedActions)
+        .await
+        .expect("list sealed actions");
+    match listed {
+        Response::SealedActions { actions } => {
+            let row = actions
+                .iter()
+                .find(|a| a.action_id == action_id)
+                .expect("created action present");
+            assert!(row.enabled);
+            assert_eq!(row.revision, 1);
+        }
+        other => panic!("expected actions, got {other:?}"),
+    }
+
+    // Disable → new revision.
+    let revised = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ReviseSealedActionEnabled {
+            action_id: action_id.clone(),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("revise sealed action");
+    match revised {
+        Response::SealedActionRevised { revision, .. } => assert_eq!(revision, 2),
+        other => panic!("expected revised, got {other:?}"),
+    }
+
+    // Retire (confirm must match).
+    let retired = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::RetireSealedAction {
+            action_id: action_id.clone(),
+            confirm: action_id.clone(),
+        },
+    )
+    .await
+    .expect("retire sealed action");
+    assert!(matches!(
+        retired,
+        Response::SealedActionRetired { retired: true, .. }
+    ));
+
+    // A retire whose confirm does not match the id is a content-free bad request.
+    let err = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::RetireSealedAction {
+            action_id: "one".into(),
+            confirm: "two".into(),
+        },
+    )
+    .await
+    .expect_err("mismatched retire confirmation must reject");
+    assert_eq!(err.code, ErrorCode::BadRequest);
 }

@@ -364,6 +364,16 @@ impl SealedActionKind {
                 if origins.len() > HTTPS_MAX_ORIGINS {
                     bail!("HTTPS action declares more than {HTTPS_MAX_ORIGINS} origins");
                 }
+                // Re-parse every origin through the validating constructor. A
+                // derived `Deserialize` bypasses `HttpsOrigin::parse`, so a
+                // persisted (or otherwise deserialized) origin could carry an
+                // `http`, wildcard, user-info, or IP-literal host that the parse
+                // path rejects; round-tripping here makes `validate` fail closed
+                // on such a corrupt origin instead of trusting the raw fields.
+                for origin in origins.iter() {
+                    HttpsOrigin::parse(&origin.as_str())
+                        .context("persisted HTTPS origin fails origin validation")?;
+                }
                 credential_placement.validate()?;
                 if !path_template.starts_with('/') {
                     bail!("HTTPS action path template must start with '/'");
@@ -512,28 +522,13 @@ pub struct SealedActionInstanceSummary {
     pub retired_at_ms: Option<i64>,
 }
 
-impl SealedActionInstanceSummary {
-    fn from_snapshot(snap: &SealedActionSnapshot) -> Self {
-        let kind_tag = match &snap.kind {
-            SealedActionKind::Https { .. } => "https",
-        };
-        Self {
-            action_id: snap.action_id.clone(),
-            revision: snap.revision,
-            kind_tag: kind_tag.to_string(),
-            description: snap.description.clone(),
-            project_key: snap.project_key.clone(),
-            enabled: snap.enabled,
-            created_at_ms: snap.created_at_ms,
-            retired_at_ms: snap.retired_at_ms,
-        }
-    }
-}
-
 /// What the Owner supplies to create a sealed action instance.
+///
+/// There is deliberately no `action_id` field: the daemon mints a fresh UUID
+/// for every create, so no caller (owner RPC input included) can choose or
+/// collide with the persisted id (AC12).
 #[derive(Debug, Clone)]
 pub struct CreateSealedAction {
-    pub action_id: String,
     pub kind: SealedActionKind,
     pub description: SealedDescription,
     pub project_key: SealedProjectKey,
@@ -551,164 +546,258 @@ pub enum ReviseSealedAction {
     Enabled { action_id: String, enabled: bool },
 }
 
-/// The Owner-facing action-instance store.
+impl ReviseSealedAction {
+    /// The action id this revision targets.
+    pub fn action_id(&self) -> &str {
+        match self {
+            Self::Description { action_id, .. } | Self::Enabled { action_id, .. } => action_id,
+        }
+    }
+}
+
+/// The Owner-facing action-instance store, backed by SQLite.
 ///
 /// Every method demands [`OwnerAuthority`]. Agents and remote clients cannot
 /// create, revise, retire, or list action instances, because they cannot
 /// obtain that token.
 ///
-/// This is an in-memory store for the daemon's process lifetime. Persistence
-/// to SQLite is the store layer's responsibility; this module compiles and
-/// holds the immutable snapshots.
-#[derive(Debug, Default)]
+/// Snapshots are durable (`sealed_action_instances`), so instances survive a
+/// daemon restart. The daemon mints every `action_id` (a fresh UUID — no caller
+/// chooses it). A revise or retire revokes the dependent grants in the SAME
+/// transaction that mutates the snapshot row, so a crash can never leave a
+/// retired/revised action with a live grant; a revise additionally fences on the
+/// prior revision to reject a concurrent lost-update.
+#[derive(Clone)]
 pub struct SealedActionDirectory {
-    snapshots: std::sync::Mutex<BTreeMap<String, SealedActionSnapshot>>,
+    db: cockpit_db::db::Db,
+}
+
+impl std::fmt::Debug for SealedActionDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedActionDirectory")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SealedActionDirectory {
-    /// Create a new empty directory.
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a directory over a database handle.
+    pub fn new(db: cockpit_db::db::Db) -> Self {
+        Self { db }
     }
 
-    /// Create a sealed action instance. Compiles the kind into an immutable
-    /// snapshot and persists it.
-    pub fn create(
+    /// Create a sealed action instance. Compiles + validates the kind, mints a
+    /// fresh daemon-owned `action_id` (AC12), and persists the immutable
+    /// snapshot at revision 1.
+    pub async fn create(
         &self,
         _owner: OwnerAuthority,
         request: CreateSealedAction,
         now_ms: i64,
     ) -> Result<SealedActionInstanceSummary> {
         request.kind.validate()?;
-        // Compile the descriptor to validate the action id and revision.
+        // The daemon mints the id; no caller input can choose or collide with it.
+        let action_id = uuid::Uuid::new_v4().to_string();
+        // Compile the descriptor to validate the id + revision before persisting.
         request
             .kind
-            .compile_descriptor(&request.action_id, 1, request.description.as_str())?;
-
-        let snapshot = SealedActionSnapshot {
-            action_id: request.action_id.clone(),
-            revision: 1,
-            kind: request.kind,
-            description: request.description.as_str().to_string(),
-            project_key: request.project_key.as_str().to_string(),
-            enabled: true,
-            created_at_ms: now_ms,
-            retired_at_ms: None,
-        };
-
-        let mut snapshots = self.snapshots.lock().expect("directory mutex");
-        if snapshots.contains_key(&request.action_id) {
-            bail!("sealed action `{}` already exists", request.action_id);
-        }
-        snapshots.insert(request.action_id.clone(), snapshot.clone());
-        Ok(SealedActionInstanceSummary::from_snapshot(&snapshot))
+            .compile_descriptor(&action_id, 1, request.description.as_str())?;
+        let kind_json =
+            serde_json::to_string(&request.kind).context("serializing sealed action kind")?;
+        self.db
+            .insert_sealed_action_instance(
+                cockpit_db::db::sealed_actions::NewSealedActionInstance {
+                    action_id: action_id.clone(),
+                    revision: 1,
+                    kind_json,
+                    description: request.description.as_str().to_string(),
+                    project_key: request.project_key.as_str().to_string(),
+                    created_at_ms: now_ms,
+                },
+            )
+            .await?;
+        let row = self
+            .db
+            .sealed_action_instance(action_id)
+            .await?
+            .context("created sealed action instance not found after insert")?;
+        summary_from_row(&row)
     }
 
-    /// Revise a sealed action instance. Creates a new revision, atomically
-    /// retires the old one, and returns the new summary.
-    ///
-    /// In a full implementation, this revokes dependent grants before the
-    /// snapshot changes. Here, the grant revocation is the caller's
-    /// responsibility (the store layer's `revoke_action_grant`).
-    pub fn revise(
+    /// Revise a sealed action instance's description or enabled flag, creating a
+    /// new revision. Revokes every dependent grant in the SAME transaction that
+    /// writes the new snapshot, and fences on the prior revision so a concurrent
+    /// revise cannot silently overwrite (AC4).
+    pub async fn revise(
         &self,
         _owner: OwnerAuthority,
         request: ReviseSealedAction,
-        _now_ms: i64,
+        now_ms: i64,
     ) -> Result<SealedActionInstanceSummary> {
-        let (action_id, new_description, new_enabled) = match &request {
-            ReviseSealedAction::Description {
-                action_id,
-                description,
-            } => (
-                action_id.clone(),
-                Some(description.as_str().to_string()),
-                None,
-            ),
-            ReviseSealedAction::Enabled { action_id, enabled } => {
-                (action_id.clone(), None, Some(*enabled))
-            }
-        };
-
-        let mut snapshots = self.snapshots.lock().expect("directory mutex");
-        let existing = snapshots
-            .get(&action_id)
-            .context("sealed action does not exist")?
-            .clone();
+        let action_id = request.action_id().to_string();
+        let existing = self
+            .db
+            .sealed_action_instance(action_id.clone())
+            .await?
+            .context("sealed action does not exist")?;
         if existing.retired_at_ms.is_some() {
             bail!("cannot revise a retired sealed action");
         }
-
-        let new_revision = existing.revision + 1;
-        let description = new_description.unwrap_or_else(|| existing.description.clone());
-        let enabled = new_enabled.unwrap_or(existing.enabled);
-
-        // Compile the new descriptor to validate the revision.
-        existing
-            .kind
-            .compile_descriptor(&action_id, new_revision, &description)?;
-
-        let snapshot = SealedActionSnapshot {
-            action_id: action_id.clone(),
-            revision: new_revision,
-            kind: existing.kind.clone(),
-            description,
-            project_key: existing.project_key.clone(),
-            enabled,
-            created_at_ms: existing.created_at_ms,
-            retired_at_ms: None,
+        let description = match &request {
+            ReviseSealedAction::Description { description, .. } => description.as_str().to_string(),
+            ReviseSealedAction::Enabled { .. } => existing.description.clone(),
         };
-        snapshots.insert(action_id.clone(), snapshot.clone());
-        Ok(SealedActionInstanceSummary::from_snapshot(&snapshot))
+        let enabled = match &request {
+            ReviseSealedAction::Enabled { enabled, .. } => *enabled,
+            ReviseSealedAction::Description { .. } => existing.enabled,
+        };
+        let expected_prev = existing.revision;
+        let new_revision = existing.revision + 1;
+        // Revalidate the persisted kind and compile the new revision (id +
+        // revision bounds) before the tx; a corrupt stored kind fails closed.
+        let kind = decode_validated_kind(&existing.kind_json)?;
+        kind.compile_descriptor(&action_id, checked_revision(new_revision)?, &description)?;
+        let kind_json = existing.kind_json.clone();
+        // One transaction: revoke dependent grants BEFORE the snapshot changes,
+        // then compare-and-swap the revision.
+        let tx_action_id = action_id.clone();
+        let row = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::db::sealed_actions::revoke_action_grants_conn(
+                    conn,
+                    &tx_action_id,
+                    now_ms,
+                )?;
+                cockpit_db::db::sealed_actions::revise_action_instance_conn(
+                    conn,
+                    &tx_action_id,
+                    expected_prev,
+                    new_revision,
+                    &kind_json,
+                    &description,
+                    enabled,
+                )
+            })
+            .await?;
+        summary_from_row(&row)
     }
 
-    /// Retire a sealed action instance. Revokes dependent grants (caller's
-    /// responsibility) and marks the snapshot as retired.
-    pub fn retire(&self, _owner: OwnerAuthority, action_id: &str, now_ms: i64) -> Result<bool> {
-        let mut snapshots = self.snapshots.lock().expect("directory mutex");
-        let existing = snapshots
-            .get(action_id)
-            .context("sealed action does not exist")?;
-        if existing.retired_at_ms.is_some() {
-            return Ok(false);
-        }
-        let mut snapshot = existing.clone();
-        snapshot.retired_at_ms = Some(now_ms);
-        snapshot.enabled = false;
-        snapshots.insert(action_id.to_string(), snapshot);
-        Ok(true)
+    /// Retire a sealed action instance. Revokes every dependent grant in the
+    /// SAME transaction that stamps the row retired, so no grant outlives the
+    /// retired snapshot becoming visible (AC13). Returns `true` when this call
+    /// retired a previously-live instance, `false` when it was already retired.
+    pub async fn retire(
+        &self,
+        _owner: OwnerAuthority,
+        action_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let action_id = action_id.to_string();
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::db::sealed_actions::revoke_action_grants_conn(
+                    conn, &action_id, now_ms,
+                )?;
+                cockpit_db::db::sealed_actions::retire_action_instance_conn(
+                    conn, &action_id, now_ms,
+                )
+            })
+            .await
     }
 
     /// List all action instances. Owner-only.
-    pub fn list(&self, _owner: OwnerAuthority) -> Result<Vec<SealedActionInstanceSummary>> {
-        let snapshots = self.snapshots.lock().expect("directory mutex");
-        Ok(snapshots
-            .values()
-            .map(SealedActionInstanceSummary::from_snapshot)
-            .collect())
+    pub async fn list(&self, _owner: OwnerAuthority) -> Result<Vec<SealedActionInstanceSummary>> {
+        let rows = self.db.list_sealed_action_instances().await?;
+        rows.iter().map(summary_from_row).collect()
     }
 
     /// Get one action instance's summary. Owner-only.
-    pub fn summary(
+    pub async fn summary(
         &self,
         _owner: OwnerAuthority,
         action_id: &str,
     ) -> Result<Option<SealedActionInstanceSummary>> {
-        let snapshots = self.snapshots.lock().expect("directory mutex");
-        Ok(snapshots
-            .get(action_id)
-            .map(SealedActionInstanceSummary::from_snapshot))
+        match self
+            .db
+            .sealed_action_instance(action_id.to_string())
+            .await?
+        {
+            Some(row) => Ok(Some(summary_from_row(&row)?)),
+            None => Ok(None),
+        }
     }
 
     /// Get one action instance's snapshot. Owner-only. Used by the runtime to
     /// compile the descriptor for the registry.
-    pub fn snapshot(&self, action_id: &str) -> Option<SealedActionSnapshot> {
-        self.snapshots
-            .lock()
-            .expect("directory mutex")
-            .get(action_id)
-            .cloned()
+    pub async fn snapshot(&self, action_id: &str) -> Result<Option<SealedActionSnapshot>> {
+        match self
+            .db
+            .sealed_action_instance(action_id.to_string())
+            .await?
+        {
+            Some(row) => Ok(Some(snapshot_from_row(&row)?)),
+            None => Ok(None),
+        }
     }
+}
+
+/// Decode + REVALIDATE a persisted action kind. Derived `Deserialize` bypasses
+/// the validating constructors (`HttpsOrigin::parse`, `SealedActionKind::validate`),
+/// so a semantically-invalid-but-serde-valid stored `kind_json` (e.g. an
+/// IP-literal origin, an `http` origin, or a bad path template written by DB
+/// tampering or a future schema) would otherwise be accepted on read. Every read
+/// path revalidates here so a corrupt snapshot fails closed rather than reaching
+/// the executor (defense in depth for the increment-3 egress path).
+fn decode_validated_kind(kind_json: &str) -> Result<SealedActionKind> {
+    let kind: SealedActionKind =
+        serde_json::from_str(kind_json).context("decoding persisted sealed action kind")?;
+    kind.validate()
+        .context("persisted sealed action kind failed revalidation")?;
+    Ok(kind)
+}
+
+/// A persisted revision must fit the `u32` the runtime uses; an out-of-range
+/// value is corruption and fails closed rather than being clamped.
+fn checked_revision(revision: i64) -> Result<u32> {
+    u32::try_from(revision).context("persisted sealed action revision is out of range")
+}
+
+/// Project a persisted action-instance row into its safe Owner summary,
+/// decoding + revalidating the kind from the stored JSON.
+fn summary_from_row(
+    row: &cockpit_db::db::sealed_actions::SealedActionInstanceRow,
+) -> Result<SealedActionInstanceSummary> {
+    let kind = decode_validated_kind(&row.kind_json)?;
+    let kind_tag = match kind {
+        SealedActionKind::Https { .. } => "https",
+    };
+    Ok(SealedActionInstanceSummary {
+        action_id: row.action_id.clone(),
+        revision: checked_revision(row.revision)?,
+        kind_tag: kind_tag.to_string(),
+        description: row.description.clone(),
+        project_key: row.project_key.clone(),
+        enabled: row.enabled,
+        created_at_ms: row.created_at_ms,
+        retired_at_ms: row.retired_at_ms,
+    })
+}
+
+/// Reconstruct the full immutable snapshot from a persisted row, revalidating the
+/// kind so a corrupt snapshot never reaches a consumer.
+fn snapshot_from_row(
+    row: &cockpit_db::db::sealed_actions::SealedActionInstanceRow,
+) -> Result<SealedActionSnapshot> {
+    Ok(SealedActionSnapshot {
+        action_id: row.action_id.clone(),
+        revision: checked_revision(row.revision)?,
+        kind: decode_validated_kind(&row.kind_json)?,
+        description: row.description.clone(),
+        project_key: row.project_key.clone(),
+        enabled: row.enabled,
+        created_at_ms: row.created_at_ms,
+        retired_at_ms: row.retired_at_ms,
+    })
 }
 
 #[cfg(test)]

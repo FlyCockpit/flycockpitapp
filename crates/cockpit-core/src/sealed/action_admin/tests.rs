@@ -274,192 +274,290 @@ fn projection_parse_rejects_unknown() {
     assert!(SealedProjectionId::parse("bogus").is_err());
 }
 
-// ---- AC3: action directory create/list/revise/retire ----------------------
+// ---- action directory: SQLite-backed create/list/revise/retire -------------
 
-#[test]
-fn directory_create_and_list() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    let summary = dir
-        .create(
-            owner(),
-            CreateSealedAction {
-                action_id: "action.notify.1".to_string(),
-                kind,
-                description: SealedDescription::parse("Notify deploy").unwrap(),
-                project_key: project_key(),
-            },
-            1_000,
-        )
+use cockpit_db::db::Db;
+use cockpit_db::db::sealed_scope::{
+    NewSealedActionGrant, NewSealedValueRecord, SealedGrantSelector,
+};
+
+fn in_memory_directory() -> (Db, SealedActionDirectory) {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let dir = SealedActionDirectory::new(db.clone());
+    (db, dir)
+}
+
+async fn create_sample_action(dir: &SealedActionDirectory) -> String {
+    dir.create(
+        owner(),
+        CreateSealedAction {
+            kind: sample_https_kind(),
+            description: SealedDescription::parse("Notify deploy").unwrap(),
+            project_key: project_key(),
+        },
+        1_000,
+    )
+    .await
+    .expect("create sealed action")
+    .action_id
+}
+
+/// Seed a resolvable project-scope sealed value record and a live action grant
+/// referencing `action_id`. Returns the selector that re-reads the grant's
+/// revocation state.
+async fn seed_live_grant(db: &Db, action_id: &str) -> SealedGrantSelector {
+    let session = db.create_session("proj", "/repo", "Build").await.unwrap();
+    let session_id = session.session_id.to_string();
+    let record_id = uuid::Uuid::new_v4().to_string();
+    db.prepare_sealed_value_create(
+        NewSealedValueRecord {
+            record_id: record_id.clone(),
+            scope: cockpit_db::db::sealed_scope::SealedScopeKind::Project,
+            scope_key: "proj".into(),
+            name: "deploy_token".into(),
+            description: "deployment credential".into(),
+            owner_principal: "owner".into(),
+            created_at_ms: 1_000,
+        },
+        "op-1".into(),
+        Some("locator-a".into()),
+    )
+    .await
+    .unwrap();
+    db.commit_sealed_value_create(record_id.clone(), Some("locator-a".into()), 1_100)
+        .await
         .unwrap();
-    assert_eq!(summary.action_id, "action.notify.1");
-    assert_eq!(summary.revision, 1);
-    assert_eq!(summary.kind_tag, "https");
-    assert!(summary.enabled);
+    db.issue_sealed_action_grant(NewSealedActionGrant {
+        grant_id: "grant-1".into(),
+        record_id: record_id.clone(),
+        value_version: 1,
+        project_key: "proj".into(),
+        session_id: session_id.clone(),
+        session_generation: 0,
+        action_id: action_id.to_string(),
+        action_revision: 1,
+        issued_at_ms: 1_200,
+        expires_at_ms: None,
+    })
+    .await
+    .unwrap();
+    SealedGrantSelector {
+        record_id,
+        action_id: action_id.to_string(),
+        project_key: "proj".into(),
+        session_id,
+        session_generation: 0,
+    }
+}
 
-    let list = dir.list(owner()).unwrap();
+async fn grant_is_revoked(db: &Db, selector: &SealedGrantSelector) -> bool {
+    db.sealed_action_grant_for(selector.clone())
+        .await
+        .unwrap()
+        .expect("grant row present")
+        .revoked_at_ms
+        .is_some()
+}
+
+#[tokio::test]
+async fn directory_create_and_list() {
+    let (_db, dir) = in_memory_directory();
+    let action_id = create_sample_action(&dir).await;
+
+    let list = dir.list(owner()).await.unwrap();
     assert_eq!(list.len(), 1);
-    assert_eq!(list[0].action_id, "action.notify.1");
+    assert_eq!(list[0].action_id, action_id);
+    assert_eq!(list[0].revision, 1);
+    assert_eq!(list[0].kind_tag, "https");
+    assert!(list[0].enabled);
 }
 
-#[test]
-fn directory_create_rejects_duplicate() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.dup.1".to_string(),
-            kind: kind.clone(),
-            description: SealedDescription::parse("First").unwrap(),
-            project_key: project_key(),
-        },
-        1_000,
-    )
-    .unwrap();
-    let result = dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.dup.1".to_string(),
-            kind,
-            description: SealedDescription::parse("Second").unwrap(),
-            project_key: project_key(),
-        },
-        2_000,
-    );
-    assert!(result.is_err());
+#[tokio::test]
+async fn action_id_is_daemon_minted_uuid() {
+    // AC12: the caller cannot choose the persisted action id. Two creates yield
+    // two distinct daemon-minted UUIDs; the CreateSealedAction request carries
+    // no action_id field at all.
+    let (_db, dir) = in_memory_directory();
+    let first = create_sample_action(&dir).await;
+    let second = create_sample_action(&dir).await;
+    assert_ne!(first, second, "each create mints a fresh id");
+    for id in [&first, &second] {
+        uuid::Uuid::parse_str(id).expect("action id is a UUID");
+    }
+    assert_eq!(dir.list(owner()).await.unwrap().len(), 2);
 }
 
-// ---- AC5: revision revokes before snapshot change --------------------------
+#[tokio::test]
+async fn sealed_action_instance_persists_across_restart() {
+    // AC3: an action instance survives a daemon restart (a fresh Db handle over
+    // the same file sees it).
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("actions.db");
+    let action_id = {
+        let db = Db::open(&path).unwrap();
+        let dir = SealedActionDirectory::new(db);
+        create_sample_action(&dir).await
+    };
+    // "Restart": a brand-new Db handle + directory over the same file.
+    let db = Db::open(&path).unwrap();
+    let dir = SealedActionDirectory::new(db);
+    let reloaded = dir.summary(owner(), &action_id).await.unwrap().unwrap();
+    assert_eq!(reloaded.action_id, action_id);
+    assert_eq!(reloaded.revision, 1);
+    assert!(reloaded.enabled);
+}
 
-#[test]
-fn directory_revise_description_creates_new_revision() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.rev.1".to_string(),
-            kind,
-            description: SealedDescription::parse("Original").unwrap(),
-            project_key: project_key(),
-        },
-        1_000,
-    )
-    .unwrap();
-
+#[tokio::test]
+async fn directory_revise_description_creates_new_revision() {
+    let (_db, dir) = in_memory_directory();
+    let action_id = create_sample_action(&dir).await;
     let summary = dir
         .revise(
             owner(),
             ReviseSealedAction::Description {
-                action_id: "action.rev.1".to_string(),
+                action_id: action_id.clone(),
                 description: SealedDescription::parse("Updated").unwrap(),
             },
             2_000,
         )
+        .await
         .unwrap();
     assert_eq!(summary.revision, 2);
     assert_eq!(summary.description, "Updated");
 }
 
-#[test]
-fn directory_revise_enabled_creates_new_revision() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.rev.2".to_string(),
-            kind,
-            description: SealedDescription::parse("Original").unwrap(),
-            project_key: project_key(),
-        },
-        1_000,
-    )
-    .unwrap();
+#[tokio::test]
+async fn action_revision_revokes_before_snapshot_change() {
+    // AC4: a revise revokes every dependent grant in the SAME transaction that
+    // writes the new revision. After the revise: the grant is revoked AND the
+    // snapshot is at revision 2 — both committed atomically.
+    let (db, dir) = in_memory_directory();
+    let action_id = create_sample_action(&dir).await;
+    let selector = seed_live_grant(&db, &action_id).await;
+    assert!(!grant_is_revoked(&db, &selector).await, "grant starts live");
 
     let summary = dir
         .revise(
             owner(),
             ReviseSealedAction::Enabled {
-                action_id: "action.rev.2".to_string(),
+                action_id: action_id.clone(),
                 enabled: false,
             },
             2_000,
         )
+        .await
         .unwrap();
     assert_eq!(summary.revision, 2);
     assert!(!summary.enabled);
+    assert!(
+        grant_is_revoked(&db, &selector).await,
+        "the dependent grant is revoked by the revise"
+    );
 }
 
-#[test]
-fn directory_retire_marks_retired() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.ret.1".to_string(),
-            kind,
-            description: SealedDescription::parse("Original").unwrap(),
-            project_key: project_key(),
-        },
-        1_000,
-    )
-    .unwrap();
+#[tokio::test]
+async fn retire_revokes_grants_before_retired_snapshot_visible() {
+    // AC13: after retire, dependent grants are gone before any read observes the
+    // retired snapshot — the revoke and the retire commit in one transaction.
+    let (db, dir) = in_memory_directory();
+    let action_id = create_sample_action(&dir).await;
+    let selector = seed_live_grant(&db, &action_id).await;
+    assert!(!grant_is_revoked(&db, &selector).await, "grant starts live");
 
-    let retired = dir.retire(owner(), "action.ret.1", 2_000).unwrap();
+    let retired = dir.retire(owner(), &action_id, 2_000).await.unwrap();
     assert!(retired);
+    assert!(
+        grant_is_revoked(&db, &selector).await,
+        "the dependent grant is revoked by the retire"
+    );
 
-    let summary = dir.summary(owner(), "action.ret.1").unwrap().unwrap();
+    let summary = dir.summary(owner(), &action_id).await.unwrap().unwrap();
     assert_eq!(summary.retired_at_ms, Some(2_000));
     assert!(!summary.enabled);
 
     // Retiring again is a no-op.
-    let retired2 = dir.retire(owner(), "action.ret.1", 3_000).unwrap();
-    assert!(!retired2);
+    assert!(!dir.retire(owner(), &action_id, 3_000).await.unwrap());
 }
 
-#[test]
-fn directory_revise_rejects_retired() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
-    dir.create(
-        owner(),
-        CreateSealedAction {
-            action_id: "action.revret.1".to_string(),
-            kind,
-            description: SealedDescription::parse("Original").unwrap(),
-            project_key: project_key(),
+#[tokio::test]
+async fn directory_revise_rejects_retired() {
+    let (_db, dir) = in_memory_directory();
+    let action_id = create_sample_action(&dir).await;
+    dir.retire(owner(), &action_id, 2_000).await.unwrap();
+
+    let result = dir
+        .revise(
+            owner(),
+            ReviseSealedAction::Description {
+                action_id,
+                description: SealedDescription::parse("Updated").unwrap(),
+            },
+            3_000,
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn directory_revise_rejects_nonexistent() {
+    let (_db, dir) = in_memory_directory();
+    let result = dir
+        .revise(
+            owner(),
+            ReviseSealedAction::Description {
+                action_id: uuid::Uuid::new_v4().to_string(),
+                description: SealedDescription::parse("Updated").unwrap(),
+            },
+            1_000,
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn corrupt_persisted_kind_fails_closed_on_read() {
+    // A serde-valid but semantically-invalid persisted kind (an IP-literal origin
+    // that `HttpsOrigin::parse` rejects, constructed here via raw fields to bypass
+    // the validating constructor — as DB tampering or a future schema could).
+    // Reading it back must fail closed, not surface an invalid snapshot to a
+    // consumer such as the increment-3 executor.
+    let (db, dir) = in_memory_directory();
+    let invalid_kind = SealedActionKind::Https {
+        origins: HttpsOriginAllowlist {
+            origins: vec![HttpsOrigin {
+                host: "169.254.169.254".into(),
+                port: None,
+            }],
         },
-        1_000,
-    )
+        credential_placement: HttpsCredentialPlacement::Header {
+            header_name: "X-Key".into(),
+        },
+        path_template: "/v1/notify".into(),
+        projection: SealedProjectionId::None,
+        parameters: BTreeMap::new(),
+    };
+    // Precondition: this kind does NOT pass validation (the revalidation bites).
+    assert!(
+        invalid_kind.validate().is_err(),
+        "an IP-literal origin must fail validation"
+    );
+    let kind_json = serde_json::to_string(&invalid_kind).unwrap();
+    db.insert_sealed_action_instance(cockpit_db::db::sealed_actions::NewSealedActionInstance {
+        action_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        kind_json,
+        description: "corrupt".into(),
+        project_key: "proj".into(),
+        created_at_ms: 1_000,
+    })
+    .await
     .unwrap();
-    dir.retire(owner(), "action.revret.1", 2_000).unwrap();
-
-    let result = dir.revise(
-        owner(),
-        ReviseSealedAction::Description {
-            action_id: "action.revret.1".to_string(),
-            description: SealedDescription::parse("Updated").unwrap(),
-        },
-        3_000,
+    // Every read path revalidates, so listing/reading fails closed.
+    let err = dir.list(owner()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("revalidation") || err.to_string().contains("origin"),
+        "read of a corrupt kind must fail closed: {err}"
     );
-    assert!(result.is_err());
-}
-
-#[test]
-fn directory_revise_rejects_nonexistent() {
-    let dir = SealedActionDirectory::new();
-    let result = dir.revise(
-        owner(),
-        ReviseSealedAction::Description {
-            action_id: "nonexistent".to_string(),
-            description: SealedDescription::parse("Updated").unwrap(),
-        },
-        1_000,
-    );
-    assert!(result.is_err());
 }
 
 // ---- AC3: snapshot is immutable and serializable ---------------------------
@@ -599,21 +697,20 @@ fn completion_fields_contain_no_secret_derived_values() {
 
 // ---- AC3: summary has no secret-derived fields -----------------------------
 
-#[test]
-fn instance_summary_has_no_secret_fields() {
-    let dir = SealedActionDirectory::new();
-    let kind = sample_https_kind();
+#[tokio::test]
+async fn instance_summary_has_no_secret_fields() {
+    let (_db, dir) = in_memory_directory();
     let summary = dir
         .create(
             owner(),
             CreateSealedAction {
-                action_id: "action.sum.1".to_string(),
-                kind,
+                kind: sample_https_kind(),
                 description: SealedDescription::parse("Notify").unwrap(),
                 project_key: project_key(),
             },
             1_000,
         )
+        .await
         .unwrap();
     let debug = format!("{summary:?}");
     assert!(!debug.contains("secret"));

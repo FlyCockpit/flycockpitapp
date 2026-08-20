@@ -169,10 +169,19 @@ pub fn revoke_action_grants_conn(conn: &Connection, action_id: &str, now_ms: i64
 
 /// Mutate a live action instance to a new revision snapshot. The caller has
 /// already revoked the dependent grants earlier in the same transaction. Fails
-/// closed if the action is missing or already retired.
+/// closed if the action is missing, already retired, or — the lost-update fence
+/// — no longer at `expected_prev_revision`.
+///
+/// The `WHERE revision = expected_prev_revision` predicate makes the mutation a
+/// compare-and-swap on the revision read before the transaction: two concurrent
+/// revises both read revision N and try to write N+1, but only the first's
+/// `WHERE revision = N` matches. The loser changes zero rows and fails closed
+/// instead of silently overwriting the winner's snapshot (e.g. re-enabling an
+/// action the winner just disabled).
 pub fn revise_action_instance_conn(
     conn: &Connection,
     action_id: &str,
+    expected_prev_revision: i64,
     new_revision: i64,
     kind_json: &str,
     description: &str,
@@ -181,10 +190,11 @@ pub fn revise_action_instance_conn(
     let changed = conn
         .execute(
             "UPDATE sealed_action_instances
-                SET revision = ?2, kind_json = ?3, description = ?4, enabled = ?5
-              WHERE action_id = ?1 AND retired_at_ms IS NULL",
+                SET revision = ?3, kind_json = ?4, description = ?5, enabled = ?6
+              WHERE action_id = ?1 AND retired_at_ms IS NULL AND revision = ?2",
             params![
                 action_id,
+                expected_prev_revision,
                 new_revision,
                 kind_json,
                 description,
@@ -193,7 +203,10 @@ pub fn revise_action_instance_conn(
         )
         .context("revising sealed action instance")?;
     if changed != 1 {
-        bail!("cannot revise a missing or retired sealed action instance");
+        bail!(
+            "cannot revise sealed action instance: missing, retired, or revised concurrently \
+             (revision fence)"
+        );
     }
     action_instance_conn(conn, action_id)?
         .context("revised sealed action instance vanished inside its own transaction")
@@ -365,6 +378,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("sealed action instance"));
+    }
+
+    #[tokio::test]
+    async fn revise_is_fenced_on_the_prior_revision() {
+        // Finding 6: two revises that both read revision 1 must not both succeed.
+        // The first advances the row to revision 2; the second, still fencing on
+        // revision 1, changes zero rows and fails closed instead of silently
+        // overwriting the winner's snapshot.
+        let db = Db::open_in_memory().unwrap();
+        db.insert_sealed_action_instance(new_instance("act-1"))
+            .await
+            .unwrap();
+        // Winner: expected_prev = 1, write revision 2 (disable).
+        let row = db
+            .transaction(|conn| {
+                revise_action_instance_conn(
+                    conn,
+                    "act-1",
+                    1,
+                    2,
+                    r#"{"Https":{}}"#,
+                    "disabled",
+                    false,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.revision, 2);
+        assert!(!row.enabled);
+        // Loser: a stale revise still fencing on revision 1 is rejected.
+        let err = db
+            .transaction(|conn| {
+                revise_action_instance_conn(
+                    conn,
+                    "act-1",
+                    1,
+                    2,
+                    r#"{"Https":{}}"#,
+                    "re-enabled",
+                    true,
+                )
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fence"), "{err}");
+        // The winner's snapshot is intact: still revision 2, still disabled.
+        let row = db
+            .sealed_action_instance("act-1".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.revision, 2);
+        assert!(
+            !row.enabled,
+            "the stale revise did not re-enable the action"
+        );
     }
 
     #[tokio::test]

@@ -1,10 +1,14 @@
 //! `cockpit packages {list,add,import,prune}` — thin CLI over the package registry
-//! (prompt `docs-agent.md` component A).
+//! (prompt `docs-agent.md` component A). The daemon owns the registry; these
+//! commands are socket clients for the owner-remoted package RPCs and never
+//! open SQLite.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 
 use crate::cli::{PackagesAddArgs, PackagesCommand, PackagesImportArgs, PackagesPruneArgs};
-use crate::db::Db;
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 
 pub async fn run(cmd: PackagesCommand) -> Result<()> {
     match cmd {
@@ -15,16 +19,80 @@ pub async fn run(cmd: PackagesCommand) -> Result<()> {
     }
 }
 
+/// Non-secret projection of one registered package row, as returned by the
+/// daemon's `list_packages` / `add_package` responses.
+#[derive(Debug, Deserialize)]
+struct PackageRowView {
+    identifier: String,
+    display_name: String,
+    source_type: String,
+    #[serde(default)]
+    source_url: Option<String>,
+    path: String,
+}
+
+/// Projection of the `import_package` summary.
+#[derive(Debug, Deserialize)]
+struct PackageImportSummaryView {
+    imported: usize,
+    deduped: usize,
+    skipped: usize,
+    failed: usize,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    failures: Vec<PackageFailureView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageFailureView {
+    path: String,
+    reason: String,
+}
+
+/// Projection of the `prune_packages` report.
+#[derive(Debug, Deserialize)]
+struct PackagePruneReportView {
+    #[serde(default)]
+    deleted: Vec<PackagePruneEntryView>,
+    bytes_reclaimed: u64,
+    skipped_groups: usize,
+    missing_dirs: usize,
+    #[serde(default)]
+    failures: Vec<PackageFailureView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackagePruneEntryView {
+    path: String,
+    bytes: u64,
+}
+
 async fn list() -> Result<()> {
-    let db = Db::open_default()?;
-    let packages = db.list_packages().await?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for package registry")?;
+    let response = daemon
+        .client
+        .request(Request::ListPackages)
+        .await
+        .context("requesting package list from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected package list: {error}"))?;
+    let Response::Packages { packages_json } = response else {
+        bail!("daemon returned unexpected response to package list: {response:?}");
+    };
+    let packages: Vec<PackageRowView> =
+        serde_json::from_str(&packages_json).context("parsing package list")?;
+    print!("{}", format_package_list(&packages));
+    Ok(())
+}
+
+fn format_package_list(packages: &[PackageRowView]) -> String {
     if packages.is_empty() {
-        println!(
-            "No packages registered. Add one with `cockpit packages add` or `cockpit kcl import`."
-        );
-        return Ok(());
+        return "No packages registered. Add one with `cockpit packages add` or `cockpit kcl import`.\n".to_string();
     }
-    for p in &packages {
+    let mut out = String::new();
+    for p in packages {
         let kind = p.source_type.as_str();
         // Show the display name only when it differs from the identifier
         // (kcl imports often carry a friendlier name).
@@ -34,39 +102,46 @@ async fn list() -> Result<()> {
             format!("{} ({})", p.identifier, p.display_name)
         };
         match &p.source_url {
-            Some(url) => println!("{label}  [{kind}]  {url}  -> {}", p.path),
-            None => println!("{label}  [{kind}]  -> {}", p.path),
+            Some(url) => out.push_str(&format!("{label}  [{kind}]  {url}  -> {}\n", p.path)),
+            None => out.push_str(&format!("{label}  [{kind}]  -> {}\n", p.path)),
         }
     }
-    println!("\n{} package(s).", packages.len());
-    Ok(())
+    out.push_str(&format!("\n{} package(s).\n", packages.len()));
+    out
 }
 
 async fn add(args: PackagesAddArgs) -> Result<()> {
     if args.git.is_some() && args.path.is_some() {
         bail!("pass either `--git` or `--path`, not both");
     }
-    let cwd = std::env::current_dir()?;
-    let db = Db::open_default()?;
-    let shallow = !args.deep;
-
-    if let Some(url) = args.git {
-        let row = crate::packages::add_git(
-            &db,
-            &cwd,
-            &args.identifier,
-            &url,
-            args.branch.as_deref(),
-            shallow,
-        )
-        .await?;
-        println!("Registered `{}` (git) at {}", row.identifier, row.path);
-    } else if let Some(path) = args.path {
-        let row = crate::packages::add_local(&db, &args.identifier, &path).await?;
-        println!("Registered `{}` (local) at {}", row.identifier, row.path);
-    } else {
+    if args.git.is_none() && args.path.is_none() {
         bail!("`packages add` needs either `--git <url>` or `--path <dir>`");
     }
+    let cwd = std::env::current_dir()?;
+    let is_git = args.git.is_some();
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for package registry")?;
+    let response = daemon
+        .client
+        .request(Request::AddPackage {
+            project_root: cwd.display().to_string(),
+            identifier: args.identifier,
+            git: args.git,
+            branch: args.branch,
+            local_path: args.path.map(|path| path.display().to_string()),
+            deep: args.deep,
+        })
+        .await
+        .context("requesting package add from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected package add: {error}"))?;
+    let Response::PackageAdded { package_json } = response else {
+        bail!("daemon returned unexpected response to package add: {response:?}");
+    };
+    let row: PackageRowView =
+        serde_json::from_str(&package_json).context("parsing added package")?;
+    let kind = if is_git { "git" } else { "local" };
+    println!("Registered `{}` ({kind}) at {}", row.identifier, row.path);
     Ok(())
 }
 
@@ -80,18 +155,29 @@ async fn import(args: PackagesImportArgs) -> Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    let db = Db::open_default()?;
     let single_package = package.is_some();
-    let summary = if let Some(dir) = args.dir {
-        crate::packages::import_package_directory(&db, &cwd, &dir, args.path).await?
-    } else if let Some(package_dir) = package {
-        crate::packages::import_package(&db, &cwd, &package_dir, args.id.as_deref(), args.path)
-            .await?
-    } else {
-        unreachable!("checked above")
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for package registry")?;
+    let response = daemon
+        .client
+        .request(Request::ImportPackage {
+            project_root: cwd.display().to_string(),
+            dir: args.dir.map(|dir| dir.display().to_string()),
+            package: package.map(|package| package.display().to_string()),
+            id: args.id,
+            as_path: args.path,
+        })
+        .await
+        .context("requesting package import from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected package import: {error}"))?;
+    let Response::PackageImported { summary_json } = response else {
+        bail!("daemon returned unexpected response to package import: {response:?}");
     };
+    let summary: PackageImportSummaryView =
+        serde_json::from_str(&summary_json).context("parsing package import summary")?;
     print_import_summary(&summary);
-    if single_package && summary.failed() > 0 {
+    if single_package && summary.failed > 0 {
         bail!("package import failed");
     }
     Ok(())
@@ -99,49 +185,50 @@ async fn import(args: PackagesImportArgs) -> Result<()> {
 
 async fn prune(args: PackagesPruneArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let db = Db::open_default()?;
-    let report = crate::packages::prune_package_clones(
-        &db,
-        &cwd,
-        &crate::packages::PackagePruneOptions {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for package registry")?;
+    let response = daemon
+        .client
+        .request(Request::PrunePackages {
+            project_root: cwd.display().to_string(),
             days: args.days,
             dry_run: args.dry_run,
-        },
-    )
-    .await?;
+        })
+        .await
+        .context("requesting package prune from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected package prune: {error}"))?;
+    let Response::PackagesPruned { report_json } = response else {
+        bail!("daemon returned unexpected response to package prune: {response:?}");
+    };
+    let report: PackagePruneReportView =
+        serde_json::from_str(&report_json).context("parsing package prune report")?;
     print_prune_summary(&report, args.dry_run);
     Ok(())
 }
 
-fn print_import_summary(summary: &crate::packages::PackageImportSummary) {
+fn print_import_summary(summary: &PackageImportSummaryView) {
     for warning in &summary.warnings {
         eprintln!("warning: {warning}");
     }
     for failure in &summary.failures {
-        eprintln!("failed: {}: {}", failure.path.display(), failure.reason);
+        eprintln!("failed: {}: {}", failure.path, failure.reason);
     }
     println!(
         "Imported {} package(s); deduped {}; skipped {}; failed {}.",
-        summary.imported,
-        summary.deduped,
-        summary.skipped,
-        summary.failed()
+        summary.imported, summary.deduped, summary.skipped, summary.failed
     );
 }
 
-fn print_prune_summary(report: &crate::packages::PackagePruneReport, dry_run: bool) {
+fn print_prune_summary(report: &PackagePruneReportView, dry_run: bool) {
     if dry_run {
         for entry in &report.deleted {
-            println!(
-                "Would delete {} ({} bytes)",
-                entry.path.display(),
-                entry.bytes
-            );
+            println!("Would delete {} ({} bytes)", entry.path, entry.bytes);
         }
         println!(
             "Would delete {} clone directories; reclaim approximately {} bytes; skipped {}; already missing {}; failures {}.",
             report.deleted.len(),
-            report.bytes_reclaimed(),
+            report.bytes_reclaimed,
             report.skipped_groups,
             report.missing_dirs,
             report.failures.len()
@@ -150,22 +237,71 @@ fn print_prune_summary(report: &crate::packages::PackagePruneReport, dry_run: bo
         println!(
             "Deleted {} clone directories; reclaimed {} bytes; skipped {}; already missing {}; failures {}.",
             report.deleted.len(),
-            report.bytes_reclaimed(),
+            report.bytes_reclaimed,
             report.skipped_groups,
             report.missing_dirs,
             report.failures.len()
         );
     }
     for failure in &report.failures {
-        eprintln!("failed: {}: {}", failure.path.display(), failure.reason);
+        eprintln!("failed: {}: {}", failure.path, failure.reason);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use clap::Parser;
 
     use crate::cli::{Cli, Command, PackagesCommand};
+
+    #[test]
+    fn package_list_hides_matching_display_name_and_shows_url() {
+        let rows = vec![
+            PackageRowView {
+                identifier: "tokio".into(),
+                display_name: "tokio".into(),
+                source_type: "git".into(),
+                source_url: Some("https://github.com/tokio-rs/tokio".into()),
+                path: "/clones/tokio".into(),
+            },
+            PackageRowView {
+                identifier: "kcl:std".into(),
+                display_name: "Standard Library".into(),
+                source_type: "local".into(),
+                source_url: None,
+                path: "/local/std".into(),
+            },
+        ];
+        let rendered = format_package_list(&rows);
+        // Matching identifier/display_name collapses to a single label; the URL
+        // is only shown when present.
+        assert!(
+            rendered
+                .contains("tokio  [git]  https://github.com/tokio-rs/tokio  -> /clones/tokio\n")
+        );
+        assert!(rendered.contains("kcl:std (Standard Library)  [local]  -> /local/std\n"));
+        assert!(rendered.contains("\n2 package(s).\n"));
+    }
+
+    #[test]
+    fn empty_package_list_prints_guidance() {
+        assert!(
+            format_package_list(&[]).contains("No packages registered."),
+            "an empty registry must guide the user to add/import"
+        );
+    }
+
+    #[test]
+    fn import_summary_parses_daemon_projection() {
+        let summary: PackageImportSummaryView = serde_json::from_str(
+            r#"{"imported":2,"deduped":1,"skipped":0,"failed":1,"warnings":["w"],"failures":[{"path":"/a","reason":"boom"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures[0].reason, "boom");
+    }
 
     #[test]
     fn package_add_parses_singular_alias_with_git_before_identifier() {

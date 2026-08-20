@@ -17,19 +17,13 @@ const FORBIDDEN: &[&str] = &[
 
 /// Cited production sites. Counts are after `#[cfg(test)]` modules are stripped.
 const ALLOWED: &[(&str, &str, usize)] = &[
+    // `ask` is converted by `cli-ask-via-daemon`; `export` by the export
+    // rewrite. Every other product command now drives the daemon RPCs, so the
+    // CLI allow-list is NOT empty until those two land.
     ("commands/ask.rs", "Db::open_default", 1),
     ("commands/ask.rs", "vault_for_db", 1),
-    ("commands/assistant.rs", "Db::open_default", 4),
-    ("commands/connect.rs", "Db::open_default", 1),
-    ("commands/connect.rs", "vault_for_db", 1),
-    ("commands/debug.rs", "Db::open_default", 1),
     ("commands/export.rs", "Db::open_default", 1),
     ("commands/export.rs", "vault_for_db", 1),
-    ("commands/kcl.rs", "Db::open_default", 1),
-    ("commands/packages.rs", "Db::open_default", 4),
-    ("commands/session.rs", "Db::open_default", 2),
-    ("commands/sync.rs", "Db::open_default", 1),
-    ("commands/sync.rs", "vault_for_db", 1),
 ];
 
 fn repo_src() -> PathBuf {

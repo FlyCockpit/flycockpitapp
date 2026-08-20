@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 
 use crate::cli::{DebugCommand, FailedCallsArgs};
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 use crate::db::Db;
-use crate::db::tool_calls::Recovery;
-use crate::db::tool_calls::{FailedCallsFilter, ToolCallEvent};
 use crate::session::project_id_for;
 
 pub async fn run(cmd: DebugCommand) -> Result<()> {
@@ -154,117 +155,166 @@ fn truncate_for_debug(text: &str, limit: usize) -> String {
     format!("{}\n[truncated at {limit} bytes]", &text[..cut])
 }
 
+/// Non-secret projection of one failed/recovered tool-call row as returned by
+/// the daemon's `list_failed_tool_calls` response. Mirrors the daemon-side
+/// `failed_tool_call_json` shape. Carries tool inputs/outputs (never vault
+/// secrets). `recovery_kind`/`recovery_stage` are the raw DB fields; the
+/// daemon projection does not distinguish a forward-compatible "unknown"
+/// recovery from a recognized one, so the CLI renders both uniformly.
+#[derive(Debug, Deserialize)]
+struct FailedCallView {
+    timestamp: i64,
+    model: String,
+    agent: String,
+    session_id: String,
+    tool: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    hard_fail: bool,
+    #[serde(default)]
+    shape_fingerprint: Option<String>,
+    #[serde(default)]
+    recovery_kind: Option<String>,
+    #[serde(default)]
+    recovery_stage: Option<String>,
+    #[serde(default)]
+    original_input: serde_json::Value,
+    #[serde(default)]
+    wire_input: serde_json::Value,
+    #[serde(default)]
+    output: String,
+}
+
 /// `cockpit debug failed-calls` — see GOALS §12. Pulls recent rows where
 /// the tool either hard-failed or fired a recovery and prints them in a
 /// form designed for pattern-spotting (original arguments + brief
 /// output snippet), so the user can decide which patterns are worth
 /// turning into new repair-catalog entries.
 async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
-    let db = Db::open_default()?;
     let project_id = args
         .project
         .as_ref()
         .map(|project| project_id_for(project.as_path()));
     let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
 
-    let rows = db
-        .list_failed_tool_calls(FailedCallsFilter {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for failed tool calls")?;
+    let Response::FailedToolCalls { calls_json } = daemon
+        .client
+        .request(Request::ListFailedToolCalls {
             since_epoch,
             tool: args.tool.clone(),
             model: args.model.clone(),
             project_id,
             include_recovered: args.include_recovered,
-            limit: args.limit as usize,
+            limit: args.limit,
         })
-        .await?;
+        .await
+        .context("requesting failed tool calls from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected failed tool call query: {error}"))?
+    else {
+        bail!("daemon returned unexpected response to failed tool call query");
+    };
 
     if args.json {
-        for r in &rows {
-            println!("{}", serde_json::to_string(&row_as_json(r))?);
+        // NDJSON: re-emit each row as the daemon's projection (byte-identical
+        // to the former direct-DB `--json` output, which used the same shape).
+        let values: Vec<serde_json::Value> =
+            serde_json::from_str(&calls_json).context("parsing failed tool calls")?;
+        for value in &values {
+            println!("{}", serde_json::to_string(value)?);
         }
         return Ok(());
     }
 
-    if rows.is_empty() {
-        println!(
-            "No matching rows in the last {} day{}.",
-            args.days,
-            if args.days == 1 { "" } else { "s" }
-        );
-        return Ok(());
-    }
-
-    println!(
-        "{} row{} (last {} day{}):\n",
-        rows.len(),
-        if rows.len() == 1 { "" } else { "s" },
-        args.days,
-        if args.days == 1 { "" } else { "s" }
-    );
-    for r in &rows {
-        print_row(r);
-        println!();
-    }
+    let rows: Vec<FailedCallView> =
+        serde_json::from_str(&calls_json).context("parsing failed tool calls")?;
+    print!("{}", format_failed_calls(&rows, args.days));
     Ok(())
 }
 
-fn print_row(r: &ToolCallEvent) {
+fn format_failed_calls(rows: &[FailedCallView], days: u32) -> String {
+    if rows.is_empty() {
+        return format!(
+            "No matching rows in the last {} day{}.\n",
+            days,
+            if days == 1 { "" } else { "s" }
+        );
+    }
+    let mut out = format!(
+        "{} row{} (last {} day{}):\n\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        days,
+        if days == 1 { "" } else { "s" }
+    );
+    for row in rows {
+        out.push_str(&format_row(row));
+        out.push('\n');
+    }
+    out
+}
+
+fn format_row(r: &FailedCallView) -> String {
     let ts = DateTime::<Utc>::from_timestamp(r.timestamp, 0)
         .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| r.timestamp.to_string());
 
-    let status = row_status(r);
+    let status = row_status(
+        r.hard_fail,
+        r.recovery_kind.as_deref(),
+        r.recovery_stage.as_deref(),
+    );
 
-    println!(
-        "{ts}  {tool:<12} {model}  [{status}]",
+    let mut out = format!(
+        "{ts}  {tool:<12} {model}  [{status}]\n",
         ts = ts,
         tool = r.tool,
         model = r.model,
         status = status
     );
     if let Some(fp) = &r.shape_fingerprint {
-        println!("  shape: {fp}");
+        out.push_str(&format!("  shape: {fp}\n"));
     }
-    println!("  agent: {}  session: {}", r.agent, r.session_id);
+    out.push_str(&format!(
+        "  agent: {}  session: {}\n",
+        r.agent, r.session_id
+    ));
     if let Some(p) = &r.path {
-        println!("  path: {p}");
+        out.push_str(&format!("  path: {p}\n"));
     }
-    let args_pretty = serde_json::to_string_pretty(&r.original_input_json)
-        .unwrap_or_else(|_| r.original_input_json.to_string());
-    println!("  original_input:");
+    let args_pretty = serde_json::to_string_pretty(&r.original_input)
+        .unwrap_or_else(|_| r.original_input.to_string());
+    out.push_str("  original_input:\n");
     for line in args_pretty.lines() {
-        println!("    {line}");
+        out.push_str(&format!("    {line}\n"));
     }
-    if r.wire_input_json != r.original_input_json {
-        let wire_pretty = serde_json::to_string_pretty(&r.wire_input_json)
-            .unwrap_or_else(|_| r.wire_input_json.to_string());
-        println!("  wire_input (rewritten):");
+    if r.wire_input != r.original_input {
+        let wire_pretty = serde_json::to_string_pretty(&r.wire_input)
+            .unwrap_or_else(|_| r.wire_input.to_string());
+        out.push_str("  wire_input (rewritten):\n");
         for line in wire_pretty.lines() {
-            println!("    {line}");
+            out.push_str(&format!("    {line}\n"));
         }
     }
-    println!("  output:");
+    out.push_str("  output:\n");
     for line in r.output.lines().take(8) {
-        println!("    {line}");
+        out.push_str(&format!("    {line}\n"));
     }
     let extra = r.output.lines().count().saturating_sub(8);
     if extra > 0 {
-        println!("    ... [{extra} more lines]");
+        out.push_str(&format!("    ... [{extra} more lines]\n"));
     }
+    out
 }
 
-fn row_status(r: &ToolCallEvent) -> String {
-    if r.hard_fail {
+fn row_status(hard_fail: bool, kind: Option<&str>, stage: Option<&str>) -> String {
+    if hard_fail {
         "HARD FAIL".to_string()
     } else {
-        let (kind, stage) = r.recovery.raw_db_fields();
         match (kind, stage) {
-            (Some(k), Some(s)) if matches!(r.recovery, Recovery::Unknown { .. }) => {
-                format!("recovered (unknown: {k}/{s})")
-            }
-            (Some(k), None) if matches!(r.recovery, Recovery::Unknown { .. }) => {
-                format!("recovered (unknown: {k})")
-            }
             (Some(k), Some(s)) => format!("recovered ({k}/{s})"),
             (Some(k), None) => format!("recovered ({k})"),
             _ => "recovered".to_string(),
@@ -272,97 +322,71 @@ fn row_status(r: &ToolCallEvent) -> String {
     }
 }
 
-fn row_as_json(r: &ToolCallEvent) -> serde_json::Value {
-    let (kind, stage) = r.recovery.raw_db_fields();
-    serde_json::json!({
-        "event_id":         r.event_id,
-        "session_id":       r.session_id,
-        "timestamp":        r.timestamp,
-        "model":            r.model,
-        "provider":         r.provider,
-        "project_id":       r.project_id,
-        "agent":            r.agent,
-        "tool":             r.tool,
-        "path":             r.path,
-        "hard_fail":        r.hard_fail,
-        "shape_fingerprint": r.shape_fingerprint,
-        "recovery_kind":    kind,
-        "recovery_stage":   stage,
-        "original_input":   r.original_input_json,
-        "wire_input":       r.wire_input_json,
-        "output":           r.output,
-        "truncated":        r.truncated,
-        "duration_ms":      r.duration_ms,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use uuid::Uuid;
 
-    fn row_with_recovery(recovery: Recovery) -> ToolCallEvent {
-        ToolCallEvent {
-            event_id: Uuid::new_v4(),
-            session_id: Uuid::new_v4(),
-            call_id: "call-1".into(),
-            parent_call_id: None,
-            parent_child_index: None,
-            provider_item_id: None,
-            provider_call_id: None,
-            provider_call_id_source: None,
-            wire_api: None,
-            provider_family: None,
+    #[test]
+    fn hard_fail_and_recovered_statuses_render() {
+        assert_eq!(row_status(true, None, None), "HARD FAIL");
+        assert_eq!(
+            row_status(false, Some("json"), Some("parse")),
+            "recovered (json/parse)"
+        );
+        assert_eq!(row_status(false, Some("json"), None), "recovered (json)");
+        assert_eq!(row_status(false, None, None), "recovered");
+    }
+
+    #[test]
+    fn failed_call_view_parses_daemon_projection() {
+        // The projection is exactly what the daemon's `failed_tool_call_json`
+        // emits; a wrong field name here would drop the value on render.
+        let view: FailedCallView = serde_json::from_str(
+            r#"{"event_id":"e","session_id":"11111111-1111-1111-1111-111111111111","timestamp":0,"model":"m","provider":"p","project_id":"pid","agent":"Build","tool":"edit","path":"src/x.rs","hard_fail":true,"shape_fingerprint":"shape-a","recovery_kind":"json","recovery_stage":"parse","original_input":{"a":1},"wire_input":{"a":2},"output":"line1\nline2","truncated":false,"duration_ms":5}"#,
+        )
+        .unwrap();
+        assert_eq!(view.session_id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(view.shape_fingerprint.as_deref(), Some("shape-a"));
+        assert_ne!(view.wire_input, view.original_input);
+    }
+
+    #[test]
+    fn format_row_shows_status_shape_path_and_wire_rewrite() {
+        let view = FailedCallView {
             timestamp: 0,
             model: "model".into(),
-            provider: "provider".into(),
-            project_id: "project".into(),
-            project_root: "/project".into(),
             agent: "Build".into(),
-            tool: "tool".into(),
-            mcp_server: None,
-            path: None,
-            recovery,
-            hard_fail: false,
-            exit_code: None,
-            sandbox_enabled: false,
-            sandboxed: false,
-            sandbox_unavailable_reason: None,
-            original_input_json: json!({"a": 1}),
-            wire_input_json: json!({"a": 1}),
-            output: String::new(),
-            truncated: false,
-            duration_ms: 0,
-            cockpit_version: None,
-            llm_mode: None,
-            shape_fingerprint: None,
-            hint: None,
-        }
+            session_id: "sid".into(),
+            tool: "edit".into(),
+            path: Some("src/x.rs".into()),
+            hard_fail: true,
+            shape_fingerprint: Some("shape-a".into()),
+            recovery_kind: None,
+            recovery_stage: None,
+            original_input: serde_json::json!({"a": 1}),
+            wire_input: serde_json::json!({"a": 2}),
+            output: "l1\nl2".into(),
+        };
+        let rendered = format_row(&view);
+        assert!(rendered.starts_with("1970-01-01 00:00:00 UTC  edit"));
+        assert!(rendered.contains("model  [HARD FAIL]\n"));
+        assert!(rendered.contains("  shape: shape-a\n"));
+        assert!(rendered.contains("  agent: Build  session: sid\n"));
+        assert!(rendered.contains("  path: src/x.rs\n"));
+        // A distinct wire_input triggers the rewritten section.
+        assert!(rendered.contains("  wire_input (rewritten):\n"));
+        assert!(rendered.contains("  output:\n"));
     }
 
     #[test]
-    fn json_row_preserves_unknown_recovery_fields() {
-        let row = row_with_recovery(Recovery::Unknown {
-            kind: "future_kind".into(),
-            stage: Some("future_stage".into()),
-        });
-
-        let value = row_as_json(&row);
-
-        assert_eq!(value["recovery_kind"], "future_kind");
-        assert_eq!(value["recovery_stage"], "future_stage");
-    }
-
-    #[test]
-    fn unknown_recovery_status_is_not_clean() {
-        let row = row_with_recovery(Recovery::Unknown {
-            kind: "future_kind".into(),
-            stage: Some("future_stage".into()),
-        });
+    fn empty_failed_calls_reports_no_rows() {
         assert_eq!(
-            row_status(&row),
-            "recovered (unknown: future_kind/future_stage)"
+            format_failed_calls(&[], 7),
+            "No matching rows in the last 7 days.\n"
+        );
+        assert_eq!(
+            format_failed_calls(&[], 1),
+            "No matching rows in the last 1 day.\n"
         );
     }
 }

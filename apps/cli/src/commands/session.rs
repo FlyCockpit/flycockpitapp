@@ -9,12 +9,11 @@ use uuid::Uuid;
 use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
 use crate::daemon::client::{LifecycleMode, ensure_persistent_daemon, probe_or_spawn};
 use crate::daemon::proto::{Request, ResolveResponse, Response};
-use crate::db::Db;
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
     match cmd {
         SessionCommand::Answer(args) => answer(args).await,
-        SessionCommand::Show { session_id, json } => show(&session_id, json),
+        SessionCommand::Show { session_id, json } => show(&session_id, json).await,
         SessionCommand::List(args) => list(args).await,
         SessionCommand::Delete { session_id, yes } => delete(&session_id, yes).await,
         SessionCommand::Purge {
@@ -52,28 +51,28 @@ async fn delete(session: &str, yes: bool) -> Result<()> {
 
 async fn purge(before: &str, dry_run: bool, yes: bool) -> Result<()> {
     let cutoff = parse_purge_before(before)?;
-    refuse_direct_write_while_daemon_running().await?;
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let sessions = db
-        .read(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT session_id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
-            )?;
-            statement
-                .query_map([cutoff], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
-        })
-        .await?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for session purge")?;
     if dry_run {
-        println!("would delete {} ended session(s)", sessions.len());
-        return Ok(());
+        // The daemon owns session storage; `PurgeEndedSessions` deletes and has
+        // no non-destructive count. Fail closed rather than open SQLite from the
+        // CLI or invent a preview count.
+        bail!(
+            "session purge --dry-run is not available through the daemon (no non-destructive ended-session count); rerun without --dry-run to purge"
+        );
     }
-    confirm_destructive(yes, &format!("Delete {} ended session(s)", sessions.len()))?;
-    for id in sessions {
-        db.delete_session(Uuid::parse_str(&id)?).await?;
-    }
-    println!("deleted ended sessions before {before}");
+    confirm_destructive(yes, &format!("Delete all ended sessions before {before}"))?;
+    let response = daemon
+        .client
+        .request(Request::PurgeEndedSessions { before: cutoff })
+        .await
+        .context("requesting session purge from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected session purge: {error}"))?;
+    let Response::EndedSessionsPurged { purged, .. } = response else {
+        bail!("daemon returned unexpected response to session purge: {response:?}");
+    };
+    println!("deleted {purged} ended session(s) before {before}");
     Ok(())
 }
 
@@ -94,16 +93,6 @@ fn parse_purge_before(input: &str) -> Result<i64> {
         .expect("midnight is valid")
         .and_utc()
         .timestamp())
-}
-
-async fn refuse_direct_write_while_daemon_running() -> Result<()> {
-    if matches!(
-        crate::daemon::discover().await.status,
-        crate::daemon::DaemonStatus::Running
-    ) {
-        bail!("a daemon is running; stop it before using session delete or purge");
-    }
-    Ok(())
 }
 
 fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
@@ -174,48 +163,72 @@ async fn list(args: SessionListArgs) -> Result<()> {
     Ok(())
 }
 
-fn show(session: &str, json_mode: bool) -> Result<()> {
+/// Projection of one `session_compacted` event as returned by the daemon's
+/// `get_session_compactions` response. Carries the complete event payload.
+#[derive(Debug, serde::Deserialize)]
+struct CompactionView {
+    seq: i64,
+    ts_ms: i64,
+    #[serde(default)]
+    data: Value,
+}
+
+async fn show(session: &str, json_mode: bool) -> Result<()> {
     let session_id = Uuid::parse_str(session).context("parsing session id")?;
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let compactions = db.blocking_for_sync_cli(move |conn| {
-        Db::get_session_conn(conn, session_id)
-            .context("loading session")?
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-        Ok(Db::list_session_events_conn(conn, session_id)
-            .context("loading session timeline")?
-            .into_iter()
-            .filter(|event| event.kind == "session_compacted")
-            .collect::<Vec<_>>())
-    })?;
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for session show")?;
+    let response = daemon
+        .client
+        .request(Request::GetSessionCompactions { session_id })
+        .await
+        .context("requesting session compactions from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected session show: {error}"))?;
+    let Response::SessionCompactions {
+        compactions_json, ..
+    } = response
+    else {
+        bail!("daemon returned unexpected response to session show: {response:?}");
+    };
+    let compactions: Vec<CompactionView> =
+        serde_json::from_str(&compactions_json).context("parsing session compactions")?;
 
     if json_mode {
-        let values = compactions
-            .iter()
-            .map(|event| {
-                json!({
-                    "seq": event.seq,
-                    "ts_ms": event.ts_ms,
-                    "source": event.data.get("source"),
-                    "trigger_ctx_pct": event.data.get("trigger_ctx_pct"),
-                    "tokens_before": event.data.get("tokens_before"),
-                    "tokens_after": event.data.get("tokens_after"),
-                    "turns_summarized": event.data.get("turns_summarized"),
-                    "tail_kept": event.data.get("tail_kept"),
-                    "tail_trimmed": event.data.get("tail_trimmed"),
-                    "handoff": event.data.get("handoff_text"),
-                })
-            })
-            .collect::<Vec<_>>();
-        return emit_json(&json!({
-            "session_id": session_id,
-            "compactions": values,
-        }));
+        return emit_json(&render_compactions_json(session_id, &compactions));
     }
+    print!("{}", render_compactions_text(session_id, &compactions));
+    Ok(())
+}
 
+fn render_compactions_json(session_id: Uuid, compactions: &[CompactionView]) -> Value {
+    let values = compactions
+        .iter()
+        .map(|event| {
+            json!({
+                "seq": event.seq,
+                "ts_ms": event.ts_ms,
+                "source": event.data.get("source"),
+                "trigger_ctx_pct": event.data.get("trigger_ctx_pct"),
+                "tokens_before": event.data.get("tokens_before"),
+                "tokens_after": event.data.get("tokens_after"),
+                "turns_summarized": event.data.get("turns_summarized"),
+                "tail_kept": event.data.get("tail_kept"),
+                "tail_trimmed": event.data.get("tail_trimmed"),
+                "handoff": event.data.get("handoff_text"),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "session_id": session_id,
+        "compactions": values,
+    })
+}
+
+fn render_compactions_text(session_id: Uuid, compactions: &[CompactionView]) -> String {
     if compactions.is_empty() {
-        println!("no compactions recorded for session {session_id}");
-        return Ok(());
+        return format!("no compactions recorded for session {session_id}\n");
     }
+    let mut out = String::new();
     for event in compactions {
         let source = event
             .data
@@ -232,20 +245,20 @@ fn show(session: &str, json_mode: bool) -> Result<()> {
             .get("tokens_after")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        println!(
-            "compact #{} source={source} tokens={before}→{after}",
+        out.push_str(&format!(
+            "compact #{} source={source} tokens={before}→{after}\n",
             event.seq
-        );
-        println!(
-            "{}",
+        ));
+        out.push_str(
             event
                 .data
                 .get("handoff_text")
                 .and_then(Value::as_str)
-                .unwrap_or("(handoff unavailable)")
+                .unwrap_or("(handoff unavailable)"),
         );
+        out.push('\n');
     }
-    Ok(())
+    out
 }
 
 async fn answer(args: SessionAnswerArgs) -> Result<()> {
@@ -511,7 +524,67 @@ fn emit_json(value: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use crate::db::Db;
     use crate::session::Session;
+
+    #[test]
+    fn compactions_json_projects_every_planted_field() {
+        let session_id = Uuid::nil();
+        let compactions = vec![
+            CompactionView {
+                seq: 1,
+                ts_ms: 100,
+                data: json!({
+                    "source": "auto",
+                    "tokens_before": 900,
+                    "tokens_after": 300,
+                    "handoff_text": "carry these facts",
+                }),
+            },
+            CompactionView {
+                seq: 2,
+                ts_ms: 200,
+                data: json!({}),
+            },
+        ];
+        let value = render_compactions_json(session_id, &compactions);
+        // The complete list appears (distinct from a paginated read); a
+        // dropped element would shrink the array.
+        assert_eq!(value["compactions"].as_array().unwrap().len(), 2);
+        assert_eq!(value["compactions"][0]["source"], "auto");
+        assert_eq!(value["compactions"][0]["tokens_before"], 900);
+        assert_eq!(value["compactions"][0]["handoff"], "carry these facts");
+        // A missing field is projected as null, not dropped.
+        assert!(value["compactions"][1]["handoff"].is_null());
+    }
+
+    #[test]
+    fn compactions_text_renders_source_tokens_and_handoff() {
+        let text = render_compactions_text(
+            Uuid::nil(),
+            &[CompactionView {
+                seq: 3,
+                ts_ms: 0,
+                data: json!({
+                    "source": "auto",
+                    "tokens_before": 800,
+                    "tokens_after": 250,
+                    "handoff_text": "keep going",
+                }),
+            }],
+        );
+        assert!(text.contains("compact #3 source=auto tokens=800→250\n"));
+        assert!(text.contains("keep going\n"));
+    }
+
+    #[test]
+    fn compactions_text_empty_is_explicit() {
+        let text = render_compactions_text(Uuid::nil(), &[]);
+        assert_eq!(
+            text,
+            format!("no compactions recorded for session {}\n", Uuid::nil())
+        );
+    }
 
     fn option(id: &str) -> InterruptOption {
         InterruptOption {

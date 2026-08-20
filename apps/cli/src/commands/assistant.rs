@@ -1,9 +1,14 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
-use crate::assistants::{create_assistant, default_home_dir, spec_from_wizard};
+use crate::agents::{AgentDef, GoalSettingsOverride};
+use crate::assistants::{
+    AssistantConfig, CreateAssistantSpec, assistant_definition_path, default_home_dir, identity,
+    markdown_content_hash, spec_from_wizard,
+};
 use crate::cli::{
     AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
     MediaAccountingCommand,
@@ -11,7 +16,6 @@ use crate::cli::{
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
 use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{AssistantSessionResolutionMode, Request, Response};
-use crate::db::Db;
 #[cfg(test)]
 use crate::session::project_id_for;
 use crate::wizard::WizardRun;
@@ -32,27 +36,27 @@ pub async fn run(
     }
 }
 
-struct DiagnosticClock;
-impl crate::media_reservation::MonotonicClock for DiagnosticClock {
-    fn now_ms(&self) -> u64 {
-        0
-    }
-}
-
 async fn media(command: AssistantMediaCommand) -> Result<()> {
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let ledger = crate::media_reservation::MediaReservationLedger::new(
-        db,
-        std::sync::Arc::new(DiagnosticClock),
-    );
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for media reservation accounting")?;
     match command {
         AssistantMediaCommand::Accounting {
             command: MediaAccountingCommand::Diagnose { scope, id, json: _ },
         } => {
-            println!(
-                "{}",
-                serde_json::to_string(&ledger.diagnose_accounting(&scope, &id).await?)?
-            );
+            let response = daemon
+                .client
+                .request(media_diagnose_request(scope, id))
+                .await
+                .context("requesting media reservation diagnosis from daemon")?
+                .map_err(|error| {
+                    anyhow::anyhow!("daemon rejected media reservation diagnosis: {error}")
+                })?;
+            let Response::MediaReservationDiagnosis { diagnosis_json } = response else {
+                bail!("daemon returned unexpected response to media diagnosis: {response:?}");
+            };
+            // The daemon already serialized the diagnosis (no secret bytes).
+            println!("{diagnosis_json}");
         }
         AssistantMediaCommand::Accounting {
             command:
@@ -64,38 +68,60 @@ async fn media(command: AssistantMediaCommand) -> Result<()> {
                     idempotency_key,
                 },
         } => {
-            let outcome = ledger
-                .repair_accounting(
-                    crate::media_reservation::AccountingRepairRequest {
-                        attempt_id: uuid::Uuid::new_v4().to_string(),
-                        scope_kind: scope,
-                        scope_id: id,
-                        expected_block_generation,
-                        repair_plan_digest,
-                        idempotency_key,
-                        wall_ms: chrono::Utc::now()
-                            .timestamp_millis()
-                            .try_into()
-                            .unwrap_or(0),
-                    },
-                    &crate::daemon::principal::ClientPrincipal::owner(),
-                )
-                .await?;
-            println!("{}", outcome.code());
+            let response = daemon
+                .client
+                .request(media_repair_request(
+                    scope,
+                    id,
+                    expected_block_generation,
+                    repair_plan_digest,
+                    idempotency_key,
+                ))
+                .await
+                .context("requesting media reservation repair from daemon")?
+                .map_err(|error| {
+                    anyhow::anyhow!("daemon rejected media reservation repair: {error}")
+                })?;
+            let Response::MediaReservationRepaired { outcome } = response else {
+                bail!("daemon returned unexpected response to media repair: {response:?}");
+            };
+            println!("{outcome}");
         }
     }
     Ok(())
 }
 
+/// Assemble the owner-remoted request for `assistant media accounting diagnose`.
+/// Extracted so the real request the command sends is unit-testable without a
+/// live daemon.
+fn media_diagnose_request(scope: String, id: String) -> Request {
+    Request::DiagnoseMediaReservation { scope, id }
+}
+
+/// Assemble the owner-remoted request for `assistant media accounting repair`.
+fn media_repair_request(
+    scope: String,
+    id: String,
+    expected_block_generation: u64,
+    repair_plan_digest: String,
+    idempotency_key: String,
+) -> Request {
+    Request::RepairMediaReservation {
+        scope,
+        id,
+        expected_block_generation,
+        repair_plan_digest,
+        idempotency_key,
+    }
+}
+
 async fn new(args: AssistantNewArgs) -> Result<()> {
     crate::assistants::validate_assistant_name(&args.name)?;
-    let db = Db::open_default().context("opening cockpit DB")?;
     let home_dir = default_home_dir(&args.name)?;
     let descriptor = crate::assistants::descriptor();
     let mut io = StdTerminalIo;
     let tty = io::stdin().is_terminal();
     let mut actions = AssistantNewAction {
-        db,
         name: args.name.clone(),
         home_dir,
     };
@@ -104,6 +130,83 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
         bail!("assistant creation did not complete");
     }
     Ok(())
+}
+
+/// Write the assistant's local home-directory artifacts (definition markdown +
+/// identity files) and return the `(config_json, content_hash)` the registry
+/// row needs. Mirrors the file-writing half of
+/// `cockpit_core::assistants::create_assistant` (the DB persist is remoted).
+/// Pure local IO — no daemon — so a parity test can compare its output against
+/// the canonical `create_assistant` and fail if the two ever drift.
+fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
+    crate::assistants::validate_assistant_name(&spec.name)?;
+    if spec.description.trim().is_empty() {
+        bail!("assistant description is required");
+    }
+    if spec.prompt.trim().is_empty() {
+        bail!("assistant prompt is required");
+    }
+    std::fs::create_dir_all(&spec.home_dir)
+        .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
+    let path = assistant_definition_path(&spec.home_dir);
+    let agent = AgentDef {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        mode: spec.mode,
+        model: spec.model.clone(),
+        temperature: None,
+        tools: spec.tools.clone(),
+        tool_tiers: spec.tool_tiers.clone(),
+        tool_descriptions: std::collections::BTreeMap::new(),
+        scan_tool_results: None,
+        goal_supervision: GoalSettingsOverride::default(),
+        permission: None,
+        fork_eligible: false,
+        prompt: spec.prompt.clone(),
+        prompt_variants: std::collections::HashMap::new(),
+        source: path.clone(),
+    };
+    crate::agents::validate_invariants(&agent)?;
+    let markdown = agent.to_markdown()?;
+    std::fs::write(&path, &markdown)
+        .with_context(|| format!("writing assistant definition {}", path.display()))?;
+    identity::seed_identity_files(&spec.home_dir)?;
+    let config = AssistantConfig {
+        agent_source: path.to_string_lossy().into_owned(),
+        soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
+        user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
+        ..AssistantConfig::default()
+    };
+    let config_json = serde_json::to_string(&config).context("serializing assistant config")?;
+    let content_hash = markdown_content_hash(&markdown);
+    Ok((config_json, content_hash))
+}
+
+/// Write the assistant's local home-directory artifacts and persist the
+/// registry row through the daemon-owned `UpsertAssistant` RPC. Only the DB
+/// persist is remoted so the CLI never opens SQLite. Returns the persisted
+/// (name, home_dir) for the wizard's confirmation line.
+async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, String)> {
+    let (config_json, content_hash) = write_assistant_home(&spec)?;
+
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for assistant persist")?;
+    let response = daemon
+        .client
+        .request(Request::UpsertAssistant {
+            name: spec.name.clone(),
+            home_dir: spec.home_dir.to_string_lossy().into_owned(),
+            config_json,
+            content_hash,
+        })
+        .await
+        .context("requesting assistant persist from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant persist: {error}"))?;
+    let Response::AssistantUpserted { assistant } = response else {
+        bail!("daemon returned unexpected response to assistant persist: {response:?}");
+    };
+    Ok((assistant.name, assistant.home_dir))
 }
 
 async fn list() -> Result<()> {
@@ -143,18 +246,20 @@ async fn list() -> Result<()> {
 }
 
 async fn show(name: &str) -> Result<()> {
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let row = db
-        .get_assistant(name)
+    let daemon = ensure_persistent_daemon()
         .await
-        .with_context(|| format!("loading assistant `{name}`"))?
+        .context("starting persistent daemon for assistant show")?;
+    let assistant = fetch_assistant(&daemon, name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-    let def = crate::assistants::load_from_row(&row)?;
+    // The registry row carries name/home_dir/content_hash; the description,
+    // mode, model and tools live in the on-disk definition file.
+    let def = crate::assistants::load_from_home(&assistant.name, Path::new(&assistant.home_dir))?;
     println!("name: {}", def.name);
     println!("description: {}", def.description);
     println!("home_dir: {}", def.home_dir.display());
     println!("definition: {}", def.agent.source.display());
-    println!("content_hash: {}", row.content_hash);
+    println!("content_hash: {}", assistant.content_hash);
     println!("mode: {:?}", def.agent.mode);
     if let Some(model) = def.agent.model.as_deref() {
         println!("model: {model}");
@@ -166,16 +271,16 @@ async fn show(name: &str) -> Result<()> {
 }
 
 async fn delete(args: AssistantDeleteArgs) -> Result<()> {
-    let db = Db::open_default().context("opening cockpit DB")?;
-    let row = db
-        .get_assistant(&args.name)
+    let daemon = ensure_persistent_daemon()
         .await
-        .with_context(|| format!("loading assistant `{}`", args.name))?
+        .context("starting persistent daemon for assistant delete")?;
+    let assistant = fetch_assistant(&daemon, &args.name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
     if !args.yes {
         print!(
             "Delete assistant `{}` from the registry? Its home directory will remain at {} [y/N]: ",
-            args.name, row.home_dir
+            args.name, assistant.home_dir
         );
         io::stdout().flush()?;
         let mut line = String::new();
@@ -185,12 +290,52 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
             return Ok(());
         }
     }
-    db.delete_assistant(&args.name).await?;
+    let response = daemon
+        .client
+        .request(delete_assistant_request(&args.name))
+        .await
+        .context("requesting assistant delete from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
+    let Response::AssistantDeleted { .. } = response else {
+        bail!("daemon returned unexpected response to assistant delete: {response:?}");
+    };
     println!(
         "deleted assistant `{}`; home directory left intact: {}",
-        args.name, row.home_dir
+        args.name, assistant.home_dir
     );
     Ok(())
+}
+
+/// Assemble the owner-remoted `GetAssistant` read (used by `show`/`delete`).
+fn get_assistant_request(name: &str) -> Request {
+    Request::GetAssistant {
+        name: name.to_string(),
+    }
+}
+
+/// Assemble the owner-remoted `DeleteAssistant` mutation.
+fn delete_assistant_request(name: &str) -> Request {
+    Request::DeleteAssistant {
+        name: name.to_string(),
+    }
+}
+
+/// Resolve a single assistant registry row through the daemon's owner-remoted
+/// `GetAssistant` read. Returns `None` when the name is not registered.
+async fn fetch_assistant(
+    daemon: &crate::daemon::client::ConnectedDaemon,
+    name: &str,
+) -> Result<Option<crate::daemon::proto::AssistantSummary>> {
+    let response = daemon
+        .client
+        .request(get_assistant_request(name))
+        .await
+        .context("requesting assistant from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant query: {error}"))?;
+    let Response::Assistant { assistant } = response else {
+        bail!("daemon returned unexpected response to assistant query: {response:?}");
+    };
+    Ok(assistant)
 }
 
 async fn chat(name: &str, no_sandbox: bool, launch_start: Option<Instant>) -> Result<()> {
@@ -244,7 +389,6 @@ impl TerminalIo for StdTerminalIo {
 }
 
 struct AssistantNewAction {
-    db: Db,
     name: String,
     home_dir: std::path::PathBuf,
 }
@@ -261,11 +405,8 @@ impl TerminalActionHandler for AssistantNewAction {
                 return Ok(());
             }
             let spec = spec_from_wizard(&self.name, self.home_dir.clone(), run)?;
-            let row = create_assistant(&self.db, spec).await?;
-            io.write_line(&format!(
-                "Created assistant `{}` at {}",
-                row.name, row.home_dir
-            ))?;
+            let (name, home_dir) = persist_new_assistant(spec).await?;
+            io.write_line(&format!("Created assistant `{name}` at {home_dir}"))?;
             Ok(())
         })
     }
@@ -275,7 +416,100 @@ impl TerminalActionHandler for AssistantNewAction {
 mod tests {
     use super::*;
     use crate::agents::AgentMode;
+    use crate::assistants::create_assistant;
+    use crate::db::Db;
     use crate::wizard::WizardAnswer;
+
+    fn sample_spec(home: std::path::PathBuf) -> crate::assistants::CreateAssistantSpec {
+        crate::assistants::CreateAssistantSpec {
+            name: "helper-bot".to_string(),
+            description: "Helps with tests".to_string(),
+            mode: AgentMode::Primary,
+            tools: Some(vec!["read".to_string()]),
+            tool_tiers: std::collections::BTreeMap::new(),
+            model: Some("openai/gpt-5.5".to_string()),
+            prompt: "Stay focused.".to_string(),
+            home_dir: home,
+        }
+    }
+
+    #[test]
+    fn media_diagnose_and_repair_requests_are_owner_remoted() {
+        // Drives the real request-builders the `media` command calls; asserts
+        // the owner-remoted RPC tag and that the user's args map through.
+        let Request::DiagnoseMediaReservation { scope, id } =
+            media_diagnose_request("session".to_string(), "sess-1".to_string())
+        else {
+            panic!("diagnose must build DiagnoseMediaReservation");
+        };
+        assert_eq!(scope, "session");
+        assert_eq!(id, "sess-1");
+
+        let Request::RepairMediaReservation {
+            scope,
+            id,
+            expected_block_generation,
+            repair_plan_digest,
+            idempotency_key,
+        } = media_repair_request(
+            "project".to_string(),
+            "proj-9".to_string(),
+            7,
+            "digest-abc".to_string(),
+            "idem-1".to_string(),
+        )
+        else {
+            panic!("repair must build RepairMediaReservation");
+        };
+        assert_eq!(scope, "project");
+        assert_eq!(id, "proj-9");
+        assert_eq!(expected_block_generation, 7);
+        assert_eq!(repair_plan_digest, "digest-abc");
+        assert_eq!(idempotency_key, "idem-1");
+    }
+
+    #[test]
+    fn get_and_delete_assistant_requests_carry_name() {
+        let Request::GetAssistant { name } = get_assistant_request("helper-bot") else {
+            panic!("show/delete must resolve through GetAssistant");
+        };
+        assert_eq!(name, "helper-bot");
+        let Request::DeleteAssistant { name } = delete_assistant_request("helper-bot") else {
+            panic!("delete must remove through DeleteAssistant");
+        };
+        assert_eq!(name, "helper-bot");
+    }
+
+    #[tokio::test]
+    async fn cli_write_assistant_home_matches_core_create_assistant() {
+        // Drift guard: `write_assistant_home` duplicates the file-writing half
+        // of `cockpit_core::assistants::create_assistant` (cockpit-core is out
+        // of scope to refactor). Build a home both ways from the same spec and
+        // assert the on-disk definition BYTES and the content hash are
+        // identical, so a future core change to fields/ordering/format fails
+        // here instead of silently producing incompatible homes.
+        let temp = tempfile::tempdir().unwrap();
+        let core_home = temp.path().join("core").join("helper-bot");
+        let cli_home = temp.path().join("cli").join("helper-bot");
+
+        let db = Db::open_in_memory().unwrap();
+        let core_row = create_assistant(&db, sample_spec(core_home.clone()))
+            .await
+            .unwrap();
+        let (_config_json, cli_hash) =
+            write_assistant_home(&sample_spec(cli_home.clone())).unwrap();
+
+        let core_md = std::fs::read(assistant_definition_path(&core_home)).unwrap();
+        let cli_md = std::fs::read(assistant_definition_path(&cli_home)).unwrap();
+        assert_eq!(
+            core_md, cli_md,
+            "assistant.md bytes must match cockpit-core's create_assistant"
+        );
+        assert_eq!(
+            core_row.content_hash, cli_hash,
+            "content hash must match cockpit-core's create_assistant"
+        );
+    }
 
     #[tokio::test]
     async fn assistant_crud_roundtrip() {

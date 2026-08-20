@@ -27460,3 +27460,363 @@ async fn sealed_owner_edit_description_updates_inventory() {
     .expect_err("editing an unknown record must reject");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
+
+// ---- sealed-owner value channel: production redaction-resolver wiring --------
+//
+// These cover the production installation of the protected-history key resolver
+// on the daemon's `SealedValueDirectory` (built by `sealed_value_directory`):
+// session-scope create/rotate driven through the real dispatch path journal a
+// `Sealed` protected-history row on adoption (AC1); a directory built without a
+// resolver fails the session-scope adoption CLOSED (AC2); and compartment-scoped
+// (project) create/rotate journal nothing (AC3).
+
+/// Total protected-redaction-history row count across all sessions.
+async fn protected_history_total(db: &Db) -> i64 {
+    db.read(|conn| {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM protected_redaction_history",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    })
+    .await
+    .unwrap()
+}
+
+/// AC1: a session-scoped sealed create + rotate driven through the daemon
+/// dispatch path (`handle_serialized_request_with_remote_operation`) journals a
+/// `Sealed` protected-history row on adoption, carrying the typed record id, the
+/// adopted version (create v1, rotate v2), and the owning session id.
+///
+/// Non-vacuous: this journaling fires ONLY because `sealed_value_directory(ctx)`
+/// installs the daemon's shared redaction key resolver. Were that install
+/// removed, `create_session_scoped` / the session branch of `rotate_at_version`
+/// fail CLOSED (decision 16) and the `apply` dispatch would return `Err`, so the
+/// `.expect("apply ...")` below panics. The successful apply AND the journaled
+/// row with the right identity/version/session are together the distinguishing
+/// signal. A precondition assert proves the session starts with no history row,
+/// so a later row can only be the adoption under test.
+#[tokio::test]
+async fn sealed_session_create_and_rotate_journal_protected_history_through_dispatch() {
+    use crate::redact::protected_redaction_history::RedactionHistorySource;
+
+    const CREATE_LITERAL: &str = "sk-live-session-adopt-create-abc123";
+    const ROTATE_LITERAL: &str = "sk-live-session-adopt-rotate-xyz789";
+    let ctx = test_ctx();
+    let mut state = owner_state();
+
+    // A session-scope sealed value adopts into a real session row.
+    let session = ctx
+        .db
+        .create_session("proj", "/repo", "Build")
+        .await
+        .expect("session row");
+    let sid = session.session_id.to_string();
+
+    // Precondition: no protected-history row exists for this session yet.
+    assert!(
+        ctx.db
+            .protected_redaction_history_list(&sid)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no protected-history row exists before the sealed adoption"
+    );
+
+    // Begin + apply a session-scoped create through the dispatch path.
+    let begun = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::BeginSealedOwnerOperation {
+            disposition: "create".into(),
+            record_id: None,
+            name: Some("deploy_token".into()),
+            description: Some("Deploy token".into()),
+            scope_kind: Some("session".into()),
+            scope_key: Some(sid.clone()),
+        },
+    )
+    .await
+    .expect("begin session create");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+    let applied = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: Some(proto::SensitiveWireLiteral::new(CREATE_LITERAL.into())),
+        },
+    )
+    .await
+    .expect("apply session create");
+    assert!(matches!(
+        applied,
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: None
+        }
+    ));
+
+    // The create journaled exactly one Sealed row at version 1 for this session.
+    let rows = ctx.db.protected_redaction_history_list(&sid).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the session-scoped create journals one Sealed row on adoption"
+    );
+    assert_eq!(rows[0].source, RedactionHistorySource::Sealed);
+    assert_eq!(rows[0].session_id, sid);
+    assert_eq!(rows[0].sealed_version, Some(1), "create adopts version 1");
+    assert_eq!(
+        rows[0].ref_count, 0,
+        "the session adoption is the durability event: zero artifact refs"
+    );
+    let record_id = rows[0]
+        .sealed_record_id
+        .clone()
+        .expect("the create journals the typed sealed record id");
+
+    // The journaled record id resolves in the session-scoped inventory.
+    let inventory = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::SealedOwnerInventory {
+            scope_kind: Some("session".into()),
+            scope_key: Some(sid.clone()),
+        },
+    )
+    .await
+    .expect("session inventory");
+    match inventory {
+        Response::SealedOwnerInventory { items } => {
+            let item = items
+                .iter()
+                .find(|item| item.record_id == record_id)
+                .expect("created session value present in inventory");
+            assert_eq!(item.name, "deploy_token");
+            assert_eq!(item.active_version, 1);
+        }
+        other => panic!("expected inventory, got {other:?}"),
+    }
+
+    // Rotate the same record through the dispatch path.
+    let begun = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::BeginSealedOwnerOperation {
+            disposition: "rotate".into(),
+            record_id: Some(record_id.clone()),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
+        },
+    )
+    .await
+    .expect("begin session rotate");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+    let applied = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: Some(proto::SensitiveWireLiteral::new(ROTATE_LITERAL.into())),
+        },
+    )
+    .await
+    .expect("apply session rotate");
+    assert!(matches!(
+        applied,
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: None
+        }
+    ));
+
+    // The rotate journaled a second Sealed row at version 2 under the same record.
+    let rows = ctx.db.protected_redaction_history_list(&sid).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the session-scoped rotate journals a second Sealed row on adoption"
+    );
+    let rotated = rows
+        .iter()
+        .find(|row| row.sealed_version == Some(2))
+        .expect("rotate journals version 2");
+    assert_eq!(rotated.source, RedactionHistorySource::Sealed);
+    assert_eq!(
+        rotated.sealed_record_id.as_deref(),
+        Some(record_id.as_str()),
+        "the rotate carries the same record id at the bumped version"
+    );
+    assert_eq!(rotated.session_id, sid);
+    assert_eq!(rotated.ref_count, 0);
+    assert!(
+        rows.iter().any(|row| row.sealed_version == Some(1)),
+        "the version-1 create row remains alongside the rotation"
+    );
+}
+
+/// AC2: the production session-scope adoption fails CLOSED when no redaction key
+/// resolver is installed — it refuses to persist a sealed literal unjournaled
+/// (decision 16) rather than silently skipping the journal.
+///
+/// Non-vacuous: the positive control builds the directory exactly as
+/// `sealed_value_directory` does WITH the daemon's shared resolver and shows the
+/// same session-scope create succeeds and journals one row; the distinguishing
+/// case rebuilds the identical directory shape WITHOUT the resolver (the gap this
+/// prompt guards) and shows the create fails closed naming the missing resolver
+/// and persists no sealed row and no extra history row.
+#[tokio::test]
+async fn sealed_session_create_without_resolver_fails_closed() {
+    use crate::sealed::action::OwnerAuthority;
+    use crate::sealed::compartment::{SealedCompartment, SealedLiteral};
+    use crate::sealed::identity::{SealedDescription, SealedName, SealedScopeRef};
+    use crate::sealed::store::{CreateSealedValue, SealedValueDirectory};
+
+    let ctx = test_ctx();
+    let session = ctx
+        .db
+        .create_session("proj", "/repo", "Build")
+        .await
+        .expect("session row");
+    let owner = OwnerAuthority::for_owner_request();
+
+    // Positive control: WITH the daemon's shared resolver installed (exactly as
+    // `sealed_value_directory` wires it), the session-scope create succeeds and
+    // journals one row.
+    let resolver = ctx
+        .redaction_key_resolver
+        .clone()
+        .expect("test ctx seeds a redaction key resolver");
+    let with_resolver = SealedValueDirectory::new(
+        ctx.db.clone(),
+        SealedCompartment::from_vault(ctx.secret_vault.clone()),
+    )
+    .with_redaction_resolver(resolver);
+    with_resolver
+        .create(
+            owner,
+            CreateSealedValue {
+                scope: SealedScopeRef::Session(session.session_id),
+                name: SealedName::canonical("deploy_token").unwrap(),
+                description: SealedDescription::parse("Deploy token").unwrap(),
+                owner_principal: "local-owner".to_string(),
+            },
+            SealedLiteral::new("sk-live-with-resolver-abc123"),
+            1_000,
+        )
+        .await
+        .expect("create succeeds when a resolver is installed");
+    assert_eq!(
+        protected_history_total(&ctx.db).await,
+        1,
+        "the resolver-backed session create journals exactly one row"
+    );
+
+    // Distinguishing case: the SAME directory shape built WITHOUT a resolver
+    // fails the session-scope create closed and persists no sealed row.
+    let without_resolver = SealedValueDirectory::new(
+        ctx.db.clone(),
+        SealedCompartment::from_vault(ctx.secret_vault.clone()),
+    );
+    let err = without_resolver
+        .create(
+            owner,
+            CreateSealedValue {
+                scope: SealedScopeRef::Session(session.session_id),
+                name: SealedName::canonical("no_resolver_token").unwrap(),
+                description: SealedDescription::parse("Deploy token").unwrap(),
+                owner_principal: "local-owner".to_string(),
+            },
+            SealedLiteral::new("sk-live-without-resolver-xyz789"),
+            2_000,
+        )
+        .await
+        .expect_err("a missing resolver must fail the session-scope create closed");
+    assert!(
+        err.to_string().contains("resolver"),
+        "the fail-closed error names the missing resolver: {err}"
+    );
+    // The rejected create journaled nothing (count unchanged from the positive
+    // control) and persisted no sealed row.
+    assert_eq!(
+        protected_history_total(&ctx.db).await,
+        1,
+        "the rejected create journals nothing (count unchanged)"
+    );
+    assert!(
+        !ctx.db
+            .sealed_value_exists(session.session_id, "no_resolver_token")
+            .await
+            .unwrap(),
+        "a fail-closed create persists no sealed row"
+    );
+}
+
+/// AC3: a compartment-scoped (project) create + rotate driven through the daemon
+/// dispatch path journals NOTHING — the session-adoption journal fires only for
+/// session scope, never for the compartment-backed saga (which has no session).
+#[tokio::test]
+async fn sealed_compartment_create_and_rotate_journal_nothing_through_dispatch() {
+    let ctx = test_ctx();
+    let mut state = owner_state();
+
+    let record_id =
+        create_project_sealed_value(&ctx, &mut state, "proj_secret", "sk-live-proj-create-abc")
+            .await;
+    assert_eq!(
+        protected_history_total(&ctx.db).await,
+        0,
+        "a compartment-backed project create journals nothing"
+    );
+
+    // Rotate the project record through dispatch; still nothing journaled.
+    let begun = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::BeginSealedOwnerOperation {
+            disposition: "rotate".into(),
+            record_id: Some(record_id.clone()),
+            name: None,
+            description: None,
+            scope_kind: None,
+            scope_key: None,
+        },
+    )
+    .await
+    .expect("begin project rotate");
+    let capability_id = match begun {
+        Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
+        other => panic!("expected begun, got {other:?}"),
+    };
+    let applied = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ApplySealedOwnerOperation {
+            capability_id,
+            literal: Some(proto::SensitiveWireLiteral::new(
+                "sk-live-proj-rotate-xyz".into(),
+            )),
+        },
+    )
+    .await
+    .expect("apply project rotate");
+    assert!(matches!(
+        applied,
+        Response::SealedOwnerOperationApplied {
+            revealed_literal: None
+        }
+    ));
+    assert_eq!(
+        protected_history_total(&ctx.db).await,
+        0,
+        "a compartment-backed project rotate journals nothing"
+    );
+}

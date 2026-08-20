@@ -456,6 +456,14 @@ mod tests {
             "stats_rollup",
             "subagent_transcript",
             "terminal_ingress_status",
+            "list_packages",
+            "get_connector_state",
+            "get_org_sync_status",
+            "list_failed_tool_calls",
+            "get_session_compactions",
+            "get_assistant",
+            "diagnose_media_reservation",
+            "get_doctor_snapshot",
         ]);
         let actual: std::collections::BTreeSet<_> = rows
             .iter()

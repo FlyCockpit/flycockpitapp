@@ -18773,6 +18773,14 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "stats_rollup",
         "subagent_transcript",
         "terminal_ingress_status",
+        "list_packages",
+        "get_connector_state",
+        "get_org_sync_status",
+        "list_failed_tool_calls",
+        "get_session_compactions",
+        "get_assistant",
+        "diagnose_media_reservation",
+        "get_doctor_snapshot",
     ]);
     assert_eq!(actual, expected);
     for serialized in [
@@ -20491,6 +20499,21 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::PrunePackages { project_root: project_root.clone(), days: 30, dry_run: false }, kind: "prune_packages", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ImportKclPackages { project_root: project_root.clone() }, kind: "import_kcl_packages", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetConnectorState, kind: "get_connector_state", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::GetOrgSyncStatus, kind: "get_org_sync_status", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::ListFailedToolCalls { since_epoch: 0, tool: None, model: None, project_id: None, include_recovered: false, limit: 20 }, kind: "list_failed_tool_calls", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the

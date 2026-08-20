@@ -1190,6 +1190,13 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    // `docs_ask` carries a short package name + usage question; bounded by
+    // construction (a CLI-typed question, not raw tool I/O).
+    row(
+        "docs_ask",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Response` variant.
@@ -1863,6 +1870,13 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    // `docs_answer` is a single rendered docs answer (model-authored free
+    // text), classed like the sibling `doctor_snapshot` rendered payload.
+    row(
+        "docs_answer",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Event` variant.
@@ -2476,8 +2490,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 190);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 133);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 191);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 134);
         assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }
 

@@ -140,10 +140,11 @@ pub fn unjournaled_inference_optout_count() -> u64 {
 /// only with an equally narrow, justified caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnjournaledInferenceReason {
-    /// The daemon-less `cockpit ask` docs command (`apps/cli`): a standalone,
-    /// read-only session that cannot safely open the daemon-owned recovery
-    /// spool concurrently, so its inference stays on the primary-row audit path.
-    DaemonlessDocsAsk,
+    /// The read-only `cockpit ask` docs pipeline (daemon `DocsAsk` handler):
+    /// a standalone, directly-run docs session created outside the session
+    /// worker, so it has no attached daemon-owned recovery journal and its
+    /// inference stays on the primary-row audit path.
+    DocsAsk,
     /// The caged background self-improvement / skills review utility
     /// (`assistants/self_improvement.rs`): intentionally retains an isolated
     /// in-memory database, to which a daemon journal (bound to a different DB)
@@ -155,7 +156,7 @@ impl UnjournaledInferenceReason {
     /// Stable, free-text-free label for logs, doctor, and audit surfaces.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::DaemonlessDocsAsk => "daemonless_docs_ask",
+            Self::DocsAsk => "docs_ask",
             Self::CagedSelfReviewUtility => "caged_self_review_utility",
         }
     }

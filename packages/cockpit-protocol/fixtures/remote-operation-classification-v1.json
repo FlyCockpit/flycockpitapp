@@ -3729,6 +3729,31 @@
       "tag": "get_doctor_snapshot"
     },
     {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "question:string|package:option<string>|project_root:option<string>",
+      "fcorRoles": [
+        {
+          "field": "question",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "package",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "project_root",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "question:String|package:Option<String>|project_root:Option<String>",
+      "strategy": "none",
+      "tag": "docs_ask"
+    },
+    {
       "class": "rejected",
       "evidence": null,
       "fcorCanonicalSchema": "-",

@@ -211,6 +211,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             rendered,
             has_failures: _,
         } => scrub_string(rendered, redact),
+        // The docs answer is model-authored free text produced by a read-only
+        // package-question pipeline that reads the dependency's real source and
+        // the workspace. A vaulted secret value that surfaced in that context
+        // must be neutralized before it crosses the socket, exactly like the
+        // sibling rendered-doctor / transcript free-text responses above.
+        proto::Response::DocsAnswer { answer } => scrub_string(answer, redact),
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
         | proto::Response::RetainedHttpsMedia(..)

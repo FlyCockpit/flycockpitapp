@@ -1,19 +1,21 @@
-//! `cockpit ask <package> <question>` — direct CLI entry point for the
-//! read-only dependency docs pipeline.
+//! `cockpit ask <package> <question>` — CLI front end for the read-only
+//! dependency docs pipeline.
+//!
+//! The daemon owns the pipeline: `cockpit ask` starts (or reuses) the
+//! persistent daemon and sends the owner-remoted `DocsAsk` RPC. The daemon
+//! creates a `"docs"`-agent session, runs the existing two-stage
+//! package-question pipeline, and returns the rendered answer. The CLI never
+//! opens SQLite, never starts a standalone secure-key actor, and never builds
+//! an in-process engine.
 
 use std::io::Read;
-use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
-use serde_json::json;
 
 use crate::cli::AskArgs;
 use crate::commands::CommandUsageError;
-use crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH;
-use crate::engine::builtin::{DelegationRecursionContext, SpawnArgs};
-use crate::engine::model::{Model, ModelParams};
-use crate::env_snapshot::{EnvSnapshot, EnvSnapshotSource};
-use crate::session::Session;
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{Request, Response};
 
 pub async fn run(args: AskArgs) -> Result<()> {
     let stdin = if args.question.is_empty() {
@@ -22,7 +24,25 @@ pub async fn run(args: AskArgs) -> Result<()> {
         String::new()
     };
     let question = assemble_question(&args.question, &stdin)?;
-    let answer = run_docs_ask(&args.package_id, &question).await?;
+    let project_root = std::env::current_dir()
+        .context("resolving cwd for docs ask")?
+        .display()
+        .to_string();
+    let request = build_docs_ask_request(&args.package_id, question, Some(project_root));
+
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for docs ask")?;
+    let response = daemon
+        .client
+        .request(request)
+        .await
+        .context("sending docs ask to daemon")?
+        .map_err(|error| anyhow!("daemon rejected docs ask: {error}"))?;
+    let Response::DocsAnswer { answer } = response else {
+        return Err(anyhow!("daemon returned unexpected response to docs ask"));
+    };
+
     print!("{answer}");
     if !answer.ends_with('\n') {
         println!();
@@ -30,154 +50,21 @@ pub async fn run(args: AskArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    let db = crate::db::Db::open_default().context("opening cockpit DB")?;
-    crate::config::trust::enforce_noninteractive_workspace_trust(&db, &cwd).await?;
-
-    let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
-    let env = EnvSnapshot::from_process(EnvSnapshotSource::ExplicitCli);
-    // This daemon-less command has no daemon-owned secure-key actor, but a
-    // `Session` requires a key resolver (decision 16). Start a standalone actor
-    // and keep it alive for the session's lifetime. The docs ask never journals
-    // (see `allow_unjournaled_inference` below), so the resolver is never
-    // exercised, but it must be a real resolver, never absent.
-    // `start_standalone_redaction_key_resolver` boots the secure-key actor and
-    // blocks on its readiness channel (`blocking_recv`), which panics on a Tokio
-    // worker thread. Mirror the daemon (`daemon/server/mod.rs`
-    // `start_production_with_reconciler` runs off the async worker on a dedicated
-    // thread) by running the startup on a blocking thread via `spawn_blocking`.
-    let (secure_key_actor, redaction_key_resolver) = {
-        let db = db.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::redact::start_standalone_redaction_key_resolver(&db)
-        })
-        .await
-        .context("joining secure-key resolver startup for docs ask session")?
-        .context("starting secure-key resolver for docs ask session")?
-    };
-    // Own the actor across the whole session and drain it on a blocking thread
-    // afterwards. `SecureKeyActor`'s `Drop` blocks on its worker channel
-    // (`blocking_recv`), which panics on a Tokio worker thread, so the session
-    // body runs in an inner future and the actor is dropped off-worker on every
-    // exit path (success or `?`), mirroring the daemon's off-worker actor lifecycle.
-    let result: Result<String> = async move {
-        let vault = cockpit_core::secure_key::vault_for_db(&db)
-            .map_err(|e| anyhow!("opening docs ask session vault: {e}"))?;
-        let session = Session::create(
-            db.clone(),
-            cwd.clone(),
-            "docs",
-            redaction_key_resolver,
-            vault,
-        )
-        .context("creating docs ask session")?;
-        // This legacy read-only, daemon-less command cannot safely open the
-        // daemon-owned recovery spool concurrently. Its inference remains on the
-        // existing primary-row audit path; daemon/session-worker turns are always
-        // journal-required.
-        session.allow_unjournaled_inference(
-            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk,
-        );
-        session.set_sandbox_enabled(true);
-        session.set_approval_mode(extended.default_approval_mode);
-        session.set_shell_compression(extended.shell_compression);
-        seed_docs_session_active_model(&session, providers.active_model.as_ref())?;
-
-        let redact = Arc::new(
-            crate::redact::RedactionTable::build_with_env_and_store(
-                &extended.redact,
-                &cwd,
-                env.vars(),
-            )
-            .context("building redaction table")?,
-        );
-        let model = Arc::new(
-            Model::from_config_with_env(&providers, redact.clone(), |name| {
-                env.vars().get(name).cloned()
-            })
-            .context("resolving active model")?,
-        );
-        let reasoning_params = model.resolve_reasoning_params(&providers);
-        // Session-less command: resolve config once here (the trust-aware entry
-        // point already ran to produce `extended`/`providers`) and serve it to the
-        // docs pipeline through a detached config handle
-        // (`engine-config-snapshot-adoption`).
-        let config = crate::daemon::session_worker::SessionConfigHandle::detached(
-            crate::daemon::session_worker::SessionConfigSnapshot::new(
-                0,
-                providers.clone(),
-                extended.clone(),
-            ),
-        );
-        let spawn_args = SpawnArgs {
-            model,
-            params: ModelParams {
-                additional_params: reasoning_params,
-                prompt_cache_key: Some(session.id.to_string()),
-                ..ModelParams::default()
-            },
-            env_overlay: Arc::new(RwLock::new(Default::default())),
-            cwd: cwd.clone(),
-            config: config.clone(),
-            session_short_id: session.short_id.clone(),
-            assistant_identity_prefix: None,
-            model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
-            interactive: false,
-            llm_mode: extended.llm_mode,
-            model_override: None,
-            delegation_model: None,
-            delegated: true,
-            delegation_recursion: DelegationRecursionContext::default(),
-            swarm_depth: 0,
-            swarm_max_depth: DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
-            granted_tools: Vec::new(),
-            lock_identity: None,
-            write_scope: None,
-            credential_store: None,
-        };
-        let locks = Arc::new(
-            crate::locks::LockManager::from_db(db)
-                .await
-                .context("loading lock state")?,
-        );
-        let brief = build_docs_brief(package_id, question);
-        let outcome = crate::engine::docs_pipeline::run(
-            &brief,
-            &spawn_args,
-            Arc::new(session),
-            locks,
-            redact,
-            config,
-            None,
-            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
-            tokio_util::sync::CancellationToken::new(),
-            None,
-            None,
-            None,
-        )
-        .await?;
-        Ok(outcome.report)
+/// Assemble the owner-remoted `DocsAsk` request the command sends. Extracted so
+/// the real request can be unit-tested without a live daemon: `package` is the
+/// registered package identifier, `question` the assembled prompt, and
+/// `project_root` the workspace whose layered config/trust resolve the
+/// answering model.
+fn build_docs_ask_request(
+    package_id: &str,
+    question: String,
+    project_root: Option<String>,
+) -> Request {
+    Request::DocsAsk {
+        question,
+        package: Some(package_id.to_string()),
+        project_root,
     }
-    .await;
-    // Drain the standalone secure-key actor off the async worker; its `Drop`
-    // would otherwise `blocking_recv` on a Tokio worker thread and panic.
-    tokio::task::spawn_blocking(move || drop(secure_key_actor))
-        .await
-        .context("draining secure-key resolver for docs ask session")?;
-    result
-}
-
-fn seed_docs_session_active_model(
-    session: &Session,
-    active: Option<&crate::config::providers::ActiveModelRef>,
-) -> Result<()> {
-    if let Some(active) = active {
-        session
-            .set_active_model_ref(active.clone())
-            .context("recording active model for docs ask session")?;
-    }
-    Ok(())
 }
 
 fn read_stdin() -> Result<String> {
@@ -201,14 +88,6 @@ fn assemble_question(args: &[String], stdin: &str) -> Result<String> {
         .into());
     }
     Ok(question)
-}
-
-fn build_docs_brief(package_id: &str, question: &str) -> String {
-    json!({
-        "package": package_id,
-        "question": question,
-    })
-    .to_string()
 }
 
 #[cfg(test)]
@@ -250,39 +129,89 @@ mod tests {
     }
 
     #[test]
-    fn docs_brief_is_structured_json() {
-        let brief = build_docs_brief("cargo:tokio", "how do tasks work?");
-        let value: serde_json::Value = serde_json::from_str(&brief).unwrap();
-        assert_eq!(value["package"], "cargo:tokio");
-        assert_eq!(value["question"], "how do tasks work?");
+    fn build_docs_ask_request_targets_owner_remoted_docs_ask() {
+        // Drives the real request-builder the command calls: `ask` assembles an
+        // owner-remoted `DocsAsk` (daemon-owned, no in-process SQLite / engine)
+        // carrying the package, the assembled question, and the workspace root.
+        let request = build_docs_ask_request(
+            "cargo:tokio",
+            "how do tasks work?".to_string(),
+            Some("/w/project".to_string()),
+        );
+        let Request::DocsAsk {
+            question,
+            package,
+            project_root,
+        } = request
+        else {
+            panic!("ask must request DocsAsk");
+        };
+        assert_eq!(question, "how do tasks work?");
+        assert_eq!(package.as_deref(), Some("cargo:tokio"));
+        assert_eq!(project_root.as_deref(), Some("/w/project"));
     }
 
+    fn production_ask_source() -> &'static str {
+        let source = include_str!("ask.rs");
+        source
+            .split("mod tests {")
+            .next()
+            .expect("production ask.rs")
+    }
+
+    /// AC1: `ask` reaches the daemon through the shared `ensure_persistent_daemon`
+    /// entry point (the same helper `doctor` uses), which boots a persistent
+    /// daemon when none is running, and sends the owner-remoted `DocsAsk` RPC —
+    /// it never builds an in-process engine.
     #[test]
-    fn docs_ask_session_seeds_complete_active_model_selection() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let (_secure_key_actor, resolver) =
-            crate::redact::start_fake_redaction_key_resolver(&db).unwrap();
-        let vault = cockpit_core::secure_key::vault_for_db(&db).unwrap();
-        let session = Session::create(
-            db,
-            std::path::PathBuf::from("/docs"),
-            "docs",
-            resolver,
-            vault,
-        )
-        .unwrap();
-        let selection = crate::config::providers::ActiveModelRef {
-            provider: "anthropic".to_string(),
-            model: "claude-opus-4-7".to_string(),
-            reasoning_effort: Some(crate::config::providers::ActiveReasoningEffort {
-                value: "high".to_string(),
-            }),
-            thinking_mode: Some(crate::config::providers::ThinkingMode::High),
-            prompt_cache_retention: Some(crate::config::providers::PromptCacheRetention::Extended),
-        };
+    fn ask_without_daemon_starts_persistent_daemon() {
+        let production = production_ask_source();
+        assert!(
+            production.contains("ensure_persistent_daemon"),
+            "ask must start/reuse the persistent daemon"
+        );
+        assert!(
+            production.contains("Request::DocsAsk"),
+            "ask must reach the docs pipeline through the daemon RPC"
+        );
+        assert!(
+            !production.contains("docs_pipeline"),
+            "ask must not run the docs pipeline in-process"
+        );
+    }
 
-        seed_docs_session_active_model(&session, Some(&selection)).unwrap();
+    /// AC2: the rewritten command opens no CLI-side SQLite. (The workspace
+    /// production-path ratchet enforces the same by dropping `ask.rs` from its
+    /// allow-list; this is the local mirror.)
+    #[test]
+    fn ask_rs_has_no_db_open() {
+        let production = production_ask_source();
+        assert!(
+            !production.contains("Db::open_default"),
+            "ask must not open SQLite"
+        );
+        assert!(
+            !production.contains("vault_for_db"),
+            "ask must not open an in-process vault"
+        );
+    }
 
-        assert_eq!(session.active_model_ref(), Some(selection));
+    /// AC3: no standalone `SecureKeyActor` / redaction-key resolver is started;
+    /// the daemon owns the secure-key actor.
+    #[test]
+    fn ask_does_not_start_standalone_secure_key_actor() {
+        let production = production_ask_source();
+        assert!(
+            !production.contains("SecureKeyActor"),
+            "ask must not construct a standalone secure-key actor"
+        );
+        assert!(
+            !production.contains("start_standalone_redaction_key_resolver"),
+            "ask must not start a standalone redaction-key resolver"
+        );
+        assert!(
+            !production.contains("Session::create"),
+            "ask must not build an in-process session"
+        );
     }
 }

@@ -756,6 +756,14 @@ pub enum Response {
         has_failures: bool,
     },
 
+    /// Rendered dependency-docs answer for [`crate::Request::DocsAsk`].
+    /// `answer` is model-authored free text; the daemon scrubs it through
+    /// the redaction table before it crosses the socket (see the owner
+    /// backstop in `daemon::server`).
+    DocsAnswer {
+        answer: String,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1104,6 +1112,7 @@ macro_rules! response_variants {
             (Response::MediaReservationDiagnosis { .. }, "media_reservation_diagnosis");
             (Response::MediaReservationRepaired { .. }, "media_reservation_repaired");
             (Response::DoctorSnapshot { .. }, "doctor_snapshot");
+            (Response::DocsAnswer { .. }, "docs_answer");
             (Response::Unknown, "__unknown");
         ] }
     };

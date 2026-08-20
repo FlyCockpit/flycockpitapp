@@ -2441,14 +2441,12 @@ mod tests {
         assert!(session.unjournaled_inference_reason().is_none());
         let before = crate::session::unjournaled_inference_optout_count();
 
-        session.allow_unjournaled_inference(
-            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk,
-        );
+        session.allow_unjournaled_inference(crate::session::UnjournaledInferenceReason::DocsAsk);
 
         assert!(session.unjournaled_inference_allowed());
         assert_eq!(
             session.unjournaled_inference_reason(),
-            Some(crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk)
+            Some(crate::session::UnjournaledInferenceReason::DocsAsk)
         );
         assert_eq!(
             crate::session::unjournaled_inference_optout_count(),
@@ -2456,8 +2454,8 @@ mod tests {
             "each opt-out increments the audit counter exactly once"
         );
         assert_eq!(
-            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk.as_str(),
-            "daemonless_docs_ask"
+            crate::session::UnjournaledInferenceReason::DocsAsk.as_str(),
+            "docs_ask"
         );
     }
 }

@@ -3296,6 +3296,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             no_sandbox,
             offline,
         } => get_doctor_snapshot_response(project_root, no_sandbox, offline).await,
+        // Owner-remoted, read-only, serialized: the docs pipeline creates a
+        // `"docs"` session and runs a full turn, so it is not a snapshot-correct
+        // concurrent read. Runs on this per-client serialized executor.
+        Request::DocsAsk {
+            question,
+            package,
+            project_root,
+        } => docs_ask_response(ctx, question, package, project_root).await,
 
         Request::CreateAssistantSession {
             name,
@@ -12333,6 +12341,190 @@ async fn get_doctor_snapshot_response(
         rendered,
         has_failures,
     })
+}
+
+/// Structured `{package, question}` brief consumed by the docs pipeline's
+/// `parse_input`. Mirrors the JSON the former in-process `cockpit ask` built.
+fn build_docs_ask_brief(package: Option<&str>, question: &str) -> String {
+    serde_json::json!({
+        "package": package.unwrap_or_default(),
+        "question": question,
+    })
+    .to_string()
+}
+
+/// Owner-remoted `DocsAsk`: create a `"docs"`-agent session and run the
+/// existing read-only package-question pipeline entirely inside the daemon,
+/// returning the rendered answer. No standalone `SecureKeyActor` and no
+/// CLI-opened `Db`: the vault, redaction-key resolver, config source, and env
+/// baseline all come from the daemon context.
+///
+/// Trust + config resolution happen on this async task (Send DB reads); the
+/// pipeline itself holds `!Send` provider/engine state across awaits, so it is
+/// driven to completion on a dedicated current-thread runtime inside
+/// `spawn_blocking` (mirroring `get_doctor_snapshot_response`). Only the
+/// rendered answer `String` (Send) leaves the closure.
+async fn docs_ask_response(
+    ctx: &Arc<DaemonContext>,
+    question: String,
+    package: Option<String>,
+    project_root: Option<String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let cwd = project_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.canonical_cwd.clone());
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+        .await
+        .map_err(internal)?;
+    let (providers, extended) = ctx
+        .config_source()
+        .load_effective_for_daemon(&cwd, &trust_policy)
+        .map_err(daemon_config_error)?;
+
+    let env_snapshot = ctx
+        .env_baseline
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let resolver = ctx.redaction_key_resolver().map_err(internal)?;
+    let vault = ctx.secret_vault.clone();
+    let db = ctx.db.clone();
+
+    let answer = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(run_docs_ask_pipeline(
+            db,
+            cwd,
+            providers,
+            extended,
+            env_snapshot,
+            resolver,
+            vault,
+            package,
+            question,
+        ))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(bad_request)?;
+
+    Ok(Response::DocsAnswer { answer })
+}
+
+/// Assemble the throwaway `"docs"` session + spawn args and run the two-stage
+/// docs pipeline, returning its model-authored report. Runs on a dedicated
+/// current-thread runtime (see `docs_ask_response`).
+#[allow(clippy::too_many_arguments)]
+async fn run_docs_ask_pipeline(
+    db: crate::db::Db,
+    cwd: PathBuf,
+    providers: crate::config::providers::ProvidersConfig,
+    extended: crate::config::extended::ExtendedConfig,
+    env_snapshot: EnvSnapshot,
+    resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    vault: Arc<crate::secure_key::SecretVault>,
+    package: Option<String>,
+    question: String,
+) -> std::result::Result<String, String> {
+    let session = crate::session::Session::create(db.clone(), cwd.clone(), "docs", resolver, vault)
+        .map_err(|error| format!("creating docs ask session: {error:#}"))?;
+    // The docs session is created outside the session worker, so it has no
+    // attached daemon recovery journal; take the audited opt-out from the
+    // inference journal barrier (its inference stays on the primary-row audit
+    // path). This is one of the two enumerated `UnjournaledInferenceReason`
+    // callers.
+    session.allow_unjournaled_inference(crate::session::UnjournaledInferenceReason::DocsAsk);
+    session.set_sandbox_enabled(true);
+    session.set_approval_mode(extended.default_approval_mode);
+    session.set_shell_compression(extended.shell_compression);
+    if let Some(active) = providers.active_model.as_ref() {
+        session
+            .set_active_model_ref(active.clone())
+            .map_err(|error| format!("recording active model for docs ask session: {error:#}"))?;
+    }
+
+    let store = session
+        .provider_credential_store(&providers)
+        .map_err(|error| format!("opening owner-scoped credential store: {error:#}"))?;
+    let redact = Arc::new(
+        crate::redact::RedactionTable::build_with_env_and_credential_store(
+            &extended.redact,
+            &cwd,
+            env_snapshot.vars(),
+            &store,
+        )
+        .map_err(|error| format!("building redaction table: {error:#}"))?,
+    );
+    let model = Arc::new(
+        crate::engine::model::Model::from_config_with_store(
+            &providers,
+            redact.clone(),
+            |name| env_snapshot.vars().get(name).cloned(),
+            store.clone(),
+        )
+        .map_err(|error| format!("resolving active model: {error:#}"))?,
+    );
+    let reasoning_params = model.resolve_reasoning_params(&providers);
+    let config = crate::daemon::session_worker::SessionConfigHandle::detached(
+        crate::daemon::session_worker::SessionConfigSnapshot::new(
+            0,
+            providers.clone(),
+            extended.clone(),
+        ),
+    );
+    let session = Arc::new(session);
+    let spawn_args = crate::engine::builtin::SpawnArgs {
+        model,
+        params: crate::engine::model::ModelParams {
+            additional_params: reasoning_params,
+            prompt_cache_key: Some(session.id.to_string()),
+            ..crate::engine::model::ModelParams::default()
+        },
+        env_overlay: Arc::new(std::sync::RwLock::new(Default::default())),
+        cwd: cwd.clone(),
+        config: config.clone(),
+        session_short_id: session.short_id.clone(),
+        assistant_identity_prefix: None,
+        model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+        interactive: false,
+        llm_mode: extended.llm_mode,
+        model_override: None,
+        delegation_model: None,
+        delegated: true,
+        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        swarm_depth: 0,
+        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+        granted_tools: Vec::new(),
+        lock_identity: None,
+        write_scope: None,
+        credential_store: Some(store),
+    };
+    let locks = Arc::new(
+        crate::locks::LockManager::from_db(db)
+            .await
+            .map_err(|error| format!("loading lock state: {error:#}"))?,
+    );
+    let brief = build_docs_ask_brief(package.as_deref(), &question);
+    let outcome = crate::engine::docs_pipeline::run(
+        &brief,
+        &spawn_args,
+        session,
+        locks,
+        redact,
+        config,
+        None,
+        Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+        tokio_util::sync::CancellationToken::new(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(outcome.report)
 }
 
 /// JSON projection of a package prune report.

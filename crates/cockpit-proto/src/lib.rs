@@ -2692,7 +2692,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "delete_assistant"
                 | "diagnose_media_reservation"
                 | "repair_media_reservation"
-                | "get_doctor_snapshot" => 10,
+                | "get_doctor_snapshot"
+                | "docs_ask" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 tags: the base tag
@@ -2746,7 +2747,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "assistant_deleted"
                 | "media_reservation_diagnosis"
                 | "media_reservation_repaired"
-                | "doctor_snapshot" => 10,
+                | "doctor_snapshot"
+                | "docs_answer" => 10,
                 _ => 9,
             };
             // Extended v10-only shapes on existing v9 response tags: the base
@@ -6045,6 +6047,11 @@ mod tests {
                 no_sandbox: false,
                 offline: false,
             },
+            Request::DocsAsk {
+                question: "how do tasks work?".into(),
+                package: Some("tokio".into()),
+                project_root: None,
+            },
         ] {
             let tag = request.wire_tag();
             assert_eq!(
@@ -6104,6 +6111,9 @@ mod tests {
                 rendered: String::new(),
                 has_failures: false,
             },
+            Response::DocsAnswer {
+                answer: String::new(),
+            },
         ] {
             let tag = response.wire_tag();
             assert_eq!(
@@ -6136,6 +6146,59 @@ mod tests {
                 },
             },
         };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_docs_ask_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope {
+            v: 9,
+            body: Body::Request {
+                id,
+                operation: None,
+                request: Request::DocsAsk {
+                    question: "how do tasks work?".into(),
+                    package: Some("tokio".into()),
+                    project_root: None,
+                },
+            },
+        };
+        sender
+            .framed
+            .send(serde_json::to_string(&forged).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 9, id: Some(actual), .. }) if actual == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_v10_only_docs_answer_labeled_as_v9() {
+        let (a, b) = duplex(4096);
+        let mut sender = ProtoStream::with_version(a, 9);
+        let mut receiver = ProtoStream::with_version(b, 9);
+        let id = Uuid::new_v4();
+        let forged = Envelope::response_at(
+            9,
+            id,
+            Response::DocsAnswer {
+                answer: "cited answer".into(),
+            },
+        );
         sender
             .framed
             .send(serde_json::to_string(&forged).unwrap())

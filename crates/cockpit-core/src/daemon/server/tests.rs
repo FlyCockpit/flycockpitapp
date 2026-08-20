@@ -1088,6 +1088,92 @@ async fn get_session_compactions_response_scrubs_vault_secret() {
     );
 }
 
+#[test]
+fn docs_answer_response_scrubs_vaulted_secret() {
+    // REDACTION BACKSTOP (L7/L8): the `DocsAnswer` free-text answer is
+    // model-authored and can quote a vaulted secret value it encountered while
+    // reading the workspace/dependency source. The owner-response scrub backstop
+    // (`scrub_response_free_text`, applied even to owner responses in
+    // `response_envelope_for_shared`) must neutralize it before it crosses the
+    // socket, exactly like the sibling rendered/transcript responses.
+    let marker = "fci_planted_docs_answer_secret";
+    let redact = table_for(marker);
+    let mut response = Response::DocsAnswer {
+        answer: format!("The API returns {marker} as the token (src/lib.rs:12)."),
+    };
+    // Positive control: the raw answer really carries the secret marker, so the
+    // assertion below cannot pass merely because it was never present.
+    assert!(
+        serde_json::to_string(&response).unwrap().contains(marker),
+        "raw docs answer must surface the planted secret before scrubbing"
+    );
+    scrub_response_free_text(&mut response, &redact);
+    let Response::DocsAnswer { answer } = response else {
+        panic!("expected docs answer");
+    };
+    assert!(
+        !answer.contains(marker),
+        "redaction backstop must strip the vaulted secret from the docs answer"
+    );
+    assert!(
+        answer.contains("[redacted]"),
+        "the stripped secret must be replaced in place, keeping the answer readable"
+    );
+}
+
+#[tokio::test]
+async fn docs_ask_uses_docs_agent_session() {
+    // AC5: the daemon docs-ask session agent is `"docs"`. A config source with
+    // NO active model makes `run_docs_ask_pipeline` fail deterministically at
+    // model resolution — AFTER the daemon creates and persists the docs session
+    // and BEFORE any inference/network call — so the test never hangs and never
+    // depends on a live model. The persisted session must carry the `"docs"`
+    // agent; a planted non-docs default would surface here instead.
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        crate::config::providers::ProvidersConfig::default(),
+        crate::config::extended::ExtendedConfig::default(),
+    ));
+    let mut state = owner_state();
+    let tmp = tempfile::tempdir().unwrap();
+    // Production `cockpit ask` establishes workspace trust (via
+    // `install_cli_trust_policy`) before the RPC; mirror that so the daemon
+    // resolves a trust policy for the workspace instead of failing `Unset`.
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let project_root = tmp.path().display().to_string();
+
+    let result = handle_request(
+        Request::DocsAsk {
+            question: "how do tasks work?".into(),
+            package: Some("tokio".into()),
+            project_root: Some(project_root),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "docs ask without an active model must fail at model resolution, not run inference"
+    );
+
+    let sessions = ctx.db.list_sessions(false, 100).await.unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the docs-ask RPC must create exactly one (docs) session"
+    );
+    assert_eq!(
+        sessions[0].active_agent, "docs",
+        "the daemon docs-ask session agent must be \"docs\""
+    );
+}
+
 #[tokio::test]
 async fn upsert_assistant_rejects_non_owner_principal() {
     let ctx = test_ctx();
@@ -12219,6 +12305,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_session_compactions"
         | "diagnose_media_reservation"
         | "get_doctor_snapshot" => AuthzAllowedOutcome::Response,
+        // `docs_ask` is authorized for the owner but then resolves workspace
+        // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
+        // which the ephemeral matrix daemon never trusts — so it fails closed
+        // with `Internal` post-auth, before any docs pipeline / inference runs.
+        // The authz boundary (owner-allowed, non-owner-denied) is what this
+        // matrix verifies.
+        "docs_ask" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // v10 owner-remoted persistent mutations (including the reclassified
         // `upsert_assistant`) reject on the ephemeral matrix daemon before any
         // work, exactly like the sibling ephemeral-guarded owner mutations.
@@ -12360,6 +12453,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("diagnose_media_reservation"),
         authz_owner_only("repair_media_reservation"),
         authz_owner_only("get_doctor_snapshot"),
+        authz_owner_only("docs_ask"),
         authz_owner_only("list_secret_inventory"),
         authz_owner_only("put_named_secret"),
         authz_owner_only("put_subscription_ack"),
@@ -13912,6 +14006,14 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_root: Some(root.clone()),
             no_sandbox: true,
             offline: true,
+        },
+        // project_root: None ⇒ the daemon's canonical cwd, which the ephemeral
+        // matrix daemon never trusts, so the owner-authorized request fails
+        // closed at trust resolution before running the docs pipeline.
+        "docs_ask" => Request::DocsAsk {
+            question: "how do tasks work?".into(),
+            package: Some("tokio".into()),
+            project_root: None,
         },
         other => panic!("unhandled authz matrix request kind {other}"),
     }
@@ -20514,6 +20616,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::DocsAsk { question: "how do tasks work?".into(), package: Some("tokio".into()), project_root: Some("/tmp/project".into()) }, kind: "docs_ask", session_id: None, audit_path: None, mutating: false },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
@@ -20730,6 +20833,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         DiagnoseMediaReservation,
         RepairMediaReservation,
         GetDoctorSnapshot,
+        DocsAsk,
     );
 
     let covered: HashSet<&'static str> = cases

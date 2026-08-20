@@ -1753,6 +1753,19 @@ pub enum Request {
         offline: bool,
     },
 
+    /// Answer a read-only dependency-docs question through the daemon.
+    /// The daemon creates a `"docs"`-agent session, runs the existing
+    /// read-only package-question pipeline, and returns the rendered
+    /// answer on [`crate::Response::DocsAnswer`]. `project_root` supplies
+    /// the workspace whose layered config/trust resolve the answering
+    /// model (absent ⇒ the daemon's canonical cwd, mirroring
+    /// `get_doctor_snapshot`).
+    DocsAsk {
+        question: String,
+        package: Option<String>,
+        project_root: Option<String>,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -2455,6 +2468,7 @@ macro_rules! request_variants {
             (Request::DiagnoseMediaReservation { .. }, "diagnose_media_reservation");
             (Request::RepairMediaReservation { .. }, "repair_media_reservation");
             (Request::GetDoctorSnapshot { .. }, "get_doctor_snapshot");
+            (Request::DocsAsk { .. }, "docs_ask");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -2699,6 +2713,7 @@ macro_rules! command {
             (Request::DiagnoseMediaReservation { scope, id }, "diagnose_media_reservation", owner_only, none, false, read_only, none, concurrent, none, "scope:String|id:String", [scope: String => param, id: String => param]);
             (Request::RepairMediaReservation { scope, id, expected_block_generation, repair_plan_digest, idempotency_key }, "repair_media_reservation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String", [scope: String => param, id: String => param, expected_block_generation: u64 => param, repair_plan_digest: String => param, idempotency_key: String => param]);
             (Request::GetDoctorSnapshot { project_root, no_sandbox, offline }, "get_doctor_snapshot", owner_only, none, false, read_only, none, concurrent, none, "project_root:Option<String>|no_sandbox:bool|offline:bool", [project_root: Option<String> => param, no_sandbox: bool => param, offline: bool => param]);
+            (Request::DocsAsk { question, package, project_root }, "docs_ask", owner_only, none, false, read_only, none, serialized, none, "question:String|package:Option<String>|project_root:Option<String>", [question: String => param, package: Option<String> => param, project_root: Option<String> => param]);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };
@@ -3655,6 +3670,7 @@ mod tests {
                         | "diagnose_media_reservation"
                         | "repair_media_reservation"
                         | "get_doctor_snapshot"
+                        | "docs_ask"
                 );
                 if owner_remoted {
                     assert_ne!(declared_class, "local_only");
@@ -3738,6 +3754,24 @@ mod tests {
         assert_eq!(
             fixture["rows"], rows,
             "the shared Rust/TypeScript classification fixture must match every command column exactly"
+        );
+    }
+
+    #[test]
+    fn docs_ask_is_owner_remoted_read_only() {
+        // AC6/AC7: `docs_ask` is owner-remoted (it reserves a remote operation,
+        // so it is NOT `local_only`) and its remote class is `ReadOnly` — the
+        // pipeline reads the dependency source/workspace and returns the answer
+        // on the response, persisting no audit-mutating consequence.
+        assert_eq!(
+            remote_operation_class_for_tag("docs_ask"),
+            Some(RemoteOperationClass::ReadOnly),
+            "docs_ask must be an owner-remoted read-only operation, not local_only"
+        );
+        assert_eq!(
+            remote_adapter_recovery_strategy_for_tag("docs_ask"),
+            None,
+            "a read-only docs question acquires no adapter recovery strategy"
         );
     }
 

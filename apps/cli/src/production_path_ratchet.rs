@@ -17,11 +17,9 @@ const FORBIDDEN: &[&str] = &[
 
 /// Cited production sites. Counts are after `#[cfg(test)]` modules are stripped.
 const ALLOWED: &[(&str, &str, usize)] = &[
-    // `ask` is converted by `cli-ask-via-daemon`; `export` by the export
-    // rewrite. Every other product command now drives the daemon RPCs, so the
-    // CLI allow-list is NOT empty until those two land.
-    ("commands/ask.rs", "Db::open_default", 1),
-    ("commands/ask.rs", "vault_for_db", 1),
+    // `ask` now drives the owner-remoted `DocsAsk` RPC (`cli-ask-via-daemon`),
+    // so it opens no SQLite/vault and is off this list. `export` is converted by
+    // the export rewrite; until it lands the CLI allow-list is NOT empty.
     ("commands/export.rs", "Db::open_default", 1),
     ("commands/export.rs", "vault_for_db", 1),
 ];

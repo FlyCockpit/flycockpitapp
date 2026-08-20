@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 77,
-    "request": 190,
-    "response": 133
+    "request": 191,
+    "response": 134
   },
   "messages": {
     "event": [
@@ -1660,6 +1660,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "get_doctor_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "docs_ask"
       }
     ],
     "response": [
@@ -2460,6 +2466,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "doctor_snapshot"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "docs_answer"
       }
     ]
   },

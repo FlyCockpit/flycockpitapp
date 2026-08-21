@@ -74,6 +74,9 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
     ) {
         Ok(s) => {
             s.set_external_journal(ctx.session.external_journal());
+            // Inherit the parent's command-secret cache so the scheduled loop
+            // fork's store funnel injects resolved command outputs.
+            s.set_command_secret_cache(ctx.session.command_secret_cache());
             Arc::new(s)
         }
         Err(e) => {

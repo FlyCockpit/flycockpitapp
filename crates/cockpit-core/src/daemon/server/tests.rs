@@ -28353,3 +28353,408 @@ async fn sealed_compartment_create_and_rotate_journal_nothing_through_dispatch()
         "a compartment-backed project rotate journals nothing"
     );
 }
+
+// ---- Daemon-startup command-backed secret resolution (inc 2) -------------
+
+/// Counting executor for the startup-resolution tests: records invocations and
+/// returns a canned success or a canned failure.
+struct StartupCountingExecutor {
+    outcome: std::result::Result<String, crate::secret_command::CommandSecretError>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl StartupCountingExecutor {
+    fn ok(value: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            outcome: Ok(value.to_string()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn failing(error: crate::secret_command::CommandSecretError) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            outcome: Err(error),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::secret_command::CommandSecretExecutor for StartupCountingExecutor {
+    async fn run(
+        &self,
+        _argv: &[String],
+    ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcome.clone()
+    }
+}
+
+fn startup_ctx_referencing_command_secret(secret_name: &str) -> std::sync::Arc<DaemonContext> {
+    use crate::config::providers::{
+        ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "lmstudio".to_string(),
+        ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            models: vec![ModelEntry {
+                id: "m".to_string(),
+                ..ModelEntry::default()
+            }],
+            headers: vec![HeaderSpec {
+                name: "Authorization".to_string(),
+                value: format!("Bearer $secret:{secret_name}"),
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    providers.active_model = Some(ActiveModelRef {
+        provider: "lmstudio".to_string(),
+        model: "m".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
+        providers,
+        crate::config::extended::ExtendedConfig::default(),
+    ))
+}
+
+/// Claim `(provider, cwd)` ownership of `item_id` so the owner-scoped startup
+/// resolution (keyed on `std::env::current_dir()`) resolves it. Read-only w.r.t.
+/// the process cwd — never mutates it.
+fn claim_current_dir_ownership(db: &crate::db::Db, item_id: &str) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let root = crate::secret_ownership::canonical_owner_root(&cwd.display().to_string());
+    let item_id = item_id.to_string();
+    db.blocking_write_for_sync_maintenance(move |conn| {
+        conn.execute(
+            "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+             VALUES (?1, 'provider', ?2, 0)",
+            rusqlite::params![item_id, root],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Mark the process cwd as a TRUSTED workspace in `db`, so startup resolution
+/// (which resolves the trust policy from the DB for `current_dir()` and loads
+/// via the trust-aware daemon loader) does not fail-closed on an unset/untrusted
+/// workspace. Trust is keyed on the SAME resolved root that
+/// `resolve_workspace_trust_policy_from_db` queries — `resolve_trust_root` walks
+/// to the git worktree root, so trusting the raw cwd would miss. Writes only to
+/// the test's own DB.
+async fn trust_current_dir(db: &crate::db::Db) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let root = crate::config::trust::resolve_trust_root(&cwd).expect("resolve trust root for cwd");
+    db.set_workspace_trust(
+        &root.root,
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    )
+    .await
+    .unwrap();
+}
+
+/// AC3: a referenced, provider-owned command-backed secret is `Resolved` after
+/// startup resolution (which `boot_with_db` runs) in a TRUSTED workspace.
+#[tokio::test]
+async fn daemon_startup_resolves_referenced_command_secrets() {
+    let ctx = startup_ctx_referencing_command_secret("startupcmd");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("startupcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    claim_current_dir_ownership(&ctx.db, "startupcmd");
+    trust_current_dir(&ctx.db).await;
+
+    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
+        "startup-resolved-token-abcdef0123456789",
+    ));
+    ctx.registry.set_command_secret_cache(cache.clone());
+
+    ctx.resolve_startup_command_secrets().await;
+
+    assert!(
+        matches!(
+            cache.status("startupcmd"),
+            Some(crate::secret_command::CommandResolutionStatus::Resolved)
+        ),
+        "a referenced command secret must be Resolved after startup"
+    );
+    assert_eq!(cache.exec_count(), 1);
+}
+
+/// AC3: a failing startup resolution lands as `Failed` and never fails boot
+/// (the resolution completes without panicking / returning an error).
+#[tokio::test]
+async fn daemon_startup_command_secret_failure_does_not_fail_boot() {
+    let ctx = startup_ctx_referencing_command_secret("startupcmd");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("startupcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    claim_current_dir_ownership(&ctx.db, "startupcmd");
+    trust_current_dir(&ctx.db).await;
+
+    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::failing(
+        crate::secret_command::CommandSecretError::NotFound,
+    ));
+    ctx.registry.set_command_secret_cache(cache.clone());
+
+    // Completes normally: startup resolution never fails boot on a command error.
+    ctx.resolve_startup_command_secrets().await;
+
+    assert!(
+        matches!(
+            cache.status("startupcmd"),
+            Some(crate::secret_command::CommandResolutionStatus::Failed(_))
+        ),
+        "a failing referenced command secret must land as Failed after startup"
+    );
+    assert_eq!(cache.exec_count(), 1);
+}
+
+/// HIGH #3a (part 1): an UNSET/untrusted workspace fails closed — startup
+/// resolution resolves the trust policy from the DB, and with no trust decision
+/// it never loads project config or execs. The FIXED source WOULD return the
+/// reference if consulted, so a `0` exec count proves the trust gate exists (an
+/// implementation that skipped the trust check would exec 1).
+#[tokio::test]
+async fn daemon_startup_untrusted_workspace_does_not_exec_command() {
+    let ctx = startup_ctx_referencing_command_secret("trustcmd");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("trustcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    // Ownership is claimed so the ONLY thing preventing execution is the
+    // (absent) workspace trust decision — no `trust_current_dir` call here.
+    claim_current_dir_ownership(&ctx.db, "trustcmd");
+
+    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
+        "must-never-be-produced-token",
+    ));
+    ctx.registry.set_command_secret_cache(cache.clone());
+
+    ctx.resolve_startup_command_secrets().await;
+
+    assert_eq!(
+        cache.exec_count(),
+        0,
+        "an untrusted / unset workspace must never exec a project command reference at boot"
+    );
+    assert!(cache.status("trustcmd").is_none());
+}
+
+/// HIGH #3a (part 2): startup resolution loads through the TRUST-AWARE daemon
+/// loader (`load_effective_for_daemon` → `daemon_load`), NOT the trust-blind
+/// `load`. With a TRUSTED workspace (so trust resolution succeeds), a source
+/// whose trust-blind `load` references the command secret while its trust-aware
+/// `daemon_load` returns empty (the dropped-project-layer shape) must exec 0
+/// times — an implementation that consulted `load` would exec 1.
+#[tokio::test]
+async fn daemon_startup_uses_trust_aware_daemon_loader() {
+    use crate::config::providers::{
+        ActiveModelRef, HeaderSpec, ModelEntry, ProviderEntry, ProvidersConfig,
+    };
+    let mut referencing = ProvidersConfig::default();
+    referencing.providers.insert(
+        "lmstudio".to_string(),
+        ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            models: vec![ModelEntry {
+                id: "m".to_string(),
+                ..ModelEntry::default()
+            }],
+            headers: vec![HeaderSpec {
+                name: "Authorization".to_string(),
+                value: "Bearer $secret:trustcmd".to_string(),
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    referencing.active_model = Some(ActiveModelRef {
+        provider: "lmstudio".to_string(),
+        model: "m".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    });
+    let source = crate::daemon::config_source::ConfigSource::new_with_daemon_load(
+        // Trust-blind `load`: references the command secret (what an unguarded
+        // implementation would consult).
+        move |_cwd| {
+            Ok((
+                referencing.clone(),
+                crate::config::extended::ExtendedConfig::default(),
+            ))
+        },
+        // Trust-aware `daemon_load`: models a dropped project layer (empty).
+        |_cwd| {
+            Ok(crate::daemon::config_source::DaemonConfigLoad {
+                providers: crate::config::providers::ProvidersConfig::default(),
+                extended: crate::config::extended::ExtendedConfig::default(),
+                response_metrics_tokenizer_validation: Ok(()),
+                participating_layers: Vec::new(),
+            })
+        },
+        |_cwd, _provider| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::new(Vec::new(), Vec::new()),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("trustcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    claim_current_dir_ownership(&ctx.db, "trustcmd");
+    // Trusted workspace, so trust resolution SUCCEEDS and the loader choice is
+    // the only thing that matters.
+    trust_current_dir(&ctx.db).await;
+
+    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
+        "must-never-be-produced-token",
+    ));
+    ctx.registry.set_command_secret_cache(cache.clone());
+
+    ctx.resolve_startup_command_secrets().await;
+
+    assert_eq!(
+        cache.exec_count(),
+        0,
+        "startup must use the trust-aware daemon loader, not the trust-blind load"
+    );
+    assert!(cache.status("trustcmd").is_none());
+}
+
+/// MEDIUM (owner-scoping through the startup route): startup resolution reads
+/// argv specs through an OWNER-SCOPED store, so a referenced command name owned
+/// by a DIFFERENT workspace is never executed at boot. In a TRUSTED workspace
+/// (so trust is not the reason for skipping) with the spec present but owned by
+/// a foreign root, `resolve_startup_command_secrets` must exec 0 times — a
+/// regression to an UNSCOPED vault lookup would find the spec and exec it once.
+#[tokio::test]
+async fn daemon_startup_does_not_exec_foreign_owned_command() {
+    let ctx = startup_ctx_referencing_command_secret("foreignstartupcmd");
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
+    store
+        .set_named_secret_command("foreignstartupcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+    // Owned by a DIFFERENT workspace root, NOT this daemon's cwd — so the
+    // owner-scoped startup view drops it.
+    let foreign_root = crate::secret_ownership::canonical_owner_root("/some/other/workspace");
+    ctx.db
+        .blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES ('foreignstartupcmd', 'provider', ?1, 0)",
+                rusqlite::params![foreign_root],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // Trusted, so the ONLY thing preventing execution is owner-scoping.
+    trust_current_dir(&ctx.db).await;
+
+    let cache = crate::secret_command::CommandSecretCache::new(StartupCountingExecutor::ok(
+        "must-never-be-produced-token",
+    ));
+    ctx.registry.set_command_secret_cache(cache.clone());
+
+    ctx.resolve_startup_command_secrets().await;
+
+    assert_eq!(
+        cache.exec_count(),
+        0,
+        "startup must owner-scope: a foreign-owned command name is never execed"
+    );
+    assert!(cache.status("foreignstartupcmd").is_none());
+}
+
+/// #5(b): the REAL `boot_with_db` entry point runs startup command-secret
+/// resolution. A trusted workspace + a fixed config that REFERENCES a
+/// provider-owned command secret is injected, so the boot-path resolution must
+/// leave a completed status (`Resolved`/`Failed`) in the daemon cache. Removing
+/// the `resolve_startup_command_secrets` hook from `boot_with_db` makes the
+/// status `None` and fails this test. (The argv is a nonexistent program, so the
+/// real subprocess executor returns quickly with `Failed(NotFound)` — no hang.)
+#[tokio::test]
+async fn boot_with_db_resolves_referenced_command_secret() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // In-memory DB so the pre-boot seed writes (spec save + ownership) take the
+    // synchronous memory path — safe inside a tokio test — and the shared handle
+    // is read by boot's own vault.
+    let db = crate::db::Db::open_in_memory().expect("temp db");
+    // Seed the vault (via the same opener boot uses), ownership, and trust
+    // BEFORE boot, then boot with a fixed config that references the command.
+    let vault = crate::secure_key::open_for_db(&db).expect("boot vault");
+    let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+    store
+        .set_named_secret_command(
+            "bootcmd",
+            vec!["cockpit-boot-command-secret-probe-nonexistent".to_string()],
+        )
+        .unwrap();
+    store.save().unwrap();
+    claim_current_dir_ownership(&db, "bootcmd");
+    trust_current_dir(&db).await;
+
+    let mut providers = crate::config::providers::ProvidersConfig::default();
+    providers.providers.insert(
+        "lmstudio".to_string(),
+        crate::config::providers::ProviderEntry {
+            url: "http://localhost:1/v1".to_string(),
+            headers: vec![crate::config::providers::HeaderSpec {
+                name: "Authorization".to_string(),
+                value: "Bearer $secret:bootcmd".to_string(),
+            }],
+            ..crate::config::providers::ProviderEntry::default()
+        },
+    );
+    let config_source = crate::daemon::config_source::ConfigSource::fixed(
+        providers,
+        crate::config::extended::ExtendedConfig::default(),
+    );
+
+    let mut timer = crate::startup::PhaseTimer::start("boot_resolves_referenced_command");
+    let ctx = boot_with_db(
+        DaemonPaths {
+            socket: tmp.path().join("cockpit-cmd-boot.sock"),
+            pid_file: tmp.path().join("cockpit-cmd-boot.pid"),
+            ephemeral: true,
+        },
+        db,
+        &mut timer,
+        crate::daemon::terminal::test_host_factory(),
+        config_source,
+    )
+    .await
+    .expect("boot_with_db must succeed with startup command resolution wired in");
+
+    assert!(
+        ctx.registry
+            .command_secret_cache()
+            .status("bootcmd")
+            .is_some(),
+        "boot must run startup command-secret resolution for the referenced, \
+         trusted, owned command secret"
+    );
+}
+
+// `forked_session_inherits_command_secret_cache` moved to the driver tests
+// (`engine::driver::tests::noninteractive`), where it drives the REAL
+// `prepare_fork_task_context` production path instead of manually copying the
+// cache onto a bare child session (which would pass even if the production copy
+// were removed).

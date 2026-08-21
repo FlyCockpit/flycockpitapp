@@ -180,6 +180,13 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Daemon-process command-backed secret cache. Late-installed by the
+    /// registry / daemon before the worker (or DocsAsk session) builds any
+    /// store, so every `credential_store` / `provider_credential_store` this
+    /// session builds injects the resolved command outputs the cache holds
+    /// (a sync, execution-free lookup). Absent in isolated unit sessions, where
+    /// command-backed secrets simply resolve as missing.
+    command_secret_cache: Mutex<Option<Arc<crate::secret_command::CommandSecretCache>>>,
     /// Required key resolver for protected redaction-history journaling.
     /// Installed at construction by the registry / daemon (production) or the
     /// shared test helper (tests) — never `Option`, never lazily set (decision
@@ -436,6 +443,26 @@ impl Session {
         self.external_journal.lock().unwrap().clone()
     }
 
+    /// Install (or inherit) the daemon-process command-secret cache.
+    /// Late-installed like [`Self::set_external_journal`] before the worker /
+    /// DocsAsk / fork / scheduled session builds any store, so every credential
+    /// store this session builds injects resolved command outputs. Takes an
+    /// `Option` so a derived session can copy a parent's cache verbatim
+    /// (`child.set_command_secret_cache(parent.command_secret_cache())`) — a
+    /// parent without a cache yields `None` and the child resolves as missing.
+    pub(crate) fn set_command_secret_cache(
+        &self,
+        cache: Option<Arc<crate::secret_command::CommandSecretCache>>,
+    ) {
+        *self.command_secret_cache.lock().unwrap() = cache;
+    }
+
+    pub(crate) fn command_secret_cache(
+        &self,
+    ) -> Option<Arc<crate::secret_command::CommandSecretCache>> {
+        self.command_secret_cache.lock().unwrap().clone()
+    }
+
     /// The session's protected redaction-history key resolver. Required and
     /// installed at construction (decision 16). Consumed by the journaling
     /// chokepoints landed in Layer C.
@@ -450,7 +477,21 @@ impl Session {
     }
 
     pub(crate) fn credential_store(&self) -> anyhow::Result<crate::credentials::CredentialStore> {
-        crate::credentials::CredentialStore::from_vault(self.secret_vault.clone())
+        let mut store = crate::credentials::CredentialStore::from_vault(self.secret_vault.clone())?;
+        self.inject_command_outputs_if_installed(&mut store);
+        Ok(store)
+    }
+
+    /// Inject resolved command-backed outputs from the installed daemon cache
+    /// into `store` (single funnel; see
+    /// [`crate::credentials::CredentialStore::inject_command_outputs`]). A no-op
+    /// when no cache is installed (isolated sessions) — command secrets then
+    /// resolve as missing. The lock guard is released before the (sync,
+    /// execution-free) injection so it is never held across other work.
+    fn inject_command_outputs_if_installed(&self, store: &mut crate::credentials::CredentialStore) {
+        if let Some(cache) = self.command_secret_cache() {
+            store.inject_command_outputs(&cache);
+        }
     }
 
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]
@@ -464,7 +505,7 @@ impl Session {
         &self,
         providers: &crate::config::providers::ProvidersConfig,
     ) -> anyhow::Result<crate::credentials::CredentialStore> {
-        crate::credentials::CredentialStore::from_vault_owner_scoped(
+        let mut store = crate::credentials::CredentialStore::from_vault_owner_scoped(
             self.secret_vault.clone(),
             crate::secret_ownership::OWNER_KIND_PROVIDER,
             &crate::secret_ownership::canonical_owner_root(
@@ -476,7 +517,13 @@ impl Session {
             // (fail closed on unclaimed). The daemon's provider settings paths
             // establish ownership with a scan; already-owned names still resolve.
             None,
-        )
+        )?;
+        // Inject resolved command outputs from the daemon cache. The store is
+        // owner-scoped, so only (provider, this-workspace)-owned command names
+        // are present and injectable — a foreign-owned command name is never
+        // injected (and, resolved through this same scoped view, never execed).
+        self.inject_command_outputs_if_installed(&mut store);
+        Ok(store)
     }
 
     /// Take the audited opt-out from the durable-before-handoff inference

@@ -5119,3 +5119,69 @@ fn delegated_batch_admission_gate_serializes_dynamic_and_overlaps_read_only() {
         "read-only-eligible children run CONCURRENTLY under shared read guards"
     );
 }
+
+/// Canned executor for the fork-inheritance test: returns a fixed token so a
+/// resolved command output can be planted in the parent's cache.
+struct CannedCommandExecutor(String);
+
+#[async_trait::async_trait]
+impl crate::secret_command::CommandSecretExecutor for CannedCommandExecutor {
+    async fn run(
+        &self,
+        _argv: &[String],
+    ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Drives the REAL `prepare_fork_task_context` production path: a task fork
+/// inherits the parent session's command-secret cache, so the DERIVED child's
+/// store funnel injects the resolved command output. This does NOT manually set
+/// the cache on the child — removing the production cache copy in
+/// `prepare_fork_task_context` leaves the child cache-less and the token
+/// un-redacted, failing this test.
+#[tokio::test]
+async fn forked_task_session_inherits_command_secret_cache_via_real_path() {
+    let (driver, _tmp) = test_driver_without_network(1);
+
+    // Plant a command spec in the parent session's vault and a cache that has
+    // already resolved it (as `start_worker` would before a fork).
+    let mut store =
+        crate::credentials::CredentialStore::from_vault(driver.session.secret_vault().clone())
+            .unwrap();
+    store
+        .set_named_secret_command("forkcmd", vec!["prog".to_string()])
+        .unwrap();
+    store.save().unwrap();
+
+    let token = "forked-task-inherited-token-abcdef0123456789";
+    let cache = crate::secret_command::CommandSecretCache::new(std::sync::Arc::new(
+        CannedCommandExecutor(token.to_string()),
+    ));
+    cache
+        .ensure_resolved("forkcmd", &["prog".to_string()])
+        .await;
+    driver.session.set_command_secret_cache(Some(cache));
+
+    // Real production derivation — NOT a manual child cache install.
+    let (child, _history) = driver
+        .prepare_fork_task_context()
+        .await
+        .expect("fork task context");
+
+    // The child's store funnel injects the inherited resolved output, so the
+    // redaction table (built the way the worker builds it) redacts the token.
+    let table = crate::redact::RedactionTable::build_with_env_and_credential_store(
+        &crate::config::extended::ExtendedConfig::default().redact,
+        &child.project_root,
+        &std::collections::HashMap::new(),
+        &child.credential_store().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        table.scrub(token),
+        token,
+        "the forked child must inherit the parent's command-secret cache via \
+         prepare_fork_task_context"
+    );
+}

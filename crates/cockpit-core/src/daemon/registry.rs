@@ -158,6 +158,13 @@ struct Inner {
     /// Daemon-held wrap-key vault installed at construction. Session
     /// create/resume/fork use this handle instead of opening a second vault.
     secret_vault: Arc<Mutex<Option<Arc<crate::secure_key::SecretVault>>>>,
+    /// Daemon-process cache of resolved command-backed named secrets
+    /// (`command-backed-secret-refs-daemon`). One cache per daemon process,
+    /// single-flight per name; sync lookups never execute. Created eagerly with
+    /// the real subprocess executor so it is always present; tests swap in a
+    /// counting-executor cache via [`SessionRegistry::set_command_secret_cache`]
+    /// before any session starts.
+    command_secret_cache: Mutex<Arc<crate::secret_command::CommandSecretCache>>,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -354,7 +361,10 @@ fn resolve_session_worker_model(
         let env_lookup = |name: &str| env_snapshot.vars().get(name).cloned();
         // Owner-scoped resolution: this provider request may only resolve
         // `$secret:` names owned by (provider, this workspace root). See
-        // `named-secret-ownership-boundary`.
+        // `named-secret-ownership-boundary`. `provider_credential_store` injects
+        // any resolved command-backed outputs from the installed daemon cache (a
+        // sync, execution-free lookup) so a `$secret:` command reference expands
+        // to the cached value.
         let store = session.provider_credential_store(&session_providers)?;
         let model =
             Model::from_config_with_store(&session_providers, redact.clone(), env_lookup, store)?;
@@ -473,6 +483,9 @@ impl SessionRegistry {
                 external_journal: Arc::new(Mutex::new(None)),
                 redaction_key_resolver: Arc::new(Mutex::new(None)),
                 secret_vault: Arc::new(Mutex::new(None)),
+                command_secret_cache: Mutex::new(
+                    crate::secret_command::CommandSecretCache::with_subprocess_executor(),
+                ),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
@@ -564,6 +577,118 @@ impl SessionRegistry {
         crate::sync::lock_or_recover(&self.inner.secret_vault)
             .clone()
             .context("secret vault not installed on registry")
+    }
+
+    /// Install a specific command-secret cache. Production uses the eager
+    /// subprocess-backed cache from construction; this is the test seam that
+    /// injects a counting-executor cache so exec-count assertions are possible.
+    /// Must be called before any session start.
+    pub fn set_command_secret_cache(&self, cache: Arc<crate::secret_command::CommandSecretCache>) {
+        *crate::sync::lock_or_recover(&self.inner.command_secret_cache) = cache;
+    }
+
+    /// The daemon-process command-secret cache (single-flight per name; sync
+    /// lookups never execute).
+    pub(crate) fn command_secret_cache(&self) -> Arc<crate::secret_command::CommandSecretCache> {
+        crate::sync::lock_or_recover(&self.inner.command_secret_cache).clone()
+    }
+
+    /// Pre-resolve (execute-once) every command-backed secret referenced by
+    /// `providers_cfg`'s headers into the daemon cache, reading argv specs
+    /// through the session's OWNER-SCOPED provider store — so only command names
+    /// owned by `(provider, this workspace)` are ever executed; a foreign-owned
+    /// name is dropped from the scoped view and never execed. Called on the ASYNC
+    /// session create/resume path BEFORE the sync `start_worker`, so every
+    /// subsequent sync redaction/model build (start, model-switch, tandem,
+    /// redaction refresh) observes the CACHE and never triggers a subprocess exec
+    /// (`async_resolve_precedes_redaction_and_model_build`).
+    pub(crate) async fn preresolve_session_command_secrets(
+        &self,
+        session: &Session,
+        providers_cfg: &ProvidersConfig,
+    ) {
+        let referenced = crate::secret_ref::provider_named_secret_references(providers_cfg);
+        if referenced.is_empty() {
+            return;
+        }
+        let store = match session.provider_credential_store(providers_cfg) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "command-secret pre-resolution skipped: owner-scoped store unavailable"
+                );
+                return;
+            }
+        };
+        self.resolve_referenced_from_store(&store, &referenced, false)
+            .await;
+    }
+
+    /// Resolve (optionally invalidating first) the command-backed secrets in
+    /// `referenced` that are owned by `(provider, project_root)`. Reads argv
+    /// specs through an OWNER-SCOPED store so a foreign-owned name is never
+    /// executed. Used by daemon startup, provider-config update, and DocsAsk —
+    /// all of which know the concrete `(provider, workspace root)` scope.
+    pub(crate) async fn resolve_provider_command_secrets(
+        &self,
+        project_root: &str,
+        referenced: &std::collections::BTreeSet<String>,
+        invalidate: bool,
+    ) {
+        if referenced.is_empty() {
+            return;
+        }
+        let Ok(vault) = self.secret_vault() else {
+            return;
+        };
+        let store = match crate::credentials::CredentialStore::from_vault_owner_scoped(
+            vault,
+            crate::secret_ownership::OWNER_KIND_PROVIDER,
+            &crate::secret_ownership::canonical_owner_root(project_root),
+            referenced,
+            // No cross-config scan here: never lazily claim an unclaimed name.
+            // An already-provider-owned name (claimed on provider save) resolves;
+            // a foreign / unclaimed name is dropped and never execed.
+            None,
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "command-secret resolution skipped: owner-scoped store unavailable"
+                );
+                return;
+            }
+        };
+        self.resolve_referenced_from_store(&store, referenced, invalidate)
+            .await;
+    }
+
+    /// Resolve each `referenced` command-backed name from an ALREADY OWNER-SCOPED
+    /// `store`: a name the scoped store does not know as command-backed (foreign,
+    /// unclaimed, or literal) is skipped and never executed. `store` is an owned
+    /// snapshot, so no lock guard is held across the `.await`s below.
+    async fn resolve_referenced_from_store(
+        &self,
+        store: &crate::credentials::CredentialStore,
+        referenced: &std::collections::BTreeSet<String>,
+        invalidate: bool,
+    ) {
+        let cache = self.command_secret_cache();
+        for name in referenced {
+            let Some(argv) = store.named_secret_command_spec(name) else {
+                continue;
+            };
+            let argv = argv.to_vec();
+            if invalidate {
+                cache.invalidate(name);
+            }
+            // Single-flight, execute-once (or once-more after invalidate). The
+            // resolved value stays in daemon memory; only a sanitized status is
+            // observable outside the cache.
+            cache.ensure_resolved(name, &argv).await;
+        }
     }
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -727,6 +852,11 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
+        // Async pre-resolve referenced command-backed secrets into the daemon
+        // cache BEFORE the sync `start_worker` builds the redaction table and
+        // model, so both observe the cache and never trigger a sync exec.
+        self.preresolve_session_command_secrets(&session, &providers_cfg)
+            .await;
         self.start_worker(
             session,
             &providers_cfg,
@@ -785,6 +915,10 @@ impl SessionRegistry {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             next_generation(&mut workers)
         };
+        // Async pre-resolve referenced command-backed secrets before the sync
+        // `start_worker` (see `attach_create_session`).
+        self.preresolve_session_command_secrets(&session, &providers_cfg)
+            .await;
         self.start_worker(
             session,
             &providers_cfg,
@@ -821,6 +955,10 @@ impl SessionRegistry {
             .inner
             .config_source
             .load_effective_for_daemon(&session.project_root, &trust_policy)?;
+        // Async pre-resolve referenced command-backed secrets before the sync
+        // `start_worker` (see `attach_create_session`).
+        self.preresolve_session_command_secrets(&session, &providers_cfg)
+            .await;
         self.start_worker(
             session,
             &providers_cfg,
@@ -953,7 +1091,18 @@ impl SessionRegistry {
 
         session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
 
+        // Install the daemon command-secret cache on the session BEFORE any store
+        // is built, so EVERY credential store this session builds for the whole
+        // worker lifetime — the initial redaction table and model here, plus later
+        // model-switch, tandem, and redaction-refresh builds — injects the
+        // resolved command outputs the cache holds (a sync, execution-free
+        // lookup). Pre-resolution has already run on the async caller path.
+        session.set_command_secret_cache(Some(self.command_secret_cache()));
+
         // Build per-session redaction table from the immutable session env.
+        // `credential_store` injects any resolved command-backed output into the
+        // store, so the planted token joins the redaction table while the argv
+        // spec never does (`command_secret_output_joins_redaction_table`).
         let redact = RedactionTable::build_with_env_and_credential_store(
             &extended_cfg.redact,
             &project_root,
@@ -3503,5 +3652,354 @@ mod tests {
         reg.resume_session_locks(sid);
         tokio::task::yield_now().await;
         assert_eq!(locks.holder(&keep), Some((sid, "builder".to_string())));
+    }
+
+    // ---- Command-backed secret daemon wiring (inc 2) ---------------------
+
+    /// Counting executor: records every invocation and returns a canned token,
+    /// so exec-count assertions can distinguish a sync exec from a cache hit.
+    struct CountingOkExecutor {
+        value: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingOkExecutor {
+        fn new(value: &str) -> Arc<Self> {
+            Arc::new(Self {
+                value: value.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::secret_command::CommandSecretExecutor for CountingOkExecutor {
+        async fn run(
+            &self,
+            _argv: &[String],
+        ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.value.clone())
+        }
+    }
+
+    fn command_secret_config_source() -> crate::daemon::config_source::ConfigSource {
+        crate::daemon::config_source::ConfigSource::fixed(
+            ProvidersConfig::default(),
+            ExtendedConfig::default(),
+        )
+    }
+
+    /// A registry whose vault holds a single command-backed spec and whose
+    /// command cache is the supplied counting cache.
+    fn registry_with_command_secret(
+        name: &str,
+        argv: Vec<String>,
+        cache: Arc<crate::secret_command::CommandSecretCache>,
+    ) -> SessionRegistry {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let locks = Arc::new(LockManager::in_memory(db.clone()));
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+        let mut store = crate::credentials::CredentialStore::from_vault(vault.clone()).unwrap();
+        store.set_named_secret_command(name, argv).unwrap();
+        store.save().unwrap();
+        let reg = SessionRegistry::new(
+            db,
+            locks,
+            ShutdownSignal::new(),
+            None,
+            command_secret_config_source(),
+        );
+        reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        reg.set_secret_vault(vault);
+        reg.set_command_secret_cache(cache);
+        reg
+    }
+
+    fn providers_referencing_secret(name: &str) -> ProvidersConfig {
+        use crate::config::providers::{HeaderSpec, ModelEntry, ProviderEntry};
+        use std::collections::BTreeMap;
+
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".to_string(),
+                models: vec![ModelEntry {
+                    id: "parent-model".to_string(),
+                    ..ModelEntry::default()
+                }],
+                headers: vec![HeaderSpec {
+                    name: "Authorization".to_string(),
+                    value: format!("Bearer $secret:{name}"),
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".to_string(),
+                model: "parent-model".to_string(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            ..ProvidersConfig::default()
+        }
+    }
+
+    fn daemon_start_env() -> EnvSnapshot {
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        )
+    }
+
+    /// Claim `(provider, project_root)` ownership of a named secret so the
+    /// owner-scoped resolution/injection view resolves it. Mirrors the ownership
+    /// row a provider save (or the inc4 command-spec RPC) would insert.
+    fn claim_provider_ownership(db: &Db, item_id: &str, project_root: &std::path::Path) {
+        let root =
+            crate::secret_ownership::canonical_owner_root(&project_root.display().to_string());
+        let item_id = item_id.to_string();
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES (?1, 'provider', ?2, 0)",
+                rusqlite::params![item_id, root],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn root_string(session: &Session) -> String {
+        session.project_root.display().to_string()
+    }
+
+    /// AC7: the resolved command output joins the per-session redaction table,
+    /// while the argv spec never does. Drives the SAME sync build `start_worker`
+    /// runs (`session.credential_store()` funnel + `build_with_env_and_credential_store`).
+    #[tokio::test]
+    async fn command_secret_output_joins_redaction_table_but_spec_does_not() {
+        let token = "cmd-resolved-secret-token-abcdef0123456789";
+        let program = "resolve-github-token-fetcher-program-longname";
+        let cache = crate::secret_command::CommandSecretCache::new(CountingOkExecutor::new(token));
+        let reg = registry_with_command_secret(
+            "ghcmd",
+            vec![program.to_string(), "auth".to_string(), "token".to_string()],
+            cache.clone(),
+        );
+        let session = test_session(&reg);
+        claim_provider_ownership(&reg.inner.db, "ghcmd", &session.project_root);
+
+        // Async owner-scoped pre-resolution, then install the cache on the
+        // session exactly as `start_worker` does before building any store.
+        let providers = providers_referencing_secret("ghcmd");
+        reg.preresolve_session_command_secrets(&session, &providers)
+            .await;
+        assert_eq!(cache.exec_count(), 1);
+        session.set_command_secret_cache(Some(reg.command_secret_cache()));
+
+        let table = RedactionTable::build_with_env_and_credential_store(
+            &ExtendedConfig::default().redact,
+            &session.project_root,
+            daemon_start_env().vars(),
+            &session.credential_store().unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(
+            table.scrub(token),
+            token,
+            "the resolved command output must join the redaction table"
+        );
+        // The argv spec (a long, otherwise-redactable string) is never a
+        // redaction candidate: it lives only in command_specs, never in secrets.
+        assert_eq!(
+            table.scrub(program),
+            program,
+            "the argv program must never be redacted"
+        );
+        // Building the table consulted the cache and never re-execed.
+        assert_eq!(cache.exec_count(), 1);
+    }
+
+    /// AC6: async pre-resolution must precede the sync redaction AND model
+    /// build. Before resolve the owner-scoped model store and the redaction
+    /// table see nothing and no exec happens; after resolve both see the cached
+    /// value, and constructing the real `Model` never triggers a sync exec.
+    #[tokio::test]
+    async fn async_resolve_precedes_redaction_and_model_build() {
+        let token = "ordering-probe-resolved-token-abcdef0123456789";
+        let cache = crate::secret_command::CommandSecretCache::new(CountingOkExecutor::new(token));
+        let reg = registry_with_command_secret("ordercmd", vec!["prog".to_string()], cache.clone());
+        let session = test_session(&reg);
+        claim_provider_ownership(&reg.inner.db, "ordercmd", &session.project_root);
+        session.set_command_secret_cache(Some(reg.command_secret_cache()));
+        let providers = providers_referencing_secret("ordercmd");
+
+        // BEFORE pre-resolution: the owner-scoped model store and the redaction
+        // table observe nothing (the sync lookup never execs), and no exec ran —
+        // the hazard the ordering guards against (build-before-resolve).
+        assert_eq!(
+            session
+                .provider_credential_store(&providers)
+                .unwrap()
+                .named_secret("ordercmd"),
+            None,
+            "the model store must not see the value before pre-resolution"
+        );
+        let early = RedactionTable::build_with_env_and_credential_store(
+            &ExtendedConfig::default().redact,
+            &session.project_root,
+            daemon_start_env().vars(),
+            &session.credential_store().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(early.scrub(token), token, "no value before pre-resolution");
+        // Also construct the REAL model before pre-resolution: the sync model
+        // build consults the store's execution-free `named_secret`, so it must
+        // NOT exec even when the secret is unresolved (whether the build
+        // succeeds or fails-closed on the missing header, exec_count stays 0).
+        let _ = resolve_session_worker_model(
+            &providers,
+            &ExtendedConfig::default(),
+            &session,
+            Arc::new(early),
+            &daemon_start_env(),
+            None,
+            &reg.inner.shutdown,
+        );
+        assert_eq!(
+            cache.exec_count(),
+            0,
+            "the sync redaction/model build must never trigger an exec"
+        );
+
+        // Real async pre-resolution (the path the session-create callers run).
+        reg.preresolve_session_command_secrets(&session, &providers)
+            .await;
+        assert_eq!(
+            cache.exec_count(),
+            1,
+            "async pre-resolve execs exactly once"
+        );
+
+        // AFTER pre-resolution: the owner-scoped model store now expands the ref,
+        // the redaction table redacts the value, and building the REAL model
+        // consumes the injected store without any further exec.
+        assert_eq!(
+            session
+                .provider_credential_store(&providers)
+                .unwrap()
+                .named_secret("ordercmd"),
+            Some(token),
+            "the model store must expand the ref to the cached value"
+        );
+        let late = RedactionTable::build_with_env_and_credential_store(
+            &ExtendedConfig::default().redact,
+            &session.project_root,
+            daemon_start_env().vars(),
+            &session.credential_store().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(late.scrub(token), token, "resolve-before-build injects it");
+        let model = resolve_session_worker_model(
+            &providers,
+            &ExtendedConfig::default(),
+            &session,
+            Arc::new(late),
+            &daemon_start_env(),
+            None,
+            &reg.inner.shutdown,
+        )
+        .expect("model build");
+        assert_eq!(model.model_id_ref(), "parent-model");
+        assert_eq!(
+            cache.exec_count(),
+            1,
+            "redaction + model construction consulted the cache; never a sync exec"
+        );
+    }
+
+    /// AC4: a provider update that references the command secret re-execs
+    /// exactly once more; an update whose reference set does not include it
+    /// execs zero times. Exercises the owner-scoped `resolve_provider_command_secrets`
+    /// the SaveProviderConfig arm invokes.
+    #[tokio::test]
+    async fn provider_update_invalidation_reexecutes_once() {
+        let cache = crate::secret_command::CommandSecretCache::new(CountingOkExecutor::new(
+            "provider-update-token-abcdef0123456789",
+        ));
+        let reg = registry_with_command_secret("cmd", vec!["prog".to_string()], cache.clone());
+        let session = test_session(&reg);
+        claim_provider_ownership(&reg.inner.db, "cmd", &session.project_root);
+        let root = root_string(&session);
+
+        let referencing: std::collections::BTreeSet<String> =
+            ["cmd".to_string()].into_iter().collect();
+        let unreferenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // Initial resolution (as at boot / session start).
+        reg.resolve_provider_command_secrets(&root, &referencing, false)
+            .await;
+        assert_eq!(cache.exec_count(), 1);
+
+        // Saving a provider that references the command secret: exactly once more.
+        reg.resolve_provider_command_secrets(&root, &referencing, true)
+            .await;
+        assert_eq!(
+            cache.exec_count(),
+            2,
+            "a referencing provider update must re-exec exactly once more"
+        );
+
+        // Saving an unreferenced provider (empty scoped set): zero execs.
+        reg.resolve_provider_command_secrets(&root, &unreferenced, true)
+            .await;
+        assert_eq!(
+            cache.exec_count(),
+            2,
+            "an unreferenced provider update must not re-exec the command secret"
+        );
+    }
+
+    /// HIGH #3b: a config referencing a command name owned by a DIFFERENT
+    /// workspace must NOT execute it — the owner-scoped view drops the foreign
+    /// name so pre-resolution never reads its argv.
+    #[tokio::test]
+    async fn foreign_owned_command_secret_is_not_execed() {
+        let cache = crate::secret_command::CommandSecretCache::new(CountingOkExecutor::new(
+            "foreign-token-should-never-be-produced",
+        ));
+        let reg =
+            registry_with_command_secret("foreigncmd", vec!["prog".to_string()], cache.clone());
+        let session = test_session(&reg);
+        // Ownership belongs to a DIFFERENT workspace root, not this session's.
+        claim_provider_ownership(
+            &reg.inner.db,
+            "foreigncmd",
+            std::path::Path::new("/some/other/workspace"),
+        );
+        session.set_command_secret_cache(Some(reg.command_secret_cache()));
+        let providers = providers_referencing_secret("foreigncmd");
+
+        reg.preresolve_session_command_secrets(&session, &providers)
+            .await;
+        assert_eq!(
+            cache.exec_count(),
+            0,
+            "a foreign-owned command name must never be executed"
+        );
+        assert_eq!(
+            session
+                .provider_credential_store(&providers)
+                .unwrap()
+                .named_secret("foreigncmd"),
+            None,
+            "a foreign-owned command name must never be injected/expanded"
+        );
     }
 }

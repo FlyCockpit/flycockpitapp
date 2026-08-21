@@ -6674,7 +6674,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            match remote_operation {
+            let result = match remote_operation {
                 Some(operation) => {
                     finish_remote_provider_mutation(
                         operation,
@@ -6694,7 +6694,43 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     provider_config_save(ctx, &project_root, &provider_id, entry, header_secrets)
                         .await
                 }
+            };
+            // Invalidate + re-resolve the command secrets this provider
+            // references AFTER the save completes and its config-publication lock
+            // is released (so a slow, up-to-30s subprocess never blocks other
+            // config-publication RPCs; inc1's generation fencing keeps a stale
+            // in-flight result from being injected). The reference set is read
+            // from the EFFECTIVE post-save entry — NOT the caller's request entry,
+            // whose masked `********` headers hide a preserved `$secret:cmd` that
+            // `provider_config_save` restores internally — and scoped to THIS
+            // provider (a sibling's reference is never re-executed by an unrelated
+            // save). A referencing update re-execs exactly once more; an
+            // unreferenced update execs zero times
+            // (`provider_update_invalidation_reexecutes_once`).
+            //
+            // NOTE: a provider header can only statically reference a `$secret:`
+            // name backed by a `NamedSecret` vault row (the atomic
+            // `ensure_static_named_reference_owned_on_conn` check). A COMMAND-kind
+            // secret has no such row, so a provider that references a command
+            // secret is not saveable until inc4 extends that validation and the
+            // put-command-spec RPC. This re-resolution is therefore correct and
+            // forward-compatible; the resolution semantics themselves are covered
+            // now by the registry-level `provider_update_invalidation_reexecutes_once`.
+            if result.is_ok()
+                && let Ok((_, _, effective)) = daemon_provider_config(ctx, &project_root).await
+                && let Some(saved_entry) = effective.providers.get(&provider_id)
+            {
+                let saved_command_refs: std::collections::BTreeSet<String> = saved_entry
+                    .headers
+                    .iter()
+                    .flat_map(|header| crate::envref::referenced_names(&header.value))
+                    .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+                    .collect();
+                ctx.registry
+                    .resolve_provider_command_secrets(&project_root, &saved_command_refs, true)
+                    .await;
             }
+            result
         }
 
         Request::SetupCopilotAuth {
@@ -12780,6 +12816,17 @@ async fn docs_ask_response(
     let vault = ctx.secret_vault.clone();
     let db = ctx.db.clone();
 
+    // Async, owner-scoped pre-resolution BEFORE spawn_blocking: command
+    // resolution is async subprocess work and cannot run on the sync docs build
+    // inside spawn_blocking. Resolve into the daemon cache here (owner-scoped by
+    // (provider, cwd)); the docs session then injects the cached outputs at its
+    // sync redaction/model build via the installed cache.
+    let command_secret_cache = ctx.registry.command_secret_cache();
+    let docs_command_refs = crate::secret_ref::provider_named_secret_references(&providers);
+    ctx.registry
+        .resolve_provider_command_secrets(&cwd.display().to_string(), &docs_command_refs, false)
+        .await;
+
     let answer = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -12793,6 +12840,7 @@ async fn docs_ask_response(
             env_snapshot,
             resolver,
             vault,
+            command_secret_cache,
             package,
             question,
         ))
@@ -12816,11 +12864,15 @@ async fn run_docs_ask_pipeline(
     env_snapshot: EnvSnapshot,
     resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     vault: Arc<crate::secure_key::SecretVault>,
+    command_secret_cache: Arc<crate::secret_command::CommandSecretCache>,
     package: Option<String>,
     question: String,
 ) -> std::result::Result<String, String> {
     let session = crate::session::Session::create(db.clone(), cwd.clone(), "docs", resolver, vault)
         .map_err(|error| format!("creating docs ask session: {error:#}"))?;
+    // Install the daemon command-secret cache so this session's sync redaction
+    // and model builds inject the (already pre-resolved) command outputs.
+    session.set_command_secret_cache(Some(command_secret_cache));
     // The docs session is created outside the session worker, so it has no
     // attached daemon recovery journal; take the audited opt-out from the
     // inference journal barrier (its inference stays on the primary-row audit
@@ -13536,7 +13588,7 @@ pub(super) async fn auto_title_request(
     let session = if let Some(handle) = live.as_ref() {
         handle.session()
     } else {
-        std::sync::Arc::new(
+        let session = std::sync::Arc::new(
             crate::session::Session::resume(
                 ctx.db.clone(),
                 session_id,
@@ -13548,7 +13600,12 @@ pub(super) async fn auto_title_request(
                 code: ErrorCode::UnknownSession,
                 message: format!("unknown session {session_id}"),
             })?,
-        )
+        );
+        // Resumed outside the session worker: install the daemon command-secret
+        // cache so this title model's store funnel injects resolved command
+        // outputs (the live branch already carries the cache on its session).
+        session.set_command_secret_cache(Some(ctx.registry.command_secret_cache()));
+        session
     };
 
     if session.title().is_some() {

@@ -539,6 +539,7 @@ async fn host_capabilities_boot_with_db_populates_snapshot_when_keyring_missing(
         db,
         &mut timer,
         crate::daemon::terminal::test_host_factory(),
+        crate::daemon::config_source::ConfigSource::production(),
     )
     .await
     .expect("boot_with_db");

@@ -2282,6 +2282,55 @@ impl DaemonContext {
         self._secure_key_actor = Some(actor);
     }
 
+    /// Resolve every command-backed named secret referenced by the daemon's
+    /// configured provider headers into the process cache at startup
+    /// (`daemon_startup_resolves_referenced_command_secrets`). Referenced names
+    /// end up `Resolved` or `Failed` in the cache; a failure lands as `Failed`
+    /// and NEVER fails boot — the first outbound request then observes the cached
+    /// status (missing / auth error), never a sync exec. Called once from
+    /// `boot_with_db`, after the secure-key actor has attached.
+    pub(crate) async fn resolve_startup_command_secrets(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        // Trust-gate the config load: a daemon launched inside an UNTRUSTED
+        // repository must not read that repo's project-layer provider headers
+        // and exec their `$secret:` command references at boot. Loading under
+        // the DB-resolved workspace trust policy drops untrusted project layers,
+        // so only trusted (workspace/global) references reach resolution.
+        let trust_policy = match crate::config::trust::resolve_workspace_trust_policy_from_db(
+            &self.db, &cwd,
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "startup command-secret resolution skipped: workspace trust policy unavailable"
+                );
+                return;
+            }
+        };
+        let providers = match self
+            .config_source
+            .load_effective_for_daemon(&cwd, &trust_policy)
+        {
+            Ok((providers, _extended)) => providers,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "startup command-secret resolution skipped: provider config load failed"
+                );
+                return;
+            }
+        };
+        let names = crate::secret_ref::provider_named_secret_references(&providers);
+        // Owner-scoped by (provider, cwd): only already-claimed command names
+        // resolve; a foreign / unclaimed name is dropped and never execed.
+        self.registry
+            .resolve_provider_command_secrets(&cwd.display().to_string(), &names, false)
+            .await;
+    }
+
     /// The shared production redaction key resolver, or a fail-closed error when
     /// the secure-key actor never attached (decision 16 — required, never
     /// `Option` at the point of use).
@@ -2854,7 +2903,14 @@ pub async fn boot(
 ) -> Result<DaemonContext> {
     let mut timer = crate::startup::PhaseTimer::start("daemon::boot");
     let db = Db::open_default().context("opening session DB")?;
-    let ctx = boot_with_db(paths, db, &mut timer, terminal_factory).await?;
+    let ctx = boot_with_db(
+        paths,
+        db,
+        &mut timer,
+        terminal_factory,
+        crate::daemon::config_source::ConfigSource::production(),
+    )
+    .await?;
     timer.done();
     Ok(ctx)
 }
@@ -2864,6 +2920,7 @@ pub(crate) async fn boot_with_db(
     db: Db,
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
+    config_source: crate::daemon::config_source::ConfigSource,
 ) -> Result<DaemonContext> {
     #[cfg(not(test))]
     let mut containment_recovered = false;
@@ -2877,13 +2934,7 @@ pub(crate) async fn boot_with_db(
     run_boot_housekeeping(&db).await;
     timer.phase("prune_and_sweep");
     #[cfg_attr(test, allow(unused_mut))]
-    let mut ctx = DaemonContext::new(
-        db.clone(),
-        locks,
-        paths,
-        terminal_factory,
-        crate::daemon::config_source::ConfigSource::production(),
-    );
+    let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
     if let Some(storage) = &ctx.media_storage_recovery {
         storage
             .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
@@ -3174,6 +3225,12 @@ pub(crate) async fn boot_with_db(
     {
         tracing::warn!(error = %error, "skill curator scheduler registration failed");
     }
+    // Resolve command-backed named secrets referenced by configured provider
+    // headers into the daemon cache. Failures land as `Failed` (never fail
+    // boot); the first outbound request then sees the cached status, not a sync
+    // exec.
+    ctx.resolve_startup_command_secrets().await;
+    timer.phase("command_secret_startup_resolve");
     Ok(ctx)
 }
 

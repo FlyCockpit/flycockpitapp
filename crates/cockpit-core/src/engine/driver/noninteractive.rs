@@ -812,6 +812,10 @@ impl Driver {
         )
         .context("creating forked task session")?;
         session.set_external_journal(self.session.external_journal());
+        // Inherit the parent's command-secret cache so the forked task session's
+        // store funnel injects the same resolved command outputs (its
+        // model/redaction/backup stores would otherwise resolve as missing).
+        session.set_command_secret_cache(self.session.command_secret_cache());
         Ok((Arc::new(session), history))
     }
 

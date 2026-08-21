@@ -1329,7 +1329,16 @@ async fn run_foreground_inner_with_boot_db(
     timer.phase("probe_pidfile_bind");
 
     let ctx = std::sync::Arc::new(match boot_db {
-        Some(db) => server::boot_with_db(paths.clone(), db, &mut timer, terminal_factory).await?,
+        Some(db) => {
+            server::boot_with_db(
+                paths.clone(),
+                db,
+                &mut timer,
+                terminal_factory,
+                crate::daemon::config_source::ConfigSource::production(),
+            )
+            .await?
+        }
         None => server::boot(paths.clone(), terminal_factory).await?,
     });
     if resume_all_sessions {

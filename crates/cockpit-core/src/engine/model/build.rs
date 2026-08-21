@@ -130,6 +130,22 @@ impl Model {
     /// redaction table (the session's table for in-session utility calls;
     /// a `RedactConfig`+cwd-built table for out-of-session ones).
     #[allow(dead_code)]
+    /// LIMITATION (command-backed-secret-refs-daemon inc2): this utility-model
+    /// constructor resolves through [`Self::for_provider`] →
+    /// [`Self::for_provider_with_env`], which supplies NO credential store and a
+    /// `|_| None` secret lookup. The provider entry and its headers are still
+    /// consumed, but any `$secret:` header reference — LITERAL or COMMAND-backed
+    /// — simply fails to expand, because there is no store to resolve it against.
+    /// This is an UNSUPPORTED path for secret-bearing headers, not an enforced
+    /// invariant: callers that build a utility model this way (auto-title,
+    /// prompt-injection guard, predict/preflight/translate, safety-gate, harness
+    /// summarization, skill auto-select) get an unexpanded header rather than a
+    /// resolved one. Command-backed secrets share exactly the pre-existing
+    /// behavior of literal named secrets here, so this is out of inc2's scope,
+    /// not a regression. Foreground/session and DocsAsk models (which DO expand
+    /// headers) go through the store-bearing `from_config_with_store` /
+    /// `for_provider_with_store` paths, where the `Session` store funnel injects
+    /// resolved command outputs.
     pub fn from_ref(
         cfg: &ProvidersConfig,
         model_ref: &str,

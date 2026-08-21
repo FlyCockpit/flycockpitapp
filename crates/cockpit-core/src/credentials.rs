@@ -376,6 +376,31 @@ impl CredentialStore {
         }
     }
 
+    /// Inject every resolved command-backed output the daemon cache holds for
+    /// this store's command-backed names into the in-memory secret view. This
+    /// is the single funnel through which `Session::credential_store` /
+    /// `provider_credential_store` make resolved outputs visible to redaction
+    /// and `$secret:` expansion, so EVERY downstream model/redaction build (start,
+    /// model-switch, tandem, redaction refresh, DocsAsk) sees the cached value.
+    ///
+    /// Purely in-memory (stages no mutation, so `save` never persists a resolved
+    /// output). Only names this store already knows as command-backed are
+    /// injected, and only when the cache holds a resolved (not failed /
+    /// unresolved) value — a sync cache lookup that NEVER executes. Because the
+    /// owner-scoped store's `command_specs` are already scoped to (owner, root),
+    /// a foreign-owned command name is not present here and is never injected.
+    pub(crate) fn inject_command_outputs(
+        &mut self,
+        cache: &crate::secret_command::CommandSecretCache,
+    ) {
+        let names: Vec<String> = self.command_specs.keys().cloned().collect();
+        for name in names {
+            if let Some(value) = cache.resolved_output(&name) {
+                self.secrets.insert(name, value);
+            }
+        }
+    }
+
     pub fn remove_named_secret(&mut self, name: &str) {
         self.secrets.remove(name);
         self.command_specs.remove(name);

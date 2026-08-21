@@ -453,6 +453,7 @@ impl Session {
             db,
             secret_vault: vault,
             external_journal: Mutex::new(None),
+            command_secret_cache: Mutex::new(None),
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             unjournaled_inference_reason: Mutex::new(None),

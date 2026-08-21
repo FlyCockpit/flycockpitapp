@@ -46,6 +46,14 @@ mod recording;
 pub mod sealed_values;
 #[cfg(any(test, feature = "test-support"))]
 mod test_constructors;
+/// The trusted-child sealed-value capture authority + pending-record registry
+/// (leak-report AC7/AC8, sub-increment 2c-2). Exercised end-to-end by its own
+/// unit tests; the production coordinator that mints and drives it lands in the
+/// follow-up sub-increment (2c-3), so its host-side entry points are
+/// `dead_code`-allowed until then, mirroring the not-yet-wired owner-only
+/// [`Session::set_sealed_value`] surface in `sealed_values`.
+#[allow(dead_code)]
+pub(crate) mod trusted_child_capture;
 /// Crate-wide re-export of the mid-transaction audit-write fault seam so tests
 /// outside the `session` module (e.g. the driver dual-failure test) can arm it.
 #[cfg(test)]

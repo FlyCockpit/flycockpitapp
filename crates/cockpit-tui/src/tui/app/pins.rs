@@ -918,7 +918,10 @@ mod tests {
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
             attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            submission_session_tx: tokio::sync::watch::channel(
+                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
+            )
+            .0,
             awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
@@ -935,6 +938,11 @@ mod tests {
             attach_context: None,
             last_applied_seq: None,
             client_tasks: ClientTasks::default(),
+            #[cfg(test)]
+            test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_force_can_switch: false,
+            test_advance_epoch_when_switch_task_created: false,
         }
     }
 

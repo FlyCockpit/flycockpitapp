@@ -19,7 +19,7 @@ use cockpit_core::engine::message::UserSubmission;
 
 fn runner_with_sender(
     input_tx: mpsc::Sender<RunnerInput>,
-    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
+    events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (record_tx, _record_rx) = mpsc::channel(1);
     runner_with_channels(input_tx, record_tx, events)
@@ -28,7 +28,7 @@ fn runner_with_sender(
 fn runner_with_channels(
     input_tx: mpsc::Sender<RunnerInput>,
     record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
-    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
+    events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (control_tx, _control_rx) = mpsc::channel(1);
     runner_with_all_channels(input_tx, record_tx, control_tx, events)
@@ -38,7 +38,7 @@ fn runner_with_all_channels(
     input_tx: mpsc::Sender<RunnerInput>,
     record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
     control_tx: mpsc::Sender<ControlRequest>,
-    events: Arc<Mutex<Vec<cockpit_core::engine::TurnEvent>>>,
+    events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
     AgentRunner {
@@ -55,7 +55,10 @@ fn runner_with_all_channels(
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
         attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        submission_session_tx: tokio::sync::watch::channel(
+            crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
+        )
+        .0,
         awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
@@ -72,10 +75,19 @@ fn runner_with_all_channels(
         attach_context: None,
         last_applied_seq: Some(Arc::new(Mutex::new(Some(0)))),
         client_tasks: ClientTasks::default(),
+        #[cfg(test)]
+        test_session_switch_rx: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        test_force_can_switch: false,
+        test_advance_epoch_when_switch_task_created: false,
     }
 }
 
 fn switch_outcome(session_id: uuid::Uuid) -> AsyncActionPayload {
+    switch_outcome_with_epoch(session_id, 0)
+}
+
+fn switch_outcome_with_epoch(session_id: uuid::Uuid, attachment_epoch: u64) -> AsyncActionPayload {
     AsyncActionPayload::SessionSwitched(Box::new(SessionSwitchOutcome {
         target: SessionTarget::New,
         session_id,
@@ -92,6 +104,7 @@ fn switch_outcome(session_id: uuid::Uuid) -> AsyncActionPayload {
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,
+        attachment_epoch,
         transition_guard: None,
     }))
 }
@@ -1059,6 +1072,7 @@ async fn successful_side_return_commits_snapshot_restore_and_discard_after_resul
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,
+        attachment_epoch: 0,
         transition_guard: None,
     };
     app.async_actions.start(
@@ -2015,7 +2029,9 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             async move {
                 complete_first_rx.await.expect("release first switch");
                 first_returned_in_task.store(true, Ordering::Release);
-                Ok(switch_outcome(switched_session))
+                // Outcome epoch must match the transport attach epoch the
+                // runner will publish before App drains (see store below).
+                Ok(switch_outcome_with_epoch(switched_session, 1))
             },
         )
         .id();

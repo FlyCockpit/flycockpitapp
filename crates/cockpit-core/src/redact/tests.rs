@@ -2746,3 +2746,241 @@ fn straddle_fixpoint_cut_back_retreats_past_overlapping_literals() {
         .unwrap();
     assert_eq!(self_overlap.straddle_fixpoint_cut_back("QQQQaaaaa", 5), 4);
 }
+
+// ---------------------------------------------------------------------------
+// scrub: overlapping registered literals are fully covered
+//
+// `MatchKind::LeftmostLongest` `replace_all` emits only NON-overlapping matches
+// and resumes PAST each one, so a second registered literal that shares a run
+// with the first leaks its non-overlapping tail. These exercise the production
+// `scrub`/`scrub_cow` entry points and each FAILS against the old single-pass
+// `replace_all` implementation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scrub_covers_cross_entry_overlapping_literals() {
+    // `abcdefghij` [3,13) and `cdefghijWXYZ` [5,17) overlap in the body. The old
+    // leftmost-longest `replace_all` emits only `abcdefghij` and resumes at 13,
+    // so the second literal's tail `WXYZ` survives UN-redacted. The overlap-aware
+    // scrub must cover the whole run with a single placeholder.
+    let table = RedactionTable::empty()
+        .with_forced_literal("abcdefghij".to_string(), "$leak:a".to_string())
+        .unwrap()
+        .with_forced_literal("cdefghijWXYZ".to_string(), "$leak:b".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    let out = table.scrub("PREabcdefghijWXYZPOST");
+    assert!(!out.contains("abcdefghij"), "first secret survived: {out}");
+    assert!(
+        !out.contains("cdefghijWXYZ"),
+        "second secret survived: {out}"
+    );
+    // The specific regression: leftmost-longest leaks this non-overlapping tail.
+    assert!(!out.contains("WXYZ"), "leaked overlapping tail: {out}");
+    assert_eq!(out, format!("PRE{ph}POST"));
+}
+
+#[test]
+fn scrub_covers_self_overlapping_literal() {
+    // `aaaa` occurs at [2,6) and [3,7) in `XXaaaaaYY`. Leftmost-longest emits
+    // [2,6) and resumes at 6, leaving the trailing `a` (the [3,7) tail) intact.
+    let table = RedactionTable::empty()
+        .with_forced_literal("aaaa".to_string(), "$leak:a".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    let out = table.scrub("XXaaaaaYY");
+    // The placeholder carries no lowercase `a`, so any surviving `a` is a leak.
+    assert!(
+        !ph.contains('a'),
+        "test precondition: placeholder has no `a`"
+    );
+    assert!(
+        !out.contains('a'),
+        "an `a` from the secret run survived: {out}"
+    );
+    assert_eq!(out, format!("XX{ph}YY"));
+}
+
+#[test]
+fn scrub_covers_chained_overlapping_literals() {
+    // Three literals overlapping pairwise tile one run: `abcdef` [2,8),
+    // `cdefgh` [4,10), `efghij` [6,12) in `<<abcdefghij>>`. Leftmost-longest
+    // emits `abcdef` and resumes at 8, leaking the `ghij` tail.
+    let table = RedactionTable::empty()
+        .with_forced_literal("abcdef".to_string(), "$leak:1".to_string())
+        .unwrap()
+        .with_forced_literal("cdefgh".to_string(), "$leak:2".to_string())
+        .unwrap()
+        .with_forced_literal("efghij".to_string(), "$leak:3".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    let out = table.scrub("<<abcdefghij>>");
+    for frag in ["abcdef", "cdefgh", "efghij", "ghij"] {
+        assert!(!out.contains(frag), "fragment `{frag}` survived: {out}");
+    }
+    assert_eq!(out, format!("<<{ph}>>"));
+}
+
+#[test]
+fn scrub_non_overlapping_input_matches_legacy_behavior() {
+    // No-regression: separated distinct secrets each collapse to their own
+    // placeholder; a body with no secret returns BORROWED (unchanged bytes);
+    // and adjacent (touching, non-overlapping) secrets stay TWO placeholders,
+    // exactly as the old leftmost-longest `replace_all` produced.
+    let table = RedactionTable::empty()
+        .with_forced_literal("first-secret-value".to_string(), "$leak:1".to_string())
+        .unwrap()
+        .with_forced_literal("second-secret-value".to_string(), "$leak:2".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    assert_eq!(
+        table.scrub("a first-secret-value b second-secret-value c"),
+        format!("a {ph} b {ph} c")
+    );
+    // No secret present → borrowed (no allocation), byte-identical.
+    let clean = "nothing sensitive here at all";
+    match table.scrub_cow(clean) {
+        std::borrow::Cow::Borrowed(s) => assert_eq!(s, clean),
+        std::borrow::Cow::Owned(_) => panic!("no-match body must borrow, not allocate"),
+    }
+    // Touching-but-disjoint distinct secrets: `aaaaaa` [1,7) then `bbbbbb` [7,13)
+    // share no byte, so they stay two placeholders (touching spans are not
+    // merged — this is what the old `replace_all` emitted).
+    let adjacent = RedactionTable::empty()
+        .with_forced_literal("aaaaaa".to_string(), "$leak:a".to_string())
+        .unwrap()
+        .with_forced_literal("bbbbbb".to_string(), "$leak:b".to_string())
+        .unwrap();
+    let ph2 = adjacent.placeholder().to_string();
+    assert_eq!(adjacent.scrub("Zaaaaaabbbbbb Z"), format!("Z{ph2}{ph2} Z"));
+}
+
+#[test]
+fn scrub_single_sealed_range_keeps_marker_but_overlap_falls_back_to_generic() {
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+
+    // A single-entry sealed range with an active grant still renders the
+    // actionable marker (unchanged from the old single-pass scrub).
+    let sealed_literal = "sealed-alpha-token-value";
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_forced_sealed_literal(sealed_literal.to_string(), legacy_sealed_identity("alpha"))
+        .unwrap();
+    let mut active = std::collections::HashSet::new();
+    active.insert(legacy_active("alpha"));
+    let out = table
+        .with_sealed_replacements(&active)
+        .scrub(&format!("use {sealed_literal} now"));
+    assert!(
+        out.contains("reference sealed value `alpha`"),
+        "single-entry sealed marker missing: {out}"
+    );
+    assert!(
+        !out.contains(sealed_literal),
+        "sealed value survived: {out}"
+    );
+
+    // A range where a SEALED literal genuinely OVERLAPS an ORDINARY one spans two
+    // entries: `grantoken-shared-tail` [1,22) and `shared-tail-extra` [11,28) in
+    // `<grantoken-shared-tail-extra>`. It must render the conservative GLOBAL
+    // placeholder, never a partial sealed marker over a multi-secret blob — and
+    // the ordinary literal's `-extra` tail (which leftmost-longest would leak)
+    // must be covered.
+    let sealed2 = "grantoken-shared-tail";
+    let ordinary2 = "shared-tail-extra";
+    let mixed = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_forced_sealed_literal(sealed2.to_string(), legacy_sealed_identity("beta"))
+        .unwrap()
+        .with_forced_literal(ordinary2.to_string(), "$SECRET".to_string())
+        .unwrap();
+    let ph = mixed.placeholder().to_string();
+    let mut active2 = std::collections::HashSet::new();
+    active2.insert(legacy_active("beta"));
+    let mixed_out = mixed
+        .with_sealed_replacements(&active2)
+        .scrub("<grantoken-shared-tail-extra>");
+    assert!(
+        !mixed_out.contains("reference sealed value"),
+        "sealed marker rendered over a multi-secret overlap: {mixed_out}"
+    );
+    assert!(
+        !mixed_out.contains("grantoken"),
+        "sealed secret survived: {mixed_out}"
+    );
+    assert!(
+        !mixed_out.contains("extra"),
+        "leaked overlapping ordinary tail: {mixed_out}"
+    );
+    assert_eq!(mixed_out, format!("<{ph}>"));
+}
+
+#[test]
+fn scrub_covers_contained_literal() {
+    // `bcd` [2,5) is fully CONTAINED in `abcde` [1,6) in `Xabcde Y`.
+    // `find_overlapping_iter` reports both; the merge covers the whole `abcde`
+    // run, and the contained `bcd` never leaks.
+    let table = RedactionTable::empty()
+        .with_forced_literal("abcde".to_string(), "$leak:outer".to_string())
+        .unwrap()
+        .with_forced_literal("bcd".to_string(), "$leak:inner".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    let out = table.scrub("Xabcde Y");
+    assert!(!out.contains("abcde"), "outer secret survived: {out}");
+    assert!(!out.contains("bcd"), "contained secret leaked: {out}");
+    assert_eq!(out, format!("X{ph} Y"));
+}
+
+#[test]
+fn scrub_self_overlapping_sealed_entry_renders_marker_once() {
+    // A SELF-overlapping sealed literal with an active grant: `abcabc` occurs at
+    // [2,8) and [5,11) in `xxabcabcabcyy`. The two occurrences merge into one
+    // range from a SINGLE entry, so it renders the actionable marker exactly
+    // ONCE over the whole run — not duplicated, and not collapsed to the generic
+    // placeholder (a single-entry range keeps its typed replacement).
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let sealed_literal = "abcabc";
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new())
+        .with_forced_sealed_literal(sealed_literal.to_string(), legacy_sealed_identity("selfov"))
+        .unwrap();
+    let mut active = std::collections::HashSet::new();
+    active.insert(legacy_active("selfov"));
+    let marker = sealed_untrusted_inference_marker("selfov");
+    let out = table
+        .with_sealed_replacements(&active)
+        .scrub("xxabcabcabcyy");
+    assert_eq!(
+        out.matches(&marker).count(),
+        1,
+        "sealed marker must render exactly once over the merged self-overlap: {out}"
+    );
+    assert!(
+        !out.contains("abc"),
+        "self-overlapping secret leaked: {out}"
+    );
+    assert_eq!(out, format!("xx{marker}yy"));
+}
+
+#[test]
+fn scrub_covers_multibyte_utf8_overlapping_literals() {
+    // Two literals of multibyte (2-byte) Greek chars that OVERLAP on a char
+    // boundary: `αβγδ` [1,9) and `γδεζ` [5,13) share `γδ` in `XαβγδεζY`. The
+    // overlapping scan and the byte-offset merge must cover the whole run
+    // without ever bisecting a char (which would panic on the slice).
+    let a = "αβγδ";
+    let b = "γδεζ";
+    // Precondition: they genuinely overlap on a shared multibyte run.
+    assert!(a.ends_with("γδ") && b.starts_with("γδ"));
+    let table = RedactionTable::empty()
+        .with_forced_literal(a.to_string(), "$leak:a".to_string())
+        .unwrap()
+        .with_forced_literal(b.to_string(), "$leak:b".to_string())
+        .unwrap();
+    let ph = table.placeholder().to_string();
+    let out = table.scrub("XαβγδεζY");
+    assert!(!out.contains(a), "first multibyte secret survived: {out}");
+    assert!(!out.contains(b), "second multibyte secret survived: {out}");
+    assert!(!out.contains("γδ"), "shared multibyte run leaked: {out}");
+    assert_eq!(out, format!("X{ph}Y"));
+}

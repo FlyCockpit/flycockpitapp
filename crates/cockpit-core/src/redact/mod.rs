@@ -160,9 +160,9 @@ pub fn sealed_untrusted_inference_marker(value_id: &str) -> String {
 /// than a content-free denial.
 ///
 /// This is the one redaction architecture: there is no sealed-only regex or
-/// second Aho-Corasick pass beside the existing table. The per-entry
-/// replacement vector is parallel to the matcher's pattern list, so a single
-/// `replace_all` scan produces the correct renderer for each match.
+/// second Aho-Corasick pass beside the existing table. Each entry carries its
+/// own replacement descriptor, and [`RedactionTable::scrub_cow`] renders the
+/// descriptor of the entry (or entries) covering each redacted range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Replacement {
     /// The configured global placeholder. Used for every ordinary secret and
@@ -893,7 +893,26 @@ pub struct RedactionTable {
     /// Aho-Corasick search structure; `None` when there's nothing to
     /// scrub or redaction is disabled. Keeping it `Option` lets
     /// [`scrub`] short-circuit without allocating.
+    ///
+    /// Built with [`MatchKind::LeftmostLongest`]: this drives the fast
+    /// `is_match` gate and the journaling primitive
+    /// [`match_sensitive_literals`] (via `find_iter`), both of which want the
+    /// leftmost-longest non-overlapping emit. It is NOT used for substitution —
+    /// see `overlap_matcher`.
     matcher: Option<AhoCorasick>,
+    /// A second Aho-Corasick over the SAME pattern list, built with
+    /// [`MatchKind::Standard`] so [`scrub_cow`] can call `find_overlapping_iter`
+    /// and enumerate EVERY occurrence of EVERY registered literal — OVERLAPPING
+    /// and SELF-overlapping included. LeftmostLongest cannot do this (its
+    /// `replace_all`/`find_iter` emit only non-overlapping matches and resume
+    /// past each), which would leak the non-overlapping tail of an overlapping
+    /// secret. `AhoCorasick` is `Clone` over an internal `Arc<dyn Automaton>`,
+    /// so storing this second matcher costs its automaton memory once; the
+    /// `clone()`s in `union`/`enforced`/`with_sealed_replacements` only bump the
+    /// Arc. Rebuilt from `entries` like `matcher`; never serialized. `Some`
+    /// exactly when `matcher` is `Some` (both built from the same non-empty
+    /// pattern list at the same site).
+    overlap_matcher: Option<AhoCorasick>,
     /// The single typed entry vector used to build `matcher`, aligned 1:1 with
     /// the matcher's pattern list by construction. There is no parallel
     /// origins/replacements vector to drift: each entry carries its own typed
@@ -1229,6 +1248,7 @@ impl RedactionTable {
         if entries.is_empty() {
             return Ok(Self {
                 matcher: None,
+                overlap_matcher: None,
                 entries,
                 placeholder,
                 disabled,
@@ -1252,8 +1272,20 @@ impl RedactionTable {
             .ascii_case_insensitive(false)
             .build(&patterns)
             .map_err(|e| anyhow::anyhow!("building aho-corasick: {e}"))?;
+        // The substitution matcher over the SAME patterns. `Standard` is the
+        // only match kind that supports `find_overlapping_iter`, which
+        // `scrub_cow` needs to cover overlapping/self-overlapping literals; its
+        // `PatternID`s index `entries` identically to `matcher` (same list,
+        // same order). Kept separate from `matcher` so `is_match` and the
+        // journaling `find_iter` keep their leftmost-longest semantics.
+        let overlap_matcher = AhoCorasick::builder()
+            .match_kind(MatchKind::Standard)
+            .ascii_case_insensitive(false)
+            .build(&patterns)
+            .map_err(|e| anyhow::anyhow!("building aho-corasick (overlap): {e}"))?;
         Ok(Self {
             matcher: Some(matcher),
+            overlap_matcher: Some(overlap_matcher),
             entries,
             placeholder,
             disabled,
@@ -1386,6 +1418,8 @@ impl RedactionTable {
             .collect();
         Self {
             matcher: self.matcher.clone(),
+            // Arc bump only — see the field doc; the automaton is not re-copied.
+            overlap_matcher: self.overlap_matcher.clone(),
             entries,
             placeholder: self.placeholder.clone(),
             disabled: self.disabled,
@@ -1541,30 +1575,87 @@ impl RedactionTable {
         if !matcher.is_match(body) {
             return Cow::Borrowed(body);
         }
-        // Render each entry's typed replacement descriptor to its replacement
-        // text. Ordinary secrets and sealed-without-active-grant entries render
-        // the configured global placeholder; sealed entries with an active
-        // exact grant render the actionable marker. The vector is parallel to
-        // the matcher's pattern list, so a single `replace_all` scan produces
-        // the correct renderer for each match — there is no second pass.
+        // Enumerate EVERY occurrence of EVERY registered literal, OVERLAPPING
+        // and SELF-overlapping included. The `matcher` above is
+        // `MatchKind::LeftmostLongest`, whose `replace_all`/`find_iter` emit
+        // only NON-overlapping matches and resume PAST each one: when two
+        // registered literals overlap (share a run — e.g. `abcdefghij` and
+        // `cdefghijWXYZ` in `abcdefghijWXYZ`), or a literal self-overlaps
+        // (`aaaa` at `[0,4)` then `[1,5)`), the suppressed occurrence's tail
+        // would pass through UN-redacted, leaking a partial secret. So
+        // substitution uses `overlap_matcher` (`MatchKind::Standard`) and
+        // `find_overlapping_iter`, which yields ALL occurrences — one automaton
+        // pass, O(body + matches). Its `PatternID`s index `entries` identically
+        // to `matcher` (both built from the same pattern list, same order).
         //
-        // When all entries are `Generic` (the common case, and always the case
-        // for the persisted table), the fast path renders the placeholder
-        // once and repeats it, avoiding per-entry allocation.
-        let rendered: Vec<String> = if self
-            .entries
-            .iter()
-            .all(|entry| entry.replacement == Replacement::Generic)
-        {
-            vec![self.placeholder.clone(); self.entries.len()]
-        } else {
-            self.entries
-                .iter()
-                .map(|entry| entry.replacement.render(&self.placeholder))
-                .collect()
-        };
-        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
-        Cow::Owned(matcher.replace_all(body, &refs))
+        // `is_match` already gated the no-secret common case to a borrowed
+        // return above, so this scan runs only on bodies that carry a secret.
+        let overlap_matcher = self
+            .overlap_matcher
+            .as_ref()
+            .expect("overlap_matcher is Some whenever matcher is Some (same build site)");
+        let mut spans: Vec<(usize, usize, usize)> = overlap_matcher
+            .find_overlapping_iter(body)
+            .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
+            .collect();
+        if spans.is_empty() {
+            // `is_match` was true, so this is unreachable in practice (the same
+            // patterns drive both). Stay fail-safe: nothing to cover, borrow.
+            return Cow::Borrowed(body);
+        }
+        // Merge STRICTLY-overlapping spans into maximal covered ranges, tracking
+        // whether every span in a range came from the SAME entry. Sorting by
+        // start makes this a linear sweep; a range absorbs the next span while
+        // that span STARTS BEFORE the running end (`<`). Touching-but-disjoint
+        // spans (`next.start == end`) are NOT merged: they leave no uncovered
+        // gap, and keeping them separate preserves the old `replace_all`
+        // behavior for adjacent distinct secrets (two placeholders, and each
+        // single entry's own sealed marker) exactly. Every registered-secret
+        // byte still lands inside some emitted range, overlaps included.
+        spans.sort_unstable_by_key(|&(s, e, _)| (s, e));
+        let mut out = String::with_capacity(body.len());
+        let mut last_end = 0usize;
+        let mut i = 0usize;
+        while i < spans.len() {
+            let (start, mut end, first_idx) = spans[i];
+            let mut single_entry = true;
+            let mut j = i + 1;
+            while j < spans.len() && spans[j].0 < end {
+                if spans[j].1 > end {
+                    end = spans[j].1;
+                }
+                if spans[j].2 != first_idx {
+                    single_entry = false;
+                }
+                j += 1;
+            }
+            // Verbatim bytes between the previous range and this one. `start` and
+            // `end` are match starts/ends of whole literals in valid-UTF-8
+            // `body`, hence char boundaries, so these slices never bisect a char.
+            out.push_str(&body[last_end..start]);
+            // A range from ONE entry renders THAT entry's typed replacement
+            // (preserving current behavior — a sealed entry with an active grant
+            // still emits its actionable marker). A range spanning MULTIPLE
+            // entries is a genuine overlap of DISTINCT secrets; render the
+            // conservative GLOBAL placeholder, never a partial sealed marker over
+            // a multi-secret blob (the marker would falsely advertise one sealed
+            // handle covering bytes that belong to other secrets). The all-
+            // `Generic` common case (and the persisted table, always Generic)
+            // borrows the placeholder with no per-range allocation.
+            let replacement: Cow<str> = if single_entry {
+                match &self.entries[first_idx].replacement {
+                    Replacement::Generic => Cow::Borrowed(self.placeholder.as_str()),
+                    other => Cow::Owned(other.render(&self.placeholder)),
+                }
+            } else {
+                Cow::Borrowed(self.placeholder.as_str())
+            };
+            out.push_str(&replacement);
+            last_end = end;
+            i = j;
+        }
+        out.push_str(&body[last_end..]);
+        Cow::Owned(out)
     }
     /// Scrub every secret in `body`. Returns the cleaned string.
     pub fn scrub(&self, body: &str) -> String {
@@ -1593,6 +1684,8 @@ impl RedactionTable {
     pub fn enforced(&self) -> Self {
         Self {
             matcher: self.matcher.clone(),
+            // Arc bump only — see the field doc; the automaton is not re-copied.
+            overlap_matcher: self.overlap_matcher.clone(),
             entries: self.entries.clone(),
             placeholder: self.placeholder.clone(),
             disabled: false,
@@ -1826,6 +1919,7 @@ impl RedactionTable {
     pub fn empty() -> Self {
         Self {
             matcher: None,
+            overlap_matcher: None,
             entries: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
             disabled: false,

@@ -729,8 +729,10 @@ impl AsyncActionRunner {
     }
 
     /// Advance the UI ownership fence and cancel blocking work owned by the
-    /// previous view. Results already queued retain their old fence and are
-    /// discarded by `drain_completed`.
+    /// previous view. Exports and non-blocking work may keep running; their
+    /// completions are discarded by `drain_completed`, which also releases the
+    /// corresponding pending/keyed slots so later deduped requests are not
+    /// permanently blocked.
     pub fn advance_view_generation(&mut self) {
         self.view_generation = self.view_generation.wrapping_add(1).max(1);
         let stale = self
@@ -1054,12 +1056,10 @@ impl AsyncActionRunner {
             let Some(pending) = self.pending.get(&completed.id) else {
                 continue;
             };
-            if pending.generation != completed.generation
-                || pending.view_generation != self.view_generation
-                || pending.kind != completed.kind
-            {
+            if pending.generation != completed.generation || pending.kind != completed.kind {
                 continue;
             }
+            let stale_view = pending.view_generation != self.view_generation;
             let pending = self
                 .pending
                 .remove(&completed.id)
@@ -1068,6 +1068,13 @@ impl AsyncActionRunner {
                 && self.keyed.get(&key) == Some(&completed.id)
             {
                 self.keyed.remove(&key);
+            }
+            // Stale-view completions (exports left running across
+            // `advance_view_generation`, non-blocking work, etc.) must still
+            // release pending/keyed ownership so a later same-key action is
+            // not permanently stuck behind a discarded result.
+            if stale_view {
+                continue;
             }
             results.push(AsyncActionResult {
                 id: completed.id,
@@ -1274,6 +1281,50 @@ mod tests {
 
         assert!(runner.drain_completed().is_empty());
         assert_eq!(runner.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_view_generation_export_releases_pending_and_dedupe_key() {
+        let mut runner = AsyncActionRunner::default();
+        let key = AsyncActionKey::new("export");
+        let (release, barrier) = oneshot::channel::<()>();
+        let first = runner.start(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::Dedupe(key.clone()),
+            async move {
+                let _ = barrier.await;
+                Ok(AsyncActionPayload::Text("stale export".to_string()))
+            },
+        );
+        assert!(matches!(first, AsyncActionStart::Started(_)));
+
+        // Exports are intentionally left running across view-generation advance.
+        runner.advance_view_generation();
+        assert_eq!(runner.pending_count(), 1);
+
+        let _ = release.send(());
+        for _ in 0..20 {
+            if runner.drain_completed().is_empty() && runner.pending_count() == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runner.pending_count(),
+            0,
+            "stale-view export completion must release pending ownership"
+        );
+
+        let second = runner.start(
+            AsyncActionKind::Blocking("export.transcript"),
+            AsyncActionPolicy::Dedupe(key),
+            async { Ok(AsyncActionPayload::Text("retry".to_string())) },
+        );
+        assert!(
+            matches!(second, AsyncActionStart::Started(_)),
+            "released dedupe key must allow a subsequent same-key action"
+        );
+        assert_eq!(wait_for_results(&mut runner).await.len(), 1);
     }
 
     #[tokio::test]

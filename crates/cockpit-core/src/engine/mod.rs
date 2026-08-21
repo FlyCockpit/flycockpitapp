@@ -54,6 +54,15 @@ pub mod text_call;
 pub mod think;
 pub mod tool;
 pub mod translate;
+/// Closed acquisition-outcome type + fail-closed `RequiresUser` validator
+/// (leak-report AC6, sub-increment 2c-3a). A pure module with no provider,
+/// async, or I/O. The production coordinator that dispatches a trusted child
+/// and classifies its output into an `AcquisitionOutcome` lands in the
+/// follow-up sub-increment (2c-3b), so this type is `dead_code`-allowed until
+/// then — mirroring the not-yet-wired `session::trusted_child_capture`
+/// authority surface. The allow drops when 2c-3b consumes it.
+#[allow(dead_code)]
+pub(crate) mod trusted_child_acquisition;
 pub mod validation_hint;
 
 pub use agent::{

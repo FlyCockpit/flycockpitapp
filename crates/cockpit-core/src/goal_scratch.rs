@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use anyhow::ensure;
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 

@@ -10,6 +10,10 @@ use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
+// Brings the `Write` trait methods (`write_all`) into scope for the
+// `zip::ZipWriter` calls below without binding a name (so it neither shadows the
+// `use super::*;` glob nor trips `-D warnings` unused-import).
+use std::io::Write as _;
 use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;

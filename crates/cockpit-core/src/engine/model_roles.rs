@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::{
-    AvailabilityScope, CapabilityStatus, EffectiveModelCapabilities, ModelCustody,
+    AvailabilityScope, CapabilityStatus, EffectiveModelCapabilities, ModelCustody, ModelLocation,
     ModelOptimization, ModelPolicyCriteria, ModelPolicyError, ModelPolicySelector, ModelTrust,
     NonSensitiveModelPolicyRequest, ProvidersConfig, RedactedRendering, RequiredModelCapability,
     ResolvedModelPolicy, SensitiveModelPolicyRequest, SensitivePayload, TrustedCustodyGrant,
@@ -578,6 +578,12 @@ pub fn resolve_delegated_model_with_custody(
 /// coordinator contract. Nothing a model can write reaches it: the caller must
 /// already hold host authority, and it returns the
 /// [`TrustedCustodyGrant`] that unlocks raw provider bytes.
+///
+/// A grant is minted only when the resolved model's [`ModelLocation`] is
+/// `Local`. A trusted child on a `Remote`, `PrivateRemote`, or unknown
+/// location fails closed with no grant, so no raw provider bytes can be
+/// released to a child that is not host-local. Custody/trust and location are
+/// both required; harness mode is never consulted.
 pub fn resolve_trusted_child_model(
     category: &str,
     agent_name: &str,
@@ -614,6 +620,20 @@ pub fn resolve_trusted_child_model(
         .resolve_sensitive_model_policy(&request)
         .map_err(policy_error_message)
         .map_err(SelectorResolution::InvalidLiteral)?;
+    // AC5: raw sealed/environment inference context is released to a trusted
+    // CHILD only when the resolved model is host-`Local`. A `Remote`,
+    // `PrivateRemote`, or MISSING location fails closed HERE — before the grant
+    // is minted — so `SensitivePayload::raw_provider_bytes` returns `None` and
+    // no raw request bytes, retries, diagnostics, or exports can be assembled
+    // downstream. Location, not mode, gates the raw release: `ModelCustody`/
+    // trust already filtered the selection above, and `LlmMode` is never
+    // consulted. This is the single mint point for trusted-child grants, so
+    // gating it closes the raw path for every non-local trusted child.
+    if resolved.policy.location != Some(ModelLocation::Local) {
+        return Err(SelectorResolution::InvalidLiteral(
+            "trusted-child raw custody requires a host-local model location".to_string(),
+        ));
+    }
     let grant = resolved.trusted_custody_grant().cloned().ok_or_else(|| {
         SelectorResolution::InvalidLiteral(
             "trusted-child selection did not produce a trusted custody grant".to_string(),
@@ -1918,6 +1938,11 @@ mod tests {
                 id: "trusted-reasoning".into(),
                 subagent_invokable: Some(true),
                 trust: Some(ModelTrust::Trusted),
+                // AC5: the coordinator (step 4) mints a raw-custody grant only
+                // for a host-local trusted child, so this trusted child is
+                // `Local`. The `Remote`/`PrivateRemote`/missing fail-closed
+                // paths are proven separately in `trusted_child_*` below.
+                location: Some(ModelLocation::Local),
                 quality_rank: Some(1_000),
                 // Deliberately *not* availability-restricted. This test is
                 // about custody, so the trusted child must be fully permitted
@@ -2689,5 +2714,242 @@ mod tests {
                 .iter()
                 .any(|d| d.stage == "host_selected_model")
         );
+    }
+
+    // ---- AC5 (2c-1): trusted-child raw custody is trust + LOCATION only ----
+
+    /// A distinct marker that only a minted grant can release through
+    /// [`SensitivePayload::raw_provider_bytes`]. It is never handed to any
+    /// non-local path: a failed (`Err`) `resolve_trusted_child_model` produces
+    /// no grant, so there is nothing to release it with.
+    const PLANTED_SECRET: &str = "sk-trusted-child-raw-custody-PLANTED-2c1";
+
+    /// Providers carrying a single trusted `reasoning` child at `location`, plus
+    /// an untrusted `reasoning` alternative so the forced-`Trusted` scan has to
+    /// *choose* the trusted child rather than being the only candidate.
+    fn trusted_child_providers(location: Option<ModelLocation>) -> ProvidersConfig {
+        let mut providers = providers();
+        let minimax = providers.providers.get_mut("minimax").unwrap();
+        minimax.models.push(ModelEntry {
+            id: "trusted-reasoning".into(),
+            subagent_invokable: Some(true),
+            trust: Some(ModelTrust::Trusted),
+            quality_rank: Some(1_000),
+            location,
+            capabilities: crate::config::providers::ModelCapabilities {
+                reasoning: CapabilityStatus::Supported,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        minimax.models.push(ModelEntry {
+            id: "untrusted-reasoning".into(),
+            subagent_invokable: Some(true),
+            trust: Some(ModelTrust::Untrusted),
+            availability: crate::config::providers::ModelAvailability {
+                categories: vec!["reasoning".to_string()],
+                ..Default::default()
+            },
+            capabilities: crate::config::providers::ModelCapabilities {
+                reasoning: CapabilityStatus::Supported,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        providers
+    }
+
+    fn extended_mode(mode: LlmMode) -> ExtendedConfig {
+        ExtendedConfig {
+            llm_mode: mode,
+            agent_chooses_subagent_model: true,
+            ..ExtendedConfig::default()
+        }
+    }
+
+    /// The raw path a downstream sealed-acquisition coordinator would take: the
+    /// grant unlocks the planted secret only for the exact route it was minted
+    /// for. Asserting the secret flows here is the positive control that proves
+    /// a deny is a *real* deny, not a vacuous "nothing ever routes".
+    fn raw_bytes_released_by(grant: &TrustedCustodyGrant, model: &Arc<Model>) -> Option<String> {
+        let route = ResolvedModelPolicy {
+            provider: model.provider_id().to_string(),
+            model: model.model_id_ref().to_string(),
+            trust: ModelTrust::Trusted,
+            mode: LlmMode::Normal,
+            location: Some(ModelLocation::Local),
+            quality_rank: 0,
+            cost_rank: 0,
+            custody_filter: Some(ModelCustody::Trusted),
+        };
+        SensitivePayload::raw_for_trusted_custody()
+            .raw_provider_bytes(grant, &route, PLANTED_SECRET)
+            .map(str::to_string)
+    }
+
+    /// AC5. A trusted child resolved to a `Remote` location must fail closed:
+    /// no grant is minted, so no raw provider bytes can ever be released. Fails
+    /// against pre-gate code, where a Remote trusted child mints a grant.
+    #[test]
+    fn trusted_child_raw_custody_is_trust_only() {
+        let providers = trusted_child_providers(Some(ModelLocation::Remote));
+        let session = session_model(&providers);
+        match resolve_trusted_child_model(
+            "reasoning",
+            "deepthink",
+            &extended_mode(LlmMode::Normal),
+            &providers,
+            &session,
+            None,
+        ) {
+            Err(SelectorResolution::InvalidLiteral(message)) => {
+                assert!(
+                    message.contains("local"),
+                    "the fail-closed reason must name the location gate: {message}"
+                );
+                assert!(
+                    !message.contains(PLANTED_SECRET),
+                    "the fail-closed reason must be content-free: {message}"
+                );
+            }
+            Err(other) => panic!("unexpected error shape: {other:?}"),
+            Ok((model, _grant)) => panic!(
+                "a trusted Remote child must not mint a grant; got {}",
+                model.model_id_ref()
+            ),
+        }
+    }
+
+    /// AC5 positive control. A trusted, host-`Local` child mints a grant and the
+    /// grant releases the planted raw bytes. Guards the deny tests against a
+    /// vacuous deny-everything regression.
+    #[test]
+    fn trusted_child_local_receives_raw_custody() {
+        let providers = trusted_child_providers(Some(ModelLocation::Local));
+        let session = session_model(&providers);
+        let (model, grant) = resolve_trusted_child_model(
+            "reasoning",
+            "deepthink",
+            &extended_mode(LlmMode::Normal),
+            &providers,
+            &session,
+            None,
+        )
+        .expect("a trusted host-local child must mint a grant");
+        assert_eq!(model.provider_id(), "minimax");
+        assert_eq!(model.model_id_ref(), "trusted-reasoning");
+        assert_eq!(grant.provider(), "minimax");
+        assert_eq!(grant.model(), "trusted-reasoning");
+        assert_eq!(
+            raw_bytes_released_by(&grant, &model).as_deref(),
+            Some(PLANTED_SECRET),
+            "a host-local trusted child must release raw provider bytes"
+        );
+    }
+
+    /// AC5. `PrivateRemote` and a MISSING location each fail closed exactly like
+    /// `Remote`: only `Local` releases raw custody. Both fail against pre-gate
+    /// code (both minted a grant).
+    #[test]
+    fn trusted_child_non_local_locations_fail_closed() {
+        for location in [Some(ModelLocation::PrivateRemote), None] {
+            let providers = trusted_child_providers(location);
+            let session = session_model(&providers);
+            assert!(
+                resolve_trusted_child_model(
+                    "reasoning",
+                    "deepthink",
+                    &extended_mode(LlmMode::Normal),
+                    &providers,
+                    &session,
+                    None,
+                )
+                .is_err(),
+                "a trusted child at {location:?} must fail closed (no grant minted)"
+            );
+        }
+    }
+
+    /// AC5 regression guard. Only an untrusted `reasoning` candidate exists, at
+    /// a `Local` location. The coordinator forces `ModelCustody::Trusted`, so
+    /// the scan finds no eligible trusted model and mints nothing — a local
+    /// untrusted child is still no trusted grant. Passes today; must keep
+    /// passing.
+    #[test]
+    fn untrusted_child_gets_no_trusted_grant() {
+        let mut providers = providers();
+        providers
+            .providers
+            .get_mut("minimax")
+            .unwrap()
+            .models
+            .push(ModelEntry {
+                id: "untrusted-reasoning".into(),
+                subagent_invokable: Some(true),
+                trust: Some(ModelTrust::Untrusted),
+                location: Some(ModelLocation::Local),
+                availability: crate::config::providers::ModelAvailability {
+                    categories: vec!["reasoning".to_string()],
+                    ..Default::default()
+                },
+                capabilities: crate::config::providers::ModelCapabilities {
+                    reasoning: CapabilityStatus::Supported,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let session = session_model(&providers);
+        assert!(
+            resolve_trusted_child_model(
+                "reasoning",
+                "deepthink",
+                &extended_mode(LlmMode::Normal),
+                &providers,
+                &session,
+                None,
+            )
+            .is_err(),
+            "an untrusted child must never receive a trusted custody grant"
+        );
+    }
+
+    /// AC5. `ModelTrust`, not `LlmMode`, controls custody: a trusted `Local`
+    /// child gets raw bytes in every harness posture, and a trusted `Remote`
+    /// child fails closed in every posture. Mode alone changes no custody.
+    #[test]
+    fn trusted_child_custody_ignores_harness_mode() {
+        for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+            let providers = trusted_child_providers(Some(ModelLocation::Local));
+            let session = session_model(&providers);
+            let (model, grant) = resolve_trusted_child_model(
+                "reasoning",
+                "deepthink",
+                &extended_mode(mode),
+                &providers,
+                &session,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{mode:?}: a local trusted child must route: {e:?}"));
+            assert_eq!(
+                raw_bytes_released_by(&grant, &model).as_deref(),
+                Some(PLANTED_SECRET),
+                "{mode:?}: a host-local trusted child must release raw bytes regardless of mode"
+            );
+
+            let providers = trusted_child_providers(Some(ModelLocation::Remote));
+            let session = session_model(&providers);
+            assert!(
+                resolve_trusted_child_model(
+                    "reasoning",
+                    "deepthink",
+                    &extended_mode(mode),
+                    &providers,
+                    &session,
+                    None,
+                )
+                .is_err(),
+                "{mode:?}: a trusted Remote child must fail closed regardless of mode"
+            );
+        }
     }
 }

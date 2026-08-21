@@ -962,36 +962,124 @@ impl App {
                 // indicator still shows.
                 self.mark_working_span_started(turn_id);
                 self.finalize_pending();
+                self.active_display_attempt_id = None;
                 self.pending = Some(new_pending(agent, self.strip_inline_think()));
             }
-            TurnEvent::AssistantTextDelta { agent, delta } => {
+            TurnEvent::AssistantTextDelta { .. } => {
                 // Output is flowing — the retry (if any) reconnected.
                 self.reconnect = None;
-                let p = self.pending_or_insert_with_strip(agent, App::strip_inline_think);
-                let wrote = if p.strip_think {
-                    route_text_delta(
-                        &delta,
-                        &mut p.text,
-                        &mut p.reasoning,
-                        &mut p.inside_think,
-                        &mut p.body_started,
-                        &mut p.tag_partial,
-                    )
-                } else {
-                    // Splitting disabled for this model: content is body
-                    // verbatim (reasoning rides `reasoning_content` only). No
-                    // `ThinkSplitter` state is touched, so the partial-tag
-                    // buffer never half-initializes.
-                    p.text.push_str(&delta);
-                    !delta.trim().is_empty()
-                };
-                if wrote && p.text_started_at.is_none() {
+                // Live provisional body / performance chip is typed
+                // AssistantDisplay* only. Durable history still arrives via
+                // AssistantText; raw deltas must not drive chip updates or
+                // re-enter `<think>` parsing on the live path.
+            }
+            TurnEvent::AssistantDisplayTextDelta {
+                agent,
+                attempt_id,
+                delta,
+            } => {
+                // Typed classified delta — no raw think parsing. Live chip
+                // updates key provisional display by attempt_id (presentation
+                // state only); the body text is already presentation-ready.
+                self.reconnect = None;
+                if self.display_attempt_is_stale(attempt_id) {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
+                let p = self.pending_or_insert_with_strip(agent, |_| false);
+                p.strip_think = false;
+                p.attempt_id = Some(attempt_id);
+                p.text.push_str(&delta);
+                if !delta.trim().is_empty() && p.text_started_at.is_none() {
                     p.text_started_at = Some(Instant::now());
                 }
             }
-            TurnEvent::ReasoningDelta { agent, delta } => {
-                let p = self.pending_or_insert_with_strip(agent, App::strip_inline_think);
+            TurnEvent::ReasoningDelta { .. } => {
+                // Live reasoning is typed AssistantDisplayReasoningDelta only.
+            }
+            TurnEvent::AssistantDisplayReasoningDelta {
+                agent,
+                attempt_id,
+                delta,
+            } => {
+                if self.display_attempt_is_stale(attempt_id) {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
+                let p = self.pending_or_insert_with_strip(agent, |_| false);
+                p.strip_think = false;
+                p.attempt_id = Some(attempt_id);
                 p.reasoning.push_str(&delta);
+            }
+            TurnEvent::AssistantDisplayAttemptReset {
+                agent: _,
+                failed_attempt_id,
+                replacement_attempt_id,
+                reason: _,
+            } => {
+                // Drop only the failed attempt's provisional display.
+                if self.pending.as_ref().is_some_and(|p| {
+                    p.attempt_id == Some(failed_attempt_id) || p.attempt_id.is_none()
+                }) {
+                    self.pending = None;
+                }
+                // Advance the active attempt so late failed-attempt deltas
+                // cannot recreate a provisional row.
+                self.active_display_attempt_id = Some(replacement_attempt_id);
+            }
+            TurnEvent::AssistantDisplayComplete {
+                agent,
+                attempt_id,
+                assistant,
+            } => {
+                self.reconnect = None;
+                if self.display_attempt_is_stale(attempt_id) {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
+                let p = self.pending_or_insert_with_strip(agent, |_| false);
+                p.attempt_id = Some(attempt_id);
+                p.strip_think = false;
+                if p.text_started_at.is_none() {
+                    p.text_started_at = Some(Instant::now());
+                }
+                p.seq = assistant.seq;
+                p.response_performance = assistant.response_performance;
+                let display = assistant
+                    .presentation_text
+                    .as_deref()
+                    .unwrap_or(&assistant.text);
+                if !display.trim().is_empty() {
+                    p.text = display.to_string();
+                }
+                if p.reasoning.trim().is_empty() && !assistant.reasoning.trim().is_empty() {
+                    p.reasoning = assistant.reasoning;
+                }
+                self.finalize_pending();
+            }
+            TurnEvent::AssistantDisplayError {
+                agent: _,
+                attempt_id,
+                kind: _,
+                message,
+                presentation_text,
+            } => {
+                // Convert provisional row to one error row; no performance chip.
+                if self.display_attempt_is_stale(attempt_id) {
+                    return;
+                }
+                let body = presentation_text.unwrap_or_default();
+                if !body.trim().is_empty() || !message.trim().is_empty() {
+                    self.history.push(HistoryEntry::CommandError {
+                        line: if body.trim().is_empty() {
+                            message
+                        } else {
+                            format!("{body}\n{message}")
+                        },
+                    });
+                }
+                self.pending = None;
+                self.active_display_attempt_id = None;
             }
             TurnEvent::AssistantText {
                 text,
@@ -2448,6 +2536,13 @@ impl App {
         self.refresh_active_model_projection();
         // Config snapshot advances inventory floors / schedules replacement.
         self.on_inventory_invalidation(Some(generation), None);
+        // Feed tokenizer confirmation when a pending write is correlating.
+        if let Some(pending) = self.pending_tokenizer_confirm.take() {
+            let encoding = self.config_snapshot.extended.response_metrics_tokenizer;
+            let related = encoding == pending.candidate;
+            let outcome = pending.on_snapshot(generation, encoding, related);
+            self.apply_tokenizer_confirm_outcome(outcome);
+        }
         // Config pushes are global to the attached session. A snapshot caused
         // by an unrelated writer while the add-model settings dialog remains
         // open must update the held config, but must not consume the causal
@@ -2567,6 +2662,7 @@ impl App {
         let Some(mut p) = self.pending.take() else {
             return;
         };
+        self.active_display_attempt_id = None;
         // Flush any buffered partial tag through the shared parser so
         // finalization is byte-for-byte identical to the streaming path's
         // contract: an unterminated leading `<think>` (open tag, no close)
@@ -3220,6 +3316,7 @@ pub(super) fn new_pending(name: String, strip_think: bool) -> PendingMsg {
         inside_think: false,
         body_started: false,
         tag_partial: String::new(),
+        attempt_id: None,
         seq: None,
         strip_think,
         response_performance: None,

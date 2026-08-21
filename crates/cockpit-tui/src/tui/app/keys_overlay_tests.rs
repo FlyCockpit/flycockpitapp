@@ -101,6 +101,7 @@ fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
             "queued main message".to_string(),
         )],
         saved_pending: None,
+        saved_active_display_attempt_id: None,
         saved_prunable_tokens: 42,
         saved_cache_cold: false,
         saved_elided_event_ids: std::collections::HashSet::from(["event-1".to_string()]),

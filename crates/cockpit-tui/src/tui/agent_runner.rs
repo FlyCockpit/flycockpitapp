@@ -1516,6 +1516,7 @@ fn history_entry_seq(entry: &proto::HistoryEntry) -> Option<i64> {
 fn event_persisted_seq(event: &proto::Event) -> Option<i64> {
     match event {
         proto::Event::AssistantText { seq, .. }
+        | proto::Event::AssistantDisplayComplete { seq, .. }
         | proto::Event::QueuedUserMessagesFolded { seq, .. }
         | proto::Event::InterruptResolved { seq, .. }
         | proto::Event::ToolEnd { seq, .. }
@@ -3275,6 +3276,11 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
+        | AssistantDisplayTextDelta { session_id, .. }
+        | AssistantDisplayReasoningDelta { session_id, .. }
+        | AssistantDisplayAttemptReset { session_id, .. }
+        | AssistantDisplayComplete { session_id, .. }
+        | AssistantDisplayError { session_id, .. }
         | AssistantText { session_id, .. }
         | UserMessageRecorded { session_id, .. }
         | QueuedUserMessagesFolded { session_id, .. }
@@ -3649,6 +3655,79 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         AssistantTextDelta { agent, delta, .. } => TurnEvent::AssistantTextDelta { agent, delta },
         ReasoningDelta { agent, delta, .. } => TurnEvent::ReasoningDelta { agent, delta },
+        AssistantDisplayTextDelta {
+            agent,
+            attempt_id,
+            delta,
+            ..
+        } => TurnEvent::AssistantDisplayTextDelta {
+            agent,
+            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            delta,
+        },
+        AssistantDisplayReasoningDelta {
+            agent,
+            attempt_id,
+            delta,
+            ..
+        } => TurnEvent::AssistantDisplayReasoningDelta {
+            agent,
+            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            delta,
+        },
+        AssistantDisplayAttemptReset {
+            agent,
+            failed_attempt_id,
+            replacement_attempt_id,
+            reason,
+            ..
+        } => TurnEvent::AssistantDisplayAttemptReset {
+            agent,
+            failed_attempt_id: cockpit_core::engine::AssistantAttemptId::new(failed_attempt_id),
+            replacement_attempt_id: cockpit_core::engine::AssistantAttemptId::new(
+                replacement_attempt_id,
+            ),
+            reason,
+        },
+        AssistantDisplayComplete {
+            agent,
+            attempt_id,
+            text,
+            presentation_text,
+            reasoning,
+            seq,
+            response_performance,
+            ..
+        } => TurnEvent::AssistantDisplayComplete {
+            agent,
+            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            assistant: cockpit_core::engine::AssistantTextPayload {
+                text,
+                presentation_text,
+                reasoning,
+                seq,
+                response_performance: response_performance.as_ref().and_then(
+                    cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
+                ),
+            },
+        },
+        AssistantDisplayError {
+            agent,
+            attempt_id,
+            kind,
+            message,
+            presentation_text,
+            ..
+        } => TurnEvent::AssistantDisplayError {
+            agent,
+            attempt_id: cockpit_core::engine::AssistantAttemptId::new(attempt_id),
+            kind: match kind.as_str() {
+                "cancelled" => cockpit_core::engine::DisplayErrorKind::Cancelled,
+                _ => cockpit_core::engine::DisplayErrorKind::Failed,
+            },
+            message,
+            presentation_text,
+        },
         AssistantText {
             agent,
             text,

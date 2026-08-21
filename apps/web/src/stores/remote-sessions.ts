@@ -277,6 +277,8 @@ type RemoteSessionState = {
 
 const pendingAssistantId = "assistant:pending";
 const pendingReasoningId = "reasoning:pending";
+const pendingDisplayAssistantPrefix = "assistant:pending:";
+const pendingDisplayReasoningPrefix = "reasoning:pending:";
 const pendingUserPrefix = "user:pending:";
 const pendingUserSeq = Number.MAX_SAFE_INTEGER - 3;
 const pendingReasoningSeq = Number.MAX_SAFE_INTEGER - 2;
@@ -609,6 +611,8 @@ function historyMergeKey(entry: WebHistoryEntry) {
     entry.seq >= pendingUserSeq ||
     entry.id === pendingAssistantId ||
     entry.id === pendingReasoningId ||
+    entry.id.startsWith(pendingDisplayAssistantPrefix) ||
+    entry.id.startsWith(pendingDisplayReasoningPrefix) ||
     entry.id.startsWith(pendingUserPrefix) ||
     (entry.kind === "tool_call" && entry.status === "running")
   ) {
@@ -624,8 +628,15 @@ function mergeHistoryEntries(history: WebHistoryEntry[], entries: WebHistoryEntr
   return sortHistory([...byKey.values()]);
 }
 
+function isLiveDisplayErrorEntry(entry: WebHistoryEntry) {
+  return entry.id.startsWith("assistant-error:live:");
+}
+
 function mergeHistorySnapshot(current: WebHistoryEntry[], snapshot: WebHistoryEntry[]) {
-  if (!snapshot.length) return sortHistory(current);
+  // Always drop live-only typed display errors on attach/replay, including
+  // empty authoritative snapshots.
+  const withoutLiveErrors = current.filter((entry) => !isLiveDisplayErrorEntry(entry));
+  if (!snapshot.length) return sortHistory(withoutLiveErrors);
   const nextSeq = nextSeqFromHistory(snapshot);
   const oldestSnapshotSeq = oldestSeqFromHistory(snapshot);
   const snapshotIds = new Set(snapshot.map((entry) => entry.id));
@@ -634,7 +645,7 @@ function mergeHistorySnapshot(current: WebHistoryEntry[], snapshot: WebHistoryEn
       entry.kind === "user_message" ? (entry.clientSubmissionIds ?? []) : [],
     ),
   );
-  const preserved = current.filter(
+  const preserved = withoutLiveErrors.filter(
     (entry) =>
       !snapshotIds.has(entry.id) &&
       !(
@@ -752,12 +763,16 @@ function toWebHistoryEntry(entry: WireHistoryEntry, fallbackSeq = 0): WebHistory
     return { id: "user-note:" + seq, seq, ts: entry.ts_ms, kind: "user_note", text: entry.text };
   }
   if (entry.role === "assistant") {
+    const assistant = entry as WireHistoryEntry & {
+      presentation_text?: string | null;
+      text: string;
+    };
     return {
       id: "assistant:" + seq,
       seq,
       ts: entry.ts_ms ? Math.floor(entry.ts_ms / 1000) : undefined,
       kind: "assistant_text",
-      text: entry.text,
+      text: assistant.presentation_text ?? assistant.text,
     };
   }
   if (entry.role === "tool_call") {
@@ -963,12 +978,167 @@ function appendReasoningDelta(history: WebHistoryEntry[], delta: string) {
 }
 
 function applyAssistantText(history: WebHistoryEntry[], data: Record<string, unknown>) {
-  const text = stringField(data, "text");
+  const text = stringField(data, "presentation_text") ?? stringField(data, "text");
   if (!text) return null;
   const seq = numberField(data, "seq") ?? nextLocalSeq(history);
+  // Drop legacy pending and any attempt-keyed provisional rows left by
+  // AssistantDisplayComplete when seq was unknown (write-failure path).
+  const cleaned = history.filter(
+    (entry) =>
+      entry.id !== pendingAssistantId && !String(entry.id).startsWith(`${pendingAssistantId}:`),
+  );
+  return upsertHistory(cleaned, { id: "assistant:" + seq, seq, kind: "assistant_text", text });
+}
+
+function pendingDisplayId(attemptId: string | number) {
+  return `${pendingAssistantId}:${attemptId}`;
+}
+
+function pendingDisplayReasoningId(attemptId: string | number) {
+  return `${pendingReasoningId}:${attemptId}`;
+}
+
+function appendDisplayTextDelta(
+  history: WebHistoryEntry[],
+  attemptId: string | number,
+  delta: string,
+) {
+  const id = pendingDisplayId(attemptId);
+  const pending = history.find((entry) => entry.id === id);
+  if (pending?.kind === "assistant_text") {
+    return history.map((entry) =>
+      entry.id === id && entry.kind === "assistant_text"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortHistory([
+    ...history,
+    { id, seq: pendingAssistantSeq, kind: "assistant_text", text: delta },
+  ]);
+}
+
+function appendDisplayReasoningDelta(
+  history: WebHistoryEntry[],
+  attemptId: string | number,
+  delta: string,
+) {
+  const id = pendingDisplayReasoningId(attemptId);
+  const pending = history.find((entry) => entry.id === id);
+  if (pending?.kind === "assistant_reasoning") {
+    return history.map((entry) =>
+      entry.id === id && entry.kind === "assistant_reasoning"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortHistory([
+    ...history,
+    { id, seq: pendingReasoningSeq, kind: "assistant_reasoning", text: delta },
+  ]);
+}
+
+function applyDisplayComplete(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const attemptId = data.attempt_id;
+  if (attemptId === undefined || attemptId === null) return null;
+  const text = stringField(data, "presentation_text") ?? stringField(data, "text") ?? "";
+  const reasoning = stringField(data, "reasoning") ?? "";
+  const seq = numberField(data, "seq");
+  const displayAttemptId = attemptId as string | number;
+  // Drop attempt-scoped text + reasoning provisionals; Complete owns the
+  // terminal payload (attempt IDs are live-only).
+  let withoutPending = history.filter(
+    (entry) =>
+      entry.id !== pendingDisplayId(displayAttemptId) &&
+      entry.id !== pendingDisplayReasoningId(displayAttemptId),
+  );
+  if (!text.trim() && !reasoning.trim()) return withoutPending;
+  // seq:None (timeline write failure): keep attempt-keyed provisionals so a
+  // following AssistantText can upsert once without duplicating the reply.
+  if (seq == null) {
+    if (text.trim()) {
+      withoutPending = sortHistory([
+        ...withoutPending,
+        {
+          id: pendingDisplayId(displayAttemptId),
+          seq: pendingAssistantSeq,
+          kind: "assistant_text",
+          text,
+        },
+      ]);
+    }
+    if (reasoning.trim()) {
+      withoutPending = sortHistory([
+        ...withoutPending,
+        {
+          id: pendingDisplayReasoningId(displayAttemptId),
+          seq: pendingReasoningSeq,
+          kind: "assistant_reasoning",
+          text: reasoning,
+        },
+      ]);
+    }
+    return withoutPending;
+  }
+  if (text.trim()) {
+    withoutPending = upsertHistory(withoutPending, {
+      id: "assistant:" + seq,
+      seq,
+      kind: "assistant_text",
+      text,
+    });
+  }
+  if (reasoning.trim()) {
+    withoutPending = upsertHistory(withoutPending, {
+      id: "reasoning:" + seq,
+      seq,
+      kind: "assistant_reasoning",
+      text: reasoning,
+    });
+  }
+  return withoutPending;
+}
+
+function applyDisplayAttemptReset(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const failed = data.failed_attempt_id;
+  if (failed === undefined || failed === null) return history;
+  const failedAttemptId = failed as string | number;
+  return history.filter(
+    (entry) =>
+      entry.id !== pendingDisplayId(failedAttemptId) &&
+      entry.id !== pendingDisplayReasoningId(failedAttemptId),
+  );
+}
+
+function applyDisplayError(history: WebHistoryEntry[], data: Record<string, unknown>) {
+  const attemptId = data.attempt_id;
+  if (attemptId === undefined || attemptId === null) return null;
+  const message = stringField(data, "message") ?? "assistant display error";
+  const presentation = stringField(data, "presentation_text");
+  const detail = presentation?.trim() ? `${presentation}\n${message}` : message;
+  // Live-only error row: pending-range seq so history_replay attach drops it.
+  const seq = pendingAssistantSeq;
+  const displayAttemptId = attemptId as string | number;
   return upsertHistory(
-    history.filter((entry) => entry.id !== pendingAssistantId),
-    { id: "assistant:" + seq, seq, kind: "assistant_text", text },
+    history.filter(
+      (entry) =>
+        entry.id !== pendingDisplayId(displayAttemptId) &&
+        entry.id !== pendingDisplayReasoningId(displayAttemptId) &&
+        !String(entry.id).startsWith("assistant-error:live:"),
+    ),
+    {
+      id: "assistant-error:live:" + displayAttemptId,
+      seq,
+      kind: "inference_failure",
+      failure: {
+        agent: stringField(data, "agent") ?? "assistant",
+        provider: "",
+        model: "",
+        errorClass: stringField(data, "kind") ?? "failed",
+        detail,
+        recovery: { kind: "generic", messageKey: "remote.authGeneric" },
+      },
+    },
   );
 }
 
@@ -1119,6 +1289,66 @@ export function reduceRemoteSessionEvent(
         history: appendAssistantDelta(detail.history, data.delta as string),
       })),
     };
+  }
+
+  if (event.event === "assistant_display_text_delta") {
+    if (!sessionId || typeof data?.delta !== "string" || data.attempt_id == null)
+      return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: appendDisplayTextDelta(
+          detail.history,
+          data.attempt_id as string | number,
+          data.delta as string,
+        ),
+      })),
+    };
+  }
+
+  if (event.event === "assistant_display_reasoning_delta") {
+    if (!sessionId || typeof data?.delta !== "string" || data.attempt_id == null)
+      return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: appendDisplayReasoningDelta(
+          detail.history,
+          data.attempt_id as string | number,
+          data.delta as string,
+        ),
+      })),
+    };
+  }
+
+  if (event.event === "assistant_display_attempt_reset") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    return {
+      state: updateDetail(existing, sessionId, (detail) => ({
+        ...detail,
+        history: applyDisplayAttemptReset(detail.history, data),
+      })),
+    };
+  }
+
+  if (event.event === "assistant_display_complete") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const state = updateDetail(existing, sessionId, (detail) => {
+      const history = applyDisplayComplete(detail.history, data);
+      if (!history) return detail;
+      return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+    });
+    return { state };
+  }
+
+  if (event.event === "assistant_display_error") {
+    if (!sessionId || !data) return { state: existing, warningKind: event.event };
+    const state = updateDetail(existing, sessionId, (detail) => {
+      const history = applyDisplayError(detail.history, data);
+      if (!history) return detail;
+      return { ...detail, history, nextSeq: nextSeqFromHistory(history) };
+    });
+    return { state };
   }
 
   if (event.event === "reasoning_delta") {

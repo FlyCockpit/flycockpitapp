@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 10 as const;
+export const PROTOCOL_VERSION = 11 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust
@@ -1008,7 +1008,17 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
       role: z.literal("assistant"),
       agent: z.string(),
       text: z.string(),
+      presentation_text: z.string().optional(),
       reasoning: z.string().optional(),
+      response_performance: z
+        .object({
+          ttft_ms: safeU64NumberSchema,
+          generation_ms: safeU64NumberSchema,
+          displayed_tokens: safeU64NumberSchema,
+          encoding: z.string(),
+        })
+        .passthrough()
+        .optional(),
       ts_ms: safeI64NumberSchema.optional(),
       seq: safeI64NumberSchema.optional(),
     })
@@ -1527,6 +1537,11 @@ export const knownEventKindSchema = z.enum([
   "approval_mode_state",
   "assistant_text",
   "assistant_text_delta",
+  "assistant_display_text_delta",
+  "assistant_display_reasoning_delta",
+  "assistant_display_attempt_reset",
+  "assistant_display_complete",
+  "assistant_display_error",
   "backup_used",
   "caffeinate_state",
   "command_capability_unavailable",

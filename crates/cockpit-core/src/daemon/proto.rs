@@ -80,6 +80,86 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 delta,
             }]
         }
+        TurnEvent::AssistantDisplayTextDelta {
+            agent,
+            attempt_id,
+            delta,
+        } => {
+            vec![Event::AssistantDisplayTextDelta {
+                session_id,
+                agent,
+                attempt_id: attempt_id.as_u64(),
+                delta,
+            }]
+        }
+        TurnEvent::AssistantDisplayReasoningDelta {
+            agent,
+            attempt_id,
+            delta,
+        } => {
+            vec![Event::AssistantDisplayReasoningDelta {
+                session_id,
+                agent,
+                attempt_id: attempt_id.as_u64(),
+                delta,
+            }]
+        }
+        TurnEvent::AssistantDisplayAttemptReset {
+            agent,
+            failed_attempt_id,
+            replacement_attempt_id,
+            reason,
+        } => {
+            vec![Event::AssistantDisplayAttemptReset {
+                session_id,
+                agent,
+                failed_attempt_id: failed_attempt_id.as_u64(),
+                replacement_attempt_id: replacement_attempt_id.as_u64(),
+                reason,
+            }]
+        }
+        TurnEvent::AssistantDisplayComplete {
+            agent,
+            attempt_id,
+            assistant,
+        } => {
+            vec![Event::AssistantDisplayComplete {
+                session_id,
+                agent,
+                attempt_id: attempt_id.as_u64(),
+                text: assistant.text,
+                presentation_text: assistant.presentation_text,
+                reasoning: assistant.reasoning,
+                seq: assistant.seq,
+                response_performance: assistant.response_performance.map(|p| {
+                    crate::daemon::proto::ResponsePerformance {
+                        ttft_ms: p.ttft_ms,
+                        generation_ms: p.generation_ms,
+                        displayed_tokens: p.displayed_tokens,
+                        encoding: p.encoding.as_str().to_string(),
+                    }
+                }),
+            }]
+        }
+        TurnEvent::AssistantDisplayError {
+            agent,
+            attempt_id,
+            kind,
+            message,
+            presentation_text,
+        } => {
+            vec![Event::AssistantDisplayError {
+                session_id,
+                agent,
+                attempt_id: attempt_id.as_u64(),
+                kind: match kind {
+                    crate::engine::DisplayErrorKind::Cancelled => "cancelled".to_string(),
+                    crate::engine::DisplayErrorKind::Failed => "failed".to_string(),
+                },
+                message,
+                presentation_text,
+            }]
+        }
         TurnEvent::AssistantText {
             agent,
             text,

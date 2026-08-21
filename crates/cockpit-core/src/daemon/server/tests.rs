@@ -13486,20 +13486,20 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "toggle_pinned_message"
         | "list_project_notes"
         | "create_project_note" => AuthzAllowedOutcome::Response,
-        // v10-only owner-remoted sealed-owner channel: the matrix sends a
-        // deliberately unknown record/capability. An authorized owner reaches
-        // the handler and receives its input-validation error; non-owners
-        // remain rejected at the authorization gate.
+        // v10-only owner-remoted sealed-owner channel: the durable directory /
+        // capability-table backing is the persistence sibling's, so an
+        // authorized owner request traverses dispatch and fails closed with a
+        // content-free Internal error.
         "begin_sealed_owner_operation"
         | "apply_sealed_owner_operation"
         | "cancel_sealed_owner_operation"
+        | "sealed_owner_inventory"
         | "edit_sealed_owner_description"
         | "list_sealed_actions"
         | "create_sealed_action"
         | "revise_sealed_action_description"
         | "revise_sealed_action_enabled"
-        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        "sealed_owner_inventory" => AuthzAllowedOutcome::Response,
+        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -26283,16 +26283,22 @@ async fn delete_session_rejects_active_session() {
 }
 
 #[tokio::test]
-async fn delete_session_v9_envelope_does_not_reject_active_session() {
+async fn delete_session_at_min_supported_rejects_active_session() {
     let ctx = test_ctx();
-    // A v9 client: negotiated protocol version 9. The active-session
-    // rejection is v10-only, so a v9 envelope carrying the unchanged
-    // DeleteSession tag must NOT get the new rejection behavior.
-    let mut state = MutableClientState::detached_for_test_with_protocol_version(9);
+    // The v11 cutover retired v9/v10 (MIN_SUPPORTED == 11), so the
+    // active-session rejection now applies to every supported client. A
+    // client negotiated at the minimum supported version must therefore get
+    // the Conflict — the old frozen v9 stop-and-delete leniency is gone.
+    // This also guards the gate against drift: if PROTOCOL_VERSION were ever
+    // bumped above MIN_SUPPORTED, the oldest supported client must not
+    // silently fall back to the lenient path.
+    let mut state = MutableClientState::detached_for_test_with_protocol_version(
+        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
+    );
     // A freshly created session is active (ended_at is None).
     let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
 
-    let response = handle_request(
+    let err = handle_request(
         Request::DeleteSession {
             session_id: session.session_id,
         },
@@ -26300,18 +26306,18 @@ async fn delete_session_v9_envelope_does_not_reject_active_session() {
         &ctx,
     )
     .await
-    .expect("v9 DeleteSession must not reject an active session");
+    .expect_err("min-supported DeleteSession must reject an active session");
 
-    // v9 behavior: stop-and-delete proceeds (the old frozen behavior).
-    assert!(matches!(response, Response::Ack));
-    // The session row is gone (delete completed).
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("is active; end it before deleting"));
+    // The session row survives — a rejected delete must not remove it.
     assert!(
         ctx.db
             .get_session(session.session_id)
             .await
             .unwrap()
-            .is_none(),
-        "v9 DeleteSession must delete the active session, not reject it"
+            .is_some(),
+        "a rejected active-session delete must leave the session intact"
     );
 }
 

@@ -798,7 +798,55 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             agent: _,
             delta,
+        }
+        | proto::Event::AssistantDisplayTextDelta {
+            session_id: _,
+            agent: _,
+            attempt_id: _,
+            delta,
+        }
+        | proto::Event::AssistantDisplayReasoningDelta {
+            session_id: _,
+            agent: _,
+            attempt_id: _,
+            delta,
         } => scrub_string(delta, redact),
+        proto::Event::AssistantDisplayAttemptReset {
+            session_id: _,
+            agent: _,
+            failed_attempt_id: _,
+            replacement_attempt_id: _,
+            reason,
+        } => scrub_string(reason, redact),
+        proto::Event::AssistantDisplayComplete {
+            session_id: _,
+            agent: _,
+            attempt_id: _,
+            text,
+            presentation_text,
+            reasoning,
+            seq: _,
+            response_performance: _,
+        } => {
+            scrub_string(text, redact);
+            if let Some(presentation) = presentation_text {
+                scrub_string(presentation, redact);
+            }
+            scrub_string(reasoning, redact);
+        }
+        proto::Event::AssistantDisplayError {
+            session_id: _,
+            agent: _,
+            attempt_id: _,
+            kind: _,
+            message,
+            presentation_text,
+        } => {
+            scrub_string(message, redact);
+            if let Some(presentation) = presentation_text {
+                scrub_string(presentation, redact);
+            }
+        }
         proto::Event::AssistantText {
             session_id: _,
             agent: _,

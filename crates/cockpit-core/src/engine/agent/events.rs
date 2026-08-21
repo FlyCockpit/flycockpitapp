@@ -170,13 +170,58 @@ pub enum TurnEvent {
     },
     /// One streaming chunk of the assistant's text response. The TUI
     /// accumulates these in a live-rendered line.
+    ///
+    /// **Legacy live path.** Production interactive/noninteractive display
+    /// uses [`Self::AssistantDisplayTextDelta`] from the attempt-dispatch
+    /// classifier. This variant remains only for synthetic/test emitters that
+    /// do not own a classifier; it must not drive the performance chip.
     AssistantTextDelta { agent: String, delta: String },
     /// One streaming chunk of the model's *reasoning* (thinking-mode
     /// models only). The TUI hides this by default — the
     /// "Thinking…" placeholder is the visible affordance — but
     /// captures it so the user can expand a thinking block later to
     /// inspect the chain of thought.
+    ///
+    /// **Legacy live path.** Prefer [`Self::AssistantDisplayReasoningDelta`].
     ReasoningDelta { agent: String, delta: String },
+    /// Classified visible assistant text delta from the attempt-dispatch
+    /// [`crate::engine::DisplayStreamClassifier`]. Carries `attempt_id` for
+    /// provisional-row correlation; never durable.
+    AssistantDisplayTextDelta {
+        agent: String,
+        attempt_id: crate::engine::AssistantAttemptId,
+        delta: String,
+    },
+    /// Classified reasoning delta from the attempt-dispatch classifier.
+    AssistantDisplayReasoningDelta {
+        agent: String,
+        attempt_id: crate::engine::AssistantAttemptId,
+        delta: String,
+    },
+    /// Display-only reset: remove the failed attempt's provisional row before
+    /// any next-attempt delta. Not durable.
+    AssistantDisplayAttemptReset {
+        agent: String,
+        failed_attempt_id: crate::engine::AssistantAttemptId,
+        replacement_attempt_id: crate::engine::AssistantAttemptId,
+        reason: String,
+    },
+    /// Terminal live display complete for one attempt. Owns the durable
+    /// assistant payload (also emitted as [`Self::AssistantText`] for history).
+    AssistantDisplayComplete {
+        agent: String,
+        attempt_id: crate::engine::AssistantAttemptId,
+        assistant: crate::engine::AssistantTextPayload,
+    },
+    /// Terminal live display error for a visible primary partial failure/cancel.
+    /// Never follows Complete; no performance chip.
+    AssistantDisplayError {
+        agent: String,
+        attempt_id: crate::engine::AssistantAttemptId,
+        kind: crate::engine::DisplayErrorKind,
+        message: String,
+        presentation_text: Option<String>,
+    },
     /// Assistant turn's text is complete. Emitted right after the
     /// stream finishes (or, in non-streaming mode, after the response
     /// returns). `text` is the full accumulated body with inline
@@ -187,6 +232,7 @@ pub enum TurnEvent {
     /// `session_events` row id assigned to this message (the stable id a
     /// pin references — `pinned-messages`); `None` only when the timeline
     /// write failed. UI/DB-only — never enters the model's context.
+    /// Durable history transport only — not live chip input.
     AssistantText {
         agent: String,
         /// Model-context/wire body.

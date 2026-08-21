@@ -1969,3 +1969,243 @@ describe("remote session reducers", () => {
     });
   });
 });
+
+describe("remote_display_events_v11_web", () => {
+  it("remote_display_events_v11_web", () => {
+    const base = withDetail();
+    const sessionDetail = base.detailsBySession[sessionId];
+    expect(sessionDetail).toBeTruthy();
+
+    // Typed display deltas coalesce by attempt_id.
+    let state = reduceRemoteSessionEvent(base, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "Hel" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "lo" },
+    }).state;
+    let history = state.detailsBySession[sessionId].history;
+    expect(history.some((e) => e.kind === "assistant_text" && e.text === "Hello")).toBe(true);
+
+    // Typed reasoning deltas coalesce within one attempt.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "Think" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "ing" },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    expect(history.some((e) => e.kind === "assistant_reasoning" && e.text === "Thinking")).toBe(
+      true,
+    );
+
+    // Complete uses presentation_text when present and clears attempt-scoped
+    // reasoning (optionally finalizing durable reasoning from the payload).
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: {
+        session_id: sessionId,
+        attempt_id: 1,
+        text: "Bonjour",
+        presentation_text: "Hello",
+        reasoning: "Thinking",
+        seq: 99,
+      },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    const complete = history.find((e) => e.id === "assistant:99");
+    expect(complete?.kind).toBe("assistant_text");
+    if (complete?.kind === "assistant_text") expect(complete.text).toBe("Hello");
+    expect(history.some((e) => e.id === "reasoning:pending:1")).toBe(false);
+    expect(history.some((e) => e.id === "reasoning:99" && e.kind === "assistant_reasoning")).toBe(
+      true,
+    );
+
+    // Fallback / legacy assistant_text uses presentation_text ?? text.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_text",
+      data: { session_id: sessionId, text: "raw", presentation_text: "shown", seq: 100 },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    const shown = history.find((e) => e.id === "assistant:100");
+    expect(shown?.kind).toBe("assistant_text");
+    if (shown?.kind === "assistant_text") expect(shown.text).toBe("shown");
+
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_text",
+      data: { session_id: sessionId, text: "legacy only", seq: 101 },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    const legacy = history.find((e) => e.id === "assistant:101");
+    expect(legacy?.kind).toBe("assistant_text");
+    if (legacy?.kind === "assistant_text") expect(legacy.text).toBe("legacy only");
+
+    // Reset removes text and reasoning for the failed attempt; replacement
+    // reasoning starts a distinct row.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 7, delta: "gone" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 7, delta: "old reasoning" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_attempt_reset",
+      data: {
+        session_id: sessionId,
+        failed_attempt_id: 7,
+        replacement_attempt_id: 8,
+        reason: "timeout",
+      },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 8, delta: "new reasoning" },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    expect(history.some((e) => e.id === "assistant:pending:7")).toBe(false);
+    expect(history.some((e) => e.id === "reasoning:pending:7")).toBe(false);
+    expect(
+      history.some(
+        (e) =>
+          e.id === "reasoning:pending:8" &&
+          e.kind === "assistant_reasoning" &&
+          e.text === "new reasoning",
+      ),
+    ).toBe(true);
+
+    // Fallback complete (no presentation_text) displays text.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 9, delta: "fb" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: { session_id: sessionId, attempt_id: 9, text: "fallback body", seq: 102 },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    const fallback = history.find((e) => e.id === "assistant:102");
+    expect(fallback?.kind).toBe("assistant_text");
+    if (fallback?.kind === "assistant_text") expect(fallback.text).toBe("fallback body");
+
+    // Error converts provisional to inference_failure without a performance chip.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 11, delta: "partial" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 11, delta: "failed reasoning" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_error",
+      data: {
+        session_id: sessionId,
+        attempt_id: 11,
+        kind: "failed",
+        message: "provider failed",
+        presentation_text: "partial",
+      },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    expect(history.some((e) => e.id === "assistant:pending:11")).toBe(false);
+    expect(history.some((e) => e.id === "reasoning:pending:11")).toBe(false);
+    expect(history.some((e) => e.kind === "inference_failure")).toBe(true);
+
+    // Complete with seq:None then AssistantText must not duplicate the reply.
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 42, delta: "live" },
+    }).state;
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: {
+        session_id: sessionId,
+        attempt_id: 42,
+        text: "live final",
+        // seq omitted — timeline write failure path
+      },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    expect(
+      history.filter((e) => e.kind === "assistant_text" && e.text === "live final"),
+    ).toHaveLength(1);
+    state = reduceRemoteSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_text",
+      data: { session_id: sessionId, text: "live final", seq: 200 },
+    }).state;
+    history = state.detailsBySession[sessionId].history;
+    const liveFinals = history.filter(
+      (e) => e.kind === "assistant_text" && e.text === "live final",
+    );
+    expect(liveFinals).toHaveLength(1);
+    expect(liveFinals[0]?.id).toBe("assistant:200");
+    expect(history.some((e) => e.id === "assistant:pending:42")).toBe(false);
+
+    // Legacy attach/history entry without presentation_text displays text.
+    const legacyAttach = mergeAttach(empty, {
+      ...attachFixture,
+      history: [
+        { role: "assistant" as const, seq: 1, agent: "Build", text: "legacy attach body" },
+        {
+          role: "assistant" as const,
+          seq: 2,
+          agent: "Build",
+          text: "wire",
+          presentation_text: "shown attach",
+        },
+      ],
+    });
+    const attachHistory = legacyAttach.detailsBySession[sessionId].history;
+    expect(attachHistory.find((e) => e.id === "assistant:1")).toMatchObject({
+      kind: "assistant_text",
+      text: "legacy attach body",
+    });
+    expect(attachHistory.find((e) => e.id === "assistant:2")).toMatchObject({
+      kind: "assistant_text",
+      text: "shown attach",
+    });
+  });
+});

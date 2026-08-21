@@ -546,7 +546,7 @@ async fn record_usage_blocking(
 // standalone behavior; the backup wrapper passes `false` for the primary
 // attempt so a qualifying failure doesn't flash a red error before the backup
 // answers (the DB record + failure event are written either way).
-pub async fn turn(
+pub(crate) async fn turn(
     agent: &Agent,
     model: &Model,
     history: &mut Vec<Message>,
@@ -589,6 +589,10 @@ pub async fn turn(
     goal_provenance: Option<(Uuid, i64)>,
     turn_id: Option<String>,
     tx: &mpsc::Sender<TurnEvent>,
+    // `turn_with_backup` provides one slot for its whole logical call so a
+    // visible primary partial can be Reset by a replacement. Standalone turns
+    // pass None and allocate their own slot in the turn phase.
+    display_slot: Option<crate::engine::model::DisplayAttemptSlot>,
 ) -> Result<TurnOutcome> {
     let ctx = turn_phases::TurnCtx {
         agent,
@@ -616,6 +620,7 @@ pub async fn turn(
         goal_provenance,
         turn_id,
         tx,
+        display_slot,
     };
     turn_phases::run_turn(ctx, history, prompt).await
 }

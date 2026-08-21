@@ -970,13 +970,16 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v10 adds owner/provider persistence RPCs.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// Current wire schema version.
+///
+/// Current wire schema version. v11 makes typed assistant display events
+/// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 11.
+pub const PROTOCOL_VERSION: u32 = 11;
 
-/// The daemon and CLI require an exact current-wire match during the
-/// prerelease period. Older fixture schemas are deliberately retired rather
-/// than preserved: production will begin from a freshly compacted v1 wire.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = PROTOCOL_VERSION;
+/// Oldest wire schema version this binary accepts. v11 is current-only: the
+/// display-event breaking change has no v9/v10-compatible fallback.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 11;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1049,12 +1052,13 @@ pub const IMAGE_ATTACHMENT_MIME_PNG: &str = "image/png";
 pub const IMAGE_PART_SENTINEL: &str = "\u{0}<cockpit-image-part>\u{0}";
 
 pub fn is_protocol_compatible(v: u32) -> bool {
-    v == PROTOCOL_VERSION
+    (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&v)
 }
 
 pub fn version_mismatch_message(v: u32) -> String {
     format!(
-        "wire protocol version mismatch: peer sent v{v}, this binary requires v{PROTOCOL_VERSION}"
+        "wire protocol version mismatch: peer sent v{v}, this binary speaks v{} (supported {}..={})",
+        PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
     )
 }
 
@@ -1081,14 +1085,15 @@ impl NegotiatedProtocol {
     }
 
     pub fn from_hello(hello: &DaemonHello) -> std::result::Result<Self, ErrorPayload> {
-        if !is_protocol_compatible(hello.protocol_version) {
+        let version = PROTOCOL_VERSION.min(hello.protocol_version);
+        if version < MIN_SUPPORTED_PROTOCOL_VERSION {
             return Err(ErrorPayload {
                 code: ErrorCode::ProtocolVersion,
                 message: incompatible_daemon_protocol_message(hello.protocol_version),
             });
         }
         Ok(Self {
-            version: PROTOCOL_VERSION,
+            version,
             daemon_version: hello.daemon_version.clone(),
             daemon_protocol_version: hello.protocol_version,
         })
@@ -1097,7 +1102,8 @@ impl NegotiatedProtocol {
 
 pub fn incompatible_daemon_protocol_message(daemon_protocol_version: u32) -> String {
     format!(
-        "daemon speaks protocol v{daemon_protocol_version}; this client requires v{PROTOCOL_VERSION}. run `cockpit daemon restart`"
+        "daemon speaks protocol v{daemon_protocol_version}; this client supports v{}..=v{}. run `cockpit daemon restart`",
+        MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
     )
 }
 
@@ -2809,12 +2815,10 @@ pub enum InterruptRaiseReason {
     Rehydration,
 }
 
-/// Return the first historical protocol version that introduced a typed body.
-///
-/// The table remains useful for decoding diagnostics and for the retained
-/// migration fixtures, but it no longer grants compatibility: every live
-/// connection is required to use [`PROTOCOL_VERSION`] by
-/// [`ensure_body_supported`].
+/// Return the first protocol version that can carry a typed body. This gate
+/// is intentionally applied after negotiation and before serialization: a
+/// v10 client can use the v9 compatibility window, but must never serialize a
+/// v10-only RPC with a v9 envelope and leave an older daemon to interpret it.
 fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
     match body {
         Body::Request { request, .. } => {
@@ -2976,11 +2980,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
 }
 
 fn ensure_body_supported(version: u32, body: &Body) -> Result<()> {
-    if !is_protocol_compatible(version) {
-        bail!(
-            "protocol payload requires v{PROTOCOL_VERSION}, but negotiated daemon protocol is v{version}; run `cockpit daemon restart`"
-        );
-    }
     let (required, tag) = body_required_protocol_version(body);
     if required > version {
         bail!(
@@ -3259,9 +3258,9 @@ fn codec_error(err: LinesCodecError) -> io::Error {
 
 #[cfg(test)]
 mod proto_fixture_tests {
-    //! Protocol fixtures cover the current accepted wire and explicitly
-    //! allowlisted historical wires retained for migration archaeology. A
-    //! historical fixture directory never expands live compatibility.
+    //! Protocol fixtures cover every version accepted by this build. When the
+    //! supported range changes, add or remove the corresponding `vN/`
+    //! directories together with `SUPPORTED_PROTOCOL_VERSIONS`.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -3273,11 +3272,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    // Only fixtures for the exact wire accepted by this prerelease binary are
-    // part of the compatibility contract. Historical directories remain
-    // available for migration archaeology until the planned v1 compaction.
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
-    const HISTORICAL_PROTOCOL_VERSIONS: &[u32] = &[9];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[11];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -3356,24 +3351,23 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn fixture_directories_match_explicit_supported_and_historical_allowlists() {
+    fn frozen_fixture_supported_version_list_matches_directories() {
         let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
-            .chain(HISTORICAL_PROTOCOL_VERSIONS)
             .copied()
             .collect::<BTreeSet<_>>();
         assert!(
             !listed.is_empty(),
             "supported protocol version list is empty"
         );
-        let directories = fixture_directories();
+        let directories = supported_fixture_directories();
         assert!(
             !directories.is_empty(),
             "daemon_proto has no v*/ fixture directories"
         );
         assert_eq!(
             directories, listed,
-            "supported and historical protocol fixture allowlists must match daemon_proto/v*/ directories"
+            "supported protocol version list must match daemon_proto/v*/ directories"
         );
         for version in listed {
             assert_fixture_directory_files(version);
@@ -3529,7 +3523,7 @@ mod proto_fixture_tests {
             .join("daemon_proto")
     }
 
-    fn fixture_directories() -> BTreeSet<u32> {
+    fn supported_fixture_directories() -> BTreeSet<u32> {
         let root = daemon_proto_fixture_root();
         let entries = std::fs::read_dir(&root)
             .unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
@@ -4781,10 +4775,13 @@ mod tests {
         assert_eq!(current.version, PROTOCOL_VERSION);
         assert_eq!(current.daemon_protocol_version, PROTOCOL_VERSION);
 
-        for incompatible in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 100] {
-            let error = NegotiatedProtocol::from_hello(&hello(incompatible))
-                .expect_err("prerelease protocol policy requires an exact wire match");
-            assert_eq!(error.code, ErrorCode::ProtocolVersion);
+        let newer = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION + 100)).unwrap();
+        assert_eq!(newer.version, PROTOCOL_VERSION);
+        assert_eq!(newer.daemon_protocol_version, PROTOCOL_VERSION + 100);
+
+        if PROTOCOL_VERSION > MIN_SUPPORTED_PROTOCOL_VERSION {
+            let older = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION - 1)).unwrap();
+            assert_eq!(older.version, PROTOCOL_VERSION - 1);
         }
     }
 
@@ -6000,6 +5997,7 @@ mod tests {
             .send(&response)
             .await
             .expect_err("v10-only response must be gated on a v9 connection");
+        assert!(error.to_string().contains("provider_credential_deleted"));
         assert!(error.to_string().contains("requires v10"));
     }
 
@@ -6684,13 +6682,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 10);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION);
-        let fixture = proto_fixture_tests::read_fixture_for(PROTOCOL_VERSION, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current config_refreshed fixture")
+                .expect("v11 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6704,22 +6702,21 @@ mod tests {
     }
 
     #[test]
-    fn goal_summary_cap_is_present_in_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 10);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION);
-        let fixture = proto_fixture_tests::read_fixture_for(PROTOCOL_VERSION, "response.json");
+    fn goal_summary_cap_is_present_in_every_current_response_fixture() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current {response_name} fixture"));
+                .unwrap_or_else(|| panic!("v11 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current {response_name} must include the inclusive verification cap"
+                "v11 {response_name} must freeze the inclusive verification cap"
             );
-            serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current {response_name} must deserialize: {error}")
-            });
+            serde_json::from_value::<Response>(response.clone())
+                .unwrap_or_else(|error| panic!("v11 {response_name} must deserialize: {error}"));
         }
     }
 }

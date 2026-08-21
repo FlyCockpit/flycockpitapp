@@ -99,10 +99,21 @@ export type NativeAttachRuntimeState = {
 };
 
 const pendingAssistantId = "assistant:pending";
+const pendingReasoningId = "assistant:reasoning:pending";
+const pendingDisplayReasoningPrefix = `${pendingReasoningId}:`;
 const pendingUserPrefix = "user:pending:";
 const pendingUserSeq = Number.MAX_SAFE_INTEGER - 2;
 const pendingAssistantSeq = Number.MAX_SAFE_INTEGER - 1;
+const pendingReasoningSeq = Number.MAX_SAFE_INTEGER - 3;
 const pendingInterruptSeq = Number.MAX_SAFE_INTEGER;
+
+function pendingDisplayId(attemptId: string | number) {
+  return `${pendingAssistantId}:${attemptId}`;
+}
+
+function pendingDisplayReasoningId(attemptId: string | number) {
+  return `${pendingReasoningId}:${attemptId}`;
+}
 
 function rawEventName(raw: unknown) {
   if (!raw || typeof raw !== "object") return "unknown";
@@ -199,11 +210,15 @@ export function toNativeHistoryEntry(entry: HistoryEntry, fallbackSeq = 0): Nati
     };
   }
   if (entry.role === "assistant") {
+    const assistant = entry as HistoryEntry & {
+      presentation_text?: string | null;
+      text: string;
+    };
     return {
       id: entryId("assistant", seq),
       seq,
       kind: "assistant_text",
-      text: entry.text,
+      text: assistant.presentation_text ?? assistant.text,
     };
   }
   if (entry.role === "tool_call") {
@@ -323,6 +338,8 @@ export function nativeHistoryMergeKey(entry: NativeHistoryEntry) {
   if (
     entry.seq >= pendingUserSeq ||
     entry.id === pendingAssistantId ||
+    entry.id === pendingReasoningId ||
+    entry.id.startsWith(pendingDisplayReasoningPrefix) ||
     entry.id.startsWith(pendingUserPrefix) ||
     (entry.kind === "tool_call" && entry.status === "running") ||
     (entry.kind === "interrupt" && !entry.interrupt.resolved)
@@ -366,11 +383,14 @@ export function mergeNativeHistorySnapshot(
   current: readonly NativeHistoryEntry[],
   snapshot: readonly NativeHistoryEntry[],
 ) {
-  if (!snapshot.length) return sortNativeHistory([...current]);
+  const withoutLiveErrors = current.filter(
+    (entry) => !String(entry.id).startsWith("inference:live:"),
+  );
+  if (!snapshot.length) return sortNativeHistory([...withoutLiveErrors]);
   const nextSeq = nextSeqFromHistory(snapshot);
   const oldestSnapshotSeq = oldestSeqFromNativeHistory(snapshot);
   const snapshotIds = new Set(snapshot.map((entry) => entry.id));
-  const preserved = current.filter(
+  const preserved = withoutLiveErrors.filter(
     (entry) =>
       !snapshotIds.has(entry.id) &&
       ((oldestSnapshotSeq !== null && entry.seq < oldestSnapshotSeq) || entry.seq >= nextSeq),
@@ -418,17 +438,190 @@ function appendAssistantDelta(history: NativeHistoryEntry[], delta: string): Nat
   return sortNativeHistory([...history, pendingEntry]);
 }
 
-function applyAssistantText(history: NativeHistoryEntry[], data: { seq?: number; text: string }) {
+function appendReasoningDelta(history: NativeHistoryEntry[], delta: string): NativeHistoryEntry[] {
+  const pending = history.find(
+    (entry) => entry.kind === "assistant_reasoning" && entry.id === pendingReasoningId,
+  );
+  if (pending?.kind === "assistant_reasoning") {
+    return history.map((entry) =>
+      entry.id === pendingReasoningId && entry.kind === "assistant_reasoning"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortNativeHistory([
+    ...history,
+    { id: pendingReasoningId, seq: pendingReasoningSeq, kind: "assistant_reasoning", text: delta },
+  ]);
+}
+
+function appendDisplayTextDelta(
+  history: NativeHistoryEntry[],
+  attemptId: string | number,
+  delta: string,
+): NativeHistoryEntry[] {
+  const id = pendingDisplayId(attemptId);
+  const pending = history.find((entry) => entry.kind === "assistant_text" && entry.id === id);
+  if (pending?.kind === "assistant_text") {
+    return history.map((entry) =>
+      entry.id === id && entry.kind === "assistant_text"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortNativeHistory([
+    ...history,
+    { id, seq: pendingAssistantSeq, kind: "assistant_text", text: delta },
+  ]);
+}
+
+function appendDisplayReasoningDelta(
+  history: NativeHistoryEntry[],
+  attemptId: string | number,
+  delta: string,
+): NativeHistoryEntry[] {
+  const id = pendingDisplayReasoningId(attemptId);
+  const pending = history.find((entry) => entry.kind === "assistant_reasoning" && entry.id === id);
+  if (pending?.kind === "assistant_reasoning") {
+    return history.map((entry) =>
+      entry.id === id && entry.kind === "assistant_reasoning"
+        ? { ...entry, text: entry.text + delta }
+        : entry,
+    );
+  }
+  return sortNativeHistory([
+    ...history,
+    { id, seq: pendingReasoningSeq, kind: "assistant_reasoning", text: delta },
+  ]);
+}
+
+function applyAssistantText(
+  history: NativeHistoryEntry[],
+  data: { seq?: number; text: string; presentation_text?: string },
+) {
   const seq = typeof data.seq === "number" ? data.seq : nextLocalSeq(history);
+  const text = data.presentation_text ?? data.text;
   const finalEntry: NativeHistoryEntry = {
     id: entryId("assistant", seq),
     seq,
     kind: "assistant_text",
-    text: data.text,
+    text,
   };
+  // Drop legacy pending and attempt-keyed provisionals left when Complete
+  // had seq:None so AssistantText does not duplicate the reply.
+  const cleaned = history.filter(
+    (entry) =>
+      entry.id !== pendingAssistantId && !String(entry.id).startsWith(`${pendingAssistantId}:`),
+  );
+  return upsertHistory(cleaned, finalEntry);
+}
+
+function applyDisplayComplete(
+  history: NativeHistoryEntry[],
+  data: Record<string, unknown>,
+): NativeHistoryEntry[] | null {
+  const attemptId = data.attempt_id;
+  if (attemptId === undefined || attemptId === null) return null;
+  const text =
+    (typeof data.presentation_text === "string" ? data.presentation_text : undefined) ??
+    (typeof data.text === "string" ? data.text : "") ??
+    "";
+  const reasoning = typeof data.reasoning === "string" ? data.reasoning : "";
+  const seq = typeof data.seq === "number" ? data.seq : undefined;
+  const displayAttemptId = attemptId as string | number;
+  let withoutPending = history.filter(
+    (entry) =>
+      entry.id !== pendingDisplayId(displayAttemptId) &&
+      entry.id !== pendingDisplayReasoningId(displayAttemptId),
+  );
+  if (!text.trim() && !reasoning.trim()) return withoutPending;
+  if (seq == null) {
+    if (text.trim()) {
+      withoutPending = sortNativeHistory([
+        ...withoutPending,
+        {
+          id: pendingDisplayId(displayAttemptId),
+          seq: pendingAssistantSeq,
+          kind: "assistant_text",
+          text,
+        },
+      ]);
+    }
+    if (reasoning.trim()) {
+      withoutPending = sortNativeHistory([
+        ...withoutPending,
+        {
+          id: pendingDisplayReasoningId(displayAttemptId),
+          seq: pendingReasoningSeq,
+          kind: "assistant_reasoning",
+          text: reasoning,
+        },
+      ]);
+    }
+    return withoutPending;
+  }
+  if (text.trim()) {
+    withoutPending = upsertHistory(withoutPending, {
+      id: entryId("assistant", seq),
+      seq,
+      kind: "assistant_text",
+      text,
+    });
+  }
+  if (reasoning.trim()) {
+    withoutPending = upsertHistory(withoutPending, {
+      id: entryId("reasoning", seq),
+      seq,
+      kind: "assistant_reasoning",
+      text: reasoning,
+    });
+  }
+  return withoutPending;
+}
+
+function applyDisplayAttemptReset(
+  history: NativeHistoryEntry[],
+  data: Record<string, unknown>,
+): NativeHistoryEntry[] {
+  const failed = data.failed_attempt_id;
+  if (failed === undefined || failed === null) return history;
+  const failedAttemptId = failed as string | number;
+  return history.filter(
+    (entry) =>
+      entry.id !== pendingDisplayId(failedAttemptId) &&
+      entry.id !== pendingDisplayReasoningId(failedAttemptId),
+  );
+}
+
+function applyDisplayError(
+  history: NativeHistoryEntry[],
+  data: Record<string, unknown>,
+): NativeHistoryEntry[] | null {
+  const attemptId = data.attempt_id;
+  if (attemptId === undefined || attemptId === null) return null;
+  const message = typeof data.message === "string" ? data.message : "assistant display error";
+  const presentation =
+    typeof data.presentation_text === "string" ? data.presentation_text : undefined;
+  const detail = presentation?.trim() ? `${presentation}\n${message}` : message;
+  // Live-only error row: pending-range seq; dropped on history_replay merge.
+  const seq = pendingAssistantSeq;
+  const displayAttemptId = attemptId as string | number;
   return upsertHistory(
-    history.filter((entry) => entry.id !== pendingAssistantId),
-    finalEntry,
+    history.filter(
+      (entry) =>
+        entry.id !== pendingDisplayId(displayAttemptId) &&
+        entry.id !== pendingDisplayReasoningId(displayAttemptId) &&
+        !String(entry.id).startsWith("inference:live:"),
+    ),
+    {
+      id: `inference:live:${displayAttemptId}`,
+      seq,
+      kind: "inference_error",
+      view: inferenceFailureView({
+        error_class: typeof data.kind === "string" ? data.kind : "failed",
+        detail,
+      }),
+    },
   );
 }
 
@@ -763,6 +956,62 @@ export function reduceNativeSessionEvent(
     return { state: { ...state, history: appendAssistantDelta(state.history, data.delta) } };
   }
 
+  if (event.event === "assistant_display_text_delta") {
+    const data = eventDataRecord(event);
+    if (typeof data?.delta !== "string" || data.attempt_id == null) {
+      return { state, warning: eventWarning(event.event) };
+    }
+    return {
+      state: {
+        ...state,
+        history: appendDisplayTextDelta(
+          state.history,
+          data.attempt_id as string | number,
+          data.delta,
+        ),
+      },
+    };
+  }
+
+  if (event.event === "assistant_display_reasoning_delta") {
+    const data = eventDataRecord(event);
+    if (typeof data?.delta !== "string" || data.attempt_id == null) {
+      return { state, warning: eventWarning(event.event) };
+    }
+    return {
+      state: {
+        ...state,
+        history: appendDisplayReasoningDelta(
+          state.history,
+          data.attempt_id as string | number,
+          data.delta,
+        ),
+      },
+    };
+  }
+
+  if (event.event === "assistant_display_attempt_reset") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    return { state: { ...state, history: applyDisplayAttemptReset(state.history, data) } };
+  }
+
+  if (event.event === "assistant_display_complete") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    const history = applyDisplayComplete(state.history, data);
+    if (!history) return { state, warning: eventWarning(event.event) };
+    return { state: { ...state, history } };
+  }
+
+  if (event.event === "assistant_display_error") {
+    const data = eventDataRecord(event);
+    if (!data) return { state, warning: eventWarning(event.event) };
+    const history = applyDisplayError(state.history, data);
+    if (!history) return { state, warning: eventWarning(event.event) };
+    return { state: { ...state, history } };
+  }
+
   if (event.event === "assistant_text") {
     const data = eventDataRecord(event);
     if (typeof data?.text !== "string") return { state, warning: eventWarning(event.event) };
@@ -771,6 +1020,8 @@ export function reduceNativeSessionEvent(
         ...state,
         history: applyAssistantText(state.history, {
           text: data.text,
+          presentation_text:
+            typeof data.presentation_text === "string" ? data.presentation_text : undefined,
           seq: typeof data.seq === "number" ? data.seq : undefined,
         }),
       },

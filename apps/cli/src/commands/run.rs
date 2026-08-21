@@ -1078,11 +1078,21 @@ impl RunOutcome {
                 self.terminal_failure = false;
             }
             proto::Event::AssistantTextDelta { .. }
+            | proto::Event::AssistantDisplayTextDelta { .. }
+            | proto::Event::AssistantDisplayReasoningDelta { .. }
+            | proto::Event::AssistantDisplayComplete { .. }
             | proto::Event::AssistantText { .. }
             | proto::Event::ReasoningDelta { .. }
             | proto::Event::ToolStart { .. }
             | proto::Event::ToolEnd { .. } => self.progress = true,
-            proto::Event::InferenceFailed { .. } | proto::Event::ToolError { .. } => {
+            proto::Event::AssistantDisplayAttemptReset { .. } => {
+                // Replacement attempt may buffer until Complete (translation).
+                self.streamed_text = false;
+                self.progress = true;
+            }
+            proto::Event::AssistantDisplayError { .. }
+            | proto::Event::InferenceFailed { .. }
+            | proto::Event::ToolError { .. } => {
                 self.terminal_failure = true;
             }
             proto::Event::AgentIdle { .. } => {
@@ -1220,7 +1230,8 @@ fn handle_run_event(
     outcome.observe(event);
     match format {
         OutputFormat::Default => match event {
-            proto::Event::AssistantTextDelta { delta, .. } => {
+            proto::Event::AssistantTextDelta { delta, .. }
+            | proto::Event::AssistantDisplayTextDelta { delta, .. } => {
                 if !delta.is_empty() {
                     outcome.streamed_text = true;
                 }
@@ -1231,8 +1242,33 @@ fn handle_run_event(
                 }
                 let _ = stdout.flush();
             }
+            // Translation / buffered paths suppress live deltas until Complete.
+            // Print once when nothing was streamed, avoiding duplicate bodies.
+            proto::Event::AssistantDisplayComplete {
+                text,
+                presentation_text,
+                ..
+            } => {
+                if outcome.streamed_text {
+                    // Already printed via typed deltas.
+                } else {
+                    let body = presentation_text.as_deref().unwrap_or(text.as_str());
+                    if !body.is_empty() {
+                        outcome.streamed_text = true;
+                        if sanitize_tty {
+                            let _ = stdout.write_all(sanitize_terminal_text(body).as_bytes());
+                        } else {
+                            let _ = stdout.write_all(body.as_bytes());
+                        }
+                        let _ = stdout.flush();
+                    }
+                }
+            }
             proto::Event::ToolError { tool, error, .. } => {
                 let _ = writeln!(stderr, "[error: {tool}: {error}]");
+            }
+            proto::Event::AssistantDisplayError { message, .. } => {
+                let _ = writeln!(stderr, "[assistant display error: {message}]");
             }
             proto::Event::InferenceFailed {
                 provider,
@@ -1376,23 +1412,115 @@ fn normalized_event(session_id: Uuid, event: &proto::Event, verbose: bool) -> Op
         proto::Event::AssistantTextDelta { agent, delta, .. } => {
             json!({ "event": "assistant_delta", "session_id": session_id, "agent": agent, "delta": delta })
         }
+        proto::Event::AssistantDisplayTextDelta {
+            agent,
+            attempt_id,
+            delta,
+            ..
+        } => json!({
+            "event": "assistant_display_text_delta",
+            "session_id": session_id,
+            "agent": agent,
+            "attempt_id": attempt_id,
+            "delta": delta
+        }),
+        proto::Event::AssistantDisplayReasoningDelta {
+            agent,
+            attempt_id,
+            delta,
+            ..
+        } => json!({
+            "event": "assistant_display_reasoning_delta",
+            "session_id": session_id,
+            "agent": agent,
+            "attempt_id": attempt_id,
+            "delta": delta
+        }),
+        proto::Event::AssistantDisplayAttemptReset {
+            agent,
+            failed_attempt_id,
+            replacement_attempt_id,
+            reason,
+            ..
+        } => json!({
+            "event": "assistant_display_attempt_reset",
+            "session_id": session_id,
+            "agent": agent,
+            "failed_attempt_id": failed_attempt_id,
+            "replacement_attempt_id": replacement_attempt_id,
+            "reason": reason
+        }),
+        proto::Event::AssistantDisplayComplete {
+            agent,
+            attempt_id,
+            text,
+            presentation_text,
+            reasoning,
+            seq,
+            response_performance,
+            ..
+        } => {
+            let shown = presentation_text.as_deref().unwrap_or(text.as_str());
+            let mut obj = json!({
+                "event": "assistant_display_complete",
+                "session_id": session_id,
+                "agent": agent,
+                "attempt_id": attempt_id,
+                "text": shown,
+                "reasoning": reasoning,
+                "seq": seq
+            });
+            if let Some(perf) = response_performance {
+                obj["response_performance"] = serde_json::to_value(perf).unwrap_or(Value::Null);
+            }
+            if presentation_text.is_some() {
+                obj["presentation_text"] = json!(presentation_text);
+                obj["raw_text"] = json!(text);
+            }
+            obj
+        }
+        proto::Event::AssistantDisplayError {
+            agent,
+            attempt_id,
+            kind,
+            message,
+            presentation_text,
+            ..
+        } => {
+            let mut obj = json!({
+                "event": "assistant_display_error",
+                "session_id": session_id,
+                "agent": agent,
+                "attempt_id": attempt_id,
+                "kind": kind,
+                "message": message
+            });
+            if let Some(text) = presentation_text {
+                obj["presentation_text"] = json!(text);
+            }
+            obj
+        }
         proto::Event::ReasoningDelta { agent, delta, .. } => {
             json!({ "event": "reasoning_delta", "session_id": session_id, "agent": agent, "delta": delta })
         }
         proto::Event::AssistantText {
             agent,
             text,
+            presentation_text,
             reasoning,
             seq,
             ..
-        } => json!({
-            "event": "assistant_message",
-            "session_id": session_id,
-            "agent": agent,
-            "text": text,
-            "reasoning": reasoning,
-            "seq": seq
-        }),
+        } => {
+            let shown = presentation_text.as_deref().unwrap_or(text.as_str());
+            json!({
+                "event": "assistant_message",
+                "session_id": session_id,
+                "agent": agent,
+                "text": shown,
+                "reasoning": reasoning,
+                "seq": seq
+            })
+        }
         proto::Event::UserMessageRecorded { seq, .. } => {
             json!({ "event": "user_message_recorded", "session_id": session_id, "seq": seq })
         }
@@ -1598,6 +1726,11 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
+        | AssistantDisplayTextDelta { session_id, .. }
+        | AssistantDisplayReasoningDelta { session_id, .. }
+        | AssistantDisplayAttemptReset { session_id, .. }
+        | AssistantDisplayComplete { session_id, .. }
+        | AssistantDisplayError { session_id, .. }
         | AssistantText { session_id, .. }
         | UserMessageRecorded { session_id, .. }
         | QueuedUserMessagesFolded { session_id, .. }

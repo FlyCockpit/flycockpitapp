@@ -23,6 +23,7 @@ impl App {
             meta: std::mem::take(&mut self.transcript_view),
             history: std::mem::take(&mut self.history),
             pending: self.pending.take(),
+            active_display_attempt_id: self.active_display_attempt_id.take(),
             history_render_versions: std::mem::take(&mut self.history_render_versions),
             history_render_fingerprints: std::mem::take(&mut self.history_render_fingerprints),
             history_render_cache,
@@ -39,6 +40,7 @@ impl App {
         self.transcript_view = std::mem::take(&mut view.meta);
         self.history = std::mem::take(&mut view.history);
         self.pending = view.pending.take();
+        self.active_display_attempt_id = view.active_display_attempt_id.take();
         self.history_render_versions = std::mem::take(&mut view.history_render_versions);
         self.history_render_fingerprints = std::mem::take(&mut view.history_render_fingerprints);
         self.restore_history_render_cache(

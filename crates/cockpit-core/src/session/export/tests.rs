@@ -5116,3 +5116,48 @@ async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
         "raw export must refuse to overwrite without force",
     );
 }
+
+#[tokio::test]
+async fn assistant_message_export_retains_response_performance() {
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session
+        .record_event(
+            SessionEventKind::AssistantMessage,
+            Some("Build"),
+            Some("call-1"),
+            &json!({
+                "text": "model body",
+                "presentation_text": "shown body",
+                "reasoning": "",
+                "response_performance": {
+                    "ttft_ms": 3000,
+                    "generation_ms": 500,
+                    "displayed_tokens": 27,
+                    "encoding": "cl100k_base"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let turns = crate::session::export::transcript_json(&db, session.id, "Build")
+        .await
+        .unwrap();
+    let arr = turns.as_array().expect("turns array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["type"], "assistant");
+    assert_eq!(arr[0]["text"], "shown body");
+    assert_eq!(arr[0]["response_performance"]["ttft_ms"], 3000);
+    assert_eq!(arr[0]["response_performance"]["generation_ms"], 500);
+    assert_eq!(arr[0]["response_performance"]["displayed_tokens"], 27);
+    assert_eq!(arr[0]["response_performance"]["encoding"], "cl100k_base");
+    // attempt_id must not appear in export.
+    assert!(arr[0].get("attempt_id").is_none());
+}

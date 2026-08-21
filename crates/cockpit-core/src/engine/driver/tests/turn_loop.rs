@@ -1493,7 +1493,9 @@ async fn eligible_route_non_sensitive_turn_flushes_stream() {
     let delta_blob: String = events
         .iter()
         .filter_map(|event| match event {
-            TurnEvent::AssistantTextDelta { delta, .. } => Some(delta.clone()),
+            // The released deltas now surface on the typed display stream
+            // (AssistantDisplayTextDelta), the client-facing streaming event.
+            TurnEvent::AssistantDisplayTextDelta { delta, .. } => Some(delta.clone()),
             _ => None,
         })
         .collect();

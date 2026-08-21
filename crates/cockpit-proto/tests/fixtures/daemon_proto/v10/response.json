@@ -1287,19 +1287,87 @@
     },
     "response": "scheduled_jobs"
   },
-  "sealed_values": {
+  "docs_answer": {
     "data": {
-      "values": [
+      "answer": "Configure the sandbox in your project config under the sandbox key."
+    },
+    "response": "docs_answer"
+  },
+  "sealed_action_created": {
+    "data": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "revision": 1
+    },
+    "response": "sealed_action_created"
+  },
+  "sealed_action_retired": {
+    "data": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "retired": true
+    },
+    "response": "sealed_action_retired"
+  },
+  "sealed_action_revised": {
+    "data": {
+      "action_id": "44444444-4444-4444-8444-444444444444",
+      "revision": 2
+    },
+    "response": "sealed_action_revised"
+  },
+  "sealed_actions": {
+    "data": {
+      "actions": [
         {
-          "created_at": 1700000000,
-          "origin": "user",
-          "origin_session_id": "11111111-1111-4111-8111-111111111111",
-          "reason": "deploy",
-          "value_id": "prod_token"
+          "action_id": "44444444-4444-4444-8444-444444444444",
+          "revision": 2,
+          "enabled": true,
+          "description": "Comment on GitHub issues",
+          "project_key": "/tmp/project"
         }
       ]
     },
-    "response": "sealed_values"
+    "response": "sealed_actions"
+  },
+  "sealed_owner_description_edited": {
+    "data": {
+      "record_id": "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f"
+    },
+    "response": "sealed_owner_description_edited"
+  },
+  "sealed_owner_inventory": {
+    "data": {
+      "items": [
+        {
+          "record_id": "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f",
+          "name": "prod_token",
+          "description": "Production API token",
+          "scope_kind": "session",
+          "scope_key": "11111111-1111-4111-8111-111111111111",
+          "active_version": 1,
+          "created_at_ms": 1700000000000
+        }
+      ]
+    },
+    "response": "sealed_owner_inventory"
+  },
+  "sealed_owner_operation_applied": {
+    "data": {
+      "revealed_literal": "recovered-plaintext-secret"
+    },
+    "response": "sealed_owner_operation_applied"
+  },
+  "sealed_owner_operation_begun": {
+    "data": {
+      "capability_id": "9f8e7d6c-5b4a-4c3d-8e2f-1a2b3c4d5e6f",
+      "expires_at_ms": 1700000060000
+    },
+    "response": "sealed_owner_operation_begun"
+  },
+  "sealed_owner_operation_cancelled": {
+    "data": {
+      "spent": true
+    },
+    "response": "sealed_owner_operation_cancelled"
   },
   "leak_reports": {
     "data": {

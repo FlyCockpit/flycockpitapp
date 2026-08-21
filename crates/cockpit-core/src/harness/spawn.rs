@@ -29,6 +29,15 @@ pub struct HarnessOutput {
     pub stdout: String,
     /// Stderr tail (UTF-8 lossy, bounded).
     pub stderr: String,
+    /// Bytes dropped from the FRONT of stdout by the bounded drainer. `> 0`
+    /// means the retained tail may begin mid-secret: a registered literal whose
+    /// head was truncated leaves only its suffix at the head of `stdout`, which
+    /// the downstream whole-value scrub cannot match. The child-output scrub in
+    /// [`crate::harness::run`] uses this to drop a redaction-safe front margin.
+    pub stdout_dropped: usize,
+    /// Bytes dropped from the FRONT of stderr by the bounded drainer (same
+    /// truncation-straddle hazard as [`Self::stdout_dropped`]).
+    pub stderr_dropped: usize,
     /// Process exit code, or `None` when killed by a signal.
     pub exit_code: Option<i32>,
 }
@@ -163,11 +172,17 @@ pub async fn run_to_completion(
     tokio::select! {
         status = child.wait() => {
             let status = status.context("waiting for harness child")?;
-            let stdout = stdout_task.join_lossy().await;
-            let stderr = stderr_task.join_lossy().await;
+            let (stdout, stdout_dropped) = lossy_capture(stdout_task.join().await);
+            let (stderr, stderr_dropped) = lossy_capture(stderr_task.join().await);
             let success = status.success();
             Ok(RunOutcome::Completed {
-                output: HarnessOutput { stdout, stderr, exit_code: status.code() },
+                output: HarnessOutput {
+                    stdout,
+                    stderr,
+                    stdout_dropped,
+                    stderr_dropped,
+                    exit_code: status.code(),
+                },
                 success,
             })
         }
@@ -179,13 +194,30 @@ pub async fn run_to_completion(
                 std::time::Duration::from_millis(200),
             )
             .await;
-            let stdout = stdout_task.join_lossy().await;
-            let stderr = stderr_task.join_lossy().await;
+            let (stdout, stdout_dropped) = lossy_capture(stdout_task.join().await);
+            let (stderr, stderr_dropped) = lossy_capture(stderr_task.join().await);
             Ok(RunOutcome::TimedOut {
-                output: HarnessOutput { stdout, stderr, exit_code: None },
+                output: HarnessOutput {
+                    stdout,
+                    stderr,
+                    stdout_dropped,
+                    stderr_dropped,
+                    exit_code: None,
+                },
             })
         }
     }
+}
+
+/// Convert a drained [`crate::process::BoundedPipeCapture`] into its UTF-8 lossy
+/// string plus the count of bytes the drainer dropped from the FRONT. The drop
+/// count is what the child-output scrub needs to decide whether the retained
+/// tail may begin mid-secret (see [`HarnessOutput::stdout_dropped`]).
+fn lossy_capture(capture: crate::process::BoundedPipeCapture) -> (String, usize) {
+    (
+        String::from_utf8_lossy(&capture.bytes).into_owned(),
+        capture.dropped_bytes,
+    )
 }
 
 #[cfg(test)]

@@ -2654,3 +2654,57 @@ fn persisted_entry_debug_redacts_value() {
     assert!(!rendered.contains(secret), "leaked value: {rendered}");
     assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
 }
+
+#[test]
+fn max_match_len_reports_longest_registered_literal() {
+    // Empty/no-op table: nothing can match, so the finite bound is 0. A caller
+    // computing an (M - 1) truncation margin must guard M <= 1, and this pins the
+    // value it guards on.
+    assert_eq!(RedactionTable::empty().max_match_len(), 0);
+
+    // With several literals of differing lengths, the max is the longest one's
+    // byte length — the exact M the harness child-output scrub relies on to size
+    // its boundary-straddle margin. There is no regex/unbounded matcher, so this
+    // is a real finite ceiling on any possible match.
+    let short = "abcd"; // 4 bytes (the hard minimum entry length)
+    let long = "sk-live-longest-registered-literal-0123456789"; // 45 bytes
+    let table = RedactionTable::empty()
+        .with_forced_literal(short.to_string(), "$leak:short".to_string())
+        .unwrap()
+        .with_forced_literal(long.to_string(), "$leak:long".to_string())
+        .unwrap();
+    assert_eq!(table.max_match_len(), long.len());
+    // The enforced view shares the same entries, so its ceiling is identical —
+    // this is the view the harness output scrub actually calls.
+    assert_eq!(table.enforced().max_match_len(), long.len());
+}
+
+#[test]
+fn straddle_fixpoint_cut_advances_past_overlapping_literals() {
+    // Two OVERLAPPING registered literals: `abcdefghij` [5,15) and
+    // `cdefghijWXYZ` [7,19). aho-corasick's emitted set contains only the
+    // leftmost-longest `abcdefghij`, so snapping to a single emitted match end
+    // (15) would leave `cdefghijWXYZ` straddling the new cut. The fixpoint must
+    // advance to the FURTHEST straddling end (19).
+    let table = RedactionTable::empty()
+        .with_forced_literal("abcdefghij".to_string(), "$leak:a".to_string())
+        .unwrap()
+        .with_forced_literal("cdefghijWXYZ".to_string(), "$leak:b".to_string())
+        .unwrap();
+    let body = "PPPPPabcdefghijWXYZ....";
+    assert_eq!(table.straddle_fixpoint_cut(body, 11), 19);
+    // An offset outside every occurrence is returned unchanged (char-boundary).
+    assert_eq!(table.straddle_fixpoint_cut(body, 21), 21);
+    // A no-op (empty) table never advances.
+    assert_eq!(RedactionTable::empty().straddle_fixpoint_cut(body, 3), 3);
+
+    // SELF-overlap: `aaaa` occurs at [0,4) and [1,5); only the latter straddles
+    // cut=4. A non-overlapping scan would miss it and return 4; overlapping
+    // enumeration advances to 5. (`zzzzz` sets M=5 so the window covers [1,5).)
+    let self_overlap = RedactionTable::empty()
+        .with_forced_literal("zzzzz".to_string(), "$leak:m".to_string())
+        .unwrap()
+        .with_forced_literal("aaaa".to_string(), "$leak:a".to_string())
+        .unwrap();
+    assert_eq!(self_overlap.straddle_fixpoint_cut("aaaaaQQQQ", 4), 5);
+}

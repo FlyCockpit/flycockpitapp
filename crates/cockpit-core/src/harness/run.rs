@@ -248,6 +248,134 @@ fn render_for_harness_custody(
     }
 }
 
+/// The exact marker prepended when a front-truncated child stream's leading
+/// redaction margin is dropped, so the model-facing text is transparent about
+/// the elision rather than silently starting mid-line.
+const TRUNCATION_MARGIN_ELIDED_MARKER: &str = "[… output truncated; leading bytes elided …]\n";
+
+/// Scrub a child-output stream that the bounded drainer may have FRONT-truncated.
+///
+/// [`RedactionTable::scrub`] matches whole registered literals. When the rolling
+/// tail dropped its front (`dropped > 0`), a secret occurrence straddling that
+/// cut leaves only its SUFFIX at the head of `body`; the whole-value match cannot
+/// catch a truncated suffix, so a partial secret would otherwise survive into the
+/// model-facing text (a fail-open redaction gap).
+///
+/// The enforced table matches only finite literals (aho-corasick, no regex), so a
+/// finite maximum match length `M = scrub.max_match_len()` exists and any
+/// boundary-straddling survivor is strictly shorter than its secret, i.e. `< M`
+/// bytes, and — because the cut removed at least one leading byte — it sits at the
+/// very head of `body` at RAW offset `[0, s)` with `s <= M - 1`.
+///
+/// The margin MUST be applied in ORIGINAL (pre-scrub) coordinates. Scrubbing a
+/// fully-retained secret replaces it with the (long) placeholder, which EXPANDS
+/// the byte count; a margin measured on the SCRUBBED string can then land inside
+/// that placeholder and leave un-redacted passthrough bytes whose RAW offset was
+/// `< M - 1` — including the protruding suffix of a longer secret that overlapped
+/// a shorter one. So instead:
+///   1. Choose the raw cut in `body`: normally `margin = M - 1`, but if a secret
+///      occurrence STRICTLY straddles `margin`, snap the cut forward to that
+///      occurrence's end (it is fully retained, so it is a real secret we must not
+///      bisect and re-expose — dropping it whole is the safe move).
+///   2. Emit `MARKER + scrub(&body[cut..])`. Because `cut` never lands inside a
+///      match, `body[cut..]` starts clean: the only truncation-introduced partial
+///      (the offset-`0` straddle suffix, `[0, s)`, `s <= margin <= cut`) is fully
+///      dropped, and every remaining occurrence is whole and scrubs normally.
+///
+/// Fail-closed: when the whole retained tail is inside the unsafe window (`margin`
+/// — or a straddling occurrence's end — reaches the tail's end), it is withheld
+/// entirely rather than emitted raw.
+fn scrub_front_truncated(scrub: &RedactionTable, body: &str, dropped: usize) -> String {
+    match front_margin(scrub, body, dropped) {
+        // Not front-truncated (or no multi-byte literal can straddle): the
+        // whole-value scrub is complete on its own.
+        FrontMargin::Whole => scrub.scrub(body),
+        // Front-truncated: drop the unsafe leading margin (RAW coordinates) so the
+        // offset-0 straddle suffix is gone, then scrub the marker+tail in ONE pass.
+        // The marker is a fixed constant, so no secret can span the marker/tail
+        // junction; the combined scrub also redacts any registered literal that is
+        // a substring of the marker itself (e.g. a contained-leak literal).
+        FrontMargin::CutAt(cut) => scrub.scrub(&format!(
+            "{TRUNCATION_MARGIN_ELIDED_MARKER}{}",
+            &body[cut..]
+        )),
+        // The whole retained tail is inside the unsafe margin: withhold it, but
+        // still scrub the marker in case a registered literal is a substring of it.
+        FrontMargin::Withhold => scrub.scrub(TRUNCATION_MARGIN_ELIDED_MARKER),
+    }
+}
+
+/// The RAW (unscrubbed) stdout region safe to parse harness JSON metadata from.
+///
+/// Metadata is parsed from RAW stdout on purpose — a JSON-UNSAFE redaction
+/// placeholder (one containing `"`, `\`, or a newline) would corrupt scrubbed
+/// JSON and silently drop ALL metadata, including numeric cost/token fields. But
+/// the RAW stdout may have been front-truncated, and `parse_harness_json` accepts
+/// a trailing JSON line: a secret literal whose truncated remnant forms a
+/// `{"session_id":"<fragment>"}` line would otherwise yield a boundary-straddling
+/// FRAGMENT that whole-value scrub cannot match. So parse from the RAW tail with
+/// the SAME front margin dropped (unscrubbed): the fragment is elided before parse,
+/// while numeric metadata further along is preserved and parses intact.
+fn front_truncated_parse_source<'a>(
+    scrub: &RedactionTable,
+    body: &'a str,
+    dropped: usize,
+) -> &'a str {
+    match front_margin(scrub, body, dropped) {
+        FrontMargin::Whole => body,
+        FrontMargin::CutAt(cut) => &body[cut..],
+        FrontMargin::Withhold => "",
+    }
+}
+
+/// The disposition of a possibly front-truncated child stream once the unsafe
+/// leading margin is accounted for, computed entirely in RAW `body` coordinates.
+///
+/// `RedactionTable::scrub` matches whole registered literals via aho-corasick (no
+/// regex), so a finite `M = scrub.max_match_len()` exists and any
+/// truncation-straddle survivor sits at RAW offset `[0, s)` with `s <= M - 1`.
+/// The margin MUST be measured on the RAW body: scrubbing a fully-retained secret
+/// expands it into the (long) placeholder, so a margin measured on the SCRUBBED
+/// string could land inside a placeholder and leave an un-redacted passthrough
+/// byte whose raw offset was `< M - 1` (e.g. the protruding suffix of a longer
+/// secret overlapping a shorter one). The cut is snapped PAST any occurrence
+/// strictly straddling the margin so re-scrubbing the tail cannot bisect it.
+enum FrontMargin {
+    /// Not front-truncated, or no multi-byte literal can straddle: use the whole body.
+    Whole,
+    /// Front-truncated: the safe tail begins at this RAW byte offset in `body`.
+    CutAt(usize),
+    /// The entire retained tail is within the unsafe margin: withhold it.
+    Withhold,
+}
+
+fn front_margin(scrub: &RedactionTable, body: &str, dropped: usize) -> FrontMargin {
+    if dropped == 0 {
+        // The drainer split no occurrence; nothing to elide.
+        return FrontMargin::Whole;
+    }
+    let max_match = scrub.max_match_len();
+    if max_match <= 1 {
+        // Nothing registered (empty table) or only 1-byte literals: no multi-byte
+        // occurrence can straddle, so there is no partial to strip.
+        return FrontMargin::Whole;
+    }
+    let margin = max_match - 1;
+    if margin >= body.len() {
+        // The whole retained tail is inside the unsafe front margin.
+        return FrontMargin::Withhold;
+    }
+    // Advance the cut past EVERY registered-literal occurrence straddling it
+    // (overlapping literals included), to a fixpoint, so `body[cut..]` begins with
+    // no straddling secret. `aho-corasick`'s emitted set alone is insufficient —
+    // it suppresses overlaps — so this checks each literal independently.
+    let cut = scrub.straddle_fixpoint_cut(body, margin);
+    if cut >= body.len() {
+        return FrontMargin::Withhold;
+    }
+    FrontMargin::CutAt(cut)
+}
+
 /// Run one harness invocation synchronously, end to end.
 pub async fn run_harness(ctx: RunContext<'_>) -> Result<HarnessRunResult, String> {
     run_harness_inner(ctx, None).await
@@ -380,8 +508,8 @@ async fn run_harness_inner(
     // disabled, and empty content is a no-op. Untrusted output passes through
     // the same funnel (defense in depth); it never received raw secrets. Do
     // this at the single assembly funnel so no future channel can bypass it.
-    let scrubbed_stdout = scrub.scrub(&output.stdout);
-    let scrubbed_stderr = scrub.scrub(&output.stderr);
+    let scrubbed_stdout = scrub_front_truncated(&scrub, &output.stdout, output.stdout_dropped);
+    let scrubbed_stderr = scrub_front_truncated(&scrub, &output.stderr, output.stderr_dropped);
 
     // For isolated runs, capture the diff before tearing the worktree down,
     // then scrub it — a trusted harness can write its received secret into a
@@ -402,8 +530,15 @@ async fn run_harness_inner(
     //    fields (cost/tokens) can't carry a registered secret and survive
     //    intact. `session_id` is the only free-form string field; scrubbing it
     //    keeps a secret out of `summary_line()` / `render()`.
+    // Parse from the front-margin-elided RAW stdout: a front-truncated stream can
+    // otherwise present a boundary-straddling secret FRAGMENT as a trailing
+    // `{"session_id":"…"}` line that whole-value scrub cannot match. Dropping the
+    // same unsafe margin (unscrubbed) removes the fragment before parse while
+    // keeping the JSON structurally intact for numeric fields.
+    let metadata_source =
+        front_truncated_parse_source(&scrub, &output.stdout, output.stdout_dropped);
     let mut metadata = if ctx.cfg.supports_json_output {
-        parse_harness_json(&output.stdout)
+        parse_harness_json(metadata_source)
     } else {
         HarnessMetadata::default()
     };
@@ -1551,6 +1686,415 @@ mod tests {
             "{err}"
         );
         assert!(!marker.exists());
+    }
+
+    /// A registered secret positioned so the 256 KiB FRONT-truncation cut lands
+    /// inside it: the drainer drops the secret's head and keeps only its suffix
+    /// at the head of the retained tail. The whole-value scrub cannot match a
+    /// truncated suffix, so pre-fix that partial secret survived into the
+    /// model-facing text (fail-open redaction gap). This test FAILS against the
+    /// current single-end scrub, which returned `scrub.scrub(&output.stdout)`
+    /// verbatim with the surviving suffix at offset 0.
+    #[tokio::test]
+    async fn front_truncated_stream_does_not_leak_boundary_straddling_secret() {
+        const SECRET: &str = "sk-live-boundary-straddle-secret-abcdefghijklmnop";
+        let b = crate::harness::spawn::HARNESS_OUTPUT_TAIL_BYTES;
+        let l = SECRET.len();
+        // Layout A + SECRET + C so the absolute cut (total - B) falls at SECRET's
+        // midpoint. len(C) = B - L/2; any non-empty A forces a front drop.
+        let head = "A".repeat(8192);
+        let tail_fill = "C".repeat(b - l / 2);
+        let payload = format!("{head}{SECRET}{tail_fill}");
+        // Precondition: output exceeds the tail budget, so the front is dropped.
+        assert!(payload.len() > b, "payload must overflow the tail budget");
+        // The suffix that pre-fix survived at the retained-tail head.
+        let survivor = &SECRET[l / 2..];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let payload_path = tmp.path().join("payload.txt");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let table = std::sync::Arc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
+                .unwrap(),
+        );
+        let cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        let providers = ProvidersConfig::default();
+        let res = run_harness(RunContext {
+            harness_name: "sh",
+            cfg: &cfg,
+            prompt: "ignored",
+            model: None,
+            cwd: tmp.path(),
+            agent_id: "Build",
+            policy: WritePolicy::Direct,
+            redact: table,
+            utility_model: None,
+            providers: &providers,
+            shutdown_gate: None,
+            env_overlay: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.success, "rendered: {}", res.render("sh"));
+        assert!(!res.text.contains(SECRET), "full secret leaked");
+        assert!(
+            !res.text.contains(survivor),
+            "boundary-straddling secret suffix leaked: {survivor}"
+        );
+        assert!(
+            !res.render("sh").contains(survivor),
+            "boundary-straddling suffix leaked via render()"
+        );
+    }
+
+    /// A secret that lands FULLY inside the retained tail (well past the front
+    /// margin) is still scrubbed to the placeholder even when the stream was
+    /// front-truncated — the margin drop must not weaken normal redaction. This
+    /// is a no-regression guard on the fix.
+    #[tokio::test]
+    async fn front_truncated_stream_still_scrubs_fully_contained_secret() {
+        const SECRET: &str = "sk-live-fully-contained-secret-inside-tail-0001";
+        let b = crate::harness::spawn::HARNESS_OUTPUT_TAIL_BYTES;
+        // A large dropped head, then the secret deep inside the retained tail.
+        let head = "A".repeat(b);
+        let mid = "C".repeat(4096);
+        let trail = "D".repeat(4096);
+        let payload = format!("{head}{mid}{SECRET}{trail}");
+        assert!(payload.len() > b, "payload must overflow the tail budget");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let payload_path = tmp.path().join("payload.txt");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let table = std::sync::Arc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
+                .unwrap(),
+        );
+        // The replacement is the table's configured placeholder, not the origin
+        // label passed to `with_forced_literal`. Capture it before `table` moves.
+        let placeholder = table.placeholder().to_string();
+        let cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        let providers = ProvidersConfig::default();
+        let res = run_harness(RunContext {
+            harness_name: "sh",
+            cfg: &cfg,
+            prompt: "ignored",
+            model: None,
+            cwd: tmp.path(),
+            agent_id: "Build",
+            policy: WritePolicy::Direct,
+            redact: table,
+            utility_model: None,
+            providers: &providers,
+            shutdown_gate: None,
+            env_overlay: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.success, "rendered: {}", res.render("sh"));
+        assert!(!res.text.contains(SECRET), "fully-contained secret leaked");
+        assert!(
+            res.text.contains(&placeholder),
+            "fully-contained secret was not replaced by the placeholder: {}",
+            &res.text[..80.min(res.text.len())]
+        );
+    }
+
+    /// The 256 KiB memory bound still holds under a >1 MB runaway child while the
+    /// front-truncation scrub runs with a registered secret: the child's tail is
+    /// bounded by the drainer (unchanged) and the returned text is capped, so no
+    /// unbounded buffering is reintroduced and no secret leaks.
+    #[tokio::test]
+    async fn front_truncation_scrub_stays_bounded_under_runaway_child() {
+        const SECRET: &str = "sk-live-runaway-bound-secret-0001";
+        let tmp = tempfile::tempdir().unwrap();
+        let table = std::sync::Arc::new(
+            RedactionTable::empty()
+                .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
+                .unwrap(),
+        );
+        // ~1.1 MB of filler — no secret in the stream, so the bound is what we
+        // assert here (the leak paths are covered above).
+        let cfg = sh_harness("yes SAFELINEXYZ | head -c 1100000");
+        let providers = ProvidersConfig::default();
+        let res = run_harness(RunContext {
+            harness_name: "sh",
+            cfg: &cfg,
+            prompt: "ignored",
+            model: None,
+            cwd: tmp.path(),
+            agent_id: "Build",
+            policy: WritePolicy::Direct,
+            redact: table,
+            utility_model: None,
+            providers: &providers,
+            shutdown_gate: None,
+            env_overlay: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.success, "rendered: {}", res.render("sh"));
+        // The returned text is capped well under the raw child output — the
+        // report cap plus a small marker/excerpt slack, never the full ~1.1 MB.
+        assert!(
+            res.text.len() <= crate::harness::spawn::HARNESS_OUTPUT_TAIL_BYTES,
+            "returned text not bounded: {} bytes",
+            res.text.len()
+        );
+        assert!(!res.text.contains(SECRET));
+    }
+
+    /// Unit-pins the boundary-straddle margin logic in isolation: given the
+    /// retained tail the drainer would hand the scrub (secret head already
+    /// dropped, only its suffix at offset 0, `dropped > 0`), the surviving suffix
+    /// is stripped, while a `dropped == 0` (untruncated) tail scrubs normally.
+    #[test]
+    fn scrub_front_truncated_strips_head_suffix_only_when_truncated() {
+        const SECRET: &str = "sk-live-unit-margin-secret-0123456789abcdef";
+        let table = RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
+            .unwrap();
+        // The retained tail begins mid-secret: only the suffix survived the front
+        // cut. With dropped > 0, the (M-1) margin drop removes it.
+        let suffix = &SECRET[10..];
+        let body = format!("{suffix}{}", "C".repeat(100));
+        let truncated = scrub_front_truncated(&table, &body, 10);
+        assert!(!truncated.contains(suffix), "suffix survived: {truncated}");
+        assert!(!truncated.contains(SECRET));
+
+        // A fully-retained secret (dropped == 0) is scrubbed to the placeholder,
+        // never dropped.
+        let intact = format!("prefix {SECRET} suffix");
+        let scrubbed = scrub_front_truncated(&table, &intact, 0);
+        assert!(!scrubbed.contains(SECRET));
+        // `with_forced_literal`'s 2nd arg is the entry ORIGIN label, not the
+        // replacement text — an ordinary/contained literal renders as the table's
+        // configured global placeholder. Assert against that, not the label.
+        assert!(scrubbed.contains(table.placeholder()));
+        assert!(scrubbed.contains("prefix "));
+    }
+
+    /// HIGH #1 regression: the truncation margin MUST be applied in RAW
+    /// (pre-scrub) coordinates, because scrubbing a fully-retained secret expands
+    /// it into the (~59-byte) placeholder and a margin measured on the SCRUBBED
+    /// string then lands inside that placeholder, leaving an un-redacted
+    /// passthrough byte whose raw offset was `< M-1`.
+    ///
+    /// Two literals where the shorter is a substring of the longer: the retained
+    /// tail begins mid-`abcdefghij` (its `ab` head dropped at the front cut), so
+    /// only its suffix `cdefghij` survives. `cdef` (now fully retained) matches
+    /// and expands to the placeholder, pushing the un-redacted `ghij` — a suffix
+    /// of the LONGER secret — past a scrubbed-coordinate `M-1` cut. The
+    /// raw-coordinate cut drops `ghij` (raw offset 4..8 < margin 9). FAILS against
+    /// the scrubbed-coordinate implementation.
+    #[test]
+    fn scrub_front_truncated_applies_margin_in_raw_coordinates() {
+        let table = RedactionTable::empty()
+            .with_forced_literal("abcdefghij".to_string(), "$leak:long".to_string())
+            .unwrap()
+            .with_forced_literal("cdef".to_string(), "$leak:short".to_string())
+            .unwrap();
+        assert_eq!(table.max_match_len(), 10);
+        assert!(
+            table.placeholder().len() > 9,
+            "placeholder must exceed the margin for this counterexample to bite"
+        );
+        // `ab` already dropped by the front cut; `cdefghij` is the surviving
+        // suffix of `abcdefghij`.
+        let body = format!("cdefghij{}", "Z".repeat(200));
+        let out = scrub_front_truncated(&table, &body, 2);
+        assert!(
+            !out.contains("ghij"),
+            "longer-secret suffix leaked past the expanded placeholder: {}",
+            &out[..48.min(out.len())]
+        );
+        assert!(!out.contains("cdefghij"));
+    }
+
+    /// HIGH #1 companion: a secret occurrence that STRICTLY straddles the raw
+    /// margin (start < margin < end) is fully retained, so a naive "drop `M-1` raw
+    /// bytes then scrub" would bisect it and re-expose its suffix. Snapping the cut
+    /// to the occurrence's end drops it whole. Proves the raw-coordinate path snaps
+    /// past straddling matches rather than cutting blindly at `margin`.
+    #[test]
+    fn scrub_front_truncated_snaps_past_secret_straddling_margin() {
+        const SECRET: &str = "sk-live-straddle-margin-secret-abcdefghij"; // len 41
+        let table = RedactionTable::empty()
+            .with_forced_literal(SECRET.to_string(), "$leak:test".to_string())
+            .unwrap();
+        let m = SECRET.len(); // margin = m - 1 = 40
+        let head = "H".repeat(m - 1 - 5); // SECRET starts 5 bytes before the margin
+        let body = format!("{head}{SECRET}{}", "T".repeat(50));
+        let start = head.len();
+        assert!(
+            start < m - 1 && start + m > m - 1,
+            "SECRET must strictly straddle the margin"
+        );
+        let out = scrub_front_truncated(&table, &body, 3);
+        assert!(!out.contains(SECRET));
+        // The partial a non-snapping cut at `margin` would leak: SECRET missing
+        // its first (margin - start) = 5 bytes.
+        let survivor = &SECRET[(m - 1) - start..];
+        assert!(
+            !out.contains(survivor),
+            "straddling-secret partial leaked: {survivor}"
+        );
+    }
+
+    /// HIGH (round 3): the straddle-snap must be OVERLAPPING-literal-aware.
+    /// aho-corasick's leftmost-longest emit yields only `abcdefghij` [5,15) and
+    /// SUPPRESSES the overlapping `cdefghijWXYZ` [7,19). A single snap to the
+    /// emitted match end (15) leaves `cdefghijWXYZ` straddling the new cut, so
+    /// scrubbing `body[15..]` emits its suffix `WXYZ`. The overlapping-aware
+    /// fixpoint advances to 19, dropping `WXYZ`. FAILS against the single-snap code.
+    #[test]
+    fn scrub_front_truncated_snaps_past_overlapping_straddling_literals() {
+        let table = RedactionTable::empty()
+            .with_forced_literal("abcdefghij".to_string(), "$leak:a".to_string())
+            .unwrap()
+            .with_forced_literal("cdefghijWXYZ".to_string(), "$leak:b".to_string())
+            .unwrap();
+        assert_eq!(table.max_match_len(), 12); // margin = 11
+        let body = format!("PPPPPabcdefghijWXYZ{}", "Q".repeat(50));
+        let out = scrub_front_truncated(&table, &body, 3);
+        assert!(
+            !out.contains("WXYZ"),
+            "overlapping straddling secret suffix leaked: {}",
+            &out[..48.min(out.len())]
+        );
+        assert!(!out.contains("abcdefghijWXYZ"));
+    }
+
+    /// HIGH (round 4): the per-entry occurrence scan must enumerate
+    /// SELF-overlapping occurrences. `zzzzz` sets M=5 (margin=4); `aaaa` occurs at
+    /// `[0,4)` AND `[1,5)` in the retained tail `aaaaaQQQ…`. `str::match_indices`
+    /// emits only the non-overlapping `[0,4)` (which does NOT straddle cut=4) and
+    /// suppresses `[1,5)` (which DOES), so the fixpoint would stop at 4 and
+    /// `scrub(&body[4..])` emits `a` (a partial of `aaaa`) into `aQ…`. Overlapping
+    /// enumeration advances the cut to 5, dropping every `a`. FAILS against the
+    /// `match_indices` (non-overlapping) scan.
+    #[test]
+    fn scrub_front_truncated_snaps_past_self_overlapping_literal() {
+        let table = RedactionTable::empty()
+            .with_forced_literal("zzzzz".to_string(), "$leak:m".to_string())
+            .unwrap()
+            .with_forced_literal("aaaa".to_string(), "$leak:a".to_string())
+            .unwrap();
+        assert_eq!(table.max_match_len(), 5); // margin = 4
+        let body = format!("aaaaa{}", "Q".repeat(20));
+        let out = scrub_front_truncated(&table, &body, 3);
+        // The leaked partial under a non-overlapping scan is `a` immediately
+        // followed by the filler (`aQ`); the fix drops all `a`s before the tail.
+        assert!(
+            !out.contains("aQ"),
+            "self-overlapping straddling secret partial leaked: {}",
+            &out[..48.min(out.len())]
+        );
+    }
+
+    /// MEDIUM (round 3): the elision marker must be scrubbed too. A contained-leak
+    /// literal that is a SUBSTRING of the marker text (`truncated`) must be
+    /// redacted rather than passed through in the fixed marker. FAILS against
+    /// emitting the marker unscrubbed. Covers both the CutAt and Withhold paths.
+    #[test]
+    fn scrub_front_truncated_scrubs_the_elision_marker() {
+        let table = RedactionTable::empty()
+            .with_forced_literal("truncated".to_string(), "$leak:marker".to_string())
+            .unwrap();
+        // Precondition: the marker really contains the registered literal.
+        assert!(TRUNCATION_MARGIN_ELIDED_MARKER.contains("truncated"));
+
+        // CutAt path: a tail longer than the margin.
+        let cut_out = scrub_front_truncated(&table, &"z".repeat(100), 5);
+        assert!(
+            !cut_out.contains("truncated"),
+            "marker leaked a registered literal (CutAt): {cut_out}"
+        );
+        assert!(cut_out.contains(table.placeholder()));
+
+        // Withhold path: a tail shorter than the margin (M-1 = 8 >= 2).
+        let withhold_out = scrub_front_truncated(&table, "zz", 5);
+        assert!(
+            !withhold_out.contains("truncated"),
+            "marker leaked a registered literal (Withhold): {withhold_out}"
+        );
+        assert!(withhold_out.contains(table.placeholder()));
+    }
+
+    /// HIGH #2 regression: harness JSON metadata is parsed from RAW stdout (to
+    /// survive a JSON-unsafe placeholder), but a front-truncated stream can present
+    /// a boundary-straddling secret FRAGMENT as a trailing `{"session_id":"…"}`
+    /// line. Whole-value scrub of the extracted fragment can't match the original
+    /// longer literal, so pre-fix it surfaced in `metadata` / `render()`. FAILS
+    /// against parsing un-margined RAW stdout.
+    #[tokio::test]
+    async fn front_truncated_json_metadata_never_leaks_boundary_fragment() {
+        const FRAG: &str = "sess-frag-live-9f3a2b8c";
+        // The registered secret embeds the opening of a session_id object and ENDS
+        // at FRAG; the closing `"}` is appended in the output, NOT part of the
+        // secret. Front-truncating right before the `{` leaves a valid trailing
+        // JSON line whose session_id is FRAG — a fragment of the secret.
+        let secret = format!("{}{{\"session_id\":\"{FRAG}", "A".repeat(12));
+        let brace_offset = 12; // index of `{` within `secret`
+        let b = crate::harness::spawn::HARNESS_OUTPUT_TAIL_BYTES;
+        let json_tail = "\"}";
+        // Size trailing filler so the 256 KiB front cut lands exactly at the brace.
+        let trailing_len = b + brace_offset - secret.len() - json_tail.len() - 1;
+        let trailing = "T".repeat(trailing_len);
+        let payload = format!("{secret}{json_tail}\n{trailing}");
+        assert_eq!(
+            payload.len() - b,
+            brace_offset,
+            "front cut must land exactly at the JSON brace"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let payload_path = tmp.path().join("payload.json");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        let table = std::sync::Arc::new(
+            RedactionTable::empty()
+                .with_forced_literal(secret.clone(), "$leak:test".to_string())
+                .unwrap(),
+        );
+        let mut cfg = sh_harness(&format!("cat {}", payload_path.display()));
+        cfg.supports_json_output = true;
+        cfg.trust = crate::config::extended::HarnessTrust::Trusted;
+        let providers = ProvidersConfig::default();
+        let res = run_harness(RunContext {
+            harness_name: "sh",
+            cfg: &cfg,
+            prompt: "ignored",
+            model: None,
+            cwd: tmp.path(),
+            agent_id: "Build",
+            policy: WritePolicy::Direct,
+            redact: table,
+            utility_model: None,
+            providers: &providers,
+            shutdown_gate: None,
+            env_overlay: None,
+        })
+        .await
+        .unwrap();
+        assert!(res.success, "rendered: {}", res.render("sh"));
+        assert!(
+            res.metadata.session_id.as_deref() != Some(FRAG),
+            "boundary fragment parsed into session_id: {:?}",
+            res.metadata.session_id
+        );
+        assert!(
+            !res.render("sh").contains(FRAG),
+            "boundary fragment leaked via render(): {}",
+            res.render("sh")
+        );
+        assert!(
+            !res.text.contains(FRAG),
+            "boundary fragment leaked via text"
+        );
     }
 
     /// A `sh -c <script>` harness: prompt rides stdin (ignored by the

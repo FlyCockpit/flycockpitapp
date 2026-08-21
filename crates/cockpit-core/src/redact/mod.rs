@@ -1646,6 +1646,103 @@ impl RedactionTable {
         &self.placeholder
     }
 
+    /// The maximum byte length of any literal this table can match — the
+    /// finite `M` a caller needs to bound a truncation-straddle margin.
+    ///
+    /// Every entry is a fixed literal string matched via `aho-corasick`
+    /// (`MatchKind::LeftmostLongest`); there is no regex or otherwise-unbounded
+    /// matcher in this architecture, so the longest possible match is exactly the
+    /// longest registered literal. Returns `0` for an empty/no-op table (nothing
+    /// can match), so a caller computing an `(M - 1)` margin must guard `M <= 1`.
+    ///
+    /// A stream that was front-truncated before this table's whole-value `scrub`
+    /// runs can leave only the SUFFIX of a boundary-straddling secret at the head
+    /// of the retained text, which the whole-value match cannot catch. That
+    /// surviving suffix is strictly shorter than the secret, hence `< M` bytes, so
+    /// dropping `M - 1` leading bytes after scrubbing removes it. See the harness
+    /// child-output scrub in `crate::harness::run`.
+    pub fn max_match_len(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.value.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Advance a byte cut forward, starting from `start`, PAST every registered
+    /// literal OCCURRENCE that strictly straddles it (`s < cut < s + value.len()`),
+    /// to a fixpoint. After it returns `cut`, no registered literal — overlapping
+    /// ones included — straddles the front of `body[cut..]`, so a fresh
+    /// `scrub(&body[cut..])` cannot leave a boundary-straddling suffix un-redacted.
+    ///
+    /// This must NOT use the `scrub` matcher's emitted set: `aho-corasick`
+    /// leftmost-longest emits only NON-overlapping matches, while the table permits
+    /// OVERLAPPING registered literals. Snapping past one emitted match can leave a
+    /// DIFFERENT literal (that the emit suppressed) straddling the new cut. So each
+    /// registered `entry.value` is checked INDEPENDENTLY for a straddling
+    /// occurrence, and `cut` is advanced to the MAXIMUM end of any such occurrence,
+    /// iterating until none straddle. `cut` strictly increases each step and is
+    /// bounded by `body.len()`, so it converges. A returned value `>= body.len()`
+    /// means the whole tail is unsafe and the caller must withhold it (fail-closed).
+    ///
+    /// Only occurrences within `[cut - (M-1), cut + (M-1)]` (`M = max_match_len`)
+    /// can straddle `cut`, so the per-step scan is bounded to that window. The
+    /// window is snapped OUTWARD to UTF-8 boundaries so slicing never panics
+    /// (widening only adds safe context); returned cuts land on match ends, which
+    /// are char boundaries because matches are whole literals in valid-UTF-8 `body`.
+    ///
+    /// Deliberately independent of the `disabled` opt-out: the harness path calls
+    /// this on the [`Self::enforced`] view (never disabled), and the spans are what
+    /// a substitution WOULD cover.
+    pub fn straddle_fixpoint_cut(&self, body: &str, start: usize) -> usize {
+        let mut cut = crate::text::ceil_char_boundary(body, start);
+        let max_match = self.max_match_len();
+        if max_match <= 1 || self.matcher.is_none() {
+            return cut;
+        }
+        loop {
+            // Occurrences that could straddle `cut` start in `(cut - M, cut)` and
+            // end in `(cut, cut + M)`, so they lie within this window. Snap the
+            // window outward to char boundaries so the slice is always valid.
+            let lo = crate::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
+            let hi = crate::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
+            let window = &body[lo..hi];
+            let mut advanced = cut;
+            for entry in &self.entries {
+                let value = entry.value.as_str();
+                if value.is_empty() {
+                    continue;
+                }
+                // Enumerate EVERY occurrence of `value` in the window, OVERLAPPING
+                // included — `str::match_indices` is non-overlapping and would
+                // suppress a self-overlapping occurrence (e.g. `aaaa` at `[1,5)`
+                // behind `[0,4)`), and the suppressed one can be the occurrence
+                // straddling `cut`. Advance the cursor ONE char boundary past each
+                // found START, not past the whole match.
+                let mut i = 0;
+                while let Some(rel) = window[i..].find(value) {
+                    let start_in_window = i + rel;
+                    let s = lo + start_in_window; // absolute start
+                    let e = s + value.len(); // absolute end (matched == value)
+                    if s < cut && e > cut {
+                        advanced = advanced.max(e);
+                    }
+                    i = crate::text::ceil_char_boundary(window, start_in_window + 1);
+                    if i >= window.len() {
+                        break;
+                    }
+                }
+            }
+            if advanced <= cut {
+                return cut;
+            }
+            cut = advanced; // a match end: a char boundary
+            if cut >= body.len() {
+                return cut;
+            }
+        }
+    }
+
     /// A no-op table that scrubs nothing, because it has no entries. Used as
     /// the raw-custody token a trusted route receives, as a fallback when a
     /// redaction chokepoint object is needed but the table couldn't be built

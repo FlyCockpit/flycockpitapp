@@ -8,9 +8,9 @@
 //! content, starting a child without capability, or restoring authority after
 //! an uncertain publish.
 
-use crate::write_scope::backend::ScopedWriteBackend;
 #[cfg(unix)]
-use crate::write_scope::backend::{HardLinkPreflight, InodeIdentity};
+use crate::write_scope::backend::HardLinkPreflight;
+use crate::write_scope::backend::{InodeIdentity, ScopedWriteBackend};
 use crate::write_scope::fake::{ExternalRaceFixture, PublishBehavior};
 use crate::write_scope::permits::MutationKind;
 use crate::write_scope::types::WriteScopeError;

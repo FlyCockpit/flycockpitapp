@@ -99,6 +99,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let old_pid = daemon::daemon_pid(&paths);
             let discovered = daemon::discover().await;
             let should_stop = restart_should_stop(discovered.status);
+            let restarted = should_stop && old_pid.is_some();
             let replacement_no_sandbox = if should_stop {
                 daemon::derive_restart_no_sandbox(&paths, no_sandbox)
             } else {
@@ -130,10 +131,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
 
             let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
-            println!(
-                "{}",
-                restart_started_message(should_stop, pid, &paths.socket)
-            );
+            println!("{}", restart_started_message(restarted, pid, &paths.socket));
             Ok(())
         }
         DaemonCommand::Status { json } => {

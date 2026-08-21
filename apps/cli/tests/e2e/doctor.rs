@@ -87,14 +87,19 @@ fn no_providers_exits_one() {
 #[test]
 fn output_is_secret_free() {
     let home = IsolatedHome::new();
+    home.write_local_provider_config("http://127.0.0.1:9/v1");
     let config = home.config_dir();
-    std::fs::create_dir_all(config.join("providers")).unwrap();
-    std::fs::write(config.join("config.json"), "{}").unwrap();
-    std::fs::write(
-        config.join("providers/diagnostic.json"),
-        r#"{"url":"https://provider.example/v1","headers":[{"name":"authorization","value":"Bearer doctor-secret-value-12345"}]}"#,
-    )
-    .unwrap();
+    let provider_path = config.join("providers/local.json");
+    let mut provider: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
+    provider
+        .as_object_mut()
+        .expect("local provider fixture must be an object")
+        .remove("auth");
+    provider["headers"] = serde_json::json!([
+        {"name": "authorization", "value": "Bearer doctor-secret-value-12345"}
+    ]);
+    std::fs::write(provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
 
     let output = home
         .cockpit()
@@ -103,7 +108,7 @@ fn output_is_secret_free() {
         .unwrap();
     let text = output_text(&output);
     assert!(
-        text.contains("diagnostic credentials: ok (literal header)"),
+        text.contains("local credentials: ok (literal header)"),
         "{text}"
     );
     assert!(!text.contains("doctor-secret-value-12345"), "{text}");

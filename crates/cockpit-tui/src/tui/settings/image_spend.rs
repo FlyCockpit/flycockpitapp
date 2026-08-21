@@ -859,7 +859,7 @@ mod tests {
     /// the SQLite ledger in the TUI process.
     ///
     /// Non-vacuity guard (L7): `open_default_call_count()` is a thread-local
-    /// tally of in-process `Db::open_default()` calls. The removed direct-ledger
+    /// tally of in-process database-open calls. The removed direct-ledger
     /// implementation opened the ledger *synchronously on this thread* (a
     /// current-thread runtime driving `activate_saved_policy_default` /
     /// `current_saved_policy_default`), so it would leave the counter `>= 1`.
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(
             cockpit_core::test_env::direct_ledger_open_count(),
             0,
-            "the save must reach the daemon RPC, never Db::open_default in-process"
+            "the save must reach the daemon RPC, never open the database in-process"
         );
         assert_eq!(saved.policy_version, 1);
         assert_eq!(saved.settings, settings);
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(
             cockpit_core::test_env::direct_ledger_open_count(),
             0,
-            "the reload must reach the daemon RPC, never Db::open_default in-process"
+            "the reload must reach the daemon RPC, never open the database in-process"
         );
         assert_eq!(loaded.policy_version, 1);
         assert_eq!(loaded.settings, settings);

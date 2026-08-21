@@ -1085,15 +1085,14 @@ impl NegotiatedProtocol {
     }
 
     pub fn from_hello(hello: &DaemonHello) -> std::result::Result<Self, ErrorPayload> {
-        let version = PROTOCOL_VERSION.min(hello.protocol_version);
-        if version < MIN_SUPPORTED_PROTOCOL_VERSION {
+        if hello.protocol_version != PROTOCOL_VERSION {
             return Err(ErrorPayload {
                 code: ErrorCode::ProtocolVersion,
                 message: incompatible_daemon_protocol_message(hello.protocol_version),
             });
         }
         Ok(Self {
-            version,
+            version: PROTOCOL_VERSION,
             daemon_version: hello.daemon_version.clone(),
             daemon_protocol_version: hello.protocol_version,
         })
@@ -4770,18 +4769,22 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_version_is_min_of_client_and_daemon() {
+    fn negotiated_version_requires_an_exact_daemon_match() {
         let current = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION)).unwrap();
         assert_eq!(current.version, PROTOCOL_VERSION);
         assert_eq!(current.daemon_protocol_version, PROTOCOL_VERSION);
 
-        let newer = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION + 100)).unwrap();
-        assert_eq!(newer.version, PROTOCOL_VERSION);
-        assert_eq!(newer.daemon_protocol_version, PROTOCOL_VERSION + 100);
-
-        if PROTOCOL_VERSION > MIN_SUPPORTED_PROTOCOL_VERSION {
-            let older = NegotiatedProtocol::from_hello(&hello(PROTOCOL_VERSION - 1)).unwrap();
-            assert_eq!(older.version, PROTOCOL_VERSION - 1);
+        for incompatible in [
+            PROTOCOL_VERSION.saturating_sub(1),
+            PROTOCOL_VERSION.saturating_add(1),
+        ] {
+            let err = NegotiatedProtocol::from_hello(&hello(incompatible))
+                .expect_err("any protocol mismatch must be rejected");
+            assert_eq!(err.code, ErrorCode::ProtocolVersion);
+            assert_eq!(
+                err.message,
+                incompatible_daemon_protocol_message(incompatible)
+            );
         }
     }
 
@@ -6621,7 +6624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_only_request_is_sent_after_v10_negotiation() {
+    async fn v10_request_is_rejected_after_the_current_only_v11_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6635,20 +6638,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        let frame = receiver.recv().await.unwrap().expect("v10 frame");
-        match frame {
-            RecvFrame::Envelope(env) => {
-                assert_eq!(env.v, 10);
-                assert!(matches!(
-                    env.body,
-                    Body::Request {
-                        request: Request::ListSecretInventory { .. },
-                        ..
-                    }
-                ));
-            }
-            other => panic!("expected v10 request envelope, got {other:?}"),
-        }
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            Some(RecvFrame::VersionMismatch { v: 10, .. })
+        ));
     }
 
     #[tokio::test]

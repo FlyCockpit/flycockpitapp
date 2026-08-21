@@ -1993,26 +1993,21 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_hello_socket(socket: PathBuf) -> std::thread::JoinHandle<()> {
-        spawn_hello_socket_with_line(
-            socket,
-            serde_json::json!({
-                "kind": "response",
-                "id": uuid::Uuid::nil(),
-                "response": {
-                    "type": "daemon_status",
-                    "pid": 1,
-                    "uptime_secs": 0,
-                    "active_sessions": 0,
-                    "socket_path": "test.sock",
-                    "daemon_version": "test",
-                    "protocol_version": proto::PROTOCOL_VERSION,
-                    "paused_sessions": 0,
-                    "database_path": "test.db",
-                    "schema_version": crate::db::EXPECTED_SCHEMA_VERSION,
-                }
-            })
-            .to_string(),
-        )
+        let hello = proto::Envelope::response(
+            uuid::Uuid::nil(),
+            proto::Response::DaemonStatus {
+                pid: 1,
+                uptime_secs: 0,
+                active_sessions: 0,
+                socket_path: "test.sock".to_string(),
+                daemon_version: "test".to_string(),
+                protocol_version: proto::PROTOCOL_VERSION,
+                paused_sessions: 0,
+                database_path: "test.db".to_string(),
+                schema_version: crate::db::EXPECTED_SCHEMA_VERSION,
+            },
+        );
+        spawn_hello_socket_with_line(socket, serde_json::to_string(&hello).unwrap())
     }
 
     #[cfg(unix)]

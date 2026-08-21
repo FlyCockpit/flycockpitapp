@@ -23,8 +23,13 @@ use serde_json::Value;
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
 use crate::intel::budget::retained_truncated_body;
-use crate::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
-use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use crate::process::{
+    BoundedPipeCapture, CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES,
+};
+use crate::redact::RedactionTable;
+use crate::tools::common::{
+    OUTPUT_BYTE_CAP, drop_back_margin, drop_front_margin, truncate_head_tail_redacted,
+};
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
 pub(crate) const WEBFETCH: &str = "webfetch";
@@ -296,8 +301,23 @@ impl Tool for CustomBashTool {
                 ));
             }
         };
-        let stdout = stdout_task.join_lossy().await;
-        let stderr = stderr_task.join_lossy().await;
+        // A bounded drain keeps a HEAD and a TAIL, omitting the middle when the
+        // stream overflows. Concatenating head+tail across that omission can leave
+        // a boundary-straddling secret's PREFIX at the head end or SUFFIX at the
+        // tail start — partials the downstream whole-value §7 scrub cannot match.
+        // Join through the redaction-aware path so those partials are elided
+        // before the raw text flows to the §7 chokepoint. `ctx.redact` is the
+        // driver's pre-policy session table; the model dispatch scrubs with the
+        // model's effective egress view. That view is NOT the same object, but for
+        // the case that matters — an untrusted model, whose output is scrubbed —
+        // the policy transforms (`enforced()`, `with_sealed_replacements()`) change
+        // only enforcement/replacement descriptors, never the entry VALUES, so
+        // `max_match_len` here equals the M §7 will match, bounding exactly the
+        // right margin. (A trusted model gets an empty egress table and raw
+        // custody — no downstream scrub to protect, and an empty table here is a
+        // no-op passthrough.)
+        let stdout = boundary_safe_join(&ctx.redact, stdout_task.join().await);
+        let stderr = boundary_safe_join(&ctx.redact, stderr_task.join().await);
 
         let mut combined = String::new();
         combined.push_str(&stdout);
@@ -333,16 +353,23 @@ impl Tool for CustomBashTool {
         let changed_after_build = false;
         if combined.len() > OUTPUT_BYTE_CAP {
             // Byte-boundary-safe; `String::truncate` would panic on a
-            // multibyte boundary. Head+tail keeps any appended stderr.
-            return Ok(
-                ToolOutput::truncated_text(truncate_head_tail(&combined, OUTPUT_BYTE_CAP))
-                    .with_truncated_retention(retained_truncated_body(&combined))
-                    .with_output_sidecar(self.provenance_sidecar(
-                        &selected,
-                        status.code(),
-                        changed_after_build,
-                    )),
-            );
+            // multibyte boundary. Head+tail keeps any appended stderr. The
+            // redacted variant additionally elides the unsafe margin at the
+            // head→middle and middle→tail truncation boundaries so no
+            // boundary-straddling PARTIAL survives into the §7 whole-value scrub;
+            // the retained (retrievable) body is elided at its own prefix-cut
+            // boundary for the same reason.
+            return Ok(ToolOutput::truncated_text(truncate_head_tail_redacted(
+                &ctx.redact,
+                &combined,
+                OUTPUT_BYTE_CAP,
+            ))
+            .with_truncated_retention(boundary_safe_retention(&ctx.redact, &combined))
+            .with_output_sidecar(self.provenance_sidecar(
+                &selected,
+                status.code(),
+                changed_after_build,
+            )));
         }
         Ok(
             ToolOutput::text(combined).with_output_sidecar(self.provenance_sidecar(
@@ -376,6 +403,59 @@ impl CustomBashTool {
                 "exit_code": exit_code,
             }),
         }
+    }
+}
+
+/// Fixed marker inserted at a bounded-drain head/tail junction whose middle was
+/// omitted. A constant (never secret-bearing); the §7 scrub matches it whole.
+const OMITTED_MIDDLE_MARKER: &str = "\n... [output truncated: middle bytes elided] ...\n";
+
+/// Join a bounded-drain capture (retained HEAD + omitted MIDDLE + retained TAIL)
+/// into one string, eliding the unsafe margin at the head/tail junction so no
+/// boundary-straddling secret PARTIAL reaches the downstream §7 whole-value scrub.
+///
+/// When nothing was dropped (`dropped_bytes == 0`) the head and tail are
+/// contiguous in the original stream — there is no omission boundary — so this is
+/// exactly the prior `join_lossy` (`head ++ tail`). It is likewise a no-op join
+/// when the table has no multi-byte literal (`max_match_len <= 1`), so an empty
+/// table never perturbs output. Otherwise it drops the back margin of the head
+/// (which may hold a straddling secret's PREFIX) and the front margin of the tail
+/// (which may hold a straddling secret's SUFFIX) and joins them around the fixed
+/// marker. The head and tail are UTF-8-lossy-decoded SEPARATELY at the
+/// stream-char-boundary split (`head_len`), so an invalid byte in one never
+/// shifts the junction offset.
+fn boundary_safe_join(table: &RedactionTable, cap: BoundedPipeCapture) -> String {
+    let split = cap.head_len.min(cap.bytes.len());
+    let head = String::from_utf8_lossy(&cap.bytes[..split]);
+    let tail = String::from_utf8_lossy(&cap.bytes[split..]);
+    if cap.dropped_bytes == 0 || table.max_match_len() <= 1 {
+        return format!("{head}{tail}");
+    }
+    let safe_head = drop_back_margin(table, &head);
+    let safe_tail = drop_front_margin(table, &tail);
+    format!("{safe_head}{OMITTED_MIDDLE_MARKER}{safe_tail}")
+}
+
+/// Boundary-safe [`retained_truncated_body`] for the retrievable retention copy.
+/// The retention is a PREFIX cut of `combined` at `RETAINED_TRUNCATED_OUTPUT_BYTE_CAP`;
+/// when it is partial, a registered secret straddling that prefix cut leaves its
+/// PREFIX at the retained end. Since `combined` is already boundary-safe at every
+/// drain junction, the only residual boundary is that prefix cut, so drop its
+/// back margin. A non-partial retention (whole body retained) has no cut boundary
+/// and is returned unchanged.
+fn boundary_safe_retention(
+    table: &RedactionTable,
+    combined: &str,
+) -> crate::engine::tool::RetainedTruncatedOutput {
+    let base = retained_truncated_body(combined);
+    if !base.partial {
+        return base;
+    }
+    let safe = drop_back_margin(table, &base.content);
+    crate::engine::tool::RetainedTruncatedOutput {
+        original_byte_len: base.original_byte_len,
+        content: safe.to_string(),
+        partial: true,
     }
 }
 
@@ -999,5 +1079,123 @@ mod tests {
         assert_eq!(sidecar["provenance"], "configured");
         assert_eq!(sidecar["source"], "test");
         assert_eq!(sidecar["exit_code"], 0);
+    }
+
+    fn leak_table(secret: &str) -> RedactionTable {
+        RedactionTable::empty()
+            .with_forced_literal(secret.to_string(), "$leak:test".to_string())
+            .unwrap()
+    }
+
+    // The bounded drain keeps HEAD + omitted-MIDDLE + TAIL. A secret straddling
+    // the head→middle omission leaves its PREFIX at the head end; one straddling
+    // middle→tail leaves its SUFFIX at the tail start. A plain `head ++ tail`
+    // concatenation feeds both partials to the §7 whole-value scrub, which cannot
+    // match a partial. `boundary_safe_join` elides the unsafe margin at the
+    // junction. FAILS against a plain concatenation.
+    #[test]
+    fn boundary_safe_join_elides_junction_partials() {
+        const S1: &str = "sk-live-HEADJUNCTION-0123456789abcdefXY"; // 39 bytes
+        const S2: &str = "sk-live-TAILJUNCTION-0123456789abcdefXY"; // 39 bytes
+        let table = RedactionTable::empty()
+            .with_forced_literal(S1.to_string(), "$leak:1".to_string())
+            .unwrap()
+            .with_forced_literal(S2.to_string(), "$leak:2".to_string())
+            .unwrap();
+        let head_prefix = &S1[..12];
+        let tail_suffix = &S2[S2.len() - 12..];
+        let head = format!("{}{head_prefix}", "A".repeat(100));
+        let tail = format!("{tail_suffix}{}", "B".repeat(100));
+        let head_len = head.len();
+        let bytes = format!("{head}{tail}").into_bytes();
+
+        // Precondition: a plain head++tail leaks both partials past the scrub.
+        let plain = table.scrub(&format!("{head}{tail}"));
+        assert!(
+            plain.contains(head_prefix),
+            "raw join must leak the head prefix"
+        );
+        assert!(
+            plain.contains(tail_suffix),
+            "raw join must leak the tail suffix"
+        );
+
+        let cap = BoundedPipeCapture {
+            bytes,
+            dropped_bytes: 500, // middle omitted → junction is a real boundary
+            head_len,
+        };
+        let scrubbed = table.scrub(&boundary_safe_join(&table, cap));
+        assert!(
+            !scrubbed.contains(head_prefix),
+            "head-end prefix leaked: {scrubbed}"
+        );
+        assert!(!scrubbed.contains(tail_suffix), "tail-start suffix leaked");
+        assert!(!scrubbed.contains(S1));
+        assert!(!scrubbed.contains(S2));
+    }
+
+    // With nothing dropped the head and tail are contiguous (no omission), so the
+    // join is byte-identical to the prior `join_lossy` — no marker, no elision.
+    #[test]
+    fn boundary_safe_join_is_passthrough_when_nothing_dropped() {
+        let table = leak_table("sk-live-UNUSED-0123456789abcdefghijkl");
+        let cap = BoundedPipeCapture {
+            bytes: b"hello world".to_vec(),
+            dropped_bytes: 0,
+            head_len: 5,
+        };
+        assert_eq!(boundary_safe_join(&table, cap), "hello world");
+    }
+
+    // End-to-end through the real tool entry point: a >1 MiB child stays memory-
+    // bounded, a fully-contained secret is still scrubbed (no over-elision), and
+    // neither the model-facing text nor the retrievable retention leaks a partial.
+    #[tokio::test]
+    async fn custom_tool_over_1mb_child_is_bounded_and_leak_free() {
+        const SECRET: &str = "sk-live-EMBEDDED-0123456789abcdefghij"; // 37 bytes
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let mut ctx = crate::tools::common::test_ctx(cwd);
+        ctx.session
+            .set_approval_mode(crate::config::extended::ApprovalMode::Yolo);
+        ctx.redact = std::sync::Arc::new(leak_table(SECRET));
+        let tpl = ToolCommandTemplate {
+            enabled: true,
+            command: format!("printf '%s' {SECRET}; yes 0123456789 | head -c 1200000"),
+            description: None,
+        };
+        let tool = CustomBashTool::from_template_with_provenance(
+            "large",
+            &tpl,
+            ToolTemplateProvenance::Configured {
+                source: "test".to_string(),
+            },
+        );
+
+        let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
+
+        assert!(out.truncated);
+        assert!(
+            out.content.len() <= OUTPUT_BYTE_CAP,
+            "memory bound violated: {}",
+            out.content.len()
+        );
+        // §7 model-dispatch scrub over the model-facing text: the contained secret
+        // is redacted and no partial survives.
+        let scrubbed = ctx.redact.scrub(&out.content);
+        assert!(!scrubbed.contains(SECRET), "contained secret not scrubbed");
+        assert!(scrubbed.contains(ctx.redact.placeholder()));
+        // The retrievable retention (re-injected through §7 on retrieval) is
+        // likewise boundary-safe.
+        let retained = out
+            .truncated_retention
+            .as_ref()
+            .expect("retention for over-cap output");
+        let scrubbed_ret = ctx.redact.scrub(&retained.content);
+        assert!(
+            !scrubbed_ret.contains(SECRET),
+            "retention leaked the secret"
+        );
     }
 }

@@ -2708,3 +2708,41 @@ fn straddle_fixpoint_cut_advances_past_overlapping_literals() {
         .unwrap();
     assert_eq!(self_overlap.straddle_fixpoint_cut("aaaaaQQQQ", 4), 5);
 }
+
+#[test]
+fn straddle_fixpoint_cut_back_retreats_past_overlapping_literals() {
+    // The BACK mirror of the forward fixpoint. Two OVERLAPPING literals ending at
+    // the head end: `abcdefghij` [4,14) and `WXYZabcdef` [0,10) both straddle a
+    // back cut inside them. aho-corasick emits only leftmost-longest, so a single
+    // snap to one emitted match start would leave the other straddling the new
+    // cut. The back fixpoint must retreat to the EARLIEST straddling start (0).
+    let table = RedactionTable::empty()
+        .with_forced_literal("abcdefghij".to_string(), "$leak:a".to_string())
+        .unwrap()
+        .with_forced_literal("WXYZabcdef".to_string(), "$leak:b".to_string())
+        .unwrap();
+    // body: `WXYZabcdefghij....` — `WXYZabcdef` [0,10), `abcdefghij` [4,14).
+    let body = "WXYZabcdefghij....";
+    // A cut at 8 straddles both (0<8<10 and 4<8<14); retreat below both to 0.
+    assert_eq!(table.straddle_fixpoint_cut_back(body, 8), 0);
+    // A cut outside every occurrence is returned unchanged (char boundary).
+    assert_eq!(table.straddle_fixpoint_cut_back(body, 15), 15);
+    // A no-op (empty) table never retreats.
+    assert_eq!(
+        RedactionTable::empty().straddle_fixpoint_cut_back(body, 8),
+        8
+    );
+
+    // SELF-overlap mirror of the forward `aaaaaQQQQ` case: trailing `aaaaa` in
+    // `QQQQaaaaa`, with `aaaa` at [4,8) and [5,9). A cut at 5 straddles [4,8);
+    // a non-overlapping scan alone would then stop, but the fixpoint must keep
+    // retreating past every straddling occurrence until the whole run of `a`s is
+    // dropped — down to 4 (keeping `QQQQ`). (`zzzzz` sets M=5 so the window
+    // reaches the straddlers.)
+    let self_overlap = RedactionTable::empty()
+        .with_forced_literal("zzzzz".to_string(), "$leak:m".to_string())
+        .unwrap()
+        .with_forced_literal("aaaa".to_string(), "$leak:a".to_string())
+        .unwrap();
+    assert_eq!(self_overlap.straddle_fixpoint_cut_back("QQQQaaaaa", 5), 4);
+}

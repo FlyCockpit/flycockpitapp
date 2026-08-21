@@ -1743,6 +1743,75 @@ impl RedactionTable {
         }
     }
 
+    /// The BACK-margin mirror of [`Self::straddle_fixpoint_cut`]. Retreat a byte
+    /// cut BACKWARD, starting from `start`, BELOW every registered literal
+    /// OCCURRENCE that strictly straddles it (`s < cut < s + value.len()`), to a
+    /// fixpoint. After it returns `cut`, no registered literal — overlapping ones
+    /// included — straddles the END of `body[..cut]`, so scrubbing `body[..cut]`
+    /// cannot leave a boundary-straddling PREFIX un-redacted at that end.
+    ///
+    /// This is the mirror the head/tail-capture geometry needs: when a bounded
+    /// drain omits the MIDDLE of a stream, a secret straddling the head→middle
+    /// omission leaves only its PREFIX at the END of the retained head, which the
+    /// whole-value scrub cannot match. Dropping a back margin down to this cut
+    /// removes the prefix without bisecting any fully-retained secret straddling
+    /// the margin point (that would re-expose its suffix at the new end).
+    ///
+    /// Like the forward variant, this checks each registered `entry.value`
+    /// INDEPENDENTLY for straddling occurrences (aho-corasick's leftmost-longest
+    /// emit suppresses overlaps, so one snap past an emitted match can leave a
+    /// different literal straddling), enumerates OVERLAPPING occurrences within
+    /// the bounded `[cut - (M-1), cut + (M-1)]` window, and retreats `cut` to the
+    /// MINIMUM start of any such occurrence, iterating to a fixpoint. `cut`
+    /// strictly decreases each step and is bounded below by `0`, so it converges.
+    /// A returned value `0` means the whole head is unsafe and the caller must
+    /// withhold it (fail-closed).
+    pub fn straddle_fixpoint_cut_back(&self, body: &str, start: usize) -> usize {
+        let mut cut = crate::text::floor_char_boundary(body, start.min(body.len()));
+        let max_match = self.max_match_len();
+        if max_match <= 1 || self.matcher.is_none() {
+            return cut;
+        }
+        loop {
+            // Occurrences that could straddle `cut` start in `(cut - M, cut)` and
+            // end in `(cut, cut + M)`, so they lie within this window. Snap the
+            // window outward to char boundaries so the slice is always valid.
+            let lo = crate::text::floor_char_boundary(body, cut.saturating_sub(max_match - 1));
+            let hi = crate::text::ceil_char_boundary(body, (cut + max_match - 1).min(body.len()));
+            let window = &body[lo..hi];
+            let mut retreated = cut;
+            for entry in &self.entries {
+                let value = entry.value.as_str();
+                if value.is_empty() {
+                    continue;
+                }
+                // Enumerate EVERY occurrence of `value` in the window, OVERLAPPING
+                // included (see the forward variant), and retreat past the START of
+                // any occurrence straddling `cut`.
+                let mut i = 0;
+                while let Some(rel) = window[i..].find(value) {
+                    let start_in_window = i + rel;
+                    let s = lo + start_in_window; // absolute start
+                    let e = s + value.len(); // absolute end (matched == value)
+                    if s < cut && e > cut {
+                        retreated = retreated.min(s);
+                    }
+                    i = crate::text::ceil_char_boundary(window, start_in_window + 1);
+                    if i >= window.len() {
+                        break;
+                    }
+                }
+            }
+            if retreated >= cut {
+                return cut;
+            }
+            cut = retreated; // a match start: a char boundary
+            if cut == 0 {
+                return 0;
+            }
+        }
+    }
+
     /// A no-op table that scrubs nothing, because it has no entries. Used as
     /// the raw-custody token a trusted route receives, as a fallback when a
     /// redaction chokepoint object is needed but the table couldn't be built

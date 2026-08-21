@@ -20,6 +20,13 @@ const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 pub struct BoundedPipeCapture {
     pub bytes: Vec<u8>,
     pub dropped_bytes: usize,
+    /// Byte length of the retained HEAD within `bytes`: `bytes[..head_len]` is the
+    /// head, `bytes[head_len..]` is the tail. `head_len` lands on a char boundary
+    /// of the original stream (the drainer snapped the head there), so when
+    /// `dropped_bytes > 0` this is exactly the head→omitted-middle→tail junction a
+    /// redaction-aware consumer must treat as a boundary. Equals `bytes.len()`
+    /// when nothing was pushed to the tail (small output; no junction).
+    pub head_len: usize,
 }
 
 #[derive(Debug)]
@@ -103,6 +110,7 @@ impl BoundedPipeDrainState {
         bytes.extend_from_slice(&self.tail);
         BoundedPipeCapture {
             dropped_bytes: self.total_read.saturating_sub(bytes.len()),
+            head_len: self.head.len(),
             bytes,
         }
     }

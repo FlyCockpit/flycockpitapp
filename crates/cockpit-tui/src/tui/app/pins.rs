@@ -1120,7 +1120,10 @@ mod tests {
                         protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
-                        schema_version: cockpit_core::db::EXPECTED_SCHEMA_VERSION,
+                        // Handshake negotiation intentionally ignores database
+                        // metadata; keep this socket fixture independent of
+                        // cockpit-core's private storage implementation.
+                        schema_version: 0,
                     },
                 ))
                 .await

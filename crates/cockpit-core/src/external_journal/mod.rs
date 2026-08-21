@@ -36,6 +36,7 @@ pub mod keys;
 pub mod projection;
 pub mod spool;
 
+#[cfg(any(unix, test))]
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +51,7 @@ use cockpit_db::external_journal::{
     ExternalJournalAgeReport, ExternalJournalCapacity, ExternalJournalRecord, ExternalJournalState,
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
+#[cfg(any(unix, test))]
 use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
 
 pub(crate) use fsguard::DirGuard;

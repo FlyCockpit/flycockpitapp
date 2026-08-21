@@ -11,11 +11,14 @@
 //! descriptor.
 
 /// Exact Unix file mode required for the recovery artifact.
+#[cfg(any(unix, test))]
 pub const EXPECTED_FILE_MODE: u32 = 0o600;
 /// Exact Unix directory mode required for the recovery directory.
+#[cfg(any(unix, test))]
 pub const EXPECTED_DIR_MODE: u32 = 0o700;
 
 /// What the Unix syscall layer observed about one artifact file.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnixFileStat {
     pub is_regular_file: bool,
@@ -26,6 +29,7 @@ pub struct UnixFileStat {
 }
 
 /// What the Unix syscall layer observed about the recovery directory.
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnixDirStat {
     pub is_directory: bool,
@@ -87,6 +91,7 @@ pub enum Violation {
     ParentIdentityMismatch,
 }
 
+#[cfg(any(unix, test))]
 pub fn verify_unix_file(stat: UnixFileStat, expected_uid: u32) -> Result<(), Violation> {
     if stat.is_symlink {
         return Err(Violation::Symlink);
@@ -109,6 +114,7 @@ pub fn verify_unix_file(stat: UnixFileStat, expected_uid: u32) -> Result<(), Vio
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 pub fn verify_unix_dir(stat: UnixDirStat) -> Result<(), Violation> {
     if stat.is_symlink {
         return Err(Violation::Symlink);

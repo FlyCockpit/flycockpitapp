@@ -94,12 +94,14 @@ pub struct EventEnvelope {
 /// Owns foreground-daemon metadata from pid-file publication through boot and
 /// shutdown. Early startup failures (including schema rejection) must not
 /// leave a dead pid, socket, or endpoint record behind.
+#[cfg(any(unix, test))]
 struct ForegroundMetadataGuard {
     paths: DaemonPaths,
     pid: u32,
     armed: bool,
 }
 
+#[cfg(any(unix, test))]
 impl ForegroundMetadataGuard {
     fn new(paths: &DaemonPaths) -> Self {
         Self {
@@ -117,6 +119,7 @@ impl ForegroundMetadataGuard {
     }
 }
 
+#[cfg(any(unix, test))]
 impl Drop for ForegroundMetadataGuard {
     fn drop(&mut self) {
         self.cleanup();
@@ -234,16 +237,19 @@ fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
+#[cfg(any(unix, test))]
 fn write_endpoint_record(paths: &DaemonPaths) -> Result<()> {
     write_endpoint_record_with_pid(paths, std::process::id())
 }
 
+#[cfg(any(unix, test))]
 fn write_endpoint_record_with_pid(paths: &DaemonPaths, pid: u32) -> Result<()> {
     let canonical = DaemonPaths::resolve_canonical()
         .context("resolving canonical daemon paths for endpoint publication")?;
     write_endpoint_record_with_pid_and_canonical(paths, &canonical, pid)
 }
 
+#[cfg(any(unix, test))]
 fn write_endpoint_record_with_pid_and_canonical(
     paths: &DaemonPaths,
     canonical: &DaemonPaths,
@@ -276,6 +282,7 @@ fn write_endpoint_record_with_pid_and_canonical(
     std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))
 }
 
+#[cfg(any(unix, test))]
 fn remove_endpoint_record_if_owned(paths: &DaemonPaths) {
     if paths.ephemeral {
         return;
@@ -287,6 +294,7 @@ fn remove_endpoint_record_if_owned(paths: &DaemonPaths) {
     remove_endpoint_record_if_owned_with_canonical(paths, &canonical);
 }
 
+#[cfg(any(unix, test))]
 fn remove_endpoint_record_if_owned_with_canonical(paths: &DaemonPaths, canonical: &DaemonPaths) {
     if paths.ephemeral {
         return;
@@ -315,6 +323,7 @@ fn remove_endpoint_record_if_owned_with_canonical(paths: &DaemonPaths, canonical
     }
 }
 
+#[cfg(any(unix, test))]
 fn remove_endpoint_record_unverified() {
     if let Ok(path) = endpoint_file() {
         let _ = std::fs::remove_file(path);
@@ -621,6 +630,7 @@ fn status_for_socket_response(response: &SocketHelloResponse) -> DaemonStatus {
     }
 }
 
+#[cfg(any(unix, test))]
 fn parse_socket_hello_line(socket: &Path, line: &str) -> Option<proto::DaemonHello> {
     match proto::parse_daemon_hello_line(line) {
         Ok(hello) => hello,
@@ -1320,14 +1330,6 @@ async fn run_foreground_inner_with_boot_db(
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let mut metadata_guard = ForegroundMetadataGuard::new(&paths);
 
-    let listener = bind_private_socket(&paths.socket)?;
-    if boot_db.is_some() {
-        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
-    } else {
-        write_endpoint_record(&paths)?;
-    }
-    timer.phase("probe_pidfile_bind");
-
     let ctx = std::sync::Arc::new(match boot_db {
         Some(db) => {
             server::boot_with_db(
@@ -1345,6 +1347,17 @@ async fn run_foreground_inner_with_boot_db(
         resume_all_paused_sessions(&ctx.db).await?;
     }
     timer.phase("boot");
+
+    // Do not expose a connectable socket until boot has completed. A client
+    // that observes a bound socket expects the hello promptly; publishing it
+    // before database/config initialization creates a startup handshake race.
+    let listener = bind_private_socket(&paths.socket)?;
+    if boot_db.is_some() {
+        write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
+    } else {
+        write_endpoint_record(&paths)?;
+    }
+    timer.phase("bind_publish");
 
     // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
     // route into the single graceful-shutdown path. The **first** signal
@@ -1604,6 +1617,7 @@ pub async fn run_foreground_inner(
 /// notice — so even if `drain_all`'s own timeout is somehow still pending,
 /// the gate reflects "forced" for any late observer. Detached; the process
 /// exits shortly after `drain_all` returns regardless.
+#[cfg(any(unix, test))]
 fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration) {
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
@@ -1614,6 +1628,7 @@ fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration
     });
 }
 
+#[cfg(any(unix, test))]
 async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
     for row in db.paused_session_work_all().await? {
         if let Err(e) = db.mark_paused_session_work_resumed(row.session_id).await {
@@ -1639,6 +1654,7 @@ async fn resume_all_paused_sessions(db: &crate::db::Db) -> Result<()> {
 /// whose last UI detached *mid-inference* drains the in-flight work (same
 /// grace/force bound) before the process exits; only an *idle* one reaps
 /// with nothing to wait on.
+#[cfg(any(unix, test))]
 async fn idle_watchdog(
     mut presence: tokio::sync::watch::Receiver<usize>,
     idle_grace: Duration,
@@ -1774,6 +1790,7 @@ fn stop_unix_with_timeout(
     }
 }
 
+#[cfg(any(unix, test))]
 fn remove_metadata_if_pid_matches(paths: &DaemonPaths, expected_pid: u32) -> bool {
     if read_pid(paths) != Some(expected_pid) {
         return false;
@@ -1975,7 +1992,26 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_hello_socket(socket: PathBuf) -> std::thread::JoinHandle<()> {
-        spawn_hello_socket_with_line(socket, "{}".to_string())
+        spawn_hello_socket_with_line(
+            socket,
+            serde_json::json!({
+                "kind": "response",
+                "id": uuid::Uuid::nil(),
+                "response": {
+                    "type": "daemon_status",
+                    "pid": 1,
+                    "uptime_secs": 0,
+                    "active_sessions": 0,
+                    "socket_path": "test.sock",
+                    "daemon_version": "test",
+                    "protocol_version": proto::PROTOCOL_VERSION,
+                    "paused_sessions": 0,
+                    "database_path": "test.db",
+                    "schema_version": crate::db::EXPECTED_SCHEMA_VERSION,
+                }
+            })
+            .to_string(),
+        )
     }
 
     #[cfg(unix)]

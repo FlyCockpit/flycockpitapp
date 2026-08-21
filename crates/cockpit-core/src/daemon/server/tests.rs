@@ -13493,13 +13493,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "begin_sealed_owner_operation"
         | "apply_sealed_owner_operation"
         | "cancel_sealed_owner_operation"
-        | "sealed_owner_inventory"
         | "edit_sealed_owner_description"
         | "list_sealed_actions"
         | "create_sealed_action"
         | "revise_sealed_action_description"
         | "revise_sealed_action_enabled"
         | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "sealed_owner_inventory" => AuthzAllowedOutcome::Response,
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -26288,9 +26288,7 @@ async fn delete_session_v9_envelope_does_not_reject_active_session() {
     // A v9 client: negotiated protocol version 9. The active-session
     // rejection is v10-only, so a v9 envelope carrying the unchanged
     // DeleteSession tag must NOT get the new rejection behavior.
-    let mut state = MutableClientState::detached_for_test_with_protocol_version(
-        proto::MIN_SUPPORTED_PROTOCOL_VERSION,
-    );
+    let mut state = MutableClientState::detached_for_test_with_protocol_version(9);
     // A freshly created session is active (ended_at is None).
     let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
 

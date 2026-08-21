@@ -574,6 +574,7 @@ fn remove_pending_request(
     pending.remove(&id)
 }
 
+#[cfg(any(unix, test))]
 fn is_nil_daemon_status_hello(id: Uuid, response: &Response) -> bool {
     id.is_nil() && matches!(response, Response::DaemonStatus { .. })
 }

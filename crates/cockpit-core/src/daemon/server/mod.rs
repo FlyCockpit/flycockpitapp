@@ -3441,10 +3441,12 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
     }
 }
 
+#[cfg(any(unix, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     run_retention_tick_db(ctx.db.clone(), cfg).await;
 }
 
+#[cfg(any(unix, test))]
 async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     let now_secs = chrono::Utc::now().timestamp();
     run_retention_pass(db, cfg, now_secs).await;
@@ -4088,6 +4090,7 @@ where
     handle_client_transport_as(stream, ctx, principal, client_instance_id).await
 }
 
+#[cfg(any(unix, test))]
 async fn handle_client_transport<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -5189,4 +5192,6 @@ mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;
-pub(crate) use dispatch::spawn_lock_sweeper;
+pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
+    dispatch::spawn_lock_sweeper(ctx);
+}

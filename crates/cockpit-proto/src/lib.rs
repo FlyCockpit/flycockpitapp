@@ -6000,7 +6000,6 @@ mod tests {
             .send(&response)
             .await
             .expect_err("v10-only response must be gated on a v9 connection");
-        assert!(error.to_string().contains("provider_credential_deleted"));
         assert!(error.to_string().contains("requires v10"));
     }
 

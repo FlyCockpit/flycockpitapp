@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use super::display::HeldWaylandConnection;
 use super::display::{LinuxDesktopProbe, probe_linux_desktop};
 use super::types::{PlatformKind, SafeErrorKind, SessionContext, SkipReason};
@@ -23,7 +23,7 @@ pub trait ExecutableClipboard: Send {
 #[derive(Debug, Default)]
 pub struct PlatformExecutable {
     /// Optional pre-held Wayland connection (tests / service injection).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub wayland: Option<HeldWaylandConnection>,
 }
 
@@ -33,12 +33,12 @@ impl ExecutableClipboard for PlatformExecutable {
             PlatformKind::MacOs => run_pbcopy(text),
             PlatformKind::Windows => run_clip_exe(text),
             PlatformKind::Linux => {
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 {
                     let held = self.wayland.take();
                     run_wl_copy(text, held)
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 {
                     let _ = text;
                     Err(SafeErrorKind::Unsupported)
@@ -71,8 +71,9 @@ pub fn executable_eligibility(ctx: &SessionContext) -> Result<(), SkipReason> {
         PlatformKind::Linux => {
             // X11 never eligible. Wayland only with held connection.
             match probe_linux_desktop() {
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 LinuxDesktopProbe::Wayland(_) => Ok(()),
+                #[cfg(target_os = "linux")]
                 LinuxDesktopProbe::X11Unsupported { reason } => Err(reason),
                 LinuxDesktopProbe::Ineligible { reason } => Err(reason),
             }
@@ -105,8 +106,9 @@ pub fn executable_eligibility_with_probe(
     match ctx.platform {
         PlatformKind::MacOs | PlatformKind::Windows => Ok(()),
         PlatformKind::Linux => match probe {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             LinuxDesktopProbe::Wayland(_) => Ok(()),
+            #[cfg(target_os = "linux")]
             LinuxDesktopProbe::X11Unsupported { reason } => Err(*reason),
             LinuxDesktopProbe::Ineligible { reason } => Err(*reason),
         },
@@ -131,7 +133,7 @@ fn run_clip_exe(text: &str) -> Result<(), SafeErrorKind> {
     spawn_stdin_bytes(&path, &[], &encoded, &[])
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_wl_copy(text: &str, held: Option<HeldWaylandConnection>) -> Result<(), SafeErrorKind> {
     use std::os::fd::AsRawFd;
 
@@ -176,6 +178,7 @@ fn run_wl_copy(text: &str, held: Option<HeldWaylandConnection>) -> Result<(), Sa
     result
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_wl_copy() -> Result<PathBuf, SafeErrorKind> {
     let primary = Path::new("/usr/bin/wl-copy");
     if primary.exists() {

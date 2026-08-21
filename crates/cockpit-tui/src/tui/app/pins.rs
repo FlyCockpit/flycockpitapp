@@ -1108,6 +1108,23 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut proto = ProtoStream::new(stream);
+            proto
+                .send(&Envelope::response(
+                    uuid::Uuid::nil(),
+                    Response::DaemonStatus {
+                        pid: 1,
+                        uptime_secs: 0,
+                        active_sessions: 0,
+                        socket_path: "test.sock".to_string(),
+                        daemon_version: "test".to_string(),
+                        protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                        paused_sessions: 0,
+                        database_path: "test.db".to_string(),
+                        schema_version: cockpit_core::db::EXPECTED_SCHEMA_VERSION,
+                    },
+                ))
+                .await
+                .unwrap();
             let env = match proto.recv().await.unwrap().unwrap() {
                 RecvFrame::Envelope(env) => env,
                 RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),

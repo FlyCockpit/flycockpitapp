@@ -416,7 +416,7 @@ fn take_forced_cleanup_failure() -> bool {
 fn take_forced_cleanup_failure() -> bool {
     take_forced_failure(&FORCE_SOURCE_CLEANUP_FAILURE)
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn take_forced_metadata_failure() -> bool {
     false
 }

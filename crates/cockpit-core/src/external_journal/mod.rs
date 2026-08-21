@@ -471,6 +471,7 @@ impl ExternalJournal {
         Ok(operations)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn write_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -490,6 +491,7 @@ impl ExternalJournal {
         Ok(())
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn read_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -1821,6 +1823,7 @@ impl ExternalJournal {
     }
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteRenameArtifactV1 {
     pub logical_attachment_id: Uuid,
@@ -1833,10 +1836,12 @@ pub(crate) struct RemoteRenameArtifactV1 {
     pub target_name: String,
 }
 
+#[cfg(any(unix, test))]
 fn remote_rename_artifact_name(artifact_id: Uuid, generation: u64) -> String {
     format!("{artifact_id}.{generation}.rr1")
 }
 
+#[cfg(any(unix, test))]
 impl RemoteRenameArtifactV1 {
     const FIXED: usize = 4 + 16 + 16 + 8 + 57 * 3 + 2 + 2;
 

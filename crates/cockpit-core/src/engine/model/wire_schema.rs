@@ -351,11 +351,26 @@ mod tests {
             return;
         };
         if is_object_schema(object) {
-            if !object.contains_key("properties") {
+            let typed_map = object.get("propertyNames").is_some_and(Value::is_object)
+                && object.get("maxProperties").is_some()
+                && object
+                    .get("additionalProperties")
+                    .and_then(|value| value.get("oneOf"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|variants| {
+                        !variants.is_empty()
+                            && variants.iter().all(|variant| {
+                                variant
+                                    .get("additionalProperties")
+                                    .is_some_and(|value| value == &Value::Bool(false))
+                            })
+                    });
+            if !object.contains_key("properties") && !typed_map {
                 out.push(format!("{path}: object schema has no properties"));
             }
             if let Some(additional) = object.get("additionalProperties")
                 && additional != &Value::Bool(false)
+                && !typed_map
             {
                 out.push(format!(
                     "{path}: additionalProperties must be false, got {additional}"

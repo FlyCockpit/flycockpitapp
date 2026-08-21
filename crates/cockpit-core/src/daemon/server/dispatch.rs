@@ -678,6 +678,7 @@ pub(super) fn remote_request_hash(ctx: &DaemonContext, canonical: &[u8]) -> [u8;
 /// equals the remotely-admissible `transactional_mutation` rows enumerated from
 /// the `command!` classification table (a new tag missing here — or a stale tag
 /// listed here — fails the gate).
+#[cfg(any(unix, test))]
 pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
     "send_user_message",
     "cancel_run_invocation",
@@ -712,6 +713,7 @@ pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
 /// registry entry fails there); it does NOT trip a release daemon. The set
 /// computation still references the registry in every profile so the const is
 /// never dead code.
+#[cfg(any(unix, test))]
 pub(super) fn debug_assert_ledger_site_registry_consistent() {
     macro_rules! transactional_registry_rows {
         (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
@@ -10183,6 +10185,7 @@ pub(super) async fn recover_provider_config_journals(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 pub(super) async fn recover_all_provider_config_journals(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
@@ -11293,6 +11296,7 @@ pub(super) async fn recover_mcp_config_journals(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 pub(super) async fn recover_all_mcp_config_journals(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {

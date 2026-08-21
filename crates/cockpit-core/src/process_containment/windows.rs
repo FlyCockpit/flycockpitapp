@@ -283,6 +283,7 @@ pub mod job_symbols {
         CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
     };
 
+    #[cfg(test)]
     pub fn inventory_symbol_names() -> &'static [&'static str] {
         &[
             "CreateJobObjectW",

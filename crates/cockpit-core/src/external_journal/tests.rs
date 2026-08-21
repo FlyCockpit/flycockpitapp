@@ -15,16 +15,16 @@ use cockpit_db::external_journal::{
     CapsulePartition, EXTERNAL_JOURNAL_ADMISSION_CAPSULES, EXTERNAL_JOURNAL_PREPARED_TTL_MS,
     EXTERNAL_JOURNAL_UNRESOLVED_CRITICAL_MS, ExternalJournalState,
 };
+#[cfg(unix)]
 use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
 
+#[cfg(unix)]
+use super::RemoteRenameArtifactV1;
 use super::capsule::{CAPSULE_BYTES, CapsuleSlot, SLOT_BYTES};
 use super::keys::SpoolKeyRing;
 use super::projection::{Digest, OperationBody, SafeToken, SanitizedProjection};
 use super::spool::{Spool, SpoolAccess, SpoolFaults};
-use super::{
-    DbFaults, DispatchTicket, ExternalJournal, ExternalJournalError, OutcomeDurability,
-    RemoteRenameArtifactV1,
-};
+use super::{DbFaults, DispatchTicket, ExternalJournal, ExternalJournalError, OutcomeDurability};
 
 const T0: i64 = 1_700_000_000_000;
 

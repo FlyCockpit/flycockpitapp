@@ -1870,12 +1870,14 @@ fn validate_path_text(path: &str) -> std::result::Result<(), ErrorPayload> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn posix_literal(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngressShellDialect {
+    #[cfg(any(not(windows), test))]
     Posix,
     #[allow(dead_code)]
     PowerShell,
@@ -1889,6 +1891,7 @@ fn shell_path_literal(
 ) -> std::result::Result<String, ErrorPayload> {
     validate_path_text(path)?;
     match dialect {
+        #[cfg(any(not(windows), test))]
         IngressShellDialect::Posix => Ok(posix_literal(path)),
         IngressShellDialect::PowerShell => Ok(format!("'{}'", path.replace('\'', "''"))),
         IngressShellDialect::Cmd => {

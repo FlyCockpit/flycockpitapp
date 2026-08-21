@@ -1375,21 +1375,21 @@ mod concurrency {
         }
     }
 
-    #[test]
-    fn all_or_none_acquisition_commits_all() {
+    #[tokio::test]
+    async fn all_or_none_acquisition_commits_all() {
         let acquirer = FakeReservationAcquirer::new(2);
         let req = reservation_request("inv-1", 16, 0);
-        let result = acquirer.acquire(req);
+        let result = acquirer.acquire(req).await;
         assert!(matches!(result, ReservationAcquisition::Committed { .. }));
         assert_eq!(acquirer.acquired_count(), 1);
     }
 
-    #[test]
-    fn cap_exhaustion_rolls_back_all() {
+    #[tokio::test]
+    async fn cap_exhaustion_rolls_back_all() {
         let acquirer = FakeReservationAcquirer::new(2);
         // Simulate cap already exhausted.
         let req = reservation_request("inv-1", 16, 16);
-        let result = acquirer.acquire(req);
+        let result = acquirer.acquire(req).await;
         assert!(matches!(
             result,
             ReservationAcquisition::RolledBack {
@@ -1399,12 +1399,12 @@ mod concurrency {
         assert_eq!(acquirer.acquired_count(), 0);
     }
 
-    #[test]
-    fn provider_concurrency_exhaustion_rolls_back_all() {
+    #[tokio::test]
+    async fn provider_concurrency_exhaustion_rolls_back_all() {
         let acquirer = FakeReservationAcquirer::new(1);
         // Acquire one slot.
         let req1 = reservation_request("inv-1", 16, 0);
-        acquirer.acquire(req1);
+        acquirer.acquire(req1).await;
         // Second acquire: provider concurrency exhausted.
         let req2 = ReservationRequest {
             invocation_id: "inv-2".to_string(),
@@ -1417,7 +1417,7 @@ mod concurrency {
             provider_concurrency_max: 2,
             current_provider_concurrency: 1,
         };
-        let result = acquirer.acquire(req2);
+        let result = acquirer.acquire(req2).await;
         assert!(matches!(
             result,
             ReservationAcquisition::RolledBack {
@@ -1426,82 +1426,64 @@ mod concurrency {
         ));
     }
 
-    #[test]
-    fn no_overcommit() {
+    #[tokio::test]
+    async fn no_overcommit() {
         let acquirer = FakeReservationAcquirer::new(2);
         // Acquire max.
-        acquirer.acquire(reservation_request("inv-1", 16, 0));
-        acquirer.acquire(ReservationRequest {
-            invocation_id: "inv-2".to_string(),
-            session_id: "s1".to_string(),
-            sidecar_invocation_cap: SidecarInvocationCap {
-                value: 16,
-                provenance: SidecarInvocationCapProvenance::Configured,
-            },
-            current_session_usage: 1,
-            provider_concurrency_max: 2,
-            current_provider_concurrency: 1,
-        });
+        acquirer.acquire(reservation_request("inv-1", 16, 0)).await;
+        acquirer
+            .acquire(ReservationRequest {
+                invocation_id: "inv-2".to_string(),
+                session_id: "s1".to_string(),
+                sidecar_invocation_cap: SidecarInvocationCap {
+                    value: 16,
+                    provenance: SidecarInvocationCapProvenance::Configured,
+                },
+                current_session_usage: 1,
+                provider_concurrency_max: 2,
+                current_provider_concurrency: 1,
+            })
+            .await;
         assert_eq!(acquirer.acquired_count(), 2);
         // Third acquire must fail.
-        let result = acquirer.acquire(ReservationRequest {
-            invocation_id: "inv-3".to_string(),
-            session_id: "s1".to_string(),
-            sidecar_invocation_cap: SidecarInvocationCap {
-                value: 16,
-                provenance: SidecarInvocationCapProvenance::Configured,
-            },
-            current_session_usage: 2,
-            provider_concurrency_max: 2,
-            current_provider_concurrency: 2,
-        });
+        let result = acquirer
+            .acquire(ReservationRequest {
+                invocation_id: "inv-3".to_string(),
+                session_id: "s1".to_string(),
+                sidecar_invocation_cap: SidecarInvocationCap {
+                    value: 16,
+                    provenance: SidecarInvocationCapProvenance::Configured,
+                },
+                current_session_usage: 2,
+                provider_concurrency_max: 2,
+                current_provider_concurrency: 2,
+            })
+            .await;
         assert!(matches!(result, ReservationAcquisition::RolledBack { .. }));
         assert_eq!(acquirer.acquired_count(), 2); // no overcommit
     }
 
-    #[test]
-    fn exactly_once_release() {
+    #[tokio::test]
+    async fn exactly_once_settle_releases() {
         let acquirer = FakeReservationAcquirer::new(2);
-        acquirer.acquire(reservation_request("inv-1", 16, 0));
-        acquirer.release("inv-1");
+        acquirer.acquire(reservation_request("inv-1", 16, 0)).await;
+        acquirer.settle("inv-1").await.unwrap();
         assert_eq!(acquirer.acquired_count(), 0);
-        assert_eq!(acquirer.released_count(), 1);
-        // Release again: no double-release.
-        acquirer.release("inv-1");
-        assert_eq!(acquirer.released_count(), 1);
+        assert_eq!(acquirer.settled_count(), 1);
+        // Settle again: no double-settle.
+        acquirer.settle("inv-1").await.unwrap();
+        assert_eq!(acquirer.settled_count(), 1);
     }
 
-    #[test]
-    fn pre_handoff_cancellation_releases_reservations() {
+    #[tokio::test]
+    async fn settle_on_terminal_outcome_releases_reservation() {
         let acquirer = FakeReservationAcquirer::new(2);
-        acquirer.acquire(reservation_request("inv-1", 16, 0));
-        // Cancellation before handoff: release.
-        acquirer.release("inv-1");
+        acquirer.acquire(reservation_request("inv-1", 16, 0)).await;
+        // On any terminal outcome (success or failure) settle releases the
+        // reservation so no queued row leaks.
+        acquirer.settle("inv-1").await.unwrap();
         assert_eq!(acquirer.acquired_count(), 0);
-    }
-
-    #[test]
-    fn terminal_reconciliation_releases_concurrency_keeps_cap() {
-        let acquirer = FakeReservationAcquirer::new(2);
-        acquirer.acquire(reservation_request("inv-1", 16, 0));
-        // Terminal reconciliation: provider concurrency slot released, but
-        // sidecar invocation cap charge remains (release = Never per central
-        // media policy).
-        acquirer.reconcile("inv-1", true);
-        assert_eq!(acquirer.acquired_count(), 0);
-        assert_eq!(acquirer.reconciled_count(), 1);
-    }
-
-    #[test]
-    fn ambiguous_handoff_remains_accounted_until_terminal() {
-        let acquirer = FakeReservationAcquirer::new(2);
-        acquirer.acquire(reservation_request("inv-1", 16, 0));
-        // Ambiguous: not terminal yet — remains accounted.
-        acquirer.reconcile("inv-1", false);
-        assert_eq!(acquirer.acquired_count(), 1); // still held
-        // Later terminal reconciliation releases.
-        acquirer.reconcile("inv-1", true);
-        assert_eq!(acquirer.acquired_count(), 0);
+        assert_eq!(acquirer.settled_count(), 1);
     }
 }
 

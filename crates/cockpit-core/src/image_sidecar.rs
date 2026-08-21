@@ -44,10 +44,11 @@
 //! that dimension via [`SidecarInvocationCap`] and never defines a sidecar-local
 //! cap field or fallback.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1839,14 +1840,49 @@ impl ReservationFailureReason {
     }
 }
 
-/// A pure, injected reservation acquirer. Implementations own the atomic
-/// all-or-none acquisition logic. Cancellation before proven handoff releases
-/// them; accepted/ambiguous work remains accounted until terminal
-/// reconciliation.
+/// A terminalization failure: the reservation could not be settled/released.
+/// The caller MUST fail closed rather than report success over a leaked row.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("reservation settlement failed: {message}")]
+pub struct ReservationSettleError {
+    pub message: String,
+}
+
+impl ReservationSettleError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// An injected reservation acquirer. Implementations own the atomic
+/// all-or-none acquisition logic.
+///
+/// The lifecycle in this tree is deliberately simple: [`acquire`](Self::acquire)
+/// reserves, and [`settle`](Self::settle) terminally releases the reservation on
+/// the terminal outcome (success OR failure) so no queued row ever leaks.
+/// `settle` returns a `Result` so the caller can fail closed on a
+/// terminalization failure rather than silently leaking a reserved row.
+///
+/// The methods are `async` because the production implementation
+/// ([`crate::image_sidecar::pipeline::LedgerReservationAcquirer`]) is backed by
+/// the async, `Db`-transaction-threaded media-reservation ledger. Breaking this
+/// pure-module API to force the real ledger is preferred (pre-release) over
+/// leaving a sync footgun that cannot call the real ledger.
+///
+/// The real `AtHandoff` per-session charge, provider-concurrency enforcement,
+/// and ambiguous-handoff (keep-charge) accounting are deferred to the
+/// real-`SidecarProviderTransport` follow-up (see the `TODO` on
+/// [`LedgerReservationAcquirer::settle`]); the stubbed transport performs no
+/// real external egress, so there is nothing to charge or keep in this tree.
+#[async_trait]
 pub trait ReservationAcquirer: Send + Sync {
-    fn acquire(&self, request: ReservationRequest) -> ReservationAcquisition;
-    fn release(&self, invocation_id: &str);
-    fn reconcile(&self, invocation_id: &str, terminal: bool);
+    async fn acquire(&self, request: ReservationRequest) -> ReservationAcquisition;
+    /// Terminally settle (release) the reservation identified by
+    /// `reservation_id` so no queued row leaks. Returns `Err` if terminalization
+    /// failed.
+    async fn settle(&self, reservation_id: &str) -> Result<(), ReservationSettleError>;
 }
 
 /// Request for atomic reservation acquisition.
@@ -1861,21 +1897,30 @@ pub struct ReservationRequest {
 }
 
 /// A fake reservation acquirer for tests. All-or-none, no overcommit,
-/// exactly-once release/reconciliation.
+/// exactly-once settle.
+///
+/// This is `#[cfg(test)]`: production composition never constructs it. The
+/// production acquirer is
+/// [`crate::image_sidecar::pipeline::LedgerReservationAcquirer`].
+#[cfg(test)]
 pub struct FakeReservationAcquirer {
     state: Mutex<FakeReservationState>,
     provider_concurrency_max: u64,
 }
 
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct FakeReservationState {
     acquired: BTreeMap<String, FakeReservation>,
-    released: BTreeSet<String>,
-    reconciled: BTreeSet<String>,
+    settled: BTreeSet<String>,
     session_usage: u64,
     provider_concurrency: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct FakeReservation {
@@ -1885,6 +1930,7 @@ struct FakeReservation {
     provider_concurrency_slot: String,
 }
 
+#[cfg(test)]
 impl FakeReservationAcquirer {
     pub fn new(provider_concurrency_max: u64) -> Self {
         Self {
@@ -1897,12 +1943,8 @@ impl FakeReservationAcquirer {
         self.state.lock().unwrap().acquired.len()
     }
 
-    pub fn released_count(&self) -> usize {
-        self.state.lock().unwrap().released.len()
-    }
-
-    pub fn reconciled_count(&self) -> usize {
-        self.state.lock().unwrap().reconciled.len()
+    pub fn settled_count(&self) -> usize {
+        self.state.lock().unwrap().settled.len()
     }
 
     pub fn is_acquired(&self, invocation_id: &str) -> bool {
@@ -1914,8 +1956,10 @@ impl FakeReservationAcquirer {
     }
 }
 
+#[cfg(test)]
+#[async_trait]
 impl ReservationAcquirer for FakeReservationAcquirer {
-    fn acquire(&self, request: ReservationRequest) -> ReservationAcquisition {
+    async fn acquire(&self, request: ReservationRequest) -> ReservationAcquisition {
         let mut state = self.state.lock().unwrap();
         // All-or-none: check every reservation before committing any.
         if request.current_session_usage >= request.sidecar_invocation_cap.value {
@@ -1950,29 +1994,17 @@ impl ReservationAcquirer for FakeReservationAcquirer {
         }
     }
 
-    fn release(&self, invocation_id: &str) {
+    async fn settle(&self, reservation_id: &str) -> Result<(), ReservationSettleError> {
         let mut state = self.state.lock().unwrap();
-        if let Some(reservation) = state.acquired.remove(invocation_id) {
-            // Exactly-once release.
-            if state.released.insert(invocation_id.to_string()) {
+        if let Some(reservation) = state.acquired.remove(reservation_id) {
+            // Exactly-once terminal settlement releases the reservation.
+            if state.settled.insert(reservation_id.to_string()) {
                 state.session_usage = state.session_usage.saturating_sub(1);
                 state.provider_concurrency = state.provider_concurrency.saturating_sub(1);
                 let _ = reservation;
             }
         }
-    }
-
-    fn reconcile(&self, invocation_id: &str, terminal: bool) {
-        let mut state = self.state.lock().unwrap();
-        if terminal {
-            // Terminal reconciliation: release the slot but keep the session
-            // cap charge (sidecar invocations are never reclaimed per the
-            // central media policy: release = Never).
-            if state.acquired.remove(invocation_id).is_some() {
-                state.reconciled.insert(invocation_id.to_string());
-                state.provider_concurrency = state.provider_concurrency.saturating_sub(1);
-            }
-        }
+        Ok(())
     }
 }
 
@@ -1993,6 +2025,7 @@ pub fn computer_use_eligibility_unchanged(
 }
 
 pub mod dossier;
+pub mod pipeline;
 
 #[cfg(test)]
 mod tests;

@@ -570,6 +570,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "extract_video_clip",
         "extract_audio",
         "read_image",
+        "ask_image",
         "list_image_generation_targets",
         "generate_image",
         "get_image_generation_job",
@@ -841,6 +842,14 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             condition: Some("Requires typed session attachments and the image crate."),
         },
         BuiltinToolInventoryItem {
+            family: "Media",
+            name: "ask_image",
+            summary: "Ask one bounded question about a single current-session image via a sidecar model.",
+            condition: Some(
+                "Routes through the sidecar egress policy; requires typed session attachments.",
+            ),
+        },
+        BuiltinToolInventoryItem {
             family: "Image Generation",
             name: "list_image_generation_targets",
             summary: "List enabled image-generation targets with safe capability/health/cost projections.",
@@ -955,6 +964,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::audio_video::ExtractVideoClipTool),
         Arc::new(tools::audio_video::ExtractAudioTool),
         Arc::new(tools::read_image::ReadImageTool),
+        Arc::new(tools::ask_image::AskImageTool),
         Arc::new(crate::image_generation_agent_tools::ListImageGenerationTargetsTool),
         Arc::new(crate::image_generation_agent_tools::GenerateImageTool),
         Arc::new(crate::image_generation_agent_tools::GetImageGenerationJobTool),
@@ -991,6 +1001,7 @@ fn materialize_tool_by_name(
         "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
         "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool)),
         "read_image" => tb.with(Arc::new(tools::read_image::ReadImageTool)),
+        "ask_image" => tb.with(Arc::new(tools::ask_image::AskImageTool)),
         "list_image_generation_targets" => tb.with(Arc::new(
             crate::image_generation_agent_tools::ListImageGenerationTargetsTool,
         )),
@@ -1467,7 +1478,10 @@ fn effective_tool_tier(
             _ => crate::agents::ToolTier::Disabled,
         };
     }
-    if matches!(tool, "read_image") {
+    // `ask_image` is attached to the same agent classes as `read_image`
+    // (default: every tier that gets read_image also gets ask_image), so vision
+    // questions go through the sidecar egress policy rather than the primary.
+    if matches!(tool, "read_image" | "ask_image") {
         return match def.name.as_str() {
             "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
             "Careful" | "builder" | "deepthink" | "Multireview" => {
@@ -1519,6 +1533,21 @@ fn with_read_image_tools(
         crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "read_image", def, args)?,
         crate::agents::ToolTier::Discoverable => {
             add_discoverable_tool_by_name(tb, "read_image", def, args)?
+        }
+        crate::agents::ToolTier::Disabled => tb,
+    };
+    Ok(tb)
+}
+
+fn with_ask_image_tools(
+    mut tb: ToolBox,
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+) -> Result<ToolBox> {
+    tb = match effective_tool_tier(def, "ask_image", false) {
+        crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "ask_image", def, args)?,
+        crate::agents::ToolTier::Discoverable => {
+            add_discoverable_tool_by_name(tb, "ask_image", def, args)?
         }
         crate::agents::ToolTier::Disabled => tb,
     };
@@ -2220,6 +2249,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     }
     tb = with_audio_video_tools(tb, def, args)?;
     tb = with_read_image_tools(tb, def, args)?;
+    tb = with_ask_image_tools(tb, def, args)?;
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.

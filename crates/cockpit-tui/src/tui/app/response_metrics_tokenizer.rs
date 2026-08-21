@@ -147,6 +147,10 @@ impl TokenizerConfirmPending {
         TokenizerConfirmOutcome::Cancelled
     }
 
+    // Dormant transition: cancels a pending confirmation when the session's
+    // attachment epoch advances. The live driver (agent_runner attachment_epoch)
+    // exists; the call site is wired in a follow-up. Tested here.
+    #[allow(dead_code)]
     pub(crate) fn on_attachment_change(
         self,
         session_id: Uuid,
@@ -189,10 +193,12 @@ impl TokenizerConfirmPending {
 }
 
 /// The five shared encodings shown in Behavior settings (default cl100k_base).
+#[cfg(test)]
 pub(crate) fn response_metrics_tokenizer_choices() -> &'static [TiktokenEncoding] {
     &TiktokenEncoding::ALL
 }
 
+#[cfg(test)]
 pub(crate) fn response_metrics_tokenizer_help() -> &'static str {
     "Normalizes user-experienced TPS across models. Neither provider-native nor calibration."
 }

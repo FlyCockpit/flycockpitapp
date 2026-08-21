@@ -29,9 +29,10 @@ mod inventory;
 #[cfg(test)]
 mod inventory_tests;
 mod response_metrics_tokenizer;
+pub(crate) use response_metrics_tokenizer::{TokenizerConfirmOutcome, TokenizerConfirmPending};
+#[cfg(test)]
 pub(crate) use response_metrics_tokenizer::{
-    TokenizerConfirmOutcome, TokenizerConfirmPending, response_metrics_tokenizer_choices,
-    response_metrics_tokenizer_help,
+    response_metrics_tokenizer_choices, response_metrics_tokenizer_help,
 };
 mod local_commands;
 mod model_controls;

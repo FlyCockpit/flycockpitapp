@@ -305,7 +305,7 @@ overrides:
   hono@<4.12.25: '>=4.12.25'
   picomatch@>=4 <4.0.4: '>=4.0.4'
   defu@<6.1.5: '>=6.1.5'
-  deepmerge-ts@<7.1.6: 7.1.6
+  deepmerge-ts@<8.0.0: 8.0.0
   brace-expansion@>=2 <2.1.2: '>=2.1.2 <3'
   brace-expansion@>=3 <5.0.9: '>=5.0.9'
   fast-uri@<3.1.3: '>=3.1.3'
@@ -6501,8 +6501,8 @@ packages:
   deep-is@0.1.4:
     resolution: {integrity: sha512-oIPzksmTg4/MriiaYGO+okXDT7ztn/w3Eptv/+gSIdMdKsJo0u4CfYNFJPy+4SKMuCqGw2wxnA+URMg3t8a/bQ==}
 
-  deepmerge-ts@7.1.6:
-    resolution: {integrity: sha512-gQhL1ksGBLQbHeAo47YU6cs2ahd3Pv+8PFYoWogNZbQnNwQyOh9Ad5kbeHFiWwbKdeWQJ5Z7Y7mwb9ew2hXBLw==}
+  deepmerge-ts@8.0.0:
+    resolution: {integrity: sha512-ICNjaP0ML+eSdEpJYQC46XiAn/UjAdwbEl0dE8p85ZTeNDinN4Kd4+9jS4OSAuH7st6eC7rQhsqTF5zIDaUm2g==}
     engines: {node: '>=16.0.0'}
 
   deepmerge@4.3.1:
@@ -14077,7 +14077,7 @@ snapshots:
   '@prisma/config@7.8.0(magicast@0.5.3)':
     dependencies:
       c12: 3.3.4(magicast@0.5.3)
-      deepmerge-ts: 7.1.6
+      deepmerge-ts: 8.0.0
       effect: 3.20.0
       empathic: 2.0.0
     transitivePeerDependencies:
@@ -17042,7 +17042,7 @@ snapshots:
 
   deep-is@0.1.4: {}
 
-  deepmerge-ts@7.1.6: {}
+  deepmerge-ts@8.0.0: {}
 
   deepmerge@4.3.1: {}
 

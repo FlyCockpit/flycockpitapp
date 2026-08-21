@@ -294,6 +294,22 @@ impl App {
         }
         self.cancel_paste_probes_matching(|probe| probe.owner_fence.is_none());
         self.cancel_model_controls_for_epoch_change(new_session_id);
+        self.clear_model_and_config_chrome_for_empty_session();
+        if let Some(state) = state {
+            self.apply_active_model_state(
+                state.selection.clone(),
+                state.default_selection.clone(),
+                state.diverged,
+                state.generation,
+            );
+        }
+    }
+
+    /// Drop outgoing active-model projection and daemon config chrome the same
+    /// way a true empty session waits for attach. Used by provisional `/new`
+    /// (immediate clear) and by `start_model_state_epoch` before applying a
+    /// replacement snapshot. Failure must not restore the cleared chrome.
+    pub(super) fn clear_model_and_config_chrome_for_empty_session(&mut self) {
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;
         self.active_model_state_confirmed = false;
@@ -304,14 +320,6 @@ impl App {
         self.config_drift = None;
         self.refresh_config_drift_surfaces();
         self.refresh_active_model_projection();
-        if let Some(state) = state {
-            self.apply_active_model_state(
-                state.selection.clone(),
-                state.default_selection.clone(),
-                state.diverged,
-                state.generation,
-            );
-        }
     }
 
     /// Invalidate every daemon-resolved config projection before accepting
@@ -350,6 +358,20 @@ impl App {
         &mut self,
         new_session_id: Option<uuid::Uuid>,
     ) {
+        self.cancel_model_controls_for_epoch_change_with_presentation(new_session_id, true);
+    }
+
+    /// Cancel pending model controls for an attach/session transition.
+    ///
+    /// When `present_notice` is false (emptied `/new` views), keep internal
+    /// cancellation and retry retention but do not append a history row —
+    /// the cleared transcript admits only authorized delivery notices and
+    /// the `/new` command error.
+    pub(super) fn cancel_model_controls_for_epoch_change_with_presentation(
+        &mut self,
+        new_session_id: Option<uuid::Uuid>,
+        present_notice: bool,
+    ) {
         let previous_session_id = self.launch.session_id;
         if let Some(pending) = self.cancel_model_controls_for_runner_epoch() {
             let reason = match new_session_id {
@@ -366,11 +388,14 @@ impl App {
                 trigger = ?pending.trigger,
                 generation = pending.minimum_generation,
                 reason,
+                present_notice,
                 "model selection cancelled by runner epoch change"
             );
-            self.push_plain(format!(
-                "Model selection was cancelled by {reason}; your draft and exact queued message were retained for retry."
-            ));
+            if present_notice {
+                self.push_plain(format!(
+                    "Model selection was cancelled by {reason}; your draft and exact queued message were retained for retry."
+                ));
+            }
         }
     }
 

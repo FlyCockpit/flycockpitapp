@@ -171,22 +171,35 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
-        // Cancellation is a terminal runner outcome, but ownership ended, so
-        // it is intentionally acknowledged without applying UI mutations.
+        // Cancellation is a terminal runner outcome; most kinds intentionally
+        // skip UI mutation. Session switch/resume must still settle provisional
+        // buffers, order, and the cleared-view failure contract.
         let cancelled = self.async_actions.drain_cancelled();
         self.tombstone_cancelled_mouse_copies(&cancelled);
+        let session_switch_cancellations = cancelled
+            .into_iter()
+            .filter(|result| {
+                matches!(
+                    result.kind,
+                    AsyncActionKind::Internal("session.switch" | "session.resume")
+                )
+            })
+            .collect::<Vec<_>>();
         let mut results = self.async_actions.expire_blocking(
             self.async_action_clock_origin + self.event_loop_monotonic_now,
             std::time::Duration::from_secs(30),
         );
         results.extend(self.async_actions.drain_completed());
-        let changed = !results.is_empty();
+        let changed = !results.is_empty() || !session_switch_cancellations.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
                 result.kind,
                 AsyncActionKind::Internal("oauth.codex.poll" | "oauth.grok.complete")
             )
         });
+        for result in session_switch_cancellations {
+            self.apply_async_action_result(result);
+        }
         for result in results {
             self.apply_async_action_result(result);
         }
@@ -201,6 +214,19 @@ impl App {
     }
 
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
+        // Provisional `/new` owns a cleared view. Only the switch/resume
+        // settlement path and outgoing delivery-receipt fence bookkeeping may
+        // run; every other completion is presentation noise from the discarded
+        // transcript (including Blocking timeouts that bypass view-generation).
+        if self.provisional_new_session
+            && !matches!(
+                result.kind,
+                AsyncActionKind::Internal("session.switch" | "session.resume")
+                    | AsyncActionKind::Blocking("paste.delivery_receipt")
+            )
+        {
+            return;
+        }
         match result.kind {
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
@@ -427,17 +453,19 @@ impl App {
                                 .remove(&client_submission_id)
                             {
                                 self.submission_fences.remove(&client_submission_id);
-                                let wire_fingerprint = if wire_fingerprint.is_empty() {
-                                    "unavailable"
-                                } else {
-                                    &wire_fingerprint
-                                };
-                                self.push_plain(format!(
+                                if !self.provisional_new_session {
+                                    let wire_fingerprint = if wire_fingerprint.is_empty() {
+                                        "unavailable"
+                                    } else {
+                                        &wire_fingerprint
+                                    };
+                                    self.push_plain(format!(
                                     "Delivery {outcome} for message {} in session {} (daemon wire {}).",
                                     record.client_submission_id,
                                     record.session_id,
                                     wire_fingerprint
                                 ));
+                                }
                             }
                         }
                     }
@@ -460,10 +488,11 @@ impl App {
                             && !matches!(outcome.target, agent_runner::SessionTarget::New)
                         {
                             self.history.push(HistoryEntry::CommandError {
-                                line: "/new: session switch returned the wrong target; old session preserved"
+                                line: "/new: session switch returned the wrong target; view remains cleared"
                                     .to_string(),
                             });
                             self.fail_pending_session_switch_submissions();
+                            self.abandon_provisional_new_session();
                         } else {
                             if label == "session.switch" {
                                 self.commit_new_session_switch_outcome(*outcome);
@@ -476,10 +505,11 @@ impl App {
                     Ok(_) => {
                         if label == "session.switch" {
                             self.history.push(HistoryEntry::CommandError {
-                                line: "/new: session switch returned an unexpected response; old session preserved"
+                                line: "/new: session switch returned an unexpected response; view remains cleared"
                                     .to_string(),
                             });
                             self.fail_pending_session_switch_submissions();
+                            self.abandon_provisional_new_session();
                         } else {
                             self.history.push(HistoryEntry::CommandError {
                                 line: "/resume: session switch returned an unexpected response"
@@ -509,6 +539,9 @@ impl App {
                             });
                         }
                         self.fail_pending_session_switch_submissions();
+                        if label == "session.switch" {
+                            self.abandon_provisional_new_session();
+                        }
                     }
                 }
                 if label == "session.switch"

@@ -1737,6 +1737,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 btw_fork: None,
                 daemon_version: "test".to_string(),
                 daemon_compatible: true,
+                attachment_epoch: 0,
                 transition_guard: None,
             });
             app.agent_runner = Some(Ok(attached_runner.take().unwrap()));
@@ -1934,11 +1935,14 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
     event_queue
         .lock()
         .unwrap()
-        .push(cockpit_core::engine::TurnEvent::ActiveModelState {
-            selection: selection("stale-provider", "stale-model"),
-            default_selection: Some(selection("stale-provider", "stale-model")),
-            diverged: false,
-            generation: 9,
+        .push(crate::tui::agent_runner::QueuedTurnEvent {
+            attachment_epoch: 0,
+            event: cockpit_core::engine::TurnEvent::ActiveModelState {
+                selection: selection("stale-provider", "stale-model"),
+                default_selection: Some(selection("stale-provider", "stale-model")),
+                diverged: false,
+                generation: 9,
+            },
         });
 
     let attached_selection = selection("attached-provider", "attached-model");
@@ -1966,6 +1970,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         btw_fork: None,
         daemon_version: "test".to_string(),
         daemon_compatible: true,
+        attachment_epoch: 0,
         transition_guard: Some(transition_guard),
     });
 

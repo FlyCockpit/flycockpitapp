@@ -4,6 +4,11 @@ use uuid::Uuid;
 
 impl App {
     pub(super) fn sync_active_agent(&mut self) {
+        // Provisional `/new` (pending or post-failure barrier) must not copy
+        // outgoing-runner agent chrome into the cleared view.
+        if self.provisional_new_session {
+            return;
+        }
         let (name, path) = {
             let Some(Ok(runner)) = self.agent_runner.as_ref() else {
                 return;

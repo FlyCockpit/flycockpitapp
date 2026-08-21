@@ -256,11 +256,260 @@ impl App {
         if let Some(Ok(runner)) = self.agent_runner.as_ref() {
             let drained = crate::tui::agent_runner::drain_turn_events(&runner.events);
             changed |= !drained.is_empty();
-            for event in drained {
-                self.apply_event(event);
+            for queued in drained {
+                self.route_queued_turn_event(queued);
             }
         }
         changed | self.drain_btw_events()
+    }
+
+    fn route_queued_turn_event(&mut self, queued: crate::tui::agent_runner::QueuedTurnEvent) {
+        use crate::tui::agent_runner::GLOBAL_ATTACHMENT_EPOCH;
+        let crate::tui::agent_runner::QueuedTurnEvent {
+            attachment_epoch,
+            event,
+        } = queued;
+        let runner_epoch = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.attachment_epoch());
+        if !self.provisional_new_session {
+            if attachment_epoch == GLOBAL_ATTACHMENT_EPOCH {
+                let is_same_session_resync = matches!(
+                    &event,
+                    TurnEvent::DaemonLinkReconnected { .. } | TurnEvent::DaemonLinkResynced { .. }
+                );
+                self.apply_event(event);
+                if is_same_session_resync {
+                    self.flush_same_session_resync_event_buffer();
+                }
+                return;
+            }
+            if attachment_epoch == self.visible_attachment_epoch {
+                self.apply_event(event);
+                return;
+            }
+            // Same-session reconnect/resync advances the runner epoch and may
+            // enqueue HistoryReplay before DaemonLinkResynced. Hold matching
+            // current-epoch events until that explicit resync signal adopts
+            // visibility — never auto-adopt on arbitrary matching-epoch
+            // traffic (resume/replacement attach can advance the runner epoch
+            // before App adopts the switch outcome).
+            if Some(attachment_epoch) == runner_epoch {
+                self.same_session_resync_event_buffer.push_back(
+                    crate::tui::agent_runner::QueuedTurnEvent {
+                        attachment_epoch,
+                        event,
+                    },
+                );
+            }
+            return;
+        }
+        if attachment_epoch == GLOBAL_ATTACHMENT_EPOCH {
+            self.apply_provisional_global_event(event);
+            return;
+        }
+        if attachment_epoch == self.visible_attachment_epoch {
+            // Outgoing attachment: durable/fence bookkeeping only — no
+            // presentation mutations into the provisional cleared view.
+            self.apply_provisional_outgoing_bookkeeping(event);
+            return;
+        }
+        if Some(attachment_epoch) == runner_epoch {
+            // Replacement attachment events arrive before outcome adoption.
+            self.provisional_new_epoch_event_buffer.push_back(
+                crate::tui::agent_runner::QueuedTurnEvent {
+                    attachment_epoch,
+                    event,
+                },
+            );
+        }
+        // Stale non-outgoing, non-replacement epochs are dropped.
+    }
+
+    /// After a same-session reconnect/resync, mirror the runner's advanced
+    /// attachment epoch into App visibility. Provisional `/new` keeps its
+    /// outgoing barrier and must not call this.
+    fn adopt_visible_attachment_epoch_from_runner(&mut self) {
+        if self.provisional_new_session {
+            return;
+        }
+        if let Some(Ok(runner)) = self.agent_runner.as_ref() {
+            self.visible_attachment_epoch = runner.attachment_epoch();
+        }
+    }
+
+    /// Drain events held for same-session reconnect/resync after
+    /// `DaemonLinkReconnected` / `DaemonLinkResynced` adopts the visible epoch.
+    fn flush_same_session_resync_event_buffer(&mut self) {
+        let buffered = std::mem::take(&mut self.same_session_resync_event_buffer);
+        for queued in buffered {
+            if queued.attachment_epoch == self.visible_attachment_epoch {
+                self.apply_event(queued.event);
+            }
+        }
+    }
+
+    /// Settle durable/fence state for the outgoing attachment without writing
+    /// history, queue, pending text, usage, model/config, active-agent,
+    /// foreground-target, or toast presentation into the cleared view.
+    fn apply_provisional_outgoing_bookkeeping(&mut self, event: TurnEvent) {
+        match event {
+            TurnEvent::UserMessageRecorded {
+                client_submission_ids,
+                ..
+            } => {
+                for id in &client_submission_ids {
+                    self.delivery_unconfirmed_records.remove(id);
+                    self.submission_fences.remove(id);
+                }
+                self.retained_user_submission_ids
+                    .retain(|id| !client_submission_ids.contains(id));
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if client_submission_ids.contains(&id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if client_submission_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::UserMessageDispatchFailed {
+                optimistic_submission_id,
+                ..
+            } => {
+                self.submission_fences.remove(&optimistic_submission_id);
+                self.retained_user_submission_ids
+                    .remove(&optimistic_submission_id);
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id)
+                    | FreshQueueAck::SuppressId(id)
+                    | FreshQueueAck::FoldedBeforeAck(id)
+                        if id == optimistic_submission_id =>
+                    {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::UserMessageDispatchRetained {
+                optimistic_submission_id,
+                ..
+            } => {
+                self.retained_user_submission_ids
+                    .insert(optimistic_submission_id);
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id)
+                    | FreshQueueAck::SuppressId(id)
+                    | FreshQueueAck::FoldedBeforeAck(id)
+                        if id == optimistic_submission_id =>
+                    {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::UserMessagesTerminated {
+                client_submission_ids,
+                ..
+            } => {
+                let terminal_ids = client_submission_ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                for id in &terminal_ids {
+                    self.submission_fences.remove(id);
+                    self.delivery_unconfirmed_records.remove(id);
+                }
+                self.retained_user_submission_ids
+                    .retain(|id| !terminal_ids.contains(id));
+                self.remember_folded_queue_item_ids(client_submission_ids.iter().copied());
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::FoldedBeforeAck(id)
+                    }
+                    FreshQueueAck::SuppressId(id) if terminal_ids.contains(&id) => {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::SessionPersistFailed {
+                client_submission_id,
+                ..
+            } => {
+                self.retained_user_submission_ids
+                    .insert(client_submission_id);
+                self.fresh_queue_ack = match self.fresh_queue_ack {
+                    FreshQueueAck::AwaitingAck(id)
+                    | FreshQueueAck::SuppressId(id)
+                    | FreshQueueAck::FoldedBeforeAck(id)
+                        if id == client_submission_id =>
+                    {
+                        FreshQueueAck::None
+                    }
+                    other => other,
+                };
+            }
+            TurnEvent::UserMessageDispatchRestored {
+                optimistic_submission_id,
+                ..
+            } => {
+                // Keep retention bookkeeping only — do not restore history /
+                // tag rows into the cleared provisional view.
+                self.retained_user_submission_ids
+                    .insert(optimistic_submission_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_provisional_global_event(&mut self, event: TurnEvent) {
+        match event {
+            TurnEvent::DaemonLinkReconnecting {
+                restarting,
+                attempt,
+            } => match &mut self.daemon_link {
+                Some(status) => {
+                    status.restarting = restarting;
+                    status.attempt = attempt;
+                }
+                None => {
+                    self.daemon_link = Some(super::DaemonLinkStatus {
+                        restarting,
+                        attempt,
+                        started_at: Instant::now(),
+                    });
+                }
+            },
+            TurnEvent::DaemonLinkReconnected { .. } => {
+                if self.daemon_link.take().is_some() {
+                    self.daemon_draining = false;
+                }
+            }
+            TurnEvent::DaemonLinkResynced { .. } => {}
+            TurnEvent::DaemonLinkTerminal { .. } => {
+                // Provisional-new must not append a history error for a
+                // terminal link event from the outgoing attachment path.
+                self.daemon_link = None;
+                self.daemon_draining = false;
+            }
+            TurnEvent::DaemonDraining { forced } => {
+                self.daemon_draining = true;
+                let _ = forced;
+            }
+            TurnEvent::HostCapabilitiesChanged { snapshot } => {
+                self.apply_event(TurnEvent::HostCapabilitiesChanged { snapshot });
+            }
+            TurnEvent::CaffeinateState { .. } => {
+                // Prompt policy: provisional globals may update only
+                // daemon-link/draining/host-capability — not caffeinate chrome.
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn reconcile_queue_update(&mut self, queue: Vec<QueuedUserMessage>) {
@@ -408,6 +657,7 @@ impl App {
                 }
             }
             TurnEvent::DaemonLinkReconnected { active_model_state } => {
+                self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
                 if self.daemon_link.take().is_some() {
@@ -416,6 +666,7 @@ impl App {
                 }
             }
             TurnEvent::DaemonLinkResynced { active_model_state } => {
+                self.adopt_visible_attachment_epoch_from_runner();
                 self.start_model_state_epoch(self.launch.session_id, active_model_state.as_ref());
                 self.retry_parked_model_selection_after_reconnect();
             }

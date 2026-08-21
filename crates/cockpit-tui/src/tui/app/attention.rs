@@ -27,6 +27,11 @@ impl App {
     }
 
     pub(super) fn push_plain(&mut self, line: impl Into<String>) {
+        // Provisional `/new` must not reintroduce discarded transcript rows from
+        // late async-action completions that still reach a presentation path.
+        if self.provisional_new_session {
+            return;
+        }
         self.history.push(HistoryEntry::Plain { line: line.into() });
     }
 

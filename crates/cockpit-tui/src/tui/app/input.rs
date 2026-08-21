@@ -2852,7 +2852,27 @@ impl App {
             let optimistic_queue_item = optimistic_queue_item
                 .expect("busy submissions always create an optimistic queue item");
             let optimistic_submission_id = optimistic_queue_item.id;
-            if self.has_pending_session_switch_action() {
+            if self.blocks_outgoing_dispatch_for_cleared_new_session() {
+                if self.pending_session_switch_target.is_none() {
+                    self.pending_session_switch_target = Some(agent_runner::SessionTarget::New);
+                }
+                // Undo the local queue presentation; retain privately.
+                self.queue
+                    .retain(|item| item.id != optimistic_submission_id);
+                self.retain_failed_session_switch_submissions(
+                    vec![PendingSessionSwitchSubmission {
+                        submission,
+                        optimistic_submission_id,
+                        error_prefix: "engine".to_string(),
+                        optimistic_tag_entries: 0,
+                        owns_working_span: false,
+                        optimistic_history: Vec::new(),
+                        optimistic_queue_item: None,
+                    }],
+                    DispatchOutcome::SessionSwitching,
+                );
+                DispatchOutcome::SessionSwitching
+            } else if self.has_pending_session_switch_action() {
                 self.queue_pending_session_switch_submission_with_optimistic_state(
                     submission,
                     "engine",
@@ -3628,8 +3648,8 @@ impl App {
     }
 
     pub(super) fn structured_paste_composer_eligible(&self) -> bool {
-        !self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
-            && !(self.pane_focused && self.pane.is_some())
+        !(self.btw_pane.as_ref().is_some_and(|pane| pane.focused)
+            || (self.pane_focused && self.pane.is_some()))
             && self.daemon_prompt.is_none()
             && !matches!(
                 self.overlay,
@@ -4765,7 +4785,10 @@ mod queued_message_edit_tests {
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
             attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            submission_session_tx: tokio::sync::watch::channel(
+                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
+            )
+            .0,
             awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
@@ -4782,6 +4805,11 @@ mod queued_message_edit_tests {
             attach_context: None,
             last_applied_seq: None,
             client_tasks: ClientTasks::default(),
+            #[cfg(test)]
+            test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_force_can_switch: false,
+            test_advance_epoch_when_switch_task_created: false,
         }
     }
 
@@ -5277,7 +5305,10 @@ mod paste_routing_tests {
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
             attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+            submission_session_tx: tokio::sync::watch::channel(
+                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
+            )
+            .0,
             awaiting_durable: Default::default(),
             short_id: "abc123".to_string(),
             project_id: "project".to_string(),
@@ -5294,6 +5325,11 @@ mod paste_routing_tests {
             attach_context: None,
             last_applied_seq: None,
             client_tasks: ClientTasks::default(),
+            #[cfg(test)]
+            test_session_switch_rx: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_force_can_switch: false,
+            test_advance_epoch_when_switch_task_created: false,
         }
     }
 

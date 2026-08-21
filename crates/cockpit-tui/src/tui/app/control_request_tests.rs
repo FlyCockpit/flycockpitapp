@@ -5,7 +5,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{App, ControlApplied};
 use crate::tui::agent_runner::{
-    AgentRunner, ClientTasks, ControlRequest, UsageCounts, control_response_outcome,
+    AgentRunner, ClientTasks, ControlRequest, QueuedTurnEvent, UsageCounts,
+    control_response_outcome,
 };
 use crate::tui::history::HistoryEntry;
 use cockpit_core::config::extended::ApprovalMode;
@@ -25,7 +26,7 @@ fn app() -> App {
 fn runner_with_channels(
     record_tx: mpsc::Sender<Request>,
     control_tx: mpsc::Sender<ControlRequest>,
-    events: Arc<Mutex<Vec<TurnEvent>>>,
+    events: Arc<Mutex<Vec<QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
     let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
@@ -43,7 +44,10 @@ fn runner_with_channels(
         active_model_state: None,
         session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
         attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        submission_session_tx: tokio::sync::watch::channel(uuid::Uuid::nil()).0,
+        submission_session_tx: tokio::sync::watch::channel(
+            crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
+        )
+        .0,
         awaiting_durable: Default::default(),
         short_id: "abc123".to_string(),
         project_id: "project".to_string(),
@@ -60,6 +64,11 @@ fn runner_with_channels(
         attach_context: None,
         last_applied_seq: None,
         client_tasks: ClientTasks::default(),
+        #[cfg(test)]
+        test_session_switch_rx: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        test_force_can_switch: false,
+        test_advance_epoch_when_switch_task_created: false,
     }
 }
 
@@ -67,7 +76,7 @@ fn install_runner(
     app: &mut App,
     record_tx: mpsc::Sender<Request>,
     control_tx: mpsc::Sender<ControlRequest>,
-) -> Arc<Mutex<Vec<TurnEvent>>> {
+) -> Arc<Mutex<Vec<QueuedTurnEvent>>> {
     let events = Arc::new(Mutex::new(Vec::new()));
     app.agent_runner = Some(Ok(runner_with_channels(
         record_tx,
@@ -269,9 +278,12 @@ async fn longcache_toggles_session_override_and_status_indicator() {
         control.request,
         Request::SetLongcache { enabled: None }
     ));
-    events.lock().unwrap().push(TurnEvent::LongcacheState {
-        enabled: true,
-        supported: true,
+    events.lock().unwrap().push(QueuedTurnEvent {
+        attachment_epoch: 0,
+        event: TurnEvent::LongcacheState {
+            enabled: true,
+            supported: true,
+        },
     });
     drain_control_events(&mut app).await;
 
@@ -286,9 +298,12 @@ async fn longcache_toggles_session_override_and_status_indicator() {
             enabled: Some(false)
         }
     ));
-    events.lock().unwrap().push(TurnEvent::LongcacheState {
-        enabled: false,
-        supported: true,
+    events.lock().unwrap().push(QueuedTurnEvent {
+        attachment_epoch: 0,
+        event: TurnEvent::LongcacheState {
+            enabled: false,
+            supported: true,
+        },
     });
     drain_control_events(&mut app).await;
 
@@ -307,14 +322,19 @@ async fn longcache_toggles_session_override_and_status_indicator() {
         }
     ));
     events.lock().unwrap().extend([
-        TurnEvent::Notice {
-            text:
-                "/longcache: extended prompt-cache retention is not verified for the active model"
+        QueuedTurnEvent {
+            attachment_epoch: 0,
+            event: TurnEvent::Notice {
+                text: "/longcache: extended prompt-cache retention is not verified for the active model"
                     .to_string(),
+            },
         },
-        TurnEvent::LongcacheState {
-            enabled: false,
-            supported: false,
+        QueuedTurnEvent {
+            attachment_epoch: 0,
+            event: TurnEvent::LongcacheState {
+                enabled: false,
+                supported: false,
+            },
         },
     ]);
     drain_control_events(&mut app).await;
@@ -444,7 +464,7 @@ async fn successful_repair_resume_ack_wakes_retained_submission_retry() {
         .await
         .expect("successful repair ACK wakes retained submissions")
         .expect("retry watch remains open");
-    assert_eq!(*retry_rx.borrow_and_update(), session_id);
+    assert_eq!(retry_rx.borrow_and_update().session_id, session_id);
 }
 
 #[tokio::test]

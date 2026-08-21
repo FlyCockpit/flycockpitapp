@@ -524,6 +524,7 @@ impl Model {
             endpoint_recovery,
             pre_drain,
             compact_utility,
+            None,
         )
         .await
     }
@@ -555,6 +556,7 @@ impl Model {
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
         compact_utility: bool,
+        display: Option<crate::engine::model::DisplayAttemptSlot>,
     ) -> Result<(
         (
             Option<String>,
@@ -695,6 +697,10 @@ impl Model {
                 loop {
                     let attempt = || async {
                         retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Each transport retry is a distinct display attempt.
+                        // Keep the overall call clock above for audit timing, but
+                        // start TTFT and the display classifier at this handoff.
+                        let attempt_dispatched_at = std::time::Instant::now();
                         let wire_tools = wire_schema::definitions_for_wire(endpoint, tools);
                         let wire_tools = wire_tools.as_ref();
                         // Build the OpenAI-compat completion request against
@@ -727,10 +733,11 @@ impl Model {
                                     &timeout,
                                     hard_timeout_on_stall,
                                     &phase,
-                                    dispatched_at,
+                                    attempt_dispatched_at,
                                     &first_token_ms,
                                     &output_sent,
                                     pre_drain.clone(),
+                                    display.as_ref(),
                                 )
                                 .await
                             }
@@ -757,10 +764,11 @@ impl Model {
                                     &timeout,
                                     hard_timeout_on_stall,
                                     &phase,
-                                    dispatched_at,
+                                    attempt_dispatched_at,
                                     &first_token_ms,
                                     &output_sent,
                                     pre_drain.clone(),
+                                    display.as_ref(),
                                 )
                                 .await
                             }
@@ -925,6 +933,7 @@ impl Model {
                 // and aggregates Responses API tool/reasoning/usage chunks.
                 let attempt = || async {
                     retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let attempt_dispatched_at = std::time::Instant::now();
                     let wire_tools = wire_schema::definitions_for_wire(
                         crate::config::providers::WireApi::Responses,
                         tools,
@@ -950,10 +959,11 @@ impl Model {
                         &timeout,
                         hard_timeout_on_stall,
                         &phase,
-                        dispatched_at,
+                        attempt_dispatched_at,
                         &first_token_ms,
                         &output_sent,
                         pre_drain.clone(),
+                        display.as_ref(),
                     )
                     .await
                 };
@@ -991,6 +1001,7 @@ impl Model {
                 // Native Anthropic: no wire-API selector, single retry unit.
                 let attempt = || async {
                     retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let attempt_dispatched_at = std::time::Instant::now();
                     let completion = build_anthropic_completion_model(model.clone());
                     let request = configured_completion_request(
                         completion,
@@ -1011,10 +1022,11 @@ impl Model {
                         &timeout,
                         hard_timeout_on_stall,
                         &phase,
-                        dispatched_at,
+                        attempt_dispatched_at,
                         &first_token_ms,
                         &output_sent,
                         pre_drain.clone(),
+                        display.as_ref(),
                     )
                     .await
                 };
@@ -1062,6 +1074,7 @@ impl Model {
                 let timing = InferenceTiming {
                     first_token_ms: (ft > 0).then_some(ft),
                     completed_ms: dispatched_at.elapsed().as_millis() as u64,
+                    open_display: display.and_then(|slot| slot.take_open_classifier()),
                 };
                 Ok((value, captured, timing))
             }
@@ -1072,6 +1085,15 @@ impl Model {
                 // than logging a real failure — keep the dedicated
                 // sentinels the driver already special-cases.
                 if cancel.is_cancelled() || is_attempt_cancelled(&err) {
+                    if let Some(slot) = display.as_ref() {
+                        slot.finish_as_error(
+                            agent_name,
+                            crate::engine::response_performance::DisplayErrorKind::Cancelled,
+                            "cancelled",
+                            event_tx,
+                        )
+                        .await;
+                    }
                     return Err(anyhow::Error::new(InferenceCancelled {
                         phase: InferencePhase::from_rank(
                             phase.load(std::sync::atomic::Ordering::SeqCst),
@@ -1106,6 +1128,10 @@ impl Model {
                 {
                     detail.push_str(" Disable the xAI beta tools entitlement in provider/model settings or choose a non-multi-agent model if the account lacks beta access.");
                 }
+                // Keep a visible partial classifier open. The backup wrapper
+                // either starts a replacement (which emits Reset) or, after
+                // failover is exhausted, emits the single terminal display
+                // error. Closing it here would make that decision impossible.
                 Err(anyhow::Error::new(InferenceFailure {
                     provider: self.provider_id().to_string(),
                     model: self.model_id().to_string(),
@@ -1975,6 +2001,7 @@ pub(super) async fn drain_completion_stream<M>(
     first_token_ms: &std::sync::atomic::AtomicU64,
     output_sent: &std::sync::atomic::AtomicBool,
     pre_drain: Option<PreDrainFuture>,
+    display: Option<&crate::engine::model::DisplayAttemptSlot>,
 ) -> Result<CompleteOut, rig::completion::CompletionError>
 where
     M: rig::completion::CompletionModel,
@@ -1996,10 +2023,16 @@ where
         built = request.stream() => built?,
     };
     await_pre_drain_record(pre_drain).await?;
+    // Successful-attempt dispatch boundary: construct the display classifier
+    // now that the stream is live, before any chunk is drained.
+    if let Some(slot) = display {
+        slot.begin_successful_attempt(agent_name, event_tx, dispatched_at)
+            .await;
+    }
     // Drive the chunk loop with TTFT + idle timeouts. The post-loop reads
     // below pick up the aggregated `choice` / `message_id` / `response` rig
     // accumulated as the stream advanced (the loop borrows `&mut stream`).
-    drain_items(
+    if let Err(err) = drain_items(
         &mut stream,
         timeout,
         hard_timeout_on_stall,
@@ -2012,8 +2045,15 @@ where
         event_tx,
         cancel,
         output_sent,
+        display,
     )
-    .await?;
+    .await
+    {
+        // Leave any open visible classifier in place:
+        // - a replacement attempt's `begin_successful_attempt` emits Reset
+        // - a terminal Err arm calls `finish_as_error` for AssistantDisplayError
+        return Err(err);
+    }
     // rig requests `stream_options.include_usage = true` on every stream;
     // providers that omit it now surface as an empty default usage value.
     let usage = TokenUsage::from(stream.response.token_usage());
@@ -2049,7 +2089,7 @@ pub(super) async fn await_pre_drain_record(
 /// backup is configured the current attempt hard-aborts with a timeout
 /// sentinel so backup fallback can engage. A ctrl+c returns [`AttemptCancelled`].
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn drain_items<S, R>(
+pub(crate) async fn drain_items<S, R>(
     stream: &mut S,
     timeout: &crate::config::providers::TimeoutConfig,
     hard_timeout_on_stall: bool,
@@ -2062,6 +2102,7 @@ pub(super) async fn drain_items<S, R>(
     event_tx: Option<&mpsc::Sender<TurnEvent>>,
     cancel: &CancellationToken,
     output_sent: &std::sync::atomic::AtomicBool,
+    display: Option<&crate::engine::model::DisplayAttemptSlot>,
 ) -> Result<(), rig::completion::CompletionError>
 where
     S: futures::Stream<
@@ -2141,7 +2182,9 @@ where
         match item? {
             StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
                 output_sent.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(event_tx) = event_tx {
+                if let Some(slot) = display {
+                    slot.feed_text(agent_name, &text.text, event_tx).await;
+                } else if let Some(event_tx) = event_tx {
                     let _ = event_tx
                         .send(TurnEvent::AssistantTextDelta {
                             agent: agent_name.to_string(),
@@ -2156,7 +2199,9 @@ where
                 if !reasoning.is_empty() {
                     output_sent.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                if let Some(event_tx) = event_tx {
+                if let Some(slot) = display {
+                    slot.feed_reasoning(agent_name, &reasoning, event_tx).await;
+                } else if let Some(event_tx) = event_tx {
                     let _ = event_tx
                         .send(TurnEvent::ReasoningDelta {
                             agent: agent_name.to_string(),
@@ -2169,7 +2214,9 @@ where
                 let combined = collect_reasoning_text(&r);
                 if !combined.is_empty() {
                     output_sent.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if let Some(event_tx) = event_tx {
+                    if let Some(slot) = display {
+                        slot.feed_reasoning(agent_name, &combined, event_tx).await;
+                    } else if let Some(event_tx) = event_tx {
                         let _ = event_tx
                             .send(TurnEvent::ReasoningDelta {
                                 agent: agent_name.to_string(),

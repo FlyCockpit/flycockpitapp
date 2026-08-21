@@ -1,6 +1,7 @@
 use super::*;
 use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, MouseCopyResult};
 use crate::tui::context_menu::ContextMenu;
+use crate::tui::history::HistoryEntry;
 use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
 use crate::tui::markdown::CopyFragment;
 use crossterm::event::{
@@ -43,6 +44,7 @@ fn selectable_meta() -> render::ChatRowMeta {
         diff_path: None,
         pin_hit: None,
         fork_hit: None,
+        metric_hit: None,
         continuation: false,
         selectable: true,
         copy_cells: Vec::new(),
@@ -647,4 +649,131 @@ async fn mouse_copy_duplicate_completed_result_is_inert() {
         Some("Copied 5 chars to clipboard.")
     );
     assert!(app.pending_mouse_copies.is_empty());
+}
+
+fn agent_with_perf_entry(performance_expanded: bool) -> HistoryEntry {
+    HistoryEntry::Agent {
+        name: "Build".into(),
+        text: "hello".into(),
+        reasoning: String::new(),
+        timestamp: chrono::Local::now(),
+        expanded: false,
+        reasoning_offset: 0,
+        think_duration: None,
+        seq: Some(1),
+        performance: Some(
+            cockpit_core::engine::response_performance::ResponsePerformance {
+                ttft_ms: 3000,
+                generation_ms: 500,
+                displayed_tokens: 27,
+                encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+            },
+        ),
+        performance_expanded,
+    }
+}
+
+fn app_with_metric_chip() -> App {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.mouse_capture = true;
+    app.chat_area = Some(Rect::new(0, 0, 40, 2));
+    app.history.push(agent_with_perf_entry(false));
+    let mut meta = selectable_meta();
+    meta.history_index = Some(0);
+    meta.metric_hit = Some(render::MetricHit {
+        history_index: 0,
+        col_start: 2,
+        col_end: 6,
+    });
+    // Non-selectable over the metric so gesture selection does not claim it.
+    meta.selectable = false;
+    app.chat_row_meta = vec![meta];
+    app
+}
+
+#[test]
+fn response_performance_chip_click_has_exact_hit_range() {
+    let mut app = app_with_metric_chip();
+    let press_gen = app.mouse_gesture_state.press_generation;
+    let view_gen = app.mouse_gesture_state.view_generation;
+
+    // Click inside hit range: Down arms, Up toggles.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 0));
+    assert!(app.pending_performance_chip_press.is_some());
+    assert_eq!(
+        app.pending_performance_chip_press.unwrap().press_generation,
+        press_gen
+    );
+    assert_eq!(
+        app.pending_performance_chip_press.unwrap().view_generation,
+        view_gen
+    );
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 0));
+    match &app.history[0] {
+        HistoryEntry::Agent {
+            performance_expanded: true,
+            expanded: false,
+            ..
+        } => {}
+        other => panic!("expected performance expanded only, got {other:?}"),
+    }
+
+    // Click outside chip: no toggle.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 0));
+    assert!(app.pending_performance_chip_press.is_none());
+    match &app.history[0] {
+        HistoryEntry::Agent {
+            performance_expanded: true,
+            ..
+        } => {}
+        other => panic!("outside click must not change expansion: {other:?}"),
+    }
+}
+
+#[test]
+fn response_performance_chip_gesture_cancels_on_drag_release_outside_and_stale_generation() {
+    let mut app = app_with_metric_chip();
+
+    // Drag cancels.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 0));
+    assert!(app.pending_performance_chip_press.is_some());
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 8, 0));
+    assert!(app.pending_performance_chip_press.is_none());
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 8, 0));
+    match &app.history[0] {
+        HistoryEntry::Agent {
+            performance_expanded: false,
+            ..
+        } => {}
+        other => panic!("drag must cancel toggle: {other:?}"),
+    }
+
+    // Release outside cancels.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 0));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30, 0));
+    match &app.history[0] {
+        HistoryEntry::Agent {
+            performance_expanded: false,
+            ..
+        } => {}
+        other => panic!("outside release must cancel: {other:?}"),
+    }
+
+    // Stale view generation cancels.
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 0));
+    assert!(app.pending_performance_chip_press.is_some());
+    app.invalidate_mouse_gesture(
+        MouseGestureInvalidation::ViewChange,
+        app.event_loop_monotonic_now,
+    );
+    assert!(app.pending_performance_chip_press.is_none());
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 0));
+    match &app.history[0] {
+        HistoryEntry::Agent {
+            performance_expanded: false,
+            ..
+        } => {}
+        other => panic!("stale generation must cancel: {other:?}"),
+    }
 }

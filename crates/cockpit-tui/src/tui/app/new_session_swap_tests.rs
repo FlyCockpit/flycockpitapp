@@ -186,6 +186,7 @@ fn side_conversation(tmp: &std::path::Path) -> SideConversation {
         saved_history_render_cache_rows: 0,
         saved_queue: Vec::new(),
         saved_pending: None,
+        saved_active_display_attempt_id: None,
         saved_prunable_tokens: 0,
         saved_cache_cold: false,
         saved_elided_event_ids: Default::default(),

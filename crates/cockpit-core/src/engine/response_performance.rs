@@ -281,14 +281,33 @@ pub struct DisplayAttemptReset {
     pub reason: String,
 }
 
+/// Why a visible primary attempt ended as a live error row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayErrorKind {
+    /// User/daemon cancellation after visible provisional output.
+    Cancelled,
+    /// Terminal failure after visible provisional output.
+    Failed,
+}
+
 /// A terminal display error for an attempt. Converts the provisional row
-/// into one explicit error row with no snapshot.
+/// into one explicit error row with no performance snapshot.
+///
+/// `AssistantDisplayError` is terminal: it never follows Complete, preserves
+/// the visible provisional body through optional `presentation_text`, and
+/// renders one error row (TUI/web/native) or a CLI textual error without a
+/// performance chip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayError {
     /// The attempt that failed terminally.
     pub attempt_id: AssistantAttemptId,
-    /// The human-readable error text.
-    pub error: String,
+    /// Cancelled vs failed.
+    pub kind: DisplayErrorKind,
+    /// Redacted safe message for the error row.
+    pub message: String,
+    /// Visible provisional body preserved for the error row, when any.
+    pub presentation_text: Option<String>,
 }
 
 /// The streaming events the classifier emits.
@@ -318,6 +337,10 @@ pub struct DisplayClassifierConfig {
     pub translation_enabled: bool,
     /// The shared tiktoken encoding for counting displayed tokens.
     pub encoding: TiktokenEncoding,
+    /// When true, finish omits the performance snapshot without dropping
+    /// the reply (simulates tokenizer failure). Production always leaves
+    /// this `false`.
+    pub force_tokenization_failure: bool,
 }
 
 impl Default for DisplayClassifierConfig {
@@ -326,7 +349,15 @@ impl Default for DisplayClassifierConfig {
             inline_think: true,
             translation_enabled: false,
             encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
         }
+    }
+}
+
+impl DisplayClassifierConfig {
+    /// Whether tokenization should be treated as failed for this attempt.
+    fn tokenization_failed(&self) -> bool {
+        self.force_tokenization_failure
     }
 }
 
@@ -375,6 +406,27 @@ pub struct DisplayStreamClassifier {
     has_visible_body: bool,
     /// Whether translation is enabled (cached from config for clarity).
     translation_enabled: bool,
+}
+
+impl std::fmt::Debug for DisplayStreamClassifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DisplayStreamClassifier")
+            .field("attempt_id", &self.attempt_id)
+            .field("attempt_dispatched_at", &self.attempt_dispatched_at)
+            .field("config", &self.config)
+            .field("accumulated_body_len", &self.accumulated_body.len())
+            .field(
+                "accumulated_reasoning_len",
+                &self.accumulated_reasoning.len(),
+            )
+            .field(
+                "first_non_whitespace_presentation_at",
+                &self.first_non_whitespace_presentation_at,
+            )
+            .field("has_visible_body", &self.has_visible_body)
+            .field("translation_enabled", &self.translation_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The clock seam the classifier reads. Production uses the real
@@ -615,7 +667,8 @@ impl DisplayStreamClassifier {
         }
 
         // Empty/think-only/no-visible-body responses omit the snapshot.
-        let performance = if display_text.trim().is_empty() {
+        // Tokenizer failure also omits the snapshot without dropping the reply.
+        let performance = if display_text.trim().is_empty() || self.config.tokenization_failed() {
             None
         } else {
             let finish_at = self.clock.now();
@@ -659,6 +712,12 @@ impl DisplayStreamClassifier {
     /// The first non-whitespace presentation instant, if recorded.
     pub fn first_presentation_at(&self) -> Option<Instant> {
         self.first_non_whitespace_presentation_at
+    }
+
+    /// Provisional body text preserved for a terminal error row when the
+    /// attempt fails/cancels after visible output.
+    pub fn accumulated_presentation_for_error(&self) -> String {
+        self.accumulated_body.clone()
     }
 }
 
@@ -716,6 +775,7 @@ mod tests {
             inline_think: true,
             translation_enabled: false,
             encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
         };
         let (mut classifier, clock) = make_classifier(1, t0, config);
 
@@ -805,6 +865,7 @@ mod tests {
             inline_think: true,
             translation_enabled: true,
             encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
         };
         let (mut classifier, clock) = make_classifier(1, t0, config);
 
@@ -856,6 +917,7 @@ mod tests {
             inline_think: true,
             translation_enabled: true,
             encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
         };
         let (mut classifier, clock) = make_classifier(1, t0, config);
 
@@ -894,6 +956,7 @@ mod tests {
             inline_think: false,
             translation_enabled: false,
             encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
         };
         let (mut classifier, clock) = make_classifier(1, t0, config.clone());
 
@@ -996,5 +1059,157 @@ mod tests {
         };
         assert_eq!(reset.failed_attempt_id.as_u64(), 1);
         assert_eq!(reset.replacement_attempt_id.as_u64(), 2);
+    }
+
+    #[test]
+    fn response_performance_stream_visible_user_body_timing() {
+        // Injected clock: whitespace alone does not start TTFT; first
+        // non-whitespace presentation does; generation_ms is finish - first.
+        let t0 = Instant::from_std(std::time::Instant::now());
+        let config = DisplayClassifierConfig {
+            inline_think: true,
+            translation_enabled: false,
+            encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
+        };
+        let (mut classifier, clock) = make_classifier(7, t0, config);
+
+        clock.borrow_mut().set(instant_after(t0, ms(50)));
+        let _ = classifier.feed_text("   ");
+        assert!(
+            classifier.first_presentation_at().is_none(),
+            "whitespace alone must not start TTFT"
+        );
+
+        clock.borrow_mut().set(instant_after(t0, ms(250)));
+        let events = classifier.feed_text("Hi");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            classifier.first_presentation_at(),
+            Some(instant_after(t0, ms(250)))
+        );
+
+        clock.borrow_mut().set(instant_after(t0, ms(850)));
+        let complete = classifier
+            .finish("Hi there", "", None)
+            .expect("visible body completes");
+        let perf = complete
+            .assistant
+            .response_performance
+            .expect("nonzero-duration visible body has snapshot");
+        assert_eq!(perf.ttft_ms, 250);
+        assert_eq!(perf.generation_ms, 600);
+        let tokens = TiktokenEncoding::Cl100k.count("Hi there") as u64;
+        assert_eq!(perf.displayed_tokens, tokens);
+        let tps = perf.tps().expect("nonzero generation has TPS");
+        assert!((tps - tokens as f64 * 1000.0 / 600.0).abs() < 0.001);
+        assert_eq!(complete.attempt_id.as_u64(), 7);
+    }
+
+    #[test]
+    fn response_performance_tokenization_failure_omits_metrics_without_dropping_reply() {
+        // Force tokenizer failure: reply must still complete; snapshot omitted.
+        let t0 = Instant::from_std(std::time::Instant::now());
+        let config = DisplayClassifierConfig {
+            inline_think: false,
+            translation_enabled: false,
+            encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: true,
+        };
+        let (mut classifier, clock) = make_classifier(3, t0, config);
+        clock.borrow_mut().set(instant_after(t0, ms(10)));
+        classifier.feed_text("Keep this reply");
+        clock.borrow_mut().set(instant_after(t0, ms(50)));
+        let complete = classifier
+            .finish("Keep this reply", "", None)
+            .expect("tokenization failure must not drop the reply");
+        assert_eq!(complete.assistant.text, "Keep this reply");
+        assert!(
+            complete.assistant.response_performance.is_none(),
+            "tokenizer failure omits the snapshot"
+        );
+    }
+
+    #[test]
+    fn response_performance_live_event_survives_assistant_message_write_failure() {
+        // Live Complete keeps its computed snapshot even when seq is None
+        // (timeline write failed). Durable rehydration then omits it.
+        let t0 = Instant::from_std(std::time::Instant::now());
+        let config = DisplayClassifierConfig {
+            inline_think: false,
+            translation_enabled: false,
+            encoding: TiktokenEncoding::Cl100k,
+            force_tokenization_failure: false,
+        };
+        let (mut classifier, clock) = make_classifier(4, t0, config);
+        clock.borrow_mut().set(instant_after(t0, ms(20)));
+        classifier.feed_text("Live body");
+        clock.borrow_mut().set(instant_after(t0, ms(120)));
+        let mut complete = classifier.finish("Live body", "", None).unwrap();
+        assert!(complete.assistant.response_performance.is_some());
+        // Simulate write failure: seq stays None; live event retains snapshot.
+        complete.assistant.seq = None;
+        assert!(complete.assistant.response_performance.is_some());
+        assert_eq!(complete.assistant.display_text(), "Live body");
+        // Durable wire payload without seq still carries performance for the
+        // live event; persistence failure is seq=None, not snapshot drop.
+        let live_json = serde_json::to_value(&complete.assistant).unwrap();
+        assert!(live_json.get("response_performance").is_some());
+        assert!(live_json.get("seq").is_none() || live_json["seq"].is_null());
+    }
+
+    #[test]
+    fn response_performance_round_trips_through_assistant_wire_history() {
+        let perf = ResponsePerformance {
+            ttft_ms: 120,
+            generation_ms: 340,
+            displayed_tokens: 42,
+            encoding: TiktokenEncoding::O200k,
+        };
+        let payload = AssistantTextPayload {
+            text: "wire body".into(),
+            presentation_text: Some("shown".into()),
+            reasoning: "think".into(),
+            seq: Some(9),
+            response_performance: Some(perf),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["response_performance"]["ttft_ms"], 120);
+        assert_eq!(json["response_performance"]["encoding"], "o200k_base");
+        assert!(json.get("attempt_id").is_none());
+        let back: AssistantTextPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(back, payload);
+        assert_eq!(back.display_text(), "shown");
+
+        // Wire HistoryEntry shape (proto) round-trips without attempt_id.
+        let history = crate::daemon::proto::HistoryEntry::Assistant {
+            agent: "Build".into(),
+            text: "wire body".into(),
+            presentation_text: Some("shown".into()),
+            reasoning: "think".into(),
+            response_performance: Some(crate::daemon::proto::ResponsePerformance {
+                ttft_ms: 120,
+                generation_ms: 340,
+                displayed_tokens: 42,
+                encoding: "o200k_base".into(),
+            }),
+            ts_ms: 1,
+            seq: 9,
+        };
+        let hist_json = serde_json::to_value(&history).unwrap();
+        assert!(hist_json.get("attempt_id").is_none());
+        let hist_back: crate::daemon::proto::HistoryEntry =
+            serde_json::from_value(hist_json).unwrap();
+        match hist_back {
+            crate::daemon::proto::HistoryEntry::Assistant {
+                response_performance: Some(p),
+                presentation_text,
+                ..
+            } => {
+                assert_eq!(p.ttft_ms, 120);
+                assert_eq!(presentation_text.as_deref(), Some("shown"));
+            }
+            other => panic!("expected Assistant history, got {other:?}"),
+        }
     }
 }

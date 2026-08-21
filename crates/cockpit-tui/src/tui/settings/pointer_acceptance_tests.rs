@@ -1444,6 +1444,7 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::PredictNextMessage),
         (Category::Behavior, SettingId::ShellCompression),
         (Category::Behavior, SettingId::InlineThink),
+        (Category::Behavior, SettingId::ResponseMetricsTokenizer),
         (Category::Behavior, SettingId::HintToolCallCorrections),
         (Category::Behavior, SettingId::ApprovalMode),
     ] {
@@ -1534,6 +1535,7 @@ fn dispatch_enabled_category_descriptor_actions() {
             | SettingId::PredictNextMessage
             | SettingId::ShellCompression
             | SettingId::InlineThink
+            | SettingId::ResponseMetricsTokenizer
             | SettingId::HintToolCallCorrections
             | SettingId::ApprovalMode => assert!(matches!(
                 dialog.test_page(),

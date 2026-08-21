@@ -47,6 +47,7 @@ fn commit_boundary_bails_on_line_initial_link_reference() {
         inside_think: false,
         body_started: true,
         tag_partial: String::new(),
+        attempt_id: None,
         seq: None,
         strip_think: true,
         response_performance: None,
@@ -2739,4 +2740,220 @@ fn classifies_partial_builder_report() {
         Some("builder stopped after writing files; validation not run yet")
     );
     assert!(classify_subagent_status("explore", "all done", false).is_none());
+}
+
+fn sample_perf() -> ResponsePerformance {
+    ResponsePerformance {
+        ttft_ms: 3000,
+        generation_ms: 500,
+        displayed_tokens: 27, // 27*1000/500 = 54 TPS exactly
+        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+    }
+}
+
+fn agent_with_perf(
+    text: &str,
+    reasoning: &str,
+    perf: Option<ResponsePerformance>,
+    expanded: bool,
+    performance_expanded: bool,
+) -> HistoryEntry {
+    HistoryEntry::Agent {
+        name: "Build".into(),
+        text: text.into(),
+        reasoning: reasoning.into(),
+        timestamp: fixed_ts(),
+        expanded,
+        reasoning_offset: 0,
+        think_duration: None,
+        seq: Some(1),
+        performance: perf,
+        performance_expanded,
+    }
+}
+
+#[test]
+fn response_performance_chip_renders_and_expands_independently() {
+    let perf = sample_perf();
+    let closed = render_entry(
+        &agent_with_perf("hello world", "secret think", Some(perf), false, false),
+        120,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        Some(PinControl {
+            seq: 1,
+            pinned: false,
+            show_control: true,
+            is_pick: false,
+        }),
+    );
+    let joined: String = closed
+        .lines
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("3/54") || joined.contains("3.0/54"),
+        "compact chip missing in:\n{joined}"
+    );
+    assert!(
+        !joined.contains("TTFT:"),
+        "detail must be collapsed by default"
+    );
+    assert!(closed.metric_region.is_some());
+    // Reasoning chip exists independently.
+    assert!(closed.chip_row.is_some());
+
+    let open = render_entry(
+        &agent_with_perf("hello world", "secret think", Some(perf), false, true),
+        120,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        Some(PinControl {
+            seq: 1,
+            pinned: false,
+            show_control: true,
+            is_pick: false,
+        }),
+    );
+    let joined: String = open
+        .lines
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("TTFT:") && joined.contains("TPS:"),
+        "expanded detail missing in:\n{joined}"
+    );
+    // Expanding performance must not expand reasoning.
+    assert!(
+        !joined.contains("secret think"),
+        "performance expand must not reveal reasoning"
+    );
+}
+
+#[test]
+fn response_performance_chip_rounding_matches_detail() {
+    // Spec examples: 3000→3, 9949→9.9, 9950→10, 10500→11; TPS half-up.
+    assert_eq!(format_ttft(3000), "3");
+    assert_eq!(format_ttft(9949), "9.9");
+    assert_eq!(format_ttft(9950), "10");
+    assert_eq!(format_ttft(10_500), "11");
+
+    let perf = ResponsePerformance {
+        ttft_ms: 3000,
+        generation_ms: 1000,
+        displayed_tokens: 54, // 54 TPS exact; 53.5 would round up
+        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+    };
+    assert_eq!(format_tps(&perf).as_deref(), Some("54"));
+    assert_eq!(metric_chip_text(&perf).as_deref(), Some("3/54"));
+    assert_eq!(metric_detail_text(&perf), "TTFT: 3s / TPS: 54");
+
+    // 53.5 → 54 half-up: tokens*1000/ms with remainder >= half.
+    let half = ResponsePerformance {
+        ttft_ms: 1000,
+        generation_ms: 2000,
+        displayed_tokens: 107, // 107000/2000 = 53.5
+        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+    };
+    assert_eq!(format_tps(&half).as_deref(), Some("54"));
+}
+
+#[test]
+fn response_performance_chip_narrow_layout_preserves_controls() {
+    let perf = sample_perf();
+    let pin = Some(PinControl {
+        seq: 7,
+        pinned: false,
+        show_control: true,
+        is_pick: false,
+    });
+
+    // Width 120: inline metric with controls/timestamp.
+    let wide = render_entry(
+        &agent_with_perf("ok", "", Some(perf), false, false),
+        120,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        pin,
+    );
+    assert!(wide.metric_region.is_some());
+    assert!(wide.pin_region.is_some());
+    let first = line_text(&wide.lines[0]);
+    assert!(first.contains("[fork]") || first.contains("[pin]"));
+
+    // Width 48: dedicated metric row, controls preserved.
+    let mid = render_entry(
+        &agent_with_perf("ok", "", Some(perf), false, false),
+        48,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        pin,
+    );
+    assert!(mid.metric_region.is_some());
+    assert!(mid.pin_region.is_some());
+
+    // Width 24: accessible header returns (floor).
+    let floor = render_entry(
+        &agent_with_perf("ok", "", Some(perf), false, false),
+        24,
+        ThinkingDisplay::Condensed,
+        MarkdownOpts::default(),
+        cockpit_config::extended::DiffStyle::default(),
+        false,
+        &no_elided(),
+        0,
+        pin,
+    );
+    assert!(
+        floor.metric_region.is_some(),
+        "metric retained at min width"
+    );
+    assert!(floor.pin_region.is_some());
+
+    // Below 24: ↔ resize state, no metric hit target.
+    for w in [23u16, 12, 1] {
+        let narrow = render_entry(
+            &agent_with_perf("ok", "", Some(perf), false, false),
+            w,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            cockpit_config::extended::DiffStyle::default(),
+            false,
+            &no_elided(),
+            0,
+            pin,
+        );
+        let text: String = narrow
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains('↔'),
+            "width {w} should show resize state: {text}"
+        );
+        assert!(narrow.metric_region.is_none());
+        assert!(narrow.pin_region.is_none());
+    }
 }

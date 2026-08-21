@@ -368,6 +368,7 @@ pub(super) enum SettingId {
     CommandProfileWrappers,
     CommandProfileCustomProfiles,
     InlineThink,
+    ResponseMetricsTokenizer,
     HintToolCallCorrections,
     TextEmbeddedRecovery,
     UtilityModel,
@@ -466,6 +467,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::CommandProfileWrappers,
     SettingId::CommandProfileCustomProfiles,
     SettingId::InlineThink,
+    SettingId::ResponseMetricsTokenizer,
     SettingId::HintToolCallCorrections,
     SettingId::TextEmbeddedRecovery,
     SettingId::UtilityModel,
@@ -566,6 +568,7 @@ impl SettingId {
             SettingId::CommandProfileWrappers => "resource profile wrappers",
             SettingId::CommandProfileCustomProfiles => "custom resource profiles",
             SettingId::InlineThink => "extract inline <think>",
+            SettingId::ResponseMetricsTokenizer => "Response metrics tokenizer",
             SettingId::HintToolCallCorrections => "hint tool-call corrections",
             SettingId::TextEmbeddedRecovery => "text-embedded recovery",
             SettingId::UtilityModel => "utility model",
@@ -812,6 +815,11 @@ impl SettingId {
                  from later turns so it never replays. Off treats it as response \
                  body — left inline as ordinary text (no chip) and carried \
                  forward. A provider or model override wins over this default."
+            }
+            SettingId::ResponseMetricsTokenizer => {
+                "Shared comparison tokenizer for response-performance TPS. \
+                 Normalizes user-experienced tokens-per-second across models; \
+                 neither provider-native nor calibration. Default `cl100k_base`."
             }
             SettingId::HintToolCallCorrections => {
                 "When a tool call is auto-repaired, also tell the model what was \
@@ -1774,6 +1782,7 @@ fn category_rows(category: Category) -> Vec<Row> {
             Setting(S::CommandProfileWrappers),
             Setting(S::CommandProfileCustomProfiles),
             Setting(S::InlineThink),
+            Setting(S::ResponseMetricsTokenizer),
             Setting(S::HintToolCallCorrections),
             Setting(S::TextEmbeddedRecovery),
             Heading(SettingHeading {
@@ -1972,6 +1981,7 @@ impl SettingsCx {
                 "on (default — <think> is thinking: chip, dropped later)",
                 "off (<think> is response body: kept inline, no chip)",
             ),
+            S::ResponseMetricsTokenizer => e.response_metrics_tokenizer.as_str().to_string(),
             S::HintToolCallCorrections => on_off(
                 e.hint_tool_call_corrections,
                 "on (tell the model what was corrected)",
@@ -2778,6 +2788,12 @@ impl SettingsCx {
             S::CommandProfileGo => toggle_command_profile(e, GO_TOOLCHAIN),
             S::CommandProfileJava => toggle_command_profile(e, JAVA_TOOLCHAIN),
             S::InlineThink => e.inline_think = !e.inline_think,
+            S::ResponseMetricsTokenizer => {
+                let all = cockpit_tokenizer::TiktokenEncoding::ALL;
+                let current = e.response_metrics_tokenizer;
+                let idx = all.iter().position(|enc| *enc == current).unwrap_or(0);
+                e.response_metrics_tokenizer = all[(idx + 1) % all.len()];
+            }
             S::HintToolCallCorrections => {
                 e.hint_tool_call_corrections = !e.hint_tool_call_corrections
             }
@@ -3535,6 +3551,7 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
         S::CommandProfileWrappers => &["commandResourceProfiles", "wrappers"],
         S::CommandProfileCustomProfiles => &["commandResourceProfiles", "profiles"],
         S::InlineThink => &["inlineThink"],
+        S::ResponseMetricsTokenizer => &["response_metrics_tokenizer"],
         S::HintToolCallCorrections => &["hintToolCallCorrections"],
         S::TextEmbeddedRecovery => &["textEmbeddedRecovery"],
         S::AgentChoosesSubagentModel => &["agent_chooses_subagent_model"],
@@ -4559,5 +4576,53 @@ mod descriptor_tests {
                 "{mode:?} label must not mention custody: {label}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod response_metrics_tokenizer_setting_tests {
+    use super::*;
+    use crate::tui::app::{response_metrics_tokenizer_choices, response_metrics_tokenizer_help};
+
+    #[test]
+    fn response_metrics_tokenizer_behavior_setting_round_trip() {
+        assert_eq!(
+            SettingId::ResponseMetricsTokenizer.label(),
+            "Response metrics tokenizer"
+        );
+        assert!(
+            SettingId::ResponseMetricsTokenizer
+                .help_text()
+                .contains("user-experienced")
+        );
+        assert_eq!(response_metrics_tokenizer_choices().len(), 5);
+        assert!(response_metrics_tokenizer_help().contains("Neither provider-native"));
+
+        // Behavior page includes the setting.
+        let rows = category_rows(Category::Behavior);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, Row::Setting(SettingId::ResponseMetricsTokenizer))),
+            "Behavior inventory must register Response metrics tokenizer"
+        );
+
+        let mut e = cockpit_config::extended::ExtendedConfig::default();
+        assert_eq!(
+            e.response_metrics_tokenizer,
+            cockpit_tokenizer::TiktokenEncoding::Cl100k
+        );
+        // Cycle through all encodings.
+        for _ in 0..5 {
+            let before = e.response_metrics_tokenizer;
+            let all = cockpit_tokenizer::TiktokenEncoding::ALL;
+            let idx = all.iter().position(|enc| *enc == before).unwrap_or(0);
+            e.response_metrics_tokenizer = all[(idx + 1) % all.len()];
+            assert_ne!(e.response_metrics_tokenizer, before);
+        }
+        // Five cycles returns to default.
+        assert_eq!(
+            e.response_metrics_tokenizer,
+            cockpit_tokenizer::TiktokenEncoding::Cl100k
+        );
     }
 }

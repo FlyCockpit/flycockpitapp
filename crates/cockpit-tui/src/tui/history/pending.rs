@@ -36,6 +36,10 @@ pub struct PendingMsg {
     /// a `<think>` or `</think>` tag — held until the next delta lets
     /// us disambiguate.
     pub tag_partial: String,
+    /// Whether this pending row is keyed to a live typed display attempt.
+    /// `None` until an `AssistantDisplay*` event owns the provisional UI;
+    /// live chip/body updates never re-enter raw `<think>` parsing.
+    pub attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
     /// `session_events.seq` of this assistant message, set from the
     /// finalizing `AssistantText` event and stamped onto the frozen
     /// [`HistoryEntry::Agent`] (the stable id a pin references —

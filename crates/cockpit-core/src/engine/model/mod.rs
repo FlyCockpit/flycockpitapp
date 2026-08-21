@@ -86,6 +86,7 @@ impl RedactedRendering for SessionRedactionRendering {
 
 mod build;
 mod dispatch;
+mod display_dispatch;
 mod failure;
 mod http_client;
 mod outbound_guard;
@@ -93,6 +94,8 @@ mod redact;
 pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;
+
+pub(crate) use display_dispatch::DisplayAttemptSlot;
 
 #[allow(unused_imports)]
 pub use build::ModelParams;

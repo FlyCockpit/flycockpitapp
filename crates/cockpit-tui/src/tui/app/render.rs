@@ -682,6 +682,15 @@ pub(crate) enum ControlChip {
     Pin { seq: i64 },
 }
 
+/// Exact glyph range for the response-performance metric chip on one
+/// rendered chat row. Clicking toggles only `performance_expanded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetricHit {
+    pub history_index: usize,
+    pub col_start: u16,
+    pub col_end: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatRowKind {
     Padding,
@@ -729,6 +738,7 @@ pub(crate) struct ChatRowMeta {
     pub diff_path: Option<String>,
     pub pin_hit: Option<PinHit>,
     pub fork_hit: Option<PinHit>,
+    pub metric_hit: Option<MetricHit>,
     pub continuation: bool,
     pub selectable: bool,
     /// Semantic copy provenance for each occupied terminal column. Wide
@@ -764,6 +774,7 @@ impl ChatRowMeta {
             diff_path: None,
             pin_hit: None,
             fork_hit: None,
+            metric_hit: None,
             continuation: false,
             selectable: false,
             copy_cells: Vec::new(),
@@ -2455,7 +2466,7 @@ impl App {
             tool_result_scroll_regions,
             reasoning_scroll_region,
             pin_region,
-            metric_region: _,
+            metric_region,
         } = rendered;
         let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
         let diff_path = match entry {
@@ -2497,6 +2508,13 @@ impl App {
                 },
                 _ => None,
             };
+            let metric_hit = metric_region.as_ref().and_then(|region| {
+                region.rows.iter().find(|r| r.row == i).map(|r| MetricHit {
+                    history_index: idx,
+                    col_start: r.col_start,
+                    col_end: r.col_end,
+                })
+            });
             let row_kind = if chip_target.is_some() || subagent_target.is_some() {
                 ChatRowKind::Chip
             } else {
@@ -2538,6 +2556,7 @@ impl App {
                 diff_path: diff_path.clone(),
                 pin_hit,
                 fork_hit,
+                metric_hit,
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
                 copy_cells: copy_body_start
@@ -7047,6 +7066,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,
@@ -7451,6 +7471,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,
@@ -7485,6 +7506,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,
@@ -7679,6 +7701,7 @@ mod render_history_spacing_tests {
                 inside_think: false,
                 body_started: true,
                 tag_partial: String::new(),
+                attempt_id: None,
                 seq: None,
                 strip_think: true,
                 response_performance: None,
@@ -7704,6 +7727,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,
@@ -7770,6 +7794,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,
@@ -9013,6 +9038,7 @@ mod render_history_spacing_tests {
             saved_history_render_cache_rows: app.history_render_cache_rows,
             saved_queue: Vec::new(),
             saved_pending: None,
+            saved_active_display_attempt_id: None,
             saved_prunable_tokens: 0,
             saved_cache_cold: false,
             saved_elided_event_ids: std::collections::HashSet::new(),
@@ -9074,6 +9100,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: true,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: false,
             response_performance: None,
@@ -10015,6 +10042,7 @@ mod render_history_spacing_tests {
             inside_think: false,
             body_started: false,
             tag_partial: String::new(),
+            attempt_id: None,
             seq: None,
             strip_think: true,
             response_performance: None,

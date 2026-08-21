@@ -16,6 +16,7 @@ workspace = true
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
 cockpit-proto = { path = "../cockpit-proto" }
+cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

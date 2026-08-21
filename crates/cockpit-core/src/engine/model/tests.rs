@@ -40,6 +40,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect_err("pre-cancelled dispatch should stop before network");
@@ -261,6 +262,7 @@ where
         Some(&tx),
         &cancel,
         &output_sent,
+        None,
     )
     .await;
     let reached = InferencePhase::from_rank(phase.load(std::sync::atomic::Ordering::SeqCst));
@@ -483,6 +485,7 @@ async fn cancel_still_aborts_after_timeout_warning() {
             Some(&tx),
             &child_cancel,
             &output_sent,
+            None,
         )
         .await
     });
@@ -3393,6 +3396,7 @@ async fn capture_anthropic_body(
             None,
             None,
             false,
+            None,
         )
         .await;
     assert!(result.is_err(), "capture server deliberately returns 400");

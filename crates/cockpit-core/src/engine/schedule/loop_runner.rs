@@ -244,6 +244,7 @@ async fn run_iteration(
             None,
             None,
             turn_tx,
+            None,
         )
         .await?;
         match outcome {

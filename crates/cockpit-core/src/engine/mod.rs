@@ -63,8 +63,9 @@ pub use agent::{
 pub use driver::Driver;
 pub use response_performance::{
     AssistantAttemptId, AssistantTextPayload, DisplayAttemptReset, DisplayClassifierConfig,
-    DisplayComplete, DisplayError, DisplayEvent, DisplayReasoningDelta, DisplayStreamClassifier,
-    DisplayTextDelta, InjectedDisplayClock, Instant, RealDisplayClock, ResponsePerformance,
+    DisplayComplete, DisplayError, DisplayErrorKind, DisplayEvent, DisplayReasoningDelta,
+    DisplayStreamClassifier, DisplayTextDelta, InjectedDisplayClock, Instant, RealDisplayClock,
+    ResponsePerformance,
 };
 
 /// Whether the conversation is at a point where context-reduction

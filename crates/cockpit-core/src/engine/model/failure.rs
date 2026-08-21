@@ -343,12 +343,17 @@ pub fn failure_engages_backup(class: &InferenceErrorClass) -> bool {
 /// Recorded into the dispatch-time record's terminal payload so an export
 /// answers "how long to first token / total" as a lookup. The failure path
 /// carries its own elapsed-ms on [`InferenceFailure`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub struct InferenceTiming {
     /// Milliseconds from dispatch to the first streamed chunk, if any.
     pub first_token_ms: Option<u64>,
     /// Milliseconds from dispatch to stream completion.
     pub completed_ms: u64,
+    /// Open display-stream classifier for the successful attempt, when the
+    /// production display path constructed one at attempt dispatch. The
+    /// turn-phase layer calls [`DisplayStreamClassifier::finish`] after
+    /// translation so the durable snapshot measures displayed UX text.
+    pub open_display: Option<crate::engine::response_performance::DisplayStreamClassifier>,
 }
 
 /// Persist a self-healed wire-API endpoint back into config

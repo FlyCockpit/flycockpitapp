@@ -4390,6 +4390,18 @@ impl NoninteractiveSteerTarget {
 struct PendingNestedDeltas {
     assistant: Option<(String, String)>,
     reasoning: Option<(String, String)>,
+    /// Typed display text deltas keyed by (agent, attempt_id).
+    display_assistant: Option<(
+        String,
+        crate::engine::response_performance::AssistantAttemptId,
+        String,
+    )>,
+    /// Typed display reasoning deltas keyed by (agent, attempt_id).
+    display_reasoning: Option<(
+        String,
+        crate::engine::response_performance::AssistantAttemptId,
+        String,
+    )>,
 }
 
 impl PendingNestedDeltas {
@@ -4415,8 +4427,62 @@ impl PendingNestedDeltas {
         }
     }
 
+    fn push_display_assistant(
+        &mut self,
+        agent: String,
+        attempt_id: crate::engine::response_performance::AssistantAttemptId,
+        delta: String,
+    ) {
+        match self.display_assistant.as_mut() {
+            Some((current_agent, current_attempt, current_delta))
+                if current_agent == &agent && *current_attempt == attempt_id =>
+            {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.display_assistant = Some((agent, attempt_id, delta));
+            }
+        }
+    }
+
+    fn push_display_reasoning(
+        &mut self,
+        agent: String,
+        attempt_id: crate::engine::response_performance::AssistantAttemptId,
+        delta: String,
+    ) {
+        match self.display_reasoning.as_mut() {
+            Some((current_agent, current_attempt, current_delta))
+                if current_agent == &agent && *current_attempt == attempt_id =>
+            {
+                current_delta.push_str(&delta);
+            }
+            _ => {
+                self.display_reasoning = Some((agent, attempt_id, delta));
+            }
+        }
+    }
+
     fn drain(&mut self) -> Vec<TurnEvent> {
         let mut out = Vec::new();
+        if let Some((agent, attempt_id, delta)) = self.display_reasoning.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::AssistantDisplayReasoningDelta {
+                agent,
+                attempt_id,
+                delta,
+            });
+        }
+        if let Some((agent, attempt_id, delta)) = self.display_assistant.take()
+            && !delta.is_empty()
+        {
+            out.push(TurnEvent::AssistantDisplayTextDelta {
+                agent,
+                attempt_id,
+                delta,
+            });
+        }
         if let Some((agent, delta)) = self.reasoning.take()
             && !delta.is_empty()
         {
@@ -4494,6 +4560,20 @@ pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
                         }
                         TurnEvent::ReasoningDelta { agent, delta } => {
                             pending.push_reasoning(agent, delta);
+                        }
+                        TurnEvent::AssistantDisplayTextDelta {
+                            agent,
+                            attempt_id,
+                            delta,
+                        } => {
+                            pending.push_display_assistant(agent, attempt_id, delta);
+                        }
+                        TurnEvent::AssistantDisplayReasoningDelta {
+                            agent,
+                            attempt_id,
+                            delta,
+                        } => {
+                            pending.push_display_reasoning(agent, attempt_id, delta);
                         }
                         other => {
                             if !flush_nested_deltas(&event_tx, &target, &mut pending).await {

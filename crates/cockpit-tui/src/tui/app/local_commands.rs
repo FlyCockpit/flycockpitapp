@@ -1088,6 +1088,17 @@ impl App {
         self.pending.as_mut().expect("pending initialized")
     }
 
+    /// True when `attempt_id` does not match the live typed-display attempt
+    /// that currently owns provisional UI (after Reset, that is the
+    /// replacement — so late failed-attempt events stay inert).
+    pub(super) fn display_attempt_is_stale(
+        &self,
+        attempt_id: cockpit_core::engine::AssistantAttemptId,
+    ) -> bool {
+        self.active_display_attempt_id
+            .is_some_and(|active| active != attempt_id)
+    }
+
     /// Bare-`/<skill-name>` sugar (implementation note):
     /// the composer holds `/<name>` optionally followed by trailing args. Seed
     /// a deterministic skill invocation, forwarding the trailing text as the

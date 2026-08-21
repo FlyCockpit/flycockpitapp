@@ -494,6 +494,66 @@ impl Session {
         }
     }
 
+    /// Invalidate and re-resolve the command-backed secret(s) referenced by ONLY
+    /// the `provider_id` entry, through this session's OWNER-SCOPED store — the
+    /// session-scoped sibling of the daemon registry's
+    /// `resolve_provider_command_secrets` (owner-scoped, invalidate-then-
+    /// `ensure_resolved`). Used by the engine's `CredentialsRejected` rebuild-
+    /// and-retry path (AC5), which has the session but not the registry: a stale
+    /// short-lived command token for the FAILING provider is re-minted into the
+    /// daemon cache so the subsequently-rebuilt model client observes the fresh
+    /// value. Scoped to `provider_id` so a 401 from one provider never invalidates
+    /// or executes a sibling provider's command secret.
+    ///
+    /// Returns `true` iff at least one owner-scoped command-backed secret for
+    /// `provider_id` was eligible and re-resolved — the caller gates the rebuild-
+    /// and-retry on this so a provider with only a static/env/literal credential
+    /// (no command-backed secret) triggers NO exec, no rebuild, and no retry. A
+    /// name the owner-scoped store does not know as command-backed (foreign,
+    /// unclaimed, or literal) is skipped and never executed. The store is an
+    /// owned snapshot, so no lock guard is held across the `.await`s.
+    pub(crate) async fn reresolve_provider_command_secrets(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+        provider_id: &str,
+    ) -> bool {
+        let Some(cache) = self.command_secret_cache() else {
+            return false;
+        };
+        let referenced =
+            crate::secret_ref::provider_named_secret_references_for(providers, provider_id);
+        if referenced.is_empty() {
+            return false;
+        }
+        let store = match self.provider_credential_store(providers) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "command-secret re-resolution skipped: owner-scoped store unavailable"
+                );
+                return false;
+            }
+        };
+        let mut reresolved_any = false;
+        for name in &referenced {
+            let Some(argv) = store.named_secret_command_spec(name) else {
+                continue;
+            };
+            let argv = argv.to_vec();
+            cache.invalidate(name);
+            // Only a SUCCESSFUL (`Resolved`) re-resolution counts as eligible: a
+            // command that fails to resolve leaves the secret still broken, so a
+            // rebuild-and-retry would just 401 again with the same stale/missing
+            // credential. A referenced-but-failing command ⇒ not eligible ⇒ the
+            // caller surfaces the original auth error with no rebuild/retry.
+            if cache.ensure_resolved(name, &argv).await.is_resolved() {
+                reresolved_any = true;
+            }
+        }
+        reresolved_any
+    }
+
     /// Owner-scoped provider resolution store. Unlike [`Self::credential_store`]
     /// (the comprehensive view used for redaction and inventory), this restricts
     /// the resolvable `$secret:` names to those owned by (provider, this

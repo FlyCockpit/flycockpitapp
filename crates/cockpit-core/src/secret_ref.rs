@@ -48,6 +48,25 @@ pub fn provider_named_secret_references(
         .collect()
 }
 
+/// Every named-secret id (`$secret:NAME`) referenced by the headers of ONLY the
+/// `provider_id` entry. Scoped to a single provider so a credentials failure on
+/// one provider re-resolves that provider's command secret(s) and never a
+/// sibling provider's (same-workspace). Empty when the provider is absent or
+/// references no `$secret:` names.
+pub fn provider_named_secret_references_for(
+    providers: &ProvidersConfig,
+    provider_id: &str,
+) -> std::collections::BTreeSet<String> {
+    providers
+        .providers
+        .get(provider_id)
+        .into_iter()
+        .flat_map(|entry| entry.headers.iter())
+        .flat_map(|header| crate::envref::referenced_names(&header.value))
+        .filter_map(|name| name.strip_prefix("secret:").map(str::to_string))
+        .collect()
+}
+
 /// CLI-owned effective provider loader. The config crate keeps header values
 /// opaque; this boundary performs the credential-store migration before the
 /// values can be used by request construction.

@@ -38,6 +38,7 @@ use crate::redact::RedactionTable;
 use crate::session::{Session, ToolCallRow};
 
 mod backup;
+mod credentials_rejected_rebuild;
 mod events;
 mod gate;
 pub(crate) mod hooks;

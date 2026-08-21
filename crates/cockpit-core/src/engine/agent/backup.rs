@@ -1,3 +1,4 @@
+use super::credentials_rejected_rebuild;
 use super::*;
 
 /// Maximum models attempted for one logical turn, including the primary.
@@ -201,6 +202,12 @@ pub async fn turn_with_backup(
     // finally stops. Only a no-candidate, no-custody primary emits its UI
     // directly. Loop-invariant by construction.
     let emit_failure_ui = candidates.is_empty() && custody_block.is_none();
+    // Credentials-rejected rebuild-and-retry latch (AC5), scoped to the WHOLE
+    // logical dispatch — declared OUTSIDE the failover loop so at most ONE
+    // automatic command-secret rebuild-and-retry happens across every physical
+    // attempt (primary + each failover candidate). A success returns out of the
+    // function, so a later independent dispatch starts with a fresh latch.
+    let mut credentials_rebuild_used = false;
     loop {
         let current_model: &Model = match current {
             None => &agent.model,
@@ -250,36 +257,112 @@ pub async fn turn_with_backup(
         // rows that are still correlatable to one logical call. (This reverts
         // the fresh-`Uuid::new_v4()`-per-attempt workaround, which decorrelated
         // failover attempts from their primary.)
-        let attempt_result = turn(
-            dispatch_agent,
-            current_model,
-            history,
-            prompt.clone(),
-            session.clone(),
-            locks.clone(),
-            redact.clone(),
-            cwd.clone(),
-            config.clone(),
-            interrupts.clone(),
-            cancel.clone(),
-            approver.clone(),
-            lsp.clone(),
-            resource_scheduler.clone(),
-            loop_guard_threshold,
-            is_root,
-            skill_write_origin,
-            review_cage.clone(),
-            context_usage,
-            deferred_log.clone(),
-            emit_failure_ui,
-            call_id,
-            attempt_ordinal,
-            if current.is_none() { tandem } else { None },
-            goal_provenance,
-            turn_id.clone(),
-            tx,
-        )
-        .await;
+        // Credentials-rejected rebuild-and-retry (AC5). On a provider auth
+        // failure classified `CredentialsRejected` (401/403) for THIS target, if
+        // the failing provider has an owner-scoped command-backed secret,
+        // re-resolve ONLY that provider's secret(s), rebuild a FRESH model client
+        // under a REFRESHED redaction table so the new token is scrubbed, and
+        // retry the SAME target ONCE. The `credentials_rebuild_used` latch (above
+        // the failover loop) permits at most ONE such rebuild across the whole
+        // logical dispatch. A provider with no command-backed secret is NOT
+        // rebuilt-and-retried (its original auth error surfaces immediately).
+        // `CredentialsRejected` does not engage backup failover, so this runs
+        // before the failover selection below.
+        let mut rebuilt_model: Option<Arc<Model>> = None;
+        let mut rebuilt_redact: Option<Arc<RedactionTable>> = None;
+        let attempt_result = loop {
+            let is_credentials_retry = rebuilt_model.is_some();
+            let model_for_attempt: &Model = rebuilt_model.as_deref().unwrap_or(current_model);
+            // The retry dispatches under the refreshed redaction table so the
+            // freshly-resolved token is scrubbed on the recorded request too.
+            let redact_for_attempt: &Arc<RedactionTable> =
+                rebuilt_redact.as_ref().unwrap_or(&redact);
+            let result = turn(
+                dispatch_agent,
+                model_for_attempt,
+                history,
+                prompt.clone(),
+                session.clone(),
+                locks.clone(),
+                redact_for_attempt.clone(),
+                cwd.clone(),
+                config.clone(),
+                interrupts.clone(),
+                cancel.clone(),
+                approver.clone(),
+                lsp.clone(),
+                resource_scheduler.clone(),
+                loop_guard_threshold,
+                is_root,
+                skill_write_origin,
+                review_cage.clone(),
+                context_usage,
+                deferred_log.clone(),
+                emit_failure_ui,
+                call_id,
+                attempt_ordinal,
+                // Tandem shadowing is a PRIMARY, first-attempt concern; a
+                // credentials rebuild-retry must not re-shadow the same call.
+                if current.is_none() && !is_credentials_retry {
+                    tandem
+                } else {
+                    None
+                },
+                goal_provenance,
+                turn_id.clone(),
+                tx,
+            )
+            .await;
+
+            // Copy the decision out with no borrow of `result` held.
+            let attempt_rebuild = credentials_rejected_rebuild::should_attempt_credentials_rebuild(
+                credentials_rejected_rebuild::result_is_credentials_rejected(&result),
+                credentials_rebuild_used,
+            );
+            if !attempt_rebuild {
+                break result;
+            }
+            match credentials_rejected_rebuild::rebuild_model_for_credentials(
+                &session,
+                &config,
+                &redact,
+                &dispatch_agent.env_overlay,
+                model_for_attempt,
+            )
+            .await
+            {
+                Ok(Some(rebuilt)) => {
+                    // A command-backed secret was re-resolved and a fresh client
+                    // built: spend the latch and retry the same target once. The
+                    // retry is a DISTINCT physical dispatch of the same logical
+                    // call, so advance the ordinal to avoid colliding with the
+                    // rejected attempt's `(call_id, ordinal)` inference-request
+                    // row.
+                    credentials_rebuild_used = true;
+                    rebuilt_model = Some(Arc::new(rebuilt.model));
+                    rebuilt_redact = Some(rebuilt.redact);
+                    attempt_ordinal += 1;
+                }
+                Ok(None) => {
+                    // Provider has no command-backed secret: not eligible. No
+                    // exec, no rebuild, no retry — surface the original auth
+                    // error unchanged.
+                    break result;
+                }
+                Err(rebuild_err) => {
+                    // Rebuild failed (unconfigured provider / bad id / store
+                    // error): surface the ORIGINAL auth failure and take no
+                    // further retry.
+                    tracing::warn!(
+                        %rebuild_err,
+                        provider = %current_model.provider_id(),
+                        model = %current_model.model_id_ref(),
+                        "credentials rebuild failed; surfacing original auth error"
+                    );
+                    break result;
+                }
+            }
+        };
 
         match attempt_result {
             Ok(outcome) => {
@@ -2113,6 +2196,557 @@ mod backup_fallback_tests {
                 .expect("backup with injected vault store must resolve $secret headers");
         assert_eq!(backup.provider_id(), "reliable");
         assert_eq!(backup.model_id_ref(), "backup-model");
+    }
+
+    /// Command executor returning canned values by call order — startup resolves
+    /// `values[0]`, a rebuild re-resolves `values[1]`, etc.
+    struct SequencedCommandExecutor {
+        values: Vec<String>,
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::secret_command::CommandSecretExecutor for SequencedCommandExecutor {
+        async fn run(
+            &self,
+            _argv: &[String],
+        ) -> std::result::Result<String, crate::secret_command::CommandSecretError> {
+            let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .values
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| "unexpected-extra-call".to_string()))
+        }
+    }
+
+    fn claim_provider_ownership_row(
+        db: &crate::db::Db,
+        item_id: &str,
+        project_root: &std::path::Path,
+    ) {
+        let root =
+            crate::secret_ownership::canonical_owner_root(&project_root.display().to_string());
+        let item_id = item_id.to_string();
+        db.blocking_write_for_sync_maintenance(move |conn| {
+            conn.execute(
+                "INSERT INTO secret_named_ownership (item_id, owner_kind, project_root, created_at)
+                 VALUES (?1, 'provider', ?2, 0)",
+                rusqlite::params![item_id, root],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// AC5 (HIGH #5, real path): a `CredentialsRejected` (401) on a command-backed
+    /// provider drives the REAL `turn_with_backup` loop through one re-resolve +
+    /// model-client rebuild + one retry. The ScriptedProvider serves 401 to the
+    /// stale-token primary, then a completion to the fresh-token rebuilt retry.
+    /// Proven on production code (no replica): the retry's captured Authorization
+    /// header carries the FRESH token (a cache-invalidate-only reuse of the stale
+    /// client would resend the stale token), the re-resolve executes exactly once,
+    /// and two distinct `(call_id, ordinal)` rows are recorded.
+    #[tokio::test]
+    async fn credentials_rejected_rebuilds_client_and_retries_on_real_path() {
+        use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage};
+
+        let provider = ScriptedProvider::builder()
+            .turn(Turn::HttpError {
+                status: 401,
+                body: r#"{"error":{"message":"unauthorized"}}"#.into(),
+            })
+            .turn(Turn::Text("answered after credential rebuild".into()))
+            .with_usage(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                use_alias_names: false,
+            })
+            .start()
+            .await;
+
+        // Session whose vault holds the provider-owned command-backed secret.
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                root,
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+        store
+            .set_named_secret_command(
+                "ghcmd",
+                vec!["gh".to_string(), "auth".to_string(), "token".to_string()],
+            )
+            .unwrap();
+        store.save().unwrap();
+        claim_provider_ownership_row(&db, "ghcmd", &session.project_root);
+
+        // startup resolves the stale token; the rebuild re-resolves the fresh one.
+        let cache =
+            crate::secret_command::CommandSecretCache::new(Arc::new(SequencedCommandExecutor {
+                values: vec![
+                    "stale-token-aaaaaaaaaaaa".to_string(),
+                    "fresh-token-bbbbbbbbbbbb".to_string(),
+                ],
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }));
+        session.set_command_secret_cache(Some(cache.clone()));
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "cloud".into(),
+            ProviderEntry {
+                url: provider.base_url(),
+                // Trusted so the captured wire request is raw (no egress
+                // redaction), letting the retry's Authorization header be
+                // asserted against the freshly-resolved token directly.
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    trust: Some(ModelTrust::Trusted),
+                    ..ModelEntry::default()
+                }],
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer $secret:ghcmd".into(),
+                }],
+                timeout: TimeoutConfig {
+                    ttft_secs: 5,
+                    idle_secs: 5,
+                },
+                ..ProviderEntry::default()
+            },
+        );
+
+        // Async startup pre-resolution → cache holds the stale token (exec 1).
+        session
+            .reresolve_provider_command_secrets(&cfg, "cloud")
+            .await;
+        assert_eq!(cache.exec_count(), 1);
+
+        // The primary client, built from the owner-scoped store, sends the stale
+        // token → the provider's first turn 401s.
+        let table = Arc::new(RedactionTable::empty());
+        let store_for_model = session.provider_credential_store(&cfg).unwrap();
+        let primary = Arc::new(
+            Model::for_provider_with_store(
+                &cfg,
+                "cloud",
+                "m",
+                table.clone(),
+                |_name: &str| -> Option<String> { None },
+                store_for_model,
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let call_id = Uuid::new_v4();
+        let cwd = session.project_root.clone();
+
+        let outcome = turn_with_backup(
+            &agent,
+            None,
+            &[],
+            &mut Vec::new(),
+            Message::user("hello"),
+            session.clone(),
+            locks,
+            table.clone(),
+            cwd,
+            crate::daemon::session_worker::SessionConfigHandle::detached(
+                crate::daemon::session_worker::SessionConfigSnapshot::new(
+                    0,
+                    cfg.clone(),
+                    crate::config::extended::ExtendedConfig::default(),
+                ),
+            ),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            call_id,
+            None,
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, TurnOutcome::Done),
+            "the rebuilt retry succeeds"
+        );
+        // Exactly one re-resolve on the rebuild (startup exec + one).
+        assert_eq!(
+            cache.exec_count(),
+            2,
+            "one and only one re-resolve on the rebuild"
+        );
+
+        // Two physical attempts under one call_id at distinct ordinals.
+        let attempts = session
+            .db
+            .list_inference_requests_for_call(&call_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "primary 401 + rebuilt retry are distinct rows"
+        );
+        assert_eq!(attempts[0].ordinal, 0);
+        assert_eq!(attempts[1].ordinal, 1);
+
+        // The retry dispatched a DISTINCT rebuilt client carrying the FRESH token.
+        let captured = provider.captured();
+        assert_eq!(captured.len(), 2, "primary 401 + one rebuilt retry");
+        let auth = |req: &CapturedRequest| {
+            req.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            auth(&captured[0]).contains("stale-token-aaaaaaaaaaaa"),
+            "the primary sent the stale token"
+        );
+        assert!(
+            auth(&captured[1]).contains("fresh-token-bbbbbbbbbbbb"),
+            "the retry sent the freshly-resolved token — a distinct rebuilt client, \
+             not a cache-invalidate-only reuse of the stale one"
+        );
+        let _ = drain(&mut rx);
+    }
+
+    /// AC3/AC5 (HIGH #3, real path): the credentials rebuild latch is scoped to
+    /// the WHOLE logical dispatch, not per failover candidate. Primary 401 →
+    /// rebuild-and-retry (one re-resolve) → that retry 5xxs → failover to a
+    /// (also command-backed) backup → backup 401. The backup's 401 must NOT
+    /// trigger a SECOND command rebuild/re-resolve: exactly one rebuild happens
+    /// across the whole dispatch and the final error surfaces. Against a
+    /// per-candidate latch the backup would rebuild too and `exec_count` would be
+    /// 4, not 3.
+    #[tokio::test]
+    async fn credentials_latch_is_per_dispatch_not_per_failover_candidate() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn};
+
+        // Primary: 401 to the first attempt, then a failover-eligible 500 to the
+        // rebuilt retry (repeat_last so internal 5xx retries all settle to 500).
+        let primary_provider = ScriptedProvider::builder()
+            .turn(Turn::HttpError {
+                status: 401,
+                body: r#"{"error":{"message":"unauthorized"}}"#.into(),
+            })
+            .turn(Turn::HttpError {
+                status: 500,
+                body: r#"{"error":{"message":"server"}}"#.into(),
+            })
+            .repeat_last()
+            .start()
+            .await;
+        // Backup: 401 (repeat_last so a buggy second rebuild-retry still gets 401
+        // rather than an unscripted request).
+        let backup_provider = ScriptedProvider::builder()
+            .turn(Turn::HttpError {
+                status: 401,
+                body: r#"{"error":{"message":"unauthorized"}}"#.into(),
+            })
+            .repeat_last()
+            .start()
+            .await;
+
+        // Session whose vault holds BOTH providers' provider-owned command secrets.
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                root,
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+        store
+            .set_named_secret_command("ghcmd", vec!["gh-prog".to_string()])
+            .unwrap();
+        store
+            .set_named_secret_command("bkcmd", vec!["bk-prog".to_string()])
+            .unwrap();
+        store.save().unwrap();
+        claim_provider_ownership_row(&db, "ghcmd", &session.project_root);
+        claim_provider_ownership_row(&db, "bkcmd", &session.project_root);
+
+        let cache =
+            crate::secret_command::CommandSecretCache::new(Arc::new(SequencedCommandExecutor {
+                values: vec![],
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }));
+        session.set_command_secret_cache(Some(cache.clone()));
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "cloud".into(),
+            ProviderEntry {
+                url: primary_provider.base_url(),
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    trust: Some(ModelTrust::Trusted),
+                    ..ModelEntry::default()
+                }],
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer $secret:ghcmd".into(),
+                }],
+                timeout: TimeoutConfig {
+                    ttft_secs: 5,
+                    idle_secs: 5,
+                },
+                ..ProviderEntry::default()
+            },
+        );
+        cfg.providers.insert(
+            "local".into(),
+            ProviderEntry {
+                url: backup_provider.base_url(),
+                models: vec![ModelEntry {
+                    id: "bm".into(),
+                    trust: Some(ModelTrust::Trusted),
+                    ..ModelEntry::default()
+                }],
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer $secret:bkcmd".into(),
+                }],
+                timeout: TimeoutConfig {
+                    ttft_secs: 5,
+                    idle_secs: 5,
+                },
+                ..ProviderEntry::default()
+            },
+        );
+
+        // Startup pre-resolution of BOTH providers' command secrets (exec 1 + 2)
+        // so both models can be built.
+        session
+            .reresolve_provider_command_secrets(&cfg, "cloud")
+            .await;
+        session
+            .reresolve_provider_command_secrets(&cfg, "local")
+            .await;
+        assert_eq!(cache.exec_count(), 2);
+
+        let table = Arc::new(RedactionTable::empty());
+        let cloud_store = session.provider_credential_store(&cfg).unwrap();
+        let primary = Arc::new(
+            Model::for_provider_with_store(
+                &cfg,
+                "cloud",
+                "m",
+                table.clone(),
+                |_name: &str| -> Option<String> { None },
+                cloud_store,
+            )
+            .unwrap(),
+        );
+        let local_store = session.provider_credential_store(&cfg).unwrap();
+        let backup = Arc::new(
+            Model::for_provider_with_store(
+                &cfg,
+                "local",
+                "bm",
+                table.clone(),
+                |_name: &str| -> Option<String> { None },
+                local_store,
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let cwd = session.project_root.clone();
+
+        let result = turn_with_backup(
+            &agent,
+            Some(&backup),
+            &[],
+            &mut Vec::new(),
+            Message::user("hello"),
+            session.clone(),
+            locks,
+            table.clone(),
+            cwd,
+            crate::daemon::session_worker::SessionConfigHandle::detached(
+                crate::daemon::session_worker::SessionConfigSnapshot::new(
+                    0,
+                    cfg.clone(),
+                    crate::config::extended::ExtendedConfig::default(),
+                ),
+            ),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "the final backup 401 surfaces");
+        // Exactly ONE command rebuild across the dispatch: startup(2) + the single
+        // cloud rebuild(1). The backup's 401 does NOT rebuild again — a per-
+        // candidate latch would make this 4.
+        assert_eq!(
+            cache.exec_count(),
+            3,
+            "at most one command rebuild-and-retry across the whole logical dispatch"
+        );
+        let _ = drain(&mut rx);
+    }
+
+    /// AC5 (real path): a provider whose credential is a STATIC key (no command-
+    /// backed secret) that 401s is surfaced immediately — no re-resolve, no
+    /// rebuild, no retry. Exactly one provider request; zero command exec. Against
+    /// a no-eligibility-gate impl the dispatch would rebuild and retry (a second
+    /// request).
+    #[tokio::test]
+    async fn static_provider_401_does_not_rebuild_or_retry() {
+        use cockpit_test_support::provider::{ScriptedProvider, Turn};
+
+        let provider = ScriptedProvider::builder()
+            .turn(Turn::HttpError {
+                status: 401,
+                body: r#"{"error":{"message":"unauthorized"}}"#.into(),
+            })
+            .start()
+            .await;
+
+        let (tmp, session, locks, _redact) = ctx();
+        // A command cache is installed, so the "not eligible" reason is the
+        // provider having no command-backed reference (not a missing cache).
+        let cache =
+            crate::secret_command::CommandSecretCache::new(Arc::new(SequencedCommandExecutor {
+                values: vec![],
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }));
+        session.set_command_secret_cache(Some(cache.clone()));
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "cloud".into(),
+            ProviderEntry {
+                url: provider.base_url(),
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    ..ModelEntry::default()
+                }],
+                // A static literal credential — NOT a `$secret:` command reference.
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer static-literal-key".into(),
+                }],
+                timeout: TimeoutConfig {
+                    ttft_secs: 5,
+                    idle_secs: 5,
+                },
+                ..ProviderEntry::default()
+            },
+        );
+
+        let table = Arc::new(RedactionTable::empty());
+        let primary = Arc::new(Model::for_provider(&cfg, "cloud", "m", table.clone()).unwrap());
+        let agent = agent_with(primary);
+
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let result = turn_with_backup(
+            &agent,
+            None,
+            &[],
+            &mut Vec::new(),
+            Message::user("hello"),
+            session.clone(),
+            locks,
+            table.clone(),
+            tmp.path().to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::detached(
+                crate::daemon::session_worker::SessionConfigSnapshot::new(
+                    0,
+                    cfg.clone(),
+                    crate::config::extended::ExtendedConfig::default(),
+                ),
+            ),
+            Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            false,
+            crate::skills::manage::SkillWriteOrigin::Foreground,
+            None,
+            crate::engine::tool::ContextUsageSnapshot::unavailable(),
+            crate::engine::deferred::DeferredLog::new(),
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            &tx,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "the static-provider 401 surfaces");
+        assert_eq!(
+            cache.exec_count(),
+            0,
+            "no command re-resolve for a provider with no command-backed secret"
+        );
+        assert_eq!(
+            provider.captured().len(),
+            1,
+            "exactly one provider request — no rebuild, no retry"
+        );
+        let _ = drain(&mut rx);
     }
 
     /// Decision (B), untrusted primary: failover may upgrade onto a trusted

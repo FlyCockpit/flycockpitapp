@@ -1041,6 +1041,11 @@ pub enum UtilityCallSite {
     PreflightRewrite,
     CompactionBrief,
     DelegationShrink,
+    /// The leak-report trusted-child acquisition child turn (2c-3b). A
+    /// non-persisting utility completion: the sensitive acquisition dispatch
+    /// runs here rather than through the turn runner so the child's raw output
+    /// never reaches a durable session event or stream.
+    TrustedChildAcquisition,
     AdHocBackground,
 }
 
@@ -1069,6 +1074,7 @@ impl UtilityCallSite {
             | Self::Translate
             | Self::SkillAutoSelect
             | Self::HarnessSummary
+            | Self::TrustedChildAcquisition
             | Self::AdHocBackground => UtilityBudgetClass::Background,
         }
     }

@@ -63,6 +63,19 @@ pub mod translate;
 /// authority surface. The allow drops when 2c-3b consumes it.
 #[allow(dead_code)]
 pub(crate) mod trusted_child_acquisition;
+/// Trusted-child sealed-value acquisition COORDINATOR (leak-report AC6,
+/// sub-increment 2c-3b). Ties together 2c-1 (`resolve_trusted_child_model`),
+/// 2c-2 (`session::trusted_child_capture`), and 2c-3a
+/// (`trusted_child_acquisition`) into the single host function that performs one
+/// acquisition over a trusted child and returns only an `AcquisitionOutcome`.
+/// The child runs as a non-persisting utility completion (never the turn
+/// runner), so its raw output never reaches a session event, `budget_result`,
+/// parent context, or the stream. The thin live task-delegation trigger is a
+/// follow-up (the swarm loop has no sealed-acquisition trigger yet, and the
+/// computer-use caller is deferred), so this module is `dead_code`-allowed until
+/// a live caller consumes it — mirroring 2c-1/2c-2/2c-3a's dormancy.
+#[allow(dead_code)]
+pub(crate) mod trusted_child_acquisition_coordinator;
 pub mod validation_hint;
 
 pub use agent::{

@@ -61,6 +61,12 @@ impl App {
         self.session_switch_in_progress() || !self.pending_session_switch_submissions.is_empty()
     }
 
+    /// Cleared `/new` view is still waiting for a successful adoption (pending
+    /// attach or post-failure barrier). Outgoing dispatch must stay suppressed.
+    pub(super) fn blocks_outgoing_dispatch_for_cleared_new_session(&self) -> bool {
+        self.provisional_new_session && !self.session_switch_in_progress()
+    }
+
     fn session_switch_targets_match(
         left: agent_runner::SessionTarget,
         right: agent_runner::SessionTarget,
@@ -163,6 +169,12 @@ impl App {
     }
 
     pub(super) fn flush_pending_session_switch_submissions(&mut self) {
+        // Cleared `/new` barrier (pending attach or post-failure): never
+        // dispatch staged payloads through the still-attached outgoing runner.
+        // Successful adoption clears `provisional_new_session` before flush.
+        if self.provisional_new_session {
+            return;
+        }
         let mut pending = std::mem::take(&mut self.pending_session_switch_submissions);
         if pending.is_empty() {
             self.pending_session_switch_target = None;
@@ -237,7 +249,10 @@ impl App {
     /// Retry only the exceptional backpressure case from the lossless
     /// post-switch batch transfer. Returns whether the pending count changed.
     pub(super) fn retry_pending_session_switch_submissions(&mut self) -> bool {
-        if self.session_switch_in_progress() || self.pending_session_switch_submissions.is_empty() {
+        if self.provisional_new_session
+            || self.session_switch_in_progress()
+            || self.pending_session_switch_submissions.is_empty()
+        {
             return false;
         }
         let before = self.pending_session_switch_submissions.len();
@@ -250,7 +265,7 @@ impl App {
         self.retain_failed_session_switch_submissions(pending, DispatchOutcome::SessionSwitching);
     }
 
-    fn retain_failed_session_switch_submissions(
+    pub(super) fn retain_failed_session_switch_submissions(
         &mut self,
         pending: Vec<PendingSessionSwitchSubmission>,
         outcome: DispatchOutcome,
@@ -291,6 +306,16 @@ impl App {
         pending: &PendingSessionSwitchSubmission,
         outcome: DispatchOutcome,
     ) {
+        if self.provisional_new_session {
+            // Provisional `/new` already discarded the outgoing view. Keep the
+            // exact payloads for retry without reintroducing outgoing-session
+            // inference/history rows into the cleared surface.
+            if pending.owns_working_span {
+                self.fresh_queue_ack = FreshQueueAck::None;
+                self.end_working_span();
+            }
+            return;
+        }
         if pending.optimistic_queue_item.is_some()
             && let Some(pos) = self
                 .queue
@@ -338,7 +363,12 @@ impl App {
     /// accepting dispatcher again. A full channel blocks later payloads for
     /// that attachment so FIFO order cannot be inverted.
     pub(super) fn retry_retained_pre_dispatch_submissions(&mut self) -> bool {
-        if self.session_switch_in_progress() || self.retained_pre_dispatch_submissions.is_empty() {
+        // Cleared `/new` (pending attach or post-failure) must not flush
+        // QueueFull leftovers through the still-attached outgoing runner.
+        if self.provisional_new_session
+            || self.session_switch_in_progress()
+            || self.retained_pre_dispatch_submissions.is_empty()
+        {
             return false;
         }
         let current_session_id = match self.agent_runner.as_ref() {
@@ -496,6 +526,29 @@ impl App {
         }
         if submission.tag_expansions.is_empty() && !tag_expansions.is_empty() {
             submission.tag_expansions = tag_expansions.to_vec();
+        }
+        // Cleared `/new` barrier after a failed/cancelled switch: retain the
+        // exact payload for retry without presentation into the discarded view
+        // and without dispatching to the outgoing runner.
+        if self.blocks_outgoing_dispatch_for_cleared_new_session() {
+            if self.pending_session_switch_target.is_none() {
+                self.pending_session_switch_target = Some(agent_runner::SessionTarget::New);
+            }
+            self.retain_failed_session_switch_submissions(
+                vec![PendingSessionSwitchSubmission {
+                    submission,
+                    optimistic_submission_id,
+                    error_prefix: error_prefix.to_string(),
+                    optimistic_tag_entries: tag_expansions.len(),
+                    owns_working_span,
+                    optimistic_history: Vec::new(),
+                    optimistic_queue_item: None,
+                }],
+                DispatchOutcome::SessionSwitching,
+            );
+            // Must not report Sent: structured-paste callers treat Sent as a
+            // real daemon dispatch and mark fences PossiblySent.
+            return DispatchOutcome::SessionSwitching;
         }
         self.lock_pending_agent_switch_log();
         let optimistic_history_start = self.history.len();

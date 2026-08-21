@@ -173,10 +173,24 @@ impl App {
     }
 
     pub(super) fn reset_session_live_state(&mut self) {
+        self.reset_session_live_state_with_model_cancel_notice(true);
+    }
+
+    /// Clear live session bookkeeping. When `present_model_cancel_notice` is
+    /// false, pending `/model` work is still cancelled and retained for retry,
+    /// but no "Model selection was cancelled…" row is appended — required for
+    /// emptied `/new` views (provisional and no-runner).
+    pub(super) fn reset_session_live_state_with_model_cancel_notice(
+        &mut self,
+        present_model_cancel_notice: bool,
+    ) {
         // Session reset begins a new runner epoch. Cancel model controls
         // before clearing general request bookkeeping so a held exact wire
         // submission cannot be stranded if the attach later fails.
-        self.cancel_model_controls_for_epoch_change(None);
+        self.cancel_model_controls_for_epoch_change_with_presentation(
+            None,
+            present_model_cancel_notice,
+        );
         self.queue.clear();
         self.folded_queue_item_ids.clear();
         self.folded_queue_item_order.clear();
@@ -381,13 +395,31 @@ impl App {
         }
         self.pending_new_session = false;
 
+        // Capture the outgoing epoch before constructing/spawning the switch
+        // task. On a multithreaded runtime the replacement attach can advance
+        // the atomic epoch before App finishes the provisional reset; reading
+        // the current epoch after spawn would misclassify replacement as
+        // outgoing.
         let switch_task = match self.agent_runner.as_ref() {
             Some(Ok(runner)) if runner.can_switch_session() => {
-                Some(runner.switch_new_session_task(self.busy))
+                let outgoing_epoch = runner.attachment_epoch();
+                Some((runner.switch_new_session_task(self.busy), outgoing_epoch))
             }
             _ => None,
         };
-        if let Some(switch_task) = switch_task {
+        if let Some((switch_task, outgoing_epoch)) = switch_task {
+            // Claim the cleared view's async-action ownership before registering
+            // `session.switch`, so the switch result belongs to the new fence and
+            // pre-existing presentation-mutating completions are discarded.
+            self.async_actions.advance_view_generation();
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
+            // Match ordinary session-switch adoption: cancelled
+            // `autocomplete.files` results are discarded, so the loading
+            // popup must not remain stuck on the cleared provisional view.
+            self.clear_at_suggestion_popup_state();
             let start = self.async_actions.start(
                 AsyncActionKind::Internal("session.switch"),
                 Self::session_switch_action_policy(),
@@ -399,6 +431,8 @@ impl App {
             );
             debug_assert!(matches!(start, AsyncActionStart::Started(_)));
             self.begin_session_switch_submission_target(agent_runner::SessionTarget::New);
+            self.begin_provisional_new_session_view(outgoing_epoch);
+            self.clear_terminal_after_committed_new_session(&mut clear_terminal);
         } else {
             // Without a replaceable attachment there is no old durable
             // runner/view transaction to protect. Commit the local reset
@@ -430,10 +464,35 @@ impl App {
         true
     }
 
+    /// Drop `@` autocomplete popup chrome so a cancelled or stale walk cannot
+    /// leave “loading…” / “no matching files” when the composer still has `@…`.
+    pub(super) fn clear_at_suggestion_popup_state(&mut self) {
+        self.at_suggestions_loading = false;
+        self.at_suggestions_loaded_query = None;
+        self.at_suggestions_error = None;
+        self.at_cache.borrow_mut().take();
+        self.at_selected = 0;
+        self.at_scroll = 0;
+        // Hit-test geometry from the last render must not survive `/new` —
+        // otherwise a click/scroll before the next draw can still target the
+        // old popup rectangle/rows.
+        self.suggestion_box_area = None;
+        self.suggestion_row_hits.clear();
+        self.hovered_suggestion = None;
+    }
+
     fn reset_new_session_view(&mut self) {
         self.finalize_pending();
+        // Empty `/new` views must not inherit a model-cancel history row from
+        // clearing pending `/model` work; keep cancellation internals only.
+        self.reset_session_live_state_with_model_cancel_notice(false);
+        // Cancelled file-autocomplete completions are discarded during
+        // provisional `/new` (and success re-reset), so clear the full `@`
+        // popup — including loaded-query / cache — the same way ordinary
+        // session switches do. Leaving those set with composer still on
+        // `@…` can show a stale “no matching files” empty popup.
+        self.clear_at_suggestion_popup_state();
         self.history.clear();
-        self.reset_session_live_state();
         self.history_render_versions.clear();
         self.history_render_fingerprints.clear();
         self.history_render_cache_clear();
@@ -493,11 +552,54 @@ impl App {
         self.history.extend(notices);
     }
 
+    /// Clear visible outgoing identity and transcript as soon as a live-runner
+    /// `session.switch` action is registered. The asynchronous attach remains
+    /// the sole authority for the replacement session id/config.
+    ///
+    /// `outgoing_epoch` must be the attachment epoch captured *before* the
+    /// switch task was constructed/spawned, not a fresh read of the runner's
+    /// atomic epoch (which the replacement attach may already have advanced).
+    fn begin_provisional_new_session_view(&mut self, outgoing_epoch: u64) {
+        self.visible_attachment_epoch = outgoing_epoch;
+        self.provisional_new_session = true;
+        self.provisional_new_epoch_event_buffer.clear();
+        // Resume/replacement-era buffered events must not flush into the
+        // provisional cleared view if a later reconnect signal arrives.
+        self.same_session_resync_event_buffer.clear();
+        if self.side_conversation.is_some() {
+            self.discard_side_conversation_for_replacement(false);
+        }
+        self.reset_new_session_view();
+        // Outgoing model/config chrome must not survive into the empty
+        // provisional view; staged submissions must not capture those fences.
+        self.clear_model_and_config_chrome_for_empty_session();
+        self.launch.session_id = None;
+        self.launch.session_short_id = None;
+        self.foreground_input_target = None;
+        self.project_id = None;
+        self.current_session_persisted = false;
+        self.busy = false;
+        self.pending = None;
+        self.queue.clear();
+        self.toast = None;
+    }
+
+    pub(super) fn abandon_provisional_new_session(&mut self) {
+        // Keep the cleared provisional barrier until a successful adoption so
+        // late outgoing events cannot repopulate the discarded view and new
+        // submissions cannot dispatch to the outgoing runner.
+        self.provisional_new_epoch_event_buffer.clear();
+        self.same_session_resync_event_buffer.clear();
+    }
+
     fn commit_new_session_without_swappable_runner(&mut self) {
         self.cancel_outgoing_turn_if_busy();
         if self.side_conversation.is_some() {
             self.discard_side_conversation_for_replacement(false);
         }
+        self.provisional_new_session = false;
+        self.provisional_new_epoch_event_buffer.clear();
+        self.same_session_resync_event_buffer.clear();
         self.reset_new_session_view();
         self.agent_runner.take();
         self.launch.session_id = None;
@@ -509,12 +611,37 @@ impl App {
     /// Commit a successful `/new` while the switch outcome still owns the
     /// runner transition guard. Old events are drained first; only optimistic
     /// rows created for submissions staged during the attach survive the
-    /// outgoing-view reset.
+    /// outgoing-view reset. When the view was already cleared provisionally,
+    /// skip a second full reset and adopt identity in place.
     pub(super) fn commit_new_session_switch_outcome(
         &mut self,
         outcome: agent_runner::SessionSwitchOutcome,
     ) {
         debug_assert!(matches!(outcome.target, agent_runner::SessionTarget::New));
+        let Some(runner_epoch) = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.attachment_epoch())
+        else {
+            self.history.push(HistoryEntry::CommandError {
+                line:
+                    "/new: session switch could not validate attachment epoch; view remains cleared"
+                        .to_string(),
+            });
+            self.fail_pending_session_switch_submissions();
+            self.abandon_provisional_new_session();
+            return;
+        };
+        if runner_epoch != outcome.attachment_epoch {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/new: session switch returned a mismatched attachment epoch; view remains cleared"
+                    .to_string(),
+            });
+            self.fail_pending_session_switch_submissions();
+            self.abandon_provisional_new_session();
+            return;
+        }
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         let staged_history = self
@@ -532,17 +659,29 @@ impl App {
             .iter()
             .any(|pending| pending.owns_working_span);
 
+        let was_provisional = self.provisional_new_session;
         self.reset_new_session_view();
-        self.history.extend(staged_history);
-        self.queue.extend(staged_queue);
-        self.adopt_session_switch_identity(&outcome);
-        self.current_session_persisted = false;
         if self.side_conversation.is_some() {
             self.discard_side_conversation_for_replacement(false);
         }
+        self.history.extend(staged_history);
+        self.queue.extend(staged_queue);
+        self.adopt_session_switch_identity(&outcome);
+        self.visible_attachment_epoch = outcome.attachment_epoch;
+        self.provisional_new_session = false;
+        self.same_session_resync_event_buffer.clear();
+        let buffered = std::mem::take(&mut self.provisional_new_epoch_event_buffer);
+        let adopted_epoch = outcome.attachment_epoch;
+        for queued in buffered {
+            if queued.attachment_epoch == adopted_epoch {
+                self.apply_event(queued.event);
+            }
+        }
+        self.current_session_persisted = false;
         if owns_working_span {
             self.begin_working_span();
         }
+        let _ = was_provisional;
     }
 
     pub(super) fn apply_session_switch_outcome(
@@ -601,8 +740,8 @@ impl App {
             MouseGestureInvalidation::ViewChange,
             self.event_loop_monotonic_now,
         );
-        self.at_suggestions_loading = false;
-        self.at_suggestions_error = None;
+        self.clear_at_suggestion_popup_state();
+        self.same_session_resync_event_buffer.clear();
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })

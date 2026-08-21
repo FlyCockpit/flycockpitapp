@@ -2129,6 +2129,26 @@ pub struct App {
     /// history spills to scrollback before the welcome header is
     /// reprinted above the viewport).
     pub(super) pending_new_session: bool,
+    /// Live-runner `/new` has scheduled `session.switch` and cleared the
+    /// visible view; identity adoption waits for a matching successful
+    /// outcome epoch. Old-epoch events are bookkeeping-only; replacement
+    /// epoch events are buffered until adoption.
+    pub(super) provisional_new_session: bool,
+    /// Attachment epoch currently allowed to drive normal `apply_event`
+    /// reduction. Stays at the outgoing epoch through provisional-new and
+    /// advances only after a matching successful `SessionSwitched(New)`.
+    pub(super) visible_attachment_epoch: u64,
+    /// Replacement-epoch turn events received while provisional-new is
+    /// active, drained FIFO after successful adoption (matching epoch only).
+    pub(super) provisional_new_epoch_event_buffer:
+        VecDeque<crate::tui::agent_runner::QueuedTurnEvent>,
+    /// Same-session reconnect/resync can advance the runner epoch and enqueue
+    /// HistoryReplay (new client epoch) before the global
+    /// `DaemonLinkReconnected` / `DaemonLinkResynced` signal. Hold those
+    /// events until that explicit resync path adopts `visible_attachment_epoch`;
+    /// do not adopt on arbitrary matching-epoch traffic (e.g. resume attach).
+    pub(super) same_session_resync_event_buffer:
+        VecDeque<crate::tui::agent_runner::QueuedTurnEvent>,
     /// A successful transactional `/new` has committed its in-memory view
     /// reset and needs the event loop's terminal handle to invalidate the
     /// alt-screen buffers. Attach failures never set this latch.
@@ -3436,6 +3456,10 @@ impl App {
             slash_menu_cache: std::cell::RefCell::new(None),
             slash_cycle_stem: None,
             pending_new_session: false,
+            provisional_new_session: false,
+            visible_attachment_epoch: 0,
+            provisional_new_epoch_event_buffer: VecDeque::new(),
+            same_session_resync_event_buffer: VecDeque::new(),
             new_session_terminal_clear_pending: false,
             leaks_reveal_clear_pending: false,
             last_usage: None,

@@ -165,6 +165,9 @@ impl BtwPane {
             return Vec::new();
         };
         agent_runner::drain_turn_events(&runner.events)
+            .into_iter()
+            .map(|queued| queued.event)
+            .collect()
     }
 
     pub(super) fn attach_runner(

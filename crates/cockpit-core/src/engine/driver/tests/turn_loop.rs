@@ -1336,3 +1336,179 @@ async fn dual_audit_failure_refuses_provider_handoff() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Leak-report buffered delivery + barrier, end-to-end through `run_turn` on the
+// real ScriptedProvider (increment 2, AC1/AC3). `scripted_read_driver` builds an
+// UNTRUSTED, tool-capable route, so `report_leak` is advertised and the buffered
+// delivery sink engages. These are the real security-boundary integration tests
+// the sink unit tests cannot cover: that `run_turn` wires the eligible route to
+// the WRAPPED sender, withholds a streamed token on a contained turn (persisting
+// nothing), and flushes it on a released turn.
+// ---------------------------------------------------------------------------
+
+/// A single SSE completion stream that emits a prose text delta (carrying
+/// `prose`) and THEN a `report_leak` tool call (carrying `secret`) — mirroring
+/// the harness's own chat-completions chunk shapes (`emit_chat_turn` +
+/// `emit_chat_tool_calls`), concatenated into one stream. `Turn::Text` /
+/// `Turn::ToolCall` cannot express a single stream carrying both, so this uses
+/// `Turn::RawSse`.
+fn text_then_report_leak_sse(prose: &str, secret: &str) -> String {
+    let content = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{ "delta": { "content": prose }, "finish_reason": null }],
+        "usage": null
+    });
+    let args = serde_json::json!({ "secret": secret, "source": "model_output" }).to_string();
+    let tool = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{ "delta": { "tool_calls": [{
+            "index": 0, "id": "leak-1", "type": "function",
+            "function": { "name": "report_leak", "arguments": args }
+        }] }, "finish_reason": null }],
+        "usage": null
+    });
+    let finish = serde_json::json!({
+        "id": "c", "model": "local",
+        "choices": [{ "delta": {}, "finish_reason": "tool_calls" }],
+        "usage": null
+    });
+    format!("data: {content}\n\ndata: {tool}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_leak_turn_withholds_stream_and_persists_no_plaintext() {
+    tokio::time::resume();
+    const PROSE_TOKEN: &str = "PLANTED-STREAM-TOKEN-a1b2c3";
+    const SECRET: &str = "PLANTED-SECRET-VALUE-d4e5f6";
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::RawSse(text_then_report_leak_sse(
+            &format!("here is prose {PROSE_TOKEN} and more"),
+            SECRET,
+        )))
+        // Fallback in case the driver continues after the contained turn; carries
+        // NEITHER the streamed token NOR the secret, so assertions hold either way.
+        .turn(Turn::Text("done".into()))
+        .start()
+        .await;
+
+    // Untrusted + tool-capable => report_leak advertised + buffered sink engaged.
+    let (mut driver, _tmp) = scripted_read_driver(&provider);
+    assert!(
+        !driver.stack[0].agent.model.is_trusted(),
+        "this route must be untrusted for the sink to engage"
+    );
+    let (queue, tx, mut rx) = event_harness();
+
+    driver
+        .run_user_input(UserSubmission::text("please process this"), &queue, &tx)
+        .await
+        .unwrap();
+
+    let events = drain_events(&mut rx);
+    let events_blob = format!("{events:?}");
+    // The streamed prose token was WITHHELD on this contained turn — it never
+    // reached the live client event stream. A regression passing `tx` directly to
+    // the completion (turn_phases.rs), or dropping the eligibility gate, would
+    // have streamed it live here and failed this assertion.
+    assert!(
+        !events_blob.contains(PROSE_TOKEN),
+        "the withheld streamed token must not reach the live event stream: {events_blob}"
+    );
+    // The reported secret never crosses to the client stream either.
+    assert!(
+        !events_blob.contains(SECRET),
+        "the reported secret must not reach the live event stream"
+    );
+    // report_leak was NOT dispatched as a generic tool (barrier partitioned it).
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolStart { tool, .. } if tool == "report_leak")),
+        "report_leak must never dispatch as a generic tool"
+    );
+
+    // Durable state carries NEITHER the streamed token NOR the secret: the
+    // sensitive turn cleared its assistant text and did not persist its choice.
+    let history = history_text(&driver.stack[0].history);
+    assert!(
+        !history.contains(PROSE_TOKEN) && !history.contains(SECRET),
+        "durable frame history must not contain withheld plaintext: {history}"
+    );
+    let rows = session_events(&driver).await;
+    let durable: String = rows
+        .iter()
+        .map(|row| serde_json::to_string(&row.data).unwrap())
+        .collect();
+    assert!(
+        !durable.contains(PROSE_TOKEN) && !durable.contains(SECRET),
+        "durable session log must not contain withheld plaintext"
+    );
+    assert!(
+        !rows.iter().any(|row| row.kind == "assistant_message"
+            && serde_json::to_string(&row.data)
+                .unwrap()
+                .contains(PROSE_TOKEN)),
+        "no assistant_message may persist the withheld token"
+    );
+
+    // Defense in depth: the secret never left on any outbound provider request.
+    let wire: String = provider_posts(&provider)
+        .iter()
+        .map(|request| request.body.to_string())
+        .collect();
+    assert!(
+        !wire.contains(SECRET),
+        "the reported secret must not appear on any outbound request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn eligible_route_non_sensitive_turn_flushes_stream() {
+    tokio::time::resume();
+    const FLUSH_TOKEN: &str = "FLUSHED-STREAM-TOKEN-e5f6a7";
+
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text(format!("assistant prose {FLUSH_TOKEN} end")))
+        .start()
+        .await;
+
+    // Same untrusted, tool-capable (sink-engaged) route as the contained test.
+    let (mut driver, _tmp) = scripted_read_driver(&provider);
+    assert!(!driver.stack[0].agent.model.is_trusted());
+    let (queue, tx, mut rx) = event_harness();
+
+    driver
+        .run_user_input(UserSubmission::text("hi"), &queue, &tx)
+        .await
+        .unwrap();
+
+    let events = drain_events(&mut rx);
+    // Positive control: on a non-sensitive (Released) turn the withheld deltas ARE
+    // flushed, so the streamed token DOES surface on the client stream — proving
+    // the withholding above is real containment, not a dead path.
+    let delta_blob: String = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::AssistantTextDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        delta_blob.contains(FLUSH_TOKEN),
+        "a Released turn must flush the withheld delta to the client stream: {events:?}"
+    );
+    // ...and the assistant message is persisted with it.
+    assert!(history_text(&driver.stack[0].history).contains(FLUSH_TOKEN));
+    let rows = session_events(&driver).await;
+    assert!(
+        rows.iter().any(|row| row.kind == "assistant_message"
+            && serde_json::to_string(&row.data)
+                .unwrap()
+                .contains(FLUSH_TOKEN)),
+        "the released turn's assistant_message must persist the flushed text"
+    );
+}

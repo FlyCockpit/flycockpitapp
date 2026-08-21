@@ -93,6 +93,7 @@ use crate::db::protected_leak_records::{
     InsertLeakRecordInput, InsertLeakResult, LeakCategory, LeakProvenance, LeakRecordStatus,
     LeakSource, insert_leak_record_conn, transition_leak_status_conn,
 };
+use crate::engine::message::ToolDefinition;
 use crate::redact::protected_redaction_history::{
     MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
     RedactionKeyResolver, append_and_attach_conn,
@@ -522,6 +523,57 @@ pub fn report_leak_schema() -> Value {
         "required": ["secret", "source"],
         "additionalProperties": false
     })
+}
+
+/// The tool-level description advertised alongside [`report_leak_schema`] on an
+/// eligible route. Names the containment contract so an untrusted model that
+/// received a secret has a legal, non-oracular way to report it.
+pub const REPORT_LEAK_TOOL_DESCRIPTION: &str = "Report a secret you accidentally received (in a tool result, the environment, \
+     or your own output) so the host can contain it. You receive only 'contained' \
+     or a content-free failure; the secret is never returned to you and never \
+     reaches the conversation, logs, or any record.";
+
+/// The wire [`ToolDefinition`] for `report_leak`, advertised on eligible routes.
+///
+/// This is a **schema-only** advertisement: appending it to a route's wire tool
+/// definitions lets an untrusted model emit a legal `report_leak` call, but
+/// `report_leak` is **never** a generic registered [`crate::engine::tool::Tool`]
+/// — no type implements `Tool` for it, and the sensitive-turn barrier
+/// ([`crate::engine::agent::sensitive_turn::partition_sensitive_calls`])
+/// intercepts any such call before generic dispatch. The name matches
+/// [`REPORT_LEAK_TOOL`] so the barrier's closed
+/// [`crate::engine::agent::sensitive_turn::SENSITIVE_INGRESS_TOOL_NAMES`] set
+/// routes it to containment.
+pub fn report_leak_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: REPORT_LEAK_TOOL.to_string(),
+        description: REPORT_LEAK_TOOL_DESCRIPTION.to_string(),
+        parameters: report_leak_schema(),
+    }
+}
+
+/// The single eligibility funnel for the `report_leak` sensitive-turn barrier
+/// (AC3, AC1's route gate).
+///
+/// A route advertises `report_leak` (and, correspondingly, engages the buffered
+/// delivery sink so its pre-classification deltas are withheld) **iff** it is a
+/// **supported, untrusted, tool-capable** completion route:
+///
+/// * **untrusted** (`!model_is_trusted`) — a trusted route is in the owner's own
+///   custody; it neither advertises nor decodes `report_leak`, so its streaming
+///   is never withheld;
+/// * **tool-capable** (`!tools.is_empty()`) — a tool-disabled route offers no
+///   tools at all, so `report_leak` cannot be advertised or called on it; and
+/// * **supported** — every provider Cockpit dispatches (`OpenAi` / `ChatGpt` /
+///   `Anthropic`) supports tool calls, so "supported" reduces to tool-capable
+///   here; an unsupported/tool-disabled route has an empty `tools`.
+///
+/// This one predicate drives BOTH the schema-advertising append (AC3) and the
+/// buffered-delivery engagement (AC1), so the two cannot drift: a route that is
+/// gated for withholding is exactly a route that advertises `report_leak`, and
+/// vice versa.
+pub fn route_advertises_report_leak(model_is_trusted: bool, tools: &[ToolDefinition]) -> bool {
+    !model_is_trusted && !tools.is_empty()
 }
 
 /// Parse a `report_leak` argument object into the typed request.

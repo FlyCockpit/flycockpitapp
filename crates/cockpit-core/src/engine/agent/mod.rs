@@ -27,8 +27,8 @@ use uuid::Uuid;
 use crate::db::tool_calls::Recovery;
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 use crate::engine::message::{
-    Message, ToolCall, collect_tool_calls, extract_reasoning, extract_text, extract_user_text,
-    strip_think_from_choice, tool_result_message,
+    Message, ToolCall, ToolDefinition, collect_tool_calls, extract_reasoning, extract_text,
+    extract_user_text, strip_think_from_choice, tool_result_message,
 };
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::repair::{self, repair};
@@ -45,6 +45,7 @@ pub(crate) mod hooks;
 mod loop_guard;
 mod outcome;
 mod recheck;
+pub(crate) mod sensitive_delivery;
 pub(crate) mod sensitive_turn;
 mod text_recovery;
 pub(crate) mod tool_dispatch;

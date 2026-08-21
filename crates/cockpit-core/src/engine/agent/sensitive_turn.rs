@@ -99,6 +99,27 @@ pub fn is_sensitive_ingress_tool(name: &str) -> bool {
     SENSITIVE_INGRESS_TOOL_NAMES.contains(&name)
 }
 
+/// Whether the sensitive-turn barrier engages (decodes + contains) for this turn.
+///
+/// The barrier engages **only** on a route that advertised `report_leak`
+/// (`report_leak_eligible`, the single funnel
+/// [`crate::leak_report::route_advertises_report_leak`]) AND that buffered at
+/// least one sensitive-ingress call. A route that never advertised the schema —
+/// trusted, tool-disabled, or otherwise unsupported — does **not** decode or
+/// contain a `report_leak`-named call (AC3: those routes "neither advertise nor
+/// decode it"). On such a route a hallucinated `report_leak { secret: ... }`
+/// falls through to ordinary unknown-tool handling: its plaintext argument is
+/// never parsed into a zeroizing frame, never durably contained, and never
+/// collapses the turn. This is the SAME predicate that gates schema advertisement
+/// and the buffered-delivery sink, so decode/contain, advertise, and withhold
+/// can never drift apart.
+pub fn sensitive_turn_engages(report_leak_eligible: bool, calls: &[ToolCall]) -> bool {
+    report_leak_eligible
+        && calls
+            .iter()
+            .any(|tc| is_sensitive_ingress_tool(&tc.function.name))
+}
+
 /// Partition a per-turn buffered tool-call list into (sensitive-ingress calls,
 /// generic calls), preserving order within each bucket.
 ///

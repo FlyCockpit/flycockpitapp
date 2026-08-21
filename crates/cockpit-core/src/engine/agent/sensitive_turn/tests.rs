@@ -397,3 +397,144 @@ async fn provider_sensitive_turn_state_machine_partial_failure_discards_whole_tu
     assert_eq!(out.sensitive_results[0].model_output, "contained");
     assert_eq!(out.sensitive_results[1].model_output, "failed");
 }
+
+// ---------------------------------------------------------------------------
+// AC3 — report_leak is advertised (schema-only) on exactly the eligible routes
+// (supported, untrusted, tool-capable) and is NEVER a generic registered Tool.
+// The advertisement funnel and the barrier are coupled: a route that advertises
+// report_leak is exactly a route whose calls the barrier intercepts.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn report_leak_schema_advertised_without_generic_tool() {
+    use crate::engine::message::ToolDefinition;
+    use crate::leak_report::{
+        report_leak_schema, report_leak_tool_definition, route_advertises_report_leak,
+    };
+
+    let some_tool = || ToolDefinition {
+        name: "read".to_string(),
+        description: "read".to_string(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    };
+
+    // Eligibility matrix: ONLY an untrusted, tool-capable route advertises
+    // report_leak. This is the single funnel `run_turn` uses to gate BOTH the
+    // schema append and the buffered-delivery withhold, so they cannot drift.
+    let tool_capable = vec![some_tool()];
+    let tool_disabled: Vec<ToolDefinition> = vec![];
+    // untrusted + tool-capable  => advertised (barrier engaged)
+    assert!(route_advertises_report_leak(false, &tool_capable));
+    // trusted (owner custody)    => never advertised, even with tools
+    assert!(!route_advertises_report_leak(true, &tool_capable));
+    // tool-disabled route        => never advertised, even if untrusted
+    assert!(!route_advertises_report_leak(false, &tool_disabled));
+    assert!(!route_advertises_report_leak(true, &tool_disabled));
+
+    // The advertised definition is schema-only: the model-facing name + the one
+    // shared argument schema.
+    let def = report_leak_tool_definition();
+    assert_eq!(def.name, REPORT_LEAK_TOOL);
+    assert_eq!(def.parameters, report_leak_schema());
+
+    // report_leak is NEVER a generic registered Tool: it is absent from the whole
+    // builtin/authorized tool registry (no type implements `Tool` for it), so its
+    // plaintext `secret` argument can never reach generic dispatch. If a future
+    // change registered it as a Tool, this fails.
+    for tool in crate::engine::builtin::invariant_builtin_tools() {
+        assert_ne!(
+            tool.name(),
+            REPORT_LEAK_TOOL,
+            "report_leak must never be a generic registered Tool"
+        );
+    }
+
+    // Coupling (schema <=> barrier): the advertised name is exactly the closed
+    // sensitive-ingress name the barrier partitions out before generic dispatch.
+    // A route that advertised report_leak WITHOUT the barrier would let the call
+    // reach generic dispatch — impossible while the name stays in this closed set
+    // and every advertising route funnels through `partition_sensitive_calls`.
+    assert!(SENSITIVE_INGRESS_TOOL_NAMES.contains(&def.name.as_str()));
+    let (sensitive, generic) = partition_sensitive_calls(vec![report_leak_call("s")]);
+    assert_eq!(sensitive.len(), 1);
+    assert!(generic.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// AC3 — a report_leak-named call is DECODED/CONTAINED only on a route that
+// advertised the schema. On a TRUSTED or TOOL-DISABLED route (which never
+// advertised report_leak), a hallucinated call is NOT decoded/contained — it
+// falls through to ordinary unknown-tool handling. This drives the two real
+// funnels (`route_advertises_report_leak` -> `sensitive_turn_engages`) exactly
+// as `run_turn` composes them.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sensitive_ingress_only_decoded_on_eligible_route() {
+    use crate::engine::message::ToolDefinition;
+    use crate::leak_report::route_advertises_report_leak;
+
+    let tool_capable = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "read".to_string(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }];
+    // A forged report_leak with a plaintext arg the model hallucinated.
+    let forged = vec![report_leak_call("forged-not-a-real-leak")];
+
+    // ELIGIBLE (untrusted + tool-capable): the barrier engages -> decode/contain.
+    let untrusted_eligible = route_advertises_report_leak(false, &tool_capable);
+    assert!(untrusted_eligible);
+    assert!(sensitive_turn_engages(untrusted_eligible, &forged));
+
+    // TRUSTED route: report_leak was never advertised, so it is NOT decoded or
+    // contained — the forged call falls through to ordinary unknown-tool handling
+    // (its plaintext arg is never parsed into a zeroizing frame or durably
+    // contained, and the turn is not collapsed).
+    let trusted_eligible = route_advertises_report_leak(true, &tool_capable);
+    assert!(!trusted_eligible);
+    assert!(!sensitive_turn_engages(trusted_eligible, &forged));
+
+    // TOOL-DISABLED route (empty tools): same — never advertised, never decoded.
+    let tool_disabled_eligible = route_advertises_report_leak(false, &[]);
+    assert!(!tool_disabled_eligible);
+    assert!(!sensitive_turn_engages(tool_disabled_eligible, &forged));
+
+    // An ordinary turn on an eligible route never engages the barrier.
+    let ordinary = vec![tool_call("read", json!({ "path": "a" }))];
+    assert!(!sensitive_turn_engages(true, &ordinary));
+}
+
+// ---------------------------------------------------------------------------
+// AC4 — a Contained turn installs the reported secret into the live redaction
+// table BEFORE the `contained` ack.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn contained_installs_redaction_before_ack() {
+    let secret = "ac4-install-before-ack-secret";
+    let host = FakeHost::contained();
+    let out = run_sensitive_turn_barrier(&host, vec![report_leak_call(secret)]).await;
+
+    // The recorded host-interaction sequence is EXACTLY contain -> install, with
+    // `install` the FINAL host op: the `contained` ack is published (the returned
+    // `SensitiveResult`) strictly AFTER install completed. There is no host
+    // interaction after install, and the barrier maps to `contained` ONLY in the
+    // install-Ok branch, so a `contained` result is not observable until install
+    // has committed the exact secret into the live redaction table.
+    assert_eq!(out.state, SensitiveTurnState::Contained);
+    assert_eq!(
+        host.events(),
+        vec!["contain", "install"],
+        "the ack seam runs contain then install, with install strictly last"
+    );
+    assert_eq!(
+        host.events().last().copied(),
+        Some("install"),
+        "no host op (and thus no observable `contained` ack) may follow install"
+    );
+    assert_eq!(host.installed(), vec![secret.to_string()]);
+    assert_eq!(out.sensitive_results[0].model_output, "contained");
+    // The negative is proven by `redaction_install_failure_fails_closed`: install
+    // failing yields `failed`, never `contained` — so `contained` <=> install Ok.
+}

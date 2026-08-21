@@ -923,7 +923,20 @@ pub(crate) async fn run_turn(
     phase_09_terminal_text_emit();
 
     let active_tools = turn_toolbox(agent, &session, &cwd, &config).await;
-    let tools = active_tools.definitions(agent.llm_mode);
+    let mut tools = active_tools.definitions(agent.llm_mode);
+    // Leak-report route gate (AC3 + AC1's buffered-delivery gate). A supported,
+    // untrusted, tool-capable completion route advertises `report_leak`
+    // (schema-only — NEVER a generic `Tool`; the sensitive-turn barrier
+    // intercepts the call before generic dispatch) AND withholds this turn's
+    // pre-classification stream deltas through the buffered delivery sink. The
+    // SAME predicate drives both so schema advertisement and stream withholding
+    // cannot drift. Computed on the pre-append tool set: a trusted or
+    // tool-disabled (empty `tools`) route is never eligible.
+    let report_leak_eligible =
+        crate::leak_report::route_advertises_report_leak(model.is_trusted(), &tools);
+    if report_leak_eligible {
+        tools.push(crate::leak_report::report_leak_tool_definition());
+    }
 
     inject_turn_start_system_messages(&session, &active_tools, is_root, context_usage, history)
         .await;
@@ -1204,17 +1217,46 @@ pub(crate) async fn run_turn(
     // `None` on the backup attempt so a fallback retry doesn't double-shadow.
     // Skipped for utility calls automatically — those never run through `turn`.
     if let Some(set) = tandem.filter(|s| s.is_enabled()) {
+        // The tandem shadow has NO sensitive-turn barrier (its output is DB-only,
+        // never dispatched or persisted as assistant prose), so it must NOT
+        // advertise `report_leak`: a shadow `report_leak` call would carry the
+        // plaintext `secret` into the recorded tandem outcome with nothing to
+        // contain it. Strip it here so schema-advertisement stays coupled to the
+        // barrier (AC3) — the shadow body differs only by the absent ingress
+        // tool, which is host containment plumbing, not a task capability.
+        let shadow_tools: Vec<ToolDefinition> = tools
+            .iter()
+            .filter(|t| t.name != crate::leak_report::REPORT_LEAK_TOOL)
+            .cloned()
+            .collect();
         let dispatch = crate::engine::schedule::TandemDispatch {
             parent_call_id: call_id.to_string(),
             agent: agent.name.clone(),
             system: agent.system.clone(),
             history: history.clone(),
             prompt: prompt.clone(),
-            tools: tools.clone(),
+            tools: shadow_tools,
             params: agent.params.clone(),
         };
         crate::engine::schedule::tandem::dispatch_turn(&session, set, dispatch);
     }
+
+    // Buffered delivery sink (AC1/2/2b/2c). On an eligible route, wrap `tx` so
+    // this turn's `AssistantTextDelta` / `ReasoningDelta` chunks are WITHHELD
+    // from the live client stream until the sensitive-turn barrier classifies
+    // the turn below; every other event still streams live. On an ineligible
+    // route (trusted or tool-disabled) `tx` is used directly and streaming is
+    // unchanged.
+    let (delivery_event_tx, delivery_sink) = if report_leak_eligible {
+        let (inner_tx, sink) =
+            crate::engine::agent::sensitive_delivery::BufferedDeliverySink::spawn(
+                tx.clone(),
+                cancel.clone(),
+            );
+        (Some(inner_tx), Some(sink))
+    } else {
+        (None, None)
+    };
 
     let completion = model
         .complete_prepared_with_pre_drain(
@@ -1222,13 +1264,26 @@ pub(crate) async fn run_turn(
             &tools,
             agent.params.clone(),
             &agent.name,
-            Some(tx),
+            Some(delivery_event_tx.as_ref().unwrap_or(tx)),
             &cancel,
             endpoint_recovery,
             None,
             false,
         )
         .await;
+
+    // Close the wrapped sender so the forwarder task finishes, then collect the
+    // withheld deltas (`None` on an ineligible route). On the provider-error /
+    // cancellation / drop path in the `Err` arm below, `withheld` is dropped
+    // WITHOUT flushing (fail-closed Discarded — no pre-classification plaintext
+    // ever reaches the client). On the success path it is flushed only when the
+    // sensitive-turn barrier classifies the turn non-sensitive (Released) with
+    // no overflow.
+    drop(delivery_event_tx);
+    let withheld = match delivery_sink {
+        Some(sink) => Some(sink.finish().await),
+        None => None,
+    };
 
     let ((msg_id, choice, usage), _captured_request, timing) = match completion {
         Ok(out) => out,
@@ -1445,9 +1500,44 @@ pub(crate) async fn run_turn(
     // and every other buffered item for the turn is then discarded. A turn with no
     // sensitive-ingress call passes through byte-identically to before.
     let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice);
-    let sensitive_turn_active = buffered_calls.iter().any(|tc| {
-        crate::engine::agent::sensitive_turn::is_sensitive_ingress_tool(&tc.function.name)
-    });
+    // Decode/contain ONLY on a route that advertised `report_leak`
+    // (`report_leak_eligible`) — the SAME funnel that gates the schema append and
+    // the withhold sink. A trusted / tool-disabled / unsupported route never
+    // advertised the schema, so a hallucinated `report_leak`-named call there is
+    // NOT decoded or contained; it falls through to ordinary unknown-tool
+    // handling (its plaintext arg is never parsed or durably contained).
+    let sensitive_turn_active = crate::engine::agent::sensitive_turn::sensitive_turn_engages(
+        report_leak_eligible,
+        &buffered_calls,
+    );
+
+    // Buffered-delivery verdict (AC1/2/2b/2c). The turn is now classified. The
+    // withheld buffer is flushed to the live client ONLY on a clean Released
+    // turn: non-sensitive, not overflowed, and not cancelled (flagged by the
+    // sink's cancellation arm OR observed live via `cancel.is_cancelled()` for
+    // the ordering where cancellation fired after the forwarder closed). Every
+    // other outcome — a sensitive/contained turn, overflow, cancellation, or the
+    // provider-error path handled in the `Err` arm above — DROPS the buffer
+    // without flushing, so no pre-classification plaintext reaches the client.
+    // `withheld` is `None` on an ineligible route, where deltas streamed live.
+    let withheld_overflow = withheld.as_ref().is_some_and(|w| w.overflowed());
+    if let Some(withheld) = withheld {
+        let should_flush = crate::engine::agent::sensitive_delivery::withheld_should_flush(
+            sensitive_turn_active,
+            &withheld,
+            cancel.is_cancelled(),
+        );
+        if should_flush {
+            withheld.flush_to(tx).await;
+        }
+        // else: dropped here without flushing (fail-closed).
+    }
+    // A turn's output is CONTAINED (collapsed — nothing dispatched, emitted, or
+    // persisted) when the sensitive-turn barrier fired OR the withhold buffer
+    // overflowed. Overflow reuses the same fail-closed collapse as a sensitive
+    // turn: content-free status, no plaintext anywhere.
+    let turn_output_contained = sensitive_turn_active || withheld_overflow;
+
     let mut calls: Vec<ToolCall> = if sensitive_turn_active {
         // Host-derived provenance from the active route; the model never supplies it.
         let provenance = crate::db::protected_leak_records::LeakProvenance {
@@ -1482,11 +1572,14 @@ pub(crate) async fn run_turn(
         // Collapse: no generic (ordinary) call survives a sensitive turn, so no
         // buffered non-sensitive item reaches parent/UI/history/tool/audit/export.
         sensitive_outcome.generic_calls
+    } else if withheld_overflow {
+        // Overflow fail-closed: discard the whole turn's output, dispatch nothing.
+        Vec::new()
     } else {
         buffered_calls
     };
 
-    if sensitive_turn_active {
+    if turn_output_contained {
         // Fail closed: drop this turn's surviving assistant text and reasoning so
         // they can never be persisted to durable history (which scrubs only with
         // the stale pre-turn `model.session_redact_table()` snapshot, not the live
@@ -1494,16 +1587,17 @@ pub(crate) async fn run_turn(
         // the reported secret IS installed into the live redaction table (so later
         // turns are scrubbed) but this turn's own prose is sacrificed rather than
         // re-scrubbed; on a Discarded turn nothing was installed, so it MUST be
-        // dropped. Blanking both makes the final AssistantMessage persist + the
-        // AssistantText client emit below skip entirely (their guard is
+        // dropped. On an overflow turn the withheld deltas were already dropped
+        // above and nothing else is emitted. Blanking both makes the final
+        // AssistantMessage persist + the AssistantText client emit below skip
+        // entirely (their guard is
         // `!text.trim().is_empty() || !reasoning.trim().is_empty()`).
         //
-        // NOTE (deferred, see implementer report): this closes the durable-persist
-        // and final-emit paths, but the LIVE streaming AssistantTextDelta /
-        // ReasoningDelta already forwarded to the client DURING completion (before
-        // this classification point) is NOT yet buffered — true buffered stream
-        // delivery requires wrapping the per-turn `tx` at the completion call and
-        // is split to a follow-up.
+        // The LIVE streaming `AssistantTextDelta` / `ReasoningDelta` for this turn
+        // were WITHHELD by the buffered delivery sink (AC1) — they never reached
+        // the client during completion — and are dropped (not flushed) on this
+        // contained/overflow path, so no pre-classification plaintext escapes on
+        // any channel.
         text.clear();
         reasoning.clear();
     }
@@ -1580,13 +1674,14 @@ pub(crate) async fn run_turn(
     } else {
         stored_assistant_choice(inline_think, &choice)
     };
-    // Sensitive-turn collapse (fail closed): drop the ENTIRE assistant turn from
-    // wire history. Its buffered tool calls (the `report_leak` ingress call and any
-    // other ordinary call) were withheld from generic dispatch, and its
-    // text/reasoning were blanked above, so persisting any part of the raw choice
-    // would either replay the plaintext `secret` argument of the report_leak call
-    // or leave a `tool_use` without a matching `tool_result`.
-    let stored_choice = if sensitive_turn_active {
+    // Contained-turn collapse (fail closed): drop the ENTIRE assistant turn from
+    // wire history. On a sensitive turn its buffered tool calls (the `report_leak`
+    // ingress call and any other ordinary call) were withheld from generic
+    // dispatch; on an overflow turn nothing survives. Its text/reasoning were
+    // blanked above, so persisting any part of the raw choice would either replay
+    // the plaintext `secret` argument of the report_leak call or leave a
+    // `tool_use` without a matching `tool_result`.
+    let stored_choice = if turn_output_contained {
         None
     } else {
         stored_choice
@@ -1617,7 +1712,7 @@ pub(crate) async fn run_turn(
     // history after the AssistantText is emitted, so the block surfaces to the
     // user before the system nudge. `Some((notice, nudge))`.
     let mut available_nudge: Option<(String, String)> = None;
-    if !sensitive_turn_active && should_attempt_text_recovery(calls.is_empty(), reasoning_rescue) {
+    if !turn_output_contained && should_attempt_text_recovery(calls.is_empty(), reasoning_rescue) {
         let mode = text_embedded_recovery_mode(&session, &config);
         match decide_text_recovery(&agent.tools, &text, mode) {
             TextRecoveryDecision::None => {}

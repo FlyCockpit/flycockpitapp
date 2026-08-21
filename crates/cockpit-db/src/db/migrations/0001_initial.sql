@@ -3922,7 +3922,13 @@ CREATE TABLE image_spend_policy_versions (
     epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
     settings_json TEXT NOT NULL,
     saved_at_ms  INTEGER NOT NULL,
-    PRIMARY KEY(project_key, version)
+    -- Server-owned rolling-epoch anchor. Present iff the policy's project_epoch
+    -- is Rolling; the anchor is never stored inside settings_json so it can
+    -- never be supplied or altered through the user-constructible settings type.
+    rolling_anchor_unix_ms INTEGER,
+    rolling_anchor_sequence INTEGER CHECK(rolling_anchor_sequence IS NULL OR rolling_anchor_sequence >= 1),
+    PRIMARY KEY(project_key, version),
+    CHECK((rolling_anchor_unix_ms IS NULL) = (rolling_anchor_sequence IS NULL))
 );
 
 CREATE TABLE image_spend_reservations (

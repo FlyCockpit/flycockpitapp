@@ -84,11 +84,10 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub response_metrics_tokenizer: TiktokenEncoding,
 
-    /// Saved image spend choices. Missing is intentionally unconfigured and
-    /// blocks paid dispatch; loaders must not inject display suggestions.
-    #[serde(default)]
-    pub image_spend: crate::config::image_spend::ImageSpendSettings,
-
+    // NOTE: image-generation spend policy is intentionally NOT a layered
+    // config field. The only authority is the immutable ledger
+    // (`image_spend_policy_versions` via `activate_saved_policy`); a
+    // `config.json`/remote layer must never be able to authorize paid dispatch.
     /// Image-generation endpoint/target/workflow registry.
     ///
     /// **Local-trust configuration only — never remote-supplied.** Endpoints
@@ -1566,7 +1565,6 @@ impl Default for ExtendedConfig {
     fn default() -> Self {
         Self {
             response_metrics_tokenizer: TiktokenEncoding::default(),
-            image_spend: crate::config::image_spend::ImageSpendSettings::default(),
             image_generation: crate::config::image_generation::ImageGenerationConfig::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
@@ -2235,7 +2233,9 @@ impl ExtendedConfigDoc {
 
         parse_field!("harnesses", harnesses);
         parse_field!("response_metrics_tokenizer", response_metrics_tokenizer);
-        parse_field!("image_spend", image_spend);
+        // `image_spend` is intentionally NOT parsed here: spend policy has a
+        // single authority (the ledger). A stray `image_spend` key in a loaded
+        // document is ignored and can never authorize paid dispatch.
         // `image_generation` is redacted specially: a malformed value's serde /
         // validation error (`ImageGenerationConfigError` uses `{self:?}`, so
         // `MissingEndpoint("…")`, wrong-type `invalid type: string "…"`, etc.)
@@ -2383,16 +2383,9 @@ impl ExtendedConfigDoc {
 
         remove_malformed!("redact", RedactConfig);
         remove_malformed!("response_metrics_tokenizer", TiktokenEncoding);
-        if let Some(value) = obj.get("image_spend")
-            && serde_json::from_value::<crate::config::image_spend::ImageSpendSettings>(
-                value.clone(),
-            )
-            .is_err()
-        {
-            // Invalid policy is an explicit fail-closed layer, not absence
-            // that may reveal and authorize a lower layer's policy.
-            obj.insert("image_spend".into(), serde_json::json!({}));
-        }
+        // `image_spend` is deliberately not merged here: spend policy is never
+        // a layered config value (its only authority is the ledger), so there
+        // is nothing to sanitize or fail closed on at this boundary.
         if let Some(value) = obj.get("image_generation")
             && serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
                 value.clone(),
@@ -2404,8 +2397,8 @@ impl ExtendedConfigDoc {
             // enabled after its endpoint/workflow was dropped, etc.) is an
             // explicit fail-closed layer. Replace with the empty-valid encoding
             // rather than removing the key, so a broken upper layer cannot
-            // reveal and authorize a lower layer's registry — matching
-            // `image_spend` above. Record a redacted (field-only) warning so
+            // reveal and authorize a lower layer's registry. Record a redacted
+            // (field-only) warning so
             // this fail-closed is surfaced through the layered load path instead
             // of happening silently. The log is path-free AND error-free: the
             // config path can itself carry a secret (token-named dir) and the

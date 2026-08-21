@@ -4268,8 +4268,11 @@ mod tests {
             sealed.spend.reservation_id.clone(),
             SpendScopeKeys {
                 plan_digest: plan_digest.clone(),
-                session_id: sealed.owner_session_id.to_string(),
-                project_key: project_id,
+                session_id: cockpit_db::image_spend::SessionId::new(
+                    sealed.owner_session_id.to_string(),
+                )
+                .unwrap(),
+                project_key: cockpit_db::image_spend::ProjectKey::new(project_id).unwrap(),
             },
             (1..=max_attempts)
                 .map(|number| AttemptMaximum {

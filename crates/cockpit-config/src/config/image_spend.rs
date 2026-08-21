@@ -157,12 +157,9 @@ mod tests {
             project: BudgetPolicy::Finite {
                 usd_micros: u64::MAX,
             },
+            // No user-supplied anchor: the server stamps the effective anchor.
             project_epoch: Some(ProjectEpochPolicy::Rolling {
                 duration_seconds: 86_400,
-                anchor: SavedInstant {
-                    unix_ms: -99,
-                    monotonic_sequence: u64::MAX,
-                },
             }),
         };
         {
@@ -174,13 +171,17 @@ mod tests {
             assert!(matches!(
                 saved.settings.project_epoch,
                 Some(ProjectEpochPolicy::Rolling {
-                    anchor: SavedInstant {
-                        unix_ms: 1_000,
-                        monotonic_sequence: 1
-                    },
-                    ..
+                    duration_seconds: 86_400
                 })
             ));
+            // The anchor is exposed only through the server-owned read model.
+            assert_eq!(
+                saved.effective_rolling_anchor,
+                Some(SavedInstant {
+                    unix_ms: 1_000,
+                    monotonic_sequence: 1,
+                })
+            );
         }
         let reopened = cockpit_db::Db::open(&path).unwrap();
         let current = reopened

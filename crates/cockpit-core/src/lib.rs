@@ -48,7 +48,6 @@ pub mod image_generation_control_plane;
 pub mod image_generation_job;
 pub mod image_generation_runtime;
 pub mod image_sidecar;
-pub mod image_spend;
 pub mod init;
 pub mod intel;
 pub mod jitter;

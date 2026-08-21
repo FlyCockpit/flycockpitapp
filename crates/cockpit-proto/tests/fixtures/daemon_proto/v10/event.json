@@ -113,11 +113,6 @@
         "generation": 4,
         "extended": {
           "response_metrics_tokenizer": "cl100k_base",
-          "image_spend": {
-            "request": "unconfigured",
-            "session": "unconfigured",
-            "project": "unconfigured"
-          },
           "image_generation": {
             "endpoints": [],
             "targets": [],

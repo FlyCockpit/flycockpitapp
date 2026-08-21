@@ -385,14 +385,11 @@ impl SettingsPage for ImageSpendPage {
                                 time_zone: String::new(),
                             }),
                             Some(ProjectEpochPolicy::CalendarMonth { .. }) => {
+                                // The rolling anchor is server-owned and stamped
+                                // on save; the editor supplies only the window
+                                // length.
                                 Some(ProjectEpochPolicy::Rolling {
                                     duration_seconds: 30 * 86_400,
-                                    anchor: cockpit_config::config::image_spend::SavedInstant {
-                                        // Placeholder only. The DB replaces it with its
-                                        // authoritative saved instant transactionally.
-                                        unix_ms: 0,
-                                        monotonic_sequence: 0,
-                                    },
                                 })
                             }
                             Some(ProjectEpochPolicy::Rolling { .. }) => None,
@@ -628,6 +625,7 @@ mod tests {
             policy_version: 4,
             epoch_policy_version: 2,
             epoch_sequence: Some(8),
+            effective_rolling_anchor: None,
         })))
         .unwrap();
         *page.load.lock().unwrap() = Some(rx);

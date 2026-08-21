@@ -3412,3 +3412,68 @@ fn remote_layer_cannot_force_secret_store_downgrade() {
         crate::db::secret_vault::SecretVaultPlacement::Keyring
     );
 }
+
+#[test]
+fn extended_config_has_no_image_spend_field() {
+    // 1. The spend policy is no longer a layered config value: `ExtendedConfig`
+    //    does not serialize an `image_spend` key, so a `config.json` can never
+    //    encode an authoritative spend policy through this type.
+    let serialized = serde_json::to_value(ExtendedConfig::default()).unwrap();
+    let object = serialized
+        .as_object()
+        .expect("extended config serializes to an object");
+    assert!(
+        object.get("image_spend").is_none(),
+        "ExtendedConfig must not serialize an image_spend field"
+    );
+    // Sanity: a real field is still present, so the absence above is meaningful.
+    assert!(object.contains_key("response_metrics_tokenizer"));
+
+    // 2. The atomic-merge table must not list `image_spend`.
+    assert!(
+        !crate::config::merge::ATOMIC_CONFIG_VALUE_PATHS
+            .iter()
+            .any(|path| path == &["image_spend"]),
+        "image_spend must not be an atomic layered-config path"
+    );
+
+    // 3. A document that carries a fully-valid, would-be-authoritative
+    //    `image_spend` policy alongside a real field still loads, and the stray
+    //    key is inert (ignored), not fail-closed and not authoritative.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        br#"{
+            "allow_remote_config": true,
+            "image_spend": {
+                "request": {"finite": {"usd_micros": 1}},
+                "session": {"finite": {"usd_micros": 1}},
+                "project": {"finite": {"usd_micros": 1}},
+                "project_epoch": {"calendar_month": {"time_zone": "UTC"}}
+            }
+        }"#,
+    )
+    .unwrap();
+    let (cfg, warnings) = ExtendedConfigDoc::load(&path)
+        .unwrap()
+        .config_with_warnings();
+    assert!(cfg.allow_remote_config, "the real field must still parse");
+    // The stray image_spend key is ignored, never surfaced as an authoritative
+    // or malformed field.
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.contains("image_spend")),
+        "a stray image_spend key must be silently ignored, got: {warnings:?}"
+    );
+    let reserialized = serde_json::to_value(&cfg).unwrap();
+    assert!(
+        reserialized
+            .as_object()
+            .unwrap()
+            .get("image_spend")
+            .is_none(),
+        "a loaded config must never round-trip an image_spend policy"
+    );
+}

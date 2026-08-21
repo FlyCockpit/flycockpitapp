@@ -9,7 +9,8 @@
 //!
 //! The module is UI-free and transport-free. It produces typed,
 //! bounded, denial-by-default structures. The job/spend foundations
-//! (`crate::image_generation_job`, `crate::image_spend`), the canonical
+//! (`crate::image_generation_job` and the `cockpit-db` image-spend ledger),
+//! the canonical
 //! dispatch (`crate::engine`), and the central authorization chokepoint
 //! are reused — this layer only adds the agent-facing tool surface and
 //! the composite decision that binds them.

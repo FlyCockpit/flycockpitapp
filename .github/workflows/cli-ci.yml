@@ -234,34 +234,59 @@ jobs:
           show_coturn_logs() {
             echo "::group::coturn logs"
             docker logs coturn || true
+            if [ -f "$logdir/turnserver.log" ]; then
+              echo "::group::coturn server log"
+              sed -n '1,400p' "$logdir/turnserver.log" || true
+              echo "::endgroup::"
+            fi
             echo "::endgroup::"
           }
           trap 'status=$?; show_coturn_logs; exit "$status"' ERR
           certdir="$RUNNER_TEMP/coturn-tls"
+          logdir="$RUNNER_TEMP/coturn-logs"
           mkdir -p "$certdir"
-          # Self-signed cert for the fixture SNI; trust it locally so
-          # rustls-native-certs verifies the TLS-to-coturn path (no public CA).
+          # coturn runs as `nobody`; its diagnostic file is visible only to
+          # that container and this ephemeral runner job.
+          install -d -m 733 "$logdir"
+          # Build a proper short-lived private CA plus a server leaf.  A
+          # self-signed leaf can pass an OpenSSL probe while being rejected by
+          # rustls/WebPKI's server-auth validation, which would leave the real
+          # TURN-over-TLS allocation path untested.
           openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -subj "/CN=Flycockpit coturn CI CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout "$certdir/ca-key.pem" -out "$certdir/ca-cert.pem"
+          openssl req -newkey rsa:2048 -nodes \
             -subj "/CN=$TURN_TLS_SNI" \
-            -addext "subjectAltName=DNS:$TURN_TLS_SNI,IP:127.0.0.1" \
-            -keyout "$certdir/key.pem" -out "$certdir/cert.pem"
+            -keyout "$certdir/key.pem" -out "$certdir/cert.csr"
+          openssl x509 -req -days 2 \
+            -in "$certdir/cert.csr" \
+            -CA "$certdir/ca-cert.pem" -CAkey "$certdir/ca-key.pem" -CAcreateserial \
+            -out "$certdir/cert.pem" \
+            -extfile <(printf '%s\n' \
+              "basicConstraints=critical,CA:FALSE" \
+              "keyUsage=critical,digitalSignature,keyEncipherment" \
+              "extendedKeyUsage=serverAuth" \
+              "subjectAltName=DNS:$TURN_TLS_SNI,IP:127.0.0.1")
           # The pinned image runs turnserver as `nobody`. Make the ephemeral
           # fixture readable through its read-only bind mount; otherwise
           # coturn silently disables TLS after failing to open the keypair.
           chmod 755 "$certdir"
           chmod 644 "$certdir/cert.pem" "$certdir/key.pem"
-          sudo cp "$certdir/cert.pem" /usr/local/share/ca-certificates/coturn-test.crt
+          sudo cp "$certdir/ca-cert.pem" /usr/local/share/ca-certificates/coturn-test.crt
           sudo update-ca-certificates
           # coturn: long-term credential mechanism, one fixture user, no relay
           # to public ranges (denied-peer ACL exercised by the test).
           docker run -d --name coturn --network host \
-            -v "$certdir:/tls:ro" "$COTURN_IMAGE" \
+            -v "$certdir:/tls:ro" -v "$logdir:/logs" "$COTURN_IMAGE" \
             -n --lt-cred-mech --fingerprint \
             --user "$TURN_USER:$TURN_PASS" \
             --realm localhost \
             --listening-port 3478 --tls-listening-port 5349 \
             --listening-ip 127.0.0.1 \
             --cert /tls/cert.pem --pkey /tls/key.pem \
+            --log-file /logs/turnserver.log \
             --denied-peer-ip 0.0.0.0-0.255.255.255 \
             --no-multicast-peers
           # UDP port scans do not prove a listener is usable. Require both the
@@ -275,7 +300,7 @@ jobs:
                 -servername "$TURN_TLS_SNI" \
                 -verify_hostname "$TURN_TLS_SNI" \
                 -verify_return_error \
-                -CAfile "$certdir/cert.pem" \
+                -CAfile "$certdir/ca-cert.pem" \
                 </dev/null >/dev/null 2>&1; then
               ready=true
               break
@@ -313,7 +338,11 @@ jobs:
 
       - name: Print coturn logs on failure
         if: failure()
-        run: docker logs coturn || true
+        run: |
+          docker logs coturn || true
+          if [ -f "$RUNNER_TEMP/coturn-logs/turnserver.log" ]; then
+            sed -n '1,400p' "$RUNNER_TEMP/coturn-logs/turnserver.log" || true
+          fi
 
       - name: Stop coturn
         if: always()

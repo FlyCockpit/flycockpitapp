@@ -13,6 +13,7 @@
     },
     "test": {
       "dependsOn": ["^build"],
+      "env": ["DATABASE_URL", "REDIS_URL", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL"],
       "inputs": [
         "src/**/*.ts",
         "src/**/*.tsx",

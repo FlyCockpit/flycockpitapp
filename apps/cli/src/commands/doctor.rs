@@ -152,16 +152,17 @@ async fn diagnostic_snapshot_worker(
         command.arg("--no-sandbox");
     }
 
-    let mut child = command.spawn().context("starting diagnostic snapshot worker")?;
+    let mut child = command
+        .spawn()
+        .context("starting diagnostic snapshot worker")?;
     let stdout = child
         .stdout
         .take()
         .context("diagnostic snapshot worker stdout was not captured")?;
     let completed = tokio::time::timeout(DIAGNOSTIC_SNAPSHOT_TIMEOUT, async {
-        tokio::try_join!(
-            read_bounded_stdout(stdout),
-            async { Ok::<_, anyhow::Error>(child.wait().await?) },
-        )
+        tokio::try_join!(read_bounded_stdout(stdout), async {
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        },)
     })
     .await;
     let (stdout, status) = match completed {

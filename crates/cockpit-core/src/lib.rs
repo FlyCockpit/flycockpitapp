@@ -85,7 +85,10 @@ pub mod startup;
 pub mod sync;
 pub mod sysinfo;
 pub mod tags;
-#[cfg(test)]
+// This surface is compiled for core's own tests and for dependents that
+// explicitly opt into the dev-only `test-support` feature. It intentionally
+// exposes only test instrumentation, never a production database API.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod text;
 pub mod tls_crypto_provider;

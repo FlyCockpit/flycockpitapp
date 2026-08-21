@@ -586,10 +586,10 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListen
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonStatus {
-    /// Daemon is running and the socket accepts a connection.
+    /// Daemon is running and completed a valid current-protocol hello.
     Running,
-    /// Daemon answers the hello handshake, but its protocol is outside this
-    /// client's supported range. Restart or upgrade before issuing requests.
+    /// Daemon's hello was malformed or its protocol is outside this client's
+    /// supported range. Restart or upgrade before issuing requests.
     IncompatibleProtocol,
     /// PID file exists and belongs to a verified cockpit daemon, but no
     /// socket path we know about answers the daemon handshake.
@@ -613,7 +613,7 @@ fn status_for_socket_response(response: &SocketHelloResponse) -> DaemonStatus {
     if response
         .hello
         .as_ref()
-        .is_some_and(|hello| !proto::is_protocol_compatible(hello.protocol_version))
+        .is_none_or(|hello| !proto::is_protocol_compatible(hello.protocol_version))
     {
         DaemonStatus::IncompatibleProtocol
     } else {

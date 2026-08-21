@@ -1443,9 +1443,15 @@ mod imp {
                     }
                 };
                 match destination_probe {
-                    RelativeProbe::Present(mut file)
-                        if verify_expected_file(&file, &recovery.artifact).is_ok()
-                            && validate_contents(&mut file, &recovery.artifact).is_ok() => {}
+                    RelativeProbe::Present(mut file) => {
+                        if verify_expected_file(&file, &recovery.artifact).is_err()
+                            || validate_contents(&mut file, &recovery.artifact).is_err()
+                        {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
+                    }
                     RelativeProbe::Absent => {
                         let source = std::ffi::OsStr::new(&recovery.source_name)
                             .encode_wide()
@@ -1463,10 +1469,14 @@ mod imp {
                             }
                         };
                         match source_probe {
-                            RelativeProbe::Present(mut file)
-                                if verify_expected_file(&file, &recovery.artifact).is_ok()
-                                    && validate_contents(&mut file, &recovery.artifact).is_ok() =>
-                            {
+                            RelativeProbe::Present(mut file) => {
+                                if verify_expected_file(&file, &recovery.artifact).is_err()
+                                    || validate_contents(&mut file, &recovery.artifact).is_err()
+                                {
+                                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                        recovery.clone(),
+                                    ));
+                                }
                                 return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
                                     HeldSealedArtifact {
                                         file,
@@ -1528,10 +1538,14 @@ mod imp {
                 };
                 match source_probe {
                     RelativeProbe::Absent => {}
-                    RelativeProbe::Present(mut file)
-                        if verify_expected_file(&file, &recovery.artifact).is_ok()
-                            && validate_contents(&mut file, &recovery.artifact).is_ok() =>
-                    {
+                    RelativeProbe::Present(mut file) => {
+                        if verify_expected_file(&file, &recovery.artifact).is_err()
+                            || validate_contents(&mut file, &recovery.artifact).is_err()
+                        {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
                             HeldSealedArtifact {
                                 file,

@@ -55,7 +55,8 @@ fn run_service() -> std::process::ExitCode {
     }
     #[cfg(not(unix))]
     {
-        let err: UnsupportedPlatform = service.listen("0.0.0.0:8443").unwrap_err();
+        let err: tenant_authority::UnsupportedPlatform =
+            service.listen("0.0.0.0:8443").unwrap_err();
         eprintln!("tenant-authority: {err}");
         std::process::ExitCode::FAILURE
     }

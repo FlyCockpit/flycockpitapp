@@ -2571,12 +2571,10 @@ impl App {
                             })
                             .copied()
                             .unwrap_or(true)),
-                copy_provenance_present: copy_body_start
-                    .as_ref()
-                    .is_some_and(|copy| {
-                        i.checked_sub(copy.start)
-                            .is_some_and(|row| row < copy.cells.len())
-                    }),
+                copy_provenance_present: copy_body_start.as_ref().is_some_and(|copy| {
+                    i.checked_sub(copy.start)
+                        .is_some_and(|row| row < copy.cells.len())
+                }),
             });
         }
 

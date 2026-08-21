@@ -224,8 +224,8 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             offline,
             no_sandbox,
         } => {
-            let snapshot = crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline)
-                .await?;
+            let snapshot =
+                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline).await?;
             println!(
                 "{}",
                 serde_json::json!({

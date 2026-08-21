@@ -274,31 +274,42 @@ async fn negotiate_hello(
     {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => {
-            tracing::debug!("daemon hello absent; using current protocol version");
-            return Ok(proto::NegotiatedProtocol::current());
+            return Err(protocol_handshake_error(
+                "daemon closed the connection before its hello",
+            ));
         }
         Ok(Err(error)) => {
-            tracing::debug!(error = %error, "daemon hello unreadable; using current protocol version");
-            return Ok(proto::NegotiatedProtocol::current());
+            tracing::debug!(error = %error, "daemon hello unreadable");
+            return Err(protocol_handshake_error("daemon hello could not be read"));
         }
         Err(_) => {
-            tracing::debug!("daemon hello timed out; using current protocol version");
-            return Ok(proto::NegotiatedProtocol::current());
+            return Err(protocol_handshake_error("daemon hello timed out"));
         }
     };
 
     let Some(hello) = (match proto::parse_daemon_hello_line(&line) {
         Ok(hello) => hello,
         Err(error) => {
-            tracing::debug!(error = %error, "daemon hello unparseable; using current protocol version");
-            return Ok(proto::NegotiatedProtocol::current());
+            tracing::debug!(error = %error, "daemon hello unparseable");
+            return Err(protocol_handshake_error("daemon hello was malformed"));
         }
     }) else {
-        tracing::debug!("first daemon frame was not a hello; using current protocol version");
-        return Ok(proto::NegotiatedProtocol::current());
+        return Err(protocol_handshake_error(
+            "first daemon frame was not a daemon-status hello",
+        ));
     };
 
     proto::NegotiatedProtocol::from_hello(&hello).map_err(anyhow::Error::new)
+}
+
+#[cfg(unix)]
+fn protocol_handshake_error(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(proto::ErrorPayload {
+        code: proto::ErrorCode::ProtocolVersion,
+        message: format!(
+            "daemon protocol handshake failed: {reason}; run `cockpit daemon restart`"
+        ),
+    })
 }
 
 #[cfg(unix)]
@@ -1079,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn negotiation_falls_back_to_current_version_when_hello_is_absent() {
+    async fn negotiation_rejects_a_daemon_that_does_not_send_a_hello() {
         let (_dir, socket, listener) = bind_test_socket();
         let server = tokio::spawn(async move {
             let (_stream, _) = listener.accept().await.unwrap();
@@ -1087,20 +1098,21 @@ mod tests {
         });
         let connect = tokio::spawn({
             let socket = socket.clone();
-            async move { DaemonClient::connect(&socket).await.unwrap() }
+            async move { DaemonClient::connect(&socket).await }
         });
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(500)).await;
-        let client = connect.await.unwrap();
-
-        assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
-        assert_eq!(client.negotiated().daemon_version, "unknown");
-        assert_eq!(
-            client.negotiated().daemon_protocol_version,
-            proto::PROTOCOL_VERSION
-        );
-        drop(client);
+        let error = match connect.await.unwrap() {
+            Ok(_) => panic!("missing hello must fail closed"),
+            Err(error) => error,
+        };
+        assert!(is_protocol_version_mismatch(&error));
+        let payload = error
+            .downcast_ref::<proto::ErrorPayload>()
+            .expect("missing hello must preserve a typed protocol error");
+        assert_eq!(payload.code, proto::ErrorCode::ProtocolVersion);
+        assert!(payload.message.contains("hello timed out"));
         server.abort();
     }
 

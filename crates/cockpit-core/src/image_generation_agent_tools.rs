@@ -1285,9 +1285,18 @@ mod tests {
         let schema = image_generation_tool_schema("generate_image");
         let parameters = &schema["properties"]["targets"]["items"]["properties"]["parameters"];
         assert_eq!(parameters["type"], "object");
-        assert_eq!(parameters["maxProperties"], MAX_GENERATE_IMAGE_TYPED_PARAMETERS);
+        assert_eq!(
+            parameters["maxProperties"],
+            MAX_GENERATE_IMAGE_TYPED_PARAMETERS
+        );
         assert_eq!(parameters["propertyNames"]["minLength"], 1);
-        assert_eq!(parameters["additionalProperties"]["oneOf"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            parameters["additionalProperties"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

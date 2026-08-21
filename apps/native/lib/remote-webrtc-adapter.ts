@@ -45,12 +45,6 @@ export const REMOTE_WEBRTC_CHANNEL_IDS = {
 export type RemoteWebRtcChannelId =
   (typeof REMOTE_WEBRTC_CHANNEL_IDS)[keyof typeof REMOTE_WEBRTC_CHANNEL_IDS];
 
-export const REMOTE_WEBRTC_CHANNEL_LANE: Readonly<Record<RemoteWebRtcChannelId, RemoteLane>> = {
-  0: "control",
-  2: "interactive",
-  4: "bulk",
-};
-
 export const REMOTE_WEBRTC_LANE_CHANNEL: Readonly<Record<RemoteLane, RemoteWebRtcChannelId>> = {
   control: 0,
   interactive: 2,

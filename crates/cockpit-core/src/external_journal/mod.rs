@@ -36,6 +36,7 @@ pub mod keys;
 pub mod projection;
 pub mod spool;
 
+#[cfg(any(unix, test))]
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +51,7 @@ use cockpit_db::external_journal::{
     ExternalJournalAgeReport, ExternalJournalCapacity, ExternalJournalRecord, ExternalJournalState,
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
+#[cfg(any(unix, test))]
 use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
 
 pub(crate) use fsguard::DirGuard;
@@ -471,6 +473,7 @@ impl ExternalJournal {
         Ok(operations)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn write_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -490,6 +493,7 @@ impl ExternalJournal {
         Ok(())
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn read_remote_rename_artifact(
         &self,
         artifact_id: Uuid,
@@ -519,7 +523,7 @@ impl ExternalJournal {
                 continue;
             };
             if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
-                let held = dir.open_file_verified(&name)?;
+                let _held = dir.open_file_verified(&name)?;
                 #[cfg(test)]
                 if self
                     .fail_remote_rename_cleanup_unlink
@@ -533,7 +537,7 @@ impl ExternalJournal {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt as _;
-                    if held
+                    if _held
                         .metadata()
                         .map_err(|error| {
                             ExternalJournalError::Spool(format!(
@@ -1821,6 +1825,7 @@ impl ExternalJournal {
     }
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteRenameArtifactV1 {
     pub logical_attachment_id: Uuid,
@@ -1833,10 +1838,12 @@ pub(crate) struct RemoteRenameArtifactV1 {
     pub target_name: String,
 }
 
+#[cfg(any(unix, test))]
 fn remote_rename_artifact_name(artifact_id: Uuid, generation: u64) -> String {
     format!("{artifact_id}.{generation}.rr1")
 }
 
+#[cfg(any(unix, test))]
 impl RemoteRenameArtifactV1 {
     const FIXED: usize = 4 + 16 + 16 + 8 + 57 * 3 + 2 + 2;
 

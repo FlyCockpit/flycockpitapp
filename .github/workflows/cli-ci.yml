@@ -109,13 +109,20 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       # The dependency-inventory test intentionally resolves every supported
-      # target with `--offline`; a host build fetches only its own target's
-      # optional crates. Populate the registry cache on every test runner.
+      # target with `--offline`. Fetch the complete locked graph first: target
+      # filters do not fetch every conditional package (for example Android
+      # support crates retained by `cargo metadata`), which made an otherwise
+      # hermetic inventory fail only on a cold runner.
       - name: Fetch cross-platform metadata dependencies
         run: |
+          cargo fetch --locked
           cargo fetch --locked --target aarch64-apple-darwin
           cargo fetch --locked --target x86_64-pc-windows-msvc
           cargo fetch --locked --target x86_64-unknown-linux-gnu
+          # `cargo metadata` includes Android-target package records too. Fetch
+          # one Android target explicitly so its conditional support crates are
+          # available to the audit's deliberately offline metadata invocation.
+          cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
         run: cargo nextest run --locked --workspace
@@ -215,46 +222,99 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      # Pinned coturn image. TODO(turn-coturn-conformance): before marking this
-      # job REQUIRED, replace the version tag with an immutable digest pin
-      # (`docker.io/coturn/coturn:4.6.2@sha256:<digest>`) captured from
-      # `docker buildx imagetools inspect` so the server binary cannot silently
-      # change. The version tag is used until the digest is recorded.
+      # The immutable digest keeps the conformance server binary reproducible.
       - name: Start pinned coturn (UDP/TCP/TLS, long-term credentials)
         env:
-          COTURN_IMAGE: docker.io/coturn/coturn:4.6.2
+          COTURN_IMAGE: docker.io/coturn/coturn:4.6.2@sha256:4873c54f213ec81f6b4c4c4938b69c922f50b2293ded427f5191472b9a127227
           TURN_USER: turnuser
           TURN_PASS: turnpass
           TURN_TLS_SNI: localhost
         run: |
           set -euo pipefail
+          show_coturn_logs() {
+            echo "::group::coturn logs"
+            docker logs coturn || true
+            if [ -f "$logdir/turnserver.log" ]; then
+              echo "::group::coturn server log"
+              sed -n '1,400p' "$logdir/turnserver.log" || true
+              echo "::endgroup::"
+            fi
+            echo "::endgroup::"
+          }
+          trap 'status=$?; show_coturn_logs; exit "$status"' ERR
           certdir="$RUNNER_TEMP/coturn-tls"
+          logdir="$RUNNER_TEMP/coturn-logs"
           mkdir -p "$certdir"
-          # Self-signed cert for the fixture SNI; trust it locally so
-          # rustls-native-certs verifies the TLS-to-coturn path (no public CA).
+          # coturn runs as `nobody`; its diagnostic file is visible only to
+          # that container and this ephemeral runner job.
+          install -d -m 733 "$logdir"
+          # Build a proper short-lived private CA plus a server leaf.  A
+          # self-signed leaf can pass an OpenSSL probe while being rejected by
+          # rustls/WebPKI's server-auth validation, which would leave the real
+          # TURN-over-TLS allocation path untested.
           openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -subj "/CN=Flycockpit coturn CI CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout "$certdir/ca-key.pem" -out "$certdir/ca-cert.pem"
+          openssl req -newkey rsa:2048 -nodes \
             -subj "/CN=$TURN_TLS_SNI" \
-            -addext "subjectAltName=DNS:$TURN_TLS_SNI,IP:127.0.0.1" \
-            -keyout "$certdir/key.pem" -out "$certdir/cert.pem"
-          sudo cp "$certdir/cert.pem" /usr/local/share/ca-certificates/coturn-test.crt
+            -keyout "$certdir/key.pem" -out "$certdir/cert.csr"
+          openssl x509 -req -days 2 \
+            -in "$certdir/cert.csr" \
+            -CA "$certdir/ca-cert.pem" -CAkey "$certdir/ca-key.pem" -CAcreateserial \
+            -out "$certdir/cert.pem" \
+            -extfile <(printf '%s\n' \
+              "basicConstraints=critical,CA:FALSE" \
+              "keyUsage=critical,digitalSignature,keyEncipherment" \
+              "extendedKeyUsage=serverAuth" \
+              "subjectAltName=DNS:$TURN_TLS_SNI,IP:127.0.0.1")
+          # The pinned image runs turnserver as `nobody`. Make the ephemeral
+          # fixture readable through its read-only bind mount; otherwise
+          # coturn silently disables TLS after failing to open the keypair.
+          chmod 755 "$certdir"
+          chmod 644 "$certdir/cert.pem" "$certdir/key.pem"
+          sudo cp "$certdir/ca-cert.pem" /usr/local/share/ca-certificates/coturn-test.crt
           sudo update-ca-certificates
           # coturn: long-term credential mechanism, one fixture user, no relay
           # to public ranges (denied-peer ACL exercised by the test).
           docker run -d --name coturn --network host \
-            -v "$certdir:/tls:ro" "$COTURN_IMAGE" \
+            -v "$certdir:/tls:ro" -v "$logdir:/logs" "$COTURN_IMAGE" \
             -n --lt-cred-mech --fingerprint \
             --user "$TURN_USER:$TURN_PASS" \
             --realm localhost \
             --listening-port 3478 --tls-listening-port 5349 \
             --listening-ip 127.0.0.1 \
             --cert /tls/cert.pem --pkey /tls/key.pem \
+            --log-file /logs/turnserver.log \
             --denied-peer-ip 0.0.0.0-0.255.255.255 \
             --no-multicast-peers
-          # Wait for the UDP listener.
+          # UDP port scans do not prove a listener is usable. Require both the
+          # TCP TURN listener and a verified TLS handshake before running the
+          # real-I/O conformance test.
+          ready=false
           for _ in $(seq 1 30); do
-            if nc -z -u 127.0.0.1 3478 2>/dev/null; then break; fi
+            if nc -z -w 1 127.0.0.1 3478 2>/dev/null \
+              && openssl s_client -brief \
+                -connect "127.0.0.1:5349" \
+                -servername "$TURN_TLS_SNI" \
+                -verify_hostname "$TURN_TLS_SNI" \
+                -verify_return_error \
+                -CAfile "$certdir/ca-cert.pem" \
+                </dev/null >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' coturn 2>/dev/null | grep -qx true; then
+              echo "coturn exited before becoming ready" >&2
+              exit 1
+            fi
             sleep 1
           done
+          if [ "$ready" != true ]; then
+            echo "coturn did not become TCP/TLS-ready within 30 seconds" >&2
+            exit 1
+          fi
           {
             echo "COTURN_CONFORMANCE=1"
             echo "TURN_HOST=127.0.0.1"
@@ -275,6 +335,14 @@ jobs:
           --features turn-coturn-conformance
           --run-ignored ignored-only
           -E 'test(remote_turn_socket_provider_coturn_conformance)'
+
+      - name: Print coturn logs on failure
+        if: failure()
+        run: |
+          docker logs coturn || true
+          if [ -f "$RUNNER_TEMP/coturn-logs/turnserver.log" ]; then
+            sed -n '1,400p' "$RUNNER_TEMP/coturn-logs/turnserver.log" || true
+          fi
 
       - name: Stop coturn
         if: always()

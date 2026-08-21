@@ -24,7 +24,7 @@ use cockpit_proto::remote_device_identity_enrollment::{
     RemoteIdentityCustodyError, RemoteIdentityCustodyHandleId, RemoteIdentityP256PublicKey,
     RemoteSubjectKindV1 as SubjectKind,
 };
-use cryptoki::context::{CInitializeArgs, Pkcs11};
+use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectHandle};
 use cryptoki::session::{Session, UserType};
@@ -91,7 +91,7 @@ impl Pkcs11CustodyAdapter {
         let context =
             Pkcs11::new(&config.module_path).map_err(|e| unavailable("module load", e))?;
         context
-            .initialize(CInitializeArgs::OsThreads)
+            .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
             .map_err(|e| unavailable("initialize", e))?;
         let slots = context
             .get_slots_with_token()
@@ -127,7 +127,7 @@ impl Pkcs11CustodyAdapter {
         session
             .login(
                 UserType::User,
-                Some(&AuthPin::new(self.config.user_pin.clone())),
+                Some(&AuthPin::new(self.config.user_pin.clone().into())),
             )
             .map_err(|e| unavailable("login", e))?;
         Ok(LoggedSession { session })

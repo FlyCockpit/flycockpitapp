@@ -880,6 +880,17 @@ pub enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Internal one-shot diagnostics worker. It deliberately does not boot the
+    /// normal daemon server, so it can report a database bootstrap failure.
+    #[command(hide = true)]
+    DiagnosticSnapshot {
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        no_sandbox: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]

@@ -2,6 +2,10 @@
   "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
   "extends": ["@flycockpit/config/biome.json"],
   "files": {
-    "includes": ["!!**/fixtures/remote/attempt-grants-v1.json"]
+    "includes": [
+      "!!**/fixtures/remote/attempt-grants-v1.json",
+      "!!packages/cockpit-protocol/fixtures/remote-transport-selection/vocabulary.json",
+      "!!crates/**/fuzz/corpus/**"
+    ]
   }
 }

@@ -154,7 +154,17 @@ async fn drive_udp(
         }
 
         let wait_until = match client.poll(clock.now()) {
-            TurnPollRet::Closed => return Err(ConnectError::AllocationFailed),
+            TurnPollRet::Closed => {
+                // `poll` may have queued AllocationCreateFailed immediately
+                // before returning Closed. Drain it first so the conformance
+                // log distinguishes a server-rejected Allocate from a TLS/
+                // stream close that happened before the TURN exchange.
+                if let Some(relay) = drain_events(&mut client)? {
+                    return Ok(relay);
+                }
+                eprintln!("[coturn-conformance] TURN UDP client closed before Allocate succeeded");
+                return Err(ConnectError::AllocationFailed);
+            }
             TurnPollRet::WaitUntil(t) => t,
             // No TCP relay sockets on the client-to-server UDP path.
             TurnPollRet::AllocateTcpSocket { .. } | TurnPollRet::TcpClose { .. } => clock.now(),
@@ -308,7 +318,22 @@ async fn drive_stream<C: TurnClientApi>(
         }
 
         let wait_until = match client.poll(clock.now()) {
-            TurnPollRet::Closed => return Err(ConnectError::AllocationFailed),
+            TurnPollRet::Closed => {
+                // See the matching UDP path above. This is particularly
+                // useful for the TLS leg: it separates a TLS/stream close
+                // from an Allocate rejection that the protocol queued.
+                if let Some(mut relay) = drain_events(&mut client)? {
+                    if let Some(t) = tls {
+                        relay.transport = t;
+                    }
+                    return Ok(relay);
+                }
+                let transport = if tls.is_some() { "TLS" } else { "TCP" };
+                eprintln!(
+                    "[coturn-conformance] TURN {transport} stream closed before Allocate succeeded"
+                );
+                return Err(ConnectError::AllocationFailed);
+            }
             TurnPollRet::WaitUntil(t) => t,
             TurnPollRet::AllocateTcpSocket { .. } | TurnPollRet::TcpClose { .. } => clock.now(),
         };
@@ -347,7 +372,12 @@ fn drain_events<C: TurnClientApi>(
                     transport: TurnTransport::Udp,
                 }));
             }
-            TurnEvent::AllocationCreateFailed(_) => return Err(ConnectError::AllocationFailed),
+            TurnEvent::AllocationCreateFailed(family) => {
+                eprintln!(
+                    "[coturn-conformance] TURN server rejected Allocate for relay address family {family:?}"
+                );
+                return Err(ConnectError::AllocationFailed);
+            }
             _ => {}
         }
     }

@@ -1170,6 +1170,38 @@ impl Driver {
                     });
                 }
             };
+        // Check reachability before resolving the child's execution surface.
+        // Surface resolution intentionally reads the child configuration from
+        // the selected cwd, but an unknown child must retain the parent-facing
+        // diagnostic (including the reachable-agent list) and must not reach a
+        // loader.  This is also the last point before any delegation state is
+        // registered, so a refusal has no child lifecycle side effect.
+        let parent_agent = self.stack.last().unwrap().agent.name.clone();
+        if let Some(err) = grant_rejection(
+            &child_cwd.resolved,
+            &self.config,
+            &parent_agent,
+            &child_agent,
+            &granted_tools,
+            &self.session.db,
+        )
+        .await
+        {
+            return Ok(SingleNoninteractiveCompletion {
+                child_agent,
+                task_call_id,
+                task_function_call_id,
+                report: err,
+                failed: true,
+                failure: None,
+                partial_progress: DelegationPartialProgress::default(),
+                new_handle: None,
+                snapshot: NoninteractiveDelegationSnapshot::empty(),
+                shrink: None,
+                repair_notes,
+                child_routing: None,
+            });
+        }
         // The child's posture is derived from the pinned attempt config, so the
         // `llm_mode` here (→ follow-up/child-only capability) and the handoff-tag
         // expansion below share the SAME generation as the later build/dispatch —
@@ -1250,33 +1282,6 @@ impl Driver {
             child_agent.clone(),
             NoninteractiveDelegationSnapshot::empty(),
         );
-
-        let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        if let Some(err) = grant_rejection(
-            &child_cwd.resolved,
-            &self.config,
-            &parent_agent,
-            &child_agent,
-            &granted_tools,
-            &self.session.db,
-        )
-        .await
-        {
-            return Ok(SingleNoninteractiveCompletion {
-                child_agent,
-                task_call_id,
-                task_function_call_id,
-                report: err,
-                failed: true,
-                failure: None,
-                partial_progress: DelegationPartialProgress::default(),
-                new_handle: None,
-                snapshot: NoninteractiveDelegationSnapshot::empty(),
-                shrink: None,
-                repair_notes,
-                child_routing: None,
-            });
-        }
 
         let (delegation_payload_history, delivered_brief) = if context
             == crate::engine::agent::TaskContext::Fork

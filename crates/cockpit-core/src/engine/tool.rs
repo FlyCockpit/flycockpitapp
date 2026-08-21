@@ -2637,6 +2637,7 @@ mod llm_mode_tests {
             ("extract_video_clip", ToolEffect::Mutating),
             ("extract_audio", ToolEffect::Mutating),
             ("read_image", ToolEffect::ReadOnly),
+            ("ask_image", ToolEffect::ReadOnly),
             ("list_image_generation_targets", ToolEffect::ReadOnly),
             ("generate_image", ToolEffect::Dynamic),
             ("get_image_generation_job", ToolEffect::ReadOnly),

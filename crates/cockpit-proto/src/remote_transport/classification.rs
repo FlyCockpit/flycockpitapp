@@ -2037,6 +2037,31 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::StreamChunked,
     ),
     row(
+        "assistant_display_text_delta",
+        RemoteMessageClass::ModelDelta,
+        RemoteInlinePayloadBound::StreamChunked,
+    ),
+    row(
+        "assistant_display_reasoning_delta",
+        RemoteMessageClass::ModelDelta,
+        RemoteInlinePayloadBound::StreamChunked,
+    ),
+    row(
+        "assistant_display_attempt_reset",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "assistant_display_complete",
+        RemoteMessageClass::ModelDelta,
+        RemoteInlinePayloadBound::StreamChunked,
+    ),
+    row(
+        "assistant_display_error",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "assistant_text",
         RemoteMessageClass::ModelDelta,
         RemoteInlinePayloadBound::StreamChunked,
@@ -2587,7 +2612,7 @@ mod tests {
         // Exact table sizes, so a silent shrink is caught.
         assert_eq!(REQUEST_CLASSIFICATION.len(), 200);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 142);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 77);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 82);
     }
 
     #[test]

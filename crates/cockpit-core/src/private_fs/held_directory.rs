@@ -386,7 +386,7 @@ fn run_before_publish_hook() {
         hook();
     }
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn run_before_publish_hook() {}
 #[cfg(test)]
 fn run_after_publish_effect_hook() {
@@ -394,13 +394,13 @@ fn run_after_publish_effect_hook() {
         hook();
     }
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn run_after_publish_effect_hook() {}
 #[cfg(test)]
 fn take_forced_failure(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
     flag.with(|value| value.replace(false))
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn take_forced_publish_failure() -> bool {
     false
 }
@@ -408,7 +408,7 @@ fn take_forced_publish_failure() -> bool {
 fn take_forced_publish_failure() -> bool {
     take_forced_failure(&FORCE_PUBLISH_NONCOLLISION_FAILURE)
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn take_forced_cleanup_failure() -> bool {
     false
 }
@@ -416,7 +416,7 @@ fn take_forced_cleanup_failure() -> bool {
 fn take_forced_cleanup_failure() -> bool {
     take_forced_failure(&FORCE_SOURCE_CLEANUP_FAILURE)
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), unix))]
 fn take_forced_metadata_failure() -> bool {
     false
 }
@@ -578,12 +578,13 @@ mod imp {
 
         pub(super) fn rename_noreplace(
             &self,
-            mut artifact: HeldSealedArtifact,
+            artifact: HeldSealedArtifact,
             to: &str,
         ) -> Result<HeldDirectoryEffectOutcome> {
             self.verify_directory_security()?;
             #[cfg(target_os = "linux")]
             {
+                let mut artifact = artifact;
                 run_before_publish_hook();
                 let target = CString::new(to)?;
                 let proc_source =
@@ -659,6 +660,7 @@ mod imp {
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = (artifact, to);
                 anyhow::bail!(
                     "fd-bound no-replace publication is unsupported on this Unix platform"
                 )
@@ -879,6 +881,7 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn verify_published(
         dir: &HeldDirectory,
         name: &str,
@@ -1441,9 +1444,15 @@ mod imp {
                     }
                 };
                 match destination_probe {
-                    RelativeProbe::Present(mut file)
-                        if verify_expected_file(&file, &recovery.artifact).is_ok()
-                            && validate_contents(&mut file, &recovery.artifact).is_ok() => {}
+                    RelativeProbe::Present(mut file) => {
+                        if verify_expected_file(&file, &recovery.artifact).is_err()
+                            || validate_contents(&mut file, &recovery.artifact).is_err()
+                        {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
+                    }
                     RelativeProbe::Absent => {
                         let source = std::ffi::OsStr::new(&recovery.source_name)
                             .encode_wide()
@@ -1461,10 +1470,14 @@ mod imp {
                             }
                         };
                         match source_probe {
-                            RelativeProbe::Present(mut file)
-                                if verify_expected_file(&file, &recovery.artifact).is_ok()
-                                    && validate_contents(&mut file, &recovery.artifact).is_ok() =>
-                            {
+                            RelativeProbe::Present(mut file) => {
+                                if verify_expected_file(&file, &recovery.artifact).is_err()
+                                    || validate_contents(&mut file, &recovery.artifact).is_err()
+                                {
+                                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                        recovery.clone(),
+                                    ));
+                                }
                                 return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
                                     HeldSealedArtifact {
                                         file,
@@ -1526,10 +1539,14 @@ mod imp {
                 };
                 match source_probe {
                     RelativeProbe::Absent => {}
-                    RelativeProbe::Present(mut file)
-                        if verify_expected_file(&file, &recovery.artifact).is_ok()
-                            && validate_contents(&mut file, &recovery.artifact).is_ok() =>
-                    {
+                    RelativeProbe::Present(mut file) => {
+                        if verify_expected_file(&file, &recovery.artifact).is_err()
+                            || validate_contents(&mut file, &recovery.artifact).is_err()
+                        {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
                             HeldSealedArtifact {
                                 file,
@@ -1798,7 +1815,6 @@ mod imp {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use super::*;
@@ -2118,7 +2134,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use std::io::Write as _;
     use std::os::windows::fs::symlink_dir;
 
     use super::*;

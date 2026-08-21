@@ -4,16 +4,7 @@
   "consentCapabilities": ["direct_allowed", "relay_only", "unavailable"],
   "durableLifecycle": ["current", "replacement_pending", "draining"],
   "healthTiers": ["healthy", "degraded", "failed"],
-  "parentStates": [
-    "planning",
-    "establishing",
-    "active",
-    "degraded",
-    "denied",
-    "failed",
-    "cancelled",
-    "superseded"
-  ],
+  "parentStates": ["planning", "establishing", "active", "degraded", "denied", "failed", "cancelled", "superseded"],
   "reachabilityClasses": [
     "ice_no_candidate_pair",
     "ice_timeout",

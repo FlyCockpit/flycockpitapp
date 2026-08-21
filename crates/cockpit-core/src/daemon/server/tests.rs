@@ -9,7 +9,7 @@ use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
@@ -13490,8 +13490,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // capability-table backing is the persistence sibling's, so an
         // authorized owner request traverses dispatch and fails closed with a
         // content-free Internal error.
-        "begin_sealed_owner_operation"
-        | "apply_sealed_owner_operation"
+        "begin_sealed_owner_operation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "apply_sealed_owner_operation"
         | "cancel_sealed_owner_operation"
         | "sealed_owner_inventory"
         | "edit_sealed_owner_description"

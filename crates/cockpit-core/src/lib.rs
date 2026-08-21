@@ -85,7 +85,10 @@ pub mod startup;
 pub mod sync;
 pub mod sysinfo;
 pub mod tags;
-#[cfg(test)]
+// This surface is compiled for core's own tests and for dependents that
+// explicitly opt into the dev-only `test-support` feature. It intentionally
+// exposes only test instrumentation, never a production database API.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod text;
 pub mod tls_crypto_provider;
@@ -97,5 +100,8 @@ pub mod welcome;
 pub mod wizard;
 pub mod write_scope;
 
-pub use cockpit_db as db;
+// The storage crate is an implementation detail of the core layer.  Keeping
+// this alias crate-visible prevents upper layers from bypassing daemon-owned
+// RPCs to open the ledger directly.
+pub(crate) use cockpit_db as db;
 pub use cockpit_proto as proto_crate;

@@ -1,11 +1,11 @@
-FROM node:24-slim AS base
+FROM node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d AS base
 
 # Runtime base:
 #   - openssl: required by Prisma query engine
 #   - postgresql-client: provides psql, used by docker-entrypoint.sh to hold a
 #     Postgres advisory lock around `prisma db push` (multi-replica safety).
-# `apt-get upgrade` pulls the latest Debian 12 security patches for packages
-# already in node:24-slim (glibc, libcap2, systemd libs, etc.) — the base image
+# `apt-get upgrade` pulls the latest Debian 13 security patches for packages
+# already in the pinned Node Trixie image (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
 RUN apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \

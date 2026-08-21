@@ -205,6 +205,16 @@ pub const PRIVATE_FS_POLICY: PrivateFsPolicy = PrivateFsPolicy {
     directory_fsync_available: cfg!(unix),
 };
 
+#[cfg(target_os = "macos")]
+fn device_id_matches(stat_device: libc::dev_t, metadata_device: u64) -> bool {
+    u64::try_from(stat_device).is_ok_and(|device| device == metadata_device)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn device_id_matches(stat_device: libc::dev_t, metadata_device: u64) -> bool {
+    stat_device == metadata_device
+}
+
 // ------------------------------------------------------------------------
 // Windows DACL / reparse policy seam (platform-independent)
 // ------------------------------------------------------------------------
@@ -1286,8 +1296,7 @@ fn write_private_file_unix(path: &Path, bytes: &[u8], publish: PrivateWritePubli
         // SAFETY: only read `named` when fstatat succeeded.
         let matches = stat_ok && {
             let named = unsafe { named.assume_init() };
-            // `as u64`: `dev_t`/`ino_t` widths differ across Unix targets.
-            named.st_dev == held.dev() && named.st_ino == held.ino()
+            device_id_matches(named.st_dev, held.dev()) && named.st_ino == held.ino()
         };
         if !matches {
             unlinkat_best_effort(&dir_handle, &temp_c);

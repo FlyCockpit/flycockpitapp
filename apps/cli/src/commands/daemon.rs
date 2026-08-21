@@ -99,6 +99,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             let old_pid = daemon::daemon_pid(&paths);
             let discovered = daemon::discover().await;
             let should_stop = restart_should_stop(discovered.status);
+            let restarted = should_stop && old_pid.is_some();
             let replacement_no_sandbox = if should_stop {
                 daemon::derive_restart_no_sandbox(&paths, no_sandbox)
             } else {
@@ -130,10 +131,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
 
             let pid = daemon::spawn_detached_with_resume(replacement_no_sandbox, resume)?;
-            println!(
-                "{}",
-                restart_started_message(should_stop, pid, &paths.socket)
-            );
+            println!("{}", restart_started_message(restarted, pid, &paths.socket));
             Ok(())
         }
         DaemonCommand::Status { json } => {
@@ -217,6 +215,31 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                     println!("daemon: canonical daemon not running\n{EPHEMERAL_TUI_NOTE}");
                 }
             }
+            Ok(())
+        }
+        DaemonCommand::DiagnosticSnapshot {
+            path,
+            offline,
+            no_sandbox,
+        } => {
+            let snapshot =
+                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline).await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rendered": crate::diagnostics::render(&snapshot),
+                    "has_failures": snapshot.has_failures,
+                    // This worker is used only when a private ephemeral daemon
+                    // could not become ready. Keep the classification machine
+                    // readable so its parent can preserve the original daemon
+                    // error unless the database bootstrap is the actual cause.
+                    "database_bootstrap_failure": snapshot.database.iter().any(|line| {
+                        line.starts_with("openability: FAILED")
+                            || line.starts_with("schema: FAILED")
+                            || line.starts_with("path: unavailable")
+                    }),
+                })
+            );
             Ok(())
         }
     }

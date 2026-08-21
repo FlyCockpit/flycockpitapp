@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+#[cfg(not(windows))]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -114,28 +114,33 @@ async fn resolve_requested_session_via_daemon(
 ) -> Result<Option<Uuid>> {
     if let Some(session) = &args.session {
         let session_id = Uuid::parse_str(session).context("parsing --session")?;
-        // Validate via the daemon's session lookup RPC.
+        // Resolve from the durable session index rather than the live-worker
+        // status RPC: an ephemeral daemon may have persisted the session and
+        // then exited before this command resumes it on the shared daemon.
         let response = client
-            .request(crate::daemon::proto::Request::SessionLiveStatus {
-                session_ids: vec![session_id],
+            .request(crate::daemon::proto::Request::ListSessions {
+                project_id: None,
+                parent_session_id: None,
+                assistant_id: None,
             })
             .await
             .context("looking up --session via daemon")?
             .map_err(|error| anyhow::anyhow!("daemon rejected session lookup: {error}"))?;
-        let statuses = match response {
-            crate::daemon::proto::Response::SessionLiveStatus { statuses } => statuses,
+        let sessions = match response {
+            crate::daemon::proto::Response::Sessions { sessions } => sessions,
             other => bail!("daemon returned unexpected response to session lookup: {other:?}"),
         };
-        if statuses.is_empty() {
-            anyhow::bail!("unknown session {session_id}");
-        }
+        let session = sessions
+            .iter()
+            .find(|summary| summary.session_id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
         // Validate the session's project root matches the requested cwd/project
         // (Finding 4): `cockpit run --session <id>` from workspace B must not
         // attach to a session created for workspace A. The v10
-        // SessionLiveStatus response carries the session's canonical
-        // project_root for this check.
-        let status = &statuses[0];
-        if let Some(session_project_root) = &status.project_root {
+        // session summary carries the durable canonical project_root for this
+        // check, including sessions whose previous daemon has exited.
+        {
+            let session_project_root = &session.project_root;
             let requested_root = root
                 .canonicalize()
                 .with_context(|| format!("canonicalizing run cwd {}", root.display()))?;

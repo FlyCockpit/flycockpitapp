@@ -156,6 +156,15 @@ jobs:
       - setup
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
+    # The unit-test graph imports the shared server/worker environment through
+    # @flycockpit/queue.  These values only satisfy startup validation: unit
+    # tests mock persistence, and Redis integration coverage is invoked below
+    # with TEST_REDIS_URL explicitly set.
+    env:
+      DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+      REDIS_URL: redis://127.0.0.1:6379
+      BETTER_AUTH_SECRET: 0123456789abcdef0123456789abcdef
+      BETTER_AUTH_URL: https://app.example.test
     services:
       redis:
         image: redis:7.4.2-alpine

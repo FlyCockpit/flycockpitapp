@@ -10,7 +10,7 @@ homepage = "https://github.com/FlyCockpit/flycockpitapp"
 publish = false
 
 [features]
-test-support = []
+test-support = ["dep:cockpit-test-support"]
 # Compiles the real Linux/WSL PKCS#11 daemon custody adapter (cryptoki). OFF by
 # default so the serialized local gate stays green and lock-stable without a
 # PKCS#11 module present; the SoftHSM CI job enables it. macOS/Windows adapters
@@ -43,6 +43,7 @@ cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
+cockpit-test-support = { path = "../cockpit-test-support", optional = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 zip = { workspace = true }

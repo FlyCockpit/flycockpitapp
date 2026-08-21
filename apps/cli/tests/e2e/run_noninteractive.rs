@@ -492,6 +492,8 @@ async fn run_approve_class_grants() {
         "--json",
         "--approve",
         "path",
+        "--approve",
+        "command",
         "trigger approval",
     ]);
     let output = spawn_run(command);

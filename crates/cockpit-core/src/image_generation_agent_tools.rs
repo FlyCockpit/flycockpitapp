@@ -100,7 +100,12 @@ fn default_one_sample() -> u32 {
 /// Typed parameter value (boolean, integer, or text). Unknown types
 /// are rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TypedParameter {
     Boolean(bool),
     Integer(i64),
@@ -321,16 +326,47 @@ fn generate_image_schema() -> Value {
                         "format": { "type": "string", "enum": ["png", "jpeg", "webp", "svg"], "description": "Optional output format." },
                         "parameters": {
                             "type": "object",
-                            "description": "Optional typed parameters for this target.",
+                            "description": "Optional typed target parameters, keyed by parameter name.",
                             "maxProperties": MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
+                            "propertyNames": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES
+                            },
                             "additionalProperties": {
-                                "type": "object",
-                                "properties": {
-                                    "type": { "type": "string", "enum": ["boolean", "integer", "text"] },
-                                    "value": {}
-                                },
-                                "required": ["type", "value"],
-                                "additionalProperties": false
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": { "const": "boolean" },
+                                            "value": { "type": "boolean" }
+                                        },
+                                        "required": ["type", "value"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": { "const": "integer" },
+                                            "value": {
+                                                "type": "integer",
+                                                "minimum": i64::MIN,
+                                                "maximum": i64::MAX
+                                            }
+                                        },
+                                        "required": ["type", "value"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": { "const": "text" },
+                                            "value": { "type": "string", "maxLength": MAX_GENERATE_IMAGE_STRING_BYTES }
+                                        },
+                                        "required": ["type", "value"],
+                                        "additionalProperties": false
+                                    }
+                                ]
                             }
                         }
                     },
@@ -540,25 +576,31 @@ fn validate_typed_parameters(parameters: Option<&Value>, target_id: &str) -> Res
     let Some(parameters) = parameters else {
         return Ok(());
     };
-    let params_obj = parameters.as_object().ok_or_else(|| {
+    let params = parameters.as_object().ok_or_else(|| {
         anyhow::anyhow!("generate_image target `{target_id}` parameters must be an object")
     })?;
     ensure!(
-        params_obj.len() <= MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
+        params.len() <= MAX_GENERATE_IMAGE_TYPED_PARAMETERS,
         "generate_image target `{target_id}` parameters exceed the {} cap",
         MAX_GENERATE_IMAGE_TYPED_PARAMETERS
     );
-    for (key, value) in params_obj {
+    for (key, parameter) in params {
         ensure!(
             !key.is_empty() && key.len() <= MAX_GENERATE_IMAGE_STRING_BYTES,
             "generate_image target `{target_id}` parameter key is outside its bound"
         );
-        let value_obj = value.as_object().ok_or_else(|| {
+        let parameter = parameter.as_object().ok_or_else(|| {
             anyhow::anyhow!(
                 "generate_image target `{target_id}` parameter `{key}` must be an object"
             )
         })?;
-        let kind = value_obj
+        ensure!(
+            parameter.len() == 2
+                && parameter.contains_key("type")
+                && parameter.contains_key("value"),
+            "generate_image target `{target_id}` parameter `{key}` must contain only `type` and `value`"
+        );
+        let kind = parameter
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -570,10 +612,34 @@ fn validate_typed_parameters(parameters: Option<&Value>, target_id: &str) -> Res
             matches!(kind, "boolean" | "integer" | "text"),
             "generate_image target `{target_id}` parameter `{key}` has an unsupported type"
         );
+        let value = parameter.get("value").ok_or_else(|| {
+            anyhow::anyhow!(
+                "generate_image target `{target_id}` parameter `{key}` requires a `value`"
+            )
+        })?;
+        let valid = match kind {
+            "boolean" => value.is_boolean(),
+            "integer" => value.is_i64(),
+            "text" => value
+                .as_str()
+                .is_some_and(|text| text.len() <= MAX_GENERATE_IMAGE_STRING_BYTES),
+            _ => false,
+        };
         ensure!(
-            value_obj.contains_key("value"),
-            "generate_image target `{target_id}` parameter `{key}` requires a `value`"
+            valid,
+            "generate_image target `{target_id}` parameter `{key}` has a value incompatible with its type"
         );
+        // Keep the schema-layer validator tied to the public typed wire
+        // representation. This prevents a future schema/validator edit from
+        // accepting a value that `BTreeMap<String, TypedParameter>` cannot
+        // deserialize at the dispatch boundary.
+        serde_json::from_value::<TypedParameter>(Value::Object(parameter.clone())).map_err(
+            |err| {
+                anyhow::anyhow!(
+                    "generate_image target `{target_id}` parameter `{key}` is not a typed parameter: {err}"
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -1215,6 +1281,25 @@ mod tests {
     }
 
     #[test]
+    fn generate_image_schema_parameters_match_the_typed_map_wire_contract() {
+        let schema = image_generation_tool_schema("generate_image");
+        let parameters = &schema["properties"]["targets"]["items"]["properties"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(
+            parameters["maxProperties"],
+            MAX_GENERATE_IMAGE_TYPED_PARAMETERS
+        );
+        assert_eq!(parameters["propertyNames"]["minLength"], 1);
+        assert_eq!(
+            parameters["additionalProperties"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn generate_image_schema_reference_tags_only_attachment_or_local_path() {
         let schema = image_generation_tool_schema("generate_image");
         let reference_item = &schema["properties"]["references"]["items"];
@@ -1372,6 +1457,56 @@ mod tests {
         });
         let err = validate_generate_image_args(&args).unwrap_err().to_string();
         assert!(err.contains("total outputs"));
+    }
+
+    #[test]
+    fn validate_generate_image_accepts_typed_parameter_map_wire_format() {
+        let args = serde_json::json!({
+            "prompt": "a cat",
+            "directory": "/tmp/out",
+            "base_stem": "image",
+            "targets": [{
+                "target_id": "t1",
+                "parameters": {
+                    "seed": { "type": "integer", "value": 7 },
+                    "transparent": { "type": "boolean", "value": true },
+                    "style": { "type": "text", "value": "illustration" }
+                }
+            }]
+        });
+        validate_generate_image_args(&args).unwrap();
+    }
+
+    #[test]
+    fn validate_generate_image_rejects_parameter_shape_or_type_mismatch() {
+        let base = serde_json::json!({
+            "prompt": "a cat",
+            "directory": "/tmp/out",
+            "base_stem": "image",
+            "targets": [{ "target_id": "t1" }]
+        });
+
+        let mut wrong_container = base.clone();
+        wrong_container["targets"][0]["parameters"] = serde_json::json!([]);
+        assert!(validate_generate_image_args(&wrong_container).is_err());
+
+        let mut unknown_field = base.clone();
+        unknown_field["targets"][0]["parameters"] = serde_json::json!({
+            "seed": { "type": "integer", "value": 7, "provider": "ignored" }
+        });
+        assert!(validate_generate_image_args(&unknown_field).is_err());
+
+        let mut wrong_type = base;
+        wrong_type["targets"][0]["parameters"] = serde_json::json!({
+            "seed": { "type": "integer", "value": "7" }
+        });
+        assert!(validate_generate_image_args(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn typed_parameter_serde_rejects_unknown_fields() {
+        let value = serde_json::json!({ "type": "integer", "value": 7, "extra": true });
+        assert!(serde_json::from_value::<TypedParameter>(value).is_err());
     }
 
     // ---- Acceptance criterion 4: authorization proves zero provider contact ----

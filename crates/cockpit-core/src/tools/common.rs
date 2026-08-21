@@ -702,11 +702,11 @@ mod tests {
             .unwrap();
         assert_eq!(table.max_match_len(), 12); // margin = 11
         let seg = format!("PPPPPabcdefghijWXYZ{}", "Q".repeat(50));
-        // A plain whole-value scrub emits `abcdefghij` and suppresses the
-        // overlapping `cdefghijWXYZ`, leaking its `WXYZ` suffix.
+        // Whole-value redaction must remain safe for overlapping literals too;
+        // this guards the redactor independently of the boundary-elision path.
         assert!(
-            table.scrub(&seg).contains("WXYZ"),
-            "precondition: raw scrub leaks WXYZ"
+            !table.scrub(&seg).contains("WXYZ"),
+            "whole-value scrub leaked an overlapping literal suffix"
         );
 
         let safe = drop_front_margin(&table, &seg);

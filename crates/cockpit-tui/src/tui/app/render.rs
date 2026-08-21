@@ -2561,7 +2561,10 @@ impl App {
                 selectable: row_kind != ChatRowKind::Chip,
                 copy_cells: copy_body_start
                     .as_ref()
-                    .and_then(|copy| copy.cells.get(i))
+                    .and_then(|copy| {
+                        i.checked_sub(copy.start)
+                            .and_then(|row| copy.cells.get(row))
+                    })
                     .cloned()
                     .unwrap_or_default(),
                 copy_fragments: copy_body_start.as_ref().map_or_else(
@@ -2570,7 +2573,10 @@ impl App {
                 ),
                 copy_newlines_before: copy_body_start
                     .as_ref()
-                    .and_then(|copy| copy.newlines_before.get(i))
+                    .and_then(|copy| {
+                        i.checked_sub(copy.start)
+                            .and_then(|row| copy.newlines_before.get(row))
+                    })
                     .copied()
                     .unwrap_or(0),
                 copy_fallback_if_unmapped: base_copy.is_some()
@@ -2578,12 +2584,16 @@ impl App {
                     && (copy_body_start.as_ref().is_none_or(|copy| i < copy.start)
                         || copy_body_start
                             .as_ref()
-                            .and_then(|copy| copy.incomplete.get(i))
+                            .and_then(|copy| {
+                                i.checked_sub(copy.start)
+                                    .and_then(|row| copy.incomplete.get(row))
+                            })
                             .copied()
-                            .unwrap_or(false)),
-                copy_provenance_present: copy_body_start
-                    .as_ref()
-                    .is_some_and(|copy| i >= copy.start),
+                            .unwrap_or(true)),
+                copy_provenance_present: copy_body_start.as_ref().is_some_and(|copy| {
+                    i.checked_sub(copy.start)
+                        .is_some_and(|row| row < copy.cells.len())
+                }),
             });
         }
 

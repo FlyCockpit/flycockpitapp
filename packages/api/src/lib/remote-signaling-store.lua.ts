@@ -158,7 +158,7 @@ return {'committed', '1', tostring(now_ms), ARGV[3], discovery_seq and tostring(
  * ARGV: secretSha256, originClass, childAttemptId(b64url), admissionProofSha256,
  * daemonInstanceId, accountId, deviceAttachmentId, deviceGeneration.
  */
-export const REMOTE_SIGNALING_ISSUE_ADMISSION_TICKET_LUA = String.raw`
+export const REMOTE_SIGNALING_ISSUE_ADMISSION_TICKET_LUA = `
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local expires = now_ms + 30000
@@ -241,7 +241,7 @@ return {'committed', tostring(sequence), actor}
  * enforced; re-acquiring an already-held member refreshes it.
  * ARGV: leaseId, ttlMs, cap.
  */
-export const REMOTE_SIGNALING_SOCKET_LEASE_ACQUIRE_LUA = String.raw`
+export const REMOTE_SIGNALING_SOCKET_LEASE_ACQUIRE_LUA = `
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', '('..tostring(now_ms))

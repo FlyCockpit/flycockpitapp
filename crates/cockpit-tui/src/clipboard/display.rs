@@ -7,7 +7,7 @@
 use super::types::SkipReason;
 
 /// Proven Wayland session holding an authenticated connected socket.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct HeldWaylandConnection {
     stream: std::os::unix::net::UnixStream,
@@ -15,7 +15,7 @@ pub struct HeldWaylandConnection {
     pub socket_ino: u64,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl HeldWaylandConnection {
     pub fn stream(&self) -> &std::os::unix::net::UnixStream {
         &self.stream
@@ -30,9 +30,10 @@ impl HeldWaylandConnection {
 #[derive(Debug)]
 pub enum LinuxDesktopProbe {
     /// Held authenticated Wayland connection (Executable may use it).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Wayland(HeldWaylandConnection),
     /// X11 present but unsupported for copy in V1.
+    #[cfg(target_os = "linux")]
     X11Unsupported { reason: SkipReason },
     /// No eligible local desktop.
     Ineligible { reason: SkipReason },

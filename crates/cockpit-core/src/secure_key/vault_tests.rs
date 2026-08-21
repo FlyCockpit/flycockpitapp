@@ -385,13 +385,15 @@ fn vault_windows_refuses_database_mode_without_dacl() {
         if !crate::private_fs::PRIVATE_FS_POLICY.windows_dacl_enforced {
             let tmp = tempfile::TempDir::new().unwrap();
             let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
-            let err = ensure_secret_vault(
+            let err = match ensure_secret_vault(
                 &db,
                 &available_probe(),
                 &tmp.path().join("secret-vault"),
                 SecretStoreInjected::default(),
-            )
-            .unwrap_err();
+            ) {
+                Ok(_) => panic!("database-mode vault must require a protected Windows DACL"),
+                Err(err) => err,
+            };
             assert!(
                 err.reason.contains("DACL") || err.reason.contains("Windows"),
                 "{err:?}"

@@ -991,21 +991,6 @@ export function mapErrorMessage(code: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Connection/session switching cleanup
-// ---------------------------------------------------------------------------
-
-/**
- * Clear all image-generation state when switching connection/project/session.
- *
- * Per the prompt: switching connection/project/session clears pending edits,
- * approvals, uploads, artifact handles, and reducer cursors.
- */
-export function clearImageGenerationState<T extends Record<string, unknown>>(state: T): T {
-  // Return a fresh empty state; the caller replaces the partition.
-  return {} as T;
-}
-
-// ---------------------------------------------------------------------------
 // Plan invalidation
 // ---------------------------------------------------------------------------
 

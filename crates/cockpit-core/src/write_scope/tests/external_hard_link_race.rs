@@ -8,7 +8,9 @@
 //! content, starting a child without capability, or restoring authority after
 //! an uncertain publish.
 
-use crate::write_scope::backend::{HardLinkPreflight, InodeIdentity, ScopedWriteBackend};
+#[cfg(unix)]
+use crate::write_scope::backend::HardLinkPreflight;
+use crate::write_scope::backend::{InodeIdentity, ScopedWriteBackend};
 use crate::write_scope::fake::{ExternalRaceFixture, PublishBehavior};
 use crate::write_scope::permits::MutationKind;
 use crate::write_scope::types::WriteScopeError;
@@ -24,6 +26,7 @@ fn seeded_fixture(h: &Harness) -> ExternalRaceFixture {
 #[tokio::test]
 async fn direct_backend_refuses_before_transfer_no_matter_when_links_appear() {
     let h = Harness::direct().await;
+    #[cfg(unix)]
     let fixture = seeded_fixture(&h);
     let parent = h.open_root("parent").await;
 
@@ -74,6 +77,7 @@ async fn direct_backend_refuses_before_transfer_no_matter_when_links_appear() {
 async fn an_nlink_preflight_is_defeated_by_a_link_created_immediately_after() {
     // This is the concrete demonstration that a preflight is not evidence.
     let h = Harness::direct().await;
+    #[cfg(unix)]
     let fixture = seeded_fixture(&h);
 
     #[cfg(unix)]
@@ -461,6 +465,7 @@ async fn a_publish_conflict_never_restores_authority() {
 #[tokio::test]
 async fn a_child_never_starts_without_capability_even_under_race_pressure() {
     let h = Harness::direct().await;
+    #[cfg(unix)]
     let fixture = seeded_fixture(&h);
     let parent = h.open_root("parent").await;
 

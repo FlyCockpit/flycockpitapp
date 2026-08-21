@@ -611,6 +611,9 @@ fn classify_highlight_role(rel: &str, line: &str) -> String {
     if rel.contains("pins_overlay.rs") && line.contains("REVERSED") {
         return "pins overlay REVERSED row → row selection".into();
     }
+    if rel.contains("leaks_pane.rs") && line.contains("REVERSED") {
+        return "leaks pane REVERSED row → row selection".into();
+    }
     if rel.contains("app/render.rs") && line.contains("REVERSED") {
         return "text selection / composer REVERSED".into();
     }

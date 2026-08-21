@@ -43,6 +43,17 @@ fn tui_pty_mouse_protocol_coordinates() {
         );
     }
 
+    // Pointer motion is not a no-op: with mouse capture enabled it updates
+    // hover affordances. It must remain non-activating, however, so moving
+    // across the close target cannot dismiss the settings dialog.
+    session.open_settings();
+    session.write_bytes(&sgr_motion(close.sgr_x(), close.sgr_y()));
+    session.checkpoint_input_with_redraw();
+    assert!(
+        session.snapshot().contains("[Close settings]"),
+        "pointer motion must not activate [Close settings]"
+    );
+
     let incomplete = [
         ("csi-open", b"\x1b[<".as_slice()),
         ("partial-button", b"\x1b[<0;".as_slice()),
@@ -100,7 +111,6 @@ fn complete_noop_sequences(close: CellPos) -> Vec<(&'static str, Vec<u8>)> {
             sgr_malformed_complete(0, close.sgr_x(), close.sgr_y()),
         ),
         ("drag", sgr_left_drag(close.sgr_x(), close.sgr_y())),
-        ("motion", sgr_motion(close.sgr_x(), close.sgr_y())),
         ("wheel", wheel),
         ("non-primary", {
             let mut bytes = sgr_middle_click(close.sgr_x(), close.sgr_y());

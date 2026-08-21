@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cockpit_db::secret_vault::SecretVaultKind;
+#[cfg(any(test, feature = "test-support"))]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -87,6 +88,7 @@ fn parse_command_spec_payload(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CredentialFile {
     #[serde(
@@ -835,6 +837,7 @@ fn collect_string_leaves(value: &Value, origin: &str, out: &mut Vec<(String, Str
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn read_credential_file(path: &Path) -> Result<CredentialFile> {
     if !path.exists() {
         return Ok(CredentialFile::default());
@@ -843,6 +846,7 @@ fn read_credential_file(path: &Path) -> Result<CredentialFile> {
     read_credential_file_readonly(path)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
     // Fail-closed held-fd read: a symlinked, foreign-owned, hard-linked, or
     // mode-wide credential file is a typed refusal (via `PrivateFsError`), never
@@ -859,12 +863,14 @@ fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn lock_credential_file(path: &Path) -> Result<std::fs::File> {
     let lock_path = lock_path(path);
     ensure_parent_dir_private(&lock_path)?;
@@ -874,7 +880,7 @@ fn lock_credential_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     // Route through the no-follow funnel: the lock file is opened via `openat`
     // (O_NOFOLLOW, no O_TRUNC) anchored to the held, verified 0700 parent fd,
@@ -896,7 +902,7 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), any(test, feature = "test-support")))]
 fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -907,6 +913,7 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("opening credential lock {}", path.display()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()> {
     let mut pretty = serde_json::to_string_pretty(data)?;
     pretty.push('\n');
@@ -923,10 +930,12 @@ fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn ensure_parent_dir_private(path: &Path) -> Result<()> {
     Ok(crate::private_fs::ensure_parent_dir_private(path)?)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn repair_existing_file_permissions(path: &Path) -> Result<()> {
     // Fail closed: a credential file that cannot be proven private (symlink,
     // foreign owner, hard link, or an unrepairable mode) is a typed refusal,

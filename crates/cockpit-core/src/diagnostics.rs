@@ -346,10 +346,59 @@ pub fn external_journal_section(
 /// SQLite counts plus on-disk capsule/quarantine sizes and never resolves a
 /// key: diagnostics output can never disclose one.
 fn external_journal_lines() -> (Vec<String>, bool) {
-    (
-        vec!["status: unavailable (daemon snapshot missing)".to_string()],
-        true,
-    )
+    let db = match crate::db::Db::open_default() {
+        Ok(db) => db,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "status: FAILED (database unavailable: {})",
+                    one_line(&format!("{error:#}"))
+                )],
+                true,
+            );
+        }
+    };
+    let now_wall_ms = chrono::Utc::now().timestamp_millis();
+    // The journal's integrity latch is persisted, so a doctor run that holds
+    // no journal instance — and one after a restart — still reports critical.
+    let counts = db.blocking_read_for_sync_ui(move |conn| {
+        Ok((
+            crate::db::external_journal::external_journal_capacity_conn(conn)?,
+            crate::db::external_journal::external_journal_age_report_conn(conn, now_wall_ms)?,
+            crate::db::external_journal::external_journal_integrity_fault_conn(conn)?,
+        ))
+    });
+    let (capacity, age, integrity_failure) = match counts {
+        Ok(counts) => counts,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "status: FAILED ({})",
+                    one_line(&format!("{error:#}"))
+                )],
+                true,
+            );
+        }
+    };
+
+    // Inspection is read-only: it creates nothing and repairs nothing, so an
+    // insecure spool is reported rather than silently fixed.
+    let spool = match crate::external_journal::spool::Spool::inspect_default() {
+        Ok(Some(spool)) => match (spool.allocated_bytes(), spool.list_quarantined()) {
+            (Ok(allocated_bytes), Ok(quarantined)) => ExternalJournalSpoolHealth::Healthy {
+                allocated_bytes,
+                quarantined_entries: quarantined.len(),
+            },
+            (Err(error), _) | (_, Err(error)) => ExternalJournalSpoolHealth::Unhealthy {
+                detail: error.to_string(),
+            },
+        },
+        Ok(None) => ExternalJournalSpoolHealth::Absent,
+        Err(error) => ExternalJournalSpoolHealth::Unhealthy {
+            detail: error.to_string(),
+        },
+    };
+    external_journal_section(capacity, age, &spool, integrity_failure)
 }
 
 fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -> String {
@@ -357,15 +406,71 @@ fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -
 }
 
 async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (Vec<String>, bool) {
-    let _ = extended;
-    (
-        vec![
-            "path: unavailable (daemon snapshot missing)".to_string(),
-            "openability: FAILED (daemon snapshot missing)".to_string(),
-            "schema: unavailable".to_string(),
-        ],
-        true,
-    )
+    let path = match crate::db::Db::default_path() {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "path: unavailable ({})",
+                    one_line(&format!("{error:#}"))
+                )],
+                true,
+            );
+        }
+    };
+    let mut lines = vec![format!("path: {}", path.display())];
+    match crate::db::Db::open_default() {
+        Ok(db) => {
+            lines.push("openability: ok".to_string());
+            match (
+                db.schema_version().await,
+                db.applied_migration_version().await,
+            ) {
+                (Ok(schema), Ok(migration)) => {
+                    lines.push(format!(
+                        "schema: ok (actual {schema}, expected {})",
+                        crate::db::EXPECTED_SCHEMA_VERSION
+                    ));
+                    lines.push(format!(
+                        "ledger: migration {migration}; checksum verification enabled"
+                    ));
+                }
+                (schema, migration) => {
+                    let error = schema
+                        .err()
+                        .or(migration.err())
+                        .expect("one database read failed");
+                    lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
+                    return (lines, true);
+                }
+            }
+            match std::fs::metadata(&path) {
+                Ok(metadata) => lines.push(format!("size: {} bytes", metadata.len())),
+                Err(error) => lines.push(format!(
+                    "size: unavailable ({})",
+                    one_line(&error.to_string())
+                )),
+            }
+            lines.push(retention_line(&extended.retention));
+            (lines, false)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if is_schema_rejection(&message) {
+                lines.push(
+                    "openability: ok (SQLite opened, but Cockpit rejected its schema)".to_string(),
+                );
+                lines.push(format!("schema: FAILED ({})", one_line(&message)));
+            } else {
+                lines.push(format!("openability: FAILED ({})", one_line(&message)));
+                lines.push(
+                    "schema: unavailable because the database could not be opened".to_string(),
+                );
+            }
+            lines.push(retention_line(&extended.retention));
+            (lines, true)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -484,8 +589,19 @@ fn session_label(id: Option<uuid::Uuid>, short_id: Option<&str>) -> String {
 }
 
 fn workspace_trust_mode(cwd: &Path) -> String {
-    let _ = cwd;
-    "unresolved".to_string()
+    let Ok(db) = crate::db::Db::open_default() else {
+        return "unresolved".to_string();
+    };
+    let Ok(root) = crate::config::trust::resolve_trust_root(cwd) else {
+        return "unresolved".to_string();
+    };
+    db.blocking_read_for_sync_ui(move |conn| {
+        crate::db::Db::workspace_trust_by_root_conn(conn, &root.root)
+    })
+    .ok()
+    .flatten()
+    .map(|decision| decision.mode.as_str().to_string())
+    .unwrap_or_else(|| "unresolved".to_string())
 }
 
 fn provider_lines(

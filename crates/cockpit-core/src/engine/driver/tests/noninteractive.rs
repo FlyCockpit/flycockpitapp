@@ -748,6 +748,68 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
     assert!(parent_rx.recv().await.is_none());
 }
 
+#[tokio::test]
+async fn noninteractive_display_delta_coalesces_typed_text() {
+    use crate::engine::response_performance::AssistantAttemptId;
+
+    let (child_tx, child_rx) = mpsc::channel(8);
+    let (parent_tx, mut parent_rx) = mpsc::channel(8);
+    let target = NoninteractiveSteerTarget::new("task-disp", "default");
+    let forwarder = spawn_noninteractive_event_forwarder(child_rx, Some(parent_tx), Some(target));
+
+    let attempt = AssistantAttemptId::new(42);
+    child_tx
+        .send(TurnEvent::AssistantDisplayTextDelta {
+            agent: "Explore".into(),
+            attempt_id: attempt,
+            delta: "hel".into(),
+        })
+        .await
+        .unwrap();
+    child_tx
+        .send(TurnEvent::AssistantDisplayTextDelta {
+            agent: "Explore".into(),
+            attempt_id: attempt,
+            delta: "lo".into(),
+        })
+        .await
+        .unwrap();
+    child_tx
+        .send(TurnEvent::ToolStart {
+            agent: "Explore".into(),
+            call_id: "call-1".into(),
+            tool: "read".into(),
+            args: serde_json::json!({"path":"README.md"}),
+        })
+        .await
+        .unwrap();
+    drop(child_tx);
+    forwarder.await.unwrap();
+
+    match parent_rx.recv().await.unwrap() {
+        TurnEvent::NestedTurn { inner, .. } => match inner.as_ref() {
+            TurnEvent::AssistantDisplayTextDelta {
+                agent,
+                attempt_id,
+                delta,
+            } => {
+                assert_eq!(agent, "Explore");
+                assert_eq!(*attempt_id, attempt);
+                assert_eq!(delta, "hello");
+            }
+            other => panic!("expected coalesced display delta, got {other:?}"),
+        },
+        other => panic!("expected nested turn, got {other:?}"),
+    }
+    match parent_rx.recv().await.unwrap() {
+        TurnEvent::NestedTurn { inner, .. } => {
+            assert!(matches!(inner.as_ref(), TurnEvent::ToolStart { .. }));
+        }
+        other => panic!("expected nested tool start, got {other:?}"),
+    }
+    assert!(parent_rx.recv().await.is_none());
+}
+
 #[test]
 fn noninteractive_single_spawn_amends_with_child_routing() {
     std::thread::Builder::new()

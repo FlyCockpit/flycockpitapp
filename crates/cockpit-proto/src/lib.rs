@@ -972,16 +972,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version.
 ///
-/// Current wire schema version. v10 adds owner/provider persistence RPCs.
-///
-/// A v10 client may still negotiate v9 with an older daemon, but the typed
-/// transport refuses to put v10-only payloads on that connection.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// Current wire schema version. v11 makes typed assistant display events
+/// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 11.
+pub const PROTOCOL_VERSION: u32 = 11;
 
-/// Oldest wire schema version this binary accepts. The supervised-goal batch
-/// retires v8 because it replaces the goal status shape, renames its progress
-/// event, and adds a goal-creation request with no v8-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 9;
+/// Oldest wire schema version this binary accepts. v11 is current-only: the
+/// display-event breaking change has no v9/v10-compatible fallback.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 11;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3274,7 +3272,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9, 10];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[11];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -6684,13 +6682,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 10);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
-        let fixture = proto_fixture_tests::read_fixture_for(9, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("v9 config_refreshed fixture")
+                .expect("v11 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6704,21 +6702,21 @@ mod tests {
     }
 
     #[test]
-    fn goal_summary_cap_is_present_in_every_v9_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 10);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
-        let fixture = proto_fixture_tests::read_fixture_for(9, "response.json");
+    fn goal_summary_cap_is_present_in_every_current_response_fixture() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
+        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("v9 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("v11 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "v9 {response_name} must freeze the inclusive verification cap"
+                "v11 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone())
-                .unwrap_or_else(|error| panic!("v9 {response_name} must deserialize: {error}"));
+                .unwrap_or_else(|error| panic!("v11 {response_name} must deserialize: {error}"));
         }
     }
 }

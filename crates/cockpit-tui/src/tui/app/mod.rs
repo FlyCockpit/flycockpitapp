@@ -28,6 +28,11 @@ mod input;
 mod inventory;
 #[cfg(test)]
 mod inventory_tests;
+mod response_metrics_tokenizer;
+pub(crate) use response_metrics_tokenizer::{
+    TokenizerConfirmOutcome, TokenizerConfirmPending, response_metrics_tokenizer_choices,
+    response_metrics_tokenizer_help,
+};
 mod local_commands;
 mod model_controls;
 mod models_refresh;
@@ -116,7 +121,7 @@ use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
     HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, SubagentRoutingChips, ToolCall,
-    ToolCallState, classify_subagent_status, route_text_delta,
+    ToolCallState, classify_subagent_status,
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
@@ -382,6 +387,14 @@ pub(crate) struct ModelSelectionRetry {
     pub queued_submission: Option<QueuedModelSubmission>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingPerformanceChipPress {
+    pub history_index: usize,
+    pub press_generation: u64,
+    pub view_generation: u64,
+    pub cell: (u16, u16),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApplied {
     None,
@@ -409,6 +422,11 @@ pub(crate) enum ControlApplied {
         text: String,
     },
     RepairResume,
+    /// Settings Behavior tokenizer refresh confirmation (correlated
+    /// ConfigRefreshed + ConfigSnapshot).
+    ResponseMetricsTokenizer {
+        confirm_id: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1294,6 +1312,7 @@ pub(super) struct SideConversation {
     saved_history_render_cache_rows: usize,
     saved_queue: Vec<QueuedUserMessage>,
     saved_pending: Option<PendingMsg>,
+    saved_active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
     saved_prunable_tokens: u64,
     saved_cache_cold: bool,
     saved_elided_event_ids: std::collections::HashSet<String>,
@@ -1808,6 +1827,10 @@ pub struct App {
     /// renderer appends a live entry to the bottom of the history
     /// pane.
     pub(super) pending: Option<PendingMsg>,
+    /// Live typed-display attempt that owns provisional UI / chip state.
+    /// Advanced to the replacement on `AssistantDisplayAttemptReset` so late
+    /// deltas for the failed attempt cannot recreate a provisional row.
+    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
     /// Currently rendered transcript view. `Main` is the normal session transcript;
     /// `Subagent` means `history`/`pending` have been swapped to the selected child.
     pub(super) transcript_view: TranscriptViewMeta,
@@ -1980,6 +2003,16 @@ pub struct App {
     /// copy-on-release. Carries press/activation generations and tokens
     /// so late timer/clipboard results cannot overwrite newer state.
     pub(super) mouse_gesture_state: mouse_gesture::GestureState,
+    /// Performance-chip press awaiting a matching primary release on the
+    /// gesture-reducer path. Drag, release outside, or a stale view/
+    /// press generation cancels without toggling.
+    pub(super) pending_performance_chip_press: Option<PendingPerformanceChipPress>,
+    /// In-dialog dirty candidate for Behavior → Response metrics tokenizer.
+    /// Settings close (including reset) sends exactly one refresh for the
+    /// final candidate and clears this.
+    pub(super) dirty_response_metrics_tokenizer: Option<cockpit_tokenizer::TiktokenEncoding>,
+    /// Pending RefreshConfig confirmation for the tokenizer write.
+    pub(super) pending_tokenizer_confirm: Option<TokenizerConfirmPending>,
     /// Highlight/extract spans for word/line/table selections that must
     /// exclude adjacent cells. `None` means the rectangular `selection`.
     pub(super) selection_spans: Option<Vec<SelectionSpan>>,
@@ -3059,6 +3092,7 @@ pub(super) struct StoredTranscriptView {
     pub(super) meta: TranscriptViewMeta,
     pub(super) history: HistoryWindow,
     pub(super) pending: Option<PendingMsg>,
+    pub(super) active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
     pub(super) history_render_versions: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_fingerprints: HashMap<HistoryEntryId, u64>,
     pub(super) history_render_cache: HashMap<HistoryEntryId, HistoryRenderCacheEntry>,
@@ -3363,6 +3397,7 @@ impl App {
             next_history_page_request_id: 1,
             older_history_marker: scrollback_page_in::OlderHistoryMarker::None,
             pending: None,
+            active_display_attempt_id: None,
             transcript_view: TranscriptViewMeta::Main,
             transcript_view_stack: Vec::new(),
             started_at: Instant::now(),
@@ -3518,6 +3553,9 @@ impl App {
             link_registry: crate::tui::links::LinkRegistry::default(),
             link_pointer_gesture: crate::tui::links::LinkPointerGesture::default(),
             mouse_gesture_state: mouse_gesture::GestureState::new(),
+            pending_performance_chip_press: None,
+            dirty_response_metrics_tokenizer: None,
+            pending_tokenizer_confirm: None,
             selection_spans: None,
             pending_mouse_copies: HashMap::new(),
             #[cfg(test)]

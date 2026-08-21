@@ -786,6 +786,9 @@ pub enum Event {
     },
 
     /// One streaming chunk of assistant text.
+    ///
+    /// Legacy live path retained for fixtures/tests; production display uses
+    /// [`Self::AssistantDisplayTextDelta`].
     AssistantTextDelta {
         session_id: Uuid,
         agent: String,
@@ -795,10 +798,65 @@ pub enum Event {
     /// One streaming chunk of model reasoning (thinking-mode models).
     /// TUI hides this by default but persists it so the user can
     /// expand the chain of thought later.
+    ///
+    /// Legacy live path; prefer [`Self::AssistantDisplayReasoningDelta`].
     ReasoningDelta {
         session_id: Uuid,
         agent: String,
         delta: String,
+    },
+
+    /// Classified visible assistant text delta (`attempt_id` is live-only).
+    AssistantDisplayTextDelta {
+        session_id: Uuid,
+        agent: String,
+        attempt_id: u64,
+        delta: String,
+    },
+
+    /// Classified reasoning delta (`attempt_id` is live-only).
+    AssistantDisplayReasoningDelta {
+        session_id: Uuid,
+        agent: String,
+        attempt_id: u64,
+        delta: String,
+    },
+
+    /// Display-only reset before a replacement attempt's first delta.
+    AssistantDisplayAttemptReset {
+        session_id: Uuid,
+        agent: String,
+        failed_attempt_id: u64,
+        replacement_attempt_id: u64,
+        reason: String,
+    },
+
+    /// Terminal live display complete for one attempt.
+    AssistantDisplayComplete {
+        session_id: Uuid,
+        agent: String,
+        attempt_id: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_text: Option<String>,
+        #[serde(default)]
+        reasoning: String,
+        #[serde(default)]
+        seq: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_performance: Option<ResponsePerformance>,
+    },
+
+    /// Terminal live display error for a visible primary partial.
+    AssistantDisplayError {
+        session_id: Uuid,
+        agent: String,
+        attempt_id: u64,
+        /// `"cancelled"` or `"failed"`.
+        kind: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_text: Option<String>,
     },
 
     /// Assistant turn complete — `text` is the full accumulated body with
@@ -808,6 +866,7 @@ pub enum Event {
     /// across the wire. `seq` is the `session_events` row id of this message
     /// (the stable id a pin references — `pinned-messages`); `None` when the
     /// timeline write failed. UI/DB-only — never enters the model's context.
+    /// Durable history transport — not live chip input.
     AssistantText {
         session_id: Uuid,
         agent: String,
@@ -1584,6 +1643,11 @@ macro_rules! event_variants {
             (Event::InferenceWarning { .. }, "inference_warning");
             (Event::AssistantTextDelta { .. }, "assistant_text_delta");
             (Event::ReasoningDelta { .. }, "reasoning_delta");
+            (Event::AssistantDisplayTextDelta { .. }, "assistant_display_text_delta");
+            (Event::AssistantDisplayReasoningDelta { .. }, "assistant_display_reasoning_delta");
+            (Event::AssistantDisplayAttemptReset { .. }, "assistant_display_attempt_reset");
+            (Event::AssistantDisplayComplete { .. }, "assistant_display_complete");
+            (Event::AssistantDisplayError { .. }, "assistant_display_error");
             (Event::AssistantText { .. }, "assistant_text");
             (Event::UserMessageRecorded { .. }, "user_message_recorded");
             (Event::QueuedUserMessagesFolded { .. }, "queued_user_messages_folded");

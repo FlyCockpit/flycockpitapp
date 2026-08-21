@@ -202,6 +202,11 @@ pub async fn turn_with_backup(
     // finally stops. Only a no-candidate, no-custody primary emits its UI
     // directly. Loop-invariant by construction.
     let emit_failure_ui = candidates.is_empty() && custody_block.is_none();
+    // One display lifetime spans every physical primary/failover dispatch in
+    // this logical call. A failed visible stream stays open until either the
+    // next attempt emits Reset or this wrapper proves failure is terminal.
+    let display_slot =
+        crate::engine::agent::turn_phases::new_display_attempt_slot(&session, &config);
     // Credentials-rejected rebuild-and-retry latch (AC5), scoped to the WHOLE
     // logical dispatch — declared OUTSIDE the failover loop so at most ONE
     // automatic command-secret rebuild-and-retry happens across every physical
@@ -311,6 +316,7 @@ pub async fn turn_with_backup(
                 goal_provenance,
                 turn_id.clone(),
                 tx,
+                Some(display_slot.clone()),
             )
             .await;
 
@@ -420,7 +426,19 @@ pub async fn turn_with_backup(
                     let applied_block = custody_block
                         .as_ref()
                         .filter(|_| crate::engine::model::failure_engages_backup(&class));
-                    if !emit_failure_ui {
+                    let display_error_emitted = display_slot
+                        .finish_as_error(
+                            &agent.name,
+                            crate::engine::response_performance::DisplayErrorKind::Failed,
+                            class.as_str(),
+                            Some(tx),
+                        )
+                        .await;
+                    // The typed display error is the one and only UI row for
+                    // a visible partial. Audit settlement above retains the
+                    // failure/auth classification even when this live UI event
+                    // is suppressed.
+                    if !emit_failure_ui && !display_error_emitted {
                         // Route the raw provider detail through the omission
                         // funnel: the user-facing reason is the fixed marker
                         // (optionally prefixed to the advisory custody block),
@@ -1133,6 +1151,41 @@ mod backup_fallback_tests {
         format!("http://{addr}/v1")
     }
 
+    /// A stream that exposes a provisional body, then fails decoding its next
+    /// SSE item. This deterministically exercises failover after visible output.
+    async fn partial_then_stream_error_server(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let payload = format!(
+                        "data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{{\"delta\":{{\"content\":\"{body}\"}},\"finish_reason\":null}}],\"usage\":null}}\n\n"
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n",
+                        payload.len(),
+                        payload
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    // A malformed HTTP chunk after the valid SSE event makes
+                    // the body stream fail after exposing the provisional
+                    // delta. Malformed SSE data is ignored by the client and
+                    // therefore cannot exercise the terminal stream path.
+                    let _ = stream.write_all(b"not-a-chunk-size\r\n").await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
     /// A keyless OpenAI-compat provider config at `url`.
     fn provider_at(url: &str) -> ProviderEntry {
         ProviderEntry {
@@ -1598,6 +1651,139 @@ mod backup_fallback_tests {
                 .iter()
                 .any(|e| matches!(e, TurnEvent::InferenceFailed { .. })),
             "the primary's red error must be suppressed when the backup answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_primary_partial_resets_when_backup_begins() {
+        let primary_url = partial_then_stream_error_server("primary-partial").await;
+        let backup_url = sse_server("from-backup").await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("flaky".into(), provider_at(&primary_url));
+        cfg.providers
+            .insert("reliable".into(), provider_at(&backup_url));
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "flaky",
+                "primary-model",
+                Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let backup = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "reliable",
+                "backup-model",
+                Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+
+        let outcome = run(
+            &agent,
+            Some(&backup),
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            &tx,
+        )
+        .await
+        .expect("backup answers after visible primary failure");
+        assert!(matches!(outcome, TurnOutcome::Done));
+
+        let events = drain(&mut rx);
+        let backup_delta = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::AssistantDisplayTextDelta {
+                    attempt_id, delta, ..
+                } if delta == "from-backup" => Some(*attempt_id),
+                _ => None,
+            })
+            .expect("backup typed delta");
+        let reset = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                TurnEvent::AssistantDisplayAttemptReset {
+                    failed_attempt_id,
+                    replacement_attempt_id,
+                    ..
+                } if *replacement_attempt_id == backup_delta => {
+                    Some((*failed_attempt_id, *replacement_attempt_id))
+                }
+                _ => None,
+            })
+            .expect("visible primary is reset by the backup attempt");
+        assert_ne!(reset.0, reset.1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::AssistantDisplayError { .. })),
+            "a replaced visible primary emits Reset, not Error"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::InferenceFailed { .. })),
+            "an answered failover emits no terminal inference row"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_terminal_failure_emits_exactly_one_display_error_row() {
+        let primary_url = partial_then_stream_error_server("terminal-partial").await;
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers
+            .insert("flaky".into(), provider_at(&primary_url));
+        let primary = Arc::new(
+            Model::for_provider(
+                &cfg,
+                "flaky",
+                "primary-model",
+                Arc::new(RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = agent_with(primary);
+        let (tmp, session, locks, redact) = ctx();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(128);
+
+        let result = run(
+            &agent,
+            None,
+            session,
+            locks,
+            redact,
+            tmp.path().to_path_buf(),
+            &tx,
+        )
+        .await;
+        assert!(result.is_err(), "malformed stream is terminal");
+
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::AssistantDisplayError { .. }))
+                .count(),
+            1,
+            "visible terminal failure has one typed display error"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::InferenceFailed { .. }))
+                .count(),
+            0,
+            "typed display error suppresses the duplicate inference row"
         );
     }
 

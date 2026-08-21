@@ -5406,6 +5406,71 @@ mod tests {
             | proto::HistoryEntry::InferenceError { .. } => panic!("not a message entry"),
         }
     }
+
+    #[tokio::test]
+    async fn response_performance_restores_agent_history() {
+        let s = root_session();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::AssistantMessage,
+            Some("Build"),
+            Some("call-perf"),
+            &json!({
+                "text": "Bonjour",
+                "presentation_text": "Hello",
+                "reasoning": "thought",
+                "response_performance": {
+                    "ttft_ms": 150,
+                    "generation_ms": 400,
+                    "displayed_tokens": 12,
+                    "encoding": "cl100k_base"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        match &snapshot[0] {
+            proto::HistoryEntry::Assistant {
+                text,
+                presentation_text,
+                reasoning,
+                response_performance,
+                ..
+            } => {
+                assert_eq!(text, "Bonjour");
+                assert_eq!(presentation_text.as_deref(), Some("Hello"));
+                assert_eq!(reasoning, "thought");
+                let perf = response_performance.as_ref().expect("restored snapshot");
+                assert_eq!(perf.ttft_ms, 150);
+                assert_eq!(perf.generation_ms, 400);
+                assert_eq!(perf.displayed_tokens, 12);
+                assert_eq!(perf.encoding, "cl100k_base");
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+
+        // Legacy row without response_performance still restores.
+        s.record_event(
+            crate::db::session_log::SessionEventKind::AssistantMessage,
+            Some("Build"),
+            Some("call-legacy"),
+            &json!({ "text": "legacy", "reasoning": "" }),
+        )
+        .await
+        .unwrap();
+        let snapshot = history_snapshot(&s.db, s.id, "Build").await.unwrap();
+        assert_eq!(snapshot.len(), 2);
+        match &snapshot[1] {
+            proto::HistoryEntry::Assistant {
+                response_performance: None,
+                presentation_text: None,
+                text,
+                ..
+            } => assert_eq!(text, "legacy"),
+            other => panic!("expected legacy Assistant, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

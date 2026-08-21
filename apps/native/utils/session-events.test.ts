@@ -23,6 +23,7 @@ import {
   removeOptimisticUserMessage,
   restoreRetainedUserMessagesAfterAttach,
   retainUserMessageSubmission,
+  toNativeHistoryEntry,
   warnNativeSessionEvent,
 } from "./session-events";
 
@@ -954,5 +955,224 @@ describe("native session event helpers", () => {
       kind: "interrupt",
       interrupt: { interruptId, resolved: true },
     });
+  });
+});
+
+describe("remote_display_events_v11_native", () => {
+  it("remote_display_events_v11_native", () => {
+    let state = initialState;
+
+    let result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "Hel" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "lo" },
+    });
+    state = result.state;
+    expect(state.history.some((e) => e.kind === "assistant_text" && e.text === "Hello")).toBe(true);
+
+    // Typed reasoning deltas coalesce within one attempt.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "Think" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 1, delta: "ing" },
+    });
+    state = result.state;
+    expect(
+      state.history.some((e) => e.kind === "assistant_reasoning" && e.text === "Thinking"),
+    ).toBe(true);
+
+    // Translated success: presentation_text wins; attempt reasoning cleared.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: {
+        session_id: sessionId,
+        attempt_id: 1,
+        text: "Bonjour",
+        presentation_text: "Hello",
+        reasoning: "Thinking",
+        seq: 99,
+      },
+    });
+    state = result.state;
+    expect(state.history.find((e) => e.id === "assistant:99")).toMatchObject({
+      kind: "assistant_text",
+      text: "Hello",
+    });
+    expect(state.history.some((e) => e.id === "assistant:reasoning:pending:1")).toBe(false);
+    expect(state.history.find((e) => e.id === "reasoning:99")).toMatchObject({
+      kind: "assistant_reasoning",
+      text: "Thinking",
+    });
+
+    // Fallback complete without presentation_text.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: { session_id: sessionId, attempt_id: 2, text: "fallback body", seq: 100 },
+    });
+    state = result.state;
+    expect(state.history.find((e) => e.id === "assistant:100")).toMatchObject({
+      kind: "assistant_text",
+      text: "fallback body",
+    });
+
+    // Legacy assistant_text missing presentation_text.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_text",
+      data: { session_id: sessionId, text: "legacy only", seq: 101 },
+    });
+    state = result.state;
+    expect(state.history.find((e) => e.id === "assistant:101")).toMatchObject({
+      kind: "assistant_text",
+      text: "legacy only",
+    });
+
+    // Reset removes text and reasoning for the failed attempt; replacement
+    // reasoning starts a distinct row.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 7, delta: "gone" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 7, delta: "old reasoning" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_attempt_reset",
+      data: {
+        session_id: sessionId,
+        failed_attempt_id: 7,
+        replacement_attempt_id: 8,
+        reason: "timeout",
+      },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 8, delta: "new reasoning" },
+    });
+    state = result.state;
+    expect(state.history.some((e) => e.id === "assistant:pending:7")).toBe(false);
+    expect(state.history.some((e) => e.id === "assistant:reasoning:pending:7")).toBe(false);
+    expect(state.history).toContainEqual(
+      expect.objectContaining({
+        id: "assistant:reasoning:pending:8",
+        kind: "assistant_reasoning",
+        text: "new reasoning",
+      }),
+    );
+
+    // Error becomes inference_error row.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 11, delta: "partial" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_reasoning_delta",
+      data: { session_id: sessionId, attempt_id: 11, delta: "failed reasoning" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_error",
+      data: {
+        session_id: sessionId,
+        attempt_id: 11,
+        kind: "failed",
+        message: "provider failed",
+        presentation_text: "partial",
+      },
+    });
+    state = result.state;
+    expect(state.history.some((e) => e.id === "assistant:pending:11")).toBe(false);
+    expect(state.history.some((e) => e.id === "assistant:reasoning:pending:11")).toBe(false);
+    expect(state.history.some((e) => e.kind === "inference_error")).toBe(true);
+
+    // Complete with seq:None then AssistantText must not duplicate the reply.
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_text_delta",
+      data: { session_id: sessionId, attempt_id: 42, delta: "live" },
+    });
+    state = result.state;
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_display_complete",
+      data: { session_id: sessionId, attempt_id: 42, text: "live final" },
+    });
+    state = result.state;
+    expect(
+      state.history.filter((e) => e.kind === "assistant_text" && e.text === "live final"),
+    ).toHaveLength(1);
+    result = reduceNativeSessionEvent(state, {
+      v: PROTOCOL_VERSION,
+      kind: "evt",
+      event: "assistant_text",
+      data: { session_id: sessionId, text: "live final", seq: 200 },
+    });
+    state = result.state;
+    const liveFinals = state.history.filter(
+      (e) => e.kind === "assistant_text" && e.text === "live final",
+    );
+    expect(liveFinals).toHaveLength(1);
+    expect(liveFinals[0]?.id).toBe("assistant:200");
+    expect(state.history.some((e) => e.id === "assistant:pending:42")).toBe(false);
+
+    // Legacy missing presentation on wire history entry.
+    const legacy = toNativeHistoryEntry(
+      { role: "assistant", seq: 3, agent: "Build", text: "legacy wire" },
+      3,
+    );
+    expect(legacy).toMatchObject({ kind: "assistant_text", text: "legacy wire" });
+    const translated = toNativeHistoryEntry(
+      {
+        role: "assistant",
+        seq: 4,
+        agent: "Build",
+        text: "wire",
+        presentation_text: "shown",
+      },
+      4,
+    );
+    expect(translated).toMatchObject({ kind: "assistant_text", text: "shown" });
   });
 });

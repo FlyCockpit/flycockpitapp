@@ -238,6 +238,7 @@ impl App {
                 saved_history_render_cache_rows: self.history_render_cache_rows,
                 saved_queue: std::mem::take(&mut self.queue),
                 saved_pending: self.pending.take(),
+                saved_active_display_attempt_id: self.active_display_attempt_id.take(),
                 saved_prunable_tokens: self.prunable_tokens,
                 saved_cache_cold: self.cache_cold,
                 saved_elided_event_ids: std::mem::take(&mut self.elided_event_ids),
@@ -254,6 +255,7 @@ impl App {
             self.current_session_persisted = false;
             self.queue.clear();
             self.pending = None;
+            self.active_display_attempt_id = None;
             self.pending_render_cache = None;
             self.prunable_tokens = 0;
             self.cache_cold = true;
@@ -283,6 +285,7 @@ impl App {
         );
         self.queue = side.saved_queue;
         self.pending = side.saved_pending;
+        self.active_display_attempt_id = side.saved_active_display_attempt_id;
         self.mark_chat_geometry_dirty_from(0);
         self.chat_find_lines.clear();
         self.chat_find_lines_query = None;

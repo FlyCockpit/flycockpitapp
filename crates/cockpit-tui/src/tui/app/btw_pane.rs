@@ -6,7 +6,7 @@ use crate::tui::agent_runner::{self, AgentRunner};
 #[cfg(test)]
 use crate::tui::async_action::AsyncActionPayload;
 use crate::tui::composer::Composer;
-use crate::tui::history::{HistoryEntry, PendingMsg, route_text_delta};
+use crate::tui::history::{HistoryEntry, PendingMsg};
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::TurnEvent;
 use cockpit_core::engine::message::{
@@ -73,6 +73,8 @@ pub(super) struct BtwPane {
     pub composer: Composer,
     pub history: Vec<HistoryEntry>,
     pub pending: Option<PendingMsg>,
+    /// Live typed-display attempt owning BTW provisional UI (mirrors main TUI).
+    active_display_attempt_id: Option<cockpit_core::engine::AssistantAttemptId>,
     pub queue: Vec<QueuedUserMessage>,
     fresh_queue_ack: FreshQueueAck,
     folded_queue_item_ids: std::collections::HashSet<Uuid>,
@@ -95,6 +97,7 @@ impl BtwPane {
             composer: Composer::new(vim_enabled),
             history: Vec::new(),
             pending: None,
+            active_display_attempt_id: None,
             queue: Vec::new(),
             fresh_queue_ack: FreshQueueAck::None,
             folded_queue_item_ids: std::collections::HashSet::new(),
@@ -323,46 +326,156 @@ impl BtwPane {
             }
             TurnEvent::ThinkingStarted { agent, .. } => {
                 self.finalize_pending();
+                self.active_display_attempt_id = None;
                 self.pending = Some(new_pending(agent, strip_inline_think));
             }
-            TurnEvent::AssistantTextDelta { agent, delta } => {
+            TurnEvent::AssistantTextDelta { .. } => {
+                // Live provisional/chip is typed AssistantDisplay* only.
+            }
+            TurnEvent::AssistantDisplayTextDelta {
+                agent,
+                attempt_id,
+                delta,
+            } => {
+                if self
+                    .active_display_attempt_id
+                    .is_some_and(|active| active != attempt_id)
+                {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
                 let p = self
                     .pending
-                    .get_or_insert_with(|| new_pending(agent, strip_inline_think));
-                if p.strip_think {
-                    route_text_delta(
-                        &delta,
-                        &mut p.text,
-                        &mut p.reasoning,
-                        &mut p.inside_think,
-                        &mut p.body_started,
-                        &mut p.tag_partial,
-                    );
-                } else {
-                    p.text.push_str(&delta);
+                    .get_or_insert_with(|| new_pending(agent, false));
+                p.strip_think = false;
+                p.attempt_id = Some(attempt_id);
+                p.text.push_str(&delta);
+                if !delta.trim().is_empty() && p.text_started_at.is_none() {
+                    p.text_started_at = Some(std::time::Instant::now());
                 }
             }
-            TurnEvent::ReasoningDelta { agent, delta } => {
+            TurnEvent::ReasoningDelta { .. } => {
+                // Live reasoning is typed AssistantDisplayReasoningDelta only.
+            }
+            TurnEvent::AssistantDisplayReasoningDelta {
+                agent,
+                attempt_id,
+                delta,
+            } => {
+                if self
+                    .active_display_attempt_id
+                    .is_some_and(|active| active != attempt_id)
+                {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
                 let p = self
                     .pending
-                    .get_or_insert_with(|| new_pending(agent, strip_inline_think));
+                    .get_or_insert_with(|| new_pending(agent, false));
+                p.strip_think = false;
+                p.attempt_id = Some(attempt_id);
                 p.reasoning.push_str(&delta);
+            }
+            TurnEvent::AssistantDisplayAttemptReset {
+                failed_attempt_id,
+                replacement_attempt_id,
+                ..
+            } => {
+                if self.pending.as_ref().is_some_and(|p| {
+                    p.attempt_id == Some(failed_attempt_id) || p.attempt_id.is_none()
+                }) {
+                    self.pending = None;
+                }
+                self.active_display_attempt_id = Some(replacement_attempt_id);
+            }
+            TurnEvent::AssistantDisplayComplete {
+                agent,
+                attempt_id,
+                assistant,
+            } => {
+                if self
+                    .active_display_attempt_id
+                    .is_some_and(|active| active != attempt_id)
+                {
+                    return;
+                }
+                self.active_display_attempt_id = Some(attempt_id);
+                let p = self
+                    .pending
+                    .get_or_insert_with(|| new_pending(agent, false));
+                p.attempt_id = Some(attempt_id);
+                p.strip_think = false;
+                if p.text_started_at.is_none() {
+                    p.text_started_at = Some(std::time::Instant::now());
+                }
+                p.seq = assistant.seq;
+                p.response_performance = assistant.response_performance;
+                let display = assistant
+                    .presentation_text
+                    .as_deref()
+                    .unwrap_or(&assistant.text);
+                if !display.trim().is_empty() {
+                    p.text = display.to_string();
+                }
+                if p.reasoning.trim().is_empty() && !assistant.reasoning.trim().is_empty() {
+                    p.reasoning = assistant.reasoning;
+                }
+                self.finalize_pending();
+            }
+            TurnEvent::AssistantDisplayError {
+                attempt_id,
+                message,
+                presentation_text,
+                ..
+            } => {
+                if self
+                    .active_display_attempt_id
+                    .is_some_and(|active| active != attempt_id)
+                {
+                    return;
+                }
+                let body = presentation_text.unwrap_or_default();
+                if !body.trim().is_empty() || !message.trim().is_empty() {
+                    self.history.push(HistoryEntry::CommandError {
+                        line: if body.trim().is_empty() {
+                            message
+                        } else {
+                            format!("{body}\n{message}")
+                        },
+                    });
+                }
+                self.pending = None;
+                self.active_display_attempt_id = None;
             }
             TurnEvent::AssistantText {
                 agent,
                 text,
                 reasoning,
                 seq,
+                response_performance,
+                presentation_text,
                 ..
             } => {
-                let p = self
-                    .pending
-                    .get_or_insert_with(|| new_pending(agent, strip_inline_think));
-                if !text.is_empty() {
-                    p.text.push_str(&text);
+                // After typed Complete finalized, ignore durable AssistantText
+                // (avoids double rows). Still accept when pending remains.
+                let Some(p) = self.pending.as_mut() else {
+                    return;
+                };
+                if p.text_started_at.is_none() {
+                    p.text_started_at = Some(std::time::Instant::now());
                 }
-                p.reasoning.push_str(&reasoning);
+                let display = presentation_text.as_deref().unwrap_or(&text);
+                if !display.trim().is_empty() && display != p.text {
+                    p.text = display.to_string();
+                }
+                if p.reasoning.trim().is_empty() && !reasoning.trim().is_empty() {
+                    p.reasoning = reasoning;
+                }
                 p.seq = seq;
+                if response_performance.is_some() {
+                    p.response_performance = response_performance;
+                }
+                let _ = agent;
                 self.finalize_pending();
             }
             TurnEvent::InferenceFailed {
@@ -461,6 +574,7 @@ impl BtwPane {
         let Some(p) = self.pending.take() else {
             return;
         };
+        self.active_display_attempt_id = None;
         if !p.text.trim().is_empty() || !p.reasoning.trim().is_empty() {
             let think_duration = p
                 .text_started_at
@@ -928,6 +1042,9 @@ impl App {
                 event,
                 TurnEvent::ThinkingStarted { .. }
                     | TurnEvent::AssistantTextDelta { .. }
+                    | TurnEvent::AssistantDisplayTextDelta { .. }
+                    | TurnEvent::AssistantDisplayReasoningDelta { .. }
+                    | TurnEvent::AssistantDisplayComplete { .. }
                     | TurnEvent::ReasoningDelta { .. }
                     | TurnEvent::AssistantText { .. }
             );
@@ -1199,6 +1316,7 @@ mod tests {
     #[test]
     fn btw_pane_concurrent_with_main_turn() {
         let mut pane = BtwPane::new(info(false), false);
+        let attempt = cockpit_core::engine::AssistantAttemptId::new(1);
         pane.apply_event(
             TurnEvent::ThinkingStarted {
                 agent: "Btw".to_string(),
@@ -1207,8 +1325,9 @@ mod tests {
             true,
         );
         pane.apply_event(
-            TurnEvent::AssistantTextDelta {
+            TurnEvent::AssistantDisplayTextDelta {
                 agent: "Btw".to_string(),
+                attempt_id: attempt,
                 delta: "side answer".to_string(),
             },
             true,
@@ -1223,6 +1342,69 @@ mod tests {
         assert!(
             matches!(pane.history.last(), Some(HistoryEntry::Agent { text, .. }) if text == "side answer")
         );
+    }
+
+    #[test]
+    fn btw_typed_display_attempt_correlation_rejects_stale_and_raw_deltas() {
+        let mut pane = BtwPane::new(info(false), false);
+        let failed = cockpit_core::engine::AssistantAttemptId::new(7);
+        let replacement = cockpit_core::engine::AssistantAttemptId::new(8);
+        pane.apply_event(
+            TurnEvent::ThinkingStarted {
+                agent: "Btw".to_string(),
+                turn_id: Some("side".to_string()),
+            },
+            true,
+        );
+        pane.apply_event(
+            TurnEvent::AssistantDisplayTextDelta {
+                agent: "Btw".to_string(),
+                attempt_id: failed,
+                delta: "partial".to_string(),
+            },
+            true,
+        );
+        // Raw live deltas must not mutate provisional body / chip path.
+        pane.apply_event(
+            TurnEvent::AssistantTextDelta {
+                agent: "Btw".to_string(),
+                delta: "<think>nope</think>raw".to_string(),
+            },
+            true,
+        );
+        assert_eq!(
+            pane.pending.as_ref().map(|p| p.text.as_str()),
+            Some("partial")
+        );
+        pane.apply_event(
+            TurnEvent::AssistantDisplayAttemptReset {
+                agent: "Btw".to_string(),
+                failed_attempt_id: failed,
+                replacement_attempt_id: replacement,
+                reason: "timeout".to_string(),
+            },
+            true,
+        );
+        assert!(pane.pending.is_none());
+        // Late failed-attempt delta must not recreate a provisional row.
+        pane.apply_event(
+            TurnEvent::AssistantDisplayTextDelta {
+                agent: "Btw".to_string(),
+                attempt_id: failed,
+                delta: "late".to_string(),
+            },
+            true,
+        );
+        assert!(pane.pending.is_none());
+        pane.apply_event(
+            TurnEvent::AssistantDisplayTextDelta {
+                agent: "Btw".to_string(),
+                attempt_id: replacement,
+                delta: "ok".to_string(),
+            },
+            true,
+        );
+        assert_eq!(pane.pending.as_ref().map(|p| p.text.as_str()), Some("ok"));
     }
 
     #[test]

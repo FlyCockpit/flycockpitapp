@@ -216,6 +216,7 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) goal_provenance: Option<(Uuid, i64)>,
     pub(crate) turn_id: Option<String>,
     pub(crate) tx: &'a mpsc::Sender<TurnEvent>,
+    pub(crate) display_slot: Option<crate::engine::model::DisplayAttemptSlot>,
 }
 
 pub(crate) fn phase_01_pre_send_history_mutation() {}
@@ -227,6 +228,18 @@ pub(crate) fn phase_06_post_inference_text_processing() {}
 pub(crate) fn phase_07_history_push() {}
 pub(crate) fn phase_08_text_embedded_tool_call_recovery() {}
 pub(crate) fn phase_09_terminal_text_emit() {}
+
+pub(crate) fn new_display_attempt_slot(
+    session: &Arc<Session>,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+) -> crate::engine::model::DisplayAttemptSlot {
+    crate::engine::model::DisplayAttemptSlot::new(crate::engine::DisplayClassifierConfig {
+        inline_think: inline_think_enabled(session, config),
+        translation_enabled: config.extended().translation.is_active(),
+        encoding: config.extended().response_metrics_tokenizer,
+        force_tokenization_failure: false,
+    })
+}
 
 async fn record_task_unknown_agent_rejection(session: &Arc<Session>, agent: &Agent, tc: &ToolCall) {
     if let Err(e) = session
@@ -911,6 +924,7 @@ pub(crate) async fn run_turn(
     let goal_provenance = ctx.goal_provenance;
     let turn_id = ctx.turn_id;
     let tx = ctx.tx;
+    let shared_display_slot = ctx.display_slot;
 
     phase_01_pre_send_history_mutation();
     phase_02_dispatch_time_record();
@@ -1258,6 +1272,13 @@ pub(crate) async fn run_turn(
         (None, None)
     };
 
+    // Production display path: construct classifier at successful-attempt
+    // dispatch inside complete_prepared. Config mirrors the turn's think /
+    // translation / tokenizer settings so streamed deltas and the durable
+    // snapshot measure the same user-visible text.
+    let display_slot =
+        Some(shared_display_slot.unwrap_or_else(|| new_display_attempt_slot(&session, &config)));
+
     let completion = model
         .complete_prepared_with_pre_drain(
             prepared_request,
@@ -1269,6 +1290,7 @@ pub(crate) async fn run_turn(
             endpoint_recovery,
             None,
             false,
+            display_slot.clone(),
         )
         .await;
 
@@ -1285,9 +1307,26 @@ pub(crate) async fn run_turn(
         None => None,
     };
 
-    let ((msg_id, choice, usage), _captured_request, timing) = match completion {
+    let ((msg_id, choice, usage), _captured_request, mut timing) = match completion {
         Ok(out) => out,
         Err(e) => {
+            // A standalone terminal failure owns its display error here. The
+            // backup wrapper passes `false` and decides after it knows whether
+            // a replacement will begin.
+            let display_error_emitted = if emit_inference_error_ui {
+                display_slot
+                    .as_ref()
+                    .expect("display slot is always installed")
+                    .finish_as_error(
+                        &agent.name,
+                        crate::engine::response_performance::DisplayErrorKind::Failed,
+                        "inference failed",
+                        Some(tx),
+                    )
+                    .await
+            } else {
+                false
+            };
             // Settle the dispatch-time record to its terminal status and
             // surface the failure (inline error + recorded event), unless this
             // was a clean cancel / drain unwind (those keep their dedicated
@@ -1302,7 +1341,7 @@ pub(crate) async fn run_turn(
                     agent_name: &agent.name,
                     wire_api: model.wire_api_label(),
                     routing_metadata: model.routing_metadata_json(None),
-                    emit_inference_error_ui,
+                    emit_inference_error_ui: emit_inference_error_ui && !display_error_emitted,
                     goal_provenance,
                     tx,
                 },
@@ -1837,6 +1876,51 @@ pub(crate) async fn run_turn(
         if shown != text {
             event_data["presentation_text"] = serde_json::json!(shown);
         }
+        // Finish the attempt-dispatch classifier before the timeline write so
+        // the durable `response_performance` snapshot is recorded with the row.
+        let (presentation_text, response_performance, display_complete) =
+            if let Some(mut classifier) = timing.open_display.take() {
+                let translated = if shown != text {
+                    Some(shown.clone())
+                } else {
+                    None
+                };
+                match classifier.finish(&text, &reasoning, translated) {
+                    Some(complete) => {
+                        let assistant = complete.assistant;
+                        let perf = assistant.response_performance;
+                        let presentation = assistant.presentation_text.clone();
+                        (presentation, perf, Some((complete.attempt_id, assistant)))
+                    }
+                    None => (
+                        if shown != text {
+                            Some(shown.clone())
+                        } else {
+                            None
+                        },
+                        None,
+                        None,
+                    ),
+                }
+            } else {
+                (
+                    if shown != text {
+                        Some(shown.clone())
+                    } else {
+                        None
+                    },
+                    None,
+                    None,
+                )
+            };
+        if let Some(perf) = &response_performance {
+            event_data["response_performance"] = serde_json::json!({
+                "ttft_ms": perf.ttft_ms,
+                "generation_ms": perf.generation_ms,
+                "displayed_tokens": perf.displayed_tokens,
+                "encoding": perf.encoding.as_str(),
+            });
+        }
         if reasoning_rescue {
             event_data["recovery"] = serde_json::json!({
                 "kind": "reasoning_channel_rescue",
@@ -1878,16 +1962,43 @@ pub(crate) async fn run_turn(
                 None
             }
         };
-        let _ = tx
-            .send(TurnEvent::AssistantText {
-                agent: agent.name.clone(),
-                text: shown.clone(),
-                presentation_text: if shown != text { Some(shown) } else { None },
-                reasoning: reasoning.clone(),
-                seq,
-                response_performance: None,
-            })
-            .await;
+        // Live Complete retains its computed snapshot even when the timeline
+        // write failed (foundation: live event survives write failure).
+        if let Some((attempt_id, mut assistant)) = display_complete {
+            assistant.seq = seq;
+            // Prefer the finished snapshot; write failure must not drop it.
+            if assistant.response_performance.is_none() {
+                assistant.response_performance = response_performance;
+            }
+            let _ = tx
+                .send(TurnEvent::AssistantDisplayComplete {
+                    agent: agent.name.clone(),
+                    attempt_id,
+                    assistant: assistant.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(TurnEvent::AssistantText {
+                    agent: agent.name.clone(),
+                    text: assistant.text,
+                    presentation_text: assistant.presentation_text,
+                    reasoning: assistant.reasoning,
+                    seq: assistant.seq,
+                    response_performance: assistant.response_performance,
+                })
+                .await;
+        } else {
+            let _ = tx
+                .send(TurnEvent::AssistantText {
+                    agent: agent.name.clone(),
+                    text: shown.clone(),
+                    presentation_text,
+                    reasoning: reasoning.clone(),
+                    seq,
+                    response_performance,
+                })
+                .await;
+        }
     }
 
     // `available`-mode unrecovered text call (implementation note):

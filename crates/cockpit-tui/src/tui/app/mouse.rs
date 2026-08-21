@@ -200,6 +200,7 @@ impl App {
         {
             if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
                 let open_default_model_picker = self.dialog.take_pending_default_model_picker();
+                self.capture_response_metrics_tokenizer_dirty_from_dialog();
                 if let Some(provider) = self.reopen_model_picker_after_settings.take() {
                     self.dialog = crate::tui::settings::Dialog::None;
                     self.invalidate_primary_paste();
@@ -494,13 +495,24 @@ impl App {
         }
 
         // Drag/release belong to the gesture reducer once a press is live.
+        // Performance-chip press/release shares the same generation contract:
+        // any drag cancels the pending chip activation.
         if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            if self.pending_performance_chip_press.is_some() {
+                self.pending_performance_chip_press = None;
+            }
             if self.mouse_gesture_state.pending_press.is_some() {
                 self.dispatch_chat_gesture(mouse);
             }
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if self
+                .try_complete_performance_chip_press(mouse.column, mouse.row)
+                .is_some()
+            {
+                return;
+            }
             if self.mouse_gesture_state.pending_press.is_some() || self.mouse_gesture_state.dragging
             {
                 self.dispatch_chat_gesture(mouse);
@@ -562,6 +574,21 @@ impl App {
             if self.open_subagent_view_for_history_index(entry_idx) {
                 return;
             }
+        }
+
+        // Performance metric chip: fork/pin (button registry) win first;
+        // metric wins over thinking-chip and selection. Activation uses
+        // the gesture reducer's press/release + generation contract.
+        let rel_col = mouse.column.saturating_sub(area.x);
+        if let Some(hit) = self.performance_chip_hit_at(rel, rel_col) {
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+            self.pending_performance_chip_press = Some(super::PendingPerformanceChipPress {
+                history_index: hit.history_index,
+                press_generation: self.mouse_gesture_state.press_generation,
+                view_generation: self.mouse_gesture_state.view_generation,
+                cell: (mouse.column, mouse.row),
+            });
+            return;
         }
 
         // Chip click wins over drag-select start: chip rows have a
@@ -854,6 +881,59 @@ impl App {
                     | Overlay::Diff(_)
             )
             || self.pane.is_some()
+    }
+
+    fn performance_chip_hit_at(
+        &self,
+        rel_row: usize,
+        rel_col: u16,
+    ) -> Option<super::render::MetricHit> {
+        let meta = self.chat_row_meta.get(rel_row)?;
+        let hit = meta.metric_hit?;
+        if rel_col >= hit.col_start && rel_col < hit.col_end {
+            Some(hit)
+        } else {
+            None
+        }
+    }
+
+    /// Complete a pending performance-chip press on primary release.
+    /// Returns `Some(())` when the release was consumed (activate or
+    /// cancel). Drag / release-outside / stale generation cancel without
+    /// toggling; a matching in-range release toggles `performance_expanded`.
+    fn try_complete_performance_chip_press(&mut self, column: u16, row: u16) -> Option<()> {
+        let pending = self.pending_performance_chip_press.take()?;
+        if pending.press_generation != self.mouse_gesture_state.press_generation
+            || pending.view_generation != self.mouse_gesture_state.view_generation
+        {
+            return Some(());
+        }
+        let Some(area) = self.chat_area else {
+            return Some(());
+        };
+        if row < area.y
+            || row >= area.y.saturating_add(area.height)
+            || column < area.x
+            || column >= area.x.saturating_add(area.width)
+        {
+            return Some(());
+        }
+        let rel = (row - area.y) as usize;
+        let rel_col = column.saturating_sub(area.x);
+        let Some(hit) = self.performance_chip_hit_at(rel, rel_col) else {
+            return Some(());
+        };
+        if hit.history_index != pending.history_index {
+            return Some(());
+        }
+        if let Some(HistoryEntry::Agent {
+            performance_expanded,
+            ..
+        }) = self.history.get_mut(pending.history_index)
+        {
+            *performance_expanded = !*performance_expanded;
+        }
+        Some(())
     }
 
     fn control_chip_at_mouse(&self, mouse: &MouseEvent) -> Option<super::render::ControlChip> {
@@ -1313,7 +1393,16 @@ impl App {
     }
 
     pub(super) fn next_mouse_gesture_deadline(&self) -> Option<std::time::Duration> {
-        self.mouse_gesture_state.next_deadline()
+        let gesture = self.mouse_gesture_state.next_deadline();
+        let tokenizer = self
+            .pending_tokenizer_confirm
+            .as_ref()
+            .map(|pending| pending.deadline);
+        match (gesture, tokenizer) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
     }
 
     pub(super) async fn drain_ready_terminal_input_before_gesture_timer(
@@ -1329,6 +1418,11 @@ impl App {
 
     pub(super) fn service_due_mouse_gesture_timers(&mut self, now: std::time::Duration) {
         self.event_loop_monotonic_now = now;
+        // Service tokenizer confirmation timeout on the same injected clock.
+        if let Some(pending) = self.pending_tokenizer_confirm.take() {
+            let outcome = pending.on_timeout(now);
+            self.apply_tokenizer_confirm_outcome(outcome);
+        }
         let Some(deadline) = self.mouse_gesture_state.pending_copy_deadline else {
             return;
         };
@@ -1361,6 +1455,7 @@ impl App {
             }
         };
         self.reduce_mouse_gesture(input);
+        self.pending_performance_chip_press = None;
         self.abort_pending_mouse_copies();
         self.invalidate_primary_paste();
     }
@@ -2144,6 +2239,7 @@ mod affordance_hover_tests {
             diff_path: None,
             pin_hit: None,
             fork_hit: None,
+            metric_hit: None,
             continuation: false,
             selectable: false,
             copy_cells: Vec::new(),

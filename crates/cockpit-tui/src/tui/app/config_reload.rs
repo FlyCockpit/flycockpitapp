@@ -26,15 +26,82 @@ impl App {
     /// (`tui-config-single-source`, matching `active-model-switch-transaction`).
     /// When detached the write still happened, so refresh the bootstrap
     /// snapshot once from disk (the single documented detached exception).
+    ///
+    /// When a dirty response-metrics tokenizer candidate exists, this sends
+    /// exactly one RefreshConfig for that final candidate and arms
+    /// confirmation pending state.
     pub(super) fn resync_config_after_local_write(&mut self) {
         if matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
+            let applied = if let Some(candidate) = self.dirty_response_metrics_tokenizer.take() {
+                // Supersede any prior pending confirmation silently.
+                if let Some(prev) = self.pending_tokenizer_confirm.take() {
+                    let _ = prev.supersede();
+                }
+                let (session_id, attachment_epoch) = self
+                    .agent_runner
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|runner| (runner.session_id(), runner.attachment_epoch()))
+                    .unwrap_or((uuid::Uuid::nil(), 0));
+                let confirm_id = uuid::Uuid::new_v4();
+                self.pending_tokenizer_confirm = Some(TokenizerConfirmPending::new(
+                    confirm_id,
+                    session_id,
+                    attachment_epoch,
+                    candidate,
+                    self.event_loop_monotonic_now,
+                ));
+                ControlApplied::ResponseMetricsTokenizer { confirm_id }
+            } else {
+                ControlApplied::None
+            };
             self.send_daemon_request(
                 "/settings",
                 cockpit_core::daemon::proto::Request::RefreshConfig,
-                ControlApplied::None,
+                applied,
             );
         } else {
+            self.dirty_response_metrics_tokenizer = None;
             self.refresh_bootstrap_config_snapshot();
+        }
+    }
+
+    /// Apply a tokenizer confirmation outcome; append the durable post-dialog
+    /// error exactly once on terminal failure.
+    pub(super) fn apply_tokenizer_confirm_outcome(&mut self, outcome: TokenizerConfirmOutcome) {
+        match outcome {
+            TokenizerConfirmOutcome::Pending(p) => {
+                self.pending_tokenizer_confirm = Some(p);
+            }
+            TokenizerConfirmOutcome::Confirmed | TokenizerConfirmOutcome::Cancelled => {
+                self.pending_tokenizer_confirm = None;
+            }
+            TokenizerConfirmOutcome::Failed(failure) => {
+                self.pending_tokenizer_confirm = None;
+                self.history.push(HistoryEntry::CommandError {
+                    line: failure.error_line(),
+                });
+            }
+        }
+    }
+
+    /// Note a Behavior-page edit of the response metrics tokenizer so
+    /// settings close sends one correlated refresh for the final candidate.
+    pub(super) fn note_response_metrics_tokenizer_dirty(
+        &mut self,
+        candidate: cockpit_tokenizer::TiktokenEncoding,
+    ) {
+        self.dirty_response_metrics_tokenizer = Some(candidate);
+    }
+
+    /// Capture a dirty response-metrics tokenizer candidate from the open
+    /// settings dialog before it is cleared on close.
+    pub(super) fn capture_response_metrics_tokenizer_dirty_from_dialog(&mut self) {
+        let Some(candidate) = self.dialog.response_metrics_tokenizer() else {
+            return;
+        };
+        if candidate != self.config_snapshot.extended.response_metrics_tokenizer {
+            self.note_response_metrics_tokenizer_dirty(candidate);
         }
     }
 

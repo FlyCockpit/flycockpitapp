@@ -747,6 +747,7 @@ impl App {
                 // line and header refresh. TUI-side settings (vim
                 // mode, thinking display, markdown) are also reloaded
                 // so they apply without a restart.
+                self.capture_response_metrics_tokenizer_dirty_from_dialog();
                 self.dialog = Dialog::None;
                 self.invalidate_primary_paste();
                 self.sync_mouse_capture_from_dialog();

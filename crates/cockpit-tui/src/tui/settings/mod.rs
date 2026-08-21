@@ -1228,6 +1228,15 @@ impl Dialog {
             settings.page.cancel_pointer_transients();
         }
     }
+
+    /// Current Behavior → response metrics tokenizer from an open settings
+    /// dialog, used by App to arm confirmation on close.
+    pub(crate) fn response_metrics_tokenizer(&self) -> Option<cockpit_tokenizer::TiktokenEncoding> {
+        match self {
+            Dialog::Settings(settings) => Some(settings.extended.response_metrics_tokenizer),
+            _ => None,
+        }
+    }
     pub fn is_active(&self) -> bool {
         !matches!(self, Dialog::None)
     }

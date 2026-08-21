@@ -846,28 +846,62 @@ impl App {
             ControlApplied::ModelSelection { selection_id } => Some(selection_id),
             _ => None,
         };
+        let tokenizer_confirm_id = match pending.applied {
+            ControlApplied::ResponseMetricsTokenizer { confirm_id } => Some(confirm_id),
+            _ => None,
+        };
         match outcome {
-            ControlRequestOutcome::Applied | ControlRequestOutcome::ConfigRefreshed { .. } => {
-                self.apply_control_success(pending.applied)
+            ControlRequestOutcome::ConfigRefreshed {
+                applied_generation,
+                changed,
+            } => {
+                if let Some(confirm_id) = tokenizer_confirm_id
+                    && let Some(tok) = self.pending_tokenizer_confirm.take()
+                {
+                    let outcome = tok.on_response(confirm_id, applied_generation, changed, None);
+                    self.apply_tokenizer_confirm_outcome(outcome);
+                } else {
+                    self.apply_control_success(pending.applied);
+                }
             }
+            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
             ControlRequestOutcome::HostCapabilities { snapshot } => {
                 self.apply_host_capabilities(*snapshot);
                 self.apply_control_success(pending.applied);
             }
             ControlRequestOutcome::Rejected(error) => {
-                let message = format!("{}: daemon rejected request: {error}", pending.label);
-                if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                    self.show_failed_model_selection(selection, message);
+                if let Some(confirm_id) = tokenizer_confirm_id
+                    && let Some(tok) = self.pending_tokenizer_confirm.take()
+                {
+                    let code = if error.contains("invalid_response_metrics_tokenizer") {
+                        Some("invalid_response_metrics_tokenizer")
+                    } else {
+                        Some("refresh_failed")
+                    };
+                    let outcome = tok.on_response(confirm_id, 0, false, code);
+                    self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    self.push_plain(message);
+                    let message = format!("{}: daemon rejected request: {error}", pending.label);
+                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                        self.show_failed_model_selection(selection, message);
+                    } else {
+                        self.push_plain(message);
+                    }
                 }
             }
             ControlRequestOutcome::NotDelivered(reason) => {
-                let message = Self::control_not_delivered_message(&pending.label, reason);
-                if let Some(selection) = self.clear_pending_model_selection(selection_id) {
-                    self.show_failed_model_selection(selection, message);
+                if let Some(confirm_id) = tokenizer_confirm_id
+                    && let Some(tok) = self.pending_tokenizer_confirm.take()
+                {
+                    let outcome = tok.on_response(confirm_id, 0, false, Some("refresh_failed"));
+                    self.apply_tokenizer_confirm_outcome(outcome);
                 } else {
-                    self.push_plain(message);
+                    let message = Self::control_not_delivered_message(&pending.label, reason);
+                    if let Some(selection) = self.clear_pending_model_selection(selection_id) {
+                        self.show_failed_model_selection(selection, message);
+                    } else {
+                        self.push_plain(message);
+                    }
                 }
             }
         }
@@ -1097,6 +1131,9 @@ impl App {
                 if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                     runner.retry_retained_user_submissions();
                 }
+            }
+            ControlApplied::ResponseMetricsTokenizer { .. } => {
+                // Confirmation is driven by ConfigRefreshed / snapshot arms.
             }
         }
     }

@@ -1029,6 +1029,7 @@ mod tests {
             diff_path: None,
             pin_hit: None,
             fork_hit: None,
+            metric_hit: None,
             continuation: false,
             selectable: false,
             copy_cells: Vec::new(),

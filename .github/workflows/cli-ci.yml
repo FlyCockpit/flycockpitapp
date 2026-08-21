@@ -238,6 +238,11 @@ jobs:
             -subj "/CN=$TURN_TLS_SNI" \
             -addext "subjectAltName=DNS:$TURN_TLS_SNI,IP:127.0.0.1" \
             -keyout "$certdir/key.pem" -out "$certdir/cert.pem"
+          # The pinned image runs turnserver as `nobody`. Make the ephemeral
+          # fixture readable through its read-only bind mount; otherwise
+          # coturn silently disables TLS after failing to open the keypair.
+          chmod 755 "$certdir"
+          chmod 644 "$certdir/cert.pem" "$certdir/key.pem"
           sudo cp "$certdir/cert.pem" /usr/local/share/ca-certificates/coturn-test.crt
           sudo update-ca-certificates
           # coturn: long-term credential mechanism, one fixture user, no relay

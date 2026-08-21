@@ -127,7 +127,7 @@ impl Pkcs11CustodyAdapter {
         session
             .login(
                 UserType::User,
-                Some(&AuthPin::new(self.config.user_pin.clone())),
+                Some(&AuthPin::new(self.config.user_pin.clone().into())),
             )
             .map_err(|e| unavailable("login", e))?;
         Ok(LoggedSession { session })

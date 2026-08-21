@@ -560,7 +560,14 @@ pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
     writable: bool,
 ) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
+    #[cfg(unix)]
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
+        Ok(parts) => parts,
+        Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(windows)]
+    let (parent, file_name) = match open_windows_parent_directory_nofollow(path, false) {
         Ok(parts) => parts,
         Err(error) if root_cause_is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
@@ -662,7 +669,7 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
         OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
         WinLocalSystemSid,
     };
-    let expected_owner = current_windows_user_sid()?;
+    let mut expected_owner = current_windows_user_sid()?;
     let security_information = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
     let mut needed = 0u32;
     unsafe {
@@ -714,7 +721,9 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
-    if unsafe { EqualSid(owner, expected_owner.as_ptr().cast()) } == 0 {
+    // EqualSid's Windows binding takes mutable PSID pointers even though it
+    // only compares their contents.
+    if unsafe { EqualSid(owner, expected_owner.as_mut_ptr().cast()) } == 0 {
         anyhow::bail!("terminal ingress object owner is not the daemon user");
     }
     let mut dacl_present = 0;
@@ -747,7 +756,7 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
             let allowed = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
             let sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
             let approved = unsafe {
-                EqualSid(sid, expected_owner.as_ptr().cast()) != 0
+                EqualSid(sid, expected_owner.as_mut_ptr().cast()) != 0
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                     || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             };

@@ -376,6 +376,38 @@ impl UserSubmissionQueue {
         self.inner.lock().await.accepted.contains_key(&id)
     }
 
+    /// Non-mutating variant of [`Self::push_idempotent`]'s dedup decision: does
+    /// this content fingerprint / origin match an already-accepted submission
+    /// for `id`? Returns `Inserted` when the id is unseen (a genuine fresh
+    /// accept would occur), `Duplicate` on an exact match, and `Conflict` on a
+    /// different-payload reuse — WITHOUT enqueuing anything. The worker uses
+    /// this to make the acceptance decision BEFORE committing a durable
+    /// remote-operation ledger row, so a conflicting or already-accepted send
+    /// never reserves/commits a fresh ledger row. Safe against the mutating
+    /// `push_idempotent` because the worker processes `SessionWork` serially and
+    /// the `accepted` set is append-only within an epoch.
+    pub async fn peek_idempotent(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+        origin_principal: Option<&str>,
+    ) -> (IdempotentPush, Vec<QueuedUserMessage>) {
+        let state = self.inner.lock().await;
+        let outcome = match state.accepted.get(&id) {
+            Some(existing) => {
+                if existing.origin_principal.as_deref() != origin_principal
+                    || existing.fingerprint != fingerprint
+                {
+                    IdempotentPush::Conflict
+                } else {
+                    IdempotentPush::Duplicate
+                }
+            }
+            None => IdempotentPush::Inserted,
+        };
+        (outcome, snapshot_pending(&state))
+    }
+
     pub async fn requeue_front(
         &self,
         submission: UserSubmission,

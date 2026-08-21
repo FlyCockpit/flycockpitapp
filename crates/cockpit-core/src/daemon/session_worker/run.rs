@@ -387,6 +387,108 @@ pub(super) fn remote_queue_mutation_response(
     }
 }
 
+/// Outcome of committing the transactional remote-operation ledger for an
+/// authenticated remote `send_user_message`. Shared by the worker accept path
+/// and the dispatch image-duplicate fast path so BOTH reserve the operation
+/// through the SAME ledger primitive (no remote send returns accepted without a
+/// ledger operation row).
+pub(crate) enum RemoteSendDecision {
+    /// A fresh operation identity reserved and committed a ledger row.
+    Accepted,
+    /// The operation identity was already committed (exact replay).
+    Replayed,
+    /// Reject the send WITHOUT accepting: operation/actor conflict, or a
+    /// capacity/ledger failure. No fresh acceptance occurs.
+    Rejected(proto::ErrorPayload),
+}
+
+/// Reserve+commit the transactional remote-operation ledger row for a remote
+/// send. The request hash (bound to session + client_submission_id + payload in
+/// dispatch) is the exactly-once key: a replayed identity returns `Replayed`
+/// (no second commit), a reused identity carrying different content returns a
+/// conflict, and the CALLER decides whether to enqueue based on the in-memory
+/// dedup decision it already made (so a conflicting/duplicate submission never
+/// double-enqueues). The closure performs no domain mutation — the ledger row
+/// itself is the durable exactly-once acceptance record for the operation.
+///
+/// KNOWN NON-ATOMICITY (there is NO atomic durable-accept at the daemon accept
+/// path yet, and this lane deliberately does NOT try to build one). Three
+/// records that morally describe "this send was accepted" are committed
+/// SEPARATELY, not in one transaction: the run-invocation MARKER
+/// (`accept_run_if_marked`, committed in the dispatch arm before the worker
+/// dispatch — unchanged from main); this transactional LEDGER row (committed
+/// here on the worker accept); and the durable MESSAGE itself (written only
+/// later when the driver folds it into `session_events`, post-inference).
+/// The ledger DOES prevent a second ACCEPT and a normal-operation replay is
+/// idempotent (no double-enqueue). BUT because the three are not mutually atomic,
+/// a crash between any two of them leaves an inconsistent prefix: a committed
+/// ledger/marker with no durable message; or (the marker predating the driver
+/// notify) a run that starts before its marker is visible; and a crash after
+/// inference STARTS but before the fold, followed by a client replay, re-drives
+/// the enqueue and can invoke the model a SECOND time (a genuine double-EXECUTE
+/// — the same exposure a LOCAL send has, which is also durable only at fold).
+/// Closing all of these together requires routing acceptance through the atomic
+/// `accept_message_with_attachments` (`message_operation_receipts` +
+/// `message_submission_receipts` + `message_queue_items` — message + marker +
+/// ledger in ONE tx, committed before the driver is notified), which needs the
+/// `CanonicalSendUserMessageV2` envelope owned by the
+/// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
+/// the ledger row; the marker is unchanged from main; the cross-record atomicity
+/// is the V2 cutover's job.
+pub(crate) async fn reserve_remote_send_operation(
+    db: &crate::db::Db,
+    remote: &crate::daemon::session_worker::RemoteQueueOperation,
+) -> RemoteSendDecision {
+    let outcome = db
+        .execute_transactional_remote_operation(
+            crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                logical_attachment_id: &remote.logical_attachment_id,
+                operation_id: &remote.operation_id,
+                authenticated_device_id: &remote.authenticated_device_id,
+                authenticated_device_generation: remote.authenticated_device_generation,
+                operation_class:
+                    crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                request_hash: remote.request_hash,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            move |_conn| {
+                let safe_response = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "send_user_message_accept",
+                }))?;
+                Ok(
+                    crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                        value: (),
+                        safe_response: safe_response.clone(),
+                        outbox_kind: "send_user_message".into(),
+                        outbox_payload: safe_response,
+                    },
+                )
+            },
+        )
+        .await;
+    match outcome {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(())) => {
+            RemoteSendDecision::Accepted
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(_)) => {
+            RemoteSendDecision::Replayed
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict)
+        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+            RemoteSendDecision::Rejected(proto::ErrorPayload {
+                code: proto::ErrorCode::Conflict,
+                message: "remote operation conflict".into(),
+            })
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+        | Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
+            code: proto::ErrorCode::Internal,
+            message: "remote send could not be committed to the operation ledger".into(),
+        }),
+    }
+}
+
 struct RemoteQueueMutationCommit<'a> {
     session: &'a Session,
     queue: &'a crate::engine::message::UserSubmissionQueue,
@@ -1449,6 +1551,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::UserMessage {
                     submission,
+                    remote_operation,
                     respond_to,
                 } => {
                     let client_submission_id = submission
@@ -1672,6 +1775,20 @@ pub(super) async fn run_worker(
                             }));
                             continue;
                         }
+                        // The submission is already durable. For an authenticated
+                        // remote send, still resolve its operation identity through
+                        // the transactional ledger (#3) — record a fresh operation,
+                        // replay an already-committed one, or reject an
+                        // operation/actor conflict — but NEVER enqueue a second copy.
+                        if let Some(remote) = remote_operation.as_ref() {
+                            match reserve_remote_send_operation(&session.db, remote).await {
+                                RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {}
+                                RemoteSendDecision::Rejected(error) => {
+                                    let _ = respond_to.send(Err(error));
+                                    continue;
+                                }
+                            }
+                        }
                         let queue = driver_input_queue
                             .snapshot()
                             .await
@@ -1711,6 +1828,76 @@ pub(super) async fn run_worker(
                                     .to_string(),
                             }));
                             continue;
+                        }
+                    }
+                    // Authenticated remote send: commit the transactional
+                    // remote-operation ledger (FCM2 identity) on THIS worker
+                    // ACCEPT path (never a dispatch-arm shim — AC5). Make the
+                    // in-memory dedup decision FIRST with a NON-mutating peek so
+                    // a conflicting or already-accepted submission never commits
+                    // a fresh ledger row (#2): only a genuine fresh accept both
+                    // commits the ledger AND enqueues; a duplicate records/replays
+                    // the operation WITHOUT a second enqueue (#3); a conflict is
+                    // rejected with no ledger row. This runs after the terminal /
+                    // durable-receipt / model-fence checks above.
+                    if let Some(remote) = remote_operation.as_ref() {
+                        let (peek, snapshot) = driver_input_queue
+                            .peek_idempotent(
+                                receipt.id,
+                                &receipt.fingerprint,
+                                receipt.origin_principal.as_deref(),
+                            )
+                            .await;
+                        match peek {
+                            crate::engine::message::IdempotentPush::Conflict => {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::BadRequest,
+                                    message: format!(
+                                        "client_submission_id {} was already used for a different payload",
+                                        receipt.id
+                                    ),
+                                }));
+                                continue;
+                            }
+                            crate::engine::message::IdempotentPush::Duplicate => {
+                                // Already accepted this epoch (not yet durable):
+                                // record/replay the operation, never re-enqueue.
+                                match reserve_remote_send_operation(&session.db, remote).await {
+                                    RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
+                                        let queue: Vec<proto::QueueItem> =
+                                            snapshot.into_iter().map(queue_item_to_proto).collect();
+                                        let item = queue
+                                            .iter()
+                                            .find(|item| item.id == receipt.id)
+                                            .cloned()
+                                            .unwrap_or(proto::QueueItem {
+                                                id: receipt.id,
+                                                status: proto::QueueItemStatus::Folding,
+                                                text: submission.text.clone(),
+                                                display_text: submission.display_text.clone(),
+                                                target: queue_target_to_proto(target),
+                                            });
+                                        let _ = respond_to.send(Ok((item, queue)));
+                                    }
+                                    RemoteSendDecision::Rejected(error) => {
+                                        let _ = respond_to.send(Err(error));
+                                    }
+                                }
+                                continue;
+                            }
+                            crate::engine::message::IdempotentPush::Inserted => {
+                                // Genuine fresh acceptance: commit the ledger,
+                                // THEN enqueue below. A conflict/failure here
+                                // rejects without enqueuing.
+                                match reserve_remote_send_operation(&session.db, remote).await {
+                                    RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
+                                    }
+                                    RemoteSendDecision::Rejected(error) => {
+                                        let _ = respond_to.send(Err(error));
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                     }
                     let (id, snapshot, outcome) = driver_input_queue

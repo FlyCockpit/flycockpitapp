@@ -3325,6 +3325,9 @@ async fn run_boot_housekeeping(db: &Db) {
 /// [`crate::daemon::run_foreground_inner`], which drains the workers.
 #[cfg(unix)]
 pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
+    // Wiring invariant (debug/CI): the transactional ledger-site registry must
+    // exactly cover the remotely-admissible transactional_mutation commands.
+    dispatch::debug_assert_ledger_site_registry_consistent();
     // Startup recovery: converge any effective-default journal left behind by
     // an unclean shutdown before the first client can read a config snapshot.
     // Per-attach recovery re-runs this with the attached project root and

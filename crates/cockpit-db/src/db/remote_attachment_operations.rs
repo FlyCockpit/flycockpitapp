@@ -67,6 +67,25 @@ pub enum ReserveRemoteOperationOutcome {
     AttachmentLedgerCapacity,
 }
 
+/// Read-only classification of a transactional remote-operation identity,
+/// WITHOUT reserving or committing anything. Lets a destructive request
+/// (e.g. `delete_session`) short-circuit an exact committed replay to its
+/// cached response BEFORE resolving/destroying target state, while a genuinely
+/// fresh operation still falls through to the resolve-then-reserve path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTransactionalReplayLookup {
+    /// The operation identity is already committed with a matching actor/hash;
+    /// carries the cached safe response.
+    CommittedReplay(Vec<u8>),
+    /// Same operation id, different request hash/class — a conflict.
+    OperationConflict,
+    /// Same operation id, different authenticated actor — a conflict.
+    OperationActorConflict,
+    /// No committed match: no row, or a still-in-flight (non-committed) row.
+    /// The caller must resolve target state and reserve as a fresh operation.
+    NotCommitted,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReserveRemoteOperation<'a> {
     pub logical_attachment_id: &'a str,
@@ -1009,6 +1028,74 @@ impl Db {
             }
             ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+        })
+        .await
+    }
+
+    /// Read-only lookup of a transactional operation identity (no reserve, no
+    /// commit). Returns `CommittedReplay` only for an exact match (same actor,
+    /// same request hash, `transactional_mutation` class) that has already
+    /// committed; a mismatched actor/hash is a conflict; anything else is
+    /// `NotCommitted`. Used to short-circuit an exact replay of a destructive
+    /// request without re-resolving (now-absent) target state.
+    pub async fn lookup_committed_transactional_operation(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+    ) -> Result<RemoteTransactionalReplayLookup> {
+        ensure!(
+            request.operation_class == RemoteOperationClass::TransactionalMutation,
+            "committed-operation lookup requires transactional_mutation class"
+        );
+        let logical_attachment_id = request.logical_attachment_id.to_owned();
+        let operation_id = request.operation_id.to_owned();
+        let authenticated_device_id = request.authenticated_device_id.to_owned();
+        let authenticated_device_generation = request.authenticated_device_generation;
+        let expected_class = request.operation_class.as_str().to_owned();
+        let request_hash = request.request_hash;
+        self.read(move |conn| {
+            validate_uuid("logical attachment id", &logical_attachment_id)?;
+            validate_operation_id(&operation_id)?;
+            validate_uuid("authenticated device id", &authenticated_device_id)?;
+            if authenticated_device_generation == 0 {
+                bail!("authenticated device generation must be positive");
+            }
+            let actor_generation = i64::try_from(authenticated_device_generation)
+                .context("device generation exceeds SQLite INTEGER")?;
+            let existing = conn
+                .query_row(
+                    "SELECT authenticated_device_id, authenticated_device_generation, request_hash,
+                            operation_class, state, safe_response
+                     FROM remote_attachment_operations
+                     WHERE logical_attachment_id = ?1 AND operation_id = ?2",
+                    params![logical_attachment_id, operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .context("looking up committed remote operation")?;
+            let Some((device_id, generation, hash, class, state, response)) = existing else {
+                return Ok(RemoteTransactionalReplayLookup::NotCommitted);
+            };
+            if device_id != authenticated_device_id || generation != actor_generation {
+                return Ok(RemoteTransactionalReplayLookup::OperationActorConflict);
+            }
+            if class != expected_class || hash.as_slice() != request_hash {
+                return Ok(RemoteTransactionalReplayLookup::OperationConflict);
+            }
+            if state == "committed" {
+                let bytes = response.context("committed operation missing safe response")?;
+                Ok(RemoteTransactionalReplayLookup::CommittedReplay(bytes))
+            } else {
+                Ok(RemoteTransactionalReplayLookup::NotCommitted)
             }
         })
         .await

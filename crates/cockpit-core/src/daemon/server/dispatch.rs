@@ -267,17 +267,6 @@ mod oauth_store_tests {
 }
 
 #[derive(Debug)]
-struct AppFlagVersionConflict;
-
-impl std::fmt::Display for AppFlagVersionConflict {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("app flag version conflict")
-    }
-}
-
-impl std::error::Error for AppFlagVersionConflict {}
-
-#[derive(Debug)]
 struct PinMutationRejected(String);
 
 impl std::fmt::Display for PinMutationRejected {
@@ -401,6 +390,7 @@ async fn handle_send_user_message(
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
+    remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if let Some(scheduler) = &ctx.scheduler {
         scheduler.record_user_activity().await;
@@ -443,6 +433,46 @@ async fn handle_send_user_message(
         )
         .await?;
     }
+    // Build the transactional remote-operation ledger identity for an
+    // authenticated remote send. The FCM2 canonical bytes are owned by
+    // `unify-media-model-and-send-user-message-v2-cutover`: after that cutover
+    // the request hash is
+    //   `CanonicalSendUserMessageV2::encode()`
+    //     -> `encode_fcor_v1("send_user_message", &[], &fcm2_bytes)`
+    //     -> `remote_request_hash`.
+    // Until it lands, `Request::canonical_remote_operation_params_v1()`
+    // deliberately rejects `send_user_message` (its params carry the
+    // `legacy_message` role), so this consumes the FROZEN `encode_fcor_v1`
+    // encoder over the LIVE identity-bearing params: the request hash MUST bind
+    // the session and the client_submission_id (not just the content
+    // fingerprint), so a replay of the same operation identity carrying a
+    // DIFFERENT submission/session is an operation conflict, never a false
+    // ledger replay. The V2 cutover swaps the canonical-params input below (the
+    // ledger site itself does not move).
+    let remote_queue_operation = match remote_operation {
+        // TODO(unify-media-model-and-send-user-message-v2-cutover): replace these
+        // identity-bearing canonical params with `CanonicalSendUserMessageV2::encode()`.
+        Some(operation) => {
+            let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
+            params.push_uuid(session_id);
+            params.push_uuid(client_submission_id);
+            params.push_string(&wire_fingerprint).map_err(internal)?;
+            let canonical = proto::remote_operation_fcor::encode_fcor_v1(
+                "send_user_message",
+                &[],
+                &params.into_bytes(),
+            )
+            .map_err(internal)?;
+            Some(crate::daemon::session_worker::RemoteQueueOperation {
+                logical_attachment_id: operation.logical_attachment_id.to_string(),
+                operation_id: operation.operation_id.to_string(),
+                authenticated_device_id: operation.authenticated_device_id.to_string(),
+                authenticated_device_generation: operation.authenticated_device_generation,
+                request_hash: remote_request_hash(ctx, &canonical),
+            })
+        }
+        None => None,
+    };
     let mut requires_content_check = false;
     if !image_refs.is_empty() {
         let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
@@ -457,6 +487,29 @@ async fn handle_send_user_message(
             .map_err(internal)?;
         match probe_rx.await.map_err(internal)?? {
             UserMessageProbeResult::Duplicate { item, queue } => {
+                // An image-backed exact-duplicate short-circuits BEFORE the worker
+                // accept path (to avoid re-claiming already-consumed image refs),
+                // so for an authenticated remote send we must still resolve its
+                // operation identity through the SAME transactional ledger the
+                // worker uses — record a fresh operation, replay an already
+                // committed one, or reject an operation/actor conflict — so no
+                // remote send returns accepted without a ledger operation row.
+                if let Some(operation) = &remote_queue_operation {
+                    match crate::daemon::session_worker::reserve_remote_send_operation(
+                        &ctx.db, operation,
+                    )
+                    .await
+                    {
+                        crate::daemon::session_worker::RemoteSendDecision::Accepted
+                        | crate::daemon::session_worker::RemoteSendDecision::Replayed => {}
+                        crate::daemon::session_worker::RemoteSendDecision::Rejected(error) => {
+                            return Err(error);
+                        }
+                    }
+                }
+                // Run-marker acceptance already happened above (main's position:
+                // before the worker dispatch), so this duplicate path matches
+                // main and adds no marker step of its own.
                 return Ok(Response::UserMessageQueued { item, queue });
             }
             UserMessageProbeResult::Conflict => {
@@ -525,6 +578,7 @@ async fn handle_send_user_message(
     handle
         .send_work(SessionWork::UserMessage {
             submission: Box::new(submission),
+            remote_operation: remote_queue_operation,
             respond_to,
         })
         .await
@@ -608,6 +662,98 @@ async fn begin_remote_nonrepeatable(
 pub(super) fn remote_request_hash(ctx: &DaemonContext, canonical: &[u8]) -> [u8; 32] {
     ctx.secret_vault
         .keyed_request_identity(b"flycockpit-remote-operation-v1\0", canonical)
+}
+
+/// Authoritative wiring declaration (production, colocated with the dispatch
+/// handlers): the `transactional_mutation` request tags that a remote actor can
+/// be ADMITTED for (i.e. NOT `owner_only`, whose remote non-owner callers the
+/// authorization layer denies before dispatch) and that therefore MUST carry a
+/// real daemon transactional remote-operation ledger site — either an inline
+/// `execute_transactional_remote_operation` arm or the shared
+/// `commit_session_remote_mutation` helper.
+///
+/// Adding a new remotely-admissible `transactional_mutation` command REQUIRES
+/// adding it here AND wiring its ledger site;
+/// `transactional_mutation_inventory_has_ledger_site` asserts this set EXACTLY
+/// equals the remotely-admissible `transactional_mutation` rows enumerated from
+/// the `command!` classification table (a new tag missing here — or a stale tag
+/// listed here — fails the gate).
+pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
+    "send_user_message",
+    "cancel_run_invocation",
+    "remove_queued_user_message",
+    "remove_newest_queued_user_message",
+    "remove_editable_queued_user_messages",
+    "resume_paused_work",
+    "cancel_paused_work",
+    "create_goal",
+    "set_goal_status",
+    "clear_goal",
+    "pin_message",
+    "unpin_message",
+    "toggle_pinned_message",
+    "archive_session",
+    "unarchive_session",
+    "fork_session",
+    "discard_session",
+    "btw_create",
+    "btw_end",
+    "rename_session",
+    "record_session_note",
+    "delete_session",
+];
+
+/// Production consumer of [`REMOTELY_LEDGERED_TRANSACTIONAL_TAGS`]: checks that
+/// the registry stays in EXACT sync with the classification table's
+/// remotely-admissible (non-`owner_only`) `transactional_mutation` rows. Called
+/// once from `run_accept_loop`, but the equality is a `debug_assert_eq!` — it is
+/// compiled OUT of release builds, so this enforces consistency only in
+/// DEBUG/CI builds (a new or removed transactional tag without a matching
+/// registry entry fails there); it does NOT trip a release daemon. The set
+/// computation still references the registry in every profile so the const is
+/// never dead code.
+pub(super) fn debug_assert_ledger_site_registry_consistent() {
+    macro_rules! transactional_registry_rows {
+        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        }};
+    }
+    let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_registry_rows);
+    let remotely_admissible: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|(_, authz, class)| *class == "transactional_mutation" && *authz != "owner_only")
+        .map(|(tag, _, _)| *tag)
+        .collect();
+    let registered: std::collections::BTreeSet<&str> = REMOTELY_LEDGERED_TRANSACTIONAL_TAGS
+        .iter()
+        .copied()
+        .collect();
+    debug_assert_eq!(
+        registered, remotely_admissible,
+        "REMOTELY_LEDGERED_TRANSACTIONAL_TAGS drifted from the classification table's \
+         remotely-admissible transactional_mutation rows"
+    );
+}
+
+/// Build the transactional-ledger identity for a session mutation admitted as
+/// an authenticated remote operation: FCOR-encode the request at the
+/// authorization boundary (resolved resources + canonical params), key-hash it,
+/// and bind it to the admitted operation identity. Used by the session-mutation
+/// dispatch arms (`fork_session`/`discard_session`/`btw_create`/`btw_end`/
+/// `delete_session`) so the durable mutation and its exactly-once replay record
+/// commit together on the daemon.
+fn build_remote_session_ledger(
+    ctx: &DaemonContext,
+    authorized_request: &AuthorizedRequestContext,
+    request: &Request,
+    operation: &super::RemoteOperationContext,
+) -> std::result::Result<RemoteSessionLedger, ErrorPayload> {
+    let canonical_params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized_request.encode_fcor(request, &canonical_params)?;
+    let request_hash = remote_request_hash(ctx, &canonical);
+    Ok(RemoteSessionLedger::new(operation, request_hash))
 }
 
 async fn commit_remote_nonrepeatable(
@@ -1579,6 +1725,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 image_refs,
                 forced_skill,
                 run_invocation_options,
+                remote_operation,
             ))
             .await
         }
@@ -3079,55 +3226,15 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             key,
             expected_version,
         } => {
+            // `mark_app_flag_seen` is classified `local_only`: app flags are
+            // daemon-local UI acknowledgements, NOT a remoted owner mutation, so
+            // the request never reserves a transactional remote-operation ledger
+            // row. `admit_remote_operation` already denies a remote non-owner
+            // (the `local_only` class resolves to no remote class) and returns
+            // `None` for the owner, so any `remote_operation` identity is inert
+            // here by construction — persist locally only. See
+            // `mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger`.
             let db_key = app_flag_db_key(key);
-            if let Some(operation) = remote_operation {
-                let canonical_params = Request::MarkAppFlagSeen {
-                    key,
-                    expected_version,
-                }
-                .canonical_remote_operation_params_v1()
-                .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(
-                    &Request::MarkAppFlagSeen {
-                        key,
-                        expected_version,
-                    },
-                    &canonical_params,
-                )?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let logical_attachment_id = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device_id = operation.authenticated_device_id.to_string();
-                let outcome = ctx.db.execute_transactional_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &logical_attachment_id,
-                        operation_id: &operation_id,
-                        authenticated_device_id: &device_id,
-                        authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                        request_hash,
-                        now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                    move |conn| {
-                        let Some((version, changed)) = crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)? else { return Err(AppFlagVersionConflict.into()) };
-                        let response = Response::AppFlagSeen { key, version, changed };
-                        let safe_response = serde_json::to_vec(&response)?;
-                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "mark_app_flag_seen".into(), outbox_payload: safe_response })
-                    },
-                ).await.map_err(|error| {
-                    if error.downcast_ref::<AppFlagVersionConflict>().is_some() {
-                        ErrorPayload { code: ErrorCode::Conflict, message: error.to_string() }
-                    } else {
-                        internal(error)
-                    }
-                })?;
-                return match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
-            }
             let outcome = ctx
                 .db
                 .write(move |conn| {
@@ -4613,24 +4720,81 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             fork_point_turn_id,
             ephemeral,
         } => {
+            let ledger = match remote_operation {
+                Some(operation) => Some(build_remote_session_ledger(
+                    ctx,
+                    &authorized_request,
+                    &Request::ForkSession {
+                        parent_session_id,
+                        fork_point_turn_id: fork_point_turn_id.clone(),
+                        ephemeral,
+                    },
+                    operation,
+                )?),
+                None => None,
+            };
             fork_session(
                 ctx,
                 &state.principal,
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
+                ledger.as_ref(),
             )
             .await
         }
 
-        Request::DiscardSession { session_id } => discard_session(state, ctx, session_id).await,
+        Request::DiscardSession { session_id } => {
+            let ledger = match remote_operation {
+                Some(operation) => Some(build_remote_session_ledger(
+                    ctx,
+                    &authorized_request,
+                    &Request::DiscardSession { session_id },
+                    operation,
+                )?),
+                None => None,
+            };
+            discard_session(state, ctx, session_id, ledger.as_ref()).await
+        }
 
         Request::CreateBtwFork {
             parent_session_id,
             tangent,
-        } => create_btw_fork(ctx, &state.principal, parent_session_id, tangent).await,
+        } => {
+            let ledger = match remote_operation {
+                Some(operation) => Some(build_remote_session_ledger(
+                    ctx,
+                    &authorized_request,
+                    &Request::CreateBtwFork {
+                        parent_session_id,
+                        tangent,
+                    },
+                    operation,
+                )?),
+                None => None,
+            };
+            create_btw_fork(
+                ctx,
+                &state.principal,
+                parent_session_id,
+                tangent,
+                ledger.as_ref(),
+            )
+            .await
+        }
 
-        Request::EndBtwFork { parent_session_id } => end_btw_fork(ctx, parent_session_id).await,
+        Request::EndBtwFork { parent_session_id } => {
+            let ledger = match remote_operation {
+                Some(operation) => Some(build_remote_session_ledger(
+                    ctx,
+                    &authorized_request,
+                    &Request::EndBtwFork { parent_session_id },
+                    operation,
+                )?),
+                None => None,
+            };
+            end_btw_fork(ctx, parent_session_id, ledger.as_ref()).await
+        }
 
         Request::RenameSession { session_id, title } => {
             if let Some(operation) = remote_operation {
@@ -4764,7 +4928,22 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::DeleteSession { session_id } => {
-            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
+            let ledger = match remote_operation {
+                Some(operation) => Some(build_remote_session_ledger(
+                    ctx,
+                    &authorized_request,
+                    &Request::DeleteSession { session_id },
+                    operation,
+                )?),
+                None => None,
+            };
+            delete_session(
+                ctx,
+                session_id,
+                state.negotiated_protocol_version(),
+                ledger.as_ref(),
+            )
+            .await
         }
 
         Request::GetInventoryBundle {

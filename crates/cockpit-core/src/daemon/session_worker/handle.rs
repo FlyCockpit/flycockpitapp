@@ -1511,6 +1511,13 @@ pub enum SessionWork {
     },
     UserMessage {
         submission: Box<crate::engine::message::UserSubmission>,
+        /// Present when the message was admitted as an authenticated remote
+        /// operation. The worker ACCEPT path commits the transactional
+        /// remote-operation ledger (FCM2 identity) in the same step it accepts
+        /// the submission, so a replayed operation is a durable no-op rather
+        /// than a second accept. Owner/local sends pass `None` and take the
+        /// unchanged in-memory accept path.
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
         >,

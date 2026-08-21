@@ -4341,6 +4341,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let SessionWork::UserMessage {
         submission,
         respond_to,
+        ..
     } = first_work
     else {
         panic!("expected first user message work");
@@ -4418,6 +4419,7 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
     let SessionWork::UserMessage {
         submission,
         respond_to,
+        ..
     } = second_work
     else {
         panic!("expected second user message work");
@@ -9460,6 +9462,618 @@ async fn remote_owner_named_secret_commits_vault_and_replay_ledger_together() {
         .expect("committed owner-secret operation");
     assert_eq!(status.state, "committed");
     assert!(status.safe_response.is_some());
+}
+
+/// Drive a session request through the real dispatch entry point as an
+/// authenticated remote operation, injecting the admitted operation identity
+/// exactly as `admit_remote_operation` would produce it on the live path.
+async fn dispatch_remote_session(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    request: Request,
+    operation: &RemoteOperationContext,
+) -> std::result::Result<Response, ErrorPayload> {
+    let mut effects = ClientRequestEffects::default();
+    Box::pin(handle_serialized_request_with_remote_operation(
+        request,
+        state,
+        shared,
+        ctx,
+        &mut effects,
+        Some(operation),
+    ))
+    .await
+}
+
+/// Read the durable transactional-ledger state for an operation identity, or
+/// `None` when no row exists (proves a missing ledger site rather than passing
+/// vacuously).
+async fn remote_ledger_state(
+    ctx: &Arc<DaemonContext>,
+    operation: &RemoteOperationContext,
+) -> Option<String> {
+    ctx.db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .map(|status| status.state)
+}
+
+#[tokio::test]
+async fn fork_session_remote_path_commits_transactional_ledger() {
+    let ctx = persistent_test_ctx();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::ForkSession {
+        parent_session_id: parent.session_id,
+        fork_point_turn_id: None,
+        ephemeral: false,
+    };
+    let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
+        .await
+        .expect("remote fork succeeds");
+    let Response::Forked {
+        session_id: forked_id,
+        ..
+    } = first.clone()
+    else {
+        panic!("expected Forked response, got {first:?}");
+    };
+    assert!(
+        ctx.db.get_session(forked_id).await.unwrap().is_some(),
+        "the durable fork row must exist"
+    );
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await.as_deref(),
+        Some("committed"),
+        "the fork must reserve a committed transactional ledger row"
+    );
+    // Replay under the same operation identity returns the cached response and
+    // creates NO second fork (a re-run would mint a fresh session id).
+    let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("replayed remote fork succeeds");
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+    assert_eq!(
+        ctx.db.list_forks(parent.session_id).await.unwrap().len(),
+        1,
+        "a replayed operation must not create a second fork"
+    );
+}
+
+#[tokio::test]
+async fn discard_session_remote_path_commits_transactional_ledger() {
+    let ctx = persistent_test_ctx();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let side = ctx
+        .db
+        .create_ephemeral_fork(parent.session_id, None)
+        .await
+        .unwrap();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::DiscardSession {
+        session_id: side.session_id,
+    };
+    let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
+        .await
+        .expect("remote discard succeeds");
+    assert!(matches!(first, Response::Ack));
+    assert!(
+        ctx.db.get_session(side.session_id).await.unwrap().is_none(),
+        "the ephemeral session row must be gone"
+    );
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await.as_deref(),
+        Some("committed"),
+    );
+    let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("replayed remote discard is idempotent");
+    assert!(matches!(replay, Response::Ack));
+}
+
+/// A reused operation identity bearing a DIFFERENT target (mismatched request
+/// hash) is an operation conflict that `discard_session` must reject via the
+/// ledger lookup BEFORE detaching the client or stopping any worker — no side
+/// effect on a rejected op.
+#[tokio::test]
+async fn discard_session_reused_operation_conflict_rejects_before_detach() {
+    let ctx = persistent_test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, attached_session, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let other = ctx
+        .db
+        .create_ephemeral_fork(parent.session_id, None)
+        .await
+        .unwrap();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    // First discard commits the ledger for this operation identity, with a
+    // request hash bound to `other` (not the attached session).
+    let first = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        Request::DiscardSession {
+            session_id: other.session_id,
+        },
+        &operation,
+    )
+    .await
+    .expect("first discard acks");
+    assert!(matches!(first, Response::Ack));
+    assert!(
+        state.attached.is_some(),
+        "discarding a different session leaves this client attached"
+    );
+    // Reuse the SAME operation identity to discard the ATTACHED session. The
+    // request hash differs (bound to a different session), so this is an
+    // operation CONFLICT that must be rejected BEFORE the client is detached.
+    let conflict = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        Request::DiscardSession {
+            session_id: attached_session,
+        },
+        &operation,
+    )
+    .await;
+    let error =
+        conflict.expect_err("a reused operation identity with a different target conflicts");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        state.attached.is_some(),
+        "the conflicting discard must NOT detach the client before the ledger conflict check"
+    );
+}
+
+#[tokio::test]
+async fn create_btw_fork_remote_path_commits_transactional_ledger() {
+    let ctx = persistent_test_ctx();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::CreateBtwFork {
+        parent_session_id: parent.session_id,
+        tangent: false,
+    };
+    let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
+        .await
+        .expect("remote btw create succeeds");
+    let Response::BtwFork {
+        info,
+        created: true,
+    } = first.clone()
+    else {
+        panic!("expected created BtwFork, got {first:?}");
+    };
+    assert!(ctx.db.get_session(info.session_id).await.unwrap().is_some());
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await.as_deref(),
+        Some("committed"),
+    );
+    let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("replayed remote btw create succeeds");
+    assert_eq!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&replay).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn end_btw_fork_remote_path_commits_transactional_ledger() {
+    let ctx = persistent_test_ctx();
+    let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    let created = ctx
+        .db
+        .create_btw_fork(parent.session_id, false)
+        .await
+        .unwrap();
+    assert!(created.created);
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::EndBtwFork {
+        parent_session_id: parent.session_id,
+    };
+    let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
+        .await
+        .expect("remote btw end succeeds");
+    assert!(matches!(first, Response::Ack));
+    assert!(
+        ctx.db
+            .live_btw_fork_info(parent.session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the live btw fork must be ended"
+    );
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await.as_deref(),
+        Some("committed"),
+    );
+    let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("replayed remote btw end is idempotent");
+    assert!(matches!(replay, Response::Ack));
+}
+
+#[tokio::test]
+async fn delete_session_remote_path_commits_transactional_ledger() {
+    let ctx = persistent_test_ctx();
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    ctx.db.end_session(session.session_id).await.unwrap();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::DeleteSession {
+        session_id: session.session_id,
+    };
+    let first = dispatch_remote_session(&ctx, &mut state, &shared, request.clone(), &operation)
+        .await
+        .expect("remote delete succeeds");
+    assert!(matches!(first, Response::Ack));
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the session row must be deleted"
+    );
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await.as_deref(),
+        Some("committed"),
+    );
+    let replay = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("replayed remote delete is idempotent");
+    assert!(matches!(replay, Response::Ack));
+}
+
+#[tokio::test]
+async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
+    // `mark_app_flag_seen` is classified `local_only`. Even if an operation
+    // identity is injected (which `admit_remote_operation` never produces for a
+    // `local_only` class), the daemon must persist locally and reserve NO
+    // transactional ledger row.
+    let ctx = persistent_test_ctx();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let request = Request::MarkAppFlagSeen {
+        key: proto::AppFlagKey::DaemonAutostartNotice,
+        expected_version: 0,
+    };
+    let response = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+        .await
+        .expect("mark app flag seen succeeds");
+    let Response::AppFlagSeen {
+        version, changed, ..
+    } = response
+    else {
+        panic!("expected AppFlagSeen response");
+    };
+    assert!(changed);
+    assert_eq!(version, 1, "the local app flag write must have applied");
+    assert_eq!(
+        remote_ledger_state(&ctx, &operation).await,
+        None,
+        "a local_only mutation must NOT reserve any transactional ledger row"
+    );
+}
+
+#[tokio::test]
+async fn transactional_mutation_inventory_has_ledger_site() {
+    // Every `transactional_mutation` classification row that a remote actor can
+    // be admitted for must have a real daemon ledger site. Owner-only rows are
+    // exempt: `admit_remote_operation` yields an operation identity, but the
+    // authorization layer denies a remote non-owner before dispatch, so they
+    // never reserve a transactional remote-operation ledger row.
+    macro_rules! transactional_inventory_rows {
+        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        }};
+    }
+    let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_inventory_rows);
+    // Remotely-admissible = `transactional_mutation` class AND not `owner_only`
+    // (a remote non-owner is denied owner-only work at authz before dispatch, so
+    // those never reserve a transactional ledger row). These are exactly the
+    // rows that MUST have a daemon ledger site.
+    let remotely_admissible: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|(_, authz, class)| *class == "transactional_mutation" && *authz != "owner_only")
+        .map(|(tag, _, _)| *tag)
+        .collect();
+    assert!(
+        remotely_admissible.len() >= 20,
+        "command table should enumerate the remotely-admissible transactional_mutation rows"
+    );
+
+    // The PRODUCTION wiring declaration colocated with the dispatch handlers.
+    let ledgered: std::collections::BTreeSet<&str> =
+        super::dispatch::REMOTELY_LEDGERED_TRANSACTIONAL_TAGS
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(
+        super::dispatch::REMOTELY_LEDGERED_TRANSACTIONAL_TAGS.len(),
+        ledgered.len(),
+        "the production ledger-site registry must not contain duplicates"
+    );
+
+    // EXACT coverage in BOTH directions: a new remotely-admissible
+    // transactional_mutation tag that is not wired into the registry FAILS here,
+    // and a stale registry entry that is no longer a remotely-admissible
+    // transactional_mutation row FAILS here too.
+    let missing: Vec<&str> = remotely_admissible.difference(&ledgered).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "remotely-admissible transactional_mutation tags with NO daemon ledger site: {missing:?}"
+    );
+    let stale: Vec<&str> = ledgered.difference(&remotely_admissible).copied().collect();
+    assert!(
+        stale.is_empty(),
+        "ledger-site registry entries that are not remotely-admissible transactional_mutation rows: {stale:?}"
+    );
+
+    // The six tags this lane wired must each be present in the production
+    // registry (their per-tag ledger-commit tests prove the site actually
+    // commits + replays).
+    for tag in [
+        "send_user_message",
+        "fork_session",
+        "discard_session",
+        "btw_create",
+        "btw_end",
+        "delete_session",
+    ] {
+        assert!(
+            ledgered.contains(tag),
+            "`{tag}` must be wired into the transactional ledger-site registry"
+        );
+    }
+}
+
+/// #1: the `send_user_message` transactional-ledger request hash MUST bind the
+/// `client_submission_id` (and session), not just the content fingerprint. Two
+/// sends that differ ONLY in `client_submission_id` must therefore produce
+/// DIFFERENT request hashes on the worker accept path — otherwise a replay of
+/// one operation identity carrying a different submission would be mistaken for
+/// a ledger replay and silently double-enqueued.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_user_message_ledger_hash_binds_client_submission_id() {
+    async fn worker_request_hash(
+        ctx: &Arc<DaemonContext>,
+        state: MutableClientState,
+        shared: &Arc<SharedClientState>,
+        work_rx: &mut tokio::sync::mpsc::Receiver<SessionWork>,
+        client_submission_id: Uuid,
+        operation: RemoteOperationContext,
+    ) -> (MutableClientState, [u8; 32]) {
+        let ctx = ctx.clone();
+        let shared = shared.clone();
+        let task = tokio::spawn(async move {
+            let mut state = state;
+            let mut effects = ClientRequestEffects::default();
+            let request = Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
+                client_submission_id,
+                text: "same content".to_string(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                image_refs: Vec::new(),
+                forced_skill: None,
+                run_invocation_options: None,
+            };
+            let result = Box::pin(handle_serialized_request_with_remote_operation(
+                request,
+                &mut state,
+                &shared,
+                &ctx,
+                &mut effects,
+                Some(&operation),
+            ))
+            .await;
+            (state, result)
+        });
+        let work = work_rx
+            .recv()
+            .await
+            .expect("the send reaches the worker accept path");
+        let (request_hash, respond_to) = match work {
+            SessionWork::UserMessage {
+                remote_operation,
+                respond_to,
+                ..
+            } => (
+                remote_operation
+                    .expect("an admitted remote send threads its operation identity")
+                    .request_hash,
+                respond_to,
+            ),
+            other => panic!("expected UserMessage work, got {other:?}"),
+        };
+        let _ = respond_to.send(Ok((
+            proto::QueueItem {
+                id: client_submission_id,
+                status: proto::QueueItemStatus::Folding,
+                text: "same content".to_string(),
+                display_text: None,
+                target: proto::QueueTarget::default(),
+            },
+            Vec::new(),
+        )));
+        let (state, result) = task.await.unwrap();
+        result.expect("dispatch completes after the worker ack");
+        (state, request_hash)
+    }
+
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (state, session_one, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let shared = state.shared_snapshot();
+    // The SAME operation identity for both sends, differing only in the
+    // client_submission_id.
+    let operation = remote_owner_operation();
+    let (state, hash_a) = worker_request_hash(
+        &ctx,
+        state,
+        &shared,
+        &mut work_rx,
+        Uuid::new_v4(),
+        operation,
+    )
+    .await;
+    let shared_submission_id = Uuid::new_v4();
+    let (_state, hash_b) = worker_request_hash(
+        &ctx,
+        state,
+        &shared,
+        &mut work_rx,
+        shared_submission_id,
+        operation,
+    )
+    .await;
+    assert_ne!(
+        hash_a, hash_b,
+        "the FCM2 request hash must bind client_submission_id, so two sends differing only in it hash differently"
+    );
+
+    // Same operation identity + same client_submission_id but a DIFFERENT
+    // session must ALSO hash differently: the request hash binds the session, so
+    // an operation replayed against another session is not a false replay.
+    let project_two = tempfile::tempdir().unwrap();
+    let (state_two, session_two, mut work_rx_two) =
+        attached_state_with_worker_receiver(&ctx, project_two.path()).await;
+    let shared_two = state_two.shared_snapshot();
+    let (_state_two, hash_other_session) = worker_request_hash(
+        &ctx,
+        state_two,
+        &shared_two,
+        &mut work_rx_two,
+        shared_submission_id,
+        operation,
+    )
+    .await;
+    assert_ne!(
+        session_two, session_one,
+        "the two attached sessions must be distinct for this to be meaningful"
+    );
+    assert_ne!(
+        hash_b, hash_other_session,
+        "the FCM2 request hash must bind session_id, so the same submission id in a different session hashes differently"
+    );
+    // The reused-operation-identity CONFLICT (different submission => not a
+    // ledger replay, no second enqueue) is exercised end-to-end against the real
+    // worker accept path in
+    // `send_user_message_remote_path_commits_transactional_ledger`.
+}
+
+/// An image-backed EXACT-duplicate remote send short-circuits in dispatch
+/// BEFORE the worker accept path (to avoid re-claiming already-consumed image
+/// refs). It must still reserve the operation through the SAME transactional
+/// ledger, so no remote send returns accepted without a ledger operation row.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
+    let mut ctx = test_ctx();
+    let media_dir = tempfile::tempdir().unwrap();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db,
+            &media_dir.path().join("media"),
+        )
+        .unwrap(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+    let client_submission_id = Uuid::new_v4();
+    let request = Request::SendUserMessage {
+        expected_model_state_generation: None,
+        expected_model: None,
+        client_submission_id,
+        text: "image duplicate".to_string(),
+        display_text: None,
+        tag_expansions: Vec::new(),
+        image_refs: vec![image_ref.clone()],
+        forced_skill: None,
+        run_invocation_options: None,
+    };
+    let task_ctx = ctx.clone();
+    let task = tokio::spawn(async move {
+        let mut effects = ClientRequestEffects::default();
+        let result = Box::pin(handle_serialized_request_with_remote_operation(
+            request,
+            &mut state,
+            &shared,
+            &task_ctx,
+            &mut effects,
+            Some(&operation),
+        ))
+        .await;
+        (state, result)
+    });
+    // The image-backed send probes the worker first; force a Duplicate so
+    // dispatch takes the early-return fast path that must still reserve the
+    // ledger.
+    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
+        .recv()
+        .await
+        .expect("the image send probes the worker")
+    else {
+        panic!("expected ProbeUserMessage work");
+    };
+    respond_to
+        .send(Ok(UserMessageProbeResult::Duplicate {
+            item: proto::QueueItem {
+                id: client_submission_id,
+                status: proto::QueueItemStatus::Folding,
+                text: "image duplicate".to_string(),
+                display_text: None,
+                target: proto::QueueTarget::default(),
+            },
+            queue: Vec::new(),
+        }))
+        .unwrap();
+    let (_state, result) = task.await.unwrap();
+    assert!(
+        matches!(result, Ok(Response::UserMessageQueued { .. })),
+        "the duplicate image send is accepted, got {result:?}"
+    );
+    // The dispatch fast path must have reserved+committed the operation ledger.
+    let status = ctx
+        .db
+        .remote_operation_status(
+            &operation.logical_attachment_id.to_string(),
+            &operation.operation_id.to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("an image-duplicate remote send must reserve a committed ledger row");
+    assert_eq!(status.state, "committed");
 }
 
 /// A fresh, well-formed remote-operation identity for the owner-remoted
@@ -16279,6 +16893,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     SessionWork::UserMessage {
                         submission,
                         respond_to,
+                        ..
                     },
                 ) => {
                     assert_eq!(submission.text, "hello worker");
@@ -16588,6 +17203,7 @@ async fn send_user_message_propagates_exact_pre_acceptance_failure() {
             let SessionWork::UserMessage {
                 submission,
                 respond_to,
+                ..
             } = work
             else {
                 panic!("expected user message work");
@@ -22188,6 +22804,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     let SessionWork::UserMessage {
         submission,
         respond_to,
+        ..
     } = work_rx.recv().await.expect("first request reaches worker")
     else {
         panic!("expected first UserMessage work");
@@ -22224,6 +22841,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     let SessionWork::UserMessage {
         submission,
         respond_to,
+        ..
     } = work_rx
         .recv()
         .await
@@ -22264,6 +22882,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     let SessionWork::UserMessage {
         submission,
         respond_to,
+        ..
     } = work_rx
         .recv()
         .await
@@ -24462,6 +25081,7 @@ async fn serialized_requests_apply_in_receipt_order() {
         SessionWork::UserMessage {
             submission,
             respond_to,
+            ..
         } => {
             assert_eq!(submission.text, "after model switch");
             let item = proto::QueueItem {
@@ -25840,6 +26460,7 @@ async fn btw_concurrent_with_parent_turn() {
     let SessionWork::UserMessage {
         submission: parent_submission,
         respond_to: parent_respond,
+        ..
     } = parent_rx.recv().await.expect("parent work queued")
     else {
         panic!("expected parent user message work");
@@ -25904,6 +26525,7 @@ async fn btw_concurrent_with_parent_turn() {
     let SessionWork::UserMessage {
         submission: btw_submission,
         respond_to: btw_respond,
+        ..
     } = tokio::time::timeout(std::time::Duration::from_millis(250), btw_rx.recv())
         .await
         .expect("btw work was not blocked by parent turn")

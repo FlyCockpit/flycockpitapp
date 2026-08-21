@@ -518,6 +518,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::UserMessage {
                     submission: Box::new(submission),
+                    remote_operation: None,
                     respond_to,
                 })
                 .await
@@ -747,6 +748,191 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             .await
             .expect("persistent receipt failure cannot monopolize worker shutdown")
             .expect("live worker does not panic");
+        provider_server.abort();
+    });
+}
+
+/// A `send_user_message` admitted as an authenticated remote operation commits
+/// the transactional remote-operation ledger on the REAL worker ACCEPT path
+/// (`SessionWork::UserMessage`), not a dispatch-arm shim. A replayed operation
+/// identity is a durable no-op (the ledger row stays committed and the message
+/// is not accepted a second time).
+#[test]
+fn send_user_message_remote_path_commits_transactional_ledger() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        session
+            .set_active_model("lmstudio", "session-model")
+            .unwrap();
+
+        // A parked provider socket: the message is ACCEPTED (and ledgered) before
+        // the driver ever reaches the model, so the model never has to respond.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut providers = lmstudio_test_providers();
+        providers.providers.get_mut("lmstudio").unwrap().url = format!("http://{address}/v1");
+        let redact = Arc::new(RedactionTable::empty());
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        let (handle, join) = spawn(
+            session.clone(),
+            Arc::new(LockManager::in_memory(db.clone())),
+            redact,
+            model,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            false,
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            Arc::new(StdMutex::new(None)),
+            Arc::new(StdMutex::new(None)),
+            None,
+            trusted_test_policy(tmp.path()),
+            None,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            SessionConfigSnapshot::new(0, providers, extended.clone()),
+        );
+
+        let operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000051".into(),
+            operation_id: "01890f3e-4c00-7000-8000-0000000000b1".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000052".into(),
+            authenticated_device_generation: 1,
+            request_hash: [9; 32],
+        };
+
+        async fn send_remote(
+            handle: &SessionWorkerHandle,
+            client_submission_id: Uuid,
+            text: &str,
+            operation: RemoteQueueOperation,
+        ) -> std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>
+        {
+            let mut submission = crate::engine::message::UserSubmission::text(text);
+            let fingerprint = submission.client_fingerprint();
+            submission.queue_item_ids = vec![client_submission_id];
+            submission.client_submissions = vec![crate::engine::message::ClientSubmissionReceipt {
+                id: client_submission_id,
+                fingerprint: fingerprint.clone(),
+                wire_fingerprint: format!("wire-{fingerprint}"),
+                origin_principal: submission.origin_principal.clone(),
+            }];
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::UserMessage {
+                    submission: Box::new(submission),
+                    remote_operation: Some(operation),
+                    respond_to,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), response)
+                .await
+                .expect("worker acknowledges the remote accept")
+                .expect("worker response channel remains open")
+        }
+
+        let client_submission_id = Uuid::new_v4();
+        let (item, _queue) = send_remote(
+            &handle,
+            client_submission_id,
+            "remote transactional hello",
+            operation.clone(),
+        )
+        .await
+        .expect("remote send is accepted on the worker path");
+        assert_eq!(item.id, client_submission_id);
+
+        // The accept committed the transactional remote-operation ledger.
+        let status = db
+            .remote_operation_status(&operation.logical_attachment_id, &operation.operation_id)
+            .await
+            .unwrap()
+            .expect("remote send must reserve a committed transactional ledger row");
+        assert_eq!(status.state, "committed");
+
+        // Replay under the same operation identity: still accepted, still exactly
+        // one committed ledger row (no second commit / no double accept).
+        let (replay_item, _) = send_remote(
+            &handle,
+            client_submission_id,
+            "remote transactional hello",
+            operation.clone(),
+        )
+        .await
+        .expect("replayed remote send is idempotent");
+        assert_eq!(replay_item.id, client_submission_id);
+        let replay_status = db
+            .remote_operation_status(&operation.logical_attachment_id, &operation.operation_id)
+            .await
+            .unwrap()
+            .expect("the replayed operation keeps its committed ledger row");
+        assert_eq!(replay_status.state, "committed");
+
+        // #2: a CONFLICTING send (same client_submission_id, DIFFERENT content)
+        // under a fresh operation identity is rejected by the in-memory dedup
+        // decision BEFORE any ledger reservation, so the conflicting operation
+        // commits NO ledger row (the acceptance decision precedes the commit).
+        let conflict_operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000061".into(),
+            operation_id: "01890f3e-4c00-7000-8000-0000000000c1".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000062".into(),
+            authenticated_device_generation: 1,
+            request_hash: [11; 32],
+        };
+        let conflict = send_remote(
+            &handle,
+            client_submission_id,
+            "a different payload under the same id",
+            conflict_operation.clone(),
+        )
+        .await;
+        assert!(
+            conflict.is_err(),
+            "a same-id different-content send must be rejected, not accepted"
+        );
+        assert!(
+            db.remote_operation_status(
+                &conflict_operation.logical_attachment_id,
+                &conflict_operation.operation_id,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a rejected conflicting send must reserve NO transactional ledger row"
+        );
+
+        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Shutdown {
+                pause_for_resume: false,
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
         provider_server.abort();
     });
 }

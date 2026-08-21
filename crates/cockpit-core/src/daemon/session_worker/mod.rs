@@ -528,3 +528,4 @@ pub(crate) use helpers::{
     resolve_root_agent_conn,
 };
 pub(crate) use lifecycle::{initial_active_agent, initial_active_agent_for_llm_mode};
+pub(crate) use run::{RemoteSendDecision, reserve_remote_send_operation};

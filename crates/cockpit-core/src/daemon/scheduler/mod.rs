@@ -850,6 +850,9 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                     pending_terminal_disposition: None,
                     run_invocation_id: None,
                 }),
+                // Scheduled jobs are daemon-local, not authenticated remote
+                // operations, so they reserve no transactional ledger row.
+                remote_operation: None,
                 respond_to,
             })
             .await
@@ -1747,6 +1750,7 @@ mod tests {
         let SessionWork::UserMessage {
             submission,
             respond_to,
+            ..
         } = work
         else {
             panic!("expected scheduled user message work");

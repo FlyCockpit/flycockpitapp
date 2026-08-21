@@ -1052,14 +1052,25 @@ impl Db {
     ) -> Result<()> {
         let principal = principal.map(str::to_owned);
         self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
-                params![principal, session_id.to_string()],
-            )
-            .context("setting session created_by_principal")?;
-            Ok(())
+            Self::set_session_created_by_principal_conn(conn, session_id, principal.as_deref())
         })
         .await
+    }
+
+    /// Connection-direct `created_by_principal` write for callers already
+    /// inside a transaction (e.g. the transactional remote-operation ledger
+    /// writer creating a fork in the same commit as its replay record).
+    pub fn set_session_created_by_principal_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET created_by_principal = ?1 WHERE session_id = ?2",
+            params![principal, session_id.to_string()],
+        )
+        .context("setting session created_by_principal")?;
+        Ok(())
     }
 
     /// Create a fork session branching from `parent_session_id` at
@@ -1103,81 +1114,97 @@ impl Db {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin create_btw_fork tx")?;
-            if let Some(info) = live_btw_fork_info_conn(&tx, parent_session_id)? {
-                tx.commit().context("commit existing create_btw_fork tx")?;
-                return Ok(BtwForkCreateResult {
-                    info,
-                    created: false,
-                });
-            }
-            // No sealed-value guard here, deliberately: `/btw` forks copy the
-            // transcript and nothing else. There is no `INSERT INTO
-            // sealed_values` on this path, so a `/btw` fork never inherits a
-            // sealed value by any ordering, and refusing one would restrict a
-            // fork that cannot reach the bad state. The property this relies
-            // on is pinned by
-            // `btw_fork_never_inherits_sealed_values_of_either_kind`.
-            let parent = get_session_inner(&tx, parent_session_id)?
-                .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
-            let short_id = generate_unique_short_id(&tx, &parent.project_id)
-                .context("generating btw fork short_id")?;
-            let row = SessionRow {
-                session_id,
-                project_id: parent.project_id,
-                project_root: parent.project_root,
-                started_at: now,
-                last_active_at: now,
-                ended_at: None,
-                provider: parent.provider,
-                model: parent.model,
-                model_selection_json: parent.model_selection_json,
-                active_model_revision: 0,
-                session_llm_mode: parent.session_llm_mode,
-                tool_surface_override_json: parent.tool_surface_override_json,
-                goal_settings_override_json: parent.goal_settings_override_json,
-                active_agent: parent.active_agent,
-                assistant_name: parent.assistant_name,
-                short_id: Some(short_id),
-                parent_session_id: Some(parent_session_id),
-                fork_point_turn_id: None,
-                title: None,
-                user_renamed: false,
-                last_viewed_at: None,
-                archived_at: None,
-                ephemeral: true,
-                btw_parent_session_id: Some(parent_session_id),
-                btw_tangent: tangent,
-                user_content_tokens: if tangent {
-                    0
-                } else {
-                    parent.user_content_tokens
-                },
-                title_stage: if tangent { 0 } else { parent.title_stage },
-                // A `/btw` fork is a distinct session: never inherit the
-                // parent's unconsumed recovery nudge (tangent or seeded).
-                title_recovery_nudge_state: TitleRecoveryNudgeState::None,
-                guidance_baseline_path: parent.guidance_baseline_path,
-                guidance_baseline_hash: parent.guidance_baseline_hash,
-                redaction_table_json: None,
-                model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
-                created_by_principal: parent.created_by_principal,
-                shared_with_collaborators: false,
-                lifecycle: "active".to_string(),
-            };
-            let row = insert_fork_row_with_short_id_retry(&tx, row, &None)
-                .context("inserting btw fork session")?;
-            if !tangent {
-                copy_fork_transcript(&tx, parent_session_id, session_id, None)
-                    .context("copying btw fork transcript")?;
-            }
-            let info = btw_info_for_row_conn(&tx, &row)?;
+            let result =
+                Self::create_btw_fork_conn(&tx, parent_session_id, tangent, session_id, now)?;
             tx.commit().context("commit create_btw_fork tx")?;
-            Ok(BtwForkCreateResult {
-                info,
-                created: true,
-            })
+            Ok(result)
         })
         .await
+    }
+
+    /// `/btw` fork body without an owning transaction. The caller supplies a
+    /// connection ALREADY inside a transaction (e.g. the transactional
+    /// remote-operation ledger writer). Statements run directly on `conn`;
+    /// the caller commits. Idempotent: returns the existing live `/btw` fork
+    /// (`created: false`) when one is already present for the parent.
+    pub fn create_btw_fork_conn(
+        conn: &Connection,
+        parent_session_id: Uuid,
+        tangent: bool,
+        session_id: Uuid,
+        now: i64,
+    ) -> Result<BtwForkCreateResult> {
+        if let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? {
+            return Ok(BtwForkCreateResult {
+                info,
+                created: false,
+            });
+        }
+        // No sealed-value guard here, deliberately: `/btw` forks copy the
+        // transcript and nothing else. There is no `INSERT INTO
+        // sealed_values` on this path, so a `/btw` fork never inherits a
+        // sealed value by any ordering, and refusing one would restrict a
+        // fork that cannot reach the bad state. The property this relies
+        // on is pinned by
+        // `btw_fork_never_inherits_sealed_values_of_either_kind`.
+        let parent = get_session_inner(conn, parent_session_id)?
+            .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+        let short_id = generate_unique_short_id(conn, &parent.project_id)
+            .context("generating btw fork short_id")?;
+        let row = SessionRow {
+            session_id,
+            project_id: parent.project_id,
+            project_root: parent.project_root,
+            started_at: now,
+            last_active_at: now,
+            ended_at: None,
+            provider: parent.provider,
+            model: parent.model,
+            model_selection_json: parent.model_selection_json,
+            active_model_revision: 0,
+            session_llm_mode: parent.session_llm_mode,
+            tool_surface_override_json: parent.tool_surface_override_json,
+            goal_settings_override_json: parent.goal_settings_override_json,
+            active_agent: parent.active_agent,
+            assistant_name: parent.assistant_name,
+            short_id: Some(short_id),
+            parent_session_id: Some(parent_session_id),
+            fork_point_turn_id: None,
+            title: None,
+            user_renamed: false,
+            last_viewed_at: None,
+            archived_at: None,
+            ephemeral: true,
+            btw_parent_session_id: Some(parent_session_id),
+            btw_tangent: tangent,
+            user_content_tokens: if tangent {
+                0
+            } else {
+                parent.user_content_tokens
+            },
+            title_stage: if tangent { 0 } else { parent.title_stage },
+            // A `/btw` fork is a distinct session: never inherit the
+            // parent's unconsumed recovery nudge (tangent or seeded).
+            title_recovery_nudge_state: TitleRecoveryNudgeState::None,
+            guidance_baseline_path: parent.guidance_baseline_path,
+            guidance_baseline_hash: parent.guidance_baseline_hash,
+            redaction_table_json: None,
+            model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
+            created_by_principal: parent.created_by_principal,
+            shared_with_collaborators: false,
+            lifecycle: "active".to_string(),
+        };
+        let row = insert_fork_row_with_short_id_retry(conn, row, &None)
+            .context("inserting btw fork session")?;
+        if !tangent {
+            copy_fork_transcript(conn, parent_session_id, session_id, None)
+                .context("copying btw fork transcript")?;
+        }
+        let info = btw_info_for_row_conn(conn, &row)?;
+        Ok(BtwForkCreateResult {
+            info,
+            created: true,
+        })
     }
 
     pub async fn live_btw_fork_info(&self, parent_session_id: Uuid) -> Result<Option<BtwForkInfo>> {
@@ -1191,14 +1218,20 @@ impl Db {
         // each statement autocommits separately — a failure between them would
         // leave a tombstone for a session that still exists, or a deleted
         // session with no owner-visible marker for its unresolved operations.
-        self.transaction(move |conn| {
-            let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? else {
-                return Ok(false);
-            };
-            delete_session_conn(conn, info.session_id)?;
-            Ok(true)
-        })
-        .await
+        self.transaction(move |conn| Self::end_btw_fork_conn(conn, parent_session_id))
+            .await
+    }
+
+    /// End-`/btw` body without an owning transaction. The caller supplies a
+    /// connection ALREADY inside a transaction (e.g. the transactional
+    /// remote-operation ledger writer). Deletes the one live `/btw` fork for
+    /// the parent and returns whether a row was removed.
+    pub fn end_btw_fork_conn(conn: &Connection, parent_session_id: Uuid) -> Result<bool> {
+        let Some(info) = live_btw_fork_info_conn(conn, parent_session_id)? else {
+            return Ok(false);
+        };
+        delete_session_conn(conn, info.session_id)?;
+        Ok(true)
     }
 
     async fn create_fork_inner(
@@ -1233,9 +1266,33 @@ impl Db {
         let tx = conn
             .unchecked_transaction()
             .context("begin create_fork tx")?;
-        let parent = get_session_inner(&tx, parent_session_id)?
+        let row = Self::create_fork_row_conn(
+            &tx,
+            parent_session_id,
+            fork_point_turn_id,
+            ephemeral,
+            session_id,
+            now,
+        )?;
+        tx.commit().context("commit create_fork tx")?;
+        Ok(row)
+    }
+
+    /// Fork body without an owning transaction. The caller supplies a
+    /// connection ALREADY inside a transaction (e.g. the transactional
+    /// remote-operation ledger writer, which cannot nest a second
+    /// `BEGIN`). Statements run directly on `conn`; the caller commits.
+    pub fn create_fork_row_conn(
+        conn: &Connection,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        ephemeral: bool,
+        session_id: Uuid,
+        now: i64,
+    ) -> Result<SessionRow> {
+        let parent = get_session_inner(conn, parent_session_id)?
             .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
-        let short_id = generate_unique_short_id(&tx, &parent.project_id)
+        let short_id = generate_unique_short_id(conn, &parent.project_id)
             .context("generating fork short_id")?;
         let row = SessionRow {
             session_id,
@@ -1276,10 +1333,10 @@ impl Db {
             shared_with_collaborators: false,
             lifecycle: "active".to_string(),
         };
-        let row = insert_fork_row_with_short_id_retry(&tx, row, &fork_point_turn_id)
+        let row = insert_fork_row_with_short_id_retry(conn, row, &fork_point_turn_id)
             .context("inserting fork session")?;
         copy_fork_transcript(
-            &tx,
+            conn,
             parent_session_id,
             session_id,
             fork_point_turn_id.as_deref(),
@@ -1294,15 +1351,14 @@ impl Db {
         // guarding here means any future path that reaches this copy is
         // guarded by construction, instead of relying on having enumerated
         // the callers correctly.
-        refuse_fork_with_scoped_sealed_values(&tx, parent_session_id)?;
-        tx.execute(
+        refuse_fork_with_scoped_sealed_values(conn, parent_session_id)?;
+        conn.execute(
             "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
              SELECT ?1, value_id, NULL, reason, origin, created_at
              FROM sealed_values WHERE session_id = ?2",
             params![session_id.to_string(), parent_session_id.to_string()],
         )
         .context("copying sealed values into fork")?;
-        tx.commit().context("commit create_fork tx")?;
         Ok(row)
     }
 
@@ -1711,6 +1767,21 @@ impl Db {
     /// cascading relationship; the pre-delete walk only discovers sidecar
     /// files that must be removed after the transaction commits.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<()> {
+        let sidecars = self.session_delegation_sidecar_paths(session_id).await?;
+        // One transaction so the tombstone and the deletion commit together.
+        self.transaction(move |conn| delete_session_conn(conn, session_id))
+            .await?;
+        Self::remove_delegation_sidecars(sidecars)?;
+        Ok(())
+    }
+
+    /// Absolute sidecar payload paths owned by `session_id` and its fork
+    /// subtree. Collected BEFORE deletion (the rows are gone afterward) so the
+    /// caller can remove the files once the deletion transaction commits.
+    pub async fn session_delegation_sidecar_paths(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<std::path::PathBuf>> {
         let session_ids = self
             .read(move |conn| collect_subtree(conn, session_id))
             .await?;
@@ -1722,9 +1793,12 @@ impl Db {
                 }
             }
         }
-        // One transaction so the tombstone and the deletion commit together.
-        self.transaction(move |conn| delete_session_conn(conn, session_id))
-            .await?;
+        Ok(sidecars)
+    }
+
+    /// Best-effort removal of collected delegation payload sidecars after a
+    /// session deletion commits. A missing file is not an error.
+    pub fn remove_delegation_sidecars(sidecars: Vec<std::path::PathBuf>) -> Result<()> {
         for path in sidecars {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -1739,6 +1813,14 @@ impl Db {
         Ok(())
     }
 
+    /// Connection-direct session deletion for the transactional
+    /// remote-operation ledger writer (already inside a transaction). Writes
+    /// the external tombstone and deletes the row + fork subtree. Sidecar file
+    /// removal is the caller's post-commit responsibility.
+    pub fn delete_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+        delete_session_conn(conn, session_id)
+    }
+
     /// Discard a single ephemeral side-conversation session (`/side`),
     /// cascading to its descendant forks. No-op (returns `Ok(false)`) when
     /// the id is unknown or the row is **not** ephemeral — a guard so a
@@ -1747,17 +1829,21 @@ impl Db {
     pub async fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
         // `transaction` so the guard read, the tombstone, and the deletion are
         // one atomic step.
-        self.transaction(move |conn| {
-            // Guard on the typed row flag — only an ephemeral session is ever
-            // discarded this way, so a stray call can't drop a persisted one.
-            match get_session_inner(conn, session_id)? {
-                Some(row) if row.ephemeral => {}
-                _ => return Ok(false),
-            }
-            delete_session_conn(conn, session_id)?;
-            Ok(true)
-        })
-        .await
+        self.transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
+            .await
+    }
+
+    /// Discard-ephemeral body without an owning transaction. The caller
+    /// supplies a connection ALREADY inside a transaction (e.g. the
+    /// transactional remote-operation ledger writer). Guards on the typed
+    /// `ephemeral` flag so a stray call can never drop a persisted session.
+    pub fn discard_ephemeral_session_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
+        match get_session_inner(conn, session_id)? {
+            Some(row) if row.ephemeral => {}
+            _ => return Ok(false),
+        }
+        delete_session_conn(conn, session_id)?;
+        Ok(true)
     }
 
     /// Sweep every ephemeral session row (and descendant forks) from the DB.

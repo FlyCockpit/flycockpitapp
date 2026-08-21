@@ -562,13 +562,28 @@ impl Db {
         now_wall_ms: i64,
     ) -> Result<u64> {
         self.transaction(move |conn| {
-            delete_expired_run_invocation_rows(conn, now_wall_ms)?;
-            let expires = now_wall_ms
-                .checked_add(RUN_INVOCATION_RETENTION_MS)
-                .context("session delete expiry overflow")?;
-            let changed = conn
-                .execute(
-                    "UPDATE run_invocations SET
+            Self::terminalize_session_run_invocations_conn(conn, session_id, now_wall_ms)
+        })
+        .await
+    }
+
+    /// Connection-direct session run-invocation terminalization for callers
+    /// already inside a transaction (e.g. the transactional remote-operation
+    /// ledger writer deleting a session), so this durable mutation commits
+    /// atomically with the session delete + ledger row instead of in a separate
+    /// autocommitted transaction that a later ledger failure cannot undo.
+    pub fn terminalize_session_run_invocations_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        now_wall_ms: i64,
+    ) -> Result<u64> {
+        delete_expired_run_invocation_rows(conn, now_wall_ms)?;
+        let expires = now_wall_ms
+            .checked_add(RUN_INVOCATION_RETENTION_MS)
+            .context("session delete expiry overflow")?;
+        let changed = conn
+            .execute(
+                "UPDATE run_invocations SET
                         state = 'cancelled',
                         state_version = state_version + 1,
                         updated_at_wall_ms = ?1,
@@ -580,12 +595,10 @@ impl Db {
                         expires_at_wall_ms = ?2,
                         remaining_ms = 0
                      WHERE session_id = ?3 AND terminal_at_wall_ms IS NULL",
-                    params![now_wall_ms, expires, session_id.to_string()],
-                )
-                .context("terminalizing session run invocations")?;
-            Ok(changed as u64)
-        })
-        .await
+                params![now_wall_ms, expires, session_id.to_string()],
+            )
+            .context("terminalizing session run invocations")?;
+        Ok(changed as u64)
     }
 
     /// Checkpoint remaining time without advancing lifecycle state.

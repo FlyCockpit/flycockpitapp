@@ -189,22 +189,38 @@ impl TempCaptureGuard {
     }
 
     /// Execute cleanup, returning Ok(()) on success or a bounded reason code.
-    /// Cleanup is attempted exactly once; subsequent calls return Ok(()).
+    ///
+    /// On a *hard* removal failure (something other than "already gone") the
+    /// path/dir handles are **retained**, not taken, so a later explicit
+    /// `cleanup()` or the guard's `Drop` (and the owned `TempDir`'s own
+    /// recursive `Drop`) can retry removing the plaintext artifact — a single
+    /// failed unlink never permanently disarms cleanup and strands a PNG.
     pub fn cleanup(&mut self) -> Result<(), CleanupReasonCode> {
         if self.cleanup_ok {
             return Ok(());
         }
         let mut failed = None;
-        if let Some(path) = self.path.take()
-            && std::fs::remove_file(&path).is_err()
-        {
-            failed = Some(CleanupReasonCode::TempRemovalFailed);
+        // Remove the file. Keep `path` on hard failure so cleanup can retry.
+        if let Some(path) = self.path.as_deref() {
+            match std::fs::remove_file(path) {
+                Ok(()) => self.path = None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.path = None,
+                Err(_) => failed = Some(CleanupReasonCode::TempRemovalFailed),
+            }
         }
-        if let Some(dir) = self.dir.take()
-            && dir.close().is_err()
-            && failed.is_none()
-        {
-            failed = Some(CleanupReasonCode::TempDirRemovalFailed);
+        // Remove the directory tree. Remove by path (not the consuming
+        // `TempDir::close`) so on hard failure the owned `TempDir` stays in place
+        // and its own `Drop` retries the recursive removal.
+        if let Some(dir) = self.dir.as_ref() {
+            match std::fs::remove_dir_all(dir.path()) {
+                Ok(()) => self.dir = None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.dir = None,
+                Err(_) => {
+                    if failed.is_none() {
+                        failed = Some(CleanupReasonCode::TempDirRemovalFailed);
+                    }
+                }
+            }
         }
         self.cleanup_ok = failed.is_none();
         match failed {
@@ -480,7 +496,7 @@ impl LiveComputerFrame {
         SanitizedComputerFrame {
             dimensions: self.dimensions,
             byte_count: self.bytes.len(),
-            checksum: self.checksum.clone(),
+            checksum: Some(self.checksum.clone()),
             observation_id: self.observation_id.clone(),
             action_id: self.action_id.clone(),
             capture_epoch: self.capture_epoch,
@@ -531,21 +547,37 @@ impl Drop for LiveComputerFrame {
     }
 }
 
-/// Overwrite a byte vector's contents and spare capacity with zeros, then let
-/// it drop. This is a best-effort zeroization of the uniquely owned allocation;
-/// it does not claim to erase copies outside Cockpit ownership.
+/// Overwrite a byte vector's whole allocation (filled region *and* spare
+/// capacity) with zeros using volatile stores, then clear it. This is a real —
+/// not elidable — zeroization of the uniquely owned allocation; it does not
+/// claim to erase copies outside Cockpit ownership (allocator free lists, kernel
+/// page cache, compositor, GPU, encoder, or provider copies).
+///
+/// A plain `*b = 0` loop can be elided by the optimizer as a dead store when the
+/// buffer is about to be freed. [`std::ptr::write_volatile`] forces every store
+/// to be emitted, and the trailing [`compiler_fence`] prevents the compiler from
+/// reordering the wipe past the deallocation that follows on drop.
+///
+/// [`compiler_fence`]: std::sync::atomic::compiler_fence
 fn zeroize_vec(buf: &mut Vec<u8>) {
-    // Overwrite the filled region.
-    for b in buf.iter_mut() {
-        // SAFETY: we are writing valid u8 values.
-        *b = 0;
+    let cap = buf.capacity();
+    if cap > 0 {
+        let ptr = buf.as_mut_ptr();
+        // SAFETY: `ptr` is valid for writes for `cap` bytes — the `Vec` uniquely
+        // owns that allocation for the whole span, regardless of `len`. `u8` has
+        // no invalid bit patterns, so writing `0` to every byte (filled and
+        // spare) is always sound. We never *read* the spare bytes.
+        unsafe {
+            for i in 0..cap {
+                std::ptr::write_volatile(ptr.add(i), 0u8);
+            }
+        }
     }
-    // Overwrite spare capacity by extending with zeros, then truncating back.
-    let spare = buf.capacity() - buf.len();
-    if spare > 0 {
-        buf.resize(buf.capacity(), 0);
-        buf.truncate(buf.capacity() - spare);
-    }
+    // Prevent the volatile wipe from being reordered past the drop/free.
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // Elements are `u8` (no drop glue); this only resets `len`, keeping the
+    // now-zeroed allocation until `buf` itself is dropped by the caller.
+    buf.clear();
 }
 
 impl fmt::Debug for LiveComputerFrame {
@@ -600,14 +632,21 @@ impl fmt::Display for RedactionReason {
 ///
 /// `SanitizedComputerFrame` is `Serialize` and `Clone` because it is safe to
 /// persist — it carries no sensitive pixel data.
+///
+/// The [`checksum`](Self::checksum) is `None` for a dropped/stale/oversize
+/// projection that never had live bytes to hash. A live checksum field can
+/// therefore never carry a not-a-hash sentinel string: absence is modelled as
+/// `None`, not as a magic value in the `FrameChecksum` newtype.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SanitizedComputerFrame {
     /// Physical dimensions of the frame.
     pub dimensions: FrameDimensions,
     /// Number of encoded bytes (not the bytes themselves).
     pub byte_count: usize,
-    /// SHA-256 checksum for frame correlation.
-    pub checksum: FrameChecksum,
+    /// SHA-256 checksum for frame correlation, or `None` for a dropped frame
+    /// that had no live bytes to hash. A real correlation checksum is never a
+    /// sentinel string.
+    pub checksum: Option<FrameChecksum>,
     /// Observation ID for this frame.
     pub observation_id: ObservationId,
     /// Action ID that requested this frame.
@@ -632,12 +671,13 @@ impl SanitizedComputerFrame {
         media_type: ScreenshotMediaType,
         reason: RedactionReason,
     ) -> Self {
-        // For a dropped frame we cannot compute the real checksum; use a
-        // sentinel that is clearly not a content hash.
+        // A dropped frame has no live bytes, so there is no content hash to
+        // compute. The checksum is `None` — never a sentinel string that a
+        // consumer could mistake for a real correlation hash.
         Self {
             dimensions,
             byte_count,
-            checksum: FrameChecksum("dropped:unknown".to_string()),
+            checksum: None,
             observation_id,
             action_id,
             capture_epoch,
@@ -673,24 +713,39 @@ pub struct TransientProviderRequest {
 }
 
 impl TransientProviderRequest {
-    /// Borrow the wire payload for sending to the provider.
-    ///
-    /// This is the only way to access the wire payload. It is borrowed, not
-    /// owned, to prevent the caller from stashing it in a durable store.
-    pub fn wire_payload(&self) -> &serde_json::Value {
-        &self.wire_payload
-    }
-
     /// The sanitized projection for durable recording.
     pub fn projection(&self) -> &SanitizedComputerFrame {
         &self.projection
     }
 
-    /// Decompose into the wire payload and projection, consuming the request.
-    /// This is used when handing off to the provider transport, which takes
-    /// ownership of the wire payload but must record only the projection.
-    pub fn into_parts(self) -> (serde_json::Value, SanitizedComputerFrame) {
-        (self.wire_payload, self.projection)
+    /// Hand the wire payload to the provider transport inside a single scoped
+    /// borrow, consuming the request and returning the closure's result together
+    /// with the sanitized projection for durable correlation.
+    ///
+    /// This is the **only** way to reach the wire payload. It replaces both the
+    /// removed `into_parts` (which returned the owned `serde_json::Value` — a
+    /// by-default pixel escape hatch) and the removed `wire_payload(&self)`
+    /// borrow accessor (whose `.clone()` was a trivial owned escape). Here the
+    /// wire payload is only ever lent to `f` as `&serde_json::Value` and is
+    /// dropped when this call returns, so it can never outlive the request.
+    ///
+    /// Honest residual: a `&serde_json::Value` seam cannot itself prevent a
+    /// caller from cloning the value *inside* the closure — this is not
+    /// cryptographic non-exfiltration. The guarantee is narrower and structural:
+    /// there is no owned-by-default extractor, and access is a single
+    /// borrow-scoped seam that the durable sinks (which accept only
+    /// [`SanitizedComputerFrame`]) never touch.
+    pub fn with_wire<R>(
+        self,
+        f: impl FnOnce(&serde_json::Value) -> R,
+    ) -> (R, SanitizedComputerFrame) {
+        let Self {
+            wire_payload,
+            projection,
+        } = self;
+        let result = f(&wire_payload);
+        (result, projection)
+        // `wire_payload` is dropped here; the base64 pixels never escape.
     }
 }
 
@@ -1123,25 +1178,27 @@ mod tests {
     fn computer_screenshot_projection_openai() {
         let (_, frame) = make_test_frame();
         let req = openai_transient_computer_output(&frame, "call-1", 3, None);
-        let wire = req.wire_payload();
-        assert_eq!(wire["type"], "computer_call_output");
-        assert_eq!(wire["call_id"], "call-1");
-        assert_eq!(wire["completed"], 3);
-        assert_eq!(wire["output"]["type"], "computer_screenshot");
-        assert!(
-            wire["output"]["image_url"]
-                .as_str()
-                .unwrap()
-                .starts_with("data:image/png;base64,")
-        );
+        // `with_wire` is the sole wire access; assert inside the scoped borrow.
+        let (_, proj) = req.with_wire(|wire| {
+            assert_eq!(wire["type"], "computer_call_output");
+            assert_eq!(wire["call_id"], "call-1");
+            assert_eq!(wire["completed"], 3);
+            assert_eq!(wire["output"]["type"], "computer_screenshot");
+            assert!(
+                wire["output"]["image_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+        });
         // The projection contains no pixel data.
-        let proj = req.projection();
         assert_eq!(proj.byte_count, 8);
-        // Checksum is a valid hex SHA-256 (64 chars).
-        assert_eq!(proj.checksum.0.len(), 64);
-        assert!(proj.checksum.0.chars().all(|c| c.is_ascii_hexdigit()));
+        // A live projection carries a real checksum: valid hex SHA-256 (64 chars).
+        let checksum = proj.checksum.as_ref().expect("live frame has a checksum");
+        assert_eq!(checksum.0.len(), 64);
+        assert!(checksum.0.chars().all(|c| c.is_ascii_hexdigit()));
         // The projection is serializable and contains no image data.
-        let proj_json = serde_json::to_string(proj).unwrap();
+        let proj_json = serde_json::to_string(&proj).unwrap();
         assert!(!proj_json.contains("base64"));
         assert!(!proj_json.contains("data:image"));
     }
@@ -1154,13 +1211,14 @@ mod tests {
             error: super::super::ComputerError::Refused("blocked".to_string()),
         };
         let req = openai_transient_computer_output(&frame, "call-2", 1, Some(&failure));
-        let wire = req.wire_payload();
-        assert_eq!(wire["type"], "computer_call_output");
-        assert_eq!(wire["failure"]["index"], 1);
-        // No screenshot output on failure.
-        assert!(wire.get("output").is_none());
+        let (_, proj) = req.with_wire(|wire| {
+            assert_eq!(wire["type"], "computer_call_output");
+            assert_eq!(wire["failure"]["index"], 1);
+            // No screenshot output on failure.
+            assert!(wire.get("output").is_none());
+        });
         // Projection still has byte_count (the frame exists, just not sent).
-        assert_eq!(req.projection().byte_count, 8);
+        assert_eq!(proj.byte_count, 8);
     }
 
     #[test]
@@ -1171,20 +1229,21 @@ mod tests {
             "tool-1",
             ProviderMediaVariant::Anthropic20250124ImageBlock,
         );
-        let wire = req.wire_payload();
-        assert_eq!(wire["type"], "tool_result");
-        assert_eq!(wire["tool_use_id"], "tool-1");
-        assert_eq!(wire["content"][0]["type"], "image");
-        assert_eq!(wire["content"][0]["source"]["type"], "base64");
-        assert_eq!(wire["content"][0]["source"]["media_type"], "image/png");
-        assert!(
-            !wire["content"][0]["source"]["data"]
-                .as_str()
-                .unwrap()
-                .is_empty()
-        );
+        let (_, proj) = req.with_wire(|wire| {
+            assert_eq!(wire["type"], "tool_result");
+            assert_eq!(wire["tool_use_id"], "tool-1");
+            assert_eq!(wire["content"][0]["type"], "image");
+            assert_eq!(wire["content"][0]["source"]["type"], "base64");
+            assert_eq!(wire["content"][0]["source"]["media_type"], "image/png");
+            assert!(
+                !wire["content"][0]["source"]["data"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
         // Projection has no image data.
-        let proj_json = serde_json::to_string(req.projection()).unwrap();
+        let proj_json = serde_json::to_string(&proj).unwrap();
         assert!(!proj_json.contains("base64"));
     }
 
@@ -1196,13 +1255,14 @@ mod tests {
             "tool-2",
             ProviderMediaVariant::Anthropic20251124ImageBlock,
         );
-        let wire = req.wire_payload();
-        assert_eq!(wire["type"], "tool_result");
-        assert_eq!(wire["tool_use_id"], "tool-2");
-        assert_eq!(wire["content"][0]["type"], "image");
-        assert_eq!(wire["content"][0]["source"]["type"], "base64");
+        let (_, proj) = req.with_wire(|wire| {
+            assert_eq!(wire["type"], "tool_result");
+            assert_eq!(wire["tool_use_id"], "tool-2");
+            assert_eq!(wire["content"][0]["type"], "image");
+            assert_eq!(wire["content"][0]["source"]["type"], "base64");
+        });
         // Projection has no image data.
-        let proj_json = serde_json::to_string(req.projection()).unwrap();
+        let proj_json = serde_json::to_string(&proj).unwrap();
         assert!(!proj_json.contains("data:image"));
     }
 
@@ -1210,12 +1270,13 @@ mod tests {
     fn computer_screenshot_projection_screenshot_only() {
         let (_, frame) = make_test_frame();
         let req = screenshot_only_transient_request(&frame);
-        let wire = req.wire_payload();
-        assert_eq!(wire["type"], "screenshot");
-        assert_eq!(wire["media_type"], "image/png");
-        assert!(!wire["data"].as_str().unwrap().is_empty());
+        let (_, proj) = req.with_wire(|wire| {
+            assert_eq!(wire["type"], "screenshot");
+            assert_eq!(wire["media_type"], "image/png");
+            assert!(!wire["data"].as_str().unwrap().is_empty());
+        });
         // Projection has no image data.
-        let proj_json = serde_json::to_string(req.projection()).unwrap();
+        let proj_json = serde_json::to_string(&proj).unwrap();
         assert!(!proj_json.contains("base64"));
     }
 
@@ -1289,18 +1350,25 @@ mod tests {
 
     #[test]
     fn computer_screenshot_captured_provider_receives_pixels() {
-        // The captured provider fixture receives the exact pixels.
+        // The captured provider fixture receives the exact pixels — via the
+        // scoped `with_wire` borrow, which is the ONLY way to reach the wire
+        // payload now that `into_parts` (the owned-Value escape hatch) is gone.
         let (_, frame) = make_test_frame();
         let original_bytes = test_frame_bytes();
         let req = openai_transient_computer_output(&frame, "call-pixels", 1, None);
-        let (wire, _) = req.into_parts();
-        let image_url = wire["output"]["image_url"].as_str().unwrap();
-        let b64_data = image_url.strip_prefix("data:image/png;base64,").unwrap();
-        use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64_data)
-            .unwrap();
+        let (decoded, projection) = req.with_wire(|wire| {
+            let image_url = wire["output"]["image_url"].as_str().unwrap();
+            let b64_data = image_url.strip_prefix("data:image/png;base64,").unwrap();
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64_data)
+                .unwrap()
+        });
         assert_eq!(decoded, original_bytes);
+        // The projection is still returned for durable correlation and carries a
+        // real checksum, never the wire pixels.
+        assert_eq!(projection.byte_count, 8);
+        assert!(projection.checksum.is_some());
     }
 
     // -------------------------------------------------------------------------
@@ -1768,7 +1836,74 @@ mod tests {
         );
         assert_eq!(proj.redaction_reason, RedactionReason::OversizeDropped);
         assert_eq!(proj.byte_count, 1024);
-        assert_eq!(proj.checksum.0, "dropped:unknown");
+        // A dropped frame carries NO checksum — never the old "dropped:unknown"
+        // sentinel in the correlation field. This assertion fails against the
+        // previous behavior, where `checksum` was a `FrameChecksum` set to the
+        // sentinel string.
+        assert!(proj.checksum.is_none());
+    }
+
+    /// A dropped projection's serialized `checksum` field is JSON `null`, and
+    /// the not-a-hash sentinel string never appears anywhere in the output. This
+    /// fails against the old sentinel-in-checksum behavior.
+    #[test]
+    fn computer_screenshot_dropped_projection_has_no_checksum_sentinel() {
+        let proj = SanitizedComputerFrame::dropped(
+            test_dimensions(),
+            1024,
+            ObservationId("obs-d".to_string()),
+            ActionId("act-d".to_string()),
+            CaptureEpoch(50),
+            ScreenshotMediaType::Png,
+            RedactionReason::StaleEpochDropped,
+        );
+        let json = serde_json::to_string(&proj).unwrap();
+        assert!(
+            json.contains("\"checksum\":null"),
+            "dropped checksum must serialize as null, got {json}"
+        );
+        // The sentinel string must never reach a durable projection.
+        assert!(!json.contains("dropped:unknown"));
+        assert!(!json.contains("unknown"));
+
+        // A LIVE frame, by contrast, carries a real hex checksum string in the
+        // same field — proving the typed representation, not a magic string,
+        // distinguishes the two.
+        let (_, frame) = make_test_frame();
+        let live = frame.sanitized();
+        let hex = live.checksum.as_ref().expect("live checksum").0.clone();
+        assert_eq!(hex.len(), 64);
+        let live_json = serde_json::to_string(&live).unwrap();
+        assert!(live_json.contains(&format!("\"checksum\":\"{hex}\"")));
+        assert!(!live_json.contains("dropped:"));
+        assert!(!live_json.contains("\"checksum\":null"));
+    }
+
+    /// Zeroization actually overwrites the buffer's bytes. This inspects the
+    /// retained allocation after the wipe and FAILS if `zeroize_vec` were a
+    /// no-op stub (which would leave the original `0xAB` bytes intact).
+    #[test]
+    fn computer_screenshot_zeroize_wipes_bytes() {
+        let mut buf = vec![0xABu8; 512];
+        let ptr = buf.as_ptr();
+        let cap = buf.capacity();
+        assert!(cap >= 512);
+        // Precondition: every byte really holds the secret marker.
+        assert!(buf.iter().all(|&b| b == 0xAB));
+
+        zeroize_vec(&mut buf);
+
+        // `zeroize_vec` clears `len` but keeps the (now-zeroed) allocation, so
+        // the original pointer/capacity still refer to live, initialized memory.
+        assert_eq!(buf.as_ptr(), ptr, "wipe must not reallocate");
+        assert_eq!(buf.capacity(), cap, "wipe must not shrink the allocation");
+        // SAFETY: `ptr`/`cap` still name `buf`'s live allocation; every byte was
+        // written to `0` by the volatile wipe above, so all are initialized.
+        let wiped = unsafe { std::slice::from_raw_parts(ptr, cap) };
+        assert!(
+            wiped.iter().all(|&b| b == 0),
+            "every byte of the allocation must be zeroed"
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -408,6 +408,10 @@ pub struct VirtualDisplayBackend {
     geometry: DisplayGeometry,
     tools: LinuxTools,
     held_keys: Vec<String>,
+    /// Private, owner-only directory under the Cockpit data root that contains
+    /// any transient capture temp files. Never `$TMPDIR`. See
+    /// [`private_capture_root`].
+    capture_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +424,15 @@ struct LinuxTools {
 enum CaptureTool {
     Scrot(PathBuf),
     Import(PathBuf),
+}
+
+#[cfg(target_os = "linux")]
+impl CaptureTool {
+    fn program(&self) -> &std::path::Path {
+        match self {
+            CaptureTool::Scrot(path) | CaptureTool::Import(path) => path,
+        }
+    }
 }
 
 impl VirtualDisplayBackend {
@@ -443,6 +456,9 @@ impl VirtualDisplayBackend {
         let xvfb = require_capability("Xvfb", "the `xvfb` package")?;
         let xdotool = require_capability("xdotool", "the `xdotool` package")?;
         let capture = require_capture_tool()?;
+        // Contain capture artifacts under the private Cockpit data root (the
+        // same convention `FileAdvisoryLock` uses), never the shared $TMPDIR.
+        let capture_root = private_capture_root()?;
         let display = format!(":{}", 90 + (std::process::id() % 1000));
         let geometry = DisplayGeometry {
             physical: PixelSize {
@@ -481,6 +497,7 @@ impl VirtualDisplayBackend {
             geometry,
             tools: LinuxTools { xdotool, capture },
             held_keys: Vec::new(),
+            capture_root,
         })
     }
 
@@ -517,37 +534,346 @@ impl VirtualDisplayBackend {
 
     #[cfg(target_os = "linux")]
     fn capture_png(&self, region: Option<PixelRect>) -> Result<Vec<u8>, ComputerError> {
-        let tmp = tempfile::NamedTempFile::new().map_err(|error| ComputerError::CommandFailed {
-            program: "tempfile".to_string(),
+        capture_contained(
+            &RealCaptureRunner,
+            &self.tools.capture,
+            &self.display,
+            region,
+            &self.capture_root,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screenshot capture containment
+// ---------------------------------------------------------------------------
+//
+// Every platform capture that needs a filesystem path is routed through a
+// [`TempCaptureGuard`] rooted under the private Cockpit data directory
+// ([`private_capture_root`]) — never the shared `$TMPDIR`. Capture prefers
+// streaming the PNG to stdout so no artifact touches disk; when a tool cannot
+// stream, the temp-file fallback creates the destination inode itself
+// (`O_EXCL`, `0o600`), tightens/verifies it (owner, single hardlink, mode)
+// before reading, and the guard removes it on every exit path (including panic)
+// with cleanup failure surfaced as a capture error.
+//
+// THREAT MODEL: these mode bits + owned-inode checks defend against
+// OTHER-UID / world exposure of screenshot plaintext in shared temp — the real
+// target of this containment. They do NOT defend against a SAME-UID adversary,
+// who can read the data dir, `/proc/self/mem`, or `ptrace` the process
+// regardless of file modes; that requires process isolation, not this code. Do
+// not mistake this guard for same-uid isolation.
+
+/// Resolve (and, on first use, create owner-only) the private capture root.
+///
+/// `~/.local/share/cockpit/computer-capture` (respecting `XDG_DATA_HOME`),
+/// mirroring the private-fs convention `FileAdvisoryLock` uses for the host
+/// input lock. The data root is threaded into the backend at construction, not
+/// read from a mutated environment.
+#[cfg(target_os = "linux")]
+fn private_capture_root() -> Result<PathBuf, ComputerError> {
+    let root = crate::config::resolve::cockpit_data_dir()
+        .map_err(|error| ComputerError::CommandFailed {
+            program: "capture".to_string(),
             detail: error.to_string(),
+        })?
+        .join("computer-capture");
+    ensure_owner_only_dir(&root)?;
+    Ok(root)
+}
+
+/// Ensure `dir` exists as a real, owner-owned, `0o700` directory — creating it
+/// if absent and validating/tightening it if present. Fails closed if it is a
+/// symlink, not a directory, owned by another user, or cannot be made
+/// owner-only. Runs the same checks on both the freshly-created and pre-existing
+/// paths (a prior run or a hostile actor may have left a looser or foreign dir).
+#[cfg(unix)]
+fn ensure_owner_only_dir(dir: &std::path::Path) -> Result<(), ComputerError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let io_fail = |error: std::io::Error| ComputerError::CommandFailed {
+        program: "capture".to_string(),
+        detail: error.to_string(),
+    };
+    let deny = |detail: &str| ComputerError::CommandFailed {
+        program: "capture".to_string(),
+        detail: detail.to_string(),
+    };
+
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).map_err(io_fail)?;
+    }
+    // `symlink_metadata` does NOT follow a final symlink, so a symlinked root is
+    // detected rather than silently traversed.
+    let meta = std::fs::symlink_metadata(dir).map_err(io_fail)?;
+    if meta.file_type().is_symlink() {
+        return Err(deny("capture root is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(deny("capture root is not a directory"));
+    }
+    // SAFETY: `geteuid` is always safe to call.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(deny("capture root owned by another user"));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io_fail)?;
+        let remeta = std::fs::symlink_metadata(dir).map_err(io_fail)?;
+        if remeta.mode() & 0o777 != 0o700 {
+            return Err(deny("could not tighten capture root to 0o700"));
+        }
+    }
+    Ok(())
+}
+
+/// Injectable seam for running the external capture tool. Production uses
+/// [`RealCaptureRunner`]; tests inject a fake so the containment pipeline can be
+/// exercised with no real display, X server, or capture binary.
+#[cfg(unix)]
+trait CaptureRunner {
+    /// Run the tool streaming PNG to stdout. Returns raw stdout bytes on
+    /// success; an empty vec signals the tool cannot stream to stdout.
+    fn capture_to_stdout(
+        &self,
+        tool: &CaptureTool,
+        display: &str,
+        region: Option<PixelRect>,
+    ) -> Result<Vec<u8>, ComputerError>;
+
+    /// Run the tool writing a PNG to `dest` (the leaf inside a private,
+    /// owner-only guard directory).
+    fn capture_to_path(
+        &self,
+        tool: &CaptureTool,
+        display: &str,
+        region: Option<PixelRect>,
+        dest: &std::path::Path,
+    ) -> Result<(), ComputerError>;
+}
+
+/// Capture a PNG, preferring stdout and falling back to a contained temp file.
+///
+/// Stdout capture leaves no artifact on disk. When the tool produces no stdout
+/// bytes (it cannot stream), capture falls back to a temp file created only
+/// under `capture_root` via a [`TempCaptureGuard`] that removes it on every exit
+/// path — success, error, or panic/drop.
+#[cfg(unix)]
+fn capture_contained(
+    runner: &dyn CaptureRunner,
+    tool: &CaptureTool,
+    display: &str,
+    region: Option<PixelRect>,
+    capture_root: &std::path::Path,
+) -> Result<Vec<u8>, ComputerError> {
+    // Preferred: stream straight to stdout — no capture artifact ever exists on
+    // the filesystem. A hard tool/display failure propagates here.
+    let streamed = runner.capture_to_stdout(tool, display, region)?;
+    if !streamed.is_empty() {
+        return Ok(streamed);
+    }
+    // The tool wrote nothing to stdout: it cannot stream. Fall back to a
+    // contained temp file under the private capture root.
+    capture_via_contained_file(runner, tool, display, region, capture_root)
+}
+
+/// Create the capture destination file ourselves, `O_EXCL` + `0o600`, so the
+/// external tool overwrites an inode WE own inside our fresh private dir.
+///
+/// `create_new` (`O_EXCL`) fails closed if anything already exists at the path —
+/// e.g. an attacker who pre-planted a symlink or hardlink to redirect the tool's
+/// plaintext write elsewhere. `O_NOFOLLOW` rejects a symlink at the leaf itself.
+#[cfg(unix)]
+fn create_private_capture_file(dest: &std::path::Path) -> Result<(), ComputerError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dest)
+        .map_err(|error| ComputerError::CommandFailed {
+            program: "capture".to_string(),
+            detail: format!("could not create private capture file: {error}"),
         })?;
-        let path = tmp.path().to_path_buf();
-        let mut command = match &self.tools.capture {
-            CaptureTool::Scrot(program) => {
-                let mut cmd = Command::new(program);
-                if let Some(region) = region {
-                    cmd.arg("-a").arg(format!(
-                        "{},{},{},{}",
-                        region.x, region.y, region.width, region.height
-                    ));
-                }
-                cmd.arg(&path);
-                cmd
+    // Drop the handle: the tool reopens the path by name and truncates in place.
+    Ok(())
+}
+
+/// Temp-file capture fallback. The PNG is written only inside a private
+/// sub-tempdir of `capture_root`, into an inode we pre-create `O_EXCL`/`0o600`,
+/// tightened+verified (owner, single hardlink, mode) before reading, and removed
+/// by the guard on every exit path (including panic via `Drop`). A cleanup
+/// failure is surfaced as a capture error — a screenshot whose plaintext
+/// artifact could not be removed is not a success.
+#[cfg(unix)]
+fn capture_via_contained_file(
+    runner: &dyn CaptureRunner,
+    tool: &CaptureTool,
+    display: &str,
+    region: Option<PixelRect>,
+    capture_root: &std::path::Path,
+) -> Result<Vec<u8>, ComputerError> {
+    use crate::computer::frame::TempCaptureGuard;
+    let io_fail = |error: std::io::Error| ComputerError::CommandFailed {
+        program: "capture".to_string(),
+        detail: error.to_string(),
+    };
+    // Unique private sub-tempdir under the owner-only capture root — never a
+    // fixed filename and never `$TMPDIR`. `tempdir_in` creates it `0o700`.
+    let dir = tempfile::Builder::new()
+        .prefix("capture-")
+        .tempdir_in(capture_root)
+        .map_err(io_fail)?;
+    let mut guard = TempCaptureGuard::new(dir, "shot.png").map_err(io_fail)?;
+    let dest = guard
+        .path()
+        .expect("guard constructed with a file path")
+        .to_path_buf();
+    // Any early return or panic below drops `guard`, whose `Drop` removes the
+    // file and its directory — so no `*.png` can survive a mid-capture failure.
+    let result = create_private_capture_file(&dest)
+        .and_then(|()| runner.capture_to_path(tool, display, region, &dest))
+        .and_then(|()| assert_owner_only_and_read(&dest));
+    // Fail closed if cleanup cannot remove the plaintext artifact: even on an
+    // otherwise-successful capture, a failed unlink means the bytes still sit on
+    // disk, so the capture must not report success. `Drop` remains armed to
+    // retry (see `TempCaptureGuard::cleanup`).
+    match (result, guard.cleanup()) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Ok(_), Err(code)) => Err(ComputerError::CommandFailed {
+            program: "capture".to_string(),
+            detail: format!("capture artifact cleanup failed: {code}"),
+        }),
+        (Err(capture_error), _) => Err(capture_error),
+    }
+}
+
+/// Assert the just-written capture file is owner-only (`0o600`) *before*
+/// reading a single byte, tightening it if the external tool recreated it under
+/// a looser umask, or failing closed if it cannot be made owner-private. Reads
+/// happen on the held, verified fd, so there is no path-reresolution TOCTOU.
+#[cfg(unix)]
+fn assert_owner_only_and_read(path: &std::path::Path) -> Result<Vec<u8>, ComputerError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let io_fail = |error: std::io::Error| ComputerError::CommandFailed {
+        program: "capture".to_string(),
+        detail: error.to_string(),
+    };
+    let deny = |detail: &str| ComputerError::CommandFailed {
+        program: "capture".to_string(),
+        detail: detail.to_string(),
+    };
+
+    // Open without following symlinks: the tool may have replaced the leaf with
+    // a link. Every check and the read below operate on this held fd.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(io_fail)?;
+    let meta = file.metadata().map_err(io_fail)?;
+    if !meta.file_type().is_file() {
+        return Err(deny("capture path is not a regular file"));
+    }
+    // Reject hardlinks: a `st_nlink > 1` means another name refers to this
+    // inode, so the plaintext would remain reachable after the guard unlinks our
+    // leaf. We create the capture file `O_EXCL` in a fresh private dir, so a live
+    // capture is nlink==1; anything else is fail-closed.
+    if meta.nlink() != 1 {
+        return Err(deny("capture file is hardlinked"));
+    }
+    // SAFETY: `geteuid` is always safe to call.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(deny("capture file owned by another user"));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        // The tool recreated the file with a looser mode; tighten on the held fd
+        // (fchmod, no re-resolution) and re-verify, failing closed otherwise.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io_fail)?;
+        let remeta = file.metadata().map_err(io_fail)?;
+        if remeta.mode() & 0o777 != 0o600 {
+            return Err(deny("could not tighten capture file to 0o600"));
+        }
+    }
+    // Only now, with the file proven owner-only, read the bytes.
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io_fail)?;
+    Ok(bytes)
+}
+
+/// Production [`CaptureRunner`] that spawns the real capture binary.
+#[cfg(target_os = "linux")]
+struct RealCaptureRunner;
+
+#[cfg(target_os = "linux")]
+enum CaptureDest<'a> {
+    Stdout,
+    File(&'a std::path::Path),
+}
+
+#[cfg(target_os = "linux")]
+fn capture_command(
+    tool: &CaptureTool,
+    display: &str,
+    region: Option<PixelRect>,
+    dest: CaptureDest<'_>,
+) -> Command {
+    let mut cmd = Command::new(tool.program());
+    cmd.env("DISPLAY", display);
+    match tool {
+        CaptureTool::Scrot(_) => {
+            if let Some(region) = region {
+                cmd.arg("-a").arg(format!(
+                    "{},{},{},{}",
+                    region.x, region.y, region.width, region.height
+                ));
             }
-            CaptureTool::Import(program) => {
-                let mut cmd = Command::new(program);
-                if let Some(region) = region {
-                    cmd.arg("-crop").arg(format!(
-                        "{}x{}+{}+{}",
-                        region.width, region.height, region.x, region.y
-                    ));
+            match dest {
+                // scrot streams the PNG to stdout when the output file is `-`.
+                CaptureDest::Stdout => {
+                    cmd.arg("-");
                 }
-                cmd.arg(&path);
-                cmd
+                CaptureDest::File(path) => {
+                    cmd.arg(path);
+                }
             }
-        };
-        let output = command
-            .env("DISPLAY", &self.display)
+        }
+        CaptureTool::Import(_) => {
+            if let Some(region) = region {
+                cmd.arg("-crop").arg(format!(
+                    "{}x{}+{}+{}",
+                    region.width, region.height, region.x, region.y
+                ));
+            }
+            match dest {
+                // ImageMagick streams the PNG to stdout with the `png:-` target.
+                CaptureDest::Stdout => {
+                    cmd.arg("png:-");
+                }
+                CaptureDest::File(path) => {
+                    cmd.arg(path);
+                }
+            }
+        }
+    }
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+impl CaptureRunner for RealCaptureRunner {
+    fn capture_to_stdout(
+        &self,
+        tool: &CaptureTool,
+        display: &str,
+        region: Option<PixelRect>,
+    ) -> Result<Vec<u8>, ComputerError> {
+        let output = capture_command(tool, display, region, CaptureDest::Stdout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()
             .map_err(|error| ComputerError::CommandFailed {
                 program: "capture".to_string(),
@@ -559,10 +885,29 @@ impl VirtualDisplayBackend {
                 detail: String::from_utf8_lossy(&output.stderr).to_string(),
             });
         }
-        fs::read(path).map_err(|error| ComputerError::CommandFailed {
-            program: "capture".to_string(),
-            detail: error.to_string(),
-        })
+        Ok(output.stdout)
+    }
+
+    fn capture_to_path(
+        &self,
+        tool: &CaptureTool,
+        display: &str,
+        region: Option<PixelRect>,
+        dest: &std::path::Path,
+    ) -> Result<(), ComputerError> {
+        let output = capture_command(tool, display, region, CaptureDest::File(dest))
+            .output()
+            .map_err(|error| ComputerError::CommandFailed {
+                program: "capture".to_string(),
+                detail: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(ComputerError::CommandFailed {
+                program: "capture".to_string(),
+                detail: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2339,6 +2684,309 @@ pub async fn execute_openai_computer_call_json<B: ComputerBackend>(
     Ok(execute_openai_computer_call(backend, call_id, &actions).await)
 }
 
+#[cfg(all(test, unix))]
+mod capture_containment_tests {
+    use super::frame::TempCaptureGuard;
+    use super::{
+        CaptureRunner, CaptureTool, ComputerError, PixelRect, assert_owner_only_and_read,
+        capture_contained, create_private_capture_file, ensure_owner_only_dir,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    // A small but valid-looking PNG payload; contents are opaque to the guard.
+    const PNG: &[u8] = &[137, 80, 78, 71, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+    fn scrot_tool() -> CaptureTool {
+        CaptureTool::Scrot(PathBuf::from("/usr/bin/scrot"))
+    }
+
+    /// Fake capture tool — no real display, X server, or binary. `stdout` is
+    /// returned from `capture_to_stdout` (empty forces the file fallback); the
+    /// file path writes `file_bytes` at `file_mode` to `dest`.
+    struct FakeRunner {
+        stdout: Vec<u8>,
+        file_bytes: Vec<u8>,
+        file_mode: u32,
+        // When true, chmod the containing dir to `0o500` after writing so the
+        // guard's later unlink fails — exercising the fail-closed cleanup path.
+        lock_parent_after_write: bool,
+        to_path_called: Cell<bool>,
+        last_dest: RefCell<Option<PathBuf>>,
+    }
+
+    impl FakeRunner {
+        fn streaming(bytes: &[u8]) -> Self {
+            Self {
+                stdout: bytes.to_vec(),
+                file_bytes: Vec::new(),
+                file_mode: 0o600,
+                lock_parent_after_write: false,
+                to_path_called: Cell::new(false),
+                last_dest: RefCell::new(None),
+            }
+        }
+
+        fn file_only(bytes: &[u8], mode: u32) -> Self {
+            Self {
+                stdout: Vec::new(),
+                file_bytes: bytes.to_vec(),
+                file_mode: mode,
+                lock_parent_after_write: false,
+                to_path_called: Cell::new(false),
+                last_dest: RefCell::new(None),
+            }
+        }
+
+        fn file_only_then_lock_parent(bytes: &[u8]) -> Self {
+            Self {
+                stdout: Vec::new(),
+                file_bytes: bytes.to_vec(),
+                file_mode: 0o600,
+                lock_parent_after_write: true,
+                to_path_called: Cell::new(false),
+                last_dest: RefCell::new(None),
+            }
+        }
+    }
+
+    impl CaptureRunner for FakeRunner {
+        fn capture_to_stdout(
+            &self,
+            _tool: &CaptureTool,
+            _display: &str,
+            _region: Option<PixelRect>,
+        ) -> Result<Vec<u8>, ComputerError> {
+            Ok(self.stdout.clone())
+        }
+
+        fn capture_to_path(
+            &self,
+            _tool: &CaptureTool,
+            _display: &str,
+            _region: Option<PixelRect>,
+            dest: &Path,
+        ) -> Result<(), ComputerError> {
+            self.to_path_called.set(true);
+            *self.last_dest.borrow_mut() = Some(dest.to_path_buf());
+            // The destination inode was pre-created `O_EXCL`/`0o600` by
+            // production code; overwrite it in place like the real tool.
+            std::fs::write(dest, &self.file_bytes).unwrap();
+            // Emulate an external tool recreating the file under its own umask.
+            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(self.file_mode))
+                .unwrap();
+            if self.lock_parent_after_write {
+                let parent = dest.parent().unwrap();
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    fn png_count(root: &Path) -> usize {
+        fn walk(dir: &Path, n: &mut usize) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, n);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("png") {
+                        *n += 1;
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        walk(root, &mut n);
+        n
+    }
+
+    /// Preferred path: stdout capture returns the PNG and NEVER touches disk.
+    /// A regression that always used a temp file would trip `to_path_called`.
+    #[test]
+    fn computer_screenshot_capture_prefers_stdout() {
+        let root = TempDir::new().unwrap();
+        let runner = FakeRunner::streaming(PNG);
+        let bytes = capture_contained(&runner, &scrot_tool(), ":99", None, root.path()).unwrap();
+        assert_eq!(bytes, PNG);
+        assert!(
+            !runner.to_path_called.get(),
+            "stdout capture must not create a temp file"
+        );
+        assert_eq!(png_count(root.path()), 0);
+    }
+
+    /// Fallback path: a tool that cannot stream (empty stdout) captures to a
+    /// temp file created ONLY under the private capture root, and the guard
+    /// removes it — nothing survives.
+    #[test]
+    fn computer_screenshot_capture_file_fallback_contained() {
+        let root = TempDir::new().unwrap();
+        let runner = FakeRunner::file_only(PNG, 0o600);
+        let bytes = capture_contained(&runner, &scrot_tool(), ":99", None, root.path()).unwrap();
+        assert!(
+            runner.to_path_called.get(),
+            "empty stdout must fall back to the contained temp file"
+        );
+        assert_eq!(bytes, PNG);
+        // The temp file lived UNDER the private capture root, never $TMPDIR.
+        let dest = runner.last_dest.borrow().clone().unwrap();
+        assert!(
+            dest.starts_with(root.path()),
+            "capture temp path {dest:?} must be under the private root {:?}",
+            root.path()
+        );
+        // The guard removed the file (and its sub-tempdir): nothing survives.
+        assert_eq!(png_count(root.path()), 0);
+    }
+
+    /// The post-write mode assert tightens a looser-than-`0o600` capture file to
+    /// owner-only BEFORE its bytes are read. Fails against a no-op that would
+    /// leave the file `0o644`.
+    #[test]
+    fn computer_screenshot_capture_path_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, PNG).unwrap();
+        // The "tool" recreated the file world-readable.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Precondition: it really is NOT owner-only yet.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let bytes = assert_owner_only_and_read(&path).unwrap();
+        assert_eq!(bytes, PNG);
+        // The read happened on the fd only after the fchmod, so the file is
+        // owner-only by the time any byte is read.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// A panic while a capture path is live leaves NO `*.png` under the capture
+    /// root: the guard's `Drop` removes the file (and its dir) during unwind.
+    /// Fails if the guard did not own cleanup on the panic path.
+    #[test]
+    fn computer_screenshot_capture_panic_leaves_no_png() {
+        let root = TempDir::new().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sub = tempfile::Builder::new()
+                .prefix("capture-")
+                .tempdir_in(root.path())
+                .unwrap();
+            let guard = TempCaptureGuard::new(sub, "shot.png").unwrap();
+            std::fs::write(guard.path().unwrap(), PNG).unwrap();
+            // Precondition: a PNG is genuinely live under the root.
+            assert!(guard.path().unwrap().exists());
+            assert_eq!(png_count(root.path()), 1);
+            panic!("simulated panic mid-capture");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            png_count(root.path()),
+            0,
+            "no *.png may survive a mid-capture panic"
+        );
+    }
+
+    /// The destination inode is pre-created `O_EXCL`: a pre-existing `shot.png`
+    /// (an attacker plant to redirect the tool's plaintext write) makes creation
+    /// fail closed. Fails against a version that hands the bare pathname to the
+    /// tool without owning the inode first.
+    #[test]
+    fn computer_screenshot_capture_rejects_preexisting_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shot.png");
+        // Fresh path: creation succeeds and yields an owner-only file.
+        create_private_capture_file(&path).unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A pre-existing file (the plant) => O_EXCL fails => fail closed.
+        let err = create_private_capture_file(&path).unwrap_err();
+        assert!(matches!(err, ComputerError::CommandFailed { .. }));
+    }
+
+    /// The read path rejects a hardlinked capture file (`st_nlink > 1`), so a
+    /// second name to the plaintext inode cannot survive the guard's unlink.
+    /// Fails against a read path missing the nlink check.
+    #[test]
+    fn computer_screenshot_capture_rejects_hardlinked_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, PNG).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Baseline: a single-link owner-only file reads fine.
+        assert_eq!(assert_owner_only_and_read(&path).unwrap(), PNG);
+        // Hardlink it: now nlink == 2, so the read path must fail closed.
+        let link = dir.path().join("evil.hardlink");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        let err = assert_owner_only_and_read(&path).unwrap_err();
+        assert!(matches!(err, ComputerError::CommandFailed { .. }));
+    }
+
+    /// A cleanup that cannot remove the plaintext artifact makes the whole
+    /// capture fail closed — the bytes are NOT returned. Fails against a version
+    /// that discards the cleanup error and returns the screenshot anyway.
+    #[test]
+    fn computer_screenshot_capture_fails_closed_when_cleanup_fails() {
+        let root = TempDir::new().unwrap();
+        let runner = FakeRunner::file_only_then_lock_parent(PNG);
+        let result = capture_contained(&runner, &scrot_tool(), ":99", None, root.path());
+        assert!(
+            matches!(result, Err(ComputerError::CommandFailed { .. })),
+            "capture must fail closed when the artifact cannot be removed, got {result:?}"
+        );
+        // Restore write perms so the outer TempDir can clean up after the test.
+        if let Some(dest) = runner.last_dest.borrow().as_deref() {
+            let parent = dest.parent().unwrap();
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// `ensure_owner_only_dir` rejects a symlinked capture root rather than
+    /// following it into an attacker-chosen directory.
+    #[test]
+    fn computer_screenshot_capture_root_rejects_symlink() {
+        let base = TempDir::new().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = ensure_owner_only_dir(&link).unwrap_err();
+        assert!(matches!(err, ComputerError::CommandFailed { .. }));
+    }
+
+    /// `ensure_owner_only_dir` tightens a pre-existing, too-loose root to
+    /// `0o700`. Fails against a version that only sets the mode when creating the
+    /// dir and ignores a pre-existing looser one.
+    #[test]
+    fn computer_screenshot_capture_root_tightens_existing_mode() {
+        let base = TempDir::new().unwrap();
+        let dir = base.path().join("cap");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Precondition: the existing dir is group/other-accessible.
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        ensure_owner_only_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2730,22 +3378,24 @@ mod tests {
         // The transient wire payload is built from the live frame via a scoped
         // borrow, not from a serializable field on the output.
         let transient = result.transient_wire().unwrap();
-        let wire = transient.wire_payload();
-        assert_eq!(
-            wire["type"],
-            serde_json::Value::String("computer_call_output".to_string())
-        );
-        assert_eq!(wire["call_id"], "call-1");
-        assert_eq!(wire["output"]["type"], "computer_screenshot");
-        assert!(
-            wire["output"]["image_url"]
-                .as_str()
-                .unwrap()
-                .starts_with("data:image/png;base64,")
-        );
+        // `with_wire` is the sole wire-payload access; assert inside the borrow.
+        let (_, transient_projection) = transient.with_wire(|wire| {
+            assert_eq!(
+                wire["type"],
+                serde_json::Value::String("computer_call_output".to_string())
+            );
+            assert_eq!(wire["call_id"], "call-1");
+            assert_eq!(wire["output"]["type"], "computer_screenshot");
+            assert!(
+                wire["output"]["image_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+        });
         // The transient request's projection matches the output's projection.
         assert_eq!(
-            transient.projection().checksum,
+            transient_projection.checksum,
             result.output.sanitized_screenshot().unwrap().checksum
         );
     }

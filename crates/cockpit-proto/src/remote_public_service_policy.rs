@@ -942,7 +942,7 @@ impl RemoteConnectionPolicyV1 {
         if self.shared_session_route == SharedSessionRoute::RelayOnly {
             let has_webrtc = self.allowed_transports.contains(&"webrtc".to_string());
             let has_region = !self.allowed_turn_regions.is_empty();
-            if !(has_webrtc && has_region) && !self.websocket_fallback {
+            if !(has_webrtc && has_region || self.websocket_fallback) {
                 return invalid(
                     "sharedSessionRoute=relay_only requires either WebRTC with at least one region or WebSocket fallback",
                 );

@@ -95,6 +95,38 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("rejects malformed host capability snapshots", () => {
+    const frame = eventsFixture.host_capabilities_changed;
+    const snapshot = frame.data.snapshot;
+
+    expect(
+      knownEventEnvelopeSchema.safeParse({
+        ...frame,
+        data: {
+          ...frame.data,
+          snapshot: {
+            generation: snapshot.generation,
+            features: snapshot.features,
+            dependencies: snapshot.dependencies,
+          },
+        },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      knownEventEnvelopeSchema.safeParse({
+        ...frame,
+        data: {
+          ...frame.data,
+          snapshot: {
+            ...snapshot,
+            dependencies: [{ ...snapshot.dependencies[0], state: "not-a-dependency-state" }],
+          },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("requires set_default_model to carry either a reference or clear", () => {
     const base = {
       v: PROTOCOL_VERSION,

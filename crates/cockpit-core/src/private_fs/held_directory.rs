@@ -578,12 +578,13 @@ mod imp {
 
         pub(super) fn rename_noreplace(
             &self,
-            mut artifact: HeldSealedArtifact,
+            artifact: HeldSealedArtifact,
             to: &str,
         ) -> Result<HeldDirectoryEffectOutcome> {
             self.verify_directory_security()?;
             #[cfg(target_os = "linux")]
             {
+                let mut artifact = artifact;
                 run_before_publish_hook();
                 let target = CString::new(to)?;
                 let proc_source =
@@ -659,6 +660,7 @@ mod imp {
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = (artifact, to);
                 anyhow::bail!(
                     "fd-bound no-replace publication is unsupported on this Unix platform"
                 )

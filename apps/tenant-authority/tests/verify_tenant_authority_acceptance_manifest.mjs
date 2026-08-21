@@ -32,7 +32,9 @@ function readStream(stream) {
   return new Promise((resolve, reject) => {
     let data = "";
     stream.setEncoding("utf8");
-    stream.on("data", (chunk) => { data += chunk; });
+    stream.on("data", (chunk) => {
+      data += chunk;
+    });
     stream.on("end", () => resolve(data));
     stream.on("error", reject);
   });
@@ -55,7 +57,11 @@ async function main() {
   } catch (e) {
     fail(`malformed JSON on first line: ${e}`);
   }
-  if (first.type !== "version" && first["schema-version"] === undefined && first.version === undefined) {
+  if (
+    first.type !== "version" &&
+    first["schema-version"] === undefined &&
+    first.version === undefined
+  ) {
     if (!Array.isArray(first.tests) && first.type !== "test") {
       fail("unknown schema: first line is not a Nextest version event");
     }
@@ -130,7 +136,7 @@ async function main() {
   }
 
   process.stdout.write(
-    `verify_tenant_authority_acceptance_manifest: OK (${sorted.length} tests)\n`
+    `verify_tenant_authority_acceptance_manifest: OK (${sorted.length} tests)\n`,
   );
 }
 

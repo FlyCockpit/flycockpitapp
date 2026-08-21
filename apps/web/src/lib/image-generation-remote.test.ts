@@ -7,13 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 import type {
-  ArtifactRouteKind,
-  BudgetScopeProjection,
-  DestinationGrantRow,
   ImageBudgetState,
-  ImageGenerationPartition,
-  ImageGenerationRemoteState,
-  ImageGenerationRole,
   ImageJob,
   JobEvent,
   JobIdentity,
@@ -467,7 +461,6 @@ describe("image-generation reference uploads", () => {
 
   it("retry does not bind a stale attachment", () => {
     // After failure, a retry creates a new upload ID; old completion is discarded.
-    const oldUpload = makeUpload({ uploadId: "upload-1", state: "failed" });
     // isUploadRetired is false for "failed", but shouldDiscardUploadEvent
     // discards on wrong ID or older epoch. A retry would create upload-2.
     const newUpload = makeUpload({ uploadId: "upload-2", selectionEpoch: 2, state: "uploading" });

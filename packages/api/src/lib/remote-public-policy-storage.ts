@@ -303,7 +303,7 @@ export class PostgresPolicyStore implements PolicyStore {
           args.replicaGeneration,
         );
         const lease = rows[0];
-        if (!lease || lease.state !== "draining" || lease.expired !== true) {
+        if (lease?.state !== "draining" || lease.expired !== true) {
           return { removed: false, membershipGeneration: null };
         }
         const membershipGeneration = await this.bumpMembership(tx, text(lease.consumerId));
@@ -335,7 +335,7 @@ export class PostgresPolicyStore implements PolicyStore {
           args.replicaId,
         );
         const lease = rows[0];
-        if (!lease || lease.state !== "stale" || lease.reapable !== true) {
+        if (lease?.state !== "stale" || lease.reapable !== true) {
           return { reaped: false, membershipGeneration: null };
         }
         const consumerId = text(lease.consumerId);
@@ -392,7 +392,7 @@ export class PostgresPolicyStore implements PolicyStore {
         const group = groups[0];
         // Unknown consumer or a group that is not required cannot durably ACK:
         // drop any stale snapshot and report un-acked.
-        if (!group || group.state !== "required") {
+        if (group?.state !== "required") {
           await this.deleteSnapshot(tx, args.policyId, args.consumerId);
           return {
             acked: false,

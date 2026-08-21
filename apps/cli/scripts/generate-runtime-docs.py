@@ -110,8 +110,11 @@ Documentation: {docs_url}
 
 
 def catalog_values(metadata: dict) -> dict[str, str]:
-    source = CATALOG.read_text()
-    safety = (CATALOG.parent / "safety_adapters.rs").read_text()
+    # Pin the repository file encoding. On Windows, the locale default can be a
+    # legacy code page, which makes a byte-for-byte `--check` report false drift
+    # for the UTF-8 documentation we generate.
+    source = CATALOG.read_text(encoding="utf-8")
+    safety = (CATALOG.parent / "safety_adapters.rs").read_text(encoding="utf-8")
     missing = [item for item in IDS[:2] if source.count(item) < 3]
     for name in IDS[2:]:
         if name not in safety:
@@ -142,7 +145,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    metadata = tomllib.loads(METADATA.read_text())
+    metadata = tomllib.loads(METADATA.read_text(encoding="utf-8"))
     values = catalog_values(metadata)
     surface = metadata["surface"]
     media = metadata["media"]
@@ -176,15 +179,15 @@ def main() -> int:
     )
     warning = WARNING_TEMPLATE.format(**surface)
     if args.check:
-        if not DOC.exists() or DOC.read_text() != document:
+        if not DOC.exists() or DOC.read_text(encoding="utf-8") != document:
             raise SystemExit(f"generated documentation drift: {DOC.relative_to(ROOT)}")
-        if not WARNING.exists() or WARNING.read_text() != warning:
+        if not WARNING.exists() or WARNING.read_text(encoding="utf-8") != warning:
             raise SystemExit(f"generated warning drift: {WARNING.relative_to(ROOT)}")
         return 0
     DOC.parent.mkdir(parents=True, exist_ok=True)
-    DOC.write_text(document)
+    DOC.write_text(document, encoding="utf-8")
     WARNING.parent.mkdir(parents=True, exist_ok=True)
-    WARNING.write_text(warning)
+    WARNING.write_text(warning, encoding="utf-8")
     return 0
 
 

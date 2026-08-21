@@ -1543,6 +1543,7 @@ export const knownEventKindSchema = z.enum([
   "gitignore_allow",
   "goal_supervision_progress",
   "history_replay",
+  "host_capabilities_changed",
   "inference_failed",
   "inference_succeeded",
   "inference_warning",
@@ -1622,6 +1623,62 @@ const historyReplayDataSchema = z
     session_id: uuidSchema,
     entries: z.array(historyEntryWireSchema),
     max_seq: safeI64NumberSchema,
+  })
+  .passthrough();
+const hostCapabilityFeatureSchema = z
+  .object({
+    id: z.string().min(1),
+    state: z.enum(["available", "missing", "unsupported", "failed"]),
+    reason: z.string(),
+    fix_command: z.string().optional(),
+    remedy_text: z.string().optional(),
+    dependency_ids: z.array(z.string().min(1)).optional(),
+  })
+  .passthrough();
+const hostCapabilityDependencySchema = z
+  .object({
+    id: z.string().min(1),
+    state: z.enum([
+      "pending",
+      "available",
+      "missing",
+      "incompatible",
+      "timed_out",
+      "failed",
+      "unknown",
+      "not_applicable",
+    ]),
+    importance: z.enum([
+      "required_for_default_safety",
+      "required_when_feature_selected",
+      "optional_integration",
+      "optional_accelerator",
+    ]),
+    target: z.enum(["host", "container"]),
+    required_version: z.string().optional(),
+    discovered_version: z.string().optional(),
+    cause: z.unknown().optional(),
+    remedy: z.unknown().optional(),
+    reason: z.string(),
+  })
+  .passthrough();
+const hostCapabilitiesChangedDataSchema = z
+  .object({
+    snapshot: z
+      .object({
+        generation: safeU64NumberSchema,
+        features: z.array(hostCapabilityFeatureSchema),
+        dependencies: z.array(hostCapabilityDependencySchema),
+        secretStore: z
+          .object({
+            intent: z.enum(["unconfigured", "database", "keyring"]),
+            effective_placement: z.enum(["unavailable", "database", "keyring"]),
+            fail_closed_reason: z.string().nullable().optional(),
+            fix_command: z.string().nullable().optional(),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
   })
   .passthrough();
 const interruptResolvedDataSchema = z
@@ -1774,6 +1831,7 @@ const structuredEventDataSchemas = {
   default_model_update_result: defaultModelUpdateResultDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,
+  host_capabilities_changed: hostCapabilitiesChangedDataSchema,
   interrupt_raised: interruptRaisedDataSchema,
   model_selection_result: modelSelectionResultDataSchema,
   interrupt_resolved: interruptResolvedDataSchema,

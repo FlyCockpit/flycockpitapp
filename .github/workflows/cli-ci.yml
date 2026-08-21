@@ -215,19 +215,21 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      # Pinned coturn image. TODO(turn-coturn-conformance): before marking this
-      # job REQUIRED, replace the version tag with an immutable digest pin
-      # (`docker.io/coturn/coturn:4.6.2@sha256:<digest>`) captured from
-      # `docker buildx imagetools inspect` so the server binary cannot silently
-      # change. The version tag is used until the digest is recorded.
+      # The immutable digest keeps the conformance server binary reproducible.
       - name: Start pinned coturn (UDP/TCP/TLS, long-term credentials)
         env:
-          COTURN_IMAGE: docker.io/coturn/coturn:4.6.2
+          COTURN_IMAGE: docker.io/coturn/coturn:4.6.2@sha256:4873c54f213ec81f6b4c4c4938b69c922f50b2293ded427f5191472b9a127227
           TURN_USER: turnuser
           TURN_PASS: turnpass
           TURN_TLS_SNI: localhost
         run: |
           set -euo pipefail
+          show_coturn_logs() {
+            echo "::group::coturn logs"
+            docker logs coturn || true
+            echo "::endgroup::"
+          }
+          trap 'status=$?; show_coturn_logs; exit "$status"' ERR
           certdir="$RUNNER_TEMP/coturn-tls"
           mkdir -p "$certdir"
           # Self-signed cert for the fixture SNI; trust it locally so
@@ -250,11 +252,32 @@ jobs:
             --cert /tls/cert.pem --pkey /tls/key.pem \
             --denied-peer-ip 0.0.0.0-0.255.255.255 \
             --no-multicast-peers
-          # Wait for the UDP listener.
+          # UDP port scans do not prove a listener is usable. Require both the
+          # TCP TURN listener and a verified TLS handshake before running the
+          # real-I/O conformance test.
+          ready=false
           for _ in $(seq 1 30); do
-            if nc -z -u 127.0.0.1 3478 2>/dev/null; then break; fi
+            if nc -z -w 1 127.0.0.1 3478 2>/dev/null \
+              && openssl s_client -brief \
+                -connect "127.0.0.1:5349" \
+                -servername "$TURN_TLS_SNI" \
+                -verify_hostname "$TURN_TLS_SNI" \
+                -verify_return_error \
+                -CAfile "$certdir/cert.pem" \
+                </dev/null >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' coturn 2>/dev/null | grep -qx true; then
+              echo "coturn exited before becoming ready" >&2
+              exit 1
+            fi
             sleep 1
           done
+          if [ "$ready" != true ]; then
+            echo "coturn did not become TCP/TLS-ready within 30 seconds" >&2
+            exit 1
+          fi
           {
             echo "COTURN_CONFORMANCE=1"
             echo "TURN_HOST=127.0.0.1"
@@ -275,6 +298,10 @@ jobs:
           --features turn-coturn-conformance
           --run-ignored ignored-only
           -E 'test(remote_turn_socket_provider_coturn_conformance)'
+
+      - name: Print coturn logs on failure
+        if: failure()
+        run: docker logs coturn || true
 
       - name: Stop coturn
         if: always()

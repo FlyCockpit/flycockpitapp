@@ -842,6 +842,14 @@ pub struct Driver {
     test_compact_model_ref: Option<String>,
     #[cfg(test)]
     test_compaction_apply_trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    /// Deterministically force a compaction to fail at prepare or apply so the
+    /// `preCompact`/`postCompact` hook control-flow contract can be exercised
+    /// (both error paths are genuinely reachable in production — a concurrent
+    /// history change makes apply `Stale`, a store error makes it
+    /// `StoreCompressedResults`, a cancelled/overflowing brief makes prepare
+    /// fail — but are not reachable from a black-box unit test).
+    #[cfg(test)]
+    test_compact_force_failure: Option<CompactForceFailure>,
     redaction_scan_environment_override: Option<bool>,
     redaction_scan_dotenv_override: Option<bool>,
     redaction_scan_ssh_keys_override: Option<bool>,
@@ -890,6 +898,15 @@ struct TestCompactBriefCall {
     history: Vec<Message>,
     attempt: u8,
     fit_rung: crate::engine::compact_draft::CompactFitRung,
+}
+
+/// Which compaction stage a test forces to fail (see
+/// `Driver::test_compact_force_failure`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::engine::driver) enum CompactForceFailure {
+    Prepare,
+    Apply,
 }
 
 #[cfg(test)]
@@ -1362,6 +1379,8 @@ impl Driver {
             test_compact_model_ref: self.test_compact_model_ref.clone(),
             #[cfg(test)]
             test_compaction_apply_trace: self.test_compaction_apply_trace.clone(),
+            #[cfg(test)]
+            test_compact_force_failure: self.test_compact_force_failure,
             redaction_scan_environment_override: self.redaction_scan_environment_override,
             redaction_scan_dotenv_override: self.redaction_scan_dotenv_override,
             redaction_scan_ssh_keys_override: self.redaction_scan_ssh_keys_override,
@@ -1674,6 +1693,8 @@ impl Driver {
             test_compact_model_ref: None,
             #[cfg(test)]
             test_compaction_apply_trace: None,
+            #[cfg(test)]
+            test_compact_force_failure: None,
             redaction_scan_environment_override: None,
             redaction_scan_dotenv_override: None,
             redaction_scan_ssh_keys_override: None,
@@ -2858,6 +2879,10 @@ impl Driver {
                             class: f.class.clone(),
                         });
                     }
+                    // `stopFailure` observe hooks: an inference/API error ends
+                    // the attempt without a normal stop gate. Fire before the
+                    // stack unwind; never on a normal `Done`.
+                    self.run_stop_failure_hooks(&f.class).await;
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),
@@ -4406,6 +4431,57 @@ impl Driver {
         self.goal_idle_intervention_code = Some("agent_failed_to_progress_after_continue");
     }
 
+    /// Fire matching observe-only lifecycle hooks against the turn-pinned hook
+    /// registry (`self.config.snapshot().hooks()` — the same snapshot handed to
+    /// `DispatchEnv.hooks`). Observe hooks never block and are fail-open;
+    /// production always spawns through the shipped `TokioCommandRunner` /
+    /// `DefaultProcessEnv`, exactly like the pre/post-tool sites.
+    async fn fire_observe_hook(
+        &self,
+        event: crate::config::extended::hooks::HookEvent,
+        match_value: &str,
+        tool_name: Option<&str>,
+        tool_call_id: Option<&str>,
+        fields: crate::engine::agent::hooks::ObserveFields<'_>,
+    ) {
+        let snapshot = self.config.snapshot();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
+            event,
+            match_value,
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
+            tool_name,
+            tool_call_id,
+            None,
+            None,
+            fields,
+        )
+        .await;
+    }
+
+    /// Fire `stopFailure` observe hooks on an inference/API error that ends the
+    /// attempt without a normal stop gate. Matcher / `errorClass` are the stable
+    /// per-variant token from [`error_class_match_value`]. Never fired on a
+    /// normal `TurnOutcome::Done`.
+    async fn run_stop_failure_hooks(&self, class: &crate::engine::model::InferenceErrorClass) {
+        let match_value = crate::engine::agent::hooks::error_class_match_value(class);
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::StopFailure,
+            match_value,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                error_class: Some(match_value),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     async fn record_user_message_event(
         &mut self,
         agent: Option<&str>,
@@ -4413,6 +4489,13 @@ impl Driver {
         data: &serde_json::Value,
         receipts: &[crate::engine::message::ClientSubmissionReceipt],
         tx: &mpsc::Sender<TurnEvent>,
+        // `userPromptSubmit` matcher / `promptSource`: `Some("user")` for a
+        // genuine direct external submission, `Some("queued")` for a queued-user
+        // fold, and `None` to SUPPRESS the event entirely for host / goal /
+        // scheduled / system-driven auto-turns (which reach the same recording
+        // path via `run_user_input` but are not user prompts). Host-injected
+        // stop-continuation feedback never calls this method at all.
+        prompt_source: Option<&'static str>,
     ) -> UserMessageRecordOutcome {
         for attempt in 0..USER_MESSAGE_EVENT_WRITE_ATTEMPTS {
             #[cfg(test)]
@@ -4449,7 +4532,27 @@ impl Driver {
                 .await;
 
             match result {
-                Ok(seq) => return UserMessageRecordOutcome::Recorded(seq),
+                Ok(seq) => {
+                    // `userPromptSubmit` observe hooks: fire once, AFTER the
+                    // user-message row is durably persisted, keyed off the real
+                    // user-submit source. Suppressed (never fired) for host /
+                    // goal / scheduled auto-turns (`prompt_source == None`).
+                    // Observe-only / fail-open.
+                    if let Some(source) = prompt_source {
+                        self.fire_observe_hook(
+                            crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+                            source,
+                            None,
+                            None,
+                            crate::engine::agent::hooks::ObserveFields {
+                                prompt_source: Some(source),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                    return UserMessageRecordOutcome::Recorded(seq);
+                }
                 Err(error) if receipts.is_empty() => {
                     tracing::warn!(%error, "record user_message event failed");
                     return UserMessageRecordOutcome::Untracked;
@@ -4549,6 +4652,10 @@ impl Driver {
                 &data,
                 &folded.client_submissions,
                 tx,
+                // A fold is a genuine queued-USER submission — fire `queued`
+                // only when the folded submission is itself an external user
+                // origin, never for a host-driven origin that reached the batch.
+                folded.origin.user_prompt_submit_source().map(|_| "queued"),
             )
             .await
         {
@@ -6359,6 +6466,11 @@ impl Driver {
         // built. Non-vision callers already folded images into `text` and
         // pass none here (composer-paste-handling).
         let submission_kind = submission.kind;
+        // Classify the root-turn origin for the `userPromptSubmit` hook: only a
+        // genuine external user submission fires the event; goal / scheduled /
+        // auto-continue / retry / tool-result / internal directives reach this
+        // same path but must NOT (see `SubmissionOrigin::user_prompt_submit_source`).
+        let user_prompt_source = submission.origin.user_prompt_submit_source();
         let images = submission.images;
         let user_text = submission.text;
         let display_text = submission.display_text;
@@ -6498,6 +6610,7 @@ impl Driver {
                 &event_data,
                 &client_submissions,
                 tx,
+                user_prompt_source,
             )
             .await
         {
@@ -6989,6 +7102,10 @@ impl Driver {
                             .mark_run_invocation_terminal(run_id, "failed", "failed", now)
                             .await;
                     }
+                    // `stopFailure` observe hooks: a terminal inference/API
+                    // error ends the root attempt without a normal stop gate.
+                    // Fire before the stack unwind; never on a normal `Done`.
+                    self.run_stop_failure_hooks(&f.class).await;
                     self.unwind_stack_to_root_and_discard_pending_input(
                         StackUnwindReason::InferenceFailed {
                             provider: f.provider.clone(),

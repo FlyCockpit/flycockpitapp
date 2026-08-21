@@ -160,6 +160,29 @@ impl SubmissionOrigin {
     pub fn advances_activity_epoch(self) -> bool {
         matches!(self, Self::ExternalRoot)
     }
+
+    /// The `userPromptSubmit` hook `promptSource` for a root turn driven by a
+    /// submission of this origin, or `None` when the origin is a host / goal /
+    /// scheduled / system-driven turn that must NOT fire the "a user submitted a
+    /// prompt" event. Only a genuine external user submission
+    /// ([`Self::ExternalRoot`]) is a real user prompt; every host-driven
+    /// auto-turn (goal supervision, scheduled jobs, auto-continue, retry
+    /// recovery, tool-result / compact continuations, and internal directives)
+    /// reuses the same `run_user_input` entry point but is NOT a user prompt.
+    /// Exhaustive so a new origin variant is a compile error here, forcing an
+    /// explicit fire-or-suppress decision.
+    pub fn user_prompt_submit_source(self) -> Option<&'static str> {
+        match self {
+            Self::ExternalRoot => Some("user"),
+            Self::GoalContinuation
+            | Self::ScheduledJob
+            | Self::AutoContinue
+            | Self::RetryRecovery
+            | Self::ToolResult
+            | Self::CompactNotice
+            | Self::Internal => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

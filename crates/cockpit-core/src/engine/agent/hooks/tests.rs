@@ -1022,33 +1022,286 @@ fn clip_reason_exact_max_is_not_truncated() {
 // Hook event table tests
 // ---------------------------------------------------------------------------
 
+/// Run one matching `run_observe_hooks` invocation against a fresh ledger and
+/// return `(recorded (event,status) rows, parsed stdin envelope if the hook was
+/// invoked)`. Drives the production dispatcher every wired boundary calls, with
+/// an injected fake runner (captures stdin) + fake process env — no real
+/// process, no wall-clock sleep, no `std::env` mutation.
+async fn observe_once(
+    process_env: &dyn ProcessEnv,
+    reg: &HookRegistry,
+    event: HookEvent,
+    match_value: &str,
+    tool_name: Option<&str>,
+    fields: ObserveFields<'_>,
+) -> (Vec<(String, String)>, Option<Value>) {
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+    run_observe_hooks(
+        &runner,
+        process_env,
+        reg,
+        event,
+        match_value,
+        sid,
+        workspace(),
+        &db,
+        tool_name,
+        None,
+        None,
+        None,
+        fields,
+    )
+    .await;
+    let rows = hook_run_events(&db, sid).await;
+    let stdin_json = runner
+        .invocations()
+        .first()
+        .map(|inv| serde_json::from_str::<Value>(&inv.stdin).expect("envelope is valid JSON"));
+    (rows, stdin_json)
+}
+
+/// A `ResolvedHook` matching `event` only on `matcher`.
+fn observe_hook(event: HookEvent, matcher: &str) -> ResolvedHook {
+    test_hook(
+        event,
+        vec!["obs".to_string()],
+        Some(vec![matcher.to_string()]),
+        BTreeMap::new(),
+        5,
+    )
+}
+
+#[tokio::test]
+async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
+    // Scripted per-event harness. For each of the six wired observe events:
+    //   1. a hook whose matcher equals the boundary vocabulary fires exactly
+    //      one `hook_run` row and receives its first-class typed envelope field
+    //      on stdin, and
+    //   2. a hook whose matcher is a *lookalike* (a sibling value the boundary
+    //      never uses) fires nothing — proving exact-matcher selection, not a
+    //      blanket "any hook for this event" dispatch.
+    // The typed-field assertions fail to compile against dead-code HEAD (the
+    // `startSource`/`promptSource`/`permissionKind`/`errorClass`/`compactSource`
+    // envelope fields and `ObserveFields` do not exist there), and the row/no-row
+    // assertions fail behaviorally if a boundary's matcher/typed field is wrong.
+    let env = FakeProcessEnv::with_default_resolution();
+
+    // sessionStart: matcher `fresh` | `resume`; typed field `startSource`.
+    let (rows, stdin) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::SessionStart, "fresh")]),
+        HookEvent::SessionStart,
+        "fresh",
+        None,
+        ObserveFields {
+            start_source: Some("fresh"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("sessionStart".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("sessionStart hook invoked");
+    assert_eq!(stdin["hookEventName"], "sessionStart");
+    assert_eq!(stdin["startSource"], "fresh");
+    // Lookalike matcher (`resume`) must not fire on a `fresh` start.
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::SessionStart, "resume")]),
+        HookEvent::SessionStart,
+        "fresh",
+        None,
+        ObserveFields {
+            start_source: Some("fresh"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "resume-only hook must not fire on fresh start"
+    );
+
+    // userPromptSubmit: matcher `user` | `queued`; typed field `promptSource`.
+    let (rows, stdin) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::UserPromptSubmit, "queued")]),
+        HookEvent::UserPromptSubmit,
+        "queued",
+        None,
+        ObserveFields {
+            prompt_source: Some("queued"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("userPromptSubmit".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("userPromptSubmit hook invoked");
+    assert_eq!(stdin["promptSource"], "queued");
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::UserPromptSubmit, "user")]),
+        HookEvent::UserPromptSubmit,
+        "queued",
+        None,
+        ObserveFields {
+            prompt_source: Some("queued"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "user-only hook must not fire on queued fold"
+    );
+
+    // permissionDenied: matcher = resolved tool name; typed field
+    // `permissionKind` carries the deny status string (distinct from the
+    // matcher), and the envelope also carries `toolName`.
+    let (rows, stdin) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::PermissionDenied, "bash")]),
+        HookEvent::PermissionDenied,
+        "bash",
+        Some("bash"),
+        ObserveFields {
+            permission_kind: Some("review_cage_denied"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("permissionDenied".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("permissionDenied hook invoked");
+    assert_eq!(stdin["toolName"], "bash");
+    assert_eq!(stdin["permissionKind"], "review_cage_denied");
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::PermissionDenied, "read")]),
+        HookEvent::PermissionDenied,
+        "bash",
+        Some("bash"),
+        ObserveFields {
+            permission_kind: Some("review_cage_denied"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "read-only hook must not fire on a bash deny"
+    );
+
+    // preCompact / postCompact: matcher = compact source; typed field
+    // `compactSource`. `agent_requested` is preserved as its OWN value (F2),
+    // never collapsed into `auto`.
+    for (event, key, source) in [
+        (HookEvent::PreCompact, "preCompact", "manual"),
+        (HookEvent::PostCompact, "postCompact", "auto"),
+        (HookEvent::PreCompact, "preCompact", "agent_requested"),
+    ] {
+        let (rows, stdin) = observe_once(
+            &env,
+            &registry(vec![observe_hook(event, source)]),
+            event,
+            source,
+            None,
+            ObserveFields {
+                compact_source: Some(source),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(rows, vec![(key.to_string(), "success".to_string())]);
+        let stdin = stdin.expect("compact hook invoked");
+        assert_eq!(stdin["hookEventName"], key);
+        assert_eq!(stdin["compactSource"], source);
+    }
+    // An `agent_requested` compaction must not fire an `auto`-only hook.
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::PreCompact, "auto")]),
+        HookEvent::PreCompact,
+        "agent_requested",
+        None,
+        ObserveFields {
+            compact_source: Some("agent_requested"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "agent_requested must stay a distinct compactSource from auto"
+    );
+
+    // stopFailure: matcher = `error_class_match_value`; typed field `errorClass`.
+    let network = error_class_match_value(&crate::engine::model::InferenceErrorClass::Network);
+    assert_eq!(network, "network");
+    let (rows, stdin) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::StopFailure, network)]),
+        HookEvent::StopFailure,
+        network,
+        None,
+        ObserveFields {
+            error_class: Some(network),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("stopFailure".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("stopFailure hook invoked");
+    assert_eq!(stdin["errorClass"], "network");
+    // A different error class is a distinct token (no vocabulary collapse).
+    let ttft = error_class_match_value(&crate::engine::model::InferenceErrorClass::TimeoutTtft);
+    assert_ne!(ttft, network);
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::StopFailure, ttft)]),
+        HookEvent::StopFailure,
+        network,
+        None,
+        ObserveFields {
+            error_class: Some(network),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "a timeout_ttft-only hook must not fire on a network failure"
+    );
+}
+
 #[test]
-fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
-    // Every typed config event fires exactly at its named lifecycle boundary.
-    // This test verifies the event key strings are stable and the policy
-    // assigns the correct gate, applicability, and matcher for each event.
-    let events = HookEvent::ALL;
-    assert_eq!(events.len(), 13);
-
-    // Verify each event has a unique key.
-    let keys: Vec<&str> = events.iter().map(|e| e.key()).collect();
-    let unique: std::collections::HashSet<_> = keys.iter().collect();
-    assert_eq!(keys.len(), unique.len());
-
-    // Verify key strings match the native lifecycle boundaries.
-    assert_eq!(HookEvent::SessionStart.key(), "sessionStart");
-    assert_eq!(HookEvent::UserPromptSubmit.key(), "userPromptSubmit");
-    assert_eq!(HookEvent::PreToolUse.key(), "preToolUse");
-    assert_eq!(HookEvent::PostToolUse.key(), "postToolUse");
-    assert_eq!(HookEvent::PostToolUseFailure.key(), "postToolUseFailure");
-    assert_eq!(HookEvent::PermissionDenied.key(), "permissionDenied");
-    assert_eq!(HookEvent::Stop.key(), "stop");
-    assert_eq!(HookEvent::StopFailure.key(), "stopFailure");
-    assert_eq!(HookEvent::SubagentStart.key(), "subagentStart");
-    assert_eq!(HookEvent::SubagentStop.key(), "subagentStop");
-    assert_eq!(HookEvent::PreCompact.key(), "preCompact");
-    assert_eq!(HookEvent::PostCompact.key(), "postCompact");
-    assert_eq!(HookEvent::SessionEnd.key(), "sessionEnd");
+fn error_class_match_value_is_stable_per_variant() {
+    use crate::engine::model::InferenceErrorClass as C;
+    // Fixed variants reuse the class's own snake_case vocabulary; the two
+    // data-bearing variants collapse to a stable coarse `&'static str` token.
+    assert_eq!(error_class_match_value(&C::TimeoutTtft), "timeout_ttft");
+    assert_eq!(error_class_match_value(&C::TimeoutIdle), "timeout_idle");
+    assert_eq!(error_class_match_value(&C::Network), "network");
+    assert_eq!(error_class_match_value(&C::Http(503)), "http");
+    assert_eq!(
+        error_class_match_value(&C::BillingOrQuotaExhausted),
+        "billing_or_quota_exhausted"
+    );
+    assert_eq!(
+        error_class_match_value(&C::Other("weird".to_string())),
+        "other"
+    );
 }
 
 #[test]
@@ -1565,10 +1818,14 @@ async fn tool_hook_matcher_and_ordering() {
             sid,
             workspace(),
             &db,
-            Some("fresh"),
             None,
             None,
             None,
+            None,
+            ObserveFields {
+                start_source: Some("fresh"),
+                ..Default::default()
+            },
         )
         .await;
         assert_eq!(

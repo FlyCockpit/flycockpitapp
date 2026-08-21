@@ -236,3 +236,149 @@ fn steer_queue_drains_fifo_at_child_turn_boundary() {
         "turn-boundary drain consumes queued steers"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle observe-hook boundary wiring (userPromptSubmit / stopFailure)
+//
+// These drive the real driver production entry points at their named
+// boundaries. The hook command is unresolvable so it fails open
+// (executable-not-found) without spawning a process; a `hook_run` row is still
+// recorded, which is the wiring signal. On dead-code HEAD (no wiring) no such
+// row exists, so each fails there. Shared helpers
+// (`observe_boundary_registry` / `inject_hooks` / `observe_hook_events`) live
+// in `tests/mod.rs`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn submission_origin_user_prompt_source_only_fires_for_external_user() {
+    // The single explicit discriminator (carried on the submission, not ambient
+    // state): only a genuine external user submission is a `userPromptSubmit`;
+    // every host / goal / scheduled / system-driven origin suppresses it. This
+    // is the classification the `run_user_input` path keys off, so it can never
+    // fire as `"user"` for a goal or scheduled auto-turn.
+    use crate::engine::message::SubmissionOrigin as O;
+    assert_eq!(O::ExternalRoot.user_prompt_submit_source(), Some("user"));
+    for host in [
+        O::GoalContinuation,
+        O::ScheduledJob,
+        O::AutoContinue,
+        O::RetryRecovery,
+        O::ToolResult,
+        O::CompactNotice,
+        O::Internal,
+    ] {
+        assert_eq!(
+            host.user_prompt_submit_source(),
+            None,
+            "{host:?} must not fire userPromptSubmit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
+    // Drive the record boundary directly with each resolved source. `user`
+    // fires one row; a `queued`-only hook does not fire for `user` (exact
+    // matcher); and `None` (a host/goal/scheduled origin) fires ZERO rows even
+    // with a `user`-matched hook registered — the regression the reviewer
+    // flagged (goal/scheduled auto-turns hitting the hardcoded `"user"`).
+    let (tx, _rx) = mpsc::channel(8);
+    let data = serde_json::json!({ "text": "hello" });
+
+    // `Some("user")` → one row.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+            "user",
+        ),
+    );
+    let _ = driver
+        .record_user_message_event(Some("Build"), None, &data, &[], &tx, Some("user"))
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "userPromptSubmit").await,
+        vec!["failed".to_string()],
+        "a genuine user submission must fire exactly one userPromptSubmit hook"
+    );
+
+    // A queued-only hook must NOT fire for a `user` submission.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+            "queued",
+        ),
+    );
+    let _ = driver
+        .record_user_message_event(Some("Build"), None, &data, &[], &tx, Some("user"))
+        .await;
+    assert!(
+        observe_hook_events(&driver, "userPromptSubmit")
+            .await
+            .is_empty(),
+        "a queued-only hook must not fire on a user submission"
+    );
+
+    // `None` (host / goal / scheduled auto-turn) → ZERO rows even with a
+    // `user`-matched hook registered.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+            "user",
+        ),
+    );
+    let _ = driver
+        .record_user_message_event(Some("Build"), None, &data, &[], &tx, None)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "userPromptSubmit")
+            .await
+            .is_empty(),
+        "a host/goal/scheduled auto-turn must fire NO userPromptSubmit hook"
+    );
+}
+
+#[tokio::test]
+async fn stop_failure_hook_fires_on_inference_error_class() {
+    // The production `run_stop_failure_hooks` helper (the exact call the two
+    // inference-failure arms make before unwinding) fires a `stopFailure` hook
+    // matched on the error-class token, and does not fire on a lookalike class.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::StopFailure,
+            "network",
+        ),
+    );
+    driver
+        .run_stop_failure_hooks(&crate::engine::model::InferenceErrorClass::Network)
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "stopFailure").await,
+        vec!["failed".to_string()],
+        "a network inference failure must fire exactly one stopFailure hook"
+    );
+
+    // A `timeout_ttft`-only hook must not fire on a network failure.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::StopFailure,
+            "timeout_ttft",
+        ),
+    );
+    driver
+        .run_stop_failure_hooks(&crate::engine::model::InferenceErrorClass::Network)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "stopFailure").await.is_empty(),
+        "a timeout_ttft-only hook must not fire on a network failure"
+    );
+}

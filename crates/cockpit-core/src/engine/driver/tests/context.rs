@@ -2859,3 +2859,108 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
     drop(tx);
     while rx.recv().await.is_some() {}
 }
+
+/// A registry with BOTH `preCompact` and `postCompact` hooks matched on the
+/// `manual` compact source. Commands are unresolvable (fail-open) so no real
+/// process spawns; each firing still records one `hook_run` row.
+fn compact_manual_registry() -> crate::config::extended::hooks::HookRegistry {
+    use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+    let hook = |event: HookEvent| ResolvedHook {
+        event,
+        matcher: Some(["manual".to_string()].into_iter().collect()),
+        command: vec!["cockpit-compact-hook-does-not-exist".to_string()],
+        timeout_secs: 5,
+        env: std::collections::BTreeMap::new(),
+        origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+        source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+        source_directory: std::path::PathBuf::from("/tmp/test"),
+    };
+    HookRegistry {
+        hooks: vec![hook(HookEvent::PreCompact), hook(HookEvent::PostCompact)],
+        warnings: Vec::new(),
+    }
+}
+
+/// The ordered event keys of the `preCompact` / `postCompact` `hook_run` rows.
+async fn compact_hook_event_order(driver: &Driver) -> Vec<String> {
+    driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "hook_run")
+        .filter_map(|e| e.data["event"].as_str().map(str::to_string))
+        .filter(|event| event == "preCompact" || event == "postCompact")
+        .collect()
+}
+
+#[tokio::test]
+async fn compact_hooks_fire_pre_before_post_only_on_success() {
+    // Pin the asymmetric (BY DESIGN) preCompact/postCompact contract over the
+    // real `do_compact_with_source` boundary:
+    //   prepare-fail → 0 pre + 0 post (no compaction attempted)
+    //   apply-fail   → 1 pre + 0 post (preCompact fired before the destructive
+    //                  apply and cannot be retroactively un-fired)
+    //   success      → 1 pre + 1 post, preCompact strictly before postCompact
+    // Source is "manual" so the auto-compact-gate failure branch is never taken.
+
+    // prepare-fail → neither fires.
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Prepare);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert!(
+        observe_hook_events(&driver, "preCompact").await.is_empty(),
+        "prepare failure must not fire preCompact"
+    );
+    assert!(
+        observe_hook_events(&driver, "postCompact").await.is_empty(),
+        "prepare failure must not fire postCompact"
+    );
+
+    // apply-fail → preCompact only.
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Apply);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert_eq!(
+        observe_hook_events(&driver, "preCompact").await,
+        vec!["failed".to_string()],
+        "apply failure must still fire preCompact (fired before the destructive apply)"
+    );
+    assert!(
+        observe_hook_events(&driver, "postCompact").await.is_empty(),
+        "apply failure must NOT fire postCompact (no durable successor)"
+    );
+
+    // success → both, pre strictly before post.
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert_eq!(
+        observe_hook_events(&driver, "preCompact").await,
+        vec!["failed".to_string()],
+        "success must fire exactly one preCompact"
+    );
+    assert_eq!(
+        observe_hook_events(&driver, "postCompact").await,
+        vec!["failed".to_string()],
+        "success must fire exactly one postCompact"
+    );
+    assert_eq!(
+        compact_hook_event_order(&driver).await,
+        vec!["preCompact".to_string(), "postCompact".to_string()],
+        "preCompact must be recorded strictly before postCompact"
+    );
+}

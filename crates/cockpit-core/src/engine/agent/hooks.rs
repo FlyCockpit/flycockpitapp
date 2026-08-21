@@ -100,6 +100,40 @@ pub struct HookEnvelope {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `sessionStart` discriminator: `fresh` | `resume`. First-class typed
+    /// field (Decision 8) — not overloaded onto generic `source`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_source: Option<String>,
+    /// `userPromptSubmit` discriminator: `user` | `queued`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_source: Option<String>,
+    /// `permissionDenied` discriminator: the existing deny status string
+    /// already produced at the ordinary-tool deny site.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_kind: Option<String>,
+    /// `stopFailure` discriminator: the stable inference error-class token
+    /// from [`error_class_match_value`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// `preCompact` / `postCompact` discriminator: `agent_requested` | `auto`
+    /// | `manual`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_source: Option<String>,
+}
+
+/// Typed, camelCase observe-envelope discriminators (Decision 8 / F1).
+///
+/// Each observe event populates exactly the field(s) meaningful to it; the
+/// rest stay `None` and are omitted from the serialized JSON. These are
+/// first-class typed fields, deliberately NOT overloaded onto the generic
+/// `source` / `reason` keys.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ObserveFields<'a> {
+    pub start_source: Option<&'a str>,
+    pub prompt_source: Option<&'a str>,
+    pub permission_kind: Option<&'a str>,
+    pub error_class: Option<&'a str>,
+    pub compact_source: Option<&'a str>,
 }
 
 impl HookEnvelope {
@@ -130,6 +164,11 @@ impl HookEnvelope {
             subagent_type: None,
             source: None,
             reason: None,
+            start_source: None,
+            prompt_source: None,
+            permission_kind: None,
+            error_class: None,
+            compact_source: None,
         }
     }
 
@@ -166,11 +205,19 @@ impl HookEnvelope {
             subagent_type: None,
             source: None,
             reason: None,
+            start_source: None,
+            prompt_source: None,
+            permission_kind: None,
+            error_class: None,
+            compact_source: None,
         }
     }
 
     /// Build an observe-only lifecycle envelope.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    ///
+    /// `fields` carries the first-class typed discriminators (Decision 8);
+    /// generic `source` / `reason` remain for the stop-gate `end_turn` path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_observe(
         event: HookEvent,
         session_id: Uuid,
@@ -182,6 +229,7 @@ impl HookEnvelope {
         reason: Option<&str>,
         subagent_type: Option<&str>,
         subagent_id: Option<&str>,
+        fields: ObserveFields<'_>,
     ) -> Self {
         Self {
             hook_event_name: event.key().to_string(),
@@ -199,6 +247,11 @@ impl HookEnvelope {
             subagent_type: subagent_type.map(str::to_string),
             source: source.map(str::to_string),
             reason: reason.map(str::to_string),
+            start_source: fields.start_source.map(str::to_string),
+            prompt_source: fields.prompt_source.map(str::to_string),
+            permission_kind: fields.permission_kind.map(str::to_string),
+            error_class: fields.error_class.map(str::to_string),
+            compact_source: fields.compact_source.map(str::to_string),
         }
     }
 
@@ -1273,6 +1326,7 @@ pub(crate) async fn run_stop_hooks(
         None,
         None,
         None,
+        ObserveFields::default(),
     );
     let stdin = envelope.to_json_string();
 
@@ -1415,7 +1469,7 @@ pub(crate) async fn run_stop_hooks(
 /// `sessionEnd`) never block. All matching hooks run sequentially even if an
 /// earlier observer fails. Each failed run is recorded; a nonmatching handler
 /// produces no row.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_observe_hooks(
     runner: &dyn CommandRunner,
     process_env: &dyn ProcessEnv,
@@ -1425,10 +1479,11 @@ pub(crate) async fn run_observe_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
-    source: Option<&str>,
-    reason: Option<&str>,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
     subagent_type: Option<&str>,
     subagent_id: Option<&str>,
+    fields: ObserveFields<'_>,
 ) {
     let hooks = matching_hooks(registry, event, match_value);
     if hooks.is_empty() {
@@ -1441,12 +1496,13 @@ pub(crate) async fn run_observe_hooks(
         session_id,
         workspace_root,
         &timestamp,
+        tool_name,
+        tool_call_id,
         None,
         None,
-        source,
-        reason,
         subagent_type,
         subagent_id,
+        fields,
     );
     let stdin = envelope.to_json_string();
 
@@ -1464,8 +1520,8 @@ pub(crate) async fn run_observe_hooks(
                     },
                     0,
                     None,
-                    None,
-                    None,
+                    tool_name,
+                    tool_call_id,
                     subagent_id,
                 )
                 .await;
@@ -1478,8 +1534,8 @@ pub(crate) async fn run_observe_hooks(
             event,
             session_id,
             workspace_root,
-            None,
-            None,
+            tool_name,
+            tool_call_id,
         );
         let child_env = match env_result {
             Ok(env) => env,
@@ -1492,8 +1548,8 @@ pub(crate) async fn run_observe_hooks(
                     &HookDecision::Failed { reason },
                     0,
                     None,
-                    None,
-                    None,
+                    tool_name,
+                    tool_call_id,
                     subagent_id,
                 )
                 .await;
@@ -1533,11 +1589,39 @@ pub(crate) async fn run_observe_hooks(
             &decision,
             raw.duration_ms,
             None,
-            None,
-            None,
+            tool_name,
+            tool_call_id,
             subagent_id,
         )
         .await;
+    }
+}
+
+/// Stable, per-variant `&'static str` match value for a `stopFailure` hook.
+///
+/// Reuses the inference error-class vocabulary
+/// ([`InferenceErrorClass::as_str`]) so config matchers and tests share ONE
+/// token set rather than a second parallel enum (F3). The two data-bearing
+/// variants (`Http`, `Other`) collapse to a stable coarse token because the
+/// helper must return `&'static str`.
+pub(crate) fn error_class_match_value(
+    class: &crate::engine::model::InferenceErrorClass,
+) -> &'static str {
+    use crate::engine::model::InferenceErrorClass as C;
+    match class {
+        C::TimeoutTtft => "timeout_ttft",
+        C::TimeoutIdle => "timeout_idle",
+        C::Network => "network",
+        C::Http(_) => "http",
+        C::UtilityTimeout => "utility_timeout",
+        C::MissingToolEntitlement { .. } => "missing_tool_entitlement",
+        C::ClientSideToolsUnsupported => "client_side_tools_unsupported",
+        C::ResponsesToolIdentity => "responses_tool_identity",
+        C::ProviderNotConfigured => "provider_not_configured",
+        C::ProviderRateLimit => "provider_rate_limit",
+        C::BillingOrQuotaExhausted => "billing_or_quota_exhausted",
+        C::UnrenderableWireField => "unrenderable_wire_field",
+        C::Other(_) => "other",
     }
 }
 

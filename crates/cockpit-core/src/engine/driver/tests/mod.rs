@@ -994,6 +994,64 @@ fn append_complete_test_turns(driver: &mut Driver, count: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared lifecycle observe-hook boundary test helpers.
+//
+// A single observe hook whose command is deliberately unresolvable fails open
+// (executable-not-found) WITHOUT spawning a real process, yet still records a
+// `hook_run` row — the wiring signal every boundary test asserts on.
+// ---------------------------------------------------------------------------
+
+/// A registry with a single observe hook for `event` matched only on `matcher`.
+fn observe_boundary_registry(
+    event: crate::config::extended::hooks::HookEvent,
+    matcher: &str,
+) -> crate::config::extended::hooks::HookRegistry {
+    use crate::config::extended::hooks::{HookOrigin, HookRegistry, ResolvedHook};
+    HookRegistry {
+        hooks: vec![ResolvedHook {
+            event,
+            matcher: Some([matcher.to_string()].into_iter().collect()),
+            command: vec!["cockpit-observe-hook-does-not-exist".to_string()],
+            timeout_secs: 5,
+            env: std::collections::BTreeMap::new(),
+            origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+            source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+            source_directory: std::path::PathBuf::from("/tmp/test"),
+        }],
+        warnings: Vec::new(),
+    }
+}
+
+/// Install a hook registry on the driver's turn-pinned config snapshot without
+/// disturbing the test provider override compaction relies on.
+fn inject_hooks(driver: &mut Driver, reg: crate::config::extended::hooks::HookRegistry) {
+    driver.set_config_handle(
+        crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::with_hooks(
+                1,
+                crate::config::providers::ProvidersConfig::default(),
+                crate::config::extended::ExtendedConfig::default(),
+                reg,
+            ),
+        ),
+    );
+}
+
+/// The recorded `hook_run` statuses for `event`, in insertion order.
+async fn observe_hook_events(driver: &Driver, event: &str) -> Vec<String> {
+    driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "hook_run" && e.data["event"] == event)
+        .map(|e| e.data["status"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 async fn wait_for_shadow_brief(driver: &mut Driver) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

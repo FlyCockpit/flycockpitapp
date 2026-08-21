@@ -1353,6 +1353,43 @@ pub(super) async fn run_worker(
         );
     }
 
+    // `sessionStart` observe hooks: fire once per worker start, after
+    // rehydration completes. Matcher / `startSource` is `resume` when the
+    // session was rehydrated from durable history, else `fresh`. Observe-only /
+    // fail-open; the registry comes from the current config snapshot (cloned so
+    // no lock guard is held across the hook run).
+    {
+        let start_source = if rehydrated.is_some() {
+            "resume"
+        } else {
+            "fresh"
+        };
+        let registry = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hooks()
+            .clone();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            &registry,
+            crate::config::extended::hooks::HookEvent::SessionStart,
+            start_source,
+            session.id,
+            &project_root,
+            &session.db,
+            None,
+            None,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                start_source: Some(start_source),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     // Releasable, debug-build + env-gated pause point
     // (`daemon-lifecycle-replay-timing-robustness.md`, §3 / criterion 1): hold
     // the attach reconciliation BEFORE the crash-surviving `Open → Parked`

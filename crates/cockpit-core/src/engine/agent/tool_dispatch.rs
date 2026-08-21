@@ -129,6 +129,39 @@ pub(crate) enum MontyNativeAuthorization {
     Denied(Value),
 }
 
+/// Fire `permissionDenied` observe hooks for a real approval / safety-gate /
+/// review-cage / standing-reject denial of an ordinary tool. Observe-only and
+/// fail-open: a hook failure never alters the deny decision. Matcher = resolved
+/// canonical tool name; `permissionKind` = the existing deny status string the
+/// deny site already carries. Not fired for a pre-tool hook deny or a
+/// schema-repair failure.
+async fn fire_permission_denied_hook(
+    env: &DispatchEnv<'_>,
+    tool_name: &str,
+    tool_call_id: &str,
+    permission_kind: &'static str,
+) {
+    super::hooks::run_observe_hooks(
+        &super::hooks::TokioCommandRunner::new(),
+        &super::hooks::DefaultProcessEnv,
+        env.hooks,
+        crate::config::extended::hooks::HookEvent::PermissionDenied,
+        tool_name,
+        env.session.id,
+        env.cwd,
+        &env.session.db,
+        Some(tool_name),
+        Some(tool_call_id),
+        None,
+        None,
+        super::hooks::ObserveFields {
+            permission_kind: Some(permission_kind),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
 pub(crate) async fn execute_ordinary_call(
     env: &DispatchEnv<'_>,
     history: &mut Vec<Message>,
@@ -517,6 +550,26 @@ pub(crate) async fn execute_ordinary_call(
     }
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
+    // `permissionDenied` observe-hook classification (Decision 3): a real
+    // approval / safety-gate / standing-reject / review-cage denial of an
+    // ordinary tool. NOT fired for a schema-repair failure, a placeholder
+    // block, a recoverable-repeat guidance message, or the pre-tool hook deny
+    // (which returns before reaching the deny-audit site below). `permissionKind`
+    // is the existing deny status string this path already produces (`gate.rs`
+    // block status for the gate, the tool-call-completed lifecycle status for
+    // the loop guard, and the canonical `review_cage_denied` kind for the cage).
+    let permission_denied_kind: Option<&'static str> =
+        if placeholder_blocked || !repair_outcome.valid || repeated_recoverable_tool_call_reject {
+            None
+        } else if loop_guard_reject {
+            Some("blocked_loop_guard")
+        } else if gate_blocked {
+            Some(gate_block_status)
+        } else if cage_block.is_some() {
+            Some("review_cage_denied")
+        } else {
+            None
+        };
     // Track whether a real tool execution actually occurred. Existing
     // gate/sandbox/approval refusals, schema-validation failures, loop-guard
     // rejections, and placeholder blocks are NOT executions and fire no post
@@ -561,17 +614,38 @@ pub(crate) async fn execute_ordinary_call(
             } else {
                 crate::approval::Decision::NoninteractiveDeny
             };
+            // A /btw approval denial early-returns before the common deny-audit
+            // site below, so `permissionDenied` must fire here (observe-only /
+            // fail-open) with the matching deny kind — otherwise a real
+            // approval / standing-reject denial of a mutating ordinary tool in a
+            // side conversation would fire no hook.
             match decision {
                 crate::approval::Decision::Allow { .. } => {}
                 crate::approval::Decision::NoninteractiveDeny => {
+                    fire_permission_denied_hook(
+                        env,
+                        resolved_name,
+                        &tc.id,
+                        "approval_noninteractive_denied",
+                    )
+                    .await;
                     return Err(invalid_input(crate::approval::NONINTERACTIVE_RUN_DENIAL));
                 }
                 crate::approval::Decision::Deny => {
+                    fire_permission_denied_hook(env, resolved_name, &tc.id, "approval_denied")
+                        .await;
                     return Err(invalid_input(
                         "btw side conversation: mutating tool call denied",
                     ));
                 }
                 crate::approval::Decision::StandingReject { scope } => {
+                    fire_permission_denied_hook(
+                        env,
+                        resolved_name,
+                        &tc.id,
+                        "blocked_standing_reject",
+                    )
+                    .await;
                     return Err(invalid_input(crate::approval::standing_reject_refusal(
                         resolved_name,
                         scope,
@@ -1166,6 +1240,15 @@ pub(crate) async fn execute_ordinary_call(
         {
             tracing::warn!(error = %e, tool = %resolved_name, "record tool_call_completed event failed");
         }
+    }
+
+    // `permissionDenied` observe hooks (Decision 3): fire AFTER the deny has
+    // been recorded and audited (the `tool_call` row + `tool_call_completed`
+    // event above) and BEFORE the rejected-tool diagnostic is returned to the
+    // model. Observe-only / fail-open. The matcher is the resolved canonical
+    // tool name; `permissionKind` is the existing deny status string.
+    if let Some(permission_kind) = permission_denied_kind {
+        fire_permission_denied_hook(env, resolved_name, &tc.id, permission_kind).await;
     }
 
     // §12 correction hints → the WIRE tool_result the model reads
@@ -2127,6 +2210,117 @@ mod tests {
         assert!(!result.contains("should not run"));
     }
 
+    /// Build a registry with a single `permissionDenied` hook matched to
+    /// `tool`. The command is deliberately unresolvable so the hook fails open
+    /// (executable-not-found) WITHOUT spawning a real process — a `hook_run`
+    /// row is still recorded, which is all the wiring assertion needs.
+    fn permission_denied_registry(tool: &str) -> crate::config::extended::hooks::HookRegistry {
+        use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+        HookRegistry {
+            hooks: vec![ResolvedHook {
+                event: HookEvent::PermissionDenied,
+                matcher: Some([tool.to_string()].into_iter().collect()),
+                command: vec!["cockpit-permission-hook-does-not-exist".to_string()],
+                timeout_secs: 5,
+                env: std::collections::BTreeMap::new(),
+                origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+                source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+                source_directory: std::path::PathBuf::from("/tmp/test"),
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    async fn permission_denied_hook_tools(session: &Session) -> Vec<String> {
+        session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "hook_run" && e.data["event"] == "permissionDenied")
+            .map(|e| e.data["tool_name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn permission_denied_hook_fires_on_ordinary_tool_denial() {
+        // A review-cage denial of an ordinary tool fires exactly one
+        // `permissionDenied` hook_run row at the deny-audit site, matched on the
+        // resolved tool name. On dead-code HEAD (no wiring) no such row exists,
+        // so this fails there. A separate ALLOWED dispatch with the SAME hook
+        // registered records NO `permissionDenied` row — proving the event
+        // fires only on a real denial, never on the allow / pre-hook path.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let model = test_model();
+        let reg = permission_denied_registry("echo");
+
+        // (a) Denied by the review cage → one permissionDenied row for `echo`.
+        {
+            let session = test_session(tmp.path());
+            let (tx, _rx) = mpsc::channel(8);
+            let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+            ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+            let env = DispatchEnv {
+                agent: &agent,
+                session: &session,
+                model: &model,
+                active_tools: &tools,
+                ctx: &ctx,
+                tx: &tx,
+                hint_corrections: false,
+                loop_guard_threshold: 10,
+                hooks: &reg,
+                cwd: tmp.path(),
+            };
+            let call = tool_call("echo", serde_json::json!({ "text": "should not run" }));
+            let mut history = Vec::new();
+            push_assistant_call(&mut history, &call);
+            execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                permission_denied_hook_tools(&session).await,
+                vec!["echo".to_string()],
+                "a review-cage denial must fire exactly one permissionDenied hook for `echo`"
+            );
+        }
+
+        // (b) Allowed dispatch (no cage) with the same hook registered → no
+        // permissionDenied row. This covers the "never on the allow / pre-hook
+        // path" contract: the pre-hook deny returns before the deny-audit site,
+        // and a normal dispatch never classifies a permissionKind.
+        {
+            let session = test_session(tmp.path());
+            let (tx, _rx) = mpsc::channel(8);
+            let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+            let env = DispatchEnv {
+                agent: &agent,
+                session: &session,
+                model: &model,
+                active_tools: &tools,
+                ctx: &ctx,
+                tx: &tx,
+                hint_corrections: false,
+                loop_guard_threshold: 10,
+                hooks: &reg,
+                cwd: tmp.path(),
+            };
+            let call = tool_call("echo", serde_json::json!({ "text": "runs fine" }));
+            let mut history = Vec::new();
+            push_assistant_call(&mut history, &call);
+            execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+                .await
+                .unwrap();
+            assert!(
+                permission_denied_hook_tools(&session).await.is_empty(),
+                "an allowed dispatch must not fire permissionDenied"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn placeholder_guard_precedes_schema_validation_in_ordinary_dispatch() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2599,6 +2793,64 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "denied pre-approval call must not be audited as executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_mutating_tool_denial_fires_permission_denied_hook() {
+        // A /btw side-conversation approval denial of a mutating ordinary tool
+        // early-returns before the common deny-audit site, so it must fire
+        // `permissionDenied` at the early-return arm. With no approver the btw
+        // gate resolves to `NoninteractiveDeny`. On dead-code HEAD (no wiring at
+        // the early-return arm) no permissionDenied row exists → this fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+            name: "dynamic_tool",
+            called: called.clone(),
+        }));
+        let agent = test_agent(tools.clone());
+        let session = test_btw_session(tmp.path()).await;
+        session.set_approval_mode(ApprovalMode::Yolo);
+        let model = test_model();
+        let reg = permission_denied_registry("dynamic_tool");
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &reg,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("dynamic_tool", serde_json::json!({ "text": "blocked" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        let err = execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "dynamic_tool",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .expect_err("btw dynamic tool must require approval");
+        assert!(
+            err.to_string()
+                .contains(crate::approval::NONINTERACTIVE_RUN_DENIAL)
+        );
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(
+            permission_denied_hook_tools(&session).await,
+            vec!["dynamic_tool".to_string()],
+            "a /btw approval denial must fire exactly one permissionDenied hook"
         );
     }
 

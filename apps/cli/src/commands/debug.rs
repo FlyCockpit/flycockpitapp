@@ -159,8 +159,10 @@ fn truncate_for_debug(text: &str, limit: usize) -> String {
 /// the daemon's `list_failed_tool_calls` response. Mirrors the daemon-side
 /// `failed_tool_call_json` shape. Carries tool inputs/outputs (never vault
 /// secrets). `recovery_kind`/`recovery_stage` are the raw DB fields; the
-/// daemon projection does not distinguish a forward-compatible "unknown"
-/// recovery from a recognized one, so the CLI renders both uniformly.
+/// daemon projection also sets `recovery_unknown` when the persisted recovery
+/// kind/stage was not recognized by the producing binary (a newer/renamed/
+/// downgraded build), which the CLI annotates so it is not mistaken for a
+/// recognized recovery.
 #[derive(Debug, Deserialize)]
 struct FailedCallView {
     timestamp: i64,
@@ -178,6 +180,8 @@ struct FailedCallView {
     recovery_kind: Option<String>,
     #[serde(default)]
     recovery_stage: Option<String>,
+    #[serde(default)]
+    recovery_unknown: bool,
     #[serde(default)]
     original_input: serde_json::Value,
     #[serde(default)]
@@ -266,6 +270,7 @@ fn format_row(r: &FailedCallView) -> String {
         r.hard_fail,
         r.recovery_kind.as_deref(),
         r.recovery_stage.as_deref(),
+        r.recovery_unknown,
     );
 
     let mut out = format!(
@@ -310,14 +315,21 @@ fn format_row(r: &FailedCallView) -> String {
     out
 }
 
-fn row_status(hard_fail: bool, kind: Option<&str>, stage: Option<&str>) -> String {
+fn row_status(hard_fail: bool, kind: Option<&str>, stage: Option<&str>, unknown: bool) -> String {
+    // An unrecognized recovery kind/stage still carries a raw `kind`/`stage`
+    // string, so annotate it so it is not read as a recognized recovery.
+    let suffix = if unknown {
+        " (unrecognized recovery)"
+    } else {
+        ""
+    };
     if hard_fail {
-        "HARD FAIL".to_string()
+        format!("HARD FAIL{suffix}")
     } else {
         match (kind, stage) {
-            (Some(k), Some(s)) => format!("recovered ({k}/{s})"),
-            (Some(k), None) => format!("recovered ({k})"),
-            _ => "recovered".to_string(),
+            (Some(k), Some(s)) => format!("recovered ({k}/{s}){suffix}"),
+            (Some(k), None) => format!("recovered ({k}){suffix}"),
+            _ => format!("recovered{suffix}"),
         }
     }
 }
@@ -328,13 +340,31 @@ mod tests {
 
     #[test]
     fn hard_fail_and_recovered_statuses_render() {
-        assert_eq!(row_status(true, None, None), "HARD FAIL");
+        assert_eq!(row_status(true, None, None, false), "HARD FAIL");
         assert_eq!(
-            row_status(false, Some("json"), Some("parse")),
+            row_status(false, Some("json"), Some("parse"), false),
             "recovered (json/parse)"
         );
-        assert_eq!(row_status(false, Some("json"), None), "recovered (json)");
-        assert_eq!(row_status(false, None, None), "recovered");
+        assert_eq!(
+            row_status(false, Some("json"), None, false),
+            "recovered (json)"
+        );
+        assert_eq!(row_status(false, None, None, false), "recovered");
+    }
+
+    #[test]
+    fn unrecognized_recovery_is_annotated() {
+        // An unknown persisted recovery kind/stage still carries a raw
+        // `kind`/`stage`; the status must flag it as unrecognized so it is not
+        // mistaken for a recognized recovery.
+        assert_eq!(
+            row_status(false, Some("future_kind"), Some("future_stage"), true),
+            "recovered (future_kind/future_stage) (unrecognized recovery)"
+        );
+        assert_eq!(
+            row_status(true, None, None, true),
+            "HARD FAIL (unrecognized recovery)"
+        );
     }
 
     #[test]
@@ -363,6 +393,7 @@ mod tests {
             shape_fingerprint: Some("shape-a".into()),
             recovery_kind: None,
             recovery_stage: None,
+            recovery_unknown: false,
             original_input: serde_json::json!({"a": 1}),
             wire_input: serde_json::json!({"a": 2}),
             output: "l1\nl2".into(),

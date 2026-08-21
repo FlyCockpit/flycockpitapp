@@ -71,6 +71,15 @@ impl Recovery {
         }
     }
 
+    /// Whether this recovery was loaded from a persisted kind/stage that this
+    /// binary does not recognize (a newer, renamed, or downgraded build). The
+    /// raw kind/stage still surface via [`Recovery::raw_db_fields`], but a
+    /// consumer cannot otherwise tell an unrecognized kind apart from a known
+    /// one, so display/export projections carry this flag explicitly.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Recovery::Unknown { .. })
+    }
+
     /// Dynamic `(recovery_kind, recovery_stage)` for display/export paths that
     /// may need to surface unknown persisted values.
     pub fn raw_db_fields(&self) -> (Option<Cow<'_, str>>, Option<Cow<'_, str>>) {

@@ -1145,6 +1145,128 @@ async fn list_failed_tool_calls_response_scrubs_vault_secret() {
 }
 
 #[tokio::test]
+async fn list_failed_tool_calls_response_flags_unknown_recovery() {
+    // A failed/recovered row whose persisted recovery kind/stage this binary
+    // does not recognize (a newer/renamed/downgraded build) decodes to
+    // `Recovery::Unknown`. The projected `calls_json` must carry
+    // `recovery_unknown: true` for that row so a consumer can tell it apart from
+    // a recognized recovery — whose raw `recovery_kind` string is otherwise
+    // indistinguishable.
+    let ctx = test_ctx();
+    let mut state = owner_state();
+    let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
+
+    let mk = |call_id: &str, tool: &str, ts: i64, recovery: crate::db::tool_calls::Recovery| {
+        crate::db::tool_calls::ToolCallEvent {
+            event_id: Uuid::new_v4(),
+            session_id: session.session_id,
+            call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            provider_item_id: None,
+            provider_call_id: None,
+            provider_call_id_source: None,
+            wire_api: None,
+            provider_family: None,
+            timestamp: ts,
+            model: "m".into(),
+            provider: "p".into(),
+            project_id: "proj".into(),
+            project_root: "/repo".into(),
+            agent: "Build".into(),
+            tool: tool.into(),
+            mcp_server: None,
+            path: None,
+            recovery,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            original_input_json: serde_json::json!({}),
+            wire_input_json: serde_json::json!({}),
+            output: String::new(),
+            truncated: false,
+            duration_ms: 0,
+            cockpit_version: None,
+            llm_mode: None,
+            shape_fingerprint: None,
+            hint: None,
+        }
+    };
+
+    // Unknown-recovery row: persist an unrecognized kind/stage via the raw-field
+    // write path (`insert_tool_call_conn`), which preserves `Recovery::Unknown`
+    // instead of collapsing it to NULL. On read-back it decodes to Unknown.
+    let unknown_ev = mk(
+        "call-unknown",
+        "unknown_tool",
+        200,
+        crate::db::tool_calls::Recovery::Unknown {
+            kind: "future_kind".into(),
+            stage: Some("future_stage".into()),
+        },
+    );
+    ctx.db
+        .write(move |conn| crate::db::Db::insert_tool_call_conn(conn, &unknown_ev))
+        .await
+        .unwrap();
+
+    // Known-recovery row: a recognized edit cascade.
+    let known_ev = mk(
+        "call-known",
+        "known_tool",
+        100,
+        crate::db::tool_calls::Recovery::EditCascade {
+            stage: "line_trim",
+            path: "old_string".into(),
+        },
+    );
+    ctx.db.insert_tool_call(&known_ev).await.unwrap();
+
+    let response = handle_request(
+        Request::ListFailedToolCalls {
+            since_epoch: 0,
+            tool: None,
+            model: None,
+            project_id: None,
+            include_recovered: true,
+            limit: 50,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    let Response::FailedToolCalls { calls_json } = response else {
+        panic!("expected FailedToolCalls response");
+    };
+    let calls: Vec<serde_json::Value> = serde_json::from_str(&calls_json).unwrap();
+
+    let find = |tool: &str| {
+        calls
+            .iter()
+            .find(|c| c["tool"] == tool)
+            .unwrap_or_else(|| panic!("row for tool `{tool}` missing"))
+    };
+    let unknown_row = find("unknown_tool");
+    let known_row = find("known_tool");
+
+    // The raw kind is still surfaced, but only the flag distinguishes it.
+    assert_eq!(unknown_row["recovery_kind"], "future_kind");
+    assert_eq!(
+        unknown_row["recovery_unknown"], true,
+        "an unrecognized recovery kind/stage must be flagged"
+    );
+    assert_eq!(known_row["recovery_kind"], "edit_cascade");
+    assert_eq!(
+        known_row["recovery_unknown"], false,
+        "a recognized recovery must not be flagged unknown"
+    );
+}
+
+#[tokio::test]
 async fn get_session_compactions_response_scrubs_vault_secret() {
     // FINDING 1 / L8: the compaction event `data` payload is free text; a
     // vaulted secret in it must be stripped by the redaction backstop.

@@ -12748,6 +12748,12 @@ fn failed_tool_call_json(row: &crate::db::tool_calls::ToolCallEvent) -> serde_js
         "shape_fingerprint": row.shape_fingerprint,
         "recovery_kind": kind,
         "recovery_stage": stage,
+        // `recovery_kind`/`recovery_stage` above carry the raw persisted values,
+        // which are byte-identical for a recognized kind and one this binary
+        // does not recognize (a newer/renamed/downgraded build). This explicit
+        // flag lets a consumer tell them apart: `true` iff the row decoded to
+        // `Recovery::Unknown`.
+        "recovery_unknown": row.recovery.is_unknown(),
         "original_input": row.original_input_json,
         "wire_input": row.wire_input_json,
         "output": row.output,

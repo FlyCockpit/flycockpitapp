@@ -97,5 +97,8 @@ pub mod welcome;
 pub mod wizard;
 pub mod write_scope;
 
-pub use cockpit_db as db;
+// The storage crate is an implementation detail of the core layer.  Keeping
+// this alias crate-visible prevents upper layers from bypassing daemon-owned
+// RPCs to open the ledger directly.
+pub(crate) use cockpit_db as db;
 pub use cockpit_proto as proto_crate;

@@ -1750,8 +1750,24 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
     );
     assert_eq!(app.launch.session_id, Some(new_session_id));
     assert_eq!(app.pending_model_selection.is_some(), automatically_retried);
+    // Attaching also refreshes daemon capabilities, so unrelated control
+    // requests may legitimately be in flight.  What must not survive an
+    // epoch transition is the old model-selection request; reconnect paths
+    // replace it with a request carrying a new selection id.
+    assert!(!app.pending_control_requests.values().any(|request| {
+        matches!(
+            request.applied,
+            super::ControlApplied::ModelSelection { selection_id }
+                if selection_id == old_selection_id
+        )
+    }));
     assert_eq!(
-        !app.pending_control_requests.is_empty(),
+        app.pending_control_requests.values().any(|request| {
+            matches!(
+                request.applied,
+                super::ControlApplied::ModelSelection { .. }
+            )
+        }),
         automatically_retried
     );
     let preserved = if automatically_retried {

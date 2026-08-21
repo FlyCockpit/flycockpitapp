@@ -543,7 +543,7 @@ fn primary_paste_held_connection_contract() {
         "read_text",
         "read_image",
         "env::var",
-        "env::set_var",
+        concat!("env::", "set_var"),
     ];
     walk_rs(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui"),

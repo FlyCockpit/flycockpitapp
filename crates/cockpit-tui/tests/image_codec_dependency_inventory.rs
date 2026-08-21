@@ -243,6 +243,8 @@ fn cargo_tree(workspace: &Path, triple: &str, package: &str, edges: &str, format
         .current_dir(workspace)
         .args([
             "tree",
+            "--color",
+            "never",
             "--locked",
             "--offline",
             "--target",

@@ -109,13 +109,20 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       # The dependency-inventory test intentionally resolves every supported
-      # target with `--offline`; a host build fetches only its own target's
-      # optional crates. Populate the registry cache on every test runner.
+      # target with `--offline`. Fetch the complete locked graph first: target
+      # filters do not fetch every conditional package (for example Android
+      # support crates retained by `cargo metadata`), which made an otherwise
+      # hermetic inventory fail only on a cold runner.
       - name: Fetch cross-platform metadata dependencies
         run: |
+          cargo fetch --locked
           cargo fetch --locked --target aarch64-apple-darwin
           cargo fetch --locked --target x86_64-pc-windows-msvc
           cargo fetch --locked --target x86_64-unknown-linux-gnu
+          # `cargo metadata` includes Android-target package records too. Fetch
+          # one Android target explicitly so its conditional support crates are
+          # available to the audit's deliberately offline metadata invocation.
+          cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
         run: cargo nextest run --locked --workspace

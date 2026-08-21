@@ -12064,12 +12064,21 @@ pub(super) fn set_caffeinate(
             })
         }
         // Missing-mechanism / acquire failure: report it so the TUI shows
-        // an honest, actionable toast (never silent). State stays off.
-        Err(message) => Ok(Response::CaffeinateState {
-            active: false,
-            lid_close_guaranteed: false,
-            message,
-        }),
+        // an honest, actionable toast (never silent). Publish the unchanged
+        // inactive state too: every connected client must converge even when
+        // the OS cannot acquire an inhibitor.
+        Err(message) => {
+            ctx.broadcast_global(proto::Event::CaffeinateState {
+                active: false,
+                lid_close_guaranteed: false,
+                message: None,
+            });
+            Ok(Response::CaffeinateState {
+                active: false,
+                lid_close_guaranteed: false,
+                message,
+            })
+        }
     }
 }
 

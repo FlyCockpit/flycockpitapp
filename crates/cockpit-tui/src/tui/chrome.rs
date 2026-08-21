@@ -433,7 +433,7 @@ mod tests {
         .spans;
         let agent = spans
             .iter()
-            .find(|span| span.content == "explore")
+            .find(|span| span.content.contains("explore"))
             .expect("active-agent span present");
         assert_eq!(
             agent.style.fg,

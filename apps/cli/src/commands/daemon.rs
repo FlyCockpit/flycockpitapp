@@ -219,6 +219,31 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             }
             Ok(())
         }
+        DaemonCommand::DiagnosticSnapshot {
+            path,
+            offline,
+            no_sandbox,
+        } => {
+            let snapshot = crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline)
+                .await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "rendered": crate::diagnostics::render(&snapshot),
+                    "has_failures": snapshot.has_failures,
+                    // This worker is used only when a private ephemeral daemon
+                    // could not become ready. Keep the classification machine
+                    // readable so its parent can preserve the original daemon
+                    // error unless the database bootstrap is the actual cause.
+                    "database_bootstrap_failure": snapshot.database.iter().any(|line| {
+                        line.starts_with("openability: FAILED")
+                            || line.starts_with("schema: FAILED")
+                            || line.starts_with("path: unavailable")
+                    }),
+                })
+            );
+            Ok(())
+        }
     }
 }
 

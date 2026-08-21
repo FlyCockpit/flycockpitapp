@@ -902,12 +902,12 @@ mod tests {
         // owner-remoted `GetImageSpendPolicy` RPC.
         assert_eq!(persistence.load("rpc-project".into()), Ok(None));
 
-        cockpit_core::db::reset_open_default_call_count();
+        cockpit_core::test_env::reset_direct_ledger_open_count();
         let saved = persistence
             .save("rpc-project".into(), settings.clone(), None)
             .expect("owner daemon accepts the reviewed policy");
         assert_eq!(
-            cockpit_core::db::open_default_call_count(),
+            cockpit_core::test_env::direct_ledger_open_count(),
             0,
             "the save must reach the daemon RPC, never Db::open_default in-process"
         );
@@ -915,13 +915,13 @@ mod tests {
         assert_eq!(saved.settings, settings);
 
         // The reviewed policy round-trips back through the same owner RPC.
-        cockpit_core::db::reset_open_default_call_count();
+        cockpit_core::test_env::reset_direct_ledger_open_count();
         let loaded = persistence
             .load("rpc-project".into())
             .expect("owner daemon returns the saved policy")
             .expect("a policy is now stored");
         assert_eq!(
-            cockpit_core::db::open_default_call_count(),
+            cockpit_core::test_env::direct_ledger_open_count(),
             0,
             "the reload must reach the daemon RPC, never Db::open_default in-process"
         );

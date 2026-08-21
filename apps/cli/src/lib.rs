@@ -688,6 +688,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                 crate::cli::DaemonCommand::Status { .. }
                     | crate::cli::DaemonCommand::Start { .. }
                     | crate::cli::DaemonCommand::Stop { .. }
+                    | crate::cli::DaemonCommand::DiagnosticSnapshot { .. }
             ))
             | Some(Command::Jq(_))
             | Some(Command::Completion { .. })

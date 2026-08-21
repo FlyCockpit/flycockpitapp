@@ -31,6 +31,20 @@ pub fn lock() -> TestEnvGuard {
     TestEnvGuard::blocking_lock()
 }
 
+/// Reset the current test thread's direct-ledger-open counter.
+///
+/// This deliberately lives in core's test support surface instead of
+/// re-exporting the database crate: upper layers may assert their ownership
+/// boundary without gaining a general-purpose database API.
+pub fn reset_direct_ledger_open_count() {
+    crate::db::reset_open_default_call_count();
+}
+
+/// Return the current test thread's direct-ledger-open counter.
+pub fn direct_ledger_open_count() -> usize {
+    crate::db::open_default_call_count()
+}
+
 pub async fn lock_async() -> TestEnvGuard {
     TestEnvGuard::lock().await
 }

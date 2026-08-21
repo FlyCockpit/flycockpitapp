@@ -13486,10 +13486,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "toggle_pinned_message"
         | "list_project_notes"
         | "create_project_note" => AuthzAllowedOutcome::Response,
-        // v10-only owner-remoted sealed-owner channel: the durable directory /
-        // capability-table backing is the persistence sibling's, so an
-        // authorized owner request traverses dispatch and fails closed with a
-        // content-free Internal error.
+        // v10-only owner-remoted sealed-owner channel: the matrix sends a
+        // deliberately unknown record/capability. An authorized owner reaches
+        // the handler and receives its input-validation error; non-owners
+        // remain rejected at the authorization gate.
         "begin_sealed_owner_operation"
         | "apply_sealed_owner_operation"
         | "cancel_sealed_owner_operation"
@@ -13499,7 +13499,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "create_sealed_action"
         | "revise_sealed_action_description"
         | "revise_sealed_action_enabled"
-        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"

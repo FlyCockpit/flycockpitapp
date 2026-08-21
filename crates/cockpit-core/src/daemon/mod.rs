@@ -1330,6 +1330,7 @@ async fn run_foreground_inner_with_boot_db(
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let mut metadata_guard = ForegroundMetadataGuard::new(&paths);
 
+    let uses_supplied_boot_db = boot_db.is_some();
     let ctx = std::sync::Arc::new(match boot_db {
         Some(db) => {
             server::boot_with_db(
@@ -1352,7 +1353,7 @@ async fn run_foreground_inner_with_boot_db(
     // that observes a bound socket expects the hello promptly; publishing it
     // before database/config initialization creates a startup handshake race.
     let listener = bind_private_socket(&paths.socket)?;
-    if boot_db.is_some() {
+    if uses_supplied_boot_db {
         write_endpoint_record_with_pid_and_canonical(&paths, &paths, std::process::id())?;
     } else {
         write_endpoint_record(&paths)?;

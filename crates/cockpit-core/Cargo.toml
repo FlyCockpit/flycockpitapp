@@ -243,6 +243,7 @@ assert_cmd = { workspace = true }
 # seam so daemon-level tests can replay the same failures against real SQLite.
 # Dev-only: a normal build never enables it.
 cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
+cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Source-scan guard for the daemon custody module (syn AST visitor). Already in

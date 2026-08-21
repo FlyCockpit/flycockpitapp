@@ -1873,7 +1873,7 @@ fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", test))]
 fn split_proc_cmdline(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|b| *b == 0)

@@ -386,7 +386,7 @@ fn run_before_publish_hook() {
         hook();
     }
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn run_before_publish_hook() {}
 #[cfg(test)]
 fn run_after_publish_effect_hook() {
@@ -394,13 +394,13 @@ fn run_after_publish_effect_hook() {
         hook();
     }
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn run_after_publish_effect_hook() {}
 #[cfg(test)]
 fn take_forced_failure(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
     flag.with(|value| value.replace(false))
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn take_forced_publish_failure() -> bool {
     false
 }
@@ -408,7 +408,7 @@ fn take_forced_publish_failure() -> bool {
 fn take_forced_publish_failure() -> bool {
     take_forced_failure(&FORCE_PUBLISH_NONCOLLISION_FAILURE)
 }
-#[cfg(not(test))]
+#[cfg(all(not(test), any(target_os = "linux", windows)))]
 fn take_forced_cleanup_failure() -> bool {
     false
 }
@@ -881,6 +881,7 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn verify_published(
         dir: &HeldDirectory,
         name: &str,
@@ -1814,7 +1815,6 @@ mod imp {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use super::*;
@@ -2134,7 +2134,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use std::io::Write as _;
     use std::os::windows::fs::symlink_dir;
 
     use super::*;

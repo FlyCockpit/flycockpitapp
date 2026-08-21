@@ -1431,7 +1431,7 @@ impl MediaStorageRecovery {
             let mut hasher = Sha256::new();
             hasher.update(b"media-processing-orphan-cleanup-v1\0");
             for output in &outputs {
-                if let Some(file) = open_optional_verified(&self.owned_root, output)? {
+                if let Some(_file) = open_optional_verified(&self.owned_root, output)? {
                     self.owned_root
                         .remove_file(output)
                         .map_err(anyhow::Error::new)?;
@@ -1439,7 +1439,7 @@ impl MediaStorageRecovery {
                     {
                         use std::os::unix::fs::MetadataExt as _;
                         ensure!(
-                            file.metadata()?.nlink() == 0,
+                            _file.metadata()?.nlink() == 0,
                             "processing orphan was not deleted"
                         );
                     }
@@ -1469,7 +1469,7 @@ impl MediaStorageRecovery {
         for (upload_id, temporary, quarantine, derivative_json) in publication_intents {
             let derivatives: Vec<String> = serde_json::from_str(&derivative_json)?;
             for derivative in derivatives {
-                if let Some(file) = open_optional_verified(&self.owned_root, &derivative)? {
+                if let Some(_file) = open_optional_verified(&self.owned_root, &derivative)? {
                     self.owned_root
                         .remove_file(&derivative)
                         .map_err(anyhow::Error::new)?;
@@ -1477,7 +1477,7 @@ impl MediaStorageRecovery {
                     {
                         use std::os::unix::fs::MetadataExt as _;
                         ensure!(
-                            file.metadata()?.nlink() == 0,
+                            _file.metadata()?.nlink() == 0,
                             "orphan derivative was not deleted"
                         );
                     }
@@ -1529,7 +1529,7 @@ impl MediaStorageRecovery {
                     Some("draft_expired") => "expired",
                     _ => anyhow::bail!("invalid upload cleanup intent"),
                 };
-                if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                if let Some(_file) = open_optional_verified(&self.owned_root, &storage_id)? {
                     self.owned_root
                         .remove_file(&storage_id)
                         .map_err(anyhow::Error::new)?;
@@ -1537,7 +1537,7 @@ impl MediaStorageRecovery {
                     {
                         use std::os::unix::fs::MetadataExt as _;
                         ensure!(
-                            file.metadata()?.nlink() == 0,
+                            _file.metadata()?.nlink() == 0,
                             "intended upload temporary was not deleted"
                         );
                     }

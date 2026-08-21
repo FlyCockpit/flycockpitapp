@@ -519,7 +519,7 @@ impl ExternalJournal {
                 continue;
             };
             if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
-                let held = dir.open_file_verified(&name)?;
+                let _held = dir.open_file_verified(&name)?;
                 #[cfg(test)]
                 if self
                     .fail_remote_rename_cleanup_unlink
@@ -533,7 +533,7 @@ impl ExternalJournal {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt as _;
-                    if held
+                    if _held
                         .metadata()
                         .map_err(|error| {
                             ExternalJournalError::Spool(format!(

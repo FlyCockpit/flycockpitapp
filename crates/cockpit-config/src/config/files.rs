@@ -664,10 +664,9 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
-        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid,
-        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid,
+        GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, IsWellKnownSid, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     let mut expected_owner = current_windows_user_sid()?;
     let security_information = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;

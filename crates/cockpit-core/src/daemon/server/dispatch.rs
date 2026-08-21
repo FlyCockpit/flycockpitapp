@@ -4232,8 +4232,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             from_path,
             to_path,
         } => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(operation) = remote_operation {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 if ctx.external_journal.is_some() {
                     let request = Request::FsRename {
                         project_root,

@@ -7,7 +7,9 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rand::TryRng;

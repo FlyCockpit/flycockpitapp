@@ -683,6 +683,7 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     !matches!(
         command,
         Some(Command::Debug(crate::cli::DebugCommand::Paths))
+            | Some(Command::Doctor(_))
             | Some(Command::Invocation(_))
             | Some(Command::Daemon(
                 crate::cli::DaemonCommand::Status { .. }
@@ -1122,7 +1123,7 @@ mod tests {
         assert!(!command_requires_workspace_trust(Some(&Command::Mcp(
             crate::cli::McpCommand::List
         ))));
-        assert!(command_requires_workspace_trust(Some(&Command::Doctor(
+        assert!(!command_requires_workspace_trust(Some(&Command::Doctor(
             crate::cli::DoctorArgs {
                 path: None,
                 offline: false,

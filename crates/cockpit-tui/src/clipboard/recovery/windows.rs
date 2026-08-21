@@ -717,14 +717,6 @@ impl DirHandle {
         names.sort();
         Ok(names)
     }
-
-    /// Documented no-op: Windows has no directory fsync. A crash between a
-    /// create/remove and the next reconcile is tolerated by the
-    /// newest-wins/never-touch-unsafe-entries reconcile policy, not by
-    /// durability here.
-    pub fn sync(&self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

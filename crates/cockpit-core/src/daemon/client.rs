@@ -1045,7 +1045,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION + 1).await;
+            send_daemon_hello(&mut daemon, "0.1.handshake", proto::PROTOCOL_VERSION).await;
         });
 
         let client = DaemonClient::connect(&socket).await.unwrap();
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(client.negotiated().daemon_version, "0.1.handshake");
         assert_eq!(
             client.negotiated().daemon_protocol_version,
-            proto::PROTOCOL_VERSION + 1
+            proto::PROTOCOL_VERSION
         );
         assert_eq!(client.negotiated().version, proto::PROTOCOL_VERSION);
         server.await.unwrap();
@@ -1065,12 +1065,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut daemon = ProtoStream::new(stream);
-            send_daemon_hello(
-                &mut daemon,
-                "0.1.incompatible",
-                proto::MIN_SUPPORTED_PROTOCOL_VERSION - 1,
-            )
-            .await;
+            send_daemon_hello(&mut daemon, "0.1.incompatible", proto::PROTOCOL_VERSION + 1).await;
         });
 
         let error = match DaemonClient::connect(&socket).await {

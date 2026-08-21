@@ -4,9 +4,9 @@ use std::any::Any;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cockpit_config::config::image_spend::{
-    BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings, ImageSpendSuggestions,
-    ProjectEpochPolicy,
+    BudgetPolicy, ImageSpendSettings, ImageSpendSuggestions, ProjectEpochPolicy,
 };
+use cockpit_core::daemon::proto::{Request, Response};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -15,7 +15,19 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
 
-type LoadResult = Result<Option<CurrentImageSpendPolicy>, String>;
+/// The subset of the daemon-owned image spend policy this page renders and
+/// re-opens. The owner-remoted `GetImageSpendPolicy` / `SaveImageSpendPolicy`
+/// RPCs return only the reviewed settings and their policy version; the
+/// server-owned epoch bookkeeping (`epoch_sequence`, effective rolling anchor)
+/// never crosses the wire, so it is deliberately absent here rather than
+/// reconstructed with placeholder values.
+#[derive(Debug, Clone, PartialEq)]
+struct LoadedImageSpendPolicy {
+    settings: ImageSpendSettings,
+    policy_version: u64,
+}
+
+type LoadResult = Result<Option<LoadedImageSpendPolicy>, String>;
 
 #[derive(Default)]
 struct WorkerCompletion {
@@ -57,18 +69,78 @@ trait ImageSpendPersistence: Send + Sync {
         project_key: String,
         settings: ImageSpendSettings,
         expected_version: Option<u64>,
-    ) -> Result<CurrentImageSpendPolicy, String>;
+    ) -> Result<LoadedImageSpendPolicy, String>;
 }
 
-struct DefaultImageSpendPersistence;
+/// Production persistence: the daemon owner is the single authority for the
+/// image spend ledger. This page never opens the SQLite ledger in-process; it
+/// loads and persists exclusively through the owner-remoted daemon RPCs
+/// (`GetImageSpendPolicy` / `SaveImageSpendPolicy`), reusing the same
+/// `settings_daemon_client` boundary every other owner-remoted settings
+/// mutation uses. The daemon handler runs the `owner_only` `activate_saved_policy`.
+///
+/// The page issues these RPCs from a background worker thread so the UI never
+/// blocks. That worker is a bare OS thread with no ambient Tokio runtime, so it
+/// cannot reach the daemon client on its own. We therefore capture the
+/// long-lived application runtime `Handle` at page construction (the settings
+/// reducer runs on that runtime) and drive each request with `Handle::block_on`
+/// from the worker. Routing through the app runtime — rather than a throwaway
+/// per-call runtime — keeps the memoized daemon client and its I/O task alive.
+struct DefaultImageSpendPersistence {
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl DefaultImageSpendPersistence {
+    /// Capture the ambient application runtime handle. Called from the settings
+    /// reducer, which executes on that runtime; absent a runtime the persistence
+    /// fails closed (see [`Self::block_on`]) rather than opening the ledger.
+    fn capture() -> Self {
+        Self {
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
+    /// Drive a daemon RPC future to completion on the captured application
+    /// runtime from the worker thread. Fails closed when no runtime was captured
+    /// (L11): the TUI must never fall back to opening the ledger directly.
+    fn block_on<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        let handle = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "image spend settings require the application runtime".to_string())?;
+        handle.block_on(future)
+    }
+}
 
 impl ImageSpendPersistence for DefaultImageSpendPersistence {
     fn load(&self, project_key: String) -> LoadResult {
-        image_spend_runtime()?
-            .block_on(
-                cockpit_config::config::image_spend::current_saved_policy_default(project_key),
-            )
-            .map_err(|error| error.to_string())
+        self.block_on(async move {
+            let client = super::settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            match client
+                .request(Request::GetImageSpendPolicy { project_key })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(Response::ImageSpendPolicy {
+                    settings,
+                    policy_version,
+                }) => match (settings, policy_version) {
+                    (Some(settings), Some(policy_version)) => Ok(Some(LoadedImageSpendPolicy {
+                        settings,
+                        policy_version,
+                    })),
+                    (None, None) => Ok(None),
+                    _ => Err("daemon returned an inconsistent image spend policy".into()),
+                },
+                Ok(other) => Err(format!("unexpected image spend read response: {other:?}")),
+                Err(error) => Err(error.to_string()),
+            }
+        })
     }
 
     fn save(
@@ -76,20 +148,42 @@ impl ImageSpendPersistence for DefaultImageSpendPersistence {
         project_key: String,
         settings: ImageSpendSettings,
         expected_version: Option<u64>,
-    ) -> Result<CurrentImageSpendPolicy, String> {
-        image_spend_runtime()?
-            .block_on(
-                cockpit_config::config::image_spend::activate_saved_policy_default(
+    ) -> Result<LoadedImageSpendPolicy, String> {
+        // Serialize before the request builds the exact wire shape the CLI uses;
+        // the daemon owner validates and activates the policy. On success the
+        // daemon persisted precisely these reviewed settings, so the page
+        // re-opens them alongside the returned authoritative version.
+        let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+        self.block_on(async move {
+            let client = super::settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            match client
+                .request(Request::SaveImageSpendPolicy {
                     project_key,
-                    settings,
-                    expected_version,
-                    chrono::Utc::now().timestamp_millis(),
-                ),
-            )
-            .map_err(|error| error.to_string())
+                    settings_json,
+                    expected_policy_version: expected_version,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Ok(Response::ImageSpendPolicySaved { policy_version }) => {
+                    Ok(LoadedImageSpendPolicy {
+                        settings,
+                        policy_version,
+                    })
+                }
+                Ok(other) => Err(format!("unexpected image spend save response: {other:?}")),
+                Err(error) => Err(error.to_string()),
+            }
+        })
     }
 }
 
+/// Current-thread runtime used only by the `#[cfg(test)]` file-backed
+/// persistence seam. Production persistence runs on the captured application
+/// runtime handle through [`DefaultImageSpendPersistence::block_on`].
+#[cfg(test)]
 fn image_spend_runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -98,7 +192,10 @@ fn image_spend_runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 pub(super) fn page(project_key: String) -> PageBox {
-    page_with_persistence(project_key, Arc::new(DefaultImageSpendPersistence))
+    page_with_persistence(
+        project_key,
+        Arc::new(DefaultImageSpendPersistence::capture()),
+    )
 }
 
 fn page_with_persistence(
@@ -145,7 +242,7 @@ pub(super) struct ImageSpendPage {
     version: Option<u64>,
     status: String,
     load: Mutex<Option<mpsc::Receiver<LoadResult>>>,
-    save: Mutex<Option<mpsc::Receiver<Result<CurrentImageSpendPolicy, String>>>>,
+    save: Mutex<Option<mpsc::Receiver<Result<LoadedImageSpendPolicy, String>>>>,
     load_completion: Arc<WorkerCompletion>,
     save_completion: Mutex<Option<Arc<WorkerCompletion>>>,
     persistence: Arc<dyn ImageSpendPersistence>,
@@ -526,6 +623,12 @@ mod tests {
                     .map_err(|error| error.to_string())?;
             image_spend_runtime()?
                 .block_on(store.current(project_key))
+                .map(|current| {
+                    current.map(|policy| LoadedImageSpendPolicy {
+                        settings: policy.settings,
+                        policy_version: policy.policy_version,
+                    })
+                })
                 .map_err(|error| error.to_string())
         }
 
@@ -534,12 +637,16 @@ mod tests {
             project_key: String,
             settings: ImageSpendSettings,
             expected_version: Option<u64>,
-        ) -> Result<CurrentImageSpendPolicy, String> {
+        ) -> Result<LoadedImageSpendPolicy, String> {
             let store =
                 cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&self.path)
                     .map_err(|error| error.to_string())?;
             image_spend_runtime()?
                 .block_on(store.activate(project_key, settings, expected_version, self.saved_at_ms))
+                .map(|policy| LoadedImageSpendPolicy {
+                    settings: policy.settings,
+                    policy_version: policy.policy_version,
+                })
                 .map_err(|error| error.to_string())
         }
     }
@@ -583,7 +690,7 @@ mod tests {
             save: Mutex::new(None),
             load_completion: Arc::new(WorkerCompletion::default()),
             save_completion: Mutex::new(None),
-            persistence: Arc::new(DefaultImageSpendPersistence),
+            persistence: Arc::new(DefaultImageSpendPersistence { runtime: None }),
         }
     }
 
@@ -620,12 +727,9 @@ mod tests {
             }),
         };
         let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(Ok(Some(CurrentImageSpendPolicy {
+        tx.send(Ok(Some(LoadedImageSpendPolicy {
             settings: settings.clone(),
             policy_version: 4,
-            epoch_policy_version: 2,
-            epoch_sequence: Some(8),
-            effective_rolling_anchor: None,
         })))
         .unwrap();
         *page.load.lock().unwrap() = Some(rx);
@@ -748,5 +852,80 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.policy_version, 1);
         assert_eq!(persisted.settings, reopened.saved);
+    }
+
+    /// The production persistence path is owner-remoted: it loads and saves the
+    /// image-spend policy exclusively through the daemon RPCs and NEVER opens
+    /// the SQLite ledger in the TUI process.
+    ///
+    /// Non-vacuity guard (L7): `open_default_call_count()` is a thread-local
+    /// tally of in-process `Db::open_default()` calls. The removed direct-ledger
+    /// implementation opened the ledger *synchronously on this thread* (a
+    /// current-thread runtime driving `activate_saved_policy_default` /
+    /// `current_saved_policy_default`), so it would leave the counter `>= 1`.
+    /// The owner-remoted RPC path leaves it at `0`: the daemon, on its own
+    /// threads, is the only opener. A regression back to a direct ledger open
+    /// therefore fails these assertions.
+    #[test]
+    fn production_persistence_routes_through_owner_daemon_rpc_without_opening_ledger() {
+        let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
+        let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
+
+        // The production worker thread has no ambient runtime; production
+        // captures the long-lived app runtime handle. Mirror that here with a
+        // multi-thread runtime that outlives the calls, and drive the sync
+        // persistence methods from this (non-async) test thread exactly as the
+        // worker does.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("image spend rpc test runtime");
+        let persistence = DefaultImageSpendPersistence {
+            runtime: Some(runtime.handle().clone()),
+        };
+        // All budgets `unlimited` so `validate` passes without a project epoch,
+        // and the daemon reaches the ledger write rather than a rejection.
+        let settings = ImageSpendSettings {
+            request: BudgetPolicy::Unlimited,
+            session: BudgetPolicy::Unlimited,
+            project: BudgetPolicy::Unlimited,
+            project_epoch: None,
+        };
+
+        // Warm up the lazily-promoted in-process daemon on this thread BEFORE
+        // the counter assertions: booting the daemon opens its DB, and doing so
+        // here (rather than under a measured call) keeps that one-time open out
+        // of the tallies below. The load also asserts the precondition — no
+        // policy is stored yet — so a later load hit is caused by the save and
+        // not a pre-existing value. This warm-up read already exercises the
+        // owner-remoted `GetImageSpendPolicy` RPC.
+        assert_eq!(persistence.load("rpc-project".into()), Ok(None));
+
+        cockpit_core::db::reset_open_default_call_count();
+        let saved = persistence
+            .save("rpc-project".into(), settings.clone(), None)
+            .expect("owner daemon accepts the reviewed policy");
+        assert_eq!(
+            cockpit_core::db::open_default_call_count(),
+            0,
+            "the save must reach the daemon RPC, never Db::open_default in-process"
+        );
+        assert_eq!(saved.policy_version, 1);
+        assert_eq!(saved.settings, settings);
+
+        // The reviewed policy round-trips back through the same owner RPC.
+        cockpit_core::db::reset_open_default_call_count();
+        let loaded = persistence
+            .load("rpc-project".into())
+            .expect("owner daemon returns the saved policy")
+            .expect("a policy is now stored");
+        assert_eq!(
+            cockpit_core::db::open_default_call_count(),
+            0,
+            "the reload must reach the daemon RPC, never Db::open_default in-process"
+        );
+        assert_eq!(loaded.policy_version, 1);
+        assert_eq!(loaded.settings, settings);
     }
 }

@@ -842,6 +842,22 @@ pub enum RemoteAttemptCapability {
 }
 
 impl RequestFamily {
+    /// Every `RequestFamily` variant, for exhaustive authorization-matrix
+    /// tests. The authorization `match`es below carry no wildcard arm, so a
+    /// newly added variant fails to compile until it is given both a matrix
+    /// disposition and (in tests) an expected disposition — this array is the
+    /// iteration surface, not the exhaustiveness guarantee.
+    pub const ALL: [RequestFamily; 8] = [
+        Self::ConfigReadsAndSnapshot,
+        Self::HealthReadsAndRefresh,
+        Self::PlanGet,
+        Self::JobReadsAndSnapshot,
+        Self::JobCancel,
+        Self::ConfigMutations,
+        Self::LateResult,
+        Self::OperationStatus,
+    ];
+
     /// Returns the remote attempt capability required for this family.
     pub fn remote_capability(self) -> RemoteAttemptCapability {
         match self {
@@ -856,9 +872,40 @@ impl RequestFamily {
         }
     }
 
-    /// Returns `true` if local `Owner` is always allowed.
-    pub fn local_owner_allowed(self) -> bool {
-        true
+    /// The local-`Owner` authorization disposition for this request family.
+    ///
+    /// This is the real per-`RequestFamily` table for the daemon-local
+    /// `ClientPrincipal::Owner`, encoding the "Local Owner" column of the
+    /// settled control-plane authorization matrix
+    /// (`prompts/flycockpitapp/complete/image-generation-control-plane.md`,
+    /// "Request authorization matrix"). The local `Owner` is the daemon-local
+    /// management authority and does not depend on hosted lease availability
+    /// (Decisions §: "Local `ClientPrincipal::Owner` mutations use the existing
+    /// daemon-local authority boundary and do not depend on hosted lease
+    /// availability"), so the contract admits `Owner` for every family — each
+    /// arm encodes that disposition EXPLICITLY.
+    ///
+    /// The `match` is exhaustive with NO wildcard arm: a newly added
+    /// `RequestFamily` variant will not compile until it is given a deliberate
+    /// disposition here, which is what makes the former constant-true
+    /// `local_owner_allowed()` tautology unrepresentable. A family the contract
+    /// denies `Owner` would encode `AuthorizationDecision::deny(code)` with the
+    /// matching `ImageControlErrorCode` in its arm.
+    ///
+    /// Session-role (`Writer`/`Readonly`) denial in the matrix is a REMOTE
+    /// session-membership concern and is authorized on the remote path with the
+    /// deferred remote `authorize()`; it is not a local-`Owner` disposition.
+    pub fn local_owner_authorization(self) -> AuthorizationDecision {
+        match self {
+            Self::ConfigReadsAndSnapshot => AuthorizationDecision::allow(),
+            Self::HealthReadsAndRefresh => AuthorizationDecision::allow(),
+            Self::PlanGet => AuthorizationDecision::allow(),
+            Self::JobReadsAndSnapshot => AuthorizationDecision::allow(),
+            Self::JobCancel => AuthorizationDecision::allow(),
+            Self::ConfigMutations => AuthorizationDecision::allow(),
+            Self::LateResult => AuthorizationDecision::allow(),
+            Self::OperationStatus => AuthorizationDecision::allow(),
+        }
     }
 }
 
@@ -888,14 +935,15 @@ impl AuthorizationDecision {
 /// Authorize a control-plane request for a local `Owner` principal.
 ///
 /// Local `ClientPrincipal::Owner` mutations use the existing daemon-local
-/// authority boundary and do not depend on hosted lease availability. Every
-/// request family is allowed for `Owner`.
+/// authority boundary and do not depend on hosted lease availability. The
+/// per-family disposition is consulted from the real
+/// [`RequestFamily::local_owner_authorization`] table — there is no blanket
+/// allow. (The daemon-level gate is upstream: the `image_*` RPCs are
+/// `owner_only` at `daemon/server/authz.rs`, so a non-owner is already denied
+/// before this decision table is consulted; this function is the affordance /
+/// decision surface the TUI and handlers read.)
 pub fn authorize_local_owner(family: RequestFamily) -> AuthorizationDecision {
-    if family.local_owner_allowed() {
-        AuthorizationDecision::allow()
-    } else {
-        AuthorizationDecision::deny(ImageControlErrorCode::Forbidden)
-    }
+    family.local_owner_authorization()
 }
 
 /// Check whether a remote principal's legacy `grants` snapshot can authorize

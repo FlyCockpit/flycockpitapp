@@ -982,7 +982,7 @@ pub struct ModelParams {
     /// Optional completion length bound. On Anthropic native, a missing value
     /// is filled from the model's resolved limit before dispatch. On OpenAI-
     /// compatible endpoints (including Ollama), `None` is left as omission so
-    /// the provider applies its own default: rig 0.41 maps a present
+    /// the provider applies its own default: rig 0.42 maps a present
     /// `max_tokens` to Ollama `options.num_predict` and enforces it. Utility
     /// paths always set an explicit cap via [`UTILITY_MAX_TOKENS_CAP`].
     pub max_tokens: Option<u64>,

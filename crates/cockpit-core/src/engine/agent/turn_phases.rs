@@ -372,7 +372,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 }
                 return_structural!(task_refusal(
                     &tc.id,
-                    tc.call_id.clone(),
+                    tc.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    tc.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
                     err.model_message(),
                 ));
             }
@@ -426,8 +431,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     target_task_call_id,
                     label,
                     message,
-                    task_call_id: tc.id.clone(),
-                    task_function_call_id: tc.call_id.clone(),
+                    task_call_id: tc.id.to_string(),
+                    task_provider_item_id: tc
+                        .provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    task_function_call_id: tc
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
                 });
             }
             crate::tools::task_repair::ParsedTaskArgs::Batch {
@@ -439,7 +451,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                 if items.is_empty() || items.len() > max_parallel {
                     return_structural!(task_refusal(
                         &tc.id,
-                        tc.call_id.clone(),
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
                         format!("`batch` must contain 1 to {max_parallel} entries"),
                     ));
                 }
@@ -449,7 +466,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     if item.get("mode").is_some() {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             "`mode` is not supported inside `batch[]`",
                         ));
                     }
@@ -468,7 +490,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     if child.is_empty() || prompt.is_empty() {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             "`batch[]` entries require `agent` and non-empty `prompt`",
                         ));
                     }
@@ -489,14 +516,24 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     if label.is_empty() {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             "`label` is required when `batch` contains more than one entry",
                         ));
                     }
                     if !labels.insert(label.clone()) {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             format!("duplicate batch label `{label}`"),
                         ));
                     }
@@ -520,14 +557,24 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         record_task_unknown_agent_rejection(session, agent, tc).await;
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             format!("batch entry `{label}`: {message}"),
                         ));
                     }
                     if !crate::engine::builtin::is_noninteractive(child) {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             format!("batch entry `{label}` targets interactive agent `{child}`"),
                         ));
                     }
@@ -539,7 +586,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             Err(err) => {
                                 return_structural!(task_refusal(
                                     &tc.id,
-                                    tc.call_id.clone(),
+                                    tc.provider
+                                        .as_ref()
+                                        .and_then(|provider| provider.item_id.clone()),
+                                    tc.provider
+                                        .as_ref()
+                                        .map(|provider| provider.call_id.clone()),
                                     format!(
                                         "batch entry `{label}` has invalid model selector: {err}"
                                     ),
@@ -560,7 +612,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             format!("batch entry `{label}`: {err}"),
                         ));
                     }
@@ -569,7 +626,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         Err(err) => {
                             return_structural!(task_refusal(
                                 &tc.id,
-                                tc.call_id.clone(),
+                                tc.provider
+                                    .as_ref()
+                                    .and_then(|provider| provider.item_id.clone()),
+                                tc.provider
+                                    .as_ref()
+                                    .map(|provider| provider.call_id.clone()),
                                 format!("batch entry `{label}` has invalid depth: {err}"),
                             ));
                         }
@@ -598,8 +660,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     entries,
                     why,
                     repair_notes,
-                    task_call_id: tc.id.clone(),
-                    task_function_call_id: tc.call_id.clone(),
+                    task_call_id: tc.id.to_string(),
+                    task_provider_item_id: tc
+                        .provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    task_function_call_id: tc
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
                 });
             }
             crate::tools::task_repair::ParsedTaskArgs::Delegate {
@@ -656,7 +725,16 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .await
                 {
                     record_task_unknown_agent_rejection(session, agent, tc).await;
-                    return_structural!(task_refusal(&tc.id, tc.call_id.clone(), message));
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        message
+                    ));
                 }
                 let mode = args.get("mode").and_then(Value::as_str);
                 let model = match crate::engine::model_roles::DelegationModelSelector::from_value(
@@ -666,7 +744,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     Err(err) => {
                         return_structural!(task_refusal(
                             &tc.id,
-                            tc.call_id.clone(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
                             format!("invalid model selector: {err}"),
                         ));
                     }
@@ -684,12 +767,30 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     )
                     .await
                 {
-                    return_structural!(task_refusal(&tc.id, tc.call_id.clone(), err));
+                    return_structural!(task_refusal(
+                        &tc.id,
+                        tc.provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        tc.provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
+                        err
+                    ));
                 }
                 let remaining_depth = match task_remaining_depth(&args) {
                     Ok(depth) => depth,
                     Err(err) => {
-                        return_structural!(task_refusal(&tc.id, tc.call_id.clone(), err));
+                        return_structural!(task_refusal(
+                            &tc.id,
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.clone()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.clone()),
+                            err
+                        ));
                     }
                 };
                 // Per-delegation tool grants (`task.grant_tools`, prompt
@@ -708,7 +809,12 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     let task_identity =
                         crate::engine::task_identity::TaskProviderIdentity::for_task_call(
                             &tc.id,
-                            tc.call_id.as_deref(),
+                            tc.provider
+                                .as_ref()
+                                .and_then(|provider| provider.item_id.as_deref()),
+                            tc.provider
+                                .as_ref()
+                                .map(|provider| provider.call_id.as_str()),
                         );
                     let routing = agent.model.routing_metadata_json(None);
                     // This event embeds the parent model's task `prompt`
@@ -739,6 +845,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             &serde_json::json!({
                                 "child_agent": child,
                                 "task_call_id": tc.id,
+                                "provider_item_id": task_identity.provider_item_id,
                                 "provider_call_id": task_identity.provider_call_id,
                                 "provider_call_id_source": task_identity.provider_call_id_source,
                                 "provider_identity": task_identity.event_identity_json(&tc.id),
@@ -764,7 +871,7 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .send(TurnEvent::SubagentSpawned {
                             parent: agent.name.clone(),
                             child: child.clone(),
-                            task_call_id: tc.id.clone(),
+                            task_call_id: tc.id.to_string(),
                             label: "default".to_string(),
                             prompt: prompt.clone(),
                             requested_cwd: None,
@@ -781,8 +888,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         granted_tools,
                         todo_ids,
                         repair_notes,
-                        task_call_id: tc.id.clone(),
-                        task_function_call_id: tc.call_id.clone(),
+                        task_call_id: tc.id.to_string(),
+                        task_provider_item_id: tc
+                            .provider
+                            .as_ref()
+                            .and_then(|provider| provider.item_id.clone()),
+                        task_function_call_id: tc
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone()),
                     });
                 }
                 return_structural!(TurnOutcome::SpawnNoninteractive {
@@ -798,8 +912,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     granted_tools,
                     todo_ids,
                     repair_notes,
-                    task_call_id: tc.id.clone(),
-                    task_function_call_id: tc.call_id.clone(),
+                    task_call_id: tc.id.to_string(),
+                    task_provider_item_id: tc
+                        .provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    task_function_call_id: tc
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
                 });
             }
         }
@@ -831,8 +952,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
             original_args,
             args,
             recovery,
-            task_call_id: tc.id.clone(),
-            task_function_call_id: tc.call_id.clone(),
+            task_call_id: tc.id.to_string(),
+            task_provider_item_id: tc
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone()),
+            task_function_call_id: tc
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
         });
     }
 
@@ -868,8 +996,15 @@ pub(crate) async fn phase_10_dispatch_one_call(
             prompt,
             write_scope,
             model,
-            task_call_id: tc.id.clone(),
-            task_function_call_id: tc.call_id.clone(),
+            task_call_id: tc.id.to_string(),
+            task_provider_item_id: tc
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone()),
+            task_function_call_id: tc
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
         });
     }
 
@@ -892,6 +1027,21 @@ pub(crate) async fn phase_10_dispatch_one_call(
     }
 
     Ok(ControlFlow::Continue(()))
+}
+
+/// Structural calls return to the driver before ordinary-tool dispatch gets a
+/// chance to repair the just-stored assistant history. Keep their replay form
+/// aligned with the canonical structural result name while preserving both
+/// call identities for result correlation.
+fn rewrite_structural_call_name_if_repaired(
+    history: &mut [Message],
+    tc: &ToolCall,
+    resolved_name: &str,
+    recovery: &Recovery,
+) {
+    if matches!(recovery, Recovery::NameRepair { .. }) {
+        super::rewrite_assistant_tool_call_name(history, &tc.id, resolved_name);
+    }
 }
 
 pub(crate) async fn run_turn(
@@ -1698,10 +1848,9 @@ pub(crate) async fn run_turn(
     // on the next turn. The promoted form is identical to the user-visible
     // `text`, keeping the wire and user transcripts in lockstep.
     let stored_choice = if reasoning_rescue {
-        crate::engine::message::OneOrMany::many(vec![
-            crate::engine::message::AssistantContent::text(text.clone()),
-        ])
-        .ok()
+        Some(vec![crate::engine::message::AssistantContent::text(
+            text.clone(),
+        )])
     } else if harmony_strip.is_some() {
         // A leading Harmony special-token bleed was stripped from `text`: rebuild
         // the wire choice with the sanitized text in place of the bled `Text`
@@ -1776,7 +1925,7 @@ pub(crate) async fn run_turn(
                 }
                 let _ = tx.send(TurnEvent::Notice { text: notice }).await;
                 append_tool_call_to_last_assistant(history, &rec.call);
-                recovered_markers.insert(rec.call.id.clone(), rec.marker);
+                recovered_markers.insert(rec.call.id.to_string(), rec.marker);
                 calls.push(rec.call);
             }
             TextRecoveryDecision::UnknownStrict { call, unknown } => {
@@ -2094,11 +2243,19 @@ pub(crate) async fn run_turn(
         let name_recovery = name_repair.recovery;
 
         match phase_10_dispatch_one_call(agent, &session, &config, tx, tc, resolved_name).await? {
-            ControlFlow::Break(outcome) => return Ok(outcome),
+            ControlFlow::Break(outcome) => {
+                rewrite_structural_call_name_if_repaired(
+                    history,
+                    tc,
+                    resolved_name,
+                    &name_recovery,
+                );
+                return Ok(outcome);
+            }
             ControlFlow::Continue(()) => {}
         }
 
-        let text_recovery_marker = recovered_markers.remove(&tc.id);
+        let text_recovery_marker = recovered_markers.remove(tc.id.as_str());
         let config_snapshot = ctx.config.snapshot();
         let env = super::tool_dispatch::DispatchEnv {
             agent,
@@ -2201,7 +2358,7 @@ async fn inject_turn_start_system_messages(
 mod tests {
     use super::*;
     use crate::config::providers::{ProviderEntry, ProvidersConfig};
-    use rig::message::ToolFunction;
+    use rig::message::{ToolFunction, UserContent};
 
     fn test_model() -> Arc<Model> {
         let mut cfg = ProvidersConfig::default();
@@ -2258,8 +2415,8 @@ mod tests {
 
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
-            id: "call-1".to_string(),
-            call_id: Some("provider-call-1".to_string()),
+            id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),
+            provider: rig::message::ProviderCallId::new("provider-call-1".to_string()),
             function: ToolFunction {
                 name: name.to_string(),
                 arguments: args,
@@ -2560,6 +2717,129 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
+    }
+
+    #[tokio::test]
+    async fn phase_10_spawn_retains_responses_dual_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = test_agent();
+        agent.name = "Swarm".to_string();
+        agent.tools =
+            ToolBox::new().with(Arc::new(crate::tools::spawn::SpawnTool::for_depth(0, 3)));
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(1);
+        let provider = rig::message::ProviderCallId::new("call_spawn_1".to_string())
+            .expect("provider call id")
+            .with_item_id("fc_spawn_1".to_string());
+        let call = ToolCall {
+            id: rig::message::ToolCallId::for_provider(Some(&provider)),
+            provider: Some(provider),
+            function: ToolFunction {
+                name: "spawn".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "review the child slice",
+                    "write_scope": "slice"
+                }),
+            },
+            signature: None,
+            additional_params: None,
+        };
+
+        let flow = phase_10_dispatch_one_call(
+            &agent,
+            &session,
+            &crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            &tx,
+            &call,
+            "spawn",
+        )
+        .await
+        .unwrap();
+
+        match flow {
+            ControlFlow::Break(TurnOutcome::Spawn {
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+                ..
+            }) => {
+                assert_eq!(task_call_id, "call_spawn_1");
+                assert_eq!(task_provider_item_id.as_deref(), Some("fc_spawn_1"));
+                assert_eq!(task_function_call_id.as_deref(), Some("call_spawn_1"));
+            }
+            other => panic!("expected structural spawn break, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repaired_structural_calls_replay_with_their_canonical_result_name() {
+        for (emitted_name, resolved_name) in [
+            ("functions.task", "task"),
+            ("schedule\n", "schedule"),
+            ("<spawn>", "spawn"),
+        ] {
+            let provider = rig::message::ProviderCallId::new("fn-structural-1".to_string())
+                .expect("provider call id")
+                .with_item_id("fc-structural-1".to_string());
+            let call = ToolCall {
+                id: rig::message::ToolCallId::for_provider(Some(&provider)),
+                provider: Some(provider),
+                function: ToolFunction {
+                    name: emitted_name.to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                signature: None,
+                additional_params: None,
+            };
+            let mut history = vec![Message::Assistant {
+                id: None,
+                content: vec![crate::engine::message::AssistantContent::ToolCall(
+                    call.clone(),
+                )],
+            }];
+
+            rewrite_structural_call_name_if_repaired(
+                &mut history,
+                &call,
+                resolved_name,
+                &Recovery::NameRepair {
+                    stage: "rebind",
+                    original: emitted_name.to_string(),
+                },
+            );
+
+            let Message::Assistant { content, .. } = &history[0] else {
+                panic!("expected assistant call");
+            };
+            let crate::engine::message::AssistantContent::ToolCall(replayed) = &content[0] else {
+                panic!("expected tool call");
+            };
+            assert_eq!(replayed.function.name, resolved_name);
+            assert_eq!(replayed.id, call.id);
+            assert_eq!(replayed.provider, call.provider);
+
+            let result =
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    call.id.to_string(),
+                    call.provider
+                        .as_ref()
+                        .and_then(|provider| provider.item_id.clone()),
+                    call.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
+                    resolved_name,
+                    "structural result",
+                );
+            let Message::User { content } = result else {
+                panic!("expected structural result");
+            };
+            let UserContent::ToolResult(result) = &content[0] else {
+                panic!("expected tool result");
+            };
+            assert_eq!(result.name, resolved_name);
+            assert_eq!(result.call, call.id);
+            assert_eq!(result.provider, call.provider);
+        }
     }
 
     // ── Inference journal barrier (make-inference-journal-barrier-testable) ──

@@ -393,6 +393,23 @@ impl Driver {
             .expect("driver stack is never empty")
             .agent
             .model;
+        let providers = self.config.providers();
+        // A Responses `schedule` call is intercepted before ordinary dispatch,
+        // so retain its dual provider identity here rather than manufacturing
+        // an identity from the Rig correlation handle. Other wires have no
+        // item handle; their correlation handle is the only item fallback.
+        let provider_item_id = row
+            .provider_item_id
+            .clone()
+            .unwrap_or_else(|| row.call_id.clone());
+        let provider_identity = crate::session::ToolCallProviderIdentity::from_provider_call(
+            Some(active_model.provider_id()),
+            Some(active_model.model_id_ref()),
+            Some(&providers),
+            Some(active_model.current_wire_api()),
+            provider_item_id,
+            row.provider_call_id.clone(),
+        );
         let schedule_session_table = active_model.session_redact_table();
         // ONE authoring frame drives BOTH the timeline event and the co-persisted
         // audit row, so their journal-vs-scrub decisions come from a single
@@ -443,7 +460,7 @@ impl Driver {
                     call_id: row.call_id,
                     parent_call_id: None,
                     parent_child_index: None,
-                    identity: crate::session::ToolCallProviderIdentity::default(),
+                    identity: provider_identity,
                     tool: "schedule".to_string(),
                     path: None,
                     mcp_server: None,

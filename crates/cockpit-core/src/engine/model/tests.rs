@@ -5,6 +5,11 @@ use crate::config::providers::{ModelEntry, ProviderEntry, TimeoutConfig, WireApi
 use cockpit_test_support::provider::{CapturedRequest, ScriptedProvider, Turn, Usage, WireDialect};
 use futures::{FutureExt, StreamExt};
 
+fn additional_params(value: serde_json::Value) -> Option<rig::message::AdditionalParams> {
+    rig::message::AdditionalParams::try_from_value(value)
+        .expect("test additional params must be a JSON object")
+}
+
 #[tokio::test]
 async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
     let (_tmp, redact) = secret_table();
@@ -99,44 +104,64 @@ fn tandem_failure_response_preserves_kind_and_detail() {
 /// `complete_tandem` failure branch) routes the error through the same funnel:
 /// the persisted `detail` is the fixed marker, the raw provider body is
 /// dropped, and the typed observed-status/recovery metadata stays queryable.
-/// Non-vacuous: the sentinel appears in `err.to_string()` (asserted) but must
-/// be absent from the response — a verbatim persist would fail the check.
+/// Non-vacuous: Rig's raw `Debug` output contains the sentinel header
+/// (asserted) but the header must be absent from the response — a verbatim
+/// persist would fail the check.
 #[test]
 fn tandem_provider_error_response_omits_raw_provider_detail() {
     use rig::completion::CompletionError;
-    const SECRET: &str = "RAW_TANDEM_PROVIDER_BODY_9f3a_must_not_persist";
-    // A billing 429 whose body carries a secret the funnel must drop.
-    let err = CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
-        reqwest::StatusCode::from_u16(429).unwrap(),
-        format!("{{\"error\":{{\"message\":\"insufficient balance {SECRET}\"}}}}"),
-    ));
-    // The raw error text carries the secret — proving the assertions below are
-    // non-vacuous.
-    assert!(err.to_string().contains(SECRET));
+    const SENTINEL: &str = "RAW_TANDEM_PROVIDER_HEADER_9f3a_must_not_persist";
+    let mut detailed_headers = rig::http_client::HeaderMap::new();
+    detailed_headers.insert(
+        "x-flycockpit-sentinel",
+        rig::http_client::HeaderValue::from_static(SENTINEL),
+    );
+    let mut provider_headers = rig::http_client::HeaderMap::new();
+    provider_headers.insert(
+        "x-flycockpit-sentinel",
+        rig::http_client::HeaderValue::from_static(SENTINEL),
+    );
+    let errors = [
+        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithDetails {
+            status: reqwest::StatusCode::from_u16(429).unwrap(),
+            body: "insufficient balance".to_string(),
+            headers: Box::new(detailed_headers),
+        }),
+        CompletionError::ProviderResponse(
+            rig::ProviderResponseError::new(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                "insufficient balance",
+            )
+            .with_headers(Some(Box::new(provider_headers))),
+        ),
+    ];
 
-    let response = tandem_provider_error_response(&err);
-    let response_str = response.to_string();
-    assert!(
-        !response_str.contains(SECRET),
-        "tandem provider error must not persist the raw provider body: {response_str}"
-    );
-    assert_eq!(
-        response["error"]["detail"],
-        json!(crate::engine::model::PROVIDER_DETAIL_OMITTED)
-    );
-    // Typed metadata stays queryable.
-    assert_eq!(response["error"]["observed_status"], json!(429));
-    assert_eq!(response["error"]["recovery"], json!("billing_exhausted"));
+    for err in errors {
+        assert!(format!("{err:?}").contains(SENTINEL));
+        let response = tandem_provider_error_response(&err);
+        let response_str = response.to_string();
+        assert!(
+            !response_str.contains(SENTINEL),
+            "tandem provider error must not persist raw provider headers: {response_str}"
+        );
+        assert_eq!(
+            response["error"]["detail"],
+            json!(crate::engine::model::PROVIDER_DETAIL_OMITTED)
+        );
+        // Typed metadata stays queryable.
+        assert_eq!(response["error"]["observed_status"], json!(429));
+        assert_eq!(response["error"]["recovery"], json!("billing_exhausted"));
 
-    // The underlying funnel helper drops the text and keeps the metadata too.
-    let safe = crate::engine::model::safe_completion_error_detail(&err);
-    assert_eq!(safe.marker, crate::engine::model::PROVIDER_DETAIL_OMITTED);
-    assert_eq!(safe.observed_status, Some(429));
-    assert_eq!(
-        safe.recovery,
-        crate::engine::model::ProviderRecoverySignal::BillingExhausted
-    );
-    assert!(!serde_json::to_string(&safe).unwrap().contains(SECRET));
+        // The underlying funnel helper drops headers and keeps metadata too.
+        let safe = crate::engine::model::safe_completion_error_detail(&err);
+        assert_eq!(safe.marker, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+        assert_eq!(safe.observed_status, Some(429));
+        assert_eq!(
+            safe.recovery,
+            crate::engine::model::ProviderRecoverySignal::BillingExhausted
+        );
+        assert!(!serde_json::to_string(&safe).unwrap().contains(SENTINEL));
+    }
 }
 
 /// End-to-end proof through `complete_tandem`: the FAILURE branch omits the raw
@@ -221,10 +246,10 @@ async fn complete_tandem_failure_omits_body_while_success_is_preserved() {
 // stream. `start_paused` lets us advance the virtual clock past the
 // ceilings without real waits.
 
-type TestItem = Result<StreamedAssistantContent<()>, rig::completion::CompletionError>;
+type TestItem = Result<StreamedAssistantContent, rig::completion::CompletionError>;
 
 fn text_chunk(s: &str) -> TestItem {
-    Ok(StreamedAssistantContent::<()>::text(s))
+    Ok(StreamedAssistantContent::text(s))
 }
 
 /// Run `drain_items` over `stream` with the given timeouts, on a paused
@@ -239,9 +264,8 @@ async fn run_drain<S>(
     Vec<TurnEvent>,
 )
 where
-    S: futures::Stream<
-            Item = Result<StreamedAssistantContent<()>, rig::completion::CompletionError>,
-        > + Unpin,
+    S: futures::Stream<Item = Result<StreamedAssistantContent, rig::completion::CompletionError>>
+        + Unpin,
 {
     let phase = std::sync::atomic::AtomicU8::new(InferencePhase::Prep.rank());
     let first_token_ms = std::sync::atomic::AtomicU64::new(0);
@@ -544,15 +568,15 @@ async fn long_but_actively_streaming_is_never_killed() {
 fn assistant(parts: Vec<AssistantContent>) -> Message {
     Message::Assistant {
         id: Some("m-1".into()),
-        content: OneOrMany::many(parts).expect("non-empty assistant turn"),
+        content: parts,
     }
 }
 
 fn tool_call(id: &str) -> AssistantContent {
     use rig::message::{ToolCall, ToolFunction};
     AssistantContent::ToolCall(ToolCall {
-        id: id.into(),
-        call_id: None,
+        id: rig::message::ToolCallId::new_or_mint(id),
+        provider: None,
         function: ToolFunction {
             name: "read".into(),
             arguments: serde_json::json!({"path": "x"}),
@@ -563,10 +587,17 @@ fn tool_call(id: &str) -> AssistantContent {
 }
 
 fn responses_tool_call(id: &str, call_id: Option<&str>) -> AssistantContent {
-    use rig::message::{ToolCall, ToolFunction};
+    use rig::message::{ProviderCallId, ToolCall, ToolCallId, ToolFunction};
+    let provider = call_id
+        .map(str::to_string)
+        .and_then(ProviderCallId::new)
+        .map(|provider| provider.with_item_id(id.to_string()));
     AssistantContent::ToolCall(ToolCall {
-        id: id.into(),
-        call_id: call_id.map(str::to_string),
+        id: provider.as_ref().map_or_else(
+            || ToolCallId::new_or_mint(id),
+            |provider| ToolCallId::for_provider(Some(provider)),
+        ),
+        provider,
         function: ToolFunction {
             name: "read".into(),
             arguments: serde_json::json!({"path": SECRET}),
@@ -577,13 +608,22 @@ fn responses_tool_call(id: &str, call_id: Option<&str>) -> AssistantContent {
 }
 
 fn tool_result_message(id: &str, call_id: Option<&str>) -> Message {
-    let content = OneOrMany::one(ToolResultContent::text("ok"));
-    let result = match call_id {
-        Some(call_id) => UserContent::tool_result_with_call_id(id, call_id.to_string(), content),
-        None => UserContent::tool_result(id, content),
-    };
+    use rig::message::{ProviderCallId, ToolCallId, ToolResult};
+    let provider = call_id
+        .map(str::to_string)
+        .and_then(ProviderCallId::new)
+        .map(|provider| provider.with_item_id(id.to_string()));
+    let result = UserContent::ToolResult(ToolResult {
+        call: provider.as_ref().map_or_else(
+            || ToolCallId::new_or_mint(id),
+            |provider| ToolCallId::for_provider(Some(provider)),
+        ),
+        provider,
+        name: "read".to_string(),
+        content: vec![ToolResultContent::text("ok")],
+    });
     Message::User {
-        content: OneOrMany::one(result),
+        content: vec![result],
     }
 }
 
@@ -661,7 +701,7 @@ fn strip_reasoning_keeps_text_drops_reasoning() {
     assert_eq!(content.iter().count(), 1);
     assert!(matches!(
         content.first(),
-        AssistantContent::Text(t) if t.text == "the visible answer"
+        Some(AssistantContent::Text(t)) if t.text == "the visible answer"
     ));
 }
 
@@ -679,7 +719,7 @@ fn strip_reasoning_keeps_tool_call_drops_reasoning() {
     assert_eq!(content.iter().count(), 1);
     assert!(matches!(
         content.first(),
-        AssistantContent::ToolCall(tc) if tc.id == "tc-1"
+        Some(AssistantContent::ToolCall(tc)) if tc.id == "tc-1"
     ));
 }
 
@@ -697,7 +737,7 @@ fn strip_reasoning_dropped_turn_preserves_pairing() {
         Message::user("do the thing"),
         tool_turn,
         crate::engine::message::tool_result_message(
-            &crate::engine::message::collect_tool_calls(&OneOrMany::one(tool_call("tc-keep")))[0],
+            &crate::engine::message::collect_tool_calls(&vec![tool_call("tc-keep")])[0],
             "ok".into(),
         ),
         reasoning_only,
@@ -714,7 +754,7 @@ fn strip_reasoning_dropped_turn_preserves_pairing() {
             Message::Assistant { content, .. } => Some(
                 crate::engine::message::collect_tool_calls(content)
                     .into_iter()
-                    .map(|tc| tc.id),
+                    .map(|tc| tc.id.to_string()),
             ),
             _ => None,
         })
@@ -762,8 +802,19 @@ fn redaction_preserves_assistant_tool_call_identity_fields() {
     let scrubbed = scrub_message(redact.as_ref(), &msg).unwrap();
     let tc = first_assistant_tool_call(&scrubbed);
 
-    assert_eq!(tc.id, "provider-item");
-    assert_eq!(tc.call_id.as_deref(), Some("provider-call"));
+    assert_eq!(tc.id, "provider-call");
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .and_then(|provider| provider.item_id.as_deref()),
+        Some("provider-item")
+    );
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
     assert_eq!(tc.signature.as_deref(), Some("sig-1"));
     assert_eq!(
         tc.additional_params,
@@ -787,12 +838,22 @@ fn responses_normalization_leaves_complete_pair_unchanged() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.call_id.as_deref(), Some("provider-call"));
-    assert_eq!(tr.call_id.as_deref(), Some("provider-call"));
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
+    assert_eq!(
+        tr.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
     assert_eq!(
         records,
         vec![ResponsesToolIdentityRecord {
-            cockpit_call_id: "fc_provider-item".into(),
+            cockpit_call_id: "provider-call".into(),
             provider_item_id: "fc_provider-item".into(),
             provider_call_id: "provider-call".into(),
             provider_call_id_source: "provider",
@@ -813,7 +874,7 @@ fn responses_normalization_emits_one_record_per_call() {
     assert_eq!(
         records,
         vec![ResponsesToolIdentityRecord {
-            cockpit_call_id: "provider-item".into(),
+            cockpit_call_id: "provider-call".into(),
             provider_item_id: "provider-item".into(),
             provider_call_id: "provider-call".into(),
             provider_call_id_source: "provider",
@@ -831,9 +892,19 @@ fn responses_normalization_fills_missing_call_ids_with_provenance() {
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
     assert_eq!(tc.id, "provider-item");
-    assert_eq!(tc.call_id.as_deref(), Some("provider-item"));
-    assert_eq!(tr.id, "provider-item");
-    assert_eq!(tr.call_id.as_deref(), Some("provider-item"));
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-item")
+    );
+    assert_eq!(tr.call, "provider-item");
+    assert_eq!(
+        tr.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-item")
+    );
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].provider_item_id, "provider-item");
     assert_eq!(records[0].provider_call_id, "provider-item");
@@ -855,11 +926,21 @@ fn responses_normalization_leaves_synthetic_item_id_unchanged() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "skillslash-123");
-    assert_eq!(tc.call_id.as_deref(), Some("provider-call"));
-    assert_eq!(tr.id, "skillslash-123");
-    assert_eq!(tr.call_id.as_deref(), Some("provider-call"));
-    assert_eq!(records[0].cockpit_call_id, "skillslash-123");
+    assert_eq!(tc.id, "provider-call");
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
+    assert_eq!(tr.call, "provider-call");
+    assert_eq!(
+        tr.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
+    assert_eq!(records[0].cockpit_call_id, "provider-call");
     assert_eq!(records[0].provider_item_id, "skillslash-123");
     assert_eq!(records[0].provider_call_id, "provider-call");
 }
@@ -872,18 +953,42 @@ fn responses_normalization_preserves_provider_ids_and_is_idempotent() {
     normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
     let once_tc = first_assistant_tool_call(&history[0]);
     let once_tr = first_tool_result(&prompt);
-    assert_eq!(once_tc.id, "fc_1");
-    assert_eq!(once_tc.call_id.as_deref(), Some("call_1"));
-    assert_eq!(once_tr.id, "fc_1");
-    assert_eq!(once_tr.call_id.as_deref(), Some("call_1"));
+    assert_eq!(once_tc.id, "call_1");
+    assert_eq!(
+        once_tc
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_1")
+    );
+    assert_eq!(once_tr.call, "call_1");
+    assert_eq!(
+        once_tr
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_1")
+    );
 
     normalize_responses_tool_call_identity(&mut history, &mut prompt).unwrap();
     let twice_tc = first_assistant_tool_call(&history[0]);
     let twice_tr = first_tool_result(&prompt);
-    assert_eq!(twice_tc.id, "fc_1");
-    assert_eq!(twice_tc.call_id.as_deref(), Some("call_1"));
-    assert_eq!(twice_tr.id, "fc_1");
-    assert_eq!(twice_tr.call_id.as_deref(), Some("call_1"));
+    assert_eq!(twice_tc.id, "call_1");
+    assert_eq!(
+        twice_tc
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_1")
+    );
+    assert_eq!(twice_tr.call, "call_1");
+    assert_eq!(
+        twice_tr
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_1")
+    );
 
     let mut rewritten_history = vec![assistant(vec![responses_tool_call("skillslash-old", None)])];
     let mut rewritten_prompt = tool_result_message("skillslash-old", None);
@@ -892,9 +997,21 @@ fn responses_normalization_preserves_provider_ids_and_is_idempotent() {
     let rewritten_tc = first_assistant_tool_call(&rewritten_history[0]);
     let rewritten_tr = first_tool_result(&rewritten_prompt);
     assert_eq!(rewritten_tc.id, "skillslash-old");
-    assert_eq!(rewritten_tc.call_id.as_deref(), Some("skillslash-old"));
-    assert_eq!(rewritten_tr.id, "skillslash-old");
-    assert_eq!(rewritten_tr.call_id.as_deref(), Some("skillslash-old"));
+    assert_eq!(
+        rewritten_tc
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("skillslash-old")
+    );
+    assert_eq!(rewritten_tr.call, "skillslash-old");
+    assert_eq!(
+        rewritten_tr
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("skillslash-old")
+    );
 }
 
 #[test]
@@ -909,10 +1026,20 @@ fn responses_normalization_leaves_non_fc_id_unchanged() {
 
     let tc = first_assistant_tool_call(&history[0]);
     let tr = first_tool_result(&prompt);
-    assert_eq!(tc.id, "arbitrary-prefix-1");
-    assert_eq!(tc.call_id.as_deref(), Some("call-1"));
-    assert_eq!(tr.id, "arbitrary-prefix-1");
-    assert_eq!(tr.call_id.as_deref(), Some("call-1"));
+    assert_eq!(tc.id, "call-1");
+    assert_eq!(
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call-1")
+    );
+    assert_eq!(tr.call, "call-1");
+    assert_eq!(
+        tr.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call-1")
+    );
 }
 
 #[test]
@@ -929,12 +1056,16 @@ fn responses_normalization_fills_call_id_without_rewriting_id() {
     let tr = first_tool_result(&prompt);
     assert_eq!(tc.id, "delegation-payload-plan-abcdef123456");
     assert_eq!(
-        tc.call_id.as_deref(),
+        tc.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
         Some("delegation-payload-plan-abcdef123456")
     );
-    assert_eq!(tr.id, "delegation-payload-plan-abcdef123456");
+    assert_eq!(tr.call, "delegation-payload-plan-abcdef123456");
     assert_eq!(
-        tr.call_id.as_deref(),
+        tr.provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
         Some("delegation-payload-plan-abcdef123456")
     );
 }
@@ -945,7 +1076,19 @@ fn responses_fc_prefix_still_rejects_result_call_id_mismatch() {
         "fc-skillslash-old",
         Some("skillslash-old"),
     )])];
-    let mut prompt = tool_result_message("skillslash-old", Some("wrong-call"));
+    // Keep the result correlated to the open call, then supply a conflicting
+    // provider function-call id. Rig 0.42 derives `ToolResult.call` from the
+    // provider call id when one is present, so the old helper shape made this
+    // an orphan before the mismatched-identity branch could observe it.
+    let mut prompt = Message::User {
+        content: vec![UserContent::ToolResult(rig::message::ToolResult {
+            call: rig::message::ToolCallId::new_or_mint("skillslash-old"),
+            provider: rig::message::ProviderCallId::new("wrong-call".to_string())
+                .map(|provider| provider.with_item_id("fc-skillslash-old".to_string())),
+            name: "read".to_string(),
+            content: vec![ToolResultContent::text("ok")],
+        })],
+    };
 
     let err = normalize_responses_tool_call_identity(&mut history, &mut prompt)
         .expect_err("explicit result call_id mismatch rejected");
@@ -4957,7 +5100,7 @@ async fn utility_openai_arm_applies_max_tokens_cap() {
     }
 }
 
-/// Rig 0.41 maps OpenAI-compat `max_tokens` to Ollama's `options.num_predict`
+/// Rig 0.42 maps OpenAI-compat `max_tokens` to Ollama's `options.num_predict`
 /// (and enforces it). Main turns must not invent a default from capability
 /// metadata — only explicit policy (e.g. utility caps) may set it.
 #[tokio::test]
@@ -4988,7 +5131,7 @@ async fn openai_compat_main_turn_omits_max_tokens_by_default() {
     let body = provider.next_request().await.body;
     assert!(
         body.get("max_tokens").is_none() || body["max_tokens"].is_null(),
-        "main OpenAI-compat/Ollama turns must omit max_tokens so providers keep their own defaults (rig 0.41 enforces num_predict when set): {body}"
+        "main OpenAI-compat/Ollama turns must omit max_tokens so providers keep their own defaults (rig 0.42 enforces num_predict when set): {body}"
     );
 }
 
@@ -5299,8 +5442,21 @@ async fn tool_completion_responses_identity_behavior() {
     };
     let calls = model.tool_completion("system", "hi", &tool).await.unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].id, "fc_1");
-    assert_eq!(calls[0].call_id.as_deref(), Some("call_1"));
+    assert_eq!(calls[0].id, "call_1");
+    assert_eq!(
+        calls[0]
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_1")
+    );
+    assert_eq!(
+        calls[0]
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.item_id.as_deref()),
+        Some("fc_1")
+    );
     let request = provider.next_request().await;
     let request_line = request.request_line;
     let body = request.body;
@@ -5951,12 +6107,13 @@ async fn complete_captured_scrubs_user_message_and_tool_result() {
 
     // History carries a tool result whose body is a `cat .env` leak.
     let tool_result = Message::User {
-        content: OneOrMany::one(UserContent::tool_result(
+        content: vec![UserContent::tool_result(
             "call-1",
-            OneOrMany::one(ToolResultContent::text(format!(
+            "tool",
+            vec![ToolResultContent::text(format!(
                 "file contents: API_KEY={SECRET}"
-            ))),
-        )),
+            ))],
+        )],
     };
     let history = vec![tool_result];
     let prompt = Message::user(format!("use the token {SECRET} from the env"));
@@ -6052,7 +6209,7 @@ fn redact_scrubs_every_tool_result_part_and_preserves_opaque_reasoning() {
     let opaque_redacted = format!("redacted:{SECRET}");
     let message = Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::Reasoning({
+        content: vec![AssistantContent::Reasoning({
             let mut reasoning = Reasoning::new("placeholder");
             reasoning.id = Some("reasoning-id".into());
             reasoning.content = vec![
@@ -6067,13 +6224,13 @@ fn redact_scrubs_every_tool_result_part_and_preserves_opaque_reasoning() {
                 ReasoningContent::Summary(format!("summary:{SECRET}")),
             ];
             reasoning
-        })),
+        })],
     };
     let scrubbed = scrub_message(&redact, &message).unwrap();
     let Message::Assistant { content, .. } = scrubbed else {
         panic!("expected assistant message");
     };
-    let AssistantContent::Reasoning(reasoning) = content.first() else {
+    let Some(AssistantContent::Reasoning(reasoning)) = content.first() else {
         panic!("expected reasoning content");
     };
     assert!(matches!(
@@ -6100,27 +6257,33 @@ fn redact_scrubs_every_tool_result_part_and_preserves_opaque_reasoning() {
     // used as a JSON object key or value must never survive to an untrusted
     // wire (the pre-fix behavior passed `Json` members through verbatim).
     let tool_result = Message::User {
-        content: OneOrMany::one(UserContent::tool_result_with_call_id(
+        content: vec![UserContent::tool_result_with_call_id(
             "tool-call",
             "provider-call".to_string(),
-            OneOrMany::many(vec![
+            "read",
+            vec![
                 ToolResultContent::text(format!("first:{SECRET}")),
                 ToolResultContent::Json {
                     value: json!({"secret": SECRET, (SECRET): "as-a-key"}),
                 },
                 ToolResultContent::text(format!("last:{SECRET}")),
-            ])
-            .expect("multipart tool result is non-empty"),
-        )),
+            ],
+        )],
     };
     let scrubbed = scrub_message(&redact, &tool_result).unwrap();
     let Message::User { content } = scrubbed else {
         panic!("expected user message");
     };
-    let UserContent::ToolResult(result) = content.first() else {
+    let Some(UserContent::ToolResult(result)) = content.first() else {
         panic!("expected tool result");
     };
-    assert_eq!(result.call_id.as_deref(), Some("provider-call"));
+    assert_eq!(
+        result
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("provider-call")
+    );
     let parts: Vec<_> = result.content.iter().collect();
     assert_eq!(parts.len(), 3);
     assert!(matches!(
@@ -6176,21 +6339,22 @@ fn untrusted_json_tool_result_values_and_keys_are_scrubbed() {
     let model = model_at("http://127.0.0.1:1/v1", redact);
 
     let tool_result = Message::User {
-        content: OneOrMany::one(UserContent::tool_result_with_call_id(
+        content: vec![UserContent::tool_result_with_call_id(
             "tool",
             "call".to_string(),
-            OneOrMany::one(ToolResultContent::Json {
+            "read",
+            vec![ToolResultContent::Json {
                 value: json!({
                     "nested": { "inner": SECRET },
                     (SECRET): "value-under-secret-key",
                     "arr": [SECRET, "clean"],
                 }),
-            }),
-        )),
+            }],
+        )],
     };
     // Tool-call arguments prove key scrubbing through the same entry point.
     let assistant_msg = assistant(vec![AssistantContent::ToolCall(ToolCall::new(
-        "tc-1".to_string(),
+        rig::message::ToolCallId::new_or_mint("tc-1".to_string()),
         ToolFunction::new(
             "lookup".to_string(),
             json!({ "path": SECRET, (SECRET): "arg-key-position" }),
@@ -6236,10 +6400,10 @@ fn untrusted_json_tool_result_values_and_keys_are_scrubbed() {
     let Message::User { content } = &prepared.history[1] else {
         panic!("expected the tool-result user message");
     };
-    let UserContent::ToolResult(result) = content.first() else {
+    let Some(UserContent::ToolResult(result)) = content.first() else {
         panic!("expected a tool result");
     };
-    let ToolResultContent::Json { value } = result.content.first() else {
+    let Some(ToolResultContent::Json { value }) = result.content.first() else {
         panic!("expected a json member");
     };
     assert_eq!(
@@ -6279,15 +6443,16 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     let model = model_at("http://127.0.0.1:1/v1", table);
 
     let msg = Message::User {
-        content: OneOrMany::one(UserContent::tool_result(
+        content: vec![UserContent::tool_result(
             "tool",
-            OneOrMany::one(ToolResultContent::Json {
+            "tool",
+            vec![ToolResultContent::Json {
                 value: json!({
                     "collide": { (SECRET_A): 1, (SECRET_B): 2 },
                     "sibling": { "clean": SECRET_A },
                 }),
-            }),
-        )),
+            }],
+        )],
     };
     // Precondition: the raw fixture really carries both colliding secret keys.
     let raw = serde_json::to_string(&msg).unwrap();
@@ -6308,10 +6473,10 @@ fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
     let Message::User { content } = &prepared.history[0] else {
         panic!("expected user message");
     };
-    let UserContent::ToolResult(result) = content.first() else {
+    let Some(UserContent::ToolResult(result)) = content.first() else {
         panic!("expected tool result");
     };
-    let ToolResultContent::Json { value } = result.content.first() else {
+    let Some(ToolResultContent::Json { value }) = result.content.first() else {
         panic!("expected json member");
     };
     assert_eq!(
@@ -6360,10 +6525,10 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
     // with `additional_params` carrying the sentinel on a representative case of
     // each — nothing in this message may survive to an untrusted wire.
     let message = Message::User {
-        content: OneOrMany::many(vec![
+        content: vec![
             UserContent::Image(Image {
                 data: DocumentSourceKind::String(SECRET.to_string()),
-                additional_params: Some(json!({ "caption": SECRET })),
+                additional_params: additional_params(json!({ "caption": SECRET })),
                 ..Image::default()
             }),
             UserContent::Image(Image {
@@ -6372,7 +6537,7 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
             }),
             UserContent::Audio(Audio {
                 data: DocumentSourceKind::Base64(base64_secret.clone()),
-                additional_params: Some(json!({ "transcript": SECRET })),
+                additional_params: additional_params(json!({ "transcript": SECRET })),
                 ..Audio::default()
             }),
             UserContent::Audio(Audio {
@@ -6381,7 +6546,7 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
             }),
             UserContent::Video(Video {
                 data: DocumentSourceKind::Url(format!("https://v/{SECRET}")),
-                additional_params: Some(json!({ "poster": SECRET })),
+                additional_params: additional_params(json!({ "poster": SECRET })),
                 ..Video::default()
             }),
             UserContent::Video(Video {
@@ -6398,16 +6563,15 @@ fn untrusted_document_and_media_string_channels_are_scrubbed() {
             }),
             UserContent::Document(Document {
                 data: DocumentSourceKind::String(SECRET.to_string()),
-                additional_params: Some(json!({ "note": SECRET })),
+                additional_params: additional_params(json!({ "note": SECRET })),
                 ..Document::default()
             }),
             UserContent::Document(Document {
                 data: DocumentSourceKind::Base64(base64_secret.clone()),
-                additional_params: Some(json!({ "meta": SECRET })),
+                additional_params: additional_params(json!({ "meta": SECRET })),
                 ..Document::default()
             }),
-        ])
-        .unwrap(),
+        ],
     };
     // Precondition: the raw media message really carries the sentinel in its
     // data/additional_params channels, so a vacuous pass is impossible.
@@ -6457,10 +6621,10 @@ async fn untrusted_non_renderable_wire_field_fails_before_network() {
 
     for data in non_renderable {
         let media = || Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data: data.clone(),
                 ..Image::default()
-            })),
+            })],
         };
         let (_tmp, redact) = secret_table();
         let provider = sse_capture_provider().await;
@@ -6627,7 +6791,8 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
         UserContent::text(format!("text:{SECRET}")),
         UserContent::tool_result(
             "id",
-            OneOrMany::one(ToolResultContent::text(format!("tr:{SECRET}"))),
+            "tool",
+            vec![ToolResultContent::text(format!("tr:{SECRET}"))],
         ),
         UserContent::Image(media_image()),
         UserContent::Audio(Audio {
@@ -6656,7 +6821,7 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
         };
         assert!(declared_renderable);
         let msg = Message::User {
-            content: OneOrMany::one(part),
+            content: vec![part],
         };
         let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
         assert!(!scrubbed.contains(SECRET), "user part leaked: {scrubbed}");
@@ -6666,7 +6831,7 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
     let assistant_parts = [
         AssistantContent::text(format!("say:{SECRET}")),
         AssistantContent::ToolCall(ToolCall::new(
-            "id".to_string(),
+            rig::message::ToolCallId::new_or_mint("id".to_string()),
             ToolFunction::new(
                 format!("fn-{SECRET}"),
                 json!({ "a": SECRET, (SECRET): "k" }),
@@ -6721,7 +6886,7 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
         };
         assert!(declared);
         let msg = Message::User {
-            content: OneOrMany::one(UserContent::tool_result("t", OneOrMany::one(content))),
+            content: vec![UserContent::tool_result("t", "tool", vec![content])],
         };
         let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
         assert!(
@@ -6779,10 +6944,10 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
     ];
     for data in renderable {
         let msg = Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data,
                 ..Image::default()
-            })),
+            })],
         };
         let out = scrub_message(&redact, &msg).expect("renderable media channel scrubs");
         let scrubbed = serde_json::to_string(&out).unwrap();
@@ -6798,10 +6963,10 @@ fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
     ];
     for data in non_renderable {
         let msg = Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data,
                 ..Image::default()
-            })),
+            })],
         };
         assert!(
             scrub_message(&redact, &msg).is_err(),
@@ -6831,7 +6996,7 @@ async fn untrusted_provider_wire_inventory_is_closed() {
         assistant(vec![
             AssistantContent::text(format!("assistant text {SECRET}")),
             AssistantContent::ToolCall(ToolCall::new(
-                "tc".to_string(),
+                rig::message::ToolCallId::new_or_mint("tc".to_string()),
                 ToolFunction::new(
                     "lookup".to_string(),
                     json!({ "path": SECRET, (SECRET): "arg-key" }),
@@ -6850,19 +7015,20 @@ async fn untrusted_provider_wire_inventory_is_closed() {
             }),
         ]),
         Message::User {
-            content: OneOrMany::one(UserContent::tool_result(
+            content: vec![UserContent::tool_result(
                 "t",
-                OneOrMany::one(ToolResultContent::Json {
+                "tool",
+                vec![ToolResultContent::Json {
                     value: json!({ "v": SECRET, (SECRET): "k", "arr": [SECRET] }),
-                }),
-            )),
+                }],
+            )],
         },
         Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data: DocumentSourceKind::Base64(base64_secret.clone()),
-                additional_params: Some(json!({ "alt": SECRET })),
+                additional_params: additional_params(json!({ "alt": SECRET })),
                 ..Image::default()
-            })),
+            })],
         },
     ];
     let chat = openai_model_at_with_wire_and_redact(
@@ -6907,15 +7073,16 @@ async fn untrusted_provider_wire_inventory_is_closed() {
         Message::user(format!("user text {SECRET}")),
         assistant(vec![AssistantContent::text(format!("assistant {SECRET}"))]),
         Message::User {
-            content: OneOrMany::one(UserContent::tool_result(
+            content: vec![UserContent::tool_result(
                 "t",
-                OneOrMany::one(ToolResultContent::Json {
+                "tool",
+                vec![ToolResultContent::Json {
                     value: json!({ "v": SECRET, (SECRET): "k" }),
-                }),
-            )),
+                }],
+            )],
         },
         Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data: DocumentSourceKind::Base64(base64_secret.clone()),
                 // rig's OpenAI completion adapter requires a media type to
                 // render a base64 image onto the wire; without it the request
@@ -6923,15 +7090,15 @@ async fn untrusted_provider_wire_inventory_is_closed() {
                 // field and scrubs only the base64 data + additional_params, so
                 // the sentinel-bearing channels still reach the wire redacted.
                 media_type: Some(ImageMediaType::PNG),
-                additional_params: Some(json!({ "alt": SECRET })),
+                additional_params: additional_params(json!({ "alt": SECRET })),
                 ..Image::default()
-            })),
+            })],
         },
         Message::User {
-            content: OneOrMany::one(UserContent::Image(Image {
+            content: vec![UserContent::Image(Image {
                 data: DocumentSourceKind::Url(format!("https://h/{SECRET}")),
                 ..Image::default()
-            })),
+            })],
         },
     ];
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
@@ -7008,10 +7175,10 @@ async fn untrusted_provider_wire_inventory_is_closed() {
         .complete_captured(
             "system",
             &[Message::User {
-                content: OneOrMany::one(UserContent::Image(Image {
+                content: vec![UserContent::Image(Image {
                     data: DocumentSourceKind::Raw(vec![1, 2, 3]),
                     ..Image::default()
-                })),
+                })],
             }],
             Message::user("go"),
             &[],

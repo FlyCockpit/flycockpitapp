@@ -168,7 +168,7 @@ async fn evaluate_inner(
     {
         Ok(calls) => calls,
         Err(e) => {
-            tracing::debug!(error = %e, "safety_gate: call failed; failing closed");
+            crate::engine::model::log_utility_model_failure("safety_gate", &e);
             return Err(
                 if matches!(
                     crate::engine::model::as_inference_failure(&e).map(|failure| &failure.class),
@@ -206,8 +206,8 @@ mod tests {
 
     fn mk(name: &str, args: serde_json::Value) -> crate::engine::message::ToolCall {
         crate::engine::message::ToolCall {
-            id: "1".into(),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint("1"),
+            provider: None,
             function: rig::message::ToolFunction {
                 name: name.into(),
                 arguments: args,

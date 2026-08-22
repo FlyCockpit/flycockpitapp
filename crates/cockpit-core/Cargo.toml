@@ -38,6 +38,7 @@ image = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 # Workspace: `rig-core` aliased as `rig` — portable contracts + transport only.
 rig = { workspace = true }
+httpdate = "1"
 tokio-tungstenite = { workspace = true }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }

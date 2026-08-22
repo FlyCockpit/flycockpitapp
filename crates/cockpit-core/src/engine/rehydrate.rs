@@ -43,9 +43,9 @@
 //! full unpruned form with a warning.
 
 use anyhow::{Context, Result, anyhow};
-use rig::OneOrMany;
 use rig::message::{
-    AssistantContent, Message, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, Message, ProviderCallId, ToolCall, ToolCallId, ToolFunction, ToolResult,
+    ToolResultContent, UserContent,
 };
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -1051,8 +1051,11 @@ fn load_ledger_conn(conn: &Connection, session_id: Uuid) -> Option<PruneLedger> 
 struct PendingTurn {
     text_parts: Vec<String>,
     calls: Vec<ToolCall>,
-    /// One `(id, provider_call_id, body)` per issued call, in dispatch order.
-    results: Vec<(String, Option<String>, String)>,
+    /// One `(internal id, provider identity, tool name, body)` per issued
+    /// call, in dispatch order. The two identities remain distinct so a
+    /// resumed Responses turn echoes the provider's wire handle without
+    /// losing Cockpit's durable call correlation.
+    results: Vec<(ToolCallId, Option<ProviderCallId>, String, String)>,
 }
 
 impl PendingTurn {
@@ -1077,19 +1080,20 @@ impl PendingTurn {
         }
         // `content` is non-empty here: `is_empty()` returned false, so there
         // is text and/or at least one call.
-        if let Ok(content) = OneOrMany::many(content) {
+        if !content.is_empty() {
             history.push(Message::Assistant { id: None, content });
         }
         // Each tool result is its own user message (the live wire shape).
         // Provider contract: the results immediately follow the assistant
         // turn that issued the calls.
-        for (id, call_id, body) in self.results {
+        for (call, provider, name, body) in self.results {
             history.push(Message::User {
-                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                    id,
-                    call_id,
-                    content: OneOrMany::one(ToolResultContent::text(body)),
-                })),
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call,
+                    provider,
+                    name,
+                    content: vec![ToolResultContent::text(body)],
+                })],
             });
         }
     }
@@ -1106,6 +1110,7 @@ struct SpawnInfo {
     label: String,
     extras: serde_json::Map<String, serde_json::Value>,
     provider_call_id: Option<String>,
+    provider_item_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1114,6 +1119,7 @@ struct ReportInfo {
     label: String,
     report: String,
     provider_call_id: Option<String>,
+    provider_item_id: Option<String>,
 }
 
 fn rebuild_history(
@@ -1168,6 +1174,7 @@ fn rebuild_history(
                             | "prompt"
                             | "label"
                             | "noninteractive"
+                            | "provider_item_id"
                             | "provider_call_id"
                             | "provider_call_id_source"
                             | "function_call_id"
@@ -1187,6 +1194,7 @@ fn rebuild_history(
                     label,
                     extras,
                     provider_call_id: event_provider_call_id(ev),
+                    provider_item_id: event_provider_item_id(ev),
                 });
         }
     }
@@ -1224,6 +1232,7 @@ fn rebuild_history(
                 label,
                 report,
                 provider_call_id: event_provider_call_id(ev),
+                provider_item_id: event_provider_item_id(ev),
             };
             report_by_call.insert(call_id, info.clone());
             reports_by_call
@@ -1296,19 +1305,25 @@ fn rebuild_history(
                             .clone()
                             .unwrap_or_else(|| call_id.to_string());
                         let provider_call_id = provider_identity;
-                        pending.calls.push(ToolCall {
-                            id: provider_item_id.clone(),
-                            call_id: provider_call_id.clone(),
+                        let provider = provider_call_id
+                            .clone()
+                            .and_then(ProviderCallId::new)
+                            .map(|provider| provider.with_item_id(provider_item_id));
+                        let call = ToolCall {
+                            id: ToolCallId::new_or_mint(call_id.to_string()),
+                            provider: provider.clone(),
                             function: ToolFunction {
                                 name: tc.tool.clone(),
                                 arguments: tc.wire_input_json.clone(),
                             },
                             signature: None,
                             additional_params: None,
-                        });
+                        };
+                        pending.calls.push(call.clone());
                         pending.results.push((
-                            provider_item_id,
-                            provider_call_id,
+                            call.id,
+                            provider,
+                            tc.tool.clone(),
                             tc.output.clone(),
                         ));
                     }
@@ -1332,21 +1347,20 @@ fn rebuild_history(
                             .get("wire_input")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        pending.calls.push(ToolCall {
-                            id: call_id.to_string(),
-                            call_id: None,
+                        let call = ToolCall {
+                            id: ToolCallId::new_or_mint(call_id.to_string()),
+                            provider: None,
                             function: ToolFunction {
-                                name: tool,
+                                name: tool.clone(),
                                 arguments,
                             },
                             signature: None,
                             additional_params: None,
-                        });
-                        pending.results.push((
-                            call_id.to_string(),
-                            None,
-                            ABORTED_CALL_BODY.to_string(),
-                        ));
+                        };
+                        pending.calls.push(call.clone());
+                        pending
+                            .results
+                            .push((call.id, None, tool, ABORTED_CALL_BODY.to_string()));
                         heals.push(Recovery::ResumeHeal {
                             kind: "stub_orphan_tool_call",
                             id: call_id.to_string(),
@@ -1428,6 +1442,7 @@ fn rebuild_history(
                         label: "default".to_string(),
                         extras: serde_json::Map::new(),
                         provider_call_id: None,
+                        provider_item_id: None,
                     });
                     let mut delegate = spawn.extras;
                     delegate.insert("agent".to_string(), serde_json::json!(spawn.child));
@@ -1442,16 +1457,26 @@ fn rebuild_history(
                 };
                 let reports = reports_by_call.get(call_id).cloned().unwrap_or_default();
                 let provider_call_id = task_provider_call_id(ev, &spawns, &reports);
-                pending.calls.push(ToolCall {
-                    id: call_id.to_string(),
-                    call_id: provider_call_id.clone(),
+                let provider_item_id = task_provider_item_id(ev, &spawns, &reports);
+                let task_provider =
+                    provider_call_id
+                        .clone()
+                        .and_then(ProviderCallId::new)
+                        .map(|provider| match provider_item_id.clone() {
+                            Some(item_id) => provider.with_item_id(item_id),
+                            None => provider,
+                        });
+                let task_call = ToolCall {
+                    id: ToolCallId::new_or_mint(call_id.to_string()),
+                    provider: task_provider.clone(),
                     function: ToolFunction {
                         name: "task".to_string(),
                         arguments,
                     },
                     signature: None,
                     additional_params: None,
-                });
+                };
+                pending.calls.push(task_call.clone());
                 // The task call's result is the subagent report. A missing
                 // report means the delegation did not complete before resume:
                 // heal it with an honest stub rather than dropping the whole
@@ -1466,9 +1491,11 @@ fn rebuild_history(
                             .cloned();
                         let (report, failed) = match report {
                             Some(report) => {
-                                ensure_report_provider_call_id_matches(
+                                ensure_report_provider_identity_matches(
                                     policy,
                                     call_id,
+                                    provider_item_id.as_deref(),
+                                    report.provider_item_id.as_deref(),
                                     provider_call_id.as_deref(),
                                     report.provider_call_id.as_deref(),
                                     ev.seq,
@@ -1505,22 +1532,28 @@ fn rebuild_history(
                         "children": children,
                     })
                     .to_string();
-                    pending
-                        .results
-                        .push((call_id.to_string(), provider_call_id.clone(), body));
+                    pending.results.push((
+                        task_call.id.clone(),
+                        task_provider.clone(),
+                        "task".to_string(),
+                        body,
+                    ));
                 } else {
                     match report_by_call.get(call_id) {
                         Some(report) => {
-                            ensure_report_provider_call_id_matches(
+                            ensure_report_provider_identity_matches(
                                 policy,
                                 call_id,
+                                provider_item_id.as_deref(),
+                                report.provider_item_id.as_deref(),
                                 provider_call_id.as_deref(),
                                 report.provider_call_id.as_deref(),
                                 ev.seq,
                             )?;
                             pending.results.push((
-                                call_id.to_string(),
-                                provider_call_id.clone(),
+                                task_call.id.clone(),
+                                task_provider.clone(),
+                                "task".to_string(),
                                 report.report.clone(),
                             ));
                         }
@@ -1534,8 +1567,9 @@ fn rebuild_history(
                                 )));
                             }
                             pending.results.push((
-                                call_id.to_string(),
-                                provider_call_id.clone(),
+                                task_call.id.clone(),
+                                task_provider.clone(),
+                                "task".to_string(),
                                 MISSING_REPORT_BODY.to_string(),
                             ));
                             heals.push(Recovery::ResumeHeal {
@@ -1583,6 +1617,22 @@ fn event_provider_call_id(ev: &SessionEventRow) -> Option<String> {
         })
 }
 
+fn event_provider_item_id(ev: &SessionEventRow) -> Option<String> {
+    ev.data
+        .get("provider_item_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            ev.data
+                .get("provider_identity")
+                .and_then(|identity| identity.get("provider_item_id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
 fn task_provider_call_id(
     ev: &SessionEventRow,
     spawns: &[SpawnInfo],
@@ -1602,22 +1652,47 @@ fn task_provider_call_id(
         .or_else(|| Some(ev.call_id.as_ref()?.to_string()))
 }
 
-fn ensure_report_provider_call_id_matches(
+fn task_provider_item_id(
+    ev: &SessionEventRow,
+    spawns: &[SpawnInfo],
+    reports: &[ReportInfo],
+) -> Option<String> {
+    event_provider_item_id(ev)
+        .or_else(|| {
+            spawns
+                .iter()
+                .find_map(|spawn| spawn.provider_item_id.clone())
+        })
+        .or_else(|| {
+            reports
+                .iter()
+                .find_map(|report| report.provider_item_id.clone())
+        })
+}
+
+fn ensure_report_provider_identity_matches(
     policy: RehydratePolicy,
     call_id: &str,
-    expected: Option<&str>,
-    actual: Option<&str>,
+    expected_item_id: Option<&str>,
+    actual_item_id: Option<&str>,
+    expected_call_id: Option<&str>,
+    actual_call_id: Option<&str>,
     seq: i64,
 ) -> Result<()> {
     if policy.is_strict()
-        && let (Some(expected), Some(actual)) = (expected, actual)
-        && expected != actual
+        && ((matches!(
+            (expected_item_id, actual_item_id),
+            (Some(expected), Some(actual)) if expected != actual
+        )) || matches!(
+            (expected_call_id, actual_call_id),
+            (Some(expected), Some(actual)) if expected != actual
+        ))
     {
         return Err(anyhow::Error::new(RehydrateRepairRequired::new(
             "mismatched_pair",
             vec![call_id.to_string()],
             Some(seq.saturating_sub(1)),
-            "Responses replay found a subagent report paired to a different provider call id",
+            "Responses replay found a subagent report paired to a different provider identity",
         )));
     }
     Ok(())
@@ -1639,7 +1714,7 @@ fn result_ids(msg: &Message) -> Vec<String> {
         Message::User { content } => content
             .iter()
             .filter_map(|c| match c {
-                UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                UserContent::ToolResult(tr) => Some(tr.call.to_string()),
                 _ => None,
             })
             .collect(),
@@ -1648,13 +1723,16 @@ fn result_ids(msg: &Message) -> Vec<String> {
 }
 
 /// A synthetic, honest tool_result user message for a stubbed orphan call.
-fn stub_result_message(id: &str, body: &str) -> Message {
+/// Retain the exact wire identity and name from its assistant tool_use: Rig
+/// pairs provider replay results by all three fields.
+fn stub_result_message(call: &ToolCall, body: &str) -> Message {
     Message::User {
-        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-            id: id.to_string(),
-            call_id: None,
-            content: OneOrMany::one(ToolResultContent::text(body.to_string())),
-        })),
+        content: vec![UserContent::ToolResult(ToolResult {
+            call: call.id.clone(),
+            provider: call.provider.clone(),
+            name: call.function.name.clone(),
+            content: vec![ToolResultContent::text(body.to_string())],
+        })],
     }
 }
 
@@ -1710,7 +1788,7 @@ fn heal_pairing_pending(
                 let calls: Vec<String> = content
                     .iter()
                     .filter_map(|c| match c {
-                        AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                        AssistantContent::ToolCall(tc) => Some(tc.id.to_string()),
                         _ => None,
                     })
                     .collect();
@@ -1729,9 +1807,10 @@ fn heal_pairing_pending(
                     i += 1;
                     continue;
                 }
-                let has_orphan = content.iter().any(
-                    |c| matches!(c, UserContent::ToolResult(tr) if !open_calls.contains(&tr.id)),
-                );
+                let has_orphan = content.iter().any(|c| {
+                    matches!(c, UserContent::ToolResult(tr)
+                        if !open_calls.iter().any(|call| call == tr.call.as_str()))
+                });
                 if !has_orphan {
                     i += 1;
                     continue;
@@ -1742,10 +1821,12 @@ fn heal_pairing_pending(
                 let mut kept: Vec<UserContent> = Vec::new();
                 for c in content.iter() {
                     match c {
-                        UserContent::ToolResult(tr) if !open_calls.contains(&tr.id) => {
+                        UserContent::ToolResult(tr)
+                            if !open_calls.iter().any(|call| call == tr.call.as_str()) =>
+                        {
                             heals.push(Recovery::ResumeHeal {
                                 kind: "drop_orphan_tool_result",
-                                id: tr.id.clone(),
+                                id: tr.call.to_string(),
                             });
                         }
                         _ => kept.push(c.clone()),
@@ -1756,7 +1837,7 @@ fn heal_pairing_pending(
                     history.remove(i);
                     // Do not advance: the next message shifts into index `i`.
                 } else {
-                    *content = OneOrMany::many(kept).expect("kept is non-empty (checked above)");
+                    *content = kept;
                     i += 1;
                 }
             }
@@ -1771,14 +1852,14 @@ fn heal_pairing_pending(
     let mut i = 0;
     while i < history.len() {
         if let Message::Assistant { content, .. } = &history[i] {
-            let call_ids: Vec<String> = content
+            let calls: Vec<ToolCall> = content
                 .iter()
                 .filter_map(|c| match c {
-                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    AssistantContent::ToolCall(tc) => Some(tc.clone()),
                     _ => None,
                 })
                 .collect();
-            if !call_ids.is_empty() {
+            if !calls.is_empty() {
                 let mut covered: Vec<String> = Vec::new();
                 let mut j = i + 1;
                 while let Some(msg @ Message::User { .. }) = history.get(j) {
@@ -1799,13 +1880,13 @@ fn heal_pairing_pending(
                     covered.extend(pending_results.iter().cloned());
                 }
                 // `j` is the insertion point (just past the result run).
-                for id in &call_ids {
-                    if !covered.contains(id) {
-                        history.insert(j, stub_result_message(id, ABORTED_CALL_BODY));
+                for call in &calls {
+                    if !covered.contains(&call.id.to_string()) {
+                        history.insert(j, stub_result_message(call, ABORTED_CALL_BODY));
                         j += 1;
                         heals.push(Recovery::ResumeHeal {
                             kind: "stub_orphan_tool_call",
-                            id: id.clone(),
+                            id: call.id.to_string(),
                         });
                     }
                 }
@@ -1859,15 +1940,19 @@ fn detect_responses_identity_gaps(history: &[Message]) -> Result<()> {
                 open.clear();
                 for part in content.iter() {
                     if let AssistantContent::ToolCall(tc) = part {
-                        let Some(call_id) = tc.call_id.clone() else {
+                        let Some(call_id) = tc
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.clone())
+                        else {
                             return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                 "missing_provider_call_id",
-                                vec![tc.id.clone()],
+                                vec![tc.id.to_string()],
                                 None,
                                 "Responses replay requires the provider function call id for each assistant tool call",
                             )));
                         };
-                        open.push((tc.id.clone(), call_id));
+                        open.push((tc.id.to_string(), call_id));
                     }
                 }
             }
@@ -1876,21 +1961,26 @@ fn detect_responses_identity_gaps(history: &[Message]) -> Result<()> {
                 for part in content.iter() {
                     if let UserContent::ToolResult(tr) = part {
                         saw_result = true;
-                        let Some(pos) = open.iter().position(|(id, _)| id == &tr.id) else {
+                        let Some(pos) = open.iter().position(|(id, _)| id == tr.call.as_str())
+                        else {
                             return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                 "orphan_tool_result",
-                                vec![tr.id.clone()],
+                                vec![tr.call.to_string()],
                                 None,
                                 "Responses replay found a tool result with no preceding assistant tool call",
                             )));
                         };
                         let expected_call_id = open[pos].1.clone();
-                        match tr.call_id.as_deref() {
+                        match tr
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.call_id.as_str())
+                        {
                             Some(actual) if actual == expected_call_id.as_str() => {}
                             Some(_) => {
                                 return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                     "mismatched_pair",
-                                    vec![tr.id.clone()],
+                                    vec![tr.call.to_string()],
                                     None,
                                     "Responses replay found a tool result paired to a different provider call id",
                                 )));
@@ -1898,7 +1988,7 @@ fn detect_responses_identity_gaps(history: &[Message]) -> Result<()> {
                             None => {
                                 return Err(anyhow::Error::new(RehydrateRepairRequired::new(
                                     "missing_provider_call_id",
-                                    vec![tr.id.clone()],
+                                    vec![tr.call.to_string()],
                                     None,
                                     "Responses replay requires the provider function call id on each tool result",
                                 )));
@@ -1958,7 +2048,7 @@ pub(crate) fn validate_pairing(history: &[Message]) -> Result<()> {
             let call_ids: Vec<String> = content
                 .iter()
                 .filter_map(|c| match c {
-                    AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                    AssistantContent::ToolCall(tc) => Some(tc.id.to_string()),
                     _ => None,
                 })
                 .collect();
@@ -1997,7 +2087,7 @@ pub(crate) fn validate_pairing(history: &[Message]) -> Result<()> {
                 let calls: Vec<String> = content
                     .iter()
                     .filter_map(|c| match c {
-                        AssistantContent::ToolCall(tc) => Some(tc.id.clone()),
+                        AssistantContent::ToolCall(tc) => Some(tc.id.to_string()),
                         _ => None,
                     })
                     .collect();
@@ -2010,11 +2100,11 @@ pub(crate) fn validate_pairing(history: &[Message]) -> Result<()> {
                 for c in content.iter() {
                     if let UserContent::ToolResult(tr) = c {
                         had_result = true;
-                        if !open_calls.contains(&tr.id) {
+                        if !open_calls.iter().any(|call| call == tr.call.as_str()) {
                             return Err(anyhow!(
                                 "rebuilt history has an orphan tool_result `{}` \
                                  (no preceding tool_use); refusing to send a malformed context",
-                                tr.id
+                                tr.call
                             ));
                         }
                     }
@@ -2733,12 +2823,41 @@ mod tests {
         let h = r.history;
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "provider-item");
-        assert_eq!(calls[0].call_id.as_deref(), Some("provider-call"));
+        // Rig 0.42 keeps Cockpit's durable correlation id separate from the
+        // provider identity: `id` is the internal call id, while `provider`
+        // retains both the item and function-call handles.
+        assert_eq!(calls[0].id, "cockpit-internal");
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("provider-item")
+        );
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("provider-call")
+        );
         let results = tool_results(&h[2]);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "provider-item");
-        assert_eq!(results[0].call_id.as_deref(), Some("provider-call"));
+        assert_eq!(results[0].call, "cockpit-internal");
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("provider-item")
+        );
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("provider-call")
+        );
     }
 
     #[tokio::test]
@@ -2764,7 +2883,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
-        assert_eq!(calls[0].call_id.as_deref(), Some("provider-call"));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("provider-call")
+        );
     }
 
     #[tokio::test]
@@ -2860,10 +2985,22 @@ mod tests {
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].id, call_id);
-        assert_eq!(calls[0].call_id.as_deref(), Some(call_id));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some(call_id)
+        );
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].id, call_id);
-        assert_eq!(results[0].call_id.as_deref(), Some(call_id));
+        assert_eq!(results[0].call, call_id);
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some(call_id)
+        );
     }
 
     #[tokio::test]
@@ -2932,10 +3069,22 @@ mod tests {
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].id, call_id);
-        assert_eq!(calls[0].call_id.as_deref(), Some(call_id));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some(call_id)
+        );
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].id, call_id);
-        assert_eq!(results[0].call_id.as_deref(), Some(call_id));
+        assert_eq!(results[0].call, call_id);
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some(call_id)
+        );
     }
 
     #[tokio::test]
@@ -3034,10 +3183,22 @@ mod tests {
                 .unwrap();
             let calls = assistant_calls(&r.history[1]);
             assert_eq!(calls[0].id, call_id);
-            assert_eq!(calls[0].call_id.as_deref(), Some(call_id));
+            assert_eq!(
+                calls[0]
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.call_id.as_str()),
+                Some(call_id)
+            );
             let results = tool_results(&r.history[2]);
-            assert_eq!(results[0].id, call_id);
-            assert_eq!(results[0].call_id.as_deref(), Some(call_id));
+            assert_eq!(results[0].call, call_id);
+            assert_eq!(
+                results[0]
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.call_id.as_str()),
+                Some(call_id)
+            );
         }
     }
 
@@ -3141,13 +3302,13 @@ mod tests {
         assert_eq!(calls[0].id, "task-1");
         let results = tool_results(&h[2]);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "task-1");
+        assert_eq!(results[0].call, "task-1");
         assert_eq!(tool_result_body(&h[2]), "found three modules");
         validate_pairing(&h).expect("provider-valid");
     }
 
     #[tokio::test]
-    async fn strict_responses_rehydrate_preserves_task_provider_call_identity() {
+    async fn strict_responses_rehydrate_preserves_dual_task_provider_identity() {
         let s = root_session();
         record_user(&s, "investigate").await;
         record_assistant(&s, "infer-1", "delegating").await;
@@ -3158,11 +3319,13 @@ mod tests {
             &json!({
                 "child_agent": "explore",
                 "task_call_id": "task-1",
-                "provider_call_id": "call-provider-task",
+                "provider_item_id": "fc_task_1",
+                "provider_call_id": "call_task_1",
                 "provider_call_id_source": "provider",
                 "provider_identity": {
                     "cockpit_call_id": "task-1",
-                    "provider_call_id": "call-provider-task",
+                    "provider_item_id": "fc_task_1",
+                    "provider_call_id": "call_task_1",
                     "provider_call_id_source": "provider",
                     "wire_api": "responses"
                 },
@@ -3177,11 +3340,13 @@ mod tests {
             Some("task-1"),
             &json!({
                 "report": "found three modules",
-                "provider_call_id": "call-provider-task",
+                "provider_item_id": "fc_task_1",
+                "provider_call_id": "call_task_1",
                 "provider_call_id_source": "provider",
                 "provider_identity": {
                     "cockpit_call_id": "task-1",
-                    "provider_call_id": "call-provider-task",
+                    "provider_item_id": "fc_task_1",
+                    "provider_call_id": "call_task_1",
                     "provider_call_id_source": "provider",
                     "wire_api": "responses"
                 }
@@ -3196,17 +3361,44 @@ mod tests {
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].id, "task-1");
-        assert_eq!(calls[0].call_id.as_deref(), Some("call-provider-task"));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_task_1")
+        );
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_task_1")
+        );
         let payload = &calls[0].function.arguments["payload"];
         assert!(
             payload.get("provider_call_id").is_none(),
             "provider identity must not leak into replayed task args"
         );
+        assert!(payload.get("provider_item_id").is_none());
         assert!(payload.get("provider_call_id_source").is_none());
         assert!(payload.get("provider_identity").is_none());
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].id, "task-1");
-        assert_eq!(results[0].call_id.as_deref(), Some("call-provider-task"));
+        assert_eq!(results[0].call, "task-1");
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_task_1")
+        );
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_task_1")
+        );
     }
 
     #[tokio::test]
@@ -3259,14 +3451,26 @@ mod tests {
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].id, "task-synthetic");
-        assert_eq!(calls[0].call_id.as_deref(), Some("task-synthetic"));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("task-synthetic")
+        );
         let payload = &calls[0].function.arguments["payload"];
         assert!(payload.get("provider_call_id").is_none());
         assert!(payload.get("provider_call_id_source").is_none());
         assert!(payload.get("provider_identity").is_none());
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].id, "task-synthetic");
-        assert_eq!(results[0].call_id.as_deref(), Some("task-synthetic"));
+        assert_eq!(results[0].call, "task-synthetic");
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("task-synthetic")
+        );
     }
 
     #[tokio::test]
@@ -3325,7 +3529,10 @@ mod tests {
         let calls = assistant_calls(&r.history[1]);
         assert_eq!(calls[0].id, "task-interactive");
         assert_eq!(
-            calls[0].call_id.as_deref(),
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
             Some("call-provider-interactive")
         );
         let payload = &calls[0].function.arguments["payload"];
@@ -3334,9 +3541,12 @@ mod tests {
         assert!(payload.get("provider_call_id_source").is_none());
         assert!(payload.get("provider_identity").is_none());
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].id, "task-interactive");
+        assert_eq!(results[0].call, "task-interactive");
         assert_eq!(
-            results[0].call_id.as_deref(),
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
             Some("call-provider-interactive")
         );
     }
@@ -3368,9 +3578,21 @@ mod tests {
             .unwrap()
             .unwrap();
         let calls = assistant_calls(&r.history[1]);
-        assert_eq!(calls[0].call_id.as_deref(), Some("task-legacy"));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("task-legacy")
+        );
         let results = tool_results(&r.history[2]);
-        assert_eq!(results[0].call_id.as_deref(), Some("task-legacy"));
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("task-legacy")
+        );
     }
 
     #[tokio::test]
@@ -3572,7 +3794,13 @@ mod tests {
         let calls = assistant_calls(&h[1]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "task");
-        assert_eq!(calls[0].call_id.as_deref(), Some("call-provider-batch"));
+        assert_eq!(
+            calls[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call-provider-batch")
+        );
         assert_eq!(
             calls[0].function.arguments,
             json!({
@@ -3596,7 +3824,13 @@ mod tests {
             })
         );
         let results = tool_results(&h[2]);
-        assert_eq!(results[0].call_id.as_deref(), Some("call-provider-batch"));
+        assert_eq!(
+            results[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call-provider-batch")
+        );
         validate_pairing(&h).expect("provider-valid");
     }
 
@@ -3802,6 +4036,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "orphan");
         assert_eq!(calls[0].function.name, "read");
+        let results = tool_results(&r.history[2]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call, calls[0].id);
+        assert_eq!(results[0].provider, calls[0].provider);
+        assert_eq!(results[0].name, calls[0].function.name);
         assert_eq!(tool_result_body(&r.history[2]), ABORTED_CALL_BODY);
         assert_eq!(
             r.heals,
@@ -3889,8 +4128,8 @@ mod tests {
             .iter()
             .map(|id| {
                 AssistantContent::ToolCall(ToolCall {
-                    id: (*id).to_string(),
-                    call_id: None,
+                    id: ToolCallId::new_or_mint((*id).to_string()),
+                    provider: None,
                     function: ToolFunction {
                         name: "read".into(),
                         arguments: json!({ "path": "/f" }),
@@ -3902,13 +4141,23 @@ mod tests {
             .collect();
         Message::Assistant {
             id: None,
-            content: OneOrMany::many(calls).unwrap(),
+            content: calls,
         }
     }
 
     /// One tool_result user message (the live wire shape).
     fn result_msg(id: &str, body: &str) -> Message {
-        stub_result_message(id, body)
+        let call = ToolCall {
+            id: ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            function: ToolFunction {
+                name: "read".to_string(),
+                arguments: serde_json::Value::Null,
+            },
+            signature: None,
+            additional_params: None,
+        };
+        stub_result_message(&call, body)
     }
 
     /// A `task` delegation whose `subagent_report` never landed is HEALED
@@ -3951,9 +4200,25 @@ mod tests {
     /// stubbed with an honest aborted result; the healed history validates.
     #[tokio::test]
     async fn heal_stubs_orphan_tool_use() {
+        let provider = ProviderCallId::new("fn-orphan-1".to_string())
+            .expect("provider call id")
+            .with_item_id("fc-orphan-1".to_string());
+        let call = ToolCall {
+            id: ToolCallId::for_provider(Some(&provider)),
+            provider: Some(provider),
+            function: ToolFunction {
+                name: "read".to_string(),
+                arguments: json!({ "path": "/f" }),
+            },
+            signature: None,
+            additional_params: None,
+        };
         let mut history = vec![
             Message::user("go"),
-            assistant_with_calls(&["c1"]),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(call.clone())],
+            },
             // No tool_result follows c1.
             Message::user("next"),
         ];
@@ -3962,11 +4227,16 @@ mod tests {
         validate_pairing(&history).expect("provider-valid after heal");
         // A stub result was inserted right after the assistant turn.
         assert_eq!(tool_result_body(&history[2]), ABORTED_CALL_BODY);
+        let results = tool_results(&history[2]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call, call.id);
+        assert_eq!(results[0].provider, call.provider);
+        assert_eq!(results[0].name, call.function.name);
         assert_eq!(
             heals,
             vec![Recovery::ResumeHeal {
                 kind: "stub_orphan_tool_call",
-                id: "c1".into(),
+                id: call.id.to_string(),
             }]
         );
     }
@@ -4004,19 +4274,20 @@ mod tests {
         // Assistant issues c1 only; a user message carries BOTH c1 (paired)
         // and ghost (orphan) results.
         let mixed = Message::User {
-            content: OneOrMany::many(vec![
+            content: vec![
                 UserContent::ToolResult(ToolResult {
-                    id: "c1".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::text("real")),
+                    call: ToolCallId::new_or_mint("c1".to_string()),
+                    provider: None,
+                    name: "read".to_string(),
+                    content: vec![ToolResultContent::text("real")],
                 }),
                 UserContent::ToolResult(ToolResult {
-                    id: "ghost".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::text("stale")),
+                    call: ToolCallId::new_or_mint("ghost".to_string()),
+                    provider: None,
+                    name: "read".to_string(),
+                    content: vec![ToolResultContent::text("stale")],
                 }),
-            ])
-            .unwrap(),
+            ],
         };
         let mut history = vec![Message::user("go"), assistant_with_calls(&["c1"]), mixed];
         let mut heals = Vec::new();

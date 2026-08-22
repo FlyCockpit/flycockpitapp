@@ -2094,17 +2094,36 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
             Ok(_) => return O::Cancelled,
             Err(_) if cancel.is_cancelled() => return O::Cancelled,
             Err(e) => {
-                tracing::warn!(error = %e, purpose, "compact: brief generation failed");
-                let diagnostic = compact_diagnostic(&draft, &e.to_string());
+                // Keep the raw completion detail in-process only while the
+                // classifier recognizes a context-overflow response. Rig 0.42
+                // can render provider request ids in its display error, so the
+                // log and durable diagnostic must use the common safe
+                // projection instead of formatting a provider error.
+                let raw_error = e.to_string();
+                let safe = crate::engine::model::safe_inference_error_detail(&e);
+                if let Some(safe) = safe {
+                    tracing::warn!(
+                        purpose,
+                        provider_detail = safe.marker,
+                        observed_status = ?safe.observed_status,
+                        recovery = safe.recovery.as_str(),
+                        "compact: brief generation failed"
+                    );
+                } else {
+                    tracing::warn!(error = %e, purpose, "compact: brief generation failed");
+                }
+                let diagnostic_input = safe.map_or(raw_error.as_str(), |safe| safe.marker);
+                let diagnostic = compact_diagnostic(&draft, diagnostic_input);
                 let completion_error = e.downcast_ref::<rig::completion::CompletionError>();
-                let status =
-                    completion_error.and_then(crate::engine::model::rig_boundary::http_status_of);
+                let status = safe.and_then(|safe| safe.observed_status).or_else(|| {
+                    completion_error.and_then(crate::engine::model::rig_boundary::http_status_of)
+                });
                 let typed_timeout = completion_error
                     .and_then(crate::engine::model::rig_boundary::stream_timeout_kind)
                     .is_some();
                 let classification = crate::engine::compact_draft::classify_sample_error(
                     false,
-                    &e.to_string(),
+                    &raw_error,
                     status,
                     typed_timeout,
                 );

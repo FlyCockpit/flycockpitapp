@@ -552,6 +552,7 @@ async fn record_responses_task_pair(
 ) {
     let identity = crate::engine::task_identity::TaskProviderIdentity::for_task_call(
         task_call_id,
+        Some("fc-task-item"),
         Some(provider_call_id),
     );
     session
@@ -562,6 +563,7 @@ async fn record_responses_task_pair(
             &json!({
                 "child_agent": child_agent,
                 "task_call_id": task_call_id,
+                "provider_item_id": identity.provider_item_id,
                 "provider_call_id": identity.provider_call_id,
                 "provider_call_id_source": identity.provider_call_id_source,
                 "provider_identity": identity.event_identity_json(task_call_id),
@@ -580,6 +582,7 @@ async fn record_responses_task_pair(
             &json!({
                 "child_agent": child_agent,
                 "task_call_id": task_call_id,
+                "provider_item_id": identity.provider_item_id,
                 "provider_call_id": identity.provider_call_id,
                 "provider_call_id_source": identity.provider_call_id_source,
                 "provider_identity": identity.event_identity_json(task_call_id),
@@ -633,11 +636,13 @@ fn assert_task_event_identity(
         })
         .unwrap_or_else(|| panic!("missing {event_type} event for {task_call_id}/{label}"));
     assert_eq!(event["data"]["provider_call_id"], provider_call_id);
+    assert_eq!(event["data"]["provider_item_id"], "fc-task-item");
     assert_eq!(event["data"]["provider_call_id_source"], "provider");
     assert_eq!(
         event["data"]["provider_identity"],
         json!({
             "cockpit_call_id": task_call_id,
+            "provider_item_id": "fc-task-item",
             "provider_call_id": provider_call_id,
             "provider_call_id_source": "provider",
             "wire_api": "responses",
@@ -1685,6 +1690,96 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
     // The emitted file carries the non-`completed` status + captured body.
     assert_eq!(body["status"], "timed_out");
     assert_eq!(body["request"]["model"], "qwen3");
+}
+
+#[tokio::test]
+async fn exported_inference_failure_omits_preserved_provider_headers() {
+    use crate::session::Session;
+
+    const SENTINEL: &str = "RAW_EXPORTED_PROVIDER_HEADER_a139_must_not_persist";
+    const REQUEST_ID: &str = "req_RAW_EXPORTED_PROVIDER_REQUEST_ID_a139_must_not_persist";
+    let db = Db::open_in_memory().unwrap();
+    let session = std::sync::Arc::new(
+        Session::create_for_test(
+            db.clone(),
+            PathBuf::from("/proj"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
+    let call = Uuid::new_v4();
+    seed_inference_request(
+        &db,
+        &call.to_string(),
+        session.id,
+        &json!({"model": "mock-model", "system": "s", "tools": [], "history": []}),
+        crate::db::session_log::InferenceRequestStatus::Pending,
+    )
+    .await
+    .unwrap();
+
+    let mut headers = rig::http_client::HeaderMap::new();
+    headers.insert(
+        "x-flycockpit-sentinel",
+        rig::http_client::HeaderValue::from_static(SENTINEL),
+    );
+    headers.insert(
+        "x-request-id",
+        rig::http_client::HeaderValue::from_static(REQUEST_ID),
+    );
+    let raw = rig::completion::CompletionError::HttpError(
+        rig::http_client::Error::InvalidStatusCodeWithDetails {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: "insufficient balance".to_string(),
+            headers: Box::new(headers),
+        },
+    );
+    let raw_debug = format!("{raw:?}");
+    assert!(raw_debug.contains(SENTINEL));
+    assert!(raw_debug.contains(REQUEST_ID));
+    let failure = crate::engine::model::terminal_inference_failure(
+        &raw,
+        "mock-provider",
+        "mock-model",
+        crate::engine::model::InferencePhase::Dispatched,
+        42,
+        3,
+        crate::engine::model::ProviderRecoverySignal::None,
+    );
+    let err = anyhow::Error::new(failure);
+    crate::engine::agent::record_inference_outcome_for_export_test(session.clone(), call, 0, &err)
+        .await;
+
+    let target = get_test_session(&db, session.id).await;
+    let bundle = collect_bundle(&db, session.id).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
+    let events_json = read_zip_entry(&zip, "events.json").unwrap();
+    assert!(!events_json.contains(SENTINEL));
+    assert!(!events_json.contains(REQUEST_ID));
+    let events: Vec<Value> = serde_json::from_str(&events_json).unwrap();
+    let fail = events
+        .iter()
+        .find(|event| event["type"] == "inference_failure")
+        .expect("failure event present");
+    let file = fail["file"].as_str().expect("failure event names a file");
+    let body: Value =
+        serde_json::from_str(&read_zip_entry(&zip, file).expect("file exists")).unwrap();
+    assert_eq!(body["status"], "errored");
+    assert_eq!(
+        fail["data"]["detail"],
+        crate::engine::model::PROVIDER_DETAIL_OMITTED
+    );
+    assert_eq!(
+        fail["data"]["provider_body_snippet"],
+        crate::engine::model::PROVIDER_DETAIL_OMITTED
+    );
+    assert_eq!(
+        fail["data"]["error_class"],
+        crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted.as_str()
+    );
+    assert_eq!(fail["data"]["provider_status"], 429);
+    assert_eq!(fail["data"]["recovery"], "billing_exhausted");
 }
 
 /// A `/compact` successor session (a session boundary, not a fork) is

@@ -5,10 +5,9 @@
 //! evolves. The aliases give us a single import point if we ever do want
 //! to swap implementations.
 
-pub use rig::OneOrMany;
 pub use rig::completion::ToolDefinition;
 pub use rig::message::{AssistantContent, Message, ToolCall};
-use rig::message::{ImageMediaType, UserContent};
+use rig::message::{ImageMediaType, ProviderCallId, ToolCallId, UserContent};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -115,7 +114,6 @@ pub struct UserSubmission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_invocation_id: Option<Uuid>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSubmissionTerminalDisposition {
     PreflightRejected,
@@ -1210,7 +1208,7 @@ impl UserSubmission {
 /// Build a user [`Message`] from a [`UserSubmission`]. With no images this
 /// is exactly `Message::user(text)`. With images, the `text` is split on
 /// [`IMAGE_PART_SENTINEL`] and reassembled as an ordered
-/// `OneOrMany<UserContent>` of interleaved text + base64-PNG image parts,
+/// `Vec<UserContent>` of interleaved text + base64-PNG image parts,
 /// which rig serializes as `image_url` data-URIs for OpenAI-compatible
 /// chat completions (verified via kcl `rig-core`). Empty text segments
 /// between/around images are dropped so we don't emit empty text parts.
@@ -1248,16 +1246,17 @@ pub fn build_user_message(sub: UserSubmission) -> Message {
             None,
         ));
     }
-    match OneOrMany::many(parts) {
-        Ok(content) => Message::User { content },
-        // Empty content is unreachable (caller has images), but never
-        // panic on the wire path — fall back to the plain text form.
-        Err(_) => Message::user(sub.text),
+    if parts.is_empty() {
+        // Empty content is unreachable (caller has images), but never panic
+        // on the wire path — fall back to the plain text form.
+        Message::user(sub.text)
+    } else {
+        Message::User { content: parts }
     }
 }
 
 /// Extract concatenated text from an assistant turn's content vector.
-pub fn extract_text(choice: &OneOrMany<AssistantContent>) -> String {
+pub fn extract_text(choice: &[AssistantContent]) -> String {
     choice
         .iter()
         .filter_map(|c| match c {
@@ -1274,7 +1273,7 @@ pub fn extract_text(choice: &OneOrMany<AssistantContent>) -> String {
 /// empty string (used by the turn-assembly projection in
 /// [`crate::engine::predict`] to distinguish real user input from
 /// tool-answer rounds).
-pub fn extract_user_text(content: &OneOrMany<UserContent>) -> String {
+pub fn extract_user_text(content: &[UserContent]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
@@ -1291,7 +1290,7 @@ pub fn extract_user_text(content: &OneOrMany<UserContent>) -> String {
 /// no channel reasoning (e.g. the inline-`<think>` models, whose reasoning
 /// rides in `Text`). Used at finalization to persist channel reasoning
 /// alongside any inline-`<think>` reasoning (implementation note).
-pub fn extract_reasoning(choice: &OneOrMany<AssistantContent>) -> String {
+pub fn extract_reasoning(choice: &[AssistantContent]) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut parts = Vec::new();
     for content in choice.iter() {
@@ -1328,9 +1327,7 @@ pub fn extract_reasoning(choice: &OneOrMany<AssistantContent>) -> String {
 /// re-enter every later request and poison context (defect B). A turn that
 /// still has tool calls is never empty (the calls survive), so this only
 /// returns `None` for a true reasoning-only-with-no-action turn.
-pub fn strip_think_from_choice(
-    choice: &OneOrMany<AssistantContent>,
-) -> Option<OneOrMany<AssistantContent>> {
+pub fn strip_think_from_choice(choice: &[AssistantContent]) -> Option<Vec<AssistantContent>> {
     let mut parts: Vec<AssistantContent> = Vec::new();
     for c in choice.iter() {
         match c {
@@ -1343,7 +1340,7 @@ pub fn strip_think_from_choice(
             other => parts.push(other.clone()),
         }
     }
-    OneOrMany::many(parts).ok()
+    (!parts.is_empty()).then_some(parts)
 }
 
 /// Rebuild an assistant turn's content with every `Text` part replaced by
@@ -1355,9 +1352,9 @@ pub fn strip_think_from_choice(
 /// the stripped form, not its own broken output. Returns `None` if no part
 /// survives (rig requires a non-empty content vector).
 pub fn replace_text_in_choice(
-    choice: &OneOrMany<AssistantContent>,
+    choice: &[AssistantContent],
     text: &str,
-) -> Option<OneOrMany<AssistantContent>> {
+) -> Option<Vec<AssistantContent>> {
     let mut parts: Vec<AssistantContent> = Vec::new();
     let mut text_used = false;
     for c in choice.iter() {
@@ -1373,11 +1370,11 @@ pub fn replace_text_in_choice(
             other => parts.push(other.clone()),
         }
     }
-    OneOrMany::many(parts).ok()
+    (!parts.is_empty()).then_some(parts)
 }
 
 /// Collect all `ToolCall`s from an assistant turn's content vector.
-pub fn collect_tool_calls(choice: &OneOrMany<AssistantContent>) -> Vec<ToolCall> {
+pub fn collect_tool_calls(choice: &[AssistantContent]) -> Vec<ToolCall> {
     choice
         .iter()
         .filter_map(|c| match c {
@@ -1390,7 +1387,91 @@ pub fn collect_tool_calls(choice: &OneOrMany<AssistantContent>) -> Vec<ToolCall>
 /// Build the tool-result message rig expects in the next request, given a
 /// `ToolCall` and the (already-serialized) output string.
 pub fn tool_result_message(tc: &ToolCall, output: String) -> Message {
-    Message::tool_result_with_call_id(tc.id.clone(), tc.call_id.clone(), output)
+    tool_result_message_for(tc, &tc.function.name, output)
+}
+
+/// Build a tool-result message for the tool that actually executed. This is
+/// distinct from the model-emitted call name when Cockpit repaired that name
+/// before dispatch; Rig replays the result name on name-keyed provider wires.
+pub fn tool_result_message_for(
+    tc: &ToolCall,
+    executed_name: impl Into<String>,
+    output: String,
+) -> Message {
+    Message::User {
+        content: vec![UserContent::tool_result_for(
+            tc.id.clone(),
+            tc.provider.clone(),
+            executed_name.into(),
+            vec![rig::message::ToolResultContent::text(output)],
+        )],
+    }
+}
+
+/// Construct a Cockpit-authored tool call while keeping its internal
+/// correlator separate from the optional provider-issued replay identity.
+pub(crate) fn tool_call_with_identity(
+    call: impl Into<String>,
+    provider_item_id: Option<String>,
+    provider_call: Option<String>,
+    function: rig::message::ToolFunction,
+    signature: Option<String>,
+    additional_params: Option<serde_json::Value>,
+) -> ToolCall {
+    ToolCall {
+        id: ToolCallId::new_or_mint(call),
+        provider: provider_call.and_then(ProviderCallId::new).map(
+            |provider| match provider_item_id {
+                Some(item_id) => provider.with_item_id(item_id),
+                None => provider,
+            },
+        ),
+        function,
+        signature,
+        additional_params,
+    }
+}
+
+/// Construct a Cockpit-authored tool result for a known call.
+pub(crate) fn tool_result_with_identity(
+    call: impl Into<String>,
+    provider_call: Option<String>,
+    name: impl Into<String>,
+    content: Vec<rig::message::ToolResultContent>,
+) -> rig::message::ToolResult {
+    rig::message::ToolResult {
+        call: ToolCallId::new_or_mint(call),
+        provider: provider_call.and_then(ProviderCallId::new),
+        name: name.into(),
+        content,
+    }
+}
+
+/// Build a structural tool-result turn when Cockpit retained both parts of a
+/// provider's dual call identity. The correlation handle remains `call`; the
+/// provider values are replay-only wire handles and must not be conflated.
+pub(crate) fn synthetic_tool_result_message_with_provider_identity(
+    call: impl Into<String>,
+    provider_item_id: Option<String>,
+    provider_call: Option<String>,
+    name: impl Into<String>,
+    output: impl Into<String>,
+) -> Message {
+    let provider =
+        provider_call
+            .and_then(ProviderCallId::new)
+            .map(|provider| match provider_item_id {
+                Some(item_id) => provider.with_item_id(item_id),
+                None => provider,
+            });
+    Message::User {
+        content: vec![UserContent::ToolResult(rig::message::ToolResult {
+            call: ToolCallId::new_or_mint(call),
+            provider,
+            name: name.into(),
+            content: vec![rig::message::ToolResultContent::text(output.into())],
+        })],
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +1483,56 @@ mod tests {
             Message::User { content } => content.iter().cloned().collect(),
             _ => panic!("expected a user message"),
         }
+    }
+
+    #[test]
+    fn synthetic_task_result_keeps_task_name_and_provider_identity_on_gemini_wire() {
+        use rig::message::ToolFunction;
+        use rig::providers::gemini::completion::gemini_api_types::{Content, PartKind};
+
+        let call = tool_call_with_identity(
+            "task-call",
+            Some("item-7".to_string()),
+            Some("provider-call-9".to_string()),
+            ToolFunction {
+                name: "task".to_string(),
+                arguments: serde_json::json!({ "child_agent": "explore" }),
+            },
+            None,
+            None,
+        );
+        let result = synthetic_tool_result_message_with_provider_identity(
+            "task-call",
+            Some("item-7".to_string()),
+            Some("provider-call-9".to_string()),
+            "task",
+            "completed",
+        );
+
+        assert_eq!(call.id.as_str(), "task-call");
+        assert_eq!(call.function.name, "task");
+        let parts = user_parts(&result);
+        let UserContent::ToolResult(result_part) = &parts[0] else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(result_part.call.as_str(), call.id.as_str());
+        assert_eq!(result_part.name, call.function.name);
+        assert_eq!(
+            result_part
+                .provider
+                .as_ref()
+                .map(|provider| (provider.call_id.as_str(), provider.item_id.as_deref())),
+            call.provider
+                .as_ref()
+                .map(|provider| (provider.call_id.as_str(), provider.item_id.as_deref()))
+        );
+
+        let wire: Content = result.try_into().expect("Gemini wire conversion");
+        let PartKind::FunctionResponse(response) = &wire.parts[0].part else {
+            panic!("expected Gemini functionResponse");
+        };
+        assert_eq!(response.name, "task");
+        assert_eq!(response.id.as_deref(), Some("provider-call-9"));
     }
 
     #[test]
@@ -1484,8 +1615,9 @@ mod tests {
         assert!(matches!(parts[1], UserContent::Text(_)));
     }
 
-    fn assistant_choice(parts: Vec<AssistantContent>) -> OneOrMany<AssistantContent> {
-        OneOrMany::many(parts).unwrap()
+    fn assistant_choice(parts: Vec<AssistantContent>) -> Vec<AssistantContent> {
+        assert!(!parts.is_empty(), "assistant test choice must be non-empty");
+        parts
     }
 
     /// A channel-reasoning model's choice is byte-for-byte unchanged by
@@ -1550,8 +1682,8 @@ mod tests {
         let choice = assistant_choice(vec![
             AssistantContent::text("<think>just thinking</think>"),
             AssistantContent::ToolCall(ToolCall {
-                id: "tc-1".into(),
-                call_id: None,
+                id: rig::message::ToolCallId::new_or_mint("tc-1"),
+                provider: None,
                 function: ToolFunction {
                     name: "read".into(),
                     arguments: serde_json::json!({"path": "x"}),

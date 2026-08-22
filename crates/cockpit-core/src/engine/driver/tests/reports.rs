@@ -1,5 +1,38 @@
 use super::*;
 
+#[test]
+fn foreground_swarm_spawn_responses_result_keeps_dual_identity_and_name() {
+    let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+        "call_spawn_foreground",
+        Some("fc_spawn_foreground".to_string()),
+        Some("call_spawn_foreground".to_string()),
+        "spawn",
+        "scheduled",
+    );
+    let Message::User { content } = result else {
+        panic!("spawn result must be a user tool-result message");
+    };
+    let Some(rig::message::UserContent::ToolResult(result)) = content.first() else {
+        panic!("spawn result must contain a tool result");
+    };
+    assert_eq!(result.call.as_str(), "call_spawn_foreground");
+    assert_eq!(result.name, "spawn");
+    assert_eq!(
+        result
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_spawn_foreground")
+    );
+    assert_eq!(
+        result
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.item_id.as_deref()),
+        Some("fc_spawn_foreground")
+    );
+}
+
 /// A `builder` delegation that wrote a file returns a structured envelope with
 /// `files_changed` derived deterministically from its edits — not prose.
 #[test]
@@ -8,7 +41,13 @@ fn builder_report_is_structured_envelope_with_host_derived_files() {
     let builder = crate::engine::builtin::load("builder", &driver.spawn_args(true)).unwrap();
     let history = vec![
         write_turn("w1", "/src/a.rs"),
-        Message::tool_result_with_call_id("w1".to_string(), None, "[hash=abc123 ok]"),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "w1".to_string(),
+            None,
+            None,
+            "write",
+            "[hash=abc123 ok]",
+        ),
         Message::assistant("I changed the file."),
     ];
     let deferred = crate::engine::deferred::DeferredLog::new();
@@ -122,9 +161,21 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
 fn failed_subagent_progress_lists_partial_edits_and_incomplete_verification() {
     let history = vec![
         read_turn("r1", "/src/a.rs"),
-        Message::tool_result_with_call_id("r1".to_string(), None, "[hash=old ok]"),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "r1".to_string(),
+            None,
+            None,
+            "read",
+            "[hash=old ok]",
+        ),
         write_turn("w1", "/src/a.rs"),
-        Message::tool_result_with_call_id("w1".to_string(), None, "[hash=abc123 ok]"),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "w1".to_string(),
+            None,
+            None,
+            "write",
+            "[hash=abc123 ok]",
+        ),
         bash_turn("b1", "cargo test -p cockpit-cli"),
     ];
 
@@ -348,6 +399,7 @@ fn subagent_report_event_data_preserves_body_for_all_writer_shapes() {
         let data = subagent_report_event_data(
             child_agent,
             task_call_id,
+            None,
             function_call_id,
             label,
             report,
@@ -389,13 +441,20 @@ fn subagent_report_event_data_preserves_body_for_all_writer_shapes() {
 fn subagent_report_event_data_includes_partial_progress_when_present() {
     let progress = partial_progress_from_history(&[
         write_turn("w1", "/src/a.rs"),
-        Message::tool_result_with_call_id("w1".to_string(), None, "[hash=abc123 ok]"),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "w1".to_string(),
+            None,
+            None,
+            "write",
+            "[hash=abc123 ok]",
+        ),
     ]);
     let report = render_failed_subagent_report("Error: turn limit", &progress);
 
     let data = subagent_report_event_data(
         "builder",
         Some("task-single"),
+        None,
         Some("fn-single"),
         "default",
         &report,

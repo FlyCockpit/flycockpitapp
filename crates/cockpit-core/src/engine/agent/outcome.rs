@@ -48,11 +48,11 @@ pub enum TurnOutcome {
         todo_ids: Vec<uuid::Uuid>,
         repair_notes: Vec<String>,
         /// Outstanding tool-call id the driver must answer when the
-        /// subagent finishes. `ToolCall.id` is `String`; `ToolCall.call_id`
-        /// is `Option<String>` because some providers don't surface a
-        /// distinct id and rig's `tool_result_with_call_id` accepts the
-        /// pair shape.
+        /// subagent finishes. Rig's `ToolCall.id` is Cockpit's always-present
+        /// correlation handle; `task_function_call_id` carries the optional
+        /// provider-issued identity that may be required on replay.
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     /// Agent invoked `task` for a *noninteractive* subagent (e.g.
@@ -91,6 +91,7 @@ pub enum TurnOutcome {
         todo_ids: Vec<uuid::Uuid>,
         repair_notes: Vec<String>,
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     SpawnNoninteractiveBatch {
@@ -98,6 +99,7 @@ pub enum TurnOutcome {
         why: String,
         repair_notes: Vec<String>,
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     TaskControl {
@@ -106,10 +108,12 @@ pub enum TurnOutcome {
         label: Option<String>,
         message: Option<String>,
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     ToolResult {
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
         body: String,
     },
@@ -129,6 +133,9 @@ pub enum TurnOutcome {
         write_scope: String,
         model: Option<String>,
         task_call_id: String,
+        /// Responses providers identify a function-call item separately from
+        /// its call id; retain both wire handles for the synthetic result.
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     /// Agent invoked the `schedule` meta-tool (GOALS §22). Like `task`, this
@@ -143,6 +150,7 @@ pub enum TurnOutcome {
         args: Value,
         recovery: Recovery,
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     },
     /// A delegated subagent invoked the structural `return` tool to finish with
@@ -266,11 +274,13 @@ pub(super) fn task_remaining_depth(args: &Value) -> Result<Option<u32>, String> 
 
 pub(super) fn task_refusal(
     id: &str,
+    provider_item_id: Option<String>,
     call_id: Option<String>,
     body: impl Into<String>,
 ) -> TurnOutcome {
     TurnOutcome::ToolResult {
         task_call_id: id.to_string(),
+        task_provider_item_id: provider_item_id,
         task_function_call_id: call_id,
         body: format!("Error: {}", body.into()),
     }

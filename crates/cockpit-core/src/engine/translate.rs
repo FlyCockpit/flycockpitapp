@@ -136,7 +136,7 @@ async fn try_translate(
     {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!(error = %e, "translate: call failed; passing through");
+            crate::engine::model::log_utility_model_failure("translate", &e);
             return None;
         }
     };

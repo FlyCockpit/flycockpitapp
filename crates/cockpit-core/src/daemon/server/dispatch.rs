@@ -13853,9 +13853,15 @@ pub(super) async fn auto_title_request(
         crate::session::TitleAction::Explicit,
     )
     .await
-    .map_err(|error| ErrorPayload {
-        code: ErrorCode::BadRequest,
-        message: error.to_string(),
+    .map_err(|error| {
+        crate::engine::model::log_utility_model_failure("auto_title", &error);
+        ErrorPayload {
+            code: ErrorCode::BadRequest,
+            // Rig's provider-response display includes provider-owned body and
+            // request-id details. Keep those out of this RPC error channel.
+            message: crate::engine::model::safe_inference_error_detail(&error)
+                .map_or_else(|| error.to_string(), |safe| safe.marker_string()),
+        }
     })?
     .ok_or_else(|| ErrorPayload {
         code: ErrorCode::BadRequest,

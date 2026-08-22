@@ -1714,7 +1714,7 @@ impl Driver {
     /// a re-swap that restores the tool never strips an earlier note (it stays
     /// historically accurate). Only meaningful at the root frame.
     pub(in crate::engine::driver) fn annotate_absent_tool_calls(&mut self) {
-        use crate::engine::message::{AssistantContent, OneOrMany};
+        use crate::engine::message::AssistantContent;
         use rig::message::UserContent;
         if self.tool_call_owner.is_empty() {
             return;
@@ -1733,7 +1733,7 @@ impl Driver {
                     if let AssistantContent::ToolCall(tc) = c
                         && root.agent.tools.get(&tc.function.name).is_none()
                     {
-                        absent_call.insert(tc.id.clone(), tc.function.name.clone());
+                        absent_call.insert(tc.id.to_string(), tc.function.name.clone());
                     }
                 }
             }
@@ -1748,7 +1748,7 @@ impl Driver {
             };
             // Skip well-formed messages with no annotatable tool_result fast.
             if !content.iter().any(
-                |p| matches!(p, UserContent::ToolResult(tr) if absent_call.contains_key(&tr.id)),
+                |p| matches!(p, UserContent::ToolResult(tr) if absent_call.contains_key(tr.call.as_str())),
             ) {
                 continue;
             }
@@ -1756,9 +1756,10 @@ impl Driver {
                 .iter()
                 .map(|part| match part {
                     UserContent::ToolResult(tr) => {
-                        let (Some(tool), Some(owner)) =
-                            (absent_call.get(&tr.id), owners.get(&tr.id))
-                        else {
+                        let (Some(tool), Some(owner)) = (
+                            absent_call.get(tr.call.as_str()),
+                            owners.get(tr.call.as_str()),
+                        ) else {
                             return part.clone();
                         };
                         let note = format!(
@@ -1770,9 +1771,7 @@ impl Driver {
                     other => other.clone(),
                 })
                 .collect();
-            if let Ok(rebuilt) = OneOrMany::many(parts) {
-                *content = rebuilt;
-            }
+            *content = parts;
         }
     }
 }

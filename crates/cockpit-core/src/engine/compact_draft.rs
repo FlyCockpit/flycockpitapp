@@ -484,7 +484,6 @@ pub(crate) fn plan_chunked_synthesis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolCall, ToolFunction, ToolResult};
 
     #[test]
@@ -589,23 +588,24 @@ mod tests {
     fn compact_tool_result_truncation_preserves_pair_metadata() {
         let call = Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "call-1".into(),
-                call_id: Some("provider-call-1".into()),
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-1"),
+                provider: rig::message::ProviderCallId::new("provider-call-1"),
                 function: ToolFunction {
                     name: "read".into(),
                     arguments: serde_json::json!({"path": "large.json"}),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         };
         let result = Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: "call-1".into(),
-                call_id: Some("provider-call-1".into()),
-                content: OneOrMany::one(ToolResultContent::text("x".repeat(4_000))),
-            })),
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-1"),
+                provider: rig::message::ProviderCallId::new("provider-call-1"),
+                name: "read".into(),
+                content: vec![ToolResultContent::text("x".repeat(4_000))],
+            })],
         };
         let history = vec![Message::user("inspect it"), call.clone(), result];
         let allowance = wire_token_total(&history).saturating_sub(100);
@@ -688,23 +688,24 @@ mod tests {
     fn compact_chunk_leaf_never_promotes_truncated_source_to_full_coverage() {
         let call = Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "call-large".into(),
-                call_id: Some("provider-large".into()),
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-large"),
+                provider: rig::message::ProviderCallId::new("provider-large"),
                 function: ToolFunction {
                     name: "read".into(),
                     arguments: serde_json::json!({"path": "large.json"}),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         };
         let result = Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: "call-large".into(),
-                call_id: Some("provider-large".into()),
-                content: OneOrMany::one(ToolResultContent::text("x".repeat(20_000))),
-            })),
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint("call-large"),
+                provider: rig::message::ProviderCallId::new("provider-large"),
+                name: "read".into(),
+                content: vec![ToolResultContent::text("x".repeat(20_000))],
+            })],
         };
         let history = vec![Message::user("inspect"), call, result];
         let truncated = truncate_newest_exchange_to_fit(

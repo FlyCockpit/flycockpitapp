@@ -126,12 +126,10 @@ pub(super) fn message_references_call_id(
                 .collect();
             // Strip only when the turn is exactly the tracked skill call and
             // nothing else (the seam pushes it as a standalone assistant turn).
-            content.iter().count() == 1
-                && calls.iter().all(|id| ids.contains(*id))
-                && !calls.is_empty()
+            content.len() == 1 && calls.iter().all(|id| ids.contains(*id)) && !calls.is_empty()
         }
         Message::User { content } => content.iter().any(|c| match c {
-            UserContent::ToolResult(tr) => ids.contains(&tr.id),
+            UserContent::ToolResult(tr) => ids.contains(tr.call.as_str()),
             _ => false,
         }),
         _ => false,
@@ -151,19 +149,19 @@ pub(super) fn skill_pair_call_ids_in_history(
             Message::Assistant { content, .. } => {
                 for part in content.iter() {
                     if let AssistantContent::ToolCall(tc) = part
-                        && is_skill_slash_call_id(&tc.id)
+                        && is_skill_slash_call_id(tc.id.as_str())
                         && tc.function.name == "skill"
                     {
-                        skill_calls.insert(tc.id.clone());
+                        skill_calls.insert(tc.id.to_string());
                     }
                 }
             }
             Message::User { content } => {
                 for part in content.iter() {
                     if let UserContent::ToolResult(tr) = part
-                        && is_skill_slash_call_id(&tr.id)
+                        && is_skill_slash_call_id(tr.call.as_str())
                     {
-                        skill_results.insert(tr.id.clone());
+                        skill_results.insert(tr.call.to_string());
                     }
                 }
             }
@@ -181,7 +179,7 @@ pub(super) fn ensure_or_restore_parked_tool_call(
     history: &mut Vec<Message>,
     payload: &crate::db::needs_attention::InterruptParkPayload,
 ) -> Result<()> {
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use crate::engine::message::AssistantContent;
     use rig::message::ToolFunction;
 
     match inspect_unpaired_tool_call(history, &payload.call_id, &payload.tool)? {
@@ -189,16 +187,19 @@ pub(super) fn ensure_or_restore_parked_tool_call(
         ToolCallAnchorState::Missing => {
             history.push(Message::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                    id: payload.call_id.clone(),
-                    call_id: payload.resume.provider_call_id.clone(),
-                    function: ToolFunction {
-                        name: payload.tool.clone(),
-                        arguments: payload.args.clone(),
-                    },
-                    signature: None,
-                    additional_params: None,
-                })),
+                content: vec![AssistantContent::ToolCall(
+                    crate::engine::message::tool_call_with_identity(
+                        payload.call_id.clone(),
+                        payload.resume.provider_item_id.clone(),
+                        payload.resume.provider_call_id.clone(),
+                        ToolFunction {
+                            name: payload.tool.clone(),
+                            arguments: payload.args.clone(),
+                        },
+                        None,
+                        None,
+                    ),
+                )],
             });
             Ok(())
         }
@@ -208,6 +209,65 @@ pub(super) fn ensure_or_restore_parked_tool_call(
 enum ToolCallAnchorState {
     Present,
     Missing,
+}
+
+#[cfg(test)]
+mod parked_call_tests {
+    use super::*;
+    use crate::db::needs_attention::{
+        InterruptCallOrigin, InterruptParkPayload, InterruptResumeAnchor,
+    };
+    use crate::engine::message::AssistantContent;
+
+    #[test]
+    fn parked_restore_round_trips_and_reuses_dual_provider_identity() {
+        let payload = InterruptParkPayload {
+            tool: "bash".to_string(),
+            args: serde_json::json!({ "command": "true" }),
+            call_id: "cockpit-call-1".to_string(),
+            resume: InterruptResumeAnchor {
+                agent_id: "Build".to_string(),
+                call_id: "cockpit-call-1".to_string(),
+                provider_item_id: Some("fc_parked_1".to_string()),
+                provider_call_id: Some("call_parked_1".to_string()),
+                assistant_seq: Some(7),
+                call_origin: InterruptCallOrigin::Foreground,
+            },
+            gate: None,
+        };
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let restored: InterruptParkPayload = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            restored.resume.provider_item_id.as_deref(),
+            Some("fc_parked_1")
+        );
+        assert_eq!(
+            restored.resume.provider_call_id.as_deref(),
+            Some("call_parked_1")
+        );
+
+        let mut history = Vec::new();
+        ensure_or_restore_parked_tool_call(&mut history, &restored).unwrap();
+        let Message::Assistant { content, .. } = &history[0] else {
+            panic!("parked restore must add an assistant tool call");
+        };
+        let AssistantContent::ToolCall(call) = &content[0] else {
+            panic!("parked restore must add a tool call");
+        };
+        assert_eq!(call.id, "cockpit-call-1");
+        assert_eq!(
+            call.provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_parked_1")
+        );
+        assert_eq!(
+            call.provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_parked_1")
+        );
+    }
 }
 
 fn inspect_unpaired_tool_call(
@@ -240,7 +300,7 @@ fn inspect_unpaired_tool_call(
             Message::User { content } => {
                 for part in content.iter() {
                     if let UserContent::ToolResult(tr) = part
-                        && tr.id == call_id
+                        && tr.call == call_id
                     {
                         found_result = true;
                     }
@@ -274,9 +334,8 @@ pub(super) fn prepend_tool_result_note(
     tr: &rig::message::ToolResult,
     note: &str,
 ) -> rig::message::ToolResult {
-    use crate::engine::message::OneOrMany;
     use rig::message::ToolResultContent;
-    let mut parts: Vec<ToolResultContent> = tr.content.iter().cloned().collect();
+    let mut parts: Vec<ToolResultContent> = tr.content.to_vec();
     if let Some(idx) = parts
         .iter()
         .position(|p| matches!(p, ToolResultContent::Text(_)))
@@ -292,9 +351,10 @@ pub(super) fn prepend_tool_result_note(
         parts.insert(0, ToolResultContent::text(note.to_string()));
     }
     rig::message::ToolResult {
-        id: tr.id.clone(),
-        call_id: tr.call_id.clone(),
-        content: OneOrMany::many(parts).unwrap_or_else(|_| tr.content.clone()),
+        call: tr.call.clone(),
+        provider: tr.provider.clone(),
+        name: tr.name.clone(),
+        content: parts,
     }
 }
 
@@ -325,30 +385,36 @@ pub(super) fn delegation_payload_retrieval_history(
     row: &crate::db::task_delegation_payloads::TaskDelegationPayloadRow,
     body: &str,
 ) -> Vec<Message> {
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
-    use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
+    use crate::engine::message::AssistantContent;
+    use rig::message::{ToolFunction, ToolResultContent, UserContent};
 
     let call_id = delegation_payload_call_id(&row.label, &row.payload_hash);
     vec![
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: call_id.clone(),
-                call_id: None,
-                function: ToolFunction {
-                    name: "delegation_payload_retrieve".to_string(),
-                    arguments: serde_json::json!({ "hash": row.payload_hash }),
-                },
-                signature: None,
-                additional_params: None,
-            })),
+            content: vec![AssistantContent::ToolCall(
+                crate::engine::message::tool_call_with_identity(
+                    call_id.clone(),
+                    None,
+                    None,
+                    ToolFunction {
+                        name: "delegation_payload_retrieve".to_string(),
+                        arguments: serde_json::json!({ "hash": row.payload_hash }),
+                    },
+                    None,
+                    None,
+                ),
+            )],
         },
         Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: call_id,
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(body.to_string())),
-            })),
+            content: vec![UserContent::ToolResult(
+                crate::engine::message::tool_result_with_identity(
+                    call_id,
+                    None,
+                    "delegation_payload_retrieve",
+                    vec![ToolResultContent::text(body.to_string())],
+                ),
+            )],
         },
     ]
 }

@@ -230,6 +230,45 @@ pub fn safe_completion_error_detail(err: &rig::completion::CompletionError) -> S
     }
 }
 
+/// Content-safe projection for an inference error held behind `anyhow`.
+///
+/// Utility-model paths add context to Rig errors before deciding whether to
+/// log or degrade. Rig 0.42's provider-response display includes the provider
+/// request id, so those paths must not fall back to formatting the error when
+/// the chain still contains a provider completion error. An already-typed
+/// [`InferenceFailure`] receives the same projection because its `detail`
+/// retains the raw provider text for in-process policy only.
+pub(crate) fn safe_inference_error_detail(err: &anyhow::Error) -> Option<SafeProviderDetail> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<InferenceFailure>()
+            .map(safe_provider_detail)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<rig::completion::CompletionError>()
+                    .map(safe_completion_error_detail)
+            })
+    })
+}
+
+/// Log a best-effort utility-model failure without formatting provider-owned
+/// completion errors. Non-inference control/configuration errors keep their
+/// useful internal diagnostic; provider errors are reduced to the same fixed
+/// marker and typed metadata used by durable and user-visible failure paths.
+pub(crate) fn log_utility_model_failure(operation: &'static str, err: &anyhow::Error) {
+    if let Some(safe) = safe_inference_error_detail(err) {
+        tracing::debug!(
+            operation,
+            provider_detail = safe.marker,
+            observed_status = ?safe.observed_status,
+            recovery = safe.recovery.as_str(),
+            "utility model call failed"
+        );
+    } else {
+        tracing::debug!(operation, error = %err, "utility model call failed");
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("inference failed ({class}) for {provider}/{model} after {elapsed_ms}ms at phase {phase}")]
 pub struct InferenceFailure {
@@ -354,6 +393,38 @@ pub struct InferenceTiming {
     /// turn-phase layer calls [`DisplayStreamClassifier::finish`] after
     /// translation so the durable snapshot measures displayed UX text.
     pub open_display: Option<crate::engine::response_performance::DisplayStreamClassifier>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_anyhow_projection_omits_provider_request_id() {
+        const SENTINEL: &str = "provider-request-id-must-not-reach-log-fields";
+        let raw = rig::completion::CompletionError::ProviderResponse(
+            rig::ProviderResponseError::new(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "insufficient balance",
+            )
+            .with_provider_request_id(Some(SENTINEL.to_string())),
+        );
+
+        // Rig owns the request id and renders it in Display, so this proves
+        // the projection cannot pass merely because its fixture omitted it.
+        assert!(raw.to_string().contains(SENTINEL));
+        let wrapped = anyhow::Error::new(raw).context("utility model send failed");
+
+        let safe = safe_inference_error_detail(&wrapped).expect("provider error projection");
+        let rendered = serde_json::to_string(&safe).expect("safe projection serializes");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "safe projection leaked: {rendered}"
+        );
+        assert_eq!(safe.marker, PROVIDER_DETAIL_OMITTED);
+        assert_eq!(safe.observed_status, Some(429));
+        assert_eq!(safe.recovery, ProviderRecoverySignal::BillingExhausted);
+    }
 }
 
 /// Persist a self-healed wire-API endpoint back into config

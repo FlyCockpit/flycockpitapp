@@ -5061,13 +5061,15 @@ impl Driver {
         // Resolve preferences from the daemon-authoritative session selection.
         // The providers config supplies capabilities and wire mappings only;
         // its default selection must never override a session-only choice.
-        let additional_params = self.resolve_thinking_params_for_selection(&new_model, selection);
+        let (additional_params, endpoint_recovery_additional_params) =
+            self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         refreshed.model = new_model;
         refreshed.llm_mode = llm_mode;
         refreshed.params = crate::engine::model::ModelParams {
             additional_params,
+            endpoint_recovery_additional_params,
             // The cache key is the session id — model-agnostic, carried across.
             prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
             prompt_cache_retention,
@@ -5084,7 +5086,8 @@ impl Driver {
         selection: &crate::config::providers::ActiveModelRef,
     ) -> (String, crate::engine::builtin::SpawnArgs) {
         let name = self.stack[frame_idx].agent.name.clone();
-        let additional_params = self.resolve_thinking_params_for_selection(&new_model, selection);
+        let (additional_params, endpoint_recovery_additional_params) =
+            self.resolve_reasoning_params_for_selection(&new_model, selection);
         let prompt_cache_retention =
             self.resolve_prompt_cache_retention_for_selection(&new_model, selection);
         // Every frame on `self.stack` is foreground/user-facing: index 0 is the
@@ -5098,6 +5101,7 @@ impl Driver {
         args.delegation_model = None;
         args.params = crate::engine::model::ModelParams {
             additional_params,
+            endpoint_recovery_additional_params,
             // The cache key is the session id — model-agnostic, carried across.
             prompt_cache_key: self.stack[frame_idx].agent.params.prompt_cache_key.clone(),
             prompt_cache_retention,
@@ -5154,21 +5158,34 @@ impl Driver {
         model: &crate::engine::model::Model,
     ) -> Option<serde_json::Value> {
         let selection = self.active_selection_for_model(model);
-        self.resolve_thinking_params_for_selection(model, &selection)
+        self.resolve_reasoning_params_for_selection(model, &selection)
+            .0
     }
 
-    fn resolve_thinking_params_for_selection(
+    /// Resolve both endpoint-specific reasoning fragments together so a live
+    /// model rebuild retains the safe alternate payload used by endpoint
+    /// recovery. A model switch must never inherit the previous model's
+    /// fragment, but it must preserve the selected model's own catalog mapping.
+    fn resolve_reasoning_params_for_selection(
         &self,
         model: &crate::engine::model::Model,
         selection: &crate::config::providers::ActiveModelRef,
-    ) -> Option<serde_json::Value> {
+    ) -> (
+        Option<serde_json::Value>,
+        Option<crate::engine::model::EndpointRecoveryAdditionalParams>,
+    ) {
         if selection.provider != model.provider_id() || selection.model != model.model_id_ref() {
-            return None;
+            return (None, None);
         }
-        let providers = self.live_providers_config().ok()?;
+        let Some(providers) = self.live_providers_config().ok() else {
+            return (None, None);
+        };
         let mut providers = providers;
         providers.active_model = Some(selection.clone());
-        model.resolve_reasoning_params(&providers)
+        (
+            model.resolve_reasoning_params(&providers),
+            model.endpoint_recovery_reasoning_params(&providers),
+        )
     }
 
     fn active_selection_for_model(

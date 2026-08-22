@@ -80,6 +80,7 @@ impl Model {
                     client, model_id, ..
                 } => {
                     let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                    let params = params_for_openai_wire(&params, wire_api);
                     openai_text_completion(
                         client,
                         model_id,
@@ -175,6 +176,7 @@ impl Model {
                     client, model_id, ..
                 } => {
                     let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                    let params = params_for_openai_wire(&params, wire_api);
                     openai_text_completion(
                         client,
                         model_id,
@@ -283,6 +285,7 @@ impl Model {
                     client, model_id, ..
                 } => {
                     let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                    let params = params_for_openai_wire(&params, wire_api);
                     openai_tool_completion(
                         client, model_id, wire_api, &params, system, prompt, tool,
                     )
@@ -695,6 +698,14 @@ impl Model {
                 let mut tried_swap = false;
                 let mut approved_swap = false;
                 loop {
+                    // Catalog-derived extras are selected for the endpoint
+                    // that this attempt will actually use. A successful
+                    // recovery persists that endpoint for later turns, while
+                    // these params live for the whole session, so doing this
+                    // only on the swap retry would replay stale Responses
+                    // controls on a later Chat Completions turn.
+                    let mut attempt_params = params.clone();
+                    attempt_params.additional_params = params.additional_params_for_wire(endpoint);
                     let attempt = || async {
                         retry_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Each transport retry is a distinct display attempt.
@@ -720,8 +731,8 @@ impl Model {
                                     &history,
                                     prompt.clone(),
                                     wire_tools,
-                                    &params,
-                                    openai_additional_params(&params),
+                                    &attempt_params,
+                                    openai_additional_params(&attempt_params),
                                 );
                                 drain_completion_stream(
                                     request,
@@ -751,8 +762,8 @@ impl Model {
                                     &history,
                                     prompt.clone(),
                                     wire_tools,
-                                    &params,
-                                    openai_additional_params(&params),
+                                    &attempt_params,
+                                    openai_additional_params(&attempt_params),
                                 );
                                 drain_completion_stream(
                                     request,
@@ -1406,6 +1417,18 @@ impl Model {
     ) -> Result<serde_json::Value> {
         let prep_started = std::time::Instant::now();
         let params = self.with_resolved_model_params(params.clone());
+        // Pending inference records must carry the extras for the endpoint
+        // this model will actually use. Endpoint recovery is persisted on the
+        // model, but the session params outlive the recovery, so an
+        // endpoint-scoped Responses control must not remain in a later Chat
+        // Completions record.
+        let params = match self {
+            Model::OpenAi { client, .. } => params_for_openai_wire(
+                &params,
+                self.resolve_live_wire_api_for_base_url(client.base_url()),
+            ),
+            Model::ChatGpt { .. } | Model::Anthropic { .. } => params,
+        };
         // Scrub identically to `complete_captured` so the pre-dispatch
         // `pending` record and the terminal captured record describe
         // byte-identical requests (GOALS §7). A trusted raw-custody route keeps
@@ -1497,6 +1520,17 @@ impl Model {
         params: &ModelParams,
     ) -> TandemOutcome {
         let params = self.with_resolved_model_params(params.clone());
+        // Tandem's recorded request must be the request sent on its resolved
+        // endpoint. In particular, a session that recovered from Responses to
+        // Chat Completions must not retain a Responses-only reasoning object in
+        // the tandem record or replay it to the provider.
+        let params = match self {
+            Model::OpenAi { client, .. } => params_for_openai_wire(
+                &params,
+                self.resolve_live_wire_api_for_base_url(client.base_url()),
+            ),
+            Model::ChatGpt { .. } | Model::Anthropic { .. } => params,
+        };
         // Identical assembly to `complete_captured` / `assemble_dispatch_request`
         // (strip reasoning, scrub every dynamic text field, then
         // `assembled_request`), so the persisted tandem request body is
@@ -1627,6 +1661,7 @@ impl Model {
             } => {
                 // Use the resolved endpoint the main call would use first.
                 let wire_api = self.resolve_live_wire_api_for_base_url(client.base_url());
+                let params = params_for_openai_wire(params, wire_api);
                 match wire_api {
                     crate::config::providers::WireApi::Responses => {
                         let wire_tools = wire_schema::definitions_for_wire(wire_api, tools);
@@ -1638,8 +1673,8 @@ impl Model {
                             history,
                             prompt.clone(),
                             wire_tools,
-                            params,
-                            openai_additional_params(params),
+                            &params,
+                            openai_additional_params(&params),
                         )
                         .send()
                         .await?;
@@ -1652,8 +1687,8 @@ impl Model {
                             history,
                             prompt.clone(),
                             tools,
-                            params,
-                            openai_additional_params(params),
+                            &params,
+                            openai_additional_params(&params),
                         )
                         .send()
                         .await?;
@@ -1696,6 +1731,18 @@ impl Model {
             }
         }
     }
+}
+
+/// Bind catalog-derived OpenAI request extras to the endpoint that will
+/// actually receive a request. User-authored extras have no endpoint-recovery
+/// descriptor and therefore pass through unchanged.
+fn params_for_openai_wire(
+    params: &ModelParams,
+    wire_api: crate::config::providers::WireApi,
+) -> ModelParams {
+    let mut endpoint_params = params.clone();
+    endpoint_params.additional_params = params.additional_params_for_wire(wire_api);
+    endpoint_params
 }
 
 async fn openai_text_completion(

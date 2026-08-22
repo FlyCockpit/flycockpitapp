@@ -253,8 +253,14 @@ impl Provider for CopilotProvider {
 
     fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
         provider_id.eq_ignore_ascii_case("copilot")
-            || entry.credential_ref.as_deref() == Some("copilot")
-            || entry.url.contains("githubcopilot.com")
+            || entry
+                .effective_template(provider_id)
+                .is_some_and(|template| template.eq_ignore_ascii_case("copilot"))
+            || entry
+                .credential_ref
+                .as_deref()
+                .is_some_and(|credential| credential.eq_ignore_ascii_case("copilot"))
+            || entry.url.to_ascii_lowercase().contains("githubcopilot.com")
     }
 
     fn request_kind(&self) -> ProviderRequestKind {

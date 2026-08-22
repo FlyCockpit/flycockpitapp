@@ -10,7 +10,8 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 use crate::config::providers::{
-    CapabilitySource, ModelEntry, ProvidersConfig, WireApi, is_anthropic_native_base_url,
+    CapabilitySource, ModelEntry, ProvidersConfig, WireApi, WireApiProvenance,
+    is_anthropic_native_base_url,
 };
 use crate::providers::models_fetch::{ResolvedHeader, ResolvedRequest};
 
@@ -52,7 +53,27 @@ pub struct DeepfetchTarget {
     pub model_id: String,
     pub explicit_wire_api: WireApi,
     pub inherited_wire_api: WireApi,
+    /// Concrete endpoints advertised by the live model catalog. This is
+    /// stronger than recovered probe state, but remains below user-configured
+    /// model and provider pins.
+    pub supported_wire_apis: Vec<WireApi>,
+    /// The normal configuration resolver's automatic choice. This retains the
+    /// provider entry's immutable identity, which matters for renamed Copilot
+    /// connections when both endpoint probes succeed.
+    pub automatic_wire_api: WireApi,
     pub direct_model_scope: bool,
+}
+
+impl DeepfetchTarget {
+    fn catalog_wire_api(&self) -> Option<WireApi> {
+        if self.supported_wire_apis.contains(&WireApi::Responses) {
+            Some(WireApi::Responses)
+        } else if self.supported_wire_apis.contains(&WireApi::Completions) {
+            Some(WireApi::Completions)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +169,8 @@ pub enum DeepfetchApplyReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointSelectionNote {
     Explicit,
+    ProviderDefault,
+    Catalog,
     Pinned,
     AutoDetectedAfterBothWorked,
 }
@@ -163,6 +186,8 @@ fn wire_api_label(wire: WireApi) -> &'static str {
 fn endpoint_note_label(note: EndpointSelectionNote) -> &'static str {
     match note {
         EndpointSelectionNote::Explicit => "explicit selection",
+        EndpointSelectionNote::ProviderDefault => "provider default",
+        EndpointSelectionNote::Catalog => "live catalog",
         EndpointSelectionNote::Pinned => "probed endpoint pinned",
         EndpointSelectionNote::AutoDetectedAfterBothWorked => "both endpoints worked",
     }
@@ -468,6 +493,7 @@ pub(crate) fn apply_probed_wire_api(
         };
     }
     model.wire_api = probed;
+    model.wire_api_provenance = WireApiProvenance::Recovered;
     DeepfetchApplyReport::Applied {
         endpoint: probed,
         pinned_wire_api: Some(probed),
@@ -520,8 +546,23 @@ pub fn collect_deepfetch_targets(
             targets.push(DeepfetchTarget {
                 provider_id: provider_id.clone(),
                 model_id: model.id.clone(),
-                explicit_wire_api: model.wire_api,
+                // A prior endpoint probe/fallback is an input to automatic
+                // routing, not a user pin. Keep probing it and let a fresh
+                // live catalog supersede it.
+                explicit_wire_api: (!model.wire_api.is_auto()
+                    && model.wire_api_provenance.is_user_configured())
+                .then_some(model.wire_api)
+                .unwrap_or(WireApi::Auto),
                 inherited_wire_api: entry.wire_api,
+                supported_wire_apis: model.capabilities.supported_wire_apis.clone(),
+                automatic_wire_api: {
+                    let resolved = cfg.resolve_wire_api(provider_id, &model.id);
+                    if resolved.is_auto() {
+                        WireApi::detect_for_provider_entry(provider_id, entry, &model.id)
+                    } else {
+                        resolved
+                    }
+                },
                 direct_model_scope: scope.provider.is_some() && scope.model.is_some(),
             });
         }
@@ -542,7 +583,15 @@ pub fn plan_deepfetch(targets: &[DeepfetchTarget]) -> DeepfetchPlan {
         .len();
     let endpoint_requests = targets
         .iter()
-        .filter(|target| target.explicit_wire_api.is_auto())
+        // Provider defaults and live catalog declarations are authoritative
+        // when there is no model-level user pin. Probing both endpoints cannot
+        // change their effective route, so avoid spending requests on an
+        // ineffective recovered model override.
+        .filter(|target| {
+            target.inherited_wire_api.is_auto()
+                && target.catalog_wire_api().is_none()
+                && (target.explicit_wire_api.is_auto() || target.direct_model_scope)
+        })
         .count()
         * 2;
     let context_requests = targets.len();
@@ -588,7 +637,20 @@ pub async fn probe_target<C: DeepfetchProbeClient>(
 ) -> Result<DeepfetchApplyReport> {
     let mut pinned_wire_api = None;
     let mut endpoint_note = EndpointSelectionNote::Explicit;
-    let endpoint = if target.explicit_wire_api.is_auto() || target.direct_model_scope {
+    let endpoint = if target.explicit_wire_api.is_auto() && !target.inherited_wire_api.is_auto() {
+        // Provider defaults outrank recovered model endpoints. Do not probe
+        // and persist an endpoint that config resolution will never use.
+        endpoint_note = EndpointSelectionNote::ProviderDefault;
+        target.inherited_wire_api
+    } else if target.explicit_wire_api.is_auto()
+        && let Some(catalog_wire_api) = target.catalog_wire_api()
+    {
+        // A live `/models` catalog is stronger endpoint evidence than deep
+        // probing. It must not trigger a recovered pin or a contradictory
+        // "both endpoints work" report.
+        endpoint_note = EndpointSelectionNote::Catalog;
+        catalog_wire_api
+    } else if target.explicit_wire_api.is_auto() || target.direct_model_scope {
         let completions = classify_endpoint_probe(
             client
                 .probe_endpoint(EndpointProbeRequest {
@@ -639,11 +701,11 @@ pub async fn probe_target<C: DeepfetchProbeClient>(
         } else {
             match (&completions, &responses) {
                 (EndpointProbeOutcome::Works, EndpointProbeOutcome::Works) => {
-                    endpoint_note = EndpointSelectionNote::AutoDetectedAfterBothWorked;
-                    if target.inherited_wire_api.is_auto() {
-                        WireApi::detect_for_provider(&target.provider_id, &target.model_id)
+                    if target.explicit_wire_api.is_auto() {
+                        endpoint_note = EndpointSelectionNote::AutoDetectedAfterBothWorked;
+                        target.automatic_wire_api
                     } else {
-                        target.inherited_wire_api
+                        target.explicit_wire_api
                     }
                 }
                 (EndpointProbeOutcome::Entitlement, _) | (_, EndpointProbeOutcome::Entitlement) => {
@@ -1098,6 +1160,7 @@ mod tests {
     fn endpoint_note_labels_are_lowercase_prose() {
         let labels = [
             endpoint_note_label(EndpointSelectionNote::Explicit),
+            endpoint_note_label(EndpointSelectionNote::Catalog),
             endpoint_note_label(EndpointSelectionNote::Pinned),
             endpoint_note_label(EndpointSelectionNote::AutoDetectedAfterBothWorked),
         ];
@@ -1132,6 +1195,8 @@ mod tests {
                 model_id: "m".into(),
                 explicit_wire_api: WireApi::Auto,
                 inherited_wire_api: WireApi::Auto,
+                supported_wire_apis: Vec::new(),
+                automatic_wire_api: WireApi::Completions,
                 direct_model_scope: false,
             };
             let _ = probe_target(&mut client, &mut cfg, &target).await;
@@ -1208,6 +1273,8 @@ mod tests {
             model_id: "gpt-5-mini".into(),
             explicit_wire_api: WireApi::Auto,
             inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Responses,
             direct_model_scope: false,
         };
         let report = probe_target(&mut client, &mut cfg, &target).await.unwrap();
@@ -1240,6 +1307,8 @@ mod tests {
             model_id: "gpt-5-mini".into(),
             explicit_wire_api: WireApi::Auto,
             inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Responses,
             direct_model_scope: false,
         };
         let report = probe_target(&mut client, &mut cfg, &target).await.unwrap();
@@ -1257,7 +1326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepfetch_provider_wire_default_still_endpoint_probes_and_can_pin_model() {
+    async fn deepfetch_provider_wire_default_is_authoritative_and_skips_endpoint_probes() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
             "acme".into(),
@@ -1275,22 +1344,80 @@ mod tests {
             &cfg,
             &DeepfetchScope {
                 provider: Some("acme".into()),
-                model: None,
+                // Direct model scope must not turn a provider default into an
+                // ineffective recovered model override.
+                model: Some("m".into()),
             },
         )
         .unwrap();
         let plan = plan_deepfetch(&targets);
-        assert_eq!(plan.endpoint_requests, 2);
+        assert_eq!(plan.endpoint_requests, 0);
         assert_eq!(plan.context_requests, 1);
 
         let mut client = RecordingClient::new(
-            vec![
-                ProbeRawOutcome::HttpError(ProbeHttpError {
-                    status: 404,
-                    body: String::new(),
-                }),
-                ProbeRawOutcome::Works,
-            ],
+            vec![],
+            vec![ProbeRawOutcome::HttpError(ProbeHttpError {
+                status: 400,
+                body: "maximum context length is 128000 tokens".into(),
+            })],
+        );
+        let report = probe_target(&mut client, &mut cfg, &targets[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            DeepfetchApplyReport::Applied {
+                endpoint: WireApi::Completions,
+                pinned_wire_api: None,
+                context_tokens: Some(128000),
+                endpoint_note: EndpointSelectionNote::ProviderDefault,
+            }
+        );
+        let model = &cfg.providers["acme"].models[0];
+        assert_eq!(model.wire_api, WireApi::Auto);
+        assert!(client.endpoint_calls.is_empty());
+        assert_eq!(cfg.resolve_wire_api("acme", "m"), WireApi::Completions);
+    }
+
+    #[tokio::test]
+    async fn deepfetch_live_catalog_endpoint_is_authoritative_and_skips_endpoint_probes() {
+        use crate::config::providers::ModelCapabilities;
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "acme".into(),
+            ProviderEntry {
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    // A persisted recovery must not displace a newer live
+                    // catalog declaration.
+                    wire_api: WireApi::Completions,
+                    wire_api_provenance: WireApiProvenance::Recovered,
+                    capabilities: ModelCapabilities {
+                        supported_wire_apis: vec![WireApi::Responses],
+                        ..ModelCapabilities::default()
+                    },
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let targets = collect_deepfetch_targets(
+            &cfg,
+            &DeepfetchScope {
+                provider: Some("acme".into()),
+                model: Some("m".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(targets[0].supported_wire_apis, vec![WireApi::Responses]);
+        assert_eq!(targets[0].automatic_wire_api, WireApi::Responses);
+        let plan = plan_deepfetch(&targets);
+        assert_eq!(plan.endpoint_requests, 0);
+        assert_eq!(plan.context_requests, 1);
+
+        let mut client = RecordingClient::new(
+            Vec::new(),
             vec![ProbeRawOutcome::HttpError(ProbeHttpError {
                 status: 400,
                 body: "maximum context length is 128000 tokens".into(),
@@ -1303,13 +1430,67 @@ mod tests {
             report,
             DeepfetchApplyReport::Applied {
                 endpoint: WireApi::Responses,
-                pinned_wire_api: Some(WireApi::Responses),
+                pinned_wire_api: None,
                 context_tokens: Some(128000),
-                endpoint_note: EndpointSelectionNote::Pinned,
+                endpoint_note: EndpointSelectionNote::Catalog,
             }
         );
+        assert!(client.endpoint_calls.is_empty());
+        assert_eq!(client.context_calls[0].endpoint, ProbeEndpoint::Responses);
         let model = &cfg.providers["acme"].models[0];
-        assert_eq!(model.wire_api, WireApi::Responses);
+        assert_eq!(model.wire_api, WireApi::Completions);
+        assert_eq!(model.wire_api_provenance, WireApiProvenance::Recovered);
+        assert_eq!(cfg.resolve_wire_api("acme", "m"), WireApi::Responses);
+    }
+
+    #[tokio::test]
+    async fn deepfetch_renamed_copilot_uses_responses_when_both_endpoints_work() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "team-github".into(),
+            ProviderEntry {
+                template: Some("copilot".into()),
+                models: vec![ModelEntry {
+                    id: "gpt-5.6-terra".into(),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let targets = collect_deepfetch_targets(
+            &cfg,
+            &DeepfetchScope {
+                provider: Some("team-github".into()),
+                model: Some("gpt-5.6-terra".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(targets[0].automatic_wire_api, WireApi::Responses);
+        assert_eq!(plan_deepfetch(&targets).endpoint_requests, 2);
+
+        let mut client = RecordingClient::new(
+            vec![ProbeRawOutcome::Works, ProbeRawOutcome::Works],
+            vec![ProbeRawOutcome::HttpError(ProbeHttpError {
+                status: 400,
+                body: "maximum context length is 128000 tokens".into(),
+            })],
+        );
+        let report = probe_target(&mut client, &mut cfg, &targets[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            DeepfetchApplyReport::BothEndpointsWork {
+                endpoint: WireApi::Responses,
+                context_tokens: Some(128000),
+            }
+        );
+        assert_eq!(client.endpoint_calls.len(), 2);
+        assert_eq!(client.context_calls[0].endpoint, ProbeEndpoint::Responses);
+        assert_eq!(
+            cfg.providers["team-github"].models[0].wire_api,
+            WireApi::Auto
+        );
     }
 
     #[test]
@@ -1359,6 +1540,8 @@ mod tests {
             model_id: "m".into(),
             explicit_wire_api: WireApi::Completions,
             inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Completions,
             direct_model_scope: true,
         };
         let report = probe_target(&mut client, &mut cfg, &target).await.unwrap();
@@ -1406,6 +1589,8 @@ mod tests {
             model_id: "completed".into(),
             explicit_wire_api: WireApi::Responses,
             inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Responses,
             direct_model_scope: false,
         };
         let report = probe_target(&mut client, &mut cfg, &target).await.unwrap();
@@ -1431,6 +1616,8 @@ mod tests {
             model_id: "cancelled".into(),
             explicit_wire_api: WireApi::Responses,
             inherited_wire_api: WireApi::Auto,
+            supported_wire_apis: Vec::new(),
+            automatic_wire_api: WireApi::Responses,
             direct_model_scope: false,
         };
         let report = probe_target(&mut client, &mut cfg, &target).await.unwrap();

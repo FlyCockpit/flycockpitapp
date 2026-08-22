@@ -50,6 +50,7 @@ fn set_reasoning_effort_capability(
                 serde_json::json!("xhigh"),
             )]),
         }),
+        endpoint_request_mappings: Vec::new(),
         source: Some(CapabilitySource::Live),
     };
     let entry = cfg
@@ -63,6 +64,58 @@ fn set_reasoning_effort_capability(
             id: model.to_string(),
             capabilities: ModelCapabilities {
                 reasoning_effort: Some(capability),
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        });
+    }
+}
+
+fn set_responses_reasoning_effort_capability(
+    cfg: &mut crate::config::providers::ProvidersConfig,
+    provider: &str,
+    model: &str,
+) {
+    use crate::config::providers::{
+        CapabilitySource, CapabilityValue, EndpointReasoningEffortRequestMapping,
+        ModelCapabilities, ModelEntry, ReasoningEffortCapability, ReasoningEffortRequestMapping,
+        WireApi,
+    };
+
+    let capability = ReasoningEffortCapability {
+        values: vec![CapabilityValue {
+            value: "ultra".to_string(),
+            label: None,
+            description: None,
+        }],
+        default: Some("ultra".to_string()),
+        request_mapping: None,
+        endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+            wire_api: WireApi::Responses,
+            request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                path: vec!["reasoning".to_string(), "effort".to_string()],
+                values: std::collections::BTreeMap::from([(
+                    "ultra".to_string(),
+                    serde_json::json!("ultra"),
+                )]),
+            },
+        }],
+        source: Some(CapabilitySource::Live),
+    };
+    let entry = cfg
+        .providers
+        .get_mut(provider)
+        .expect("provider exists in model-switch harness");
+    if let Some(model_entry) = entry.models.iter_mut().find(|entry| entry.id == model) {
+        model_entry.capabilities.reasoning_effort = Some(capability);
+        model_entry.capabilities.supported_wire_apis =
+            vec![WireApi::Responses, WireApi::Completions];
+    } else {
+        entry.models.push(ModelEntry {
+            id: model.to_string(),
+            capabilities: ModelCapabilities {
+                reasoning_effort: Some(capability),
+                supported_wire_apis: vec![WireApi::Responses, WireApi::Completions],
                 ..ModelCapabilities::default()
             },
             ..ModelEntry::default()
@@ -493,6 +546,7 @@ async fn reasoning_params_prefer_native_capability_over_legacy_thinking_mode() {
                             field: "reasoning_effort".into(),
                             values: mapping,
                         }),
+                        endpoint_request_mappings: Vec::new(),
                         source: Some(CapabilitySource::Live),
                     }),
                     ..crate::config::providers::ModelCapabilities::default()
@@ -1292,6 +1346,69 @@ async fn live_model_switch_persists_requested_reasoning_options() {
         driver.stack[0].agent.params.additional_params,
         Some(serde_json::json!({ "reasoning_effort": "xhigh" })),
         "the first turn-boundary rebuild retains the committed rich selection"
+    );
+}
+
+/// A catalog-derived Responses reasoning shape is rebuilt with its alternate
+/// endpoint payload on a live switch. The generic fallback route must not
+/// replay `reasoning.effort` to Chat Completions.
+#[tokio::test]
+async fn live_model_switch_keeps_endpoint_specific_reasoning_recovery_params() {
+    use crate::config::providers::{ActiveReasoningEffort, WireApi};
+
+    let (mut driver, _tmp) = model_switch_driver();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    edit_model_switch_config(&mut driver, |cfg| {
+        set_responses_reasoning_effort_capability(cfg, "provider-b", "model-b");
+    });
+
+    driver
+        .run_control(
+            DriverControl::SetActiveModel {
+                selection_id: uuid::Uuid::nil(),
+                provider: "provider-b".into(),
+                model: "model-b".into(),
+                persist_as_default: true,
+                trigger: crate::session::ModelSwitchTrigger::Daemon,
+                reasoning_effort: Some("ultra".into()),
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            },
+            &tx,
+        )
+        .await;
+
+    let params = &driver.stack[0].agent.params;
+    assert_eq!(
+        driver.stack[0].agent.model.current_wire_api(),
+        WireApi::Responses,
+        "the advertised Responses endpoint is selected for the new model"
+    );
+    assert_eq!(
+        params.additional_params,
+        Some(serde_json::json!({ "reasoning": { "effort": "ultra" } })),
+        "the switched frame uses the catalog's Responses payload"
+    );
+    assert_eq!(
+        params
+            .endpoint_recovery_additional_params
+            .as_ref()
+            .map(|recovery| recovery.primary_wire_api),
+        Some(WireApi::Responses),
+        "the switched frame carries endpoint recovery metadata for its own model"
+    );
+    assert_eq!(
+        params.additional_params_for_wire(WireApi::Completions),
+        None,
+        "a fallback to Chat Completions omits Responses-only reasoning fields"
+    );
+    assert_eq!(
+        driver
+            .session
+            .active_model_ref()
+            .and_then(|selection| selection.reasoning_effort)
+            .map(|ActiveReasoningEffort { value }| value),
+        Some("ultra".to_string())
     );
 }
 

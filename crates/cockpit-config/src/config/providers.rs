@@ -1198,6 +1198,13 @@ pub struct ModelEntry {
     /// [`merge_fetched_models`]).
     #[serde(default, skip_serializing_if = "WireApi::is_auto")]
     pub wire_api: WireApi,
+    /// Who selected [`Self::wire_api`].  Missing values deliberately mean a
+    /// user pin for backward compatibility: before this field existed, every
+    /// concrete `wire_api` in a config was user-authored.  Endpoint recovery
+    /// and probing instead record `recovered`, which is a durable hint rather
+    /// than an authority over a fresh live catalog.
+    #[serde(default, skip_serializing_if = "WireApiProvenance::is_user_configured")]
+    pub wire_api_provenance: WireApiProvenance,
     /// Free-form metadata the `/models` endpoint returned but we don't
     /// model explicitly. Preserved verbatim so re-saving doesn't drop
     /// fields the user (or provider) cares about.
@@ -1285,6 +1292,15 @@ pub enum ReasoningEffortRequestMapping {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         values: BTreeMap<String, Value>,
     },
+    /// An OpenAI-compatible JSON object path. This is distinct from
+    /// [`Self::JsonField`] so catalog-derived mappings can faithfully model
+    /// APIs such as Responses' `reasoning.effort` without overloading dotted
+    /// field names or relying on provider-specific request-builder branches.
+    JsonPath {
+        path: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        values: BTreeMap<String, Value>,
+    },
     /// Anthropic's current native adaptive-thinking request shape. `values`
     /// optionally maps Cockpit's advertised selector to Anthropic's effort
     /// vocabulary (for example `xhigh` to `max`).
@@ -1295,6 +1311,15 @@ pub enum ReasoningEffortRequestMapping {
     /// Anthropic's older fixed-budget thinking request shape. Budgets are
     /// derived deterministically from the resolved output limit.
     AnthropicManual,
+}
+
+/// A request mapping which is valid only for one OpenAI-compatible endpoint.
+/// Live catalogs can expose one effort vocabulary on multiple endpoints even
+/// when each endpoint requires a different request shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndpointReasoningEffortRequestMapping {
+    pub wire_api: WireApi,
+    pub request_mapping: ReasoningEffortRequestMapping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1311,6 +1336,10 @@ pub struct ReasoningEffortCapability {
     pub default: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_mapping: Option<ReasoningEffortRequestMapping>,
+    /// Endpoint-scoped catalog mappings. `request_mapping` remains the
+    /// backwards-compatible endpoint-agnostic configuration form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_request_mappings: Vec<EndpointReasoningEffortRequestMapping>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<CapabilitySource>,
 }
@@ -1320,6 +1349,7 @@ impl ReasoningEffortCapability {
         self.values.is_empty()
             && self.default.is_none()
             && self.request_mapping.is_none()
+            && self.endpoint_request_mappings.is_empty()
             && self.source.is_none()
     }
 }
@@ -1402,6 +1432,11 @@ pub struct ModelCapabilities {
     pub prompt_cache_retention: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortCapability>,
+    /// Concrete OpenAI-compatible endpoints advertised by the provider's
+    /// live model catalog. Configuration pins still take precedence; when
+    /// unset Cockpit uses this to choose the provider-declared route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_wire_apis: Vec<WireApi>,
     #[serde(default, skip_serializing_if = "ClientSideToolsCapability::is_empty")]
     pub client_side_tools: ClientSideToolsCapability,
     #[serde(default, skip_serializing_if = "ComputerUseCapability::is_empty")]
@@ -1409,6 +1444,16 @@ pub struct ModelCapabilities {
 }
 
 impl ModelCapabilities {
+    pub fn preferred_wire_api(&self) -> Option<WireApi> {
+        if self.supported_wire_apis.contains(&WireApi::Responses) {
+            Some(WireApi::Responses)
+        } else if self.supported_wire_apis.contains(&WireApi::Completions) {
+            Some(WireApi::Completions)
+        } else {
+            None
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tool_calling.is_unknown()
             && self.image_input.is_unknown()
@@ -1427,6 +1472,7 @@ impl ModelCapabilities {
                 .reasoning_effort
                 .as_ref()
                 .is_none_or(ReasoningEffortCapability::is_empty)
+            && self.supported_wire_apis.is_empty()
             && self.client_side_tools.is_empty()
             && self.computer_use.is_empty()
     }
@@ -1637,6 +1683,28 @@ pub enum WireApi {
     Responses,
 }
 
+/// Authority of a concrete model-level [`WireApi`] value.
+///
+/// A recovered endpoint is persisted so a model missing from a catalog still
+/// benefits from a successful fallback after restart.  It is intentionally
+/// lower priority than an endpoint advertised by a later live catalog.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApiProvenance {
+    /// An endpoint configured by the user, or a legacy concrete `wire_api`
+    /// which predated provenance metadata.
+    #[default]
+    UserConfigured,
+    /// An endpoint learned from an approved endpoint fallback or deep probe.
+    Recovered,
+}
+
+impl WireApiProvenance {
+    pub fn is_user_configured(&self) -> bool {
+        matches!(self, Self::UserConfigured)
+    }
+}
+
 impl WireApi {
     /// True for the `Auto` (unpinned) variant — the serde skip predicate and
     /// the resolver's "fall through to auto-detect" test.
@@ -1659,14 +1727,31 @@ impl WireApi {
         }
     }
 
-    /// Provider-aware conservative default. Only the built-in OpenAI provider
-    /// keeps the `gpt-5*` → Responses heuristic; arbitrary OpenAI-compatible
+    /// Provider-aware conservative default. OpenAI and Copilot share the
+    /// `gpt-5*` → Responses fallback; a fetched catalog remains authoritative
+    /// whenever it advertises concrete endpoints. Arbitrary OpenAI-compatible
     /// endpoints default to Chat Completions.
     pub fn detect_for_provider(provider_id: &str, model_id: &str) -> WireApi {
         match provider_id {
-            "openai" => Self::detect(model_id),
+            "openai" | "copilot" => Self::detect(model_id),
             "codex-oauth" | "grok" | "grok-oauth" => WireApi::Responses,
             _ => WireApi::Completions,
+        }
+    }
+
+    /// Provider-aware conservative default using an entry's immutable vendor
+    /// identity as well as its legacy config key.  A connection created from
+    /// the Copilot template may be renamed, so the key alone is not enough to
+    /// select Copilot's GPT-5 Responses fallback.
+    pub fn detect_for_provider_entry(
+        provider_id: &str,
+        entry: &ProviderEntry,
+        model_id: &str,
+    ) -> WireApi {
+        if entry.is_copilot_identity(provider_id) {
+            Self::detect(model_id)
+        } else {
+            Self::detect_for_provider(provider_id, model_id)
         }
     }
 
@@ -1826,8 +1911,19 @@ fn preserve_model_overrides(existing: &ModelEntry, fetched: &mut ModelEntry) {
     if !existing.availability.is_empty() {
         fetched.availability = existing.availability.clone();
     }
-    if !existing.wire_api.is_auto() {
+    if !existing.wire_api.is_auto() && existing.wire_api_provenance.is_user_configured() {
         fetched.wire_api = existing.wire_api;
+        fetched.wire_api_provenance = existing.wire_api_provenance;
+    } else if !existing.wire_api.is_auto()
+        && matches!(existing.wire_api_provenance, WireApiProvenance::Recovered)
+        && fetched.wire_api.is_auto()
+        && preferred_catalog_wire_api(&fetched.capabilities).is_none()
+    {
+        // Keep a learned endpoint only while the refetch gives us no stronger
+        // information. A live endpoint catalog must be able to correct stale
+        // recovery state from a prior session.
+        fetched.wire_api = existing.wire_api;
+        fetched.wire_api_provenance = existing.wire_api_provenance;
     }
     if existing.cache.is_some() {
         fetched.cache = existing.cache.clone();
@@ -1951,6 +2047,22 @@ impl ProviderEntry {
     /// and cannot prove registry provenance.
     pub fn effective_template(&self, _key: &str) -> Option<&str> {
         self.template.as_deref()
+    }
+
+    /// Whether this entry is GitHub Copilot, including renamed connections.
+    /// Keep this aligned with the provider registry's Copilot matcher: the
+    /// persisted template is the strongest identity, while credential and URL
+    /// recognition retain compatibility for older/custom connections.
+    pub fn is_copilot_identity(&self, provider_id: &str) -> bool {
+        provider_id.eq_ignore_ascii_case("copilot")
+            || self
+                .effective_template(provider_id)
+                .is_some_and(|template| template.eq_ignore_ascii_case("copilot"))
+            || self
+                .credential_ref
+                .as_deref()
+                .is_some_and(|credential| credential.eq_ignore_ascii_case("copilot"))
+            || self.url.to_ascii_lowercase().contains("githubcopilot.com")
     }
 
     pub fn mark_model_fetch_success(&mut self, catalog: ProviderModelCatalog) {
@@ -2090,6 +2202,46 @@ fn reasoning_effort_supports_value(capability: &ReasoningEffortCapability, value
         .any(|candidate| candidate.value == value)
 }
 
+fn json_at_path(path: &[String], value: Value) -> Value {
+    debug_assert!(!path.is_empty());
+    let mut nested = value;
+    for segment in path.iter().rev() {
+        nested = Value::Object(Map::from_iter([(segment.clone(), nested)]));
+    }
+    nested
+}
+
+fn preferred_catalog_wire_api(capabilities: &ModelCapabilities) -> Option<WireApi> {
+    // `/responses` is the newer, more expressive OpenAI-compatible endpoint.
+    // Prefer it whenever the live catalog advertises support, while retaining
+    // completions for catalogs that advertise only that legacy endpoint.
+    capabilities.preferred_wire_api()
+}
+
+fn reasoning_effort_mapping_for_wire(
+    capability: &ReasoningEffortCapability,
+    wire_api: Option<WireApi>,
+) -> Option<&ReasoningEffortRequestMapping> {
+    wire_api
+        .and_then(|wire_api| {
+            capability
+                .endpoint_request_mappings
+                .iter()
+                .find(|mapping| mapping.wire_api == wire_api)
+                .map(|mapping| &mapping.request_mapping)
+        })
+        .or(capability.request_mapping.as_ref())
+}
+
+impl ReasoningEffortCapability {
+    /// Whether this capability can truthfully be offered on `wire_api`.
+    /// Endpoint-agnostic legacy mappings work everywhere; scoped catalog
+    /// mappings work only on their declared endpoint.
+    pub fn supports_wire_api(&self, wire_api: WireApi) -> bool {
+        !self.values.is_empty() && reasoning_effort_mapping_for_wire(self, Some(wire_api)).is_some()
+    }
+}
+
 pub fn manual_thinking_budget(max_tokens: u64, effort: &str) -> Result<u64> {
     let percent = match effort {
         "low" => 25,
@@ -2140,6 +2292,14 @@ pub fn validate_reasoning_effort_capability(
             }
         }
         (
+            ReasoningEffortWire::OpenAiCompatible,
+            ReasoningEffortRequestMapping::JsonPath { path, .. },
+        ) => {
+            if path.is_empty() || path.iter().any(|segment| segment.trim().is_empty()) {
+                anyhow::bail!("reasoning JSON-path mapping has an empty path segment");
+            }
+        }
+        (
             ReasoningEffortWire::AnthropicNative,
             ReasoningEffortRequestMapping::AnthropicAdaptive { values },
         ) => {
@@ -2182,6 +2342,15 @@ pub fn validate_reasoning_effort_capability(
         ) => {
             anyhow::bail!(
                 "native Anthropic reasoning cannot use JSON field `{field}`; configure an anthropic_adaptive or anthropic_manual mapping"
+            );
+        }
+        (
+            ReasoningEffortWire::AnthropicNative,
+            ReasoningEffortRequestMapping::JsonPath { path, .. },
+        ) => {
+            anyhow::bail!(
+                "native Anthropic reasoning cannot use JSON path `{}`; configure an anthropic_adaptive or anthropic_manual mapping",
+                path.join(".")
             );
         }
         (ReasoningEffortWire::OpenAiCompatible, _) => {
@@ -2639,6 +2808,23 @@ impl ProvidersConfig {
         wire: ReasoningEffortWire,
         max_tokens: Option<u64>,
     ) -> Result<Option<Value>> {
+        self.resolve_reasoning_effort_params_for_openai_endpoint(
+            provider, model, selected, wire, None, max_tokens,
+        )
+    }
+
+    /// Resolve a typed reasoning mapping for a concrete OpenAI-compatible
+    /// endpoint. Endpoint-scoped mappings are never reused on a different
+    /// route, including an error-recovery alternate.
+    pub fn resolve_reasoning_effort_params_for_openai_endpoint(
+        &self,
+        provider: &str,
+        model: &str,
+        selected: Option<&str>,
+        wire: ReasoningEffortWire,
+        wire_api: Option<WireApi>,
+        max_tokens: Option<u64>,
+    ) -> Result<Option<Value>> {
         let capability = self
             .providers
             .get(provider)
@@ -2654,6 +2840,10 @@ impl ProvidersConfig {
         let Some(capability) = capability else {
             return Ok(None);
         };
+        let mapping = reasoning_effort_mapping_for_wire(capability, wire_api);
+        if matches!(wire, ReasoningEffortWire::OpenAiCompatible) && mapping.is_none() {
+            return Ok(None);
+        }
         let value = match selected {
             Some(selected) if reasoning_effort_supports_value(capability, selected) => {
                 Some(selected)
@@ -2668,11 +2858,15 @@ impl ProvidersConfig {
         let Some(value) = value else {
             return Ok(None);
         };
-        validate_reasoning_effort_capability(capability, wire, max_tokens)?;
-        let mapping = capability
-            .request_mapping
-            .as_ref()
-            .context("reasoning effort is advertised without a request mapping")?;
+        let mapping =
+            mapping.context("reasoning effort is advertised without a request mapping")?;
+        // Reuse the public validator for the selected mapping. This also
+        // validates user-configured endpoint mappings without pretending they
+        // are safe on another endpoint.
+        let mut validation_capability = capability.clone();
+        validation_capability.request_mapping = Some(mapping.clone());
+        validation_capability.endpoint_request_mappings.clear();
+        validate_reasoning_effort_capability(&validation_capability, wire, max_tokens)?;
         let params = match mapping {
             ReasoningEffortRequestMapping::JsonField { field, values } => {
                 let mapped = values
@@ -2680,6 +2874,13 @@ impl ProvidersConfig {
                     .cloned()
                     .unwrap_or_else(|| Value::String(value.to_string()));
                 Value::Object(Map::from_iter([(field.clone(), mapped)]))
+            }
+            ReasoningEffortRequestMapping::JsonPath { path, values } => {
+                let mapped = values
+                    .get(value)
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(value.to_string()));
+                json_at_path(path, mapped)
             }
             ReasoningEffortRequestMapping::AnthropicAdaptive { values } => {
                 let effort = values.get(value).map(String::as_str).unwrap_or(value);
@@ -2712,14 +2913,24 @@ impl ProvidersConfig {
     pub fn resolve_active_model_reasoning_params(&self) -> Option<Value> {
         let active = self.active_model.as_ref()?;
         if self.has_reasoning_effort_capability(&active.provider, &active.model) {
-            return self.resolve_reasoning_effort_params(
-                &active.provider,
-                &active.model,
-                active
-                    .reasoning_effort
-                    .as_ref()
-                    .map(|effort| effort.value.as_str()),
-            );
+            let wire_api = match self.resolve_wire_api(&active.provider, &active.model) {
+                WireApi::Auto => WireApi::detect_for_provider(&active.provider, &active.model),
+                wire_api => wire_api,
+            };
+            return self
+                .resolve_reasoning_effort_params_for_openai_endpoint(
+                    &active.provider,
+                    &active.model,
+                    active
+                        .reasoning_effort
+                        .as_ref()
+                        .map(|effort| effort.value.as_str()),
+                    ReasoningEffortWire::OpenAiCompatible,
+                    Some(wire_api),
+                    None,
+                )
+                .ok()
+                .flatten();
         }
         let mode = active
             .thinking_mode
@@ -2815,8 +3026,9 @@ impl ProvidersConfig {
     }
 
     /// Resolve configured wire endpoint authority for `(provider, model)`.
-    /// Concrete model pins win, then concrete provider defaults; `Auto` means
-    /// the caller should consult learned state and conservative defaults.
+    /// Concrete model pins win, then concrete provider defaults, then a live
+    /// catalog's advertised endpoints. `Auto` means the caller should consult
+    /// learned state and conservative defaults.
     pub fn resolve_wire_api(&self, provider: &str, model: &str) -> WireApi {
         let Some(entry) = self.providers.get(provider) else {
             return WireApi::Auto;
@@ -2825,6 +3037,7 @@ impl ProvidersConfig {
             .models
             .iter()
             .find(|m| m.id == model)
+            .filter(|m| m.wire_api_provenance.is_user_configured())
             .map(|m| m.wire_api)
             .filter(|w| !w.is_auto())
         {
@@ -2833,7 +3046,30 @@ impl ProvidersConfig {
         if !entry.wire_api.is_auto() {
             return entry.wire_api;
         }
-        WireApi::Auto
+        if let Some(model) = entry.models.iter().find(|m| m.id == model)
+            && let Some(wire_api) = preferred_catalog_wire_api(&model.capabilities)
+        {
+            return wire_api;
+        }
+        if let Some(wire_api) = entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .filter(|m| matches!(m.wire_api_provenance, WireApiProvenance::Recovered))
+            .map(|m| m.wire_api)
+            .filter(|w| !w.is_auto())
+        {
+            return wire_api;
+        }
+        // Copilot's model catalog is authoritative when present, but a
+        // temporary/missing catalog must not make a renamed Copilot GPT-5
+        // connection start at Chat Completions. Other providers retain the
+        // historic `Auto` result so their learned-endpoint path remains
+        // unchanged.
+        entry
+            .is_copilot_identity(provider)
+            .then(|| WireApi::detect(model))
+            .unwrap_or(WireApi::Auto)
     }
 
     /// Whether the endpoint is explicitly pinned by model or provider config.
@@ -2845,7 +3081,7 @@ impl ProvidersConfig {
             .models
             .iter()
             .find(|m| m.id == model)
-            .is_some_and(|m| !m.wire_api.is_auto())
+            .is_some_and(|m| !m.wire_api.is_auto() && m.wire_api_provenance.is_user_configured())
             || !entry.wire_api.is_auto()
     }
 }

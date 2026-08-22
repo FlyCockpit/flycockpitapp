@@ -13108,6 +13108,7 @@ async fn run_docs_ask_pipeline(
         .map_err(|error| format!("resolving active model: {error:#}"))?,
     );
     let reasoning_params = model.resolve_reasoning_params(&providers);
+    let endpoint_recovery_reasoning_params = model.endpoint_recovery_reasoning_params(&providers);
     let config = crate::daemon::session_worker::SessionConfigHandle::detached(
         crate::daemon::session_worker::SessionConfigSnapshot::new(
             0,
@@ -13120,6 +13121,7 @@ async fn run_docs_ask_pipeline(
         model,
         params: crate::engine::model::ModelParams {
             additional_params: reasoning_params,
+            endpoint_recovery_additional_params: endpoint_recovery_reasoning_params,
             prompt_cache_key: Some(session.id.to_string()),
             ..crate::engine::model::ModelParams::default()
         },

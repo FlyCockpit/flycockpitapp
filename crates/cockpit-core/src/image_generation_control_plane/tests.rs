@@ -186,19 +186,70 @@ mod authz {
         );
     }
 
+    /// AC2 (local half): the local-`Owner` authorization matrix.
+    ///
+    /// This REPLACES the former `every_request_family_allows_local_owner`,
+    /// whose sole assertion `assert!(family.local_owner_allowed())` was a
+    /// tautology: `local_owner_allowed()` was a hardcoded `-> bool { true }`,
+    /// so the test asserted a constant against itself and would pass no matter
+    /// how the "matrix" behaved. It is deleted; `local_owner_allowed` no longer
+    /// exists.
+    ///
+    /// The real test drives the production entry point `authorize_local_owner`
+    /// and compares each family's disposition against an INDEPENDENT expected
+    /// table (`expected_local_owner`, literal per family, not re-derived from
+    /// the production `match`). Both tables are exhaustive `match`es with no
+    /// wildcard, so a new `RequestFamily` variant fails to compile until it is
+    /// given a deliberate disposition in production AND an expected disposition
+    /// here — that compile-forcing is the non-vacuity guarantee for the
+    /// all-`allow` contract, and a regression to blanket-deny fails the
+    /// per-family `allowed` assertions below.
     #[test]
-    fn every_request_family_allows_local_owner() {
-        for family in [
-            RequestFamily::ConfigReadsAndSnapshot,
-            RequestFamily::HealthReadsAndRefresh,
-            RequestFamily::PlanGet,
-            RequestFamily::JobReadsAndSnapshot,
-            RequestFamily::JobCancel,
-            RequestFamily::ConfigMutations,
-            RequestFamily::LateResult,
-            RequestFamily::OperationStatus,
-        ] {
-            assert!(family.local_owner_allowed());
+    fn image_generation_authorize_local_owner_matrix() {
+        // Independent expected disposition per family, straight from the
+        // "Local Owner" column of the settled control-plane authorization
+        // matrix. Exhaustive + wildcard-free: a new variant breaks this
+        // compile until its expected disposition is stated.
+        fn expected_local_owner(family: RequestFamily) -> AuthorizationDecision {
+            match family {
+                RequestFamily::ConfigReadsAndSnapshot => AuthorizationDecision::allow(),
+                RequestFamily::HealthReadsAndRefresh => AuthorizationDecision::allow(),
+                RequestFamily::PlanGet => AuthorizationDecision::allow(),
+                RequestFamily::JobReadsAndSnapshot => AuthorizationDecision::allow(),
+                RequestFamily::JobCancel => AuthorizationDecision::allow(),
+                RequestFamily::ConfigMutations => AuthorizationDecision::allow(),
+                RequestFamily::LateResult => AuthorizationDecision::allow(),
+                RequestFamily::OperationStatus => AuthorizationDecision::allow(),
+            }
+        }
+
+        // Cover EVERY family (not a subset). `RequestFamily::ALL` is the
+        // iteration surface; its length is pinned so a variant that widened the
+        // enum without extending `ALL` is caught here rather than silently
+        // skipped.
+        assert_eq!(
+            RequestFamily::ALL.len(),
+            8,
+            "RequestFamily::ALL must list every variant"
+        );
+
+        for family in RequestFamily::ALL {
+            let expected = expected_local_owner(family);
+            let actual = authorize_local_owner(family);
+            assert_eq!(
+                actual, expected,
+                "local-owner disposition for {family:?} must match the matrix"
+            );
+            // The whole matrix is `allow` for Owner per the contract; assert it
+            // explicitly per family so a regression to blanket-deny fails here.
+            assert!(
+                actual.allowed,
+                "Owner must be allowed for {family:?} (daemon-local authority)"
+            );
+            assert!(
+                actual.error.is_none(),
+                "an allowed local-owner decision carries no error code for {family:?}"
+            );
         }
     }
 }

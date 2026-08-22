@@ -39,18 +39,23 @@ export const MAX_CURSOR_BYTES = 512;
 export const MAX_CONFIG_CHANGES = 100;
 
 // ---------------------------------------------------------------------------
-// Hosted access scope
+// Principal scope
 // ---------------------------------------------------------------------------
 
-/** The hosted access-grant scope enum. `image_generation_admin` requires a nonnull canonical project root. */
-export type HostedAccessScope =
+/**
+ * The unified principal grant scope. Mirrors the Rust
+ * `PrincipalScope` / `RelayGrantScope` enums (the parallel `HostedAccessScope`
+ * island was deleted): `image_generation_admin` requires a nonnull canonical
+ * project root and confers no terminal/agent/project-file authority.
+ */
+export type PrincipalScope =
   | "terminal"
   | "agent"
   | "agent_readonly"
   | "project_files"
   | "image_generation_admin";
 
-export const HOSTED_ACCESS_SCOPE_STRINGS: readonly HostedAccessScope[] = [
+export const PRINCIPAL_SCOPE_STRINGS: readonly PrincipalScope[] = [
   "terminal",
   "agent",
   "agent_readonly",
@@ -59,7 +64,7 @@ export const HOSTED_ACCESS_SCOPE_STRINGS: readonly HostedAccessScope[] = [
 ];
 
 /** Returns `true` if this scope requires a nonnull project root. */
-export function scopeRequiresProjectRoot(scope: HostedAccessScope): boolean {
+export function scopeRequiresProjectRoot(scope: PrincipalScope): boolean {
   return scope === "image_generation_admin";
 }
 

@@ -19,6 +19,7 @@ export const relayGrantScopeSchema = z.enum([
   "agent",
   "agent_readonly",
   "project_files",
+  "image_generation_admin",
 ]);
 export type RelayGrantScope = z.infer<typeof relayGrantScopeSchema>;
 

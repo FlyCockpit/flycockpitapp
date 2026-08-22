@@ -3,6 +3,7 @@ enum InstanceAccessScope {
   AGENT
   AGENT_READONLY
   PROJECT_FILES
+  IMAGE_GENERATION_ADMIN
 }
 
 enum InstanceAccessGrantStatus {

@@ -31,6 +31,7 @@ fn remote_principal(scope: RelayGrantScope, project_root: Option<String>) -> Cli
         RelayGrantScope::Agent => PrincipalScope::Agent,
         RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
         RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
+        RelayGrantScope::ImageGenerationAdmin => PrincipalScope::ImageGenerationAdmin,
     };
     ClientPrincipal::from_verified_remote(
         "user-1".to_string(),
@@ -224,18 +225,23 @@ mod old_behavior_rejection {
 
     #[test]
     fn rootless_wildcard_does_not_apply_for_image_admin() {
-        // The existing rootless wildcard (project_root: None matches any
-        // project) never applies for ImageGenerationAdmin.
+        // The unified `PrincipalScope::ImageGenerationAdmin` replaces the
+        // deleted parallel `HostedAccessScope` island. The existing rootless
+        // wildcard (project_root: None matches any project) never applies for
+        // it: a missing or empty root fails closed.
+        assert!(scope_requires_project_root(
+            PrincipalScope::ImageGenerationAdmin
+        ));
         assert!(!validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             None
         ));
         assert!(!validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             Some("")
         ));
         assert!(validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             Some("/workspace/app")
         ));
     }
@@ -244,16 +250,78 @@ mod old_behavior_rejection {
     fn non_admin_scopes_do_not_require_root() {
         // Every other scope retains its reviewed project-binding rules.
         for scope in [
-            HostedAccessScope::Terminal,
-            HostedAccessScope::Agent,
-            HostedAccessScope::AgentReadonly,
-            HostedAccessScope::ProjectFiles,
+            PrincipalScope::Terminal,
+            PrincipalScope::Agent,
+            PrincipalScope::AgentReadonly,
+            PrincipalScope::ProjectFiles,
         ] {
-            assert!(!scope.requires_project_root());
+            assert!(!scope_requires_project_root(scope));
             // Root is optional for non-admin scopes.
             assert!(validate_admin_grant_root(scope, None));
             assert!(validate_admin_grant_root(scope, Some("/workspace/app")));
         }
+    }
+
+    #[test]
+    fn mint_image_admin_grant_fails_closed_without_root() {
+        // AC1: minting/decoding an `ImageGenerationAdmin` grant REQUIRES a
+        // present, nonempty project root. A missing or empty root fails closed
+        // instead of producing a rootless (project-wide) authority.
+        assert_eq!(
+            mint_image_admin_grant(None).unwrap_err(),
+            ImageControlErrorCode::Forbidden
+        );
+        assert_eq!(
+            mint_image_admin_grant(Some("")).unwrap_err(),
+            ImageControlErrorCode::Forbidden
+        );
+        let grant = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert_eq!(grant.scope, PrincipalScope::ImageGenerationAdmin);
+        assert!(
+            grant.project_root.is_some(),
+            "a minted admin grant is always rooted"
+        );
+    }
+
+    #[test]
+    fn admin_grant_root_canonical_matches_two_spellings_of_one_project() {
+        // AC13: two path spellings of the SAME project (here a trailing-slash
+        // variant, which canonicalizes identically for a not-yet-created root)
+        // normalize to one binding. The grant is minted from one spelling and
+        // matches the target expressed with the other.
+        let grant = mint_image_admin_grant(Some("/workspace/app/")).unwrap();
+        assert!(admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/app"
+        ));
+        // Reverse spelling also binds.
+        let grant2 = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert!(admin_grant_root_matches_project(
+            grant2.project_root.as_deref(),
+            "/workspace/app/"
+        ));
+    }
+
+    #[test]
+    fn admin_grant_root_rejects_string_prefix_trick_and_missing_root() {
+        // A different project must never match by string-prefix trick: a raw
+        // `starts_with` would wrongly treat `/workspace/app` as authority over
+        // `/workspace/app-evil`. Canonical-identity matching rejects it.
+        let grant = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert!(!admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/app-evil"
+        ));
+        assert!(!admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/application"
+        ));
+        // Fail closed on a missing/empty grant root.
+        assert!(!admin_grant_root_matches_project(None, "/workspace/app"));
+        assert!(!admin_grant_root_matches_project(
+            Some(""),
+            "/workspace/app"
+        ));
     }
 
     #[test]

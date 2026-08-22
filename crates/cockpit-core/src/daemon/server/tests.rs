@@ -10533,6 +10533,119 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
     assert_eq!(status.state, "committed");
 }
 
+/// The `image_generation` registry is authored ONLY by the dedicated
+/// `image_endpoint_*` RPCs; a generic `SaveExtendedConfig` (whose incoming
+/// registry is always the redacted EMPTY default) must PRESERVE it, and the
+/// dedicated RPCs must remain fully mutable afterwards — none of that path is
+/// affected by the SaveExtendedConfig merge.
+#[tokio::test]
+async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() {
+    use cockpit_config::config::image_generation::{
+        IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageEndpoint,
+        ImageGenerationConfig, ImageLocationClass,
+    };
+
+    // ISOLATE the cockpit home so `persist_registry`'s `discover_config_dirs`
+    // never resolves the developer's real `~/.config/cockpit/config.json`; the
+    // empty temp home means the project `.cockpit/config.json` is the only
+    // existing config layer, and the RPC write, the production config source,
+    // and the SaveExtendedConfig target all agree on that one file.
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    // The dedicated image-config RPC (and the trust-gated `.cockpit` config
+    // layer) resolve workspace trust from the db.
+    trust_workspace_root(&ctx, project.path()).await;
+    let project_root = project.path().to_string_lossy().into_owned();
+
+    let make_endpoint = |id: &str| {
+        serde_json::to_string(&ImageEndpoint {
+            id: id.to_string(),
+            adapter: ImageAdapterKind::OpenaiImages,
+            origin: "https://api.openai.com/".to_string(),
+            path_prefix: None,
+            credential_ref: Some("openai-key".to_string()),
+            headers: Vec::new(),
+            allow_insecure_transport: false,
+            location: ImageLocationClass::PublicCloud,
+            enabled: true,
+            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+            exclusive_server: false,
+        })
+        .unwrap()
+    };
+
+    // 1) Author a registry through the dedicated RPC.
+    let created = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+        &ctx,
+        Request::ImageEndpointCreate {
+            project_root: project_root.clone(),
+            endpoint_json: make_endpoint("openai-main"),
+            expected_config_generation: None,
+        },
+    )
+    .await
+    .expect("endpoint create succeeds");
+    assert!(matches!(created, Response::ImageControlMutated(_)));
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("openai-main"),
+        "the RPC must persist the registry to disk"
+    );
+
+    // 2) A generic settings save carrying the redacted EMPTY registry.
+    let incoming = serde_json::json!({
+        "name": "Renamed Project",
+        "image_generation": serde_json::to_value(ImageGenerationConfig::default()).unwrap(),
+    })
+    .to_string();
+    assert!(!incoming.contains("openai-main"));
+    let saved = crate::daemon::fs_api::save_extended_config(
+        project_root.clone(),
+        ".cockpit/config.json".into(),
+        incoming,
+        None,
+    )
+    .await
+    .expect("save extended config succeeds");
+    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
+    let after_save = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        after_save.contains("openai-main"),
+        "SaveExtendedConfig must preserve the RPC-authored registry"
+    );
+    assert!(after_save.contains("Renamed Project"));
+
+    // 3) The dedicated RPC still mutates the registry after the settings save.
+    let second = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+        &ctx,
+        Request::ImageEndpointCreate {
+            project_root: project_root.clone(),
+            endpoint_json: make_endpoint("backup-openai"),
+            expected_config_generation: None,
+        },
+    )
+    .await
+    .expect("second endpoint create succeeds after SaveExtendedConfig");
+    assert!(matches!(second, Response::ImageControlMutated(_)));
+    let final_config = std::fs::read_to_string(&config_path).unwrap();
+    let final_value: serde_json::Value = serde_json::from_str(&final_config).unwrap();
+    let registry: ImageGenerationConfig =
+        serde_json::from_value(final_value.get("image_generation").unwrap().clone()).unwrap();
+    let ids: Vec<&str> = registry.endpoints().iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        ids.contains(&"openai-main") && ids.contains(&"backup-openai"),
+        "both the pre-save and post-save endpoints must be present: {ids:?}"
+    );
+}
+
 /// `ImportPolicy` is owner-remoted AND keeps the batch's vault-only custody
 /// guarantee on the remote path: an imported literal credential is rejected
 /// before anything is written to config, and the reserved remote operation is

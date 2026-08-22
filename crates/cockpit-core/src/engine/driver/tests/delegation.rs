@@ -7,8 +7,8 @@ fn task_tool_call_with_args(
     args: serde_json::Value,
 ) -> crate::engine::message::ToolCall {
     crate::engine::message::ToolCall {
-        id: call_id.to_string(),
-        call_id: Some(function_call_id.to_string()),
+        id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+        provider: rig::message::ProviderCallId::new(function_call_id.to_string()),
         function: rig::message::ToolFunction {
             name: "task".into(),
             arguments: args,
@@ -685,6 +685,7 @@ async fn resolved_cwd_unknown_agent_refuses_before_load() {
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
         task_call_id: "task-resolved-cwd".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-task-resolved-cwd".to_string()),
     };
 
@@ -731,6 +732,7 @@ fn interactive_child_load_failure_returns_tool_error_without_pushing_child() {
         model: None,
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         task_call_id: "task-load-fail",
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-load-fail".to_string()),
         repair_notes: &[],
     }) {

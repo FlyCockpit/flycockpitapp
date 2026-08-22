@@ -306,6 +306,7 @@ fn single_task(
         child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         repair_notes: Vec::new(),
         task_call_id: task_call_id.to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some(format!("fn-{task_call_id}")),
     }
 }
@@ -387,6 +388,7 @@ async fn parallel_write_batch_refused_outside_frontier() {
             why: "test".to_string(),
             repair_notes: Vec::new(),
             task_call_id: format!("task-mode-{mode:?}"),
+            task_provider_item_id: None,
             task_function_call_id: None,
         };
 
@@ -421,6 +423,7 @@ async fn parallel_write_batch_refused_outside_frontier() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-mode-frontier".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: None,
     };
     let completion = driver
@@ -450,6 +453,7 @@ async fn overlapping_write_scopes_refuse_whole_batch() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-overlap".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: None,
     };
 
@@ -486,6 +490,7 @@ async fn write_scope_escaping_workspace_refused() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-escape".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: None,
     };
 
@@ -519,6 +524,7 @@ async fn write_capable_entry_requires_write_scope() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-missing-scope".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: None,
     };
 
@@ -618,6 +624,7 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
                         why: "test".to_string(),
                         repair_notes: Vec::new(),
                         task_call_id: "task-pregrant".to_string(),
+                        task_provider_item_id: None,
                         task_function_call_id: None,
                     };
                     let _ = driver
@@ -1024,6 +1031,7 @@ async fn noninteractive_batch_spawn_amends_each_child_routing() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-batch-routing".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-task-batch-routing".to_string()),
     };
 
@@ -1078,6 +1086,7 @@ async fn interactive_spawn_amends_with_child_routing() {
             model: Some(exact_model_selector("interactive-child")),
             child_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             task_call_id: "task-interactive-routing",
+            task_provider_item_id: None,
             task_function_call_id: Some("fn-task-interactive-routing".to_string()),
             repair_notes: &[],
         })
@@ -1122,6 +1131,7 @@ async fn pending_noninteractive_completion_routes_by_task_call_id() {
     let tx = driver.noninteractive_complete_tx.clone();
     tx.send(BackgroundNoninteractiveCompletion::Single {
         task_call_id: "task-a".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-task-a".to_string()),
         result: Box::new(Ok(single_noninteractive_completion("task-a", "a done"))),
     })
@@ -1129,6 +1139,7 @@ async fn pending_noninteractive_completion_routes_by_task_call_id() {
     .unwrap();
     tx.send(BackgroundNoninteractiveCompletion::Single {
         task_call_id: "task-b".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-task-b".to_string()),
         result: Box::new(Ok(single_noninteractive_completion("task-b", "b done"))),
     })
@@ -1221,6 +1232,7 @@ async fn inline_background_completion_error_keeps_original_task_pairing() {
         .finalize_background_noninteractive_completion(
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-inline".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-inline".to_string()),
                 result: Box::new(Err(anyhow::anyhow!("child crashed"))),
             }),
@@ -1272,6 +1284,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
         .finalize_background_noninteractive_completion(
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-bg-error".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-bg-error".to_string()),
                 result: Box::new(Err(anyhow::anyhow!("late child crashed"))),
             }),
@@ -1296,6 +1309,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
         .finalize_background_noninteractive_completion(
             Some(BackgroundNoninteractiveCompletion::Single {
                 task_call_id: "task-bg-error".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-bg-error".to_string()),
                 result: Box::new(Err(anyhow::anyhow!("late child crashed again"))),
             }),
@@ -1333,9 +1347,11 @@ async fn backgrounded_batch_completion_delivers_one_mixed_status_payload() {
         .finalize_background_noninteractive_completion(
             Some(BackgroundNoninteractiveCompletion::Batch {
                 task_call_id: "task-mixed".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-mixed".to_string()),
                 result: Box::new(Ok(BatchNoninteractiveCompletion {
                     task_call_id: "task-mixed".to_string(),
+                    task_provider_item_id: None,
                     task_function_call_id: Some("fn-mixed".to_string()),
                     children: vec![
                         BatchChildCompletion {
@@ -1438,6 +1454,7 @@ async fn noninteractive_single_inline_result_shape_is_unchanged() {
             SingleNoninteractiveCompletion {
                 child_agent: "explore".to_string(),
                 task_call_id: "task-single".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-single".to_string()),
                 report: "single report".to_string(),
                 failed: false,
@@ -1471,7 +1488,8 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
             SingleNoninteractiveCompletion {
                 child_agent: "explore".to_string(),
                 task_call_id: "task-single".to_string(),
-                task_function_call_id: Some("fn-single".to_string()),
+                task_provider_item_id: Some("fc_task_report_1".to_string()),
+                task_function_call_id: Some("call_task_report_1".to_string()),
                 report: "single report".to_string(),
                 failed: false,
                 failure: None,
@@ -1524,11 +1542,16 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
     assert_eq!(event.data["task_call_id"], "task-single");
     assert_eq!(event.data["label"], "default");
     assert_eq!(event.data["report"], "single report");
-    assert_eq!(event.data["provider_call_id"], "fn-single");
+    assert_eq!(event.data["provider_item_id"], "fc_task_report_1");
+    assert_eq!(event.data["provider_call_id"], "call_task_report_1");
     assert_eq!(event.data["provider_call_id_source"], "provider");
     assert_eq!(
+        event.data["provider_identity"]["provider_item_id"],
+        "fc_task_report_1"
+    );
+    assert_eq!(
         event.data["provider_identity"]["provider_call_id"],
-        "fn-single"
+        "call_task_report_1"
     );
 
     let row = driver
@@ -1545,6 +1568,14 @@ async fn noninteractive_single_report_body_matches_live_event_db_event_row_and_r
 
     assert_eq!(tool_result_id(&result), "task-single");
     assert_eq!(tool_result_text(&result), "single report");
+    assert_eq!(
+        tool_result_provider_item_id(&result).as_deref(),
+        Some("fc_task_report_1")
+    );
+    assert_eq!(
+        tool_result_provider_call_id(&result).as_deref(),
+        Some("call_task_report_1")
+    );
 }
 
 #[tokio::test]
@@ -1557,6 +1588,7 @@ async fn noninteractive_report_stamps_child_model() {
             SingleNoninteractiveCompletion {
                 child_agent: "explore".to_string(),
                 task_call_id: "task-single-child-report".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-single-child-report".to_string()),
                 report: "single report".to_string(),
                 failed: false,
@@ -1625,6 +1657,7 @@ async fn noninteractive_batch_report_stamps_child_model() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-batch-child-report".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some("fn-task-batch-child-report".to_string()),
     };
 
@@ -1805,6 +1838,7 @@ fn dmh_docs_batch_exclusive_in_flight() -> usize {
                         why: "test".to_string(),
                         repair_notes: Vec::new(),
                         task_call_id: "task-docs-excl".to_string(),
+                        task_provider_item_id: None,
                         task_function_call_id: None,
                     };
                     let _ = driver
@@ -1880,6 +1914,7 @@ async fn batch_docs_entry_fails_closed_on_unresolvable_model() {
         why: "test".to_string(),
         repair_notes: Vec::new(),
         task_call_id: "task-docs-badmodel".to_string(),
+        task_provider_item_id: None,
         task_function_call_id: None,
     };
     let completion = driver
@@ -2012,6 +2047,7 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                         why: "test".to_string(),
                         repair_notes: Vec::new(),
                         task_call_id: "task-def-race".to_string(),
+                        task_provider_item_id: None,
                         task_function_call_id: None,
                     };
                     driver
@@ -2369,6 +2405,7 @@ async fn noninteractive_single_result_includes_task_repair_notes() {
             SingleNoninteractiveCompletion {
                 child_agent: "explore".to_string(),
                 task_call_id: "task-single".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-single".to_string()),
                 report: "single report".to_string(),
                 failed: false,
@@ -2404,6 +2441,7 @@ async fn noninteractive_batch_inline_result_shape_is_unchanged() {
         .finalize_batch_noninteractive_task(
             BatchNoninteractiveCompletion {
                 task_call_id: "task-batch".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-batch".to_string()),
                 children: vec![
                     BatchChildCompletion {
@@ -2456,6 +2494,7 @@ async fn noninteractive_batch_result_includes_task_repair_notes() {
         .finalize_batch_noninteractive_task(
             BatchNoninteractiveCompletion {
                 task_call_id: "task-batch".to_string(),
+                task_provider_item_id: None,
                 task_function_call_id: Some("fn-batch".to_string()),
                 children: vec![BatchChildCompletion {
                     idx: 0,
@@ -2858,7 +2897,13 @@ async fn late_noninteractive_completion_delivers_once() {
     );
     assert!(registry.background_on_user_input("task-1", "default"));
 
-    let result = Message::tool_result_with_call_id("task-1".to_string(), None, "done".to_string());
+    let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+        "task-1".to_string(),
+        None,
+        None,
+        "task",
+        "done".to_string(),
+    );
     assert!(registry.complete("task-1", "default", "done".to_string(), false, Some(result)));
     assert!(
         !registry.complete(
@@ -2866,11 +2911,15 @@ async fn late_noninteractive_completion_delivers_once() {
             "default",
             "duplicate".to_string(),
             false,
-            Some(Message::tool_result_with_call_id(
-                "task-1".to_string(),
-                None,
-                "duplicate".to_string(),
-            ))
+            Some(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    "task-1".to_string(),
+                    None,
+                    None,
+                    "task",
+                    "duplicate".to_string(),
+                )
+            )
         ),
         "completion is accepted exactly once"
     );
@@ -3132,6 +3181,7 @@ fn docs_finalizer_outcome_and_data(
         subagent_report_event_data(
             "docs",
             Some("task-docs"),
+            None,
             None,
             "default",
             &outcome.report,
@@ -4293,6 +4343,7 @@ async fn delegated_parent_authorization_remains_parent_scoped() {
             why: "test".to_string(),
             repair_notes: Vec::new(),
             task_call_id: "task-parent-scope-admit".to_string(),
+            task_provider_item_id: None,
             task_function_call_id: None,
         };
         let completion = driver
@@ -4347,6 +4398,7 @@ async fn delegated_parent_authorization_remains_parent_scoped() {
             why: "test".to_string(),
             repair_notes: Vec::new(),
             task_call_id: "task-parent-scope-refuse".to_string(),
+            task_provider_item_id: None,
             task_function_call_id: None,
         };
         let completion = driver
@@ -4573,6 +4625,7 @@ async fn delegated_mode_refresh_or_build_failure_dispatches_nothing() {
             why: "test".to_string(),
             repair_notes: Vec::new(),
             task_call_id: "task-batch-build-failure".to_string(),
+            task_provider_item_id: None,
             task_function_call_id: None,
         };
         let message = driver
@@ -5088,6 +5141,7 @@ async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
             why: "test".to_string(),
             repair_notes: Vec::new(),
             task_call_id: "task-serial-admission".to_string(),
+            task_provider_item_id: None,
             task_function_call_id: None,
         };
         let completion = driver
@@ -5210,6 +5264,7 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
                         why: "test".to_string(),
                         repair_notes: Vec::new(),
                         task_call_id: "task-concurrency".to_string(),
+                        task_provider_item_id: None,
                         task_function_call_id: None,
                     };
                     let _ = driver

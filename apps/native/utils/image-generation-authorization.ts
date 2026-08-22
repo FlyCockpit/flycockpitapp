@@ -12,10 +12,10 @@
  */
 
 import {
-  type HostedAccessScope,
   IMAGE_GENERATION_ADMIN_SCOPE_STRING,
   type ImageControlErrorCode,
   type ImageControlRequestTag,
+  type PrincipalScope,
   scopeRequiresProjectRoot,
 } from "./image-generation-contracts";
 
@@ -28,7 +28,7 @@ export type NativePrincipalKind = "owner" | "remote" | "anonymous";
 
 /** A canonical project binding for an admin grant. */
 export interface AdminGrantProjectBinding {
-  scope: HostedAccessScope;
+  scope: PrincipalScope;
   /** Canonical project root; required nonnull for `image_generation_admin`. */
   projectRoot?: string;
   /** Canonical project id; required nonnull for `image_generation_admin`. */
@@ -190,7 +190,7 @@ export interface AuthorizationTarget {
 
 /** Validate that an `ImageGenerationAdmin` grant has a nonnull project root. */
 export function validateAdminGrantRoot(
-  scope: HostedAccessScope,
+  scope: PrincipalScope,
   projectRoot: string | undefined,
 ): boolean {
   if (scopeRequiresProjectRoot(scope)) {

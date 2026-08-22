@@ -313,8 +313,8 @@ pub(super) fn decide_text_recovery(
 fn synth_tool_call(name: &str, arguments: Value) -> ToolCall {
     use rig::message::ToolFunction;
     ToolCall {
-        id: format!("text-{}", Uuid::new_v4()),
-        call_id: None,
+        id: rig::message::ToolCallId::new_or_mint(format!("text-{}", Uuid::new_v4())),
+        provider: None,
         function: ToolFunction {
             name: name.to_string(),
             arguments,

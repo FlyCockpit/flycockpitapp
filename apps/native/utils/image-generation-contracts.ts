@@ -39,18 +39,23 @@ export const MAX_CURSOR_BYTES = 512;
 export const MAX_CONFIG_CHANGES = 100;
 
 // ---------------------------------------------------------------------------
-// Hosted access scope
+// Principal scope
 // ---------------------------------------------------------------------------
 
-/** The hosted access-grant scope enum. `image_generation_admin` requires a nonnull canonical project root. */
-export type HostedAccessScope =
+/**
+ * The unified principal grant scope. Mirrors the Rust
+ * `PrincipalScope` / `RelayGrantScope` enums (the parallel `HostedAccessScope`
+ * island was deleted): `image_generation_admin` requires a nonnull canonical
+ * project root and confers no terminal/agent/project-file authority.
+ */
+export type PrincipalScope =
   | "terminal"
   | "agent"
   | "agent_readonly"
   | "project_files"
   | "image_generation_admin";
 
-export const HOSTED_ACCESS_SCOPE_STRINGS: readonly HostedAccessScope[] = [
+export const PRINCIPAL_SCOPE_STRINGS: readonly PrincipalScope[] = [
   "terminal",
   "agent",
   "agent_readonly",
@@ -59,7 +64,7 @@ export const HOSTED_ACCESS_SCOPE_STRINGS: readonly HostedAccessScope[] = [
 ];
 
 /** Returns `true` if this scope requires a nonnull project root. */
-export function scopeRequiresProjectRoot(scope: HostedAccessScope): boolean {
+export function scopeRequiresProjectRoot(scope: PrincipalScope): boolean {
   return scope === "image_generation_admin";
 }
 
@@ -435,8 +440,38 @@ export type ReplyOutcome =
 // Budget policy
 // ---------------------------------------------------------------------------
 
-/** The budget policy DTO. `Unconfigured` blocks generation; explicit save required. */
-export type BudgetPolicy = "unconfigured" | "finite" | "unlimited";
+/** The largest representable `u64` (spend-ledger `usd_micros` upper bound). */
+export const MAX_U64_USD_MICROS = 18446744073709551615n;
+
+/**
+ * The non-lossy budget policy DTO, mirroring the Rust spend-ledger
+ * `BudgetPolicy` exactly: `Unconfigured` blocks generation, `Unlimited` allows
+ * it, and `Finite` allows it while carrying its explicit `usd_micros` amount.
+ * The wire form is serde external tagging — `"unconfigured"`, `"unlimited"`,
+ * and `{ "finite": { "usd_micros": <integer> } }` — so a `Finite` never
+ * appears without an amount.
+ *
+ * `usd_micros` is a `bigint`, never a `number`: the `u64` wire value can reach
+ * `u64::MAX`, which exceeds `Number.MAX_SAFE_INTEGER`, so a `number` would
+ * truncate large amounts.
+ */
+export type BudgetPolicy = "unconfigured" | "unlimited" | { finite: { usd_micros: bigint } };
+
+/** Narrow a {@link BudgetPolicy} to its `Finite` case. */
+export function isFinitePolicy(policy: BudgetPolicy): policy is { finite: { usd_micros: bigint } } {
+  return typeof policy === "object" && policy !== null && "finite" in policy;
+}
+
+/** Construct a `Finite` budget policy from a positive `u64` micros amount. */
+export function finiteBudgetPolicy(usdMicros: bigint): { finite: { usd_micros: bigint } } {
+  return { finite: { usd_micros: usdMicros } };
+}
+
+/** Whether a `Finite` amount is a positive `u64` (`1..=u64::MAX`), mirroring
+ *  the Rust `BudgetPolicy` deserializer that rejects `usd_micros: 0`. */
+export function isValidBudgetAmount(usdMicros: bigint): boolean {
+  return usdMicros >= 1n && usdMicros <= MAX_U64_USD_MICROS;
+}
 
 /** The budget scope projection: `(Unconfigured,null)` or `(Finite|Unlimited,positive-generation)`. */
 export interface BudgetScopeProjection {
@@ -449,9 +484,9 @@ export function unconfiguredBudgetScope(): BudgetScopeProjection {
   return { policy: "unconfigured", generation: undefined };
 }
 
-/** Construct a `Finite` projection. */
-export function finiteBudgetScope(generation: string): BudgetScopeProjection {
-  return { policy: "finite", generation };
+/** Construct a `Finite` projection carrying its `usd_micros` amount. */
+export function finiteBudgetScope(usdMicros: bigint, generation: string): BudgetScopeProjection {
+  return { policy: finiteBudgetPolicy(usdMicros), generation };
 }
 
 /** Construct an `Unlimited` projection. */

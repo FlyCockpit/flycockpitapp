@@ -2092,6 +2092,66 @@ pub(crate) fn strip_remote_image_generation(raw: &mut Value) {
     }
 }
 
+/// Parse config.json bytes into an object root, mirroring
+/// [`ExtendedConfigDoc::load`]: empty/whitespace bytes are an empty object, and
+/// a non-object root is rejected (fail closed). Shared by the layered loader's
+/// posture and the `SaveExtendedConfig` merge below.
+fn parse_config_root_object(bytes: &[u8]) -> Result<Value> {
+    let text = std::str::from_utf8(bytes).context("config.json is not valid UTF-8")?;
+    if text.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let value: Value = serde_json::from_str(text).context("config.json is not valid JSON")?;
+    match value {
+        Value::Object(_) => Ok(value),
+        other => anyhow::bail!("expected config.json root to be an object, found {other:?}"),
+    }
+}
+
+/// Render the config.json bytes to persist for a daemon `SaveExtendedConfig`
+/// write, preserving the on-disk `image_generation` registry.
+///
+/// DATA-LOSS / SECURITY: `SaveExtendedConfig` is NEVER the authoritative writer
+/// of `image_generation`. The daemon redacts the registry to the empty default
+/// (`ImageGenerationConfig::default`, via `redacted_for_snapshot`) before it
+/// sends a config snapshot to any client, so a client that round-trips that
+/// snapshot back through `SaveExtendedConfig` always carries an EMPTY
+/// `image_generation`. A verbatim write would therefore WIPE the on-disk
+/// endpoints/targets/workflows/allowlist on any generic settings save.
+/// `image_generation` is mutated ONLY through the dedicated `image_endpoint_*` /
+/// `image_target_*` RPCs, so this UNCONDITIONALLY strips whatever the incoming
+/// doc claims for `image_generation` (reusing [`strip_remote_image_generation`],
+/// the same field-owned-by-the-local-layer machinery that keeps a remote layer
+/// from authoring or wiping the registry) and re-applies the current on-disk
+/// value — taking every OTHER config section verbatim from the incoming doc. A
+/// legitimate "clear all image config" goes through the dedicated delete RPCs,
+/// never here.
+///
+/// Fails closed if either document is not a JSON object root (mirrors
+/// [`ExtendedConfigDoc::load`]), so a malformed on-disk config cannot silently
+/// drop a present-but-unreadable registry, and a malformed incoming payload is
+/// rejected rather than written.
+pub fn render_saved_extended_config_preserving_image_generation(
+    incoming_bytes: &[u8],
+    on_disk_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut incoming = parse_config_root_object(incoming_bytes)
+        .context("parsing incoming SaveExtendedConfig config.json")?;
+    // The client can never author `image_generation`; drop whatever it sent
+    // (the redacted round-trip always sends the empty registry).
+    strip_remote_image_generation(&mut incoming);
+    // Re-apply the on-disk registry so a generic settings save preserves it.
+    let on_disk = parse_config_root_object(on_disk_bytes).context("parsing on-disk config.json")?;
+    if let (Some(incoming_obj), Some(on_disk_registry)) =
+        (incoming.as_object_mut(), on_disk.get("image_generation"))
+    {
+        incoming_obj.insert("image_generation".into(), on_disk_registry.clone());
+    }
+    let pretty =
+        serde_json::to_string_pretty(&incoming).context("serializing merged config.json")?;
+    Ok(format!("{pretty}\n").into_bytes())
+}
+
 /// Installation-scoped KEK placement is never a layered config key. Strip
 /// `secretStore` / `secret_store` from every layer so project and remote
 /// documents cannot select, promote, or persist it.

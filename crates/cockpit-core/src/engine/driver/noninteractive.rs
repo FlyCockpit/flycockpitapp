@@ -632,12 +632,14 @@ pub(in crate::engine::driver) struct SingleNoninteractiveTask {
         crate::engine::builtin::DelegationRecursionContext,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) task_call_id: String,
+    pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
 }
 
 pub(in crate::engine::driver) struct SingleNoninteractiveCompletion {
     pub(in crate::engine::driver) child_agent: String,
     pub(in crate::engine::driver) task_call_id: String,
+    pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
     pub(in crate::engine::driver) report: String,
     pub(in crate::engine::driver) failed: bool,
@@ -656,6 +658,7 @@ pub(in crate::engine::driver) struct BatchNoninteractiveTask {
     pub(in crate::engine::driver) why: String,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
     pub(in crate::engine::driver) task_call_id: String,
+    pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
 }
 
@@ -671,6 +674,7 @@ pub(in crate::engine::driver) struct BatchChildCompletion {
 
 pub(in crate::engine::driver) struct BatchNoninteractiveCompletion {
     pub(in crate::engine::driver) task_call_id: String,
+    pub(in crate::engine::driver) task_provider_item_id: Option<String>,
     pub(in crate::engine::driver) task_function_call_id: Option<String>,
     pub(in crate::engine::driver) children: Vec<BatchChildCompletion>,
     pub(in crate::engine::driver) repair_notes: Vec<String>,
@@ -679,11 +683,13 @@ pub(in crate::engine::driver) struct BatchNoninteractiveCompletion {
 pub(in crate::engine::driver) enum BackgroundNoninteractiveCompletion {
     Single {
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
         result: Box<Result<SingleNoninteractiveCompletion>>,
     },
     Batch {
         task_call_id: String,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
         result: Box<Result<BatchNoninteractiveCompletion>>,
     },
@@ -1074,11 +1080,15 @@ impl Driver {
         // routing error having persisted no task delegation, registered no running
         // child, spawned nothing, and dispatched no inference.
         if let Err(err) = self.preflight_single_delegation(&task) {
-            return Ok(Message::tool_result_with_call_id(
-                task.task_call_id.clone(),
-                task.task_function_call_id.clone(),
-                prepend_task_repair_notes(err, &task.repair_notes),
-            ));
+            return Ok(
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task.task_call_id.clone(),
+                    task.task_provider_item_id.clone(),
+                    task.task_function_call_id.clone(),
+                    "task",
+                    prepend_task_repair_notes(err, &task.repair_notes),
+                ),
+            );
         }
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
@@ -1091,6 +1101,7 @@ impl Driver {
             }
         };
         let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
         let resolved_cwd_display = task.child_cwd.resolved_display();
         let task_args_json = serde_json::to_string(&serde_json::json!({
@@ -1147,14 +1158,18 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist single task delegation job and payload failed");
-                return Ok(Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            &task.repair_notes,
+                        ),
                     ),
-                ));
+                );
             }
         }
         self.noninteractive_delegations.register_running(
@@ -1167,6 +1182,7 @@ impl Driver {
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
         let completion_task_call_id = task_call_id.clone();
+        let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
             // Keep the reservation alive for the full background child
@@ -1178,6 +1194,7 @@ impl Driver {
             let _ = complete_tx
                 .send(BackgroundNoninteractiveCompletion::Single {
                     task_call_id: completion_task_call_id,
+                    task_provider_item_id: completion_task_provider_item_id,
                     task_function_call_id: completion_task_function_call_id,
                     result: Box::new(result),
                 })
@@ -1218,9 +1235,13 @@ impl Driver {
                 {
                     tracing::warn!(error = %e, task_call_id, "background single task delegation failed");
                 }
-                let ack =
-                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone())
-                        .await;
+                let ack = self
+                    .background_delegation_ack(
+                        &task_call_id,
+                        task_provider_item_id.clone(),
+                        task_function_call_id.clone(),
+                    )
+                    .await;
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
@@ -1293,6 +1314,7 @@ impl Driver {
             child_recursion,
             repair_notes,
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
         } = task;
 
@@ -1324,6 +1346,7 @@ impl Driver {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         report: format!("Error: {err}"),
                         failed: true,
@@ -1364,6 +1387,7 @@ impl Driver {
             return Ok(SingleNoninteractiveCompletion {
                 child_agent,
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
                 report: err,
                 failed: true,
@@ -1400,6 +1424,7 @@ impl Driver {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         report: format!("Error: {e:#}"),
                         failed: true,
@@ -1434,6 +1459,7 @@ impl Driver {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         report: format!("Error: {e:#}"),
                         failed: true,
@@ -1477,6 +1503,7 @@ impl Driver {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         report: DELEGATION_PAYLOAD_REFUSAL.to_string(),
                         failed: true,
@@ -1514,6 +1541,7 @@ impl Driver {
             .await;
         let task_identity = crate::engine::task_identity::TaskProviderIdentity::for_task_call(
             &task_call_id,
+            task_provider_item_id.as_deref(),
             task_function_call_id.as_deref(),
         );
         // This event embeds the parent model's task `prompt` (model-authored
@@ -1541,6 +1569,7 @@ impl Driver {
                 &serde_json::json!({
                     "child_agent": child_agent.clone(),
                     "task_call_id": task_call_id,
+                    "provider_item_id": task_identity.provider_item_id,
                     "provider_call_id": task_identity.provider_call_id,
                     "provider_call_id_source": task_identity.provider_call_id_source,
                     "provider_identity": task_identity.event_identity_json(&task_call_id),
@@ -1589,6 +1618,7 @@ impl Driver {
                     return Ok(SingleNoninteractiveCompletion {
                         child_agent,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         report: format!("Error: failed to create forked task session: {e:#}"),
                         failed: true,
@@ -1709,6 +1739,7 @@ impl Driver {
                             return Ok(SingleNoninteractiveCompletion {
                                 child_agent,
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
                                 report: format!("Error: {e:#}"),
                                 failed: true,
@@ -1909,6 +1940,7 @@ impl Driver {
         Ok(SingleNoninteractiveCompletion {
             child_agent,
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
             report: outcome.report,
             failed: outcome.failed,
@@ -1934,6 +1966,7 @@ impl Driver {
         let SingleNoninteractiveCompletion {
             child_agent,
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
             report,
             failed,
@@ -1955,11 +1988,14 @@ impl Driver {
             let caller = self.stack.last().expect("stack never empty").agent.clone();
             let report =
                 self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name);
-            let result = Message::tool_result_with_call_id(
-                task_call_id.clone(),
-                task_function_call_id,
-                report.clone(),
-            );
+            let result =
+                crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                    task_call_id.clone(),
+                    task_provider_item_id,
+                    task_function_call_id,
+                    "task",
+                    report.clone(),
+                );
             self.noninteractive_delegations
                 .set_snapshot(&task_call_id, "default", snapshot);
             self.noninteractive_delegations.complete(
@@ -2007,6 +2043,7 @@ impl Driver {
         let mut report_data = subagent_report_event_data(
             &child_agent,
             Some(&task_call_id),
+            task_provider_item_id.as_deref(),
             task_function_call_id.as_deref(),
             "default",
             &report,
@@ -2085,9 +2122,11 @@ impl Driver {
             })
             .await;
 
-        let result = Message::tool_result_with_call_id(
+        let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             task_call_id.clone(),
+            task_provider_item_id,
             task_function_call_id,
+            "task",
             report.clone(),
         );
         self.noninteractive_delegations
@@ -2233,6 +2272,7 @@ impl Driver {
         match completion {
             BackgroundNoninteractiveCompletion::Single {
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
                 result,
             } => match *result {
@@ -2288,9 +2328,11 @@ impl Driver {
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
                         Ok(NoninteractiveCompletionDelivery::Inline(
-                            Message::tool_result_with_call_id(
+                            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 body,
                             ),
                         ))
@@ -2299,6 +2341,7 @@ impl Driver {
             },
             BackgroundNoninteractiveCompletion::Batch {
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
                 result,
             } => match *result {
@@ -2371,9 +2414,11 @@ impl Driver {
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
                         Ok(NoninteractiveCompletionDelivery::Inline(
-                            Message::tool_result_with_call_id(
+                            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 body,
                             ),
                         ))
@@ -2459,6 +2504,7 @@ impl Driver {
     pub(in crate::engine::driver) async fn background_delegation_ack(
         &mut self,
         task_call_id: &str,
+        task_provider_item_id: Option<String>,
         task_function_call_id: Option<String>,
     ) -> Message {
         let completed = self
@@ -2479,7 +2525,13 @@ impl Driver {
             }
         }
         let body = format_delegation_background_ack(task_call_id, &completed, &running);
-        Message::tool_result_with_call_id(task_call_id.to_string(), task_function_call_id, body)
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            task_call_id.to_string(),
+            task_provider_item_id,
+            task_function_call_id,
+            "task",
+            body,
+        )
     }
 
     pub(in crate::engine::driver) async fn async_delegation_result(
@@ -2930,6 +2982,7 @@ impl Driver {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Message> {
         let task_call_id = task.task_call_id.clone();
+        let task_provider_item_id = task.task_provider_item_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
         // FAIL CLOSED before ANY batch persist / registration: validate EVERY
         // entry's child (or docs-stage) model. An unresolvable entry returns the
@@ -2937,11 +2990,15 @@ impl Driver {
         // running child, and spawned nothing.
         for (entry, child_cwd) in task.entries.iter().zip(task.child_cwds.iter()) {
             if let Err(err) = self.preflight_batch_entry(entry, child_cwd) {
-                return Ok(Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(err, &task.repair_notes),
-                ));
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(err, &task.repair_notes),
+                    ),
+                );
             }
         }
         // Reserve the whole batch before it is persisted or registered. The
@@ -3053,14 +3110,18 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, task_call_id, "persist batch task delegation job and payloads failed");
-                return Ok(Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(
-                        DELEGATION_PAYLOAD_REFUSAL.to_string(),
-                        &task.repair_notes,
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            DELEGATION_PAYLOAD_REFUSAL.to_string(),
+                            &task.repair_notes,
+                        ),
                     ),
-                ));
+                );
             }
         }
         for entry in &task.entries {
@@ -3075,6 +3136,7 @@ impl Driver {
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
         let completion_task_call_id = task_call_id.clone();
+        let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
             let result = runner
@@ -3088,6 +3150,7 @@ impl Driver {
             let _ = complete_tx
                 .send(BackgroundNoninteractiveCompletion::Batch {
                     task_call_id: completion_task_call_id,
+                    task_provider_item_id: completion_task_provider_item_id,
                     task_function_call_id: completion_task_function_call_id,
                     result: Box::new(result),
                 })
@@ -3137,9 +3200,13 @@ impl Driver {
                         tracing::warn!(error = %e, task_call_id, label, "background batch task delegation failed");
                     }
                 }
-                let ack =
-                    self.background_delegation_ack(&task_call_id, task_function_call_id.clone())
-                        .await;
+                let ack = self
+                    .background_delegation_ack(
+                        &task_call_id,
+                        task_provider_item_id.clone(),
+                        task_function_call_id.clone(),
+                    )
+                    .await;
                 if let Some(parent) = self.stack.last_mut() {
                     parent.history.push(ack);
                 }
@@ -3215,6 +3282,7 @@ impl Driver {
             why,
             repair_notes,
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
         } = task;
 
@@ -3390,6 +3458,7 @@ impl Driver {
         if let Some(msg) = batch_refusal {
             return Ok(BatchNoninteractiveCompletion {
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
                 children: vec![BatchChildCompletion {
                     idx: 0,
@@ -3515,6 +3584,7 @@ impl Driver {
                 .await;
             let task_identity = crate::engine::task_identity::TaskProviderIdentity::for_task_call(
                 &task_call_id,
+                task_provider_item_id.as_deref(),
                 task_function_call_id.as_deref(),
             );
             // This event embeds the parent model's task `prompt` (model-authored
@@ -3542,6 +3612,7 @@ impl Driver {
                     &serde_json::json!({
                         "child_agent": entry.child_agent.clone(),
                         "task_call_id": task_call_id,
+                        "provider_item_id": task_identity.provider_item_id,
                         "provider_call_id": task_identity.provider_call_id,
                         "provider_call_id_source": task_identity.provider_call_id_source,
                         "provider_identity": task_identity.event_identity_json(&task_call_id),
@@ -3985,6 +4056,7 @@ impl Driver {
             let mut report_data = subagent_report_event_data(
                 &entry.child_agent,
                 Some(&task_call_id),
+                task_provider_item_id.as_deref(),
                 task_function_call_id.as_deref(),
                 &entry.label,
                 &report,
@@ -4068,6 +4140,7 @@ impl Driver {
 
         Ok(BatchNoninteractiveCompletion {
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
             children,
             repair_notes,
@@ -4081,6 +4154,7 @@ impl Driver {
     ) -> Message {
         let BatchNoninteractiveCompletion {
             task_call_id,
+            task_provider_item_id,
             task_function_call_id,
             mut children,
             repair_notes,
@@ -4091,11 +4165,18 @@ impl Driver {
             && children[0].child_agent.is_empty()
             && children[0].failed
         {
-            return Message::tool_result_with_call_id(task_call_id, task_function_call_id, {
-                let caller = self.stack.last().expect("stack never empty").agent.clone();
-                let report = prepend_task_repair_notes(children.remove(0).report, &repair_notes);
-                self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name)
-            });
+            return crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+                "task",
+                {
+                    let caller = self.stack.last().expect("stack never empty").agent.clone();
+                    let report =
+                        prepend_task_repair_notes(children.remove(0).report, &repair_notes);
+                    self.expand_handoff_tags(&report, &self.cwd, caller.llm_mode, &caller.name)
+                },
+            );
         }
 
         children.sort_by_key(|child| child.idx);
@@ -4134,8 +4215,13 @@ impl Driver {
             body["repair_notes"] = serde_json::json!(repair_notes);
         }
         let body = body.to_string();
-        let result =
-            Message::tool_result_with_call_id(task_call_id.clone(), task_function_call_id, body);
+        let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            task_call_id.clone(),
+            task_provider_item_id,
+            task_function_call_id,
+            "task",
+            body,
+        );
         for (label, report, failed, snapshot) in registry_updates {
             self.noninteractive_delegations
                 .set_snapshot(&task_call_id, &label, snapshot);

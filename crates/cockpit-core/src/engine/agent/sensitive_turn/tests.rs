@@ -92,8 +92,8 @@ impl SensitiveContainmentHost for FakeHost {
 fn tool_call(name: &str, args: Value) -> ToolCall {
     use rig::message::ToolFunction;
     ToolCall {
-        id: format!("tc-{name}"),
-        call_id: None,
+        id: rig::message::ToolCallId::new_or_mint(format!("tc-{name}")),
+        provider: None,
         function: ToolFunction {
             name: name.to_string(),
             arguments: args,

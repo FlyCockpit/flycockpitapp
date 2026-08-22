@@ -28,7 +28,7 @@ use crate::db::tool_calls::Recovery;
 use crate::engine::interrupt::{freetext_of, selected_id_of};
 use crate::engine::message::{
     Message, ToolCall, ToolDefinition, collect_tool_calls, extract_reasoning, extract_text,
-    extract_user_text, strip_think_from_choice, tool_result_message,
+    extract_user_text, strip_think_from_choice,
 };
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::repair::{self, repair};
@@ -55,6 +55,8 @@ mod turn_phases;
 #[cfg(test)]
 pub(crate) use turn_phases::phase_10_dispatch_one_call;
 
+#[cfg(test)]
+pub(crate) use backup::record_inference_outcome_for_export_test;
 pub use backup::{
     BackupFallbackDecision, BackupTurnMetadata, FailoverAttempt, MAX_FAILOVER_CANDIDATES,
     suggested_action_for_failure_class, turn_with_backup,
@@ -644,12 +646,12 @@ pub(crate) async fn turn(
 /// settings — [`strip_think_from_choice`] leaves it intact.
 fn stored_assistant_choice(
     inline_think: bool,
-    choice: &crate::engine::message::OneOrMany<crate::engine::message::AssistantContent>,
-) -> Option<crate::engine::message::OneOrMany<crate::engine::message::AssistantContent>> {
+    choice: &[crate::engine::message::AssistantContent],
+) -> Option<Vec<crate::engine::message::AssistantContent>> {
     if inline_think {
         strip_think_from_choice(choice)
     } else {
-        Some(choice.clone())
+        Some(choice.to_vec())
     }
 }
 
@@ -1651,7 +1653,7 @@ fn rewrite_assistant_tool_call_name(history: &mut [Message], call_id: &str, reso
 }
 
 fn assistant_content_has_signed_reasoning(
-    content: &crate::engine::message::OneOrMany<crate::engine::message::AssistantContent>,
+    content: &[crate::engine::message::AssistantContent],
 ) -> bool {
     content.iter().any(|part| {
         matches!(
@@ -1959,19 +1961,17 @@ mod stored_choice_tests {
     //! reasoning-only turn is dropped rather than stored as `[{"text":""}]`.
 
     use super::*;
-    use crate::engine::message::{
-        AssistantContent, OneOrMany, ToolCall, collect_tool_calls, extract_text,
-    };
+    use crate::engine::message::{AssistantContent, ToolCall, collect_tool_calls, extract_text};
     use rig::message::ToolFunction;
 
-    fn text_choice(text: &str) -> OneOrMany<AssistantContent> {
-        OneOrMany::one(AssistantContent::text(text))
+    fn text_choice(text: &str) -> Vec<AssistantContent> {
+        vec![AssistantContent::text(text)]
     }
 
     fn tool_call(id: &str) -> AssistantContent {
         AssistantContent::ToolCall(ToolCall {
-            id: id.into(),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint(id),
+            provider: None,
             function: ToolFunction {
                 name: "read".into(),
                 arguments: serde_json::json!({"path": "x"}),
@@ -2013,11 +2013,10 @@ mod stored_choice_tests {
         // ON, reasoning-only body + a tool call: the block is thinking, so the
         // emptied text is dropped but the tool call survives — never an empty
         // bubble, never a dropped call.
-        let choice = OneOrMany::many(vec![
+        let choice = vec![
             AssistantContent::text("<think>just thinking</think>"),
             tool_call("tc-1"),
-        ])
-        .unwrap();
+        ];
         let stored = stored_assistant_choice(true, &choice).expect("tool call keeps turn");
         assert_eq!(stored.iter().count(), 1);
         assert!(collect_tool_calls(&stored).iter().any(|c| c.id == "tc-1"));
@@ -2058,11 +2057,10 @@ mod stored_choice_tests {
     /// `stored_assistant_choice(true, …)` is what enters history.
     #[test]
     fn multi_turn_strip_on_no_think_in_later_history_body_and_call_present() {
-        let turn1 = OneOrMany::many(vec![
+        let turn1 = vec![
             AssistantContent::text("<think>let me read the file</think>\nReading it now."),
             tool_call("tc-read"),
-        ])
-        .unwrap();
+        ];
         let stored1 = stored_assistant_choice(true, &turn1).expect("non-empty turn");
 
         // The history the turn-2 request would serialize: turn 1's stored
@@ -2153,7 +2151,7 @@ mod history_rewrite_tests {
     //! assistant turn.
 
     use super::*;
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use crate::engine::message::{AssistantContent, ToolCall};
     use crate::engine::repair::repair;
     use rig::message::ToolFunction;
     use serde_json::{Value, json};
@@ -2176,30 +2174,30 @@ mod history_rewrite_tests {
     fn assistant_turn(call_id: &str, name: &str, args: Value) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: call_id.to_string(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                provider: None,
                 function: ToolFunction {
                     name: name.into(),
                     arguments: args,
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }
     }
 
     fn signed_reasoning_tool_turn(call_id: &str, name: &str, args: Value) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::Reasoning(rig::message::Reasoning::new_with_signature(
                     "provider signed thinking",
                     Some("sig-native".into()),
                 )),
                 AssistantContent::ToolCall(ToolCall {
-                    id: call_id.to_string(),
-                    call_id: None,
+                    id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                    provider: None,
                     function: ToolFunction {
                         name: name.into(),
                         arguments: args,
@@ -2207,8 +2205,7 @@ mod history_rewrite_tests {
                     signature: None,
                     additional_params: None,
                 }),
-            ])
-            .expect("non-empty assistant turn"),
+            ],
         }
     }
 

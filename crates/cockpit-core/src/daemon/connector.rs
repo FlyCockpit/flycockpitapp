@@ -765,14 +765,29 @@ fn principal_from_relay_wire(principal: RelayPrincipal) -> ClientPrincipal {
     let grants = principal
         .grants
         .into_iter()
-        .map(|grant| PrincipalGrant {
-            scope: match grant.scope {
+        .filter_map(|grant| {
+            let scope = match grant.scope {
                 RelayGrantScope::Terminal => PrincipalScope::Terminal,
                 RelayGrantScope::Agent => PrincipalScope::Agent,
                 RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
                 RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
-            },
-            project_root: grant.project_root,
+                RelayGrantScope::ImageGenerationAdmin => PrincipalScope::ImageGenerationAdmin,
+            };
+            // Fail closed on decode: an `ImageGenerationAdmin` grant that arrives
+            // without a nonempty project root never becomes authority. It must
+            // NOT inherit the `None`-matches-any-project wildcard that the four
+            // access scopes use, so it is dropped here rather than admitted as a
+            // rootless (project-wide) image-admin grant.
+            if !crate::image_generation_control_plane::scope_project_root_is_valid(
+                scope,
+                grant.project_root.as_deref(),
+            ) {
+                return None;
+            }
+            Some(PrincipalGrant {
+                scope,
+                project_root: grant.project_root,
+            })
         })
         .collect();
     ClientPrincipal::from_verified_remote(principal.user_id, grants, principal.actor_binding)
@@ -1124,6 +1139,68 @@ mod tests {
 
         assert!(matches!(principal, ClientPrincipal::Remote(_)));
         assert!(!principal.is_owner());
+    }
+
+    #[test]
+    fn relay_wire_image_generation_admin_grant_without_root_is_dropped() {
+        // Fail closed on decode (AC1): a wire `image_generation_admin` grant
+        // with no project root must NOT be admitted as authority. A rootless
+        // access scope would wildcard-match every project; the image-admin
+        // scope may never do so, so the grant is dropped entirely and the
+        // resulting principal carries it under no scope.
+        let principal = principal_from_relay_wire(RelayPrincipal {
+            user_id: "remote-account".to_string(),
+            grants: vec![
+                RelayGrant {
+                    scope: RelayGrantScope::ImageGenerationAdmin,
+                    project_root: None,
+                },
+                RelayGrant {
+                    scope: RelayGrantScope::ImageGenerationAdmin,
+                    project_root: Some(String::new()),
+                },
+            ],
+            actor_binding: None,
+        });
+        match principal {
+            ClientPrincipal::Remote(remote) => match remote.authorization {
+                crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants) => {
+                    assert!(
+                        grants.is_empty(),
+                        "rootless image-admin grants must be dropped, got {grants:?}"
+                    );
+                }
+                other => panic!("expected legacy relay scopes, got {other:?}"),
+            },
+            ClientPrincipal::Owner => panic!("relay wire must not self-assert owner"),
+        }
+    }
+
+    #[test]
+    fn relay_wire_image_generation_admin_grant_with_root_is_admitted() {
+        // The success path: a rooted image-admin grant maps through cleanly.
+        let principal = principal_from_relay_wire(RelayPrincipal {
+            user_id: "remote-account".to_string(),
+            grants: vec![RelayGrant {
+                scope: RelayGrantScope::ImageGenerationAdmin,
+                project_root: Some("/workspace/app".to_string()),
+            }],
+            actor_binding: None,
+        });
+        match principal {
+            ClientPrincipal::Remote(remote) => match remote.authorization {
+                crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants) => {
+                    assert_eq!(grants.len(), 1);
+                    assert_eq!(
+                        grants[0].scope,
+                        crate::daemon::principal::PrincipalScope::ImageGenerationAdmin
+                    );
+                    assert_eq!(grants[0].project_root.as_deref(), Some("/workspace/app"));
+                }
+                other => panic!("expected legacy relay scopes, got {other:?}"),
+            },
+            ClientPrincipal::Owner => panic!("relay wire must not self-assert owner"),
+        }
     }
 
     fn test_context() -> (tempfile::TempDir, Arc<DaemonContext>) {

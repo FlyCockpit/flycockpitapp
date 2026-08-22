@@ -37,11 +37,16 @@ import {
   ERROR_MESSAGES,
   emptyImageGenerationRemoteState,
   emptyPartition,
+  finiteBudgetPolicy,
   getPartition,
+  isFinitePolicy,
   isJobTerminal,
   isUploadRetired,
+  isValidBudgetAmount,
+  MAX_U64_USD_MICROS,
   mapErrorMessage,
   markStaleAfterReconnect,
+  parseBudgetPolicy,
   partitionKey,
   reduceJobEvent,
   requestJobCancellation,
@@ -51,6 +56,7 @@ import {
   safeReadOnlyProjection,
   scanForForbiddenPaths,
   scanForForbiddenSentinels,
+  serializeBudgetPolicy,
   shouldDiscardUploadEvent,
   shouldInvalidatePlan,
   THUMBNAIL_BOXES,
@@ -263,9 +269,9 @@ describe("image-generation budget", () => {
   it("explicit Finite save allows paid use", () => {
     const budget = {
       ...unconfiguredBudget(),
-      request: { policy: "finite" as const, generation: "1" },
-      session: { policy: "finite" as const, generation: "1" },
-      project: { policy: "finite" as const, generation: "1" },
+      request: { policy: finiteBudgetPolicy(1_000_000n), generation: "1" },
+      session: { policy: finiteBudgetPolicy(10_000_000n), generation: "1" },
+      project: { policy: finiteBudgetPolicy(100_000_000n), generation: "1" },
       projectEpoch: "2026-01-01/2026-02-01",
     };
     expect(budgetBlocksPaidUse(budget)).toBe(false);
@@ -301,10 +307,24 @@ describe("image-generation budget", () => {
   });
 
   it("validateBudgetScope: Finite/Unlimited requires positive generation", () => {
-    expect(validateBudgetScope({ policy: "finite", generation: "1" })).toBe(true);
+    expect(validateBudgetScope({ policy: finiteBudgetPolicy(1_000_000n), generation: "1" })).toBe(
+      true,
+    );
     expect(validateBudgetScope({ policy: "unlimited", generation: "1" })).toBe(true);
-    expect(validateBudgetScope({ policy: "finite", generation: null })).toBe(false);
-    expect(validateBudgetScope({ policy: "finite", generation: "0" })).toBe(false);
+    expect(validateBudgetScope({ policy: finiteBudgetPolicy(1_000_000n), generation: null })).toBe(
+      false,
+    );
+    expect(validateBudgetScope({ policy: finiteBudgetPolicy(1_000_000n), generation: "0" })).toBe(
+      false,
+    );
+  });
+
+  it("validateBudgetScope: Finite requires a positive u64 amount", () => {
+    // A zero amount is not a valid Finite policy, mirroring the Rust
+    // deserializer that rejects `usd_micros: 0`.
+    expect(validateBudgetScope({ policy: { finite: { usd_micros: 0n } }, generation: "1" })).toBe(
+      false,
+    );
   });
 
   it("validateBudgetSetPair: (null,null) is unchanged", () => {
@@ -312,13 +332,18 @@ describe("image-generation budget", () => {
   });
 
   it("validateBudgetSetPair: nonnull policy with null generation creates", () => {
-    expect(validateBudgetSetPair("finite", null)).toBe(true);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), null)).toBe(true);
     expect(validateBudgetSetPair("unlimited", null)).toBe(true);
   });
 
   it("validateBudgetSetPair: nonnull policy with positive generation CAS-updates", () => {
-    expect(validateBudgetSetPair("finite", "1")).toBe(true);
-    expect(validateBudgetSetPair("finite", "0")).toBe(false);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), "1")).toBe(true);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), "0")).toBe(false);
+  });
+
+  it("validateBudgetSetPair: Finite with a zero amount rejects", () => {
+    expect(validateBudgetSetPair({ finite: { usd_micros: 0n } }, null)).toBe(false);
+    expect(validateBudgetSetPair({ finite: { usd_micros: 0n } }, "1")).toBe(false);
   });
 
   it("validateBudgetSetPair: Unconfigured in a save rejects", () => {
@@ -332,9 +357,44 @@ describe("image-generation budget", () => {
 
   it("validateAtLeastOnePolicy: at least one nonnull", () => {
     expect(validateAtLeastOnePolicy(null, null, null)).toBe(false);
-    expect(validateAtLeastOnePolicy("finite", null, null)).toBe(true);
+    expect(validateAtLeastOnePolicy(finiteBudgetPolicy(1_000_000n), null, null)).toBe(true);
     expect(validateAtLeastOnePolicy(null, "unlimited", null)).toBe(true);
-    expect(validateAtLeastOnePolicy(null, null, "finite")).toBe(true);
+    expect(validateAtLeastOnePolicy(null, null, finiteBudgetPolicy(1_000_000n))).toBe(true);
+  });
+
+  it("image_generation_budget_wire_carries_usd_micros", () => {
+    // AC10: a Finite budget policy carries its usd_micros amount on the wire
+    // and round-trips at the full u64::MAX boundary with no precision loss.
+    // The canonical JSON is byte-identical to Rust `serde_json::to_string`.
+    const maxFinite = finiteBudgetPolicy(MAX_U64_USD_MICROS);
+    const wire = serializeBudgetPolicy(maxFinite);
+    expect(wire).toBe('{"finite":{"usd_micros":18446744073709551615}}');
+
+    const parsed = parseBudgetPolicy(wire);
+    expect(parsed).not.toBeNull();
+    expect(isFinitePolicy(parsed!)).toBe(true);
+    // The bigint amount survives exactly — a JS `number` would truncate this
+    // to 18446744073709552000.
+    expect((parsed as { finite: { usd_micros: bigint } }).finite.usd_micros).toBe(
+      18446744073709551615n,
+    );
+    expect(18446744073709551615n).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+
+    // Unconfigured/Unlimited keep their bare-string tags and round-trip.
+    expect(serializeBudgetPolicy("unconfigured")).toBe('"unconfigured"');
+    expect(serializeBudgetPolicy("unlimited")).toBe('"unlimited"');
+    expect(parseBudgetPolicy('"unconfigured"')).toBe("unconfigured");
+    expect(parseBudgetPolicy('"unlimited"')).toBe("unlimited");
+
+    // The lossy amount-free string `"finite"` is not a valid policy, and a
+    // zero amount is rejected — the pre-inc2 lossy wire cannot decode.
+    expect(parseBudgetPolicy('"finite"')).toBeNull();
+    expect(parseBudgetPolicy('{"finite":{}}')).toBeNull();
+    expect(parseBudgetPolicy('{"finite":{"usd_micros":0}}')).toBeNull();
+    // An amount above u64::MAX is rejected rather than silently wrapped.
+    expect(parseBudgetPolicy('{"finite":{"usd_micros":18446744073709551616}}')).toBeNull();
+    expect(isValidBudgetAmount(0n)).toBe(false);
+    expect(isValidBudgetAmount(MAX_U64_USD_MICROS)).toBe(true);
   });
 
   it("validateCanonicalDecimal: 0|[1-9][0-9]{0,19}", () => {
@@ -1307,9 +1367,9 @@ describe("image-generation plan invalidation", () => {
       plan,
       currentTargets: [], // target-1 gone
       currentBudget: {
-        request: { policy: "finite", generation: "1" },
-        session: { policy: "finite", generation: "1" },
-        project: { policy: "finite", generation: "1" },
+        request: { policy: finiteBudgetPolicy(1_000_000n), generation: "1" },
+        session: { policy: finiteBudgetPolicy(10_000_000n), generation: "1" },
+        project: { policy: finiteBudgetPolicy(100_000_000n), generation: "1" },
         projectEpoch: "2026-01-01/2026-02-01",
         configGeneration: "1",
       },
@@ -1359,9 +1419,9 @@ describe("image-generation plan invalidation", () => {
         },
       ],
       currentBudget: {
-        request: { policy: "finite", generation: "1" },
-        session: { policy: "finite", generation: "1" },
-        project: { policy: "finite", generation: "1" },
+        request: { policy: finiteBudgetPolicy(1_000_000n), generation: "1" },
+        session: { policy: finiteBudgetPolicy(10_000_000n), generation: "1" },
+        project: { policy: finiteBudgetPolicy(100_000_000n), generation: "1" },
         projectEpoch: "2026-01-01/2026-02-01",
         configGeneration: "1",
       },
@@ -1397,9 +1457,9 @@ describe("image-generation plan invalidation", () => {
         },
       ],
       currentBudget: {
-        request: { policy: "finite", generation: "1" },
-        session: { policy: "finite", generation: "1" },
-        project: { policy: "finite", generation: "1" },
+        request: { policy: finiteBudgetPolicy(1_000_000n), generation: "1" },
+        session: { policy: finiteBudgetPolicy(10_000_000n), generation: "1" },
+        project: { policy: finiteBudgetPolicy(100_000_000n), generation: "1" },
         projectEpoch: "2026-01-01/2026-02-01",
         configGeneration: "1",
       },

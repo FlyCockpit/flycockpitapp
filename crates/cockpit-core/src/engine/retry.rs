@@ -37,7 +37,7 @@
 //! abstracted behind [`ConnectivityProbe`] so the loop is testable with
 //! a fake (the live TCP/DNS probe is environment-dependent).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rig::completion::CompletionError;
 use tokio::sync::mpsc;
@@ -159,13 +159,13 @@ pub(crate) fn is_usage_limit_failure(
 
 /// Classify a [`CompletionError`] into the retry taxonomy.
 ///
-/// Built on how rig 0.41 + reqwest 0.13 surface errors (verified against
+/// Built on how rig 0.42 + reqwest 0.13 surface errors (verified against
 /// `rig-core` / `reqwest` sources). Match arms stay non-exhaustive (`_`) so
 /// future rig error variants fail closed rather than breaking the build:
 ///
 /// | rig error | meaning | decision |
 /// |-----------|---------|----------|
-/// | `HttpError(InvalidStatusCode(s))` / `InvalidStatusCodeWithMessage(s, _)` | non-2xx HTTP response | `s` is `429`/`503` → `RetryAfter`; other `5xx` → `Retry`; other `4xx` → `FailFast` |
+/// | `HttpError(InvalidStatusCode(s))` / `InvalidStatusCodeWithMessage(s, _)` / `InvalidStatusCodeWithDetails { .. }` | non-2xx HTTP response | `s` is `429`/`503` → `RetryAfter`; other `5xx` → `Retry`; other `4xx` → `FailFast` |
 /// | `HttpError(Instance(e))` where `e` downcasts to `reqwest::Error` | transport failure (connect / DNS / timeout / read) | connect/timeout/request/body/decode → `Retry`; status-carrying → fold into the status arm; builder → `FailFast` |
 /// | `HttpError(Instance(e))`, non-reqwest inner error | opaque transport box | conservative `Retry` (it is on the transport path) |
 /// | `HttpError(Protocol \| StreamEnded \| NoHeaders \| InvalidContentType \| InvalidHeaderValue)` | framing/header faults, not auth | see notes below |
@@ -197,17 +197,17 @@ pub(crate) fn is_usage_limit_failure(
 ///   `InvalidHeaderValue`**: malformed framing or our own bad header —
 ///   not a dropped link and not transient, so `FailFast`.
 ///
-/// `Retry-After` cannot be recovered for status errors: rig's
-/// `non_success_status_error` reads the body and **discards the response
-/// headers** before building `InvalidStatusCodeWithMessage`, so the
-/// header value never reaches us. We therefore parse `Retry-After` only
-/// when it is *available*, which in this stack is never for the
-/// streaming path — so `RetryAfter(None)` (normal backoff) is what a
-/// `429`/`503` actually gets today. The parser ([`parse_retry_after`])
-/// is implemented and unit-tested so that the moment a provider variant
-/// surfaces the header (e.g. a future Anthropic variant), wiring it is a
-/// one-liner with no taxonomy change.
+/// Rig 0.42 preserves failed-response headers. Only the `Retry-After` value
+/// for retryable 429/503 responses is consumed here; the header map itself
+/// never leaves this in-process scheduling decision.
 pub fn classify(err: &CompletionError) -> RetryDecision {
+    classify_at(err, SystemTime::now())
+}
+
+/// Fixed-clock classification seam. Production classification supplies the
+/// current time above; keeping the clock at this narrow header-parsing boundary
+/// makes date-form `Retry-After` response coverage deterministic.
+fn classify_at(err: &CompletionError, now: SystemTime) -> RetryDecision {
     // Typed provider-recovery signals (issue #23) decide first, from the closed
     // billing/overload sets recognized once at the model boundary. Billing is
     // terminal for the same model (no top-up happens by retrying); overload gets
@@ -222,8 +222,18 @@ pub fn classify(err: &CompletionError) -> RetryDecision {
         }
         crate::engine::model::ProviderRecoverySignal::None => {}
     }
+    // Rig exposes response metadata through these accessors for both the
+    // legacy `HttpError` status shapes and `ProviderResponse`. Classify that
+    // shared representation before looking at the outer error variant so the
+    // two families cannot drift apart as Rig adds response shapes.
+    if let Some(status) = err.provider_response_status() {
+        return classify_response_status_at(status.as_u16(), err.provider_response_headers(), now);
+    }
+
     match err {
-        CompletionError::HttpError(http_err) => classify_http(http_err),
+        // A status-free `HttpError` is genuinely on Rig's transport/framing
+        // path. All current non-success status variants returned above.
+        CompletionError::HttpError(http_err) => classify_status_free_http(http_err),
         // Serialization, bad URL, request-build, malformed response body:
         // re-issuing the identical request would fail identically.
         CompletionError::JsonError(_)
@@ -232,24 +242,19 @@ pub fn classify(err: &CompletionError) -> RetryDecision {
         | CompletionError::ResponseError(_) => RetryDecision::FailFast,
         // Provider-formatted error string: only retry when it clearly
         // carries a transient HTTP status; otherwise fail fast.
-        err if crate::engine::model::rig_boundary::provider_error_status_for_retry(err)
-            .is_some() =>
-        {
-            classify_status(
-                crate::engine::model::rig_boundary::provider_error_status_for_retry(err)
-                    .expect("guarded provider status"),
-                None,
-            )
+        CompletionError::ProviderError(_) => {
+            crate::engine::model::rig_boundary::provider_error_status_for_retry(err)
+                .map_or(RetryDecision::FailFast, |status| {
+                    classify_status(status, None)
+                })
         }
         _ => RetryDecision::FailFast,
     }
 }
 
-fn classify_http(err: &rig::http_client::Error) -> RetryDecision {
+fn classify_status_free_http(err: &rig::http_client::Error) -> RetryDecision {
     use rig::http_client::Error as H;
     match err {
-        H::InvalidStatusCode(status) => classify_status(status.as_u16(), None),
-        H::InvalidStatusCodeWithMessage(status, _msg) => classify_status(status.as_u16(), None),
         // rig wraps the underlying transport error (reqwest) here for
         // both the initial round-trip and every mid-stream chunk.
         H::Instance(boxed) => classify_transport(boxed.as_ref()),
@@ -261,7 +266,30 @@ fn classify_http(err: &rig::http_client::Error) -> RetryDecision {
         H::Protocol(_) | H::NoHeaders | H::InvalidContentType(_) | H::InvalidHeaderValue(_) => {
             RetryDecision::FailFast
         }
+        // `provider_response_status` above covers every current non-success
+        // status shape. If a future Rig change makes one status-less, fail
+        // closed rather than reintroducing an outer-shape-specific parser.
+        _ => RetryDecision::FailFast,
     }
+}
+
+fn classify_response_status_at(
+    status: u16,
+    headers: Option<&rig::http_client::HeaderMap>,
+    now: SystemTime,
+) -> RetryDecision {
+    let retry_after = matches!(status, 429 | 503)
+        .then(|| retry_after_from_headers_at(headers, now))
+        .flatten();
+    classify_status(status, retry_after)
+}
+
+fn retry_after_from_headers_at(
+    headers: Option<&rig::http_client::HeaderMap>,
+    now: SystemTime,
+) -> Option<Duration> {
+    let value = headers?.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    parse_retry_after_at(value, now)
 }
 
 /// Classify an HTTP status code. `retry_after` is honored for
@@ -321,29 +349,26 @@ fn classify_reqwest(err: &reqwest::Error) -> RetryDecision {
 /// Parse an HTTP `Retry-After` header value: either delta-seconds
 /// (`"120"`) or an HTTP-date. Returns the delay from now, clamped to be
 /// non-negative; `None` for an unparseable value or a date in the past.
-///
-/// Not currently fed by the streaming path (rig may discard response
-/// headers on status errors — see [`classify`]), but implemented +
-/// tested so a future provider variant that surfaces the header (or a
-/// rig version that preserves it) wires in with a one-line change to
-/// `classify_status`. Deliberately retained, hence the `dead_code`
-/// allow — this is a complete, tested code path, not a stub.
-#[allow(dead_code)]
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
-    let value = value.trim();
+    parse_retry_after_at(value, SystemTime::now())
+}
+
+/// Fixed-clock parsing seam for deterministic retry boundary tests.
+fn parse_retry_after_at(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim_matches([' ', '\t']);
     // delta-seconds form.
-    if let Ok(secs) = value.parse::<u64>() {
+    if !value.is_empty()
+        && value.as_bytes().iter().all(u8::is_ascii_digit)
+        && let Ok(secs) = value.parse::<u64>()
+    {
         return Some(Duration::from_secs(secs));
     }
-    // HTTP-date form (RFC 7231 — IMF-fixdate / RFC 850 / asctime). chrono
-    // parses RFC 2822, which covers IMF-fixdate (`Sun, 06 Nov 1994
-    // 08:49:37 GMT`).
-    if let Ok(when) = chrono::DateTime::parse_from_rfc2822(value) {
-        let now = chrono::Utc::now();
-        let delta = when.with_timezone(&chrono::Utc) - now;
-        return delta.to_std().ok();
-    }
-    None
+    // RFC 9110 HTTP-date includes IMF-fixdate, obsolete RFC 850, and
+    // obsolete asctime; `httpdate` owns that maintained grammar.
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(now)
+        .ok()
 }
 
 /// Compute the (jittered) backoff for attempt `n` (0-based: the wait
@@ -668,22 +693,19 @@ where
 
                 failures = failures.saturating_add(1);
                 // Recurring, attempt-numbered log line so a headless `run`
-                // (no TUI) is never silently hung on an unreachable server —
-                // names provider/model/url + the attempt number, matching the
-                // interactive status. `warn` so it surfaces on stderr at the
-                // default log level.
+                // (no TUI) is never silently hung on an unreachable server.
+                // Rig 0.42 includes provider request ids in some error display
+                // forms, so this log carries only the retry decision and the
+                // model boundary's typed, header-free metadata.
+                let classified =
+                    crate::engine::model::rig_boundary::classify_terminal_failure(&err);
                 tracing::warn!(
                     attempt = failures,
-                    provider = %target.provider,
-                    model = %target.model,
-                    url = %target.url,
-                    wait_ms = wait.as_millis() as u64,
-                    error = %err,
-                    "inference unreachable — {}/{} at {} (attempt {}); retrying",
-                    target.provider,
-                    target.model,
-                    target.url,
-                    failures,
+                    decision = ?decision,
+                    class = %classified.class,
+                    observed_status = ?classified.observed_status,
+                    recovery = classified.recovery.as_str(),
+                    "inference retrying",
                 );
 
                 // Surface the reconnecting status (1-based attempt number
@@ -744,6 +766,44 @@ mod tests {
             reqwest::StatusCode::from_u16(code).unwrap(),
             "boom".into(),
         ))
+    }
+
+    fn retry_after_headers(
+        value: Option<rig::http_client::HeaderValue>,
+    ) -> rig::http_client::HeaderMap {
+        let mut headers = rig::http_client::HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(reqwest::header::RETRY_AFTER, value);
+        }
+        headers
+    }
+
+    fn retry_after_header_value(value: &str) -> rig::http_client::HeaderValue {
+        rig::http_client::HeaderValue::from_bytes(value.as_bytes())
+            .expect("test retry-after value must be valid HTTP header bytes")
+    }
+
+    fn detailed_status_with_headers(
+        code: u16,
+        body: impl Into<String>,
+        retry_after: Option<rig::http_client::HeaderValue>,
+    ) -> CompletionError {
+        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithDetails {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            body: body.into(),
+            headers: Box::new(retry_after_headers(retry_after)),
+        })
+    }
+
+    fn provider_response_with_headers(
+        code: u16,
+        body: impl Into<String>,
+        retry_after: Option<rig::http_client::HeaderValue>,
+    ) -> CompletionError {
+        CompletionError::ProviderResponse(
+            rig::ProviderResponseError::new(reqwest::StatusCode::from_u16(code).unwrap(), body)
+                .with_headers(Some(Box::new(retry_after_headers(retry_after)))),
+        )
     }
 
     #[test]
@@ -826,6 +886,160 @@ mod tests {
         assert_eq!(classify(&http_status(401)), RetryDecision::FailFast);
         assert_eq!(classify(&http_status(400)), RetryDecision::FailFast);
         assert_eq!(classify(&http_status_msg(404)), RetryDecision::FailFast);
+    }
+
+    #[test]
+    fn detailed_http_and_provider_response_honor_valid_retry_after() {
+        for code in [429, 503] {
+            for err in [
+                detailed_status_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static("7")),
+                ),
+                provider_response_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static("7")),
+                ),
+            ] {
+                assert_eq!(
+                    classify(&err),
+                    RetryDecision::RetryAfter(Some(Duration::from_secs(7))),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detailed_http_and_provider_response_reject_malformed_retry_after() {
+        // This is the end-to-end matrix through `classify`, not just the
+        // fixed-clock parser seam below: each retryable status and each Rig
+        // response shape must fall back to normal backoff for invalid grammar.
+        for code in [429, 503] {
+            for value in ["+120", "-120", "1.5", "", "18446744073709551616"] {
+                let header = retry_after_header_value(value);
+                for err in [
+                    detailed_status_with_headers(code, "rate limited", Some(header.clone())),
+                    provider_response_with_headers(code, "rate limited", Some(header)),
+                ] {
+                    assert_eq!(
+                        classify(&err),
+                        RetryDecision::RetryAfter(None),
+                        "status {code}, Retry-After {value:?}, {err:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_header_absent_non_utf8_or_past_date_uses_normal_backoff() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:50:37 GMT").unwrap();
+        let non_utf8 = rig::http_client::HeaderValue::from_bytes(&[0xff]).unwrap();
+        for code in [429, 503] {
+            for err in [
+                detailed_status_with_headers(code, "rate limited", None),
+                provider_response_with_headers(code, "rate limited", None),
+                detailed_status_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static("not-a-delay")),
+                ),
+                provider_response_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static("not-a-delay")),
+                ),
+                provider_response_with_headers(code, "rate limited", Some(non_utf8.clone())),
+                detailed_status_with_headers(code, "rate limited", Some(non_utf8.clone())),
+                detailed_status_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static(
+                        "Sun, 06 Nov 1994 08:49:37 GMT",
+                    )),
+                ),
+                provider_response_with_headers(
+                    code,
+                    "rate limited",
+                    Some(rig::http_client::HeaderValue::from_static(
+                        "Sun, 06 Nov 1994 08:49:37 GMT",
+                    )),
+                ),
+            ] {
+                assert_eq!(
+                    classify_at(&err, now),
+                    RetryDecision::RetryAfter(None),
+                    "{err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detailed_http_and_provider_response_honor_fixed_clock_retry_after_dates() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for (future, past) in [
+            (
+                "Sun, 06 Nov 1994 08:50:37 GMT",
+                "Sun, 06 Nov 1994 08:48:37 GMT",
+            ),
+            (
+                "Sunday, 06-Nov-94 08:50:37 GMT",
+                "Sunday, 06-Nov-94 08:48:37 GMT",
+            ),
+            ("Sun Nov  6 08:50:37 1994", "Sun Nov  6 08:48:37 1994"),
+        ] {
+            for (value, expected_delay) in [(future, Some(Duration::from_secs(60))), (past, None)] {
+                for code in [429, 503] {
+                    let header = retry_after_header_value(value);
+                    for err in [
+                        detailed_status_with_headers(code, "rate limited", Some(header.clone())),
+                        provider_response_with_headers(code, "rate limited", Some(header)),
+                    ] {
+                        assert_eq!(
+                            classify_at(&err, now),
+                            RetryDecision::RetryAfter(expected_delay),
+                            "status {code}, Retry-After {value:?}, {err:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_never_changes_non_429_or_503_status_semantics() {
+        for err in [
+            detailed_status_with_headers(
+                500,
+                "server error",
+                Some(rig::http_client::HeaderValue::from_static("7")),
+            ),
+            provider_response_with_headers(
+                500,
+                "server error",
+                Some(rig::http_client::HeaderValue::from_static("7")),
+            ),
+        ] {
+            assert_eq!(classify(&err), RetryDecision::Retry, "{err:?}");
+        }
+        for err in [
+            detailed_status_with_headers(
+                400,
+                "bad request",
+                Some(rig::http_client::HeaderValue::from_static("7")),
+            ),
+            provider_response_with_headers(
+                400,
+                "bad request",
+                Some(rig::http_client::HeaderValue::from_static("7")),
+            ),
+        ] {
+            assert_eq!(classify(&err), RetryDecision::FailFast, "{err:?}");
+        }
     }
 
     #[test]
@@ -914,31 +1128,43 @@ mod tests {
 
     // --- Retry-After parsing ---------------------------------------
 
-    #[tokio::test]
-    async fn retry_after_delta_seconds() {
-        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
-        assert_eq!(parse_retry_after("  0 "), Some(Duration::from_secs(0)));
+    #[test]
+    fn retry_after_delta_seconds_has_strict_ows_and_digit_grammar() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(
+            parse_retry_after_at("120", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after_at(" \t0\t ", now),
+            Some(Duration::from_secs(0))
+        );
+        for malformed in ["+120", "-120", "1.5", "", "18446744073709551616"] {
+            assert_eq!(parse_retry_after_at(malformed, now), None, "{malformed:?}");
+        }
     }
 
-    #[tokio::test]
-    async fn retry_after_http_date() {
-        // A date far in the future parses to a positive delay.
-        let future = (chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc2822();
-        let parsed = parse_retry_after(&future).expect("future date parses");
-        // Allow slack for the seconds that elapse during the test.
-        assert!(parsed <= Duration::from_secs(301) && parsed >= Duration::from_secs(290));
-    }
-
-    #[tokio::test]
-    async fn retry_after_past_date_is_none() {
-        let past = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc2822();
-        // A past date yields a negative delta → no usable delay.
-        assert_eq!(parse_retry_after(&past), None);
-    }
-
-    #[tokio::test]
-    async fn retry_after_garbage_is_none() {
-        assert_eq!(parse_retry_after("not-a-date"), None);
+    #[test]
+    fn retry_after_accepts_all_http_date_forms_with_a_fixed_clock() {
+        let now = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for (future, past) in [
+            (
+                "Sun, 06 Nov 1994 08:50:37 GMT",
+                "Sun, 06 Nov 1994 08:48:37 GMT",
+            ),
+            (
+                "Sunday, 06-Nov-94 08:50:37 GMT",
+                "Sunday, 06-Nov-94 08:48:37 GMT",
+            ),
+            ("Sun Nov  6 08:50:37 1994", "Sun Nov  6 08:48:37 1994"),
+        ] {
+            assert_eq!(
+                parse_retry_after_at(future, now),
+                Some(Duration::from_secs(60))
+            );
+            assert_eq!(parse_retry_after_at(past, now), None);
+        }
+        assert_eq!(parse_retry_after_at("not-a-date", now), None);
     }
 
     // --- backoff sequence ------------------------------------------

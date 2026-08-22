@@ -262,8 +262,11 @@ pub async fn run_sensitive_turn_barrier(
         }
         // Carry only the safe wire identifiers — never the plaintext arguments.
         results.push(SensitiveResult {
-            call_id: call.id.clone(),
-            provider_call_id: call.call_id.clone(),
+            call_id: call.id.to_string(),
+            provider_call_id: call
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
             model_output: model_output.to_string(),
         });
     }

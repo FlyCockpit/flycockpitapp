@@ -119,6 +119,8 @@ async fn schedule_subarg_repair_record_round_trips_recovery_and_wire() {
             agent: "builder".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-jobs-repair".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: original.clone(),
             wire_input_json: dispatch.wire_args.clone(),
             recovery: dispatch.recovery,
@@ -229,6 +231,8 @@ async fn schedule_tool_call_record_persists_wire_and_original() {
             agent: "builder".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-1".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: original.clone(),
             wire_input_json: wire.clone(),
             recovery: crate::db::tool_calls::Recovery::Clean,
@@ -255,6 +259,102 @@ async fn schedule_tool_call_record_persists_wire_and_original() {
     );
 }
 
+#[tokio::test]
+async fn schedule_tool_call_dual_identity_persists_and_rehydrates() {
+    let (driver, _tmp) = test_driver(8);
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "Build".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call_schedule_1".to_string(),
+            provider_item_id: Some("fc_schedule_item_1".to_string()),
+            provider_call_id: Some("call_schedule_1".to_string()),
+            original_input_json: serde_json::json!({ "action": "list" }),
+            wire_input_json: serde_json::json!({ "action": "list", "args": {} }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "scheduled".to_string(),
+            duration_ms: 1,
+        })
+        .await;
+
+    let row = driver
+        .session
+        .db
+        .list_tool_calls_for_session(driver.session.id)
+        .await
+        .unwrap()
+        .pop()
+        .expect("schedule audit row");
+    assert_eq!(row.call_id, "call_schedule_1");
+    assert_eq!(row.provider_item_id.as_deref(), Some("fc_schedule_item_1"));
+    assert_eq!(row.provider_call_id.as_deref(), Some("call_schedule_1"));
+
+    let rehydrated = crate::engine::rehydrate::rehydrate_session_with_policy(
+        &driver.session.db,
+        driver.session.id,
+        "Build",
+        crate::engine::rehydrate::RehydratePolicy::strict(),
+    )
+    .await
+    .unwrap()
+    .expect("recorded schedule tool turn rehydrates");
+    crate::engine::rehydrate::validate_pairing(&rehydrated.history)
+        .expect("rehydrated schedule result correlates with its call");
+
+    let crate::engine::message::Message::Assistant { content, .. } = &rehydrated.history[0] else {
+        panic!("expected rehydrated schedule call");
+    };
+    let rehydrated_call = content
+        .iter()
+        .find_map(|content| match content {
+            rig::message::AssistantContent::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("rehydrated schedule call");
+    assert_eq!(rehydrated_call.id, "call_schedule_1");
+    assert_eq!(
+        rehydrated_call
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.item_id.as_deref()),
+        Some("fc_schedule_item_1")
+    );
+    assert_eq!(
+        rehydrated_call
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_schedule_1")
+    );
+
+    let crate::engine::message::Message::User { content } = &rehydrated.history[1] else {
+        panic!("expected rehydrated schedule result");
+    };
+    let rehydrated_result = content
+        .iter()
+        .find_map(|content| match content {
+            rig::message::UserContent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("rehydrated schedule result");
+    assert_eq!(rehydrated_result.call, "call_schedule_1");
+    assert_eq!(
+        rehydrated_result
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.item_id.as_deref()),
+        Some("fc_schedule_item_1")
+    );
+    assert_eq!(
+        rehydrated_result
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
+        Some("call_schedule_1")
+    );
+}
+
 /// §5 dispatch record (implementation note): a dispatched
 /// `schedule` action also lands a `tool_call` row on the export timeline
 /// (`session_events`), not just the `tool_call_events` stats table — so the
@@ -267,6 +367,8 @@ async fn schedule_dispatch_emits_tool_call_session_event() {
             agent: "builder".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-evt".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: serde_json::json!({ "action": "list" }),
             wire_input_json: serde_json::json!({ "action": "list", "args": {} }),
             recovery: crate::db::tool_calls::Recovery::Clean,
@@ -399,6 +501,8 @@ async fn schedule_tool_call_journals_matched_literal_for_trusted_author() {
             agent: "Build".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-journal".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: serde_json::json!({
                 "action": "note",
                 "args": { "text": format!("remember {LIT}") },
@@ -465,6 +569,8 @@ async fn schedule_tool_call_journals_nothing_for_untrusted_author() {
             agent: "Build".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-untrusted".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: serde_json::json!({
                 "action": "note",
                 "args": { "text": format!("remember {LIT}") },
@@ -511,6 +617,8 @@ async fn schedule_tool_call_fails_closed_on_journal_failure() {
             agent: "Build".to_string(),
             llm_mode: crate::config::extended::LlmMode::default(),
             call_id: "call-sched-failclosed".to_string(),
+            provider_item_id: None,
+            provider_call_id: None,
             original_input_json: serde_json::json!({
                 "action": "note",
                 "args": { "text": format!("remember {LIT}") },
@@ -1008,7 +1116,13 @@ async fn builder_followup_persist_and_rehydrate_round_trip() {
     let history = vec![
         Message::user("implement the flag"),
         write_turn("w1", "/src/a.rs"),
-        Message::tool_result_with_call_id("w1".to_string(), None, "[hash=abc123 ok]"),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "w1".to_string(),
+            None,
+            None,
+            "write",
+            "[hash=abc123 ok]",
+        ),
         Message::assistant("done"),
     ];
     let handle = driver

@@ -265,7 +265,7 @@ pub fn classify_address(ip: IpAddr) -> AddressClass {
         AddressClass::PublicRemote
     }
 }
-fn declared_class(class: ImageLocationClass) -> AddressClass {
+pub(crate) fn declared_class(class: ImageLocationClass) -> AddressClass {
     match class {
         ImageLocationClass::Local => AddressClass::Loopback,
         ImageLocationClass::PrivateNetwork => AddressClass::PrivateLan,

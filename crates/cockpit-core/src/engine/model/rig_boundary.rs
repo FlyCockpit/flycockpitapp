@@ -51,7 +51,13 @@ pub(crate) fn classify_inference_failure(
             _ => InferenceErrorClass::TimeoutIdle,
         };
     }
-    if let Some(status) = http_status_of(err) {
+    // A provider-declared error can carry a successful HTTP status alongside
+    // its error envelope. It remains a failed inference; retain that status
+    // for diagnostics but never turn it into a successful HTTP error class.
+    if let Some(status) = http_status_of(err)
+        && (!matches!(err, rig::completion::CompletionError::ProviderResponse(_))
+            || !(200..300).contains(&status))
+    {
         return InferenceErrorClass::Http(status);
     }
     InferenceErrorClass::Network
@@ -67,15 +73,11 @@ pub(crate) fn http_status_of(err: &rig::completion::CompletionError) -> Option<u
     if let rig::completion::CompletionError::ProviderError(message) = err {
         return provider_error_status(message);
     }
-    let rig::completion::CompletionError::HttpError(http_err) = err else {
-        return None;
-    };
-    use rig::http_client::Error as H;
-    match http_err {
-        H::InvalidStatusCode(status) | H::InvalidStatusCodeWithMessage(status, _) => {
-            Some(status.as_u16())
-        }
-        H::Instance(boxed) => {
+    if let Some(status) = err.provider_response_status() {
+        return Some(status.as_u16());
+    }
+    match err {
+        rig::completion::CompletionError::HttpError(rig::http_client::Error::Instance(boxed)) => {
             let mut current: Option<&(dyn std::error::Error + 'static)> = Some(boxed.as_ref());
             while let Some(e) = current {
                 if let Some(re) = e.downcast_ref::<reqwest::Error>() {
@@ -155,10 +157,13 @@ pub(crate) fn provider_error_status_for_retry(
 fn is_unsupported_api_error(err: &rig::completion::CompletionError) -> bool {
     match err {
         rig::completion::CompletionError::ProviderError(msg) => msg.contains(UNSUPPORTED_API_CODE),
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(status, body),
-        ) => status.as_u16() == 400 && body.contains(UNSUPPORTED_API_CODE),
-        _ => false,
+        _ => {
+            err.provider_response_status()
+                .is_some_and(|status| status.as_u16() == 400)
+                && err
+                    .provider_response_body()
+                    .is_some_and(|body| body.contains(UNSUPPORTED_API_CODE))
+        }
     }
 }
 
@@ -170,18 +175,17 @@ pub(crate) fn is_endpoint_mismatch_error(err: &rig::completion::CompletionError)
         rig::completion::CompletionError::ProviderError(msg) => {
             is_endpoint_mismatch_error_text(msg)
         }
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(status, body),
-        ) => {
-            let code = status.as_u16();
+        _ if err.provider_response_status().is_some() => {
+            let code = err
+                .provider_response_status()
+                .expect("guarded provider response status")
+                .as_u16();
+            let body = err.provider_response_body().unwrap_or_default();
             if code == 404 || code == 405 || (code == 400 && body.contains(UNSUPPORTED_API_CODE)) {
                 return true;
             }
             is_endpoint_mismatch_error_text(body)
         }
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCode(status),
-        ) => matches!(status.as_u16(), 404 | 405),
         _ => false,
     }
 }
@@ -220,16 +224,15 @@ pub(crate) fn provider_recovery_signal(
     provider_recovery_signal_from_text(&recovery_scan_text(err))
 }
 
-/// The provider body text a recovery signal is scanned from. A `ProviderError`
-/// string and a status-with-message HTTP error carry the raw body directly;
-/// every other variant falls back to its Display (which never carries a body a
-/// signal would hide in).
+/// The provider body text a recovery signal is scanned from. Rig's public
+/// provider-response accessor covers both transport HTTP failures and provider
+/// error envelopes; every other variant falls back to its Display.
 fn recovery_scan_text(err: &rig::completion::CompletionError) -> String {
+    if let Some(body) = err.provider_response_body() {
+        return body.to_string();
+    }
     match err {
         rig::completion::CompletionError::ProviderError(msg) => msg.clone(),
-        rig::completion::CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(_, msg),
-        ) => msg.clone(),
         other => other.to_string(),
     }
 }
@@ -392,6 +395,25 @@ mod tests {
 
     fn provider_error(message: &str) -> CompletionError {
         CompletionError::ProviderError(message.to_string())
+    }
+
+    fn response_headers() -> rig::http_client::HeaderMap {
+        rig::http_client::HeaderMap::new()
+    }
+
+    fn detailed_response(status: u16, body: impl Into<String>) -> CompletionError {
+        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithDetails {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: body.into(),
+            headers: Box::new(response_headers()),
+        })
+    }
+
+    fn provider_response(status: u16, body: impl Into<String>) -> CompletionError {
+        CompletionError::ProviderResponse(
+            rig::ProviderResponseError::new(reqwest::StatusCode::from_u16(status).unwrap(), body)
+                .with_headers(Some(Box::new(response_headers()))),
+        )
     }
 
     #[test]
@@ -689,5 +711,95 @@ mod tests {
                 body,
             ),
         )));
+    }
+
+    #[test]
+    fn detailed_http_and_provider_response_share_endpoint_and_recovery_classification() {
+        let legacy =
+            CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "insufficient balance".to_string(),
+            ));
+        let classified = classify_terminal_failure(&legacy);
+        assert_eq!(
+            classified.class,
+            InferenceErrorClass::BillingOrQuotaExhausted
+        );
+        assert_eq!(classified.observed_status, Some(429));
+        assert_eq!(
+            classified.recovery,
+            ProviderRecoverySignal::BillingExhausted
+        );
+
+        for err in [
+            detailed_response(404, "unknown route"),
+            provider_response(404, "unknown route"),
+            detailed_response(405, "method not allowed"),
+            provider_response(405, "method not allowed"),
+            detailed_response(400, format!("{{\"code\":\"{UNSUPPORTED_API_CODE}\"}}")),
+            provider_response(400, format!("{{\"code\":\"{UNSUPPORTED_API_CODE}\"}}")),
+        ] {
+            assert!(is_endpoint_mismatch_error(&err), "{err:?}");
+        }
+
+        for err in [
+            detailed_response(429, "insufficient balance"),
+            provider_response(429, "insufficient balance"),
+        ] {
+            let classified = classify_terminal_failure(&err);
+            assert_eq!(
+                classified.class,
+                InferenceErrorClass::BillingOrQuotaExhausted
+            );
+            assert_eq!(classified.observed_status, Some(429));
+            assert_eq!(
+                classified.recovery,
+                ProviderRecoverySignal::BillingExhausted
+            );
+        }
+
+        for err in [
+            detailed_response(503, "server_is_overloaded"),
+            provider_response(503, "server_is_overloaded"),
+        ] {
+            let classified = classify_terminal_failure(&err);
+            assert_eq!(classified.class, InferenceErrorClass::Http(503));
+            assert_eq!(classified.observed_status, Some(503));
+            assert_eq!(classified.recovery, ProviderRecoverySignal::Overloaded);
+        }
+    }
+
+    #[test]
+    fn successful_status_provider_response_remains_a_failed_inference() {
+        let err = provider_response(200, "provider rejected this completion");
+        let classified = classify_terminal_failure(&err);
+        assert_eq!(classified.observed_status, Some(200));
+        assert_eq!(classified.class, InferenceErrorClass::Network);
+        assert_eq!(
+            crate::engine::retry::classify(&err),
+            crate::engine::retry::RetryDecision::FailFast
+        );
+
+        let billing = provider_response(200, "insufficient balance");
+        let classified = classify_terminal_failure(&billing);
+        assert_eq!(classified.observed_status, Some(200));
+        assert_eq!(
+            classified.class,
+            InferenceErrorClass::BillingOrQuotaExhausted
+        );
+        assert_eq!(
+            classified.recovery,
+            ProviderRecoverySignal::BillingExhausted
+        );
+
+        let overloaded = provider_response(200, "server_is_overloaded");
+        let classified = classify_terminal_failure(&overloaded);
+        assert_eq!(classified.observed_status, Some(200));
+        assert_eq!(classified.class, InferenceErrorClass::Network);
+        assert_eq!(classified.recovery, ProviderRecoverySignal::Overloaded);
+        assert_eq!(
+            crate::engine::retry::classify(&overloaded),
+            crate::engine::retry::RetryDecision::RetryOnce
+        );
     }
 }

@@ -240,7 +240,19 @@ pub async fn compact_shrink(full_history: &[Message], drafter: &dyn BriefDrafter
             "[delegation-shrink — parent context summarized while a sub-agent ran]\n\n{brief}"
         ))],
         Err(e) => {
-            tracing::warn!(error = %e, "delegation compact-shrink brief failed; falling back to prune-only");
+            if let Some(safe) = crate::engine::model::safe_inference_error_detail(&e) {
+                tracing::warn!(
+                    provider_detail = safe.marker,
+                    observed_status = ?safe.observed_status,
+                    recovery = safe.recovery.as_str(),
+                    "delegation compact-shrink brief failed; falling back to prune-only"
+                );
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "delegation compact-shrink brief failed; falling back to prune-only"
+                );
+            }
             pruned
         }
     }
@@ -250,7 +262,6 @@ pub async fn compact_shrink(full_history: &[Message], drafter: &dyn BriefDrafter
 mod tests {
     use super::*;
     use crate::config::providers::CacheMode;
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 
     fn ephemeral(ttl: u64) -> CacheConfig {
@@ -272,10 +283,10 @@ mod tests {
     fn dup_read_history() -> Vec<Message> {
         let call = |id: &str| Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(
+            content: vec![AssistantContent::ToolCall(
                 crate::engine::message::ToolCall {
-                    id: id.to_string(),
-                    call_id: None,
+                    id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+                    provider: None,
                     function: rig::message::ToolFunction {
                         name: "read".into(),
                         arguments: serde_json::json!({ "path": "/abs/foo.rs" }),
@@ -283,16 +294,17 @@ mod tests {
                     signature: None,
                     additional_params: None,
                 },
-            )),
+            )],
         };
         let result = |id: &str| Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: id.to_string(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint(id.to_string()),
+                provider: None,
+                name: "read".into(),
+                content: vec![ToolResultContent::text(
                     "FULL SNAPSHOT BODY with enough tokens to matter here",
-                )),
-            })),
+                )],
+            })],
         };
         vec![call("c1"), result("c1"), call("c2"), result("c2")]
     }

@@ -577,6 +577,16 @@ pub enum Response {
         policy_version: u64,
     },
 
+    /// Redacted LOCAL image-generation control-plane read reply
+    /// (endpoint/target/workflow list/get). Carries only safe projections.
+    ImageControlRead(crate::image_control::ImageControlReadResponseV1),
+
+    /// LOCAL image-generation control-plane config-mutation reply
+    /// (endpoint/target create/update/delete/set_default). Carries the new
+    /// authoritative config generation and the safe change set that was applied
+    /// and emitted; never raw credential/header/workflow material.
+    ImageControlMutated(crate::image_control::ImageControlMutationResponseV1),
+
     GitStatus {
         entries: Vec<GitStatusEntry>,
     },
@@ -1130,6 +1140,8 @@ macro_rules! response_variants {
             (Response::PolicyImported { .. }, "policy_imported");
             (Response::ImageSpendPolicy { .. }, "image_spend_policy");
             (Response::ImageSpendPolicySaved { .. }, "image_spend_policy_saved");
+            (Response::ImageControlRead(..), "image_control_read");
+            (Response::ImageControlMutated(..), "image_control_mutated");
             (Response::GitStatus { .. }, "git_status");
             (Response::GitDiffFile { .. }, "git_diff_file");
             (Response::TerminalOpened { .. }, "terminal_opened");

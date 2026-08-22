@@ -11,10 +11,14 @@
 //! every 3xx is a stable failure, so credentials and attribution cannot cross
 //! origins.
 //!
-//! The module is transport-free: it produces bounded read-only request
-//! descriptions and parses already-bounded responses. The runtime registry
-//! owns transport; the job/artifact foundation owns immutable plans, attempts,
-//! artifacts, and spend.
+//! The pure request/response logic (discovery, preflight, pricing, parsing)
+//! produces bounded read-only request descriptions and parses already-bounded
+//! responses. The dispatch wiring at the bottom of this module implements
+//! [`crate::image_generation_job::ImageGenerationAdapter`] over a production
+//! pinned/vetted transport seam ([`OpenrouterImagesHttpTransport`]) that reports
+//! the shared billing-safe [`crate::image_generation::transport`] vocabulary;
+//! the job/artifact foundation owns immutable plans, attempts, artifacts, and
+//! spend.
 
 use std::fmt;
 
@@ -1527,7 +1531,6 @@ impl std::error::Error for ResponseParseError {}
 /// rejected. Empty values are valid suppression markers (they suppress the
 /// matching attribution default). Invalid headers fail before building a
 /// description with a stable redacted error — no secret value is surfaced.
-#[allow(dead_code)]
 fn validate_provider_header_overrides(
     provider_headers: &[(String, String)],
 ) -> Result<(), RuntimeError> {
@@ -1558,7 +1561,6 @@ fn validate_provider_header_overrides(
 /// that happens to share the OpenRouter image base URL) gets no OpenRouter
 /// attribution headers. This matches the chat/catalog gate in `models_fetch`
 /// (`origin.is_template("openrouter")`).
-#[allow(dead_code)]
 fn apply_openrouter_attribution(
     provider_origin: &ResolvedProviderOrigin,
     headers: &mut Vec<(String, String)>,
@@ -1582,7 +1584,6 @@ fn apply_openrouter_attribution(
 /// `ResolvedProviderOrigin::Template("openrouter")`, matching the chat/catalog
 /// identity gate in `models_fetch`. A non-template origin gets no OpenRouter
 /// attribution headers.
-#[allow(dead_code)]
 pub(crate) fn build_submit_request(
     origin: &str,
     provider_origin: &ResolvedProviderOrigin,
@@ -1880,6 +1881,437 @@ pub fn blind_retry_forbidden(previous: AttemptStatus) -> bool {
         previous,
         AttemptStatus::SubmissionUnknown | AttemptStatus::Accepted
     )
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch wiring: ImageGenerationAdapter + production transport seam (AC3/AC8).
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, Url};
+
+use crate::image_generation::http_transport::{
+    ProviderTransportConfigError, VettedHttpClient, validate_https_origin,
+};
+use crate::image_generation::transport::{
+    ProviderTransportError, ProviderTransportOutcome, SubmissionDisposition,
+};
+use crate::image_generation_job::{
+    ImageGenerationAdapter, ImageGenerationHandoffRequest, ImageGenerationHandoffResult,
+    image_generation_adapter_sealed,
+};
+use crate::image_generation_runtime::{AddressClass, DnsResolver};
+
+/// The response-body bound for `POST /api/v1/images`, enforced while reading.
+/// Matches the [`parse_response`] admission bound so a body the parser would
+/// reject as oversized is refused at the transport before it is buffered.
+pub const MAX_SUBMIT_RESPONSE_BYTES: usize =
+    MAX_OUTPUT_BASE64_BYTES + MAX_USAGE_METADATA_BYTES + 1024;
+
+mod openrouter_adapter_sealed {
+    pub trait Sealed {}
+}
+
+/// Transport seam for the OpenRouter Image API. Production wires this to
+/// [`OpenrouterImagesHttpTransport`] (a pinned/vetted reqwest client); tests
+/// wire a scripted transport. The seam is the only place a request byte leaves
+/// the process, and the attribution/provider headers the adapter merged on
+/// submit are applied here alongside the caller-supplied bearer credential.
+#[async_trait::async_trait]
+pub trait OpenrouterImagesTransport: openrouter_adapter_sealed::Sealed + Send + Sync {
+    /// Submit the encoded request body with the merged (attribution + provider)
+    /// headers. Returns the bounded response on a 2xx, or a
+    /// [`ProviderTransportError`] on the shared billing-safe vocabulary.
+    async fn submit(
+        &self,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+    ) -> Result<ProviderTransportOutcome, ProviderTransportError>;
+}
+
+/// A production pinned HTTPS transport bound to one OpenRouter origin.
+///
+/// Constructible only through [`OpenrouterImagesHttpTransport::vetted`], so no
+/// caller can assemble one that skips the vetted posture. The bearer credential
+/// is caller-supplied (never hardcoded), held sensitive, and redacted in
+/// `Debug`. A `POST` is always sent to the fixed [`SUBMIT_PATH`] on the
+/// configured origin: the adapter cannot redirect the request elsewhere.
+pub struct OpenrouterImagesHttpTransport {
+    origin: Url,
+    authorization: HeaderValue,
+    dns: Arc<dyn DnsResolver>,
+    body_limit: usize,
+}
+
+impl std::fmt::Debug for OpenrouterImagesHttpTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenrouterImagesHttpTransport")
+            .field("origin", &self.origin.as_str())
+            .field("authorization", &"<redacted>")
+            .field("body_limit", &self.body_limit)
+            .finish()
+    }
+}
+
+impl OpenrouterImagesHttpTransport {
+    /// The single vetted constructor. Validates the `https` origin, binds the
+    /// caller-supplied bearer credential as a sensitive header, and fixes the
+    /// required peer location class to the public internet.
+    pub fn vetted(
+        origin: &str,
+        bearer_token: &str,
+        dns: Arc<dyn DnsResolver>,
+        body_limit: usize,
+    ) -> Result<Self, ProviderTransportConfigError> {
+        let origin = validate_https_origin(origin)?;
+        if body_limit == 0 {
+            return Err(ProviderTransportConfigError::EmptyBodyLimit);
+        }
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
+            .map_err(|_| ProviderTransportConfigError::InvalidCredential)?;
+        authorization.set_sensitive(true);
+        Ok(Self {
+            origin,
+            authorization,
+            dns,
+            body_limit,
+        })
+    }
+}
+
+impl openrouter_adapter_sealed::Sealed for OpenrouterImagesHttpTransport {}
+
+#[async_trait::async_trait]
+impl OpenrouterImagesTransport for OpenrouterImagesHttpTransport {
+    async fn submit(
+        &self,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+    ) -> Result<ProviderTransportOutcome, ProviderTransportError> {
+        let url = self
+            .origin
+            .join(SUBMIT_PATH.trim_start_matches('/'))
+            .map_err(|_| ProviderTransportError::Connect)?;
+        let mut header_map = HeaderMap::new();
+        // Attribution + provider headers first; the credential and content-type
+        // are inserted last so a provider header can never override them. A
+        // provider `authorization` override is dropped outright so it can never
+        // replace the vetted bearer credential.
+        for (name, value) in &headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            // An empty value is a suppression marker: do not emit the header.
+            if value.is_empty() {
+                continue;
+            }
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ProviderTransportError::Connect)?;
+            let header_value =
+                HeaderValue::from_str(value).map_err(|_| ProviderTransportError::Connect)?;
+            header_map.insert(header_name, header_value);
+        }
+        header_map.insert(AUTHORIZATION, self.authorization.clone());
+        header_map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        VettedHttpClient::new(self.dns.clone(), AddressClass::PublicRemote)
+            .execute(Method::POST, &url, header_map, Some(body), self.body_limit)
+            .await
+    }
+}
+
+/// The immutable per-attempt inputs the OpenRouter adapter needs to build one
+/// submission. The daemon-integration layer resolves these from the opaque
+/// dispatch identity; this crate ships the seam plus a scripted resolver.
+#[derive(Debug, Clone)]
+pub struct OpenrouterImagesAttemptInput {
+    /// Configured endpoint origin (used only to build the request description;
+    /// the transport owns the actual dial to its own configured origin).
+    pub origin: String,
+    /// Whether OpenRouter attribution headers should be merged on submit
+    /// (true only when the resolved provider identity is the `openrouter`
+    /// template origin). Keeps the crate-private origin type out of this
+    /// public plan surface.
+    pub apply_openrouter_attribution: bool,
+    /// The validated closed request DTO.
+    pub request: OpenrouterImageRequest,
+    /// Validated user/provider header overrides.
+    pub provider_headers: Vec<(String, String)>,
+}
+
+/// Resolves the immutable per-attempt plan from a dispatch handoff request.
+#[async_trait::async_trait]
+pub trait OpenrouterImagesPlanSource: openrouter_adapter_sealed::Sealed + Send + Sync {
+    async fn resolve(
+        &self,
+        request: &ImageGenerationHandoffRequest,
+    ) -> OpenrouterImagesPlanResolution;
+}
+
+/// Outcome of resolving the per-attempt plan.
+#[derive(Debug, Clone)]
+pub enum OpenrouterImagesPlanResolution {
+    Resolved(Box<OpenrouterImagesAttemptInput>),
+    Unresolvable { safe_reason: String },
+}
+
+/// The OpenRouter Images dispatch adapter. Implements the sealed
+/// [`ImageGenerationAdapter`]: a plan is resolved from the dispatch identity,
+/// one bounded request is submitted through the pinned transport with
+/// attribution applied, and the transport classification maps onto the shared
+/// billing-safe handoff vocabulary. `reconcile`/`cancel` inherit the honest
+/// no-authoritative defaults (the OpenRouter Image API is synchronous).
+pub struct OpenrouterImagesAdapter {
+    transport: Arc<dyn OpenrouterImagesTransport>,
+    plan_source: Arc<dyn OpenrouterImagesPlanSource>,
+}
+
+impl OpenrouterImagesAdapter {
+    pub fn new(
+        transport: Arc<dyn OpenrouterImagesTransport>,
+        plan_source: Arc<dyn OpenrouterImagesPlanSource>,
+    ) -> Self {
+        Self {
+            transport,
+            plan_source,
+        }
+    }
+}
+
+impl image_generation_adapter_sealed::Sealed for OpenrouterImagesAdapter {}
+
+#[async_trait::async_trait]
+impl ImageGenerationAdapter for OpenrouterImagesAdapter {
+    async fn handoff(
+        &self,
+        request: &ImageGenerationHandoffRequest,
+    ) -> ImageGenerationHandoffResult {
+        let input = match self.plan_source.resolve(request).await {
+            OpenrouterImagesPlanResolution::Resolved(input) => *input,
+            OpenrouterImagesPlanResolution::Unresolvable { safe_reason } => {
+                // No request was built or sent: definitive rejection, never
+                // submission-unknown.
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: openrouter_redacted_evidence(b"plan_unresolvable", &safe_reason),
+                };
+            }
+        };
+        let provider_origin = if input.apply_openrouter_attribution {
+            ResolvedProviderOrigin::template("openrouter")
+        } else {
+            ResolvedProviderOrigin::default()
+        };
+        let description = match build_submit_request(
+            &input.origin,
+            &provider_origin,
+            &input.request,
+            &input.provider_headers,
+        ) {
+            Ok(description) => description,
+            Err(error) => {
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: openrouter_redacted_evidence(b"request_build", &error.to_string()),
+                };
+            }
+        };
+        let body = match serde_json::to_vec(&description.body) {
+            Ok(body) => body,
+            Err(_) => {
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: openrouter_redacted_evidence(
+                        b"request_serialize",
+                        "serialize failed",
+                    ),
+                };
+            }
+        };
+        match self.transport.submit(body, description.headers).await {
+            Ok(outcome) => match parse_response(&outcome.body) {
+                Ok(_parsed) => ImageGenerationHandoffResult::Accepted {
+                    evidence: openrouter_redacted_evidence(
+                        b"accepted",
+                        &format!("status={}", outcome.status),
+                    ),
+                },
+                Err(error) => {
+                    // A 2xx that fails to parse still means the provider accepted
+                    // (and likely charged): a stable accepted-with-invalid-output,
+                    // never a resubmittable rejection.
+                    ImageGenerationHandoffResult::Accepted {
+                        evidence: openrouter_redacted_evidence(
+                            b"accepted_invalid_output",
+                            &error.to_string(),
+                        ),
+                    }
+                }
+            },
+            Err(error) => match error.submission_disposition() {
+                SubmissionDisposition::DefinitivelyRejected => {
+                    // Includes a 3xx (redirect never followed) which is a stable
+                    // failure so credentials/attribution cannot cross origins.
+                    let detail = openrouter_error_detail(&error);
+                    ImageGenerationHandoffResult::DefinitivelyRejected {
+                        evidence: openrouter_redacted_evidence(b"definitive_nonacceptance", detail),
+                    }
+                }
+                SubmissionDisposition::SubmissionUnknown => {
+                    ImageGenerationHandoffResult::SubmissionUnknown {
+                        evidence: openrouter_redacted_evidence(
+                            b"post_handoff_ambiguous",
+                            "handoff accepted",
+                        ),
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// A stable, class-derived, secret-free detail for a transport error. Never
+/// extracted from the raw provider response, so a secret echoed in an error
+/// body cannot leak.
+fn openrouter_error_detail(error: &ProviderTransportError) -> &'static str {
+    match error {
+        ProviderTransportError::Status { status, .. } => match classify_status(*status) {
+            AttemptStatus::RedirectFailure => "redirect rejected; credentials cannot cross origins",
+            AttemptStatus::DefinitivelyRejected => "provider rejected the request",
+            AttemptStatus::Accepted | AttemptStatus::SubmissionUnknown => "provider non-2xx status",
+        },
+        ProviderTransportError::Connect => "no byte accepted (connect refused)",
+        ProviderTransportError::Tls => "no byte accepted (tls)",
+        ProviderTransportError::BodyLimit => "response exceeded bound",
+        ProviderTransportError::Malformed => "response unparseable",
+        ProviderTransportError::Timeout | ProviderTransportError::AmbiguousAcceptance => {
+            "handoff ambiguous"
+        }
+    }
+}
+
+fn openrouter_redacted_evidence(class: &[u8], detail: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(class);
+    out.push(0);
+    let bounded = detail
+        .chars()
+        .take(REDACTED_DETAIL_MAX_CHARS)
+        .collect::<String>();
+    out.extend_from_slice(bounded.as_bytes());
+    out
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Crate-internal test doubles for the OpenRouter dispatch path, usable by
+    //! the dispatcher integration tests in `image_generation_job`.
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::image_generation_job::ImageGenerationHandoffRequest;
+
+    /// A recorded submission: the encoded request body and the merged headers.
+    pub(crate) type RecordedSubmission = (Vec<u8>, Vec<(String, String)>);
+
+    /// A transport returning scripted outcomes in FIFO order and recording every
+    /// submission so a test can prove the adapter built and sent a request.
+    pub(crate) struct ScriptedOpenrouterTransport {
+        outcomes: Mutex<VecDeque<Result<ProviderTransportOutcome, ProviderTransportError>>>,
+        submissions: Mutex<Vec<RecordedSubmission>>,
+    }
+
+    impl ScriptedOpenrouterTransport {
+        pub(crate) fn new(
+            outcomes: Vec<Result<ProviderTransportOutcome, ProviderTransportError>>,
+        ) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                submissions: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn submissions(&self) -> Vec<RecordedSubmission> {
+            self.submissions.lock().unwrap().clone()
+        }
+    }
+
+    impl openrouter_adapter_sealed::Sealed for ScriptedOpenrouterTransport {}
+
+    #[async_trait::async_trait]
+    impl OpenrouterImagesTransport for ScriptedOpenrouterTransport {
+        async fn submit(
+            &self,
+            body: Vec<u8>,
+            headers: Vec<(String, String)>,
+        ) -> Result<ProviderTransportOutcome, ProviderTransportError> {
+            self.submissions.lock().unwrap().push((body, headers));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted transport exhausted")
+        }
+    }
+
+    /// A plan source resolving every request to the same fixed attempt input.
+    pub(crate) struct FixedOpenrouterPlanSource {
+        input: OpenrouterImagesAttemptInput,
+    }
+
+    impl FixedOpenrouterPlanSource {
+        pub(crate) fn new(input: OpenrouterImagesAttemptInput) -> Self {
+            Self { input }
+        }
+    }
+
+    impl openrouter_adapter_sealed::Sealed for FixedOpenrouterPlanSource {}
+
+    #[async_trait::async_trait]
+    impl OpenrouterImagesPlanSource for FixedOpenrouterPlanSource {
+        async fn resolve(
+            &self,
+            _request: &ImageGenerationHandoffRequest,
+        ) -> OpenrouterImagesPlanResolution {
+            OpenrouterImagesPlanResolution::Resolved(Box::new(self.input.clone()))
+        }
+    }
+
+    /// A valid prompt-only OpenRouter attempt input against the template
+    /// `openrouter` origin (so attribution headers are merged on submit).
+    pub(crate) fn sample_attempt_input() -> OpenrouterImagesAttemptInput {
+        OpenrouterImagesAttemptInput {
+            origin: "https://openrouter.ai".to_string(),
+            apply_openrouter_attribution: true,
+            request: OpenrouterImageRequest {
+                model: "black-forest-labs/flux-1.1-pro".to_string(),
+                prompt: "a serene mountain lake at dawn".to_string(),
+                resolution: None,
+                aspect_ratio: None,
+                size: None,
+                quality: None,
+                output_format: None,
+                background: None,
+                output_compression: None,
+                seed: None,
+                n: 1,
+                input_references: Vec::new(),
+                provider: None,
+            },
+            provider_headers: Vec::new(),
+        }
+    }
+
+    /// A successful single-image OpenRouter response body for the sample plan.
+    pub(crate) fn sample_success_body() -> Vec<u8> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        serde_json::to_vec(&serde_json::json!({ "data": [{ "b64_json": b64 }] })).unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -3498,5 +3930,169 @@ mod tests {
                 "image_url": { "url": self.image_url.url }
             })
         }
+    }
+
+    // --- dispatch adapter (AC3 / AC8) ---
+
+    fn openrouter_handoff_request() -> ImageGenerationHandoffRequest {
+        ImageGenerationHandoffRequest {
+            job_id: uuid::Uuid::now_v7(),
+            slot_id: uuid::Uuid::now_v7(),
+            attempt_number: 1,
+            external_operation_id: uuid::Uuid::now_v7(),
+            provider_request_identity: "request:1".into(),
+            provider_idempotency_identity: "idempotency:1".into(),
+        }
+    }
+
+    fn openrouter_adapter_with(
+        outcome: Result<ProviderTransportOutcome, ProviderTransportError>,
+    ) -> (
+        OpenrouterImagesAdapter,
+        Arc<test_support::ScriptedOpenrouterTransport>,
+    ) {
+        let transport = Arc::new(test_support::ScriptedOpenrouterTransport::new(vec![
+            outcome,
+        ]));
+        let adapter = OpenrouterImagesAdapter::new(
+            transport.clone(),
+            Arc::new(test_support::FixedOpenrouterPlanSource::new(
+                test_support::sample_attempt_input(),
+            )),
+        );
+        (adapter, transport)
+    }
+
+    #[tokio::test]
+    async fn openrouter_adapter_accepts_2xx_and_applies_attribution_on_submit() {
+        let (adapter, transport) = openrouter_adapter_with(Ok(ProviderTransportOutcome {
+            status: 200,
+            body: test_support::sample_success_body(),
+        }));
+        let result = adapter.handoff(&openrouter_handoff_request()).await;
+        assert!(matches!(
+            result,
+            ImageGenerationHandoffResult::Accepted { .. }
+        ));
+        let submissions = transport.submissions();
+        assert_eq!(submissions.len(), 1, "one request was built and submitted");
+        let (body, headers) = &submissions[0];
+        // Attribution headers are still merged on submit (AC3).
+        assert!(
+            headers.iter().any(|(name, _)| name == "HTTP-Referer"),
+            "attribution HTTP-Referer must be applied on submit"
+        );
+        assert!(
+            headers.iter().any(|(name, _)| name == "X-OpenRouter-Title"),
+            "attribution title must be applied on submit"
+        );
+        // Non-vacuity: the serialized request body carries the prompt.
+        assert!(body.windows(6).any(|w| w == b"prompt"));
+    }
+
+    #[tokio::test]
+    async fn openrouter_adapter_3xx_is_definitive_rejection() {
+        // A redirect (never followed) is a stable failure so credentials and
+        // attribution cannot cross origins.
+        let (adapter, _t) = openrouter_adapter_with(Err(ProviderTransportError::Status {
+            status: 302,
+            body: Vec::new(),
+        }));
+        assert!(matches!(
+            adapter.handoff(&openrouter_handoff_request()).await,
+            ImageGenerationHandoffResult::DefinitivelyRejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn openrouter_adapter_ambiguous_is_submission_unknown() {
+        let (adapter, _t) =
+            openrouter_adapter_with(Err(ProviderTransportError::AmbiguousAcceptance));
+        assert!(matches!(
+            adapter.handoff(&openrouter_handoff_request()).await,
+            ImageGenerationHandoffResult::SubmissionUnknown { .. }
+        ));
+    }
+
+    // --- exhaustive transport-error mapping onto the shared vocabulary (AC8) ---
+
+    #[test]
+    fn openrouter_submission_disposition_is_billing_safe_for_every_variant() {
+        use crate::image_generation::transport::SubmissionDisposition::*;
+        assert_eq!(
+            ProviderTransportError::Connect.submission_disposition(),
+            DefinitivelyRejected
+        );
+        assert_eq!(
+            ProviderTransportError::Tls.submission_disposition(),
+            DefinitivelyRejected
+        );
+        assert_eq!(
+            ProviderTransportError::Status {
+                status: 404,
+                body: Vec::new()
+            }
+            .submission_disposition(),
+            DefinitivelyRejected
+        );
+        assert_eq!(
+            ProviderTransportError::BodyLimit.submission_disposition(),
+            DefinitivelyRejected
+        );
+        assert_eq!(
+            ProviderTransportError::Malformed.submission_disposition(),
+            DefinitivelyRejected
+        );
+        assert_eq!(
+            ProviderTransportError::Timeout.submission_disposition(),
+            SubmissionUnknown
+        );
+        assert_eq!(
+            ProviderTransportError::AmbiguousAcceptance.submission_disposition(),
+            SubmissionUnknown
+        );
+    }
+
+    struct OpenrouterFixedDns {
+        answers: Vec<std::net::IpAddr>,
+    }
+
+    impl DnsResolver for OpenrouterFixedDns {
+        fn resolve<'a>(
+            &'a self,
+            _hostname: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<std::net::IpAddr>,
+                            crate::image_generation_runtime::RuntimeError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let answers = self.answers.clone();
+            Box::pin(async move { Ok(answers) })
+        }
+    }
+
+    #[test]
+    fn openrouter_vetted_transport_redacts_bearer_in_debug() {
+        let transport = OpenrouterImagesHttpTransport::vetted(
+            "https://openrouter.ai",
+            "sk-or-super-secret",
+            Arc::new(OpenrouterFixedDns {
+                answers: vec!["93.184.216.34".parse().unwrap()],
+            }),
+            MAX_SUBMIT_RESPONSE_BYTES,
+        )
+        .expect("vetted builder accepts a clean https origin");
+        let rendered = format!("{transport:?}");
+        assert!(
+            !rendered.contains("sk-or-super-secret"),
+            "credential leaked in Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
     }
 }

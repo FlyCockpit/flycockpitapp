@@ -194,13 +194,15 @@ async fn swap_marker_does_not_leak_into_user_transcript() {
 async fn stale_tool_owner_ledgers_drop_calls_absent_from_root_history() {
     let (mut driver, _t) = test_driver(1);
     driver.stack[0].history.push(tool_call_turn("live", "edit"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "live".to_string(),
             None,
+            None,
+            "edit",
             "[elided body]",
-        ));
+        ),
+    );
     driver
         .tool_call_owner
         .insert("live".to_string(), "Build".to_string());
@@ -227,13 +229,15 @@ async fn stale_skill_pairs_drop_when_call_and_result_leave_root_history() {
     driver.stack[0]
         .history
         .push(tool_call_turn("skill-live", "skill"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "skill-live".to_string(),
             None,
+            None,
+            "skill",
             "skill body",
-        ));
+        ),
+    );
     driver.skill_pairs.push(SkillPair {
         call_id: "skill-live".to_string(),
         owner: "Build".to_string(),
@@ -259,13 +263,15 @@ async fn persisted_skill_pair_strips_after_resume_swap() {
     driver.stack[0]
         .history
         .push(tool_call_turn("skillslash-resume", "skill"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "skillslash-resume".to_string(),
             None,
+            None,
+            "skill",
             "Skill `x`:\n\nresume-only instructions",
-        ));
+        ),
+    );
     driver
         .session
         .db
@@ -301,13 +307,15 @@ async fn skill_pair_reconstructs_from_history_and_tool_log_when_db_empty() {
     driver.stack[0]
         .history
         .push(tool_call_turn("skillslash-rebuilt", "skill"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "skillslash-rebuilt".to_string(),
             None,
+            None,
+            "skill",
             "Skill `x`:\n\npre-migration instructions",
-        ));
+        ),
+    );
     record_skill_tool_row(
         &driver,
         "skillslash-rebuilt",
@@ -344,13 +352,15 @@ async fn compact_brief_history_excludes_abandoned_skill_bodies() {
     driver.stack[0]
         .history
         .push(tool_call_turn("skillslash-compact", "skill"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "skillslash-compact".to_string(),
             None,
+            None,
+            "skill",
             "Skill `x`:\n\nCOMPACT_SENTINEL_DO_NOT_SUMMARIZE",
-        ));
+        ),
+    );
     driver.skill_pairs.push(SkillPair {
         call_id: "skillslash-compact".to_string(),
         owner: "Build".to_string(),
@@ -418,21 +428,25 @@ async fn absent_tool_calls_annotated_naming_the_maker_present_tools_untouched() 
     // A (`Build`) makes a write call and a read call, each answered.
     push_user_turn(&mut driver, "edit the file then read it");
     driver.stack[0].history.push(tool_call_turn("w1", "edit"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "w1".to_string(),
             None,
+            None,
+            "edit",
             "[hash=abc ok]",
-        ));
+        ),
+    );
     driver.stack[0].history.push(tool_call_turn("r1", "read"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "r1".to_string(),
             None,
+            None,
+            "read",
             "file contents",
-        ));
+        ),
+    );
 
     // Swap to `Plan` (read-only — lacks `edit`). No annotation yet —
     // deferred to the next message.
@@ -488,23 +502,27 @@ async fn annotation_attributes_each_call_to_its_actual_maker() {
 
     // A (`Build`) makes a write call.
     driver.stack[0].history.push(tool_call_turn("b1", "edit"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "b1".to_string(),
             None,
+            None,
+            "edit",
             "build-write",
-        ));
+        ),
+    );
 
     // A second write call is still attributed to Build before the read-only swap.
     driver.stack[0].history.push(tool_call_turn("s1", "write"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "s1".to_string(),
             None,
+            None,
+            "write",
             "build-write-2",
-        ));
+        ),
+    );
 
     // Swap to `Plan` (read-only) and annotate at the next message.
     driver.swap_primary("Plan", &tx).await;
@@ -580,13 +598,15 @@ async fn read_only_agent_cannot_reissue_annotated_write_tool() {
     let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
     reroot_real(&mut driver, "Build");
     driver.stack[0].history.push(tool_call_turn("w1", "write"));
-    driver.stack[0]
-        .history
-        .push(Message::tool_result_with_call_id(
+    driver.stack[0].history.push(
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
             "w1".to_string(),
             None,
+            None,
+            "write",
             "[hash=def ok]",
-        ));
+        ),
+    );
 
     driver.swap_primary("Plan", &tx).await;
     driver.annotate_absent_tool_calls();
@@ -633,7 +653,7 @@ async fn abandoned_skill_pair_is_stripped_on_primary_swap() {
             matches!(m,
             Message::User { content }
                 if content.iter().any(|c| matches!(c,
-                    UserContent::ToolResult(tr) if tr.id.starts_with("fc-skillslash-"))))
+                    UserContent::ToolResult(tr) if tr.call.starts_with("fc-skillslash-"))))
         })
     };
     assert!(
@@ -772,7 +792,6 @@ async fn rehydrate_skips_a_live_history() {
 /// the watermark restored and the context estimate seeded.
 #[tokio::test]
 async fn fresh_driver_rehydrates_persisted_pruned_context() {
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResultContent, UserContent};
 
     let (driver, _t) = test_driver(1);
@@ -981,7 +1000,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
     // The assistant turn that issued tc-1 is unchanged (call shape kept).
     assert!(matches!(&h[1], Message::Assistant { content, .. }
         if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == "tc-1"))));
-    let _ = OneOrMany::one(UserContent::text("")); // keep import used
+    let _ = vec![UserContent::text("")]; // keep import used
 }
 
 #[tokio::test]

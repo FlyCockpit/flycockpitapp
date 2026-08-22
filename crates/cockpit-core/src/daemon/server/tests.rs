@@ -6119,6 +6119,44 @@ async fn auto_title_failure_leaves_session_unrenamed() {
 }
 
 #[tokio::test]
+async fn auto_title_rpc_omits_provider_request_id_and_body_from_error() {
+    const BODY_SENTINEL: &str = "RAW_AUTO_TITLE_PROVIDER_BODY_MUST_NOT_ESCAPE";
+    const REQUEST_ID_SENTINEL: &str = "req_RAW_AUTO_TITLE_PROVIDER_REQUEST_ID_MUST_NOT_ESCAPE";
+
+    let project = tempfile::tempdir().unwrap();
+    let url = auto_title_error_model_server(BODY_SENTINEL, REQUEST_ID_SENTINEL).await;
+    let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let error = handle_request(
+        Request::AutoTitle {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("provider failure rejects auto title");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+    assert!(!error.message.contains(BODY_SENTINEL));
+    assert!(!error.message.contains(REQUEST_ID_SENTINEL));
+}
+
+#[tokio::test]
 async fn concurrent_auto_title_second_attempt_is_rejected() {
     let project = tempfile::tempdir().unwrap();
     let url = auto_title_model_server(Some("Concurrent Title".to_string())).await;
@@ -7277,6 +7315,33 @@ async fn auto_title_model_server(content: Option<String>) -> String {
                 payload
             );
             let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+async fn auto_title_error_model_server(
+    body_sentinel: &'static str,
+    request_id: &'static str,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = format!("{{\"error\":\"{body_sentinel}\"}}");
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                 x-request-id: {request_id}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
         }
     });
@@ -10468,6 +10533,119 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
     assert_eq!(status.state, "committed");
 }
 
+/// The `image_generation` registry is authored ONLY by the dedicated
+/// `image_endpoint_*` RPCs; a generic `SaveExtendedConfig` (whose incoming
+/// registry is always the redacted EMPTY default) must PRESERVE it, and the
+/// dedicated RPCs must remain fully mutable afterwards — none of that path is
+/// affected by the SaveExtendedConfig merge.
+#[tokio::test]
+async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() {
+    use cockpit_config::config::image_generation::{
+        IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageEndpoint,
+        ImageGenerationConfig, ImageLocationClass,
+    };
+
+    // ISOLATE the cockpit home so `persist_registry`'s `discover_config_dirs`
+    // never resolves the developer's real `~/.config/cockpit/config.json`; the
+    // empty temp home means the project `.cockpit/config.json` is the only
+    // existing config layer, and the RPC write, the production config source,
+    // and the SaveExtendedConfig target all agree on that one file.
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    // The dedicated image-config RPC (and the trust-gated `.cockpit` config
+    // layer) resolve workspace trust from the db.
+    trust_workspace_root(&ctx, project.path()).await;
+    let project_root = project.path().to_string_lossy().into_owned();
+
+    let make_endpoint = |id: &str| {
+        serde_json::to_string(&ImageEndpoint {
+            id: id.to_string(),
+            adapter: ImageAdapterKind::OpenaiImages,
+            origin: "https://api.openai.com/".to_string(),
+            path_prefix: None,
+            credential_ref: Some("openai-key".to_string()),
+            headers: Vec::new(),
+            allow_insecure_transport: false,
+            location: ImageLocationClass::PublicCloud,
+            enabled: true,
+            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+            exclusive_server: false,
+        })
+        .unwrap()
+    };
+
+    // 1) Author a registry through the dedicated RPC.
+    let created = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+        &ctx,
+        Request::ImageEndpointCreate {
+            project_root: project_root.clone(),
+            endpoint_json: make_endpoint("openai-main"),
+            expected_config_generation: None,
+        },
+    )
+    .await
+    .expect("endpoint create succeeds");
+    assert!(matches!(created, Response::ImageControlMutated(_)));
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("openai-main"),
+        "the RPC must persist the registry to disk"
+    );
+
+    // 2) A generic settings save carrying the redacted EMPTY registry.
+    let incoming = serde_json::json!({
+        "name": "Renamed Project",
+        "image_generation": serde_json::to_value(ImageGenerationConfig::default()).unwrap(),
+    })
+    .to_string();
+    assert!(!incoming.contains("openai-main"));
+    let saved = crate::daemon::fs_api::save_extended_config(
+        project_root.clone(),
+        ".cockpit/config.json".into(),
+        incoming,
+        None,
+    )
+    .await
+    .expect("save extended config succeeds");
+    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
+    let after_save = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        after_save.contains("openai-main"),
+        "SaveExtendedConfig must preserve the RPC-authored registry"
+    );
+    assert!(after_save.contains("Renamed Project"));
+
+    // 3) The dedicated RPC still mutates the registry after the settings save.
+    let second = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+        &ctx,
+        Request::ImageEndpointCreate {
+            project_root: project_root.clone(),
+            endpoint_json: make_endpoint("backup-openai"),
+            expected_config_generation: None,
+        },
+    )
+    .await
+    .expect("second endpoint create succeeds after SaveExtendedConfig");
+    assert!(matches!(second, Response::ImageControlMutated(_)));
+    let final_config = std::fs::read_to_string(&config_path).unwrap();
+    let final_value: serde_json::Value = serde_json::from_str(&final_config).unwrap();
+    let registry: ImageGenerationConfig =
+        serde_json::from_value(final_value.get("image_generation").unwrap().clone()).unwrap();
+    let ids: Vec<&str> = registry.endpoints().iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        ids.contains(&"openai-main") && ids.contains(&"backup-openai"),
+        "both the pre-save and post-save endpoints must be present: {ids:?}"
+    );
+}
+
 /// `ImportPolicy` is owner-remoted AND keeps the batch's vault-only custody
 /// guarantee on the remote path: an imported literal credential is rejected
 /// before anything is written to config, and the reserved remote operation is
@@ -13625,6 +13803,30 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // Owner-remoted settings/policy reads project the effective config; the
         // owner cell resolves to a `Response` like the other read snapshots.
         "export_policy" | "get_image_spend_policy" => AuthzAllowedOutcome::Response,
+        // LOCAL owner image-control LIST reads project the (empty, on the
+        // ephemeral matrix daemon) registry, so the owner cell is a `Response`.
+        "image_endpoint_list" | "image_target_list" | "image_workflow_list" => {
+            AuthzAllowedOutcome::Response
+        }
+        // LOCAL owner image-control GET reads reference an id absent from the
+        // ephemeral daemon's empty registry, so the owner-allowed cell surfaces
+        // the daemon-layer not-found mapping (`bad_request`) post-auth.
+        "image_endpoint_get" | "image_target_get" | "image_workflow_get" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        // LOCAL owner image-control MUTATIONS: after the owner gate the handler
+        // loads the (empty) registry and rejects the matrix's bogus input before
+        // any write — a malformed `endpoint_json`/`target_json` fails the
+        // `ImageGenerationConfig::new` funnel and a delete/set_default names an
+        // id absent from the empty registry — so the owner-allowed cell surfaces
+        // `BadRequest`.
+        "image_endpoint_create"
+        | "image_endpoint_update"
+        | "image_endpoint_delete"
+        | "image_target_create"
+        | "image_target_update"
+        | "image_target_delete"
+        | "image_target_set_default" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // Owner-remoted settings/setup/flycockpit mutations validate their
         // caller-supplied payload after the owner gate; the matrix request's
         // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
@@ -13853,6 +14055,19 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("import_policy"),
         authz_owner_only("get_image_spend_policy"),
         authz_owner_only("save_image_spend_policy"),
+        authz_owner_only("image_endpoint_list"),
+        authz_owner_only("image_endpoint_get"),
+        authz_owner_only("image_target_list"),
+        authz_owner_only("image_target_get"),
+        authz_owner_only("image_workflow_list"),
+        authz_owner_only("image_workflow_get"),
+        authz_owner_only("image_endpoint_create"),
+        authz_owner_only("image_endpoint_update"),
+        authz_owner_only("image_endpoint_delete"),
+        authz_owner_only("image_target_create"),
+        authz_owner_only("image_target_update"),
+        authz_owner_only("image_target_delete"),
+        authz_owner_only("image_target_set_default"),
         authz_owner_only("set_flycockpit_connector_enabled"),
         authz_owner_only("sync_flycockpit_org_policy"),
         authz_owner_only("enroll_flycockpit_org_sync"),
@@ -15325,6 +15540,70 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
+        },
+        "image_endpoint_list" => Request::ImageEndpointList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_endpoint_get" => Request::ImageEndpointGet {
+            project_root: root.clone(),
+            endpoint_id: "ep-authz".into(),
+        },
+        "image_target_list" => Request::ImageTargetList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_target_get" => Request::ImageTargetGet {
+            project_root: root.clone(),
+            target_id: "t-authz".into(),
+        },
+        "image_workflow_list" => Request::ImageWorkflowList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_workflow_get" => Request::ImageWorkflowGet {
+            project_root: root.clone(),
+            workflow_id: "wf-authz".into(),
+        },
+        "image_endpoint_create" => Request::ImageEndpointCreate {
+            project_root: root.clone(),
+            endpoint_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_endpoint_update" => Request::ImageEndpointUpdate {
+            project_root: root.clone(),
+            endpoint_id: "ep-authz".into(),
+            endpoint_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_endpoint_delete" => Request::ImageEndpointDelete {
+            project_root: root.clone(),
+            endpoint_id: "ep-authz".into(),
+            expected_config_generation: None,
+        },
+        "image_target_create" => Request::ImageTargetCreate {
+            project_root: root.clone(),
+            target_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_target_update" => Request::ImageTargetUpdate {
+            project_root: root.clone(),
+            target_id: "t-authz".into(),
+            target_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_target_delete" => Request::ImageTargetDelete {
+            project_root: root.clone(),
+            target_id: "t-authz".into(),
+            expected_config_generation: None,
+        },
+        "image_target_set_default" => Request::ImageTargetSetDefault {
+            project_root: root.clone(),
+            target_id: "t-authz".into(),
+            expected_config_generation: None,
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
             project_key: root.clone(),
@@ -20230,6 +20509,12 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_stat",
         "get_host_capabilities",
         "get_image_spend_policy",
+        "image_endpoint_list",
+        "image_endpoint_get",
+        "image_target_list",
+        "image_target_get",
+        "image_workflow_list",
+        "image_workflow_get",
         "get_provider_catalog_snapshot",
         "get_run_invocation_status",
         "get_usage_counts",
@@ -22081,6 +22366,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageTargetList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_target_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageTargetGet { project_root: "/tmp/project".into(), target_id: "t1".into() }, kind: "image_target_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageWorkflowList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_workflow_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageWorkflowGet { project_root: "/tmp/project".into(), workflow_id: "wf1".into() }, kind: "image_workflow_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageEndpointCreate { project_root: "/tmp/project".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointUpdate { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointDelete { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), expected_config_generation: None }, kind: "image_endpoint_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetCreate { project_root: "/tmp/project".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetUpdate { project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetDelete { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetSetDefault { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
@@ -22307,6 +22605,19 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImportPolicy,
         GetImageSpendPolicy,
         SaveImageSpendPolicy,
+        ImageEndpointList,
+        ImageEndpointGet,
+        ImageTargetList,
+        ImageTargetGet,
+        ImageWorkflowList,
+        ImageWorkflowGet,
+        ImageEndpointCreate,
+        ImageEndpointUpdate,
+        ImageEndpointDelete,
+        ImageTargetCreate,
+        ImageTargetUpdate,
+        ImageTargetDelete,
+        ImageTargetSetDefault,
         ListPackages,
         AddPackage,
         ImportPackage,

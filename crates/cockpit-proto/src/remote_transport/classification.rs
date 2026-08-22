@@ -1005,6 +1005,71 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "image_endpoint_list",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_get",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_list",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_get",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_workflow_list",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_workflow_get",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_create",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_update",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_delete",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_create",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_update",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_delete",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_set_default",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "daemon_status",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
@@ -1804,6 +1869,16 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "image_control_read",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_control_mutated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "provider_oauth_started",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2008,6 +2083,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "default_model_update_result",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_control_config_changed",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2451,6 +2531,12 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Event, "queue_updated"),
     (RemoteMessageKind::Event, "assistant_text_delta"),
     (RemoteMessageKind::Event, "reasoning_delta"),
+    (RemoteMessageKind::Event, "assistant_display_text_delta"),
+    (
+        RemoteMessageKind::Event,
+        "assistant_display_reasoning_delta",
+    ),
+    (RemoteMessageKind::Event, "assistant_display_complete"),
     (RemoteMessageKind::Event, "assistant_text"),
     (RemoteMessageKind::Event, "user_message_recorded"),
     (RemoteMessageKind::Event, "queued_user_messages_folded"),
@@ -2610,9 +2696,9 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 200);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 142);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 82);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 213);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 144);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 83);
     }
 
     #[test]
@@ -2667,7 +2753,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 71);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 74);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

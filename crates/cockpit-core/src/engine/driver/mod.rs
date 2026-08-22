@@ -344,6 +344,8 @@ struct ScheduleToolCallRecord {
     agent: String,
     llm_mode: crate::config::extended::LlmMode,
     call_id: String,
+    provider_item_id: Option<String>,
+    provider_call_id: Option<String>,
     original_input_json: serde_json::Value,
     wire_input_json: serde_json::Value,
     recovery: crate::db::tool_calls::Recovery,
@@ -468,6 +470,7 @@ pub struct AgentSession {
 #[derive(Debug, Clone)]
 pub struct PendingTaskCall {
     pub call_id: String,
+    pub provider_item_id: Option<String>,
     pub function_call_id: Option<String>,
     pub repair_notes: Vec<String>,
 }
@@ -1018,6 +1021,7 @@ struct InteractiveChildLoadRequest<'a> {
     model: Option<crate::engine::model_roles::DelegationModelSelector>,
     child_recursion: crate::engine::builtin::DelegationRecursionContext,
     task_call_id: &'a str,
+    task_provider_item_id: Option<String>,
     task_function_call_id: Option<String>,
     repair_notes: &'a [String],
 }
@@ -1036,6 +1040,7 @@ fn prepend_task_repair_notes(report: String, notes: &[String]) -> String {
 fn subagent_report_event_data(
     child_agent: &str,
     task_call_id: Option<&str>,
+    task_provider_item_id: Option<&str>,
     task_function_call_id: Option<&str>,
     label: &str,
     report: &str,
@@ -1044,6 +1049,7 @@ fn subagent_report_event_data(
     let task_identity = task_call_id.map(|call_id| {
         crate::engine::task_identity::TaskProviderIdentity::for_task_call(
             call_id,
+            task_provider_item_id,
             task_function_call_id,
         )
     });
@@ -1052,6 +1058,9 @@ fn subagent_report_event_data(
         "task_call_id": task_call_id,
         "label": label,
         "report": report,
+        "provider_item_id": task_identity
+            .as_ref()
+            .and_then(|identity| identity.provider_item_id.clone()),
         "provider_call_id": task_identity
             .as_ref()
             .map(|identity| identity.provider_call_id.clone()),
@@ -2726,8 +2735,16 @@ impl Driver {
             config: self.config.clone(),
         };
         let call = crate::engine::message::ToolCall {
-            id: payload.call_id.clone(),
-            call_id: payload.resume.provider_call_id.clone(),
+            id: rig::message::ToolCallId::new_or_mint(payload.call_id.clone()),
+            provider: payload
+                .resume
+                .provider_call_id
+                .clone()
+                .and_then(rig::message::ProviderCallId::new)
+                .map(|provider| match payload.resume.provider_item_id.clone() {
+                    Some(item_id) => provider.with_item_id(item_id),
+                    None => provider,
+                }),
             function: ToolFunction {
                 name: payload.tool.clone(),
                 arguments: payload.args.clone(),
@@ -5302,7 +5319,7 @@ impl Driver {
                 for c in content.iter() {
                     if let AssistantContent::ToolCall(tc) = c {
                         self.tool_call_owner
-                            .entry(tc.id.clone())
+                            .entry(tc.id.to_string())
                             .or_insert_with(|| owner.to_string());
                     }
                 }
@@ -5329,14 +5346,14 @@ impl Driver {
                 Message::Assistant { content, .. } => {
                     for part in content.iter() {
                         if let AssistantContent::ToolCall(tc) = part {
-                            tool_call_ids.insert(tc.id.clone());
+                            tool_call_ids.insert(tc.id.to_string());
                         }
                     }
                 }
                 Message::User { content } => {
                     for part in content.iter() {
                         if let UserContent::ToolResult(tr) = part {
-                            tool_result_ids.insert(tr.id.clone());
+                            tool_result_ids.insert(tr.call.to_string());
                         }
                     }
                 }
@@ -6180,6 +6197,10 @@ impl Driver {
             .answering
             .as_ref()
             .and_then(|pending| pending.function_call_id.as_deref());
+        let task_provider_item_id = child
+            .answering
+            .as_ref()
+            .and_then(|pending| pending.provider_item_id.as_deref());
         let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
             &child.agent.model,
             child.fallback_decision.as_ref(),
@@ -6208,6 +6229,7 @@ impl Driver {
                     subagent_report_event_data(
                         &child.agent.name,
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
                         "default",
                         &report,
@@ -6240,9 +6262,11 @@ impl Driver {
             // parent's history already ends with the assistant turn that
             // emitted the task call.
             let report = prepend_task_repair_notes(report, &pending.repair_notes);
-            let result = Message::tool_result_with_call_id(
+            let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                 pending.call_id,
+                pending.provider_item_id,
                 pending.function_call_id,
+                "task",
                 report,
             );
             if let Some(parent) = self.stack.last_mut() {
@@ -6311,6 +6335,10 @@ impl Driver {
                 .answering
                 .as_ref()
                 .and_then(|pending| pending.function_call_id.as_deref());
+            let task_provider_item_id = child
+                .answering
+                .as_ref()
+                .and_then(|pending| pending.provider_item_id.as_deref());
             let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
@@ -6333,6 +6361,7 @@ impl Driver {
                         subagent_report_event_data(
                             &child.agent.name,
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
                             "default",
                             &report,
@@ -6362,11 +6391,14 @@ impl Driver {
                 .await;
 
             if let Some(pending) = child.answering {
-                let result = Message::tool_result_with_call_id(
-                    pending.call_id,
-                    pending.function_call_id,
-                    report,
-                );
+                let result =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        pending.call_id,
+                        pending.provider_item_id,
+                        pending.function_call_id,
+                        "task",
+                        report,
+                    );
                 if let Some(parent) = self.stack.last_mut() {
                     crate::engine::delegation_prompt_prune::prune_completed_delegation_prompts_with_upcoming(
                         &mut parent.history,
@@ -7402,28 +7434,36 @@ impl Driver {
                     todo_ids,
                     repair_notes,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     if let Err(err) = self.consume_delegation_retry_budget() {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
                     }
-                    let child_recursion =
-                        match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
-                            Ok(ctx) => ctx,
-                            Err(err) => {
-                                next_prompt = Message::tool_result_with_call_id(
+                    let child_recursion = match self.resolve_task_recursion(
+                        &child_agent,
+                        remaining_depth,
+                        &model,
+                    ) {
+                        Ok(ctx) => ctx,
+                        Err(err) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
+                                    task_provider_item_id,
                                     task_function_call_id,
+                                    "task",
                                     prepend_task_repair_notes(err, &repair_notes),
                                 );
-                                continue;
-                            }
-                        };
+                            continue;
+                        }
+                    };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
                     let parent_vnext_grant = self
                         .stack
@@ -7446,9 +7486,11 @@ impl Driver {
                     )
                     .await
                     {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
@@ -7513,9 +7555,11 @@ impl Driver {
                         Ok(row) => brief = delegation_payload_reference_prompt(&row),
                         Err(e) => {
                             tracing::warn!(error = %e, task_call_id, "persist interactive task delegation job and payload failed");
-                            next_prompt = Message::tool_result_with_call_id(
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 prepend_task_repair_notes(
                                     DELEGATION_PAYLOAD_REFUSAL.to_string(),
                                     &repair_notes,
@@ -7531,9 +7575,11 @@ impl Driver {
                         Ok(delivery) => delivery,
                         Err(e) => {
                             tracing::warn!(error = %e, task_call_id, "interactive task delegation payload delivery failed");
-                            next_prompt = Message::tool_result_with_call_id(
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 prepend_task_repair_notes(
                                     DELEGATION_PAYLOAD_REFUSAL.to_string(),
                                     &repair_notes,
@@ -7549,6 +7595,7 @@ impl Driver {
                             model,
                             child_recursion,
                             task_call_id: &task_call_id,
+                            task_provider_item_id: task_provider_item_id.clone(),
                             task_function_call_id: task_function_call_id.clone(),
                             repair_notes: &repair_notes,
                         },
@@ -7612,6 +7659,7 @@ impl Driver {
                         history: delegation_payload_history,
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
+                            provider_item_id: task_provider_item_id,
                             function_call_id: task_function_call_id,
                             repair_notes,
                         }),
@@ -7682,34 +7730,44 @@ impl Driver {
                     todo_ids,
                     repair_notes,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     if let Err(err) = self.consume_delegation_retry_budget() {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
                     }
-                    let child_recursion =
-                        match self.resolve_task_recursion(&child_agent, remaining_depth, &model) {
-                            Ok(ctx) => ctx,
-                            Err(err) => {
-                                next_prompt = Message::tool_result_with_call_id(
+                    let child_recursion = match self.resolve_task_recursion(
+                        &child_agent,
+                        remaining_depth,
+                        &model,
+                    ) {
+                        Ok(ctx) => ctx,
+                        Err(err) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                     task_call_id,
+                                    task_provider_item_id,
                                     task_function_call_id,
+                                    "task",
                                     prepend_task_repair_notes(err, &repair_notes),
                                 );
-                                continue;
-                            }
-                        };
+                            continue;
+                        }
+                    };
                     let child_cwd = match self.resolve_child_cwd(cwd.as_deref()) {
                         Ok(child_cwd) => child_cwd,
                         Err(err) => {
-                            next_prompt = Message::tool_result_with_call_id(
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 prepend_task_repair_notes(err, &repair_notes),
                             );
                             continue;
@@ -7733,9 +7791,11 @@ impl Driver {
                     )
                     .await
                     {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
@@ -7757,6 +7817,7 @@ impl Driver {
                                 child_recursion,
                                 repair_notes,
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
                             },
                             input_rx,
@@ -7771,12 +7832,15 @@ impl Driver {
                     why,
                     repair_notes,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     if let Err(err) = self.consume_delegation_retry_budget() {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
@@ -7796,9 +7860,11 @@ impl Driver {
                         }
                     }
                     if let Some(err) = cwd_error {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
@@ -7832,9 +7898,11 @@ impl Driver {
                         }
                     }
                     if let Some(err) = unknown_agent_error {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id,
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(err, &repair_notes),
                         );
                         continue;
@@ -7847,6 +7915,7 @@ impl Driver {
                                 why,
                                 repair_notes,
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
                             },
                             input_rx,
@@ -7862,20 +7931,24 @@ impl Driver {
                     label,
                     message,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     let body = self
                         .dispatch_task_control(action, target_task_call_id, label, message)
                         .await;
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
+                        "task",
                         body,
                     );
                     continue;
                 }
                 TurnOutcome::ToolResult {
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                     mut body,
                 } => {
@@ -7883,9 +7956,11 @@ impl Driver {
                         body.push_str("\n\n[tool surface update]\n");
                         body.push_str(&note);
                     }
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
+                        "task",
                         body,
                     );
                     continue;
@@ -7895,6 +7970,7 @@ impl Driver {
                     write_scope,
                     model,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     // Recursive `Swarm` fan-out (GOALS §24). The foreground
@@ -7978,9 +8054,11 @@ impl Driver {
                             hint: None,
                         })
                         .await;
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
+                        "spawn",
                         output,
                     );
                     if let Some(parent) = self.stack.last_mut() {
@@ -7996,6 +8074,7 @@ impl Driver {
                     args,
                     recovery,
                     task_call_id,
+                    task_provider_item_id,
                     task_function_call_id,
                 } => {
                     // The single async-job authority lives on the driver
@@ -8089,6 +8168,8 @@ impl Driver {
                         agent: agent_name.clone(),
                         llm_mode,
                         call_id: task_call_id.clone(),
+                        provider_item_id: task_provider_item_id.clone(),
+                        provider_call_id: task_function_call_id.clone(),
                         original_input_json: original_args,
                         wire_input_json: wire_input,
                         recovery,
@@ -8097,9 +8178,11 @@ impl Driver {
                         duration_ms: start.elapsed().as_millis() as u64,
                     })
                     .await;
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id,
                         task_function_call_id,
+                        "schedule",
                         output,
                     );
                     continue;
@@ -8150,17 +8233,21 @@ impl Driver {
                     task_call_id = req.task_call_id,
                     "interactive child load failed"
                 );
-                Err(Box::new(Message::tool_result_with_call_id(
-                    req.task_call_id.to_string(),
-                    req.task_function_call_id,
-                    prepend_task_repair_notes(
-                        format!(
-                            "Error: failed to load subagent `{}`: {e:#}",
-                            req.child_agent
+                Err(Box::new(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        req.task_call_id.to_string(),
+                        req.task_provider_item_id,
+                        req.task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(
+                            format!(
+                                "Error: failed to load subagent `{}`: {e:#}",
+                                req.child_agent
+                            ),
+                            req.repair_notes,
                         ),
-                        req.repair_notes,
                     ),
-                )))
+                ))
             }
         }
     }

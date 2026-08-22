@@ -290,11 +290,9 @@ fn learn_driver(
     ));
     driver.stack[0].history.push(Message::Assistant {
         id: Some("prior-assistant".into()),
-        content: crate::engine::message::OneOrMany::one(
-            crate::engine::message::AssistantContent::text(
-                "The local verification completed successfully.",
-            ),
-        ),
+        content: vec![crate::engine::message::AssistantContent::text(
+            "The local verification completed successfully.",
+        )],
     });
     (driver, tmp, root, provider)
 }
@@ -363,58 +361,55 @@ fn plan_rooted_driver() -> (Driver, tempfile::TempDir) {
 /// An assistant turn carrying a single `write` tool call on `path`.
 fn write_turn(call_id: &str, path: &str) -> Message {
     use crate::engine::message::AssistantContent;
-    use rig::OneOrMany;
     use rig::message::{ToolCall, ToolFunction};
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: call_id.to_string(),
-            call_id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: "write".to_string(),
                 arguments: serde_json::json!({ "path": path }),
             },
             signature: None,
             additional_params: None,
-        })),
+        })],
     }
 }
 
 fn read_turn(call_id: &str, path: &str) -> Message {
     use crate::engine::message::AssistantContent;
-    use rig::OneOrMany;
     use rig::message::{ToolCall, ToolFunction};
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: call_id.to_string(),
-            call_id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: "read".to_string(),
                 arguments: serde_json::json!({ "path": path }),
             },
             signature: None,
             additional_params: None,
-        })),
+        })],
     }
 }
 
 fn bash_turn(call_id: &str, command: &str) -> Message {
     use crate::engine::message::AssistantContent;
-    use rig::OneOrMany;
     use rig::message::{ToolCall, ToolFunction};
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: call_id.to_string(),
-            call_id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: "bash".to_string(),
                 arguments: serde_json::json!({ "command": command }),
             },
             signature: None,
             additional_params: None,
-        })),
+        })],
     }
 }
 
@@ -498,20 +493,20 @@ fn reroot_real(driver: &mut Driver, name: &str) {
 /// An assistant turn carrying one tool call: `tool` named `tool`, id
 /// `call_id`. Used to seed cross-agent attribution history.
 fn tool_call_turn(call_id: &str, tool: &str) -> Message {
-    use crate::engine::message::{AssistantContent, OneOrMany};
+    use crate::engine::message::AssistantContent;
     use rig::message::{ToolCall, ToolFunction};
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: call_id.to_string(),
-            call_id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: tool.to_string(),
                 arguments: serde_json::json!({}),
             },
             signature: None,
             additional_params: None,
-        })),
+        })],
     }
 }
 
@@ -523,7 +518,7 @@ fn tool_result_text_for(driver: &Driver, call_id: &str) -> String {
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c
-                    && tr.id == call_id
+                    && tr.call == call_id
                 {
                     return tr
                         .content
@@ -627,15 +622,14 @@ fn dup_read_history_tiny_savings() -> Vec<Message> {
 }
 
 fn dup_read_history_with_body(body: impl Into<String>) -> Vec<Message> {
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
     let body = body.into();
     let call = |id: &str| Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(
+        content: vec![AssistantContent::ToolCall(
             crate::engine::message::ToolCall {
-                id: id.to_string(),
-                call_id: None,
+                id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+                provider: None,
                 function: rig::message::ToolFunction {
                     name: "read".into(),
                     arguments: serde_json::json!({ "path": "/abs/foo.rs" }),
@@ -643,14 +637,15 @@ fn dup_read_history_with_body(body: impl Into<String>) -> Vec<Message> {
                 signature: None,
                 additional_params: None,
             },
-        )),
+        )],
     };
     let result = |id: &str| Message::User {
-        content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-            id: id.to_string(),
-            call_id: None,
-            content: OneOrMany::one(ToolResultContent::text(body.clone())),
-        })),
+        content: vec![UserContent::ToolResult(ToolResult {
+            call: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
+            name: "read".into(),
+            content: vec![ToolResultContent::text(body.clone())],
+        })],
     };
     vec![call("c1"), result("c1"), call("c2"), result("c2")]
 }
@@ -682,14 +677,13 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
 }
 
 fn task_tool_call(call_id: &str, function_call_id: &str) -> Message {
-    use rig::OneOrMany;
     use rig::message::AssistantContent;
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(
+        content: vec![AssistantContent::ToolCall(
             crate::engine::message::ToolCall {
-                id: call_id.to_string(),
-                call_id: Some(function_call_id.to_string()),
+                id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                provider: rig::message::ProviderCallId::new(function_call_id.to_string()),
                 function: rig::message::ToolFunction {
                     name: "task".into(),
                     arguments: serde_json::json!({
@@ -700,7 +694,7 @@ fn task_tool_call(call_id: &str, function_call_id: &str) -> Message {
                 signature: None,
                 additional_params: None,
             },
-        )),
+        )],
     }
 }
 
@@ -718,7 +712,7 @@ fn tool_result_text_and_id(msg: &Message) -> Option<(String, String)> {
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                Some((result.id.clone(), text))
+                Some((result.call.to_string(), text))
             }
             _ => None,
         }),
@@ -740,6 +734,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         history: vec![],
         answering: Some(PendingTaskCall {
             call_id: call_id.to_string(),
+            provider_item_id: None,
             function_call_id: Some(function_call_id.to_string()),
             repair_notes: Vec::new(),
         }),
@@ -1095,20 +1090,20 @@ async fn compact_inference_purposes(driver: &Driver) -> Vec<String> {
 
 /// A caller assistant turn that ends in a `task` tool call.
 fn assistant_with_task_call(task_call_id: &str) -> Message {
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use crate::engine::message::{AssistantContent, ToolCall};
     use rig::message::ToolFunction;
     Message::Assistant {
         id: None,
-        content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-            id: task_call_id.to_string(),
-            call_id: None,
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: rig::message::ToolCallId::new_or_mint(task_call_id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: "task".into(),
                 arguments: serde_json::json!({ "agent": "explore", "prompt": "go" }),
             },
             signature: None,
             additional_params: None,
-        })),
+        })],
     }
 }
 
@@ -1118,7 +1113,7 @@ fn tool_result_id(msg: &Message) -> String {
         Message::User { content } => content
             .iter()
             .find_map(|part| match part {
-                UserContent::ToolResult(result) => Some(result.id.clone()),
+                UserContent::ToolResult(result) => Some(result.call.to_string()),
                 _ => None,
             })
             .expect("tool_result id"),
@@ -1130,7 +1125,24 @@ fn tool_result_provider_call_id(msg: &Message) -> Option<String> {
     use rig::message::UserContent;
     match msg {
         Message::User { content } => content.iter().find_map(|part| match part {
-            UserContent::ToolResult(result) => result.call_id.clone(),
+            UserContent::ToolResult(result) => result
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
+            _ => None,
+        }),
+        _ => panic!("expected a tool_result user message"),
+    }
+}
+
+fn tool_result_provider_item_id(msg: &Message) -> Option<String> {
+    use rig::message::UserContent;
+    match msg {
+        Message::User { content } => content.iter().find_map(|part| match part {
+            UserContent::ToolResult(result) => result
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone()),
             _ => None,
         }),
         _ => panic!("expected a tool_result user message"),
@@ -1154,6 +1166,7 @@ fn single_noninteractive_completion(
     SingleNoninteractiveCompletion {
         child_agent: "explore".to_string(),
         task_call_id: task_call_id.to_string(),
+        task_provider_item_id: None,
         task_function_call_id: Some(format!("fn-{task_call_id}")),
         report: report.to_string(),
         failed: false,

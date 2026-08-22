@@ -20,11 +20,13 @@ use super::catalog::{
 use super::dto::NormalizedPrompt;
 use super::preflight::{PreflightInput, PreflightReference, preflight};
 use super::response::{DecodeLimit, parse_response};
+use super::test_support::UnresolvablePlanSource;
 use super::wire::{encode_generation, encode_multipart};
 use super::{
     OpenaiImagesAdapter, OpenaiImagesAttemptInput, OpenaiImagesRoute, OpenaiImagesTransport,
-    TransportError, TransportOutcome, openai_images_adapter_sealed,
+    openai_images_adapter_sealed,
 };
+use crate::image_generation::transport::{ProviderTransportError, ProviderTransportOutcome};
 use crate::image_generation_job::ImageGenerationHandoffResult;
 
 // ---------------------------------------------------------------------------
@@ -810,12 +812,12 @@ fn response_fewer_than_planned_is_missing_slots() {
 // ---------------------------------------------------------------------------
 
 struct ScriptedTransport {
-    outcomes: Mutex<Vec<Result<TransportOutcome, TransportError>>>,
+    outcomes: Mutex<Vec<Result<ProviderTransportOutcome, ProviderTransportError>>>,
     submissions: Mutex<Vec<(OpenaiImagesRoute, String, Vec<u8>)>>,
 }
 
 impl ScriptedTransport {
-    fn new(outcomes: Vec<Result<TransportOutcome, TransportError>>) -> Self {
+    fn new(outcomes: Vec<Result<ProviderTransportOutcome, ProviderTransportError>>) -> Self {
         Self {
             outcomes: Mutex::new(outcomes),
             submissions: Mutex::new(Vec::new()),
@@ -835,7 +837,7 @@ impl OpenaiImagesTransport for ScriptedTransport {
         route: OpenaiImagesRoute,
         content_type: &str,
         body: &[u8],
-    ) -> Result<TransportOutcome, TransportError> {
+    ) -> Result<ProviderTransportOutcome, ProviderTransportError> {
         self.submissions
             .lock()
             .unwrap()
@@ -849,7 +851,13 @@ impl OpenaiImagesTransport for ScriptedTransport {
 }
 
 fn adapter(transport: ScriptedTransport) -> OpenaiImagesAdapter {
-    OpenaiImagesAdapter::new(Arc::new(transport), DecodeLimit::canonical())
+    // The `attempt`-based tests never call `handoff`, so the plan source is
+    // unused; a never-resolving one keeps construction honest.
+    OpenaiImagesAdapter::new(
+        Arc::new(transport),
+        Arc::new(UnresolvablePlanSource::new("attempt-only")),
+        DecodeLimit::canonical(),
+    )
 }
 
 fn generation_attempt_input(idem: &str) -> OpenaiImagesAttemptInput {
@@ -859,39 +867,51 @@ fn generation_attempt_input(idem: &str) -> OpenaiImagesAttemptInput {
 }
 
 #[tokio::test]
-async fn transport_pre_handoff_reset_is_definitive_rejection() {
-    let transport = ScriptedTransport::new(vec![Err(TransportError::PreHandoffReset)]);
-    let adapter = adapter(transport);
-    let input = generation_attempt_input("idem-pre");
-    let (result, parsed) = adapter.attempt(&input).await;
-    assert!(parsed.is_none());
-    match result {
-        ImageGenerationHandoffResult::DefinitivelyRejected { evidence } => {
-            let text = String::from_utf8_lossy(&evidence);
-            assert!(text.contains("pre_handoff_reset"));
+async fn transport_pre_handoff_connect_is_definitive_rejection() {
+    // A pre-handoff Connect/Tls failure proves no byte was accepted, so the
+    // adapter reports a definitive rejection (safe to resubmit).
+    for pre_handoff in [ProviderTransportError::Connect, ProviderTransportError::Tls] {
+        let transport = ScriptedTransport::new(vec![Err(pre_handoff)]);
+        let adapter = adapter(transport);
+        let input = generation_attempt_input("idem-pre");
+        let (result, parsed) = adapter.attempt(&input).await;
+        assert!(parsed.is_none());
+        match result {
+            ImageGenerationHandoffResult::DefinitivelyRejected { evidence } => {
+                let text = String::from_utf8_lossy(&evidence);
+                assert!(text.contains("pre_handoff_no_byte_accepted"));
+            }
+            other => panic!("expected DefinitivelyRejected, got {other:?}"),
         }
-        other => panic!("expected DefinitivelyRejected, got {other:?}"),
     }
 }
 
 #[tokio::test]
 async fn transport_post_handoff_ambiguous_is_submission_unknown() {
-    let transport = ScriptedTransport::new(vec![Err(TransportError::PostHandoffAmbiguous)]);
-    let adapter = adapter(transport);
-    let input = generation_attempt_input("idem-amb");
-    let (result, _) = adapter.attempt(&input).await;
-    match result {
-        ImageGenerationHandoffResult::SubmissionUnknown { evidence } => {
-            let text = String::from_utf8_lossy(&evidence);
-            assert!(text.contains("post_handoff_ambiguous"));
+    // Both a post-handoff Timeout and an AmbiguousAcceptance map to
+    // SubmissionUnknown: the request bytes were written, so the outcome must be
+    // reconciled rather than assumed rejected.
+    for ambiguous in [
+        ProviderTransportError::Timeout,
+        ProviderTransportError::AmbiguousAcceptance,
+    ] {
+        let transport = ScriptedTransport::new(vec![Err(ambiguous)]);
+        let adapter = adapter(transport);
+        let input = generation_attempt_input("idem-amb");
+        let (result, _) = adapter.attempt(&input).await;
+        match result {
+            ImageGenerationHandoffResult::SubmissionUnknown { evidence } => {
+                let text = String::from_utf8_lossy(&evidence);
+                assert!(text.contains("post_handoff_ambiguous"));
+            }
+            other => panic!("expected SubmissionUnknown, got {other:?}"),
         }
-        other => panic!("expected SubmissionUnknown, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn transport_definitive_rejection_is_definitive_rejection() {
-    let transport = ScriptedTransport::new(vec![Err(TransportError::DefinitivelyRejected {
+async fn transport_definitive_status_is_definitive_rejection() {
+    let transport = ScriptedTransport::new(vec![Err(ProviderTransportError::Status {
         status: 401,
         body: Vec::new(),
     })]);
@@ -905,12 +925,27 @@ async fn transport_definitive_rejection_is_definitive_rejection() {
 }
 
 #[tokio::test]
+async fn transport_body_limit_is_definitive_rejection() {
+    let transport = ScriptedTransport::new(vec![Err(ProviderTransportError::BodyLimit)]);
+    let adapter = adapter(transport);
+    let input = generation_attempt_input("idem-body-limit");
+    let (result, _) = adapter.attempt(&input).await;
+    match result {
+        ImageGenerationHandoffResult::DefinitivelyRejected { evidence } => {
+            let text = String::from_utf8_lossy(&evidence);
+            assert!(text.contains("body_limit"));
+        }
+        other => panic!("expected DefinitivelyRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn transport_stable_request_identity_for_same_idempotency() {
     let b64 = one_pixel_png_base64();
     let body = response_body(&b64);
     let transport = ScriptedTransport::new(vec![
-        Ok(TransportOutcome { status: 200, body }),
-        Ok(TransportOutcome {
+        Ok(ProviderTransportOutcome { status: 200, body }),
+        Ok(ProviderTransportOutcome {
             status: 200,
             body: response_body(&b64),
         }),
@@ -938,7 +973,7 @@ async fn transport_no_duplicate_paid_submission_on_post_handoff_ambiguous() {
     // NOT retry. The scripted transport has exactly one outcome; if the
     // adapter retried, the second pop would panic. The test passing (no panic)
     // proves a single submission.
-    let transport = ScriptedTransport::new(vec![Err(TransportError::PostHandoffAmbiguous)]);
+    let transport = ScriptedTransport::new(vec![Err(ProviderTransportError::AmbiguousAcceptance)]);
     let adapter = adapter(transport);
     let input = generation_attempt_input("idem-no-dup");
     let (result, _) = adapter.attempt(&input).await;
@@ -952,9 +987,14 @@ async fn transport_no_duplicate_paid_submission_on_post_handoff_ambiguous() {
 async fn transport_records_exactly_one_submission_per_attempt() {
     let b64 = one_pixel_png_base64();
     let body = response_body(&b64);
-    let transport = ScriptedTransport::new(vec![Ok(TransportOutcome { status: 200, body })]);
+    let transport =
+        ScriptedTransport::new(vec![Ok(ProviderTransportOutcome { status: 200, body })]);
     let recorded = Arc::new(transport);
-    let adapter = OpenaiImagesAdapter::new(recorded.clone(), DecodeLimit::canonical());
+    let adapter = OpenaiImagesAdapter::new(
+        recorded.clone(),
+        Arc::new(UnresolvablePlanSource::new("attempt-only")),
+        DecodeLimit::canonical(),
+    );
     let input = generation_attempt_input("idem-count");
     let (_result, _) = adapter.attempt(&input).await;
     let submissions = recorded.submissions();
@@ -967,7 +1007,8 @@ async fn transport_records_exactly_one_submission_per_attempt() {
 async fn transport_accepted_with_valid_output_returns_parsed_response() {
     let b64 = one_pixel_png_base64();
     let body = response_body(&b64);
-    let transport = ScriptedTransport::new(vec![Ok(TransportOutcome { status: 200, body })]);
+    let transport =
+        ScriptedTransport::new(vec![Ok(ProviderTransportOutcome { status: 200, body })]);
     let adapter = adapter(transport);
     let input = generation_attempt_input("idem-ok");
     let (result, parsed) = adapter.attempt(&input).await;
@@ -985,7 +1026,8 @@ async fn transport_accepted_with_invalid_output_is_accepted_handoff() {
     // is Accepted (spend committed), with redacted evidence.
     let bogus = base64::engine::general_purpose::STANDARD.encode(b"not a png");
     let body = response_body(&bogus);
-    let transport = ScriptedTransport::new(vec![Ok(TransportOutcome { status: 200, body })]);
+    let transport =
+        ScriptedTransport::new(vec![Ok(ProviderTransportOutcome { status: 200, body })]);
     let adapter = adapter(transport);
     let input = generation_attempt_input("idem-invalid");
     let (result, parsed) = adapter.attempt(&input).await;
@@ -1005,7 +1047,8 @@ async fn transport_accepted_with_invalid_output_is_accepted_handoff() {
 async fn evidence_excludes_credentials_and_reference_bytes() {
     let b64 = one_pixel_png_base64();
     let body = response_body(&b64);
-    let transport = ScriptedTransport::new(vec![Ok(TransportOutcome { status: 200, body })]);
+    let transport =
+        ScriptedTransport::new(vec![Ok(ProviderTransportOutcome { status: 200, body })]);
     let adapter = adapter(transport);
     let mut input = gpt_image_15_input();
     input.prompt = "secret-prompt-do-not-leak".into();

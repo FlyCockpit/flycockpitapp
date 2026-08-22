@@ -45,7 +45,7 @@ pub fn prune_completed_delegation_prompts_with_upcoming(
             let AssistantContent::ToolCall(tc) = part else {
                 continue;
             };
-            if !completed.contains(&tc.id) {
+            if !completed.contains(tc.id.as_str()) {
                 continue;
             }
             changed += prune_tool_call(tc);
@@ -60,7 +60,7 @@ fn collect_tool_result_ids(msg: &Message, out: &mut HashSet<String>) {
     };
     for part in content.iter() {
         if let UserContent::ToolResult(tr) = part {
-            out.insert(tr.id.clone());
+            out.insert(tr.call.to_string());
         }
     }
 }
@@ -76,12 +76,12 @@ fn prune_tool_call(tc: &mut ToolCall) -> usize {
 fn prune_task_call(tc: &mut ToolCall) -> usize {
     if let Some(payload) = tc.function.arguments.get_mut("payload") {
         if payload.is_object() {
-            return prune_prompt_value(payload, &tc.id);
+            return prune_prompt_value(payload, tc.id.as_str());
         }
         if let Some(items) = payload.as_array_mut() {
             return items
                 .iter_mut()
-                .map(|entry| prune_prompt_value(entry, &tc.id))
+                .map(|entry| prune_prompt_value(entry, tc.id.as_str()))
                 .sum();
         }
     }
@@ -91,7 +91,7 @@ fn prune_task_call(tc: &mut ToolCall) -> usize {
         .get_mut("delegate")
         .filter(|value| value.is_object())
     {
-        return prune_prompt_value(delegate, &tc.id);
+        return prune_prompt_value(delegate, tc.id.as_str());
     }
     if let Some(items) = tc
         .function
@@ -101,7 +101,7 @@ fn prune_task_call(tc: &mut ToolCall) -> usize {
     {
         return items
             .iter_mut()
-            .map(|entry| prune_prompt_value(entry, &tc.id))
+            .map(|entry| prune_prompt_value(entry, tc.id.as_str()))
             .sum();
     }
     if let Some(items) = tc
@@ -112,14 +112,14 @@ fn prune_task_call(tc: &mut ToolCall) -> usize {
     {
         return items
             .iter_mut()
-            .map(|entry| prune_prompt_value(entry, &tc.id))
+            .map(|entry| prune_prompt_value(entry, tc.id.as_str()))
             .sum();
     }
     prune_single_prompt_call(tc)
 }
 
 fn prune_single_prompt_call(tc: &mut ToolCall) -> usize {
-    prune_prompt_value(&mut tc.function.arguments, &tc.id)
+    prune_prompt_value(&mut tc.function.arguments, tc.id.as_str())
 }
 
 fn prune_prompt_value(args: &mut Value, call_id: &str) -> usize {
@@ -145,7 +145,6 @@ fn prune_prompt_value(args: &mut Value, call_id: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::message::OneOrMany;
     use rig::message::ToolFunction;
     use serde_json::json;
 
@@ -160,21 +159,27 @@ mod tests {
     fn assistant_call(id: &str, name: &str, arguments: Value) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: id.to_string(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+                provider: None,
                 function: ToolFunction {
                     name: name.to_string(),
                     arguments,
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }
     }
 
     fn result(id: &str) -> Message {
-        Message::tool_result_with_call_id(id.to_string(), None, "done".to_string())
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            id.to_string(),
+            None,
+            None,
+            "task",
+            "done".to_string(),
+        )
     }
 
     fn first_call_args(msg: &Message) -> Value {
@@ -275,7 +280,13 @@ mod tests {
                     }
                 }),
             ),
-            Message::tool_result_with_call_id("task-1".to_string(), None, report.to_string()),
+            crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                "task-1".to_string(),
+                None,
+                None,
+                "task",
+                report.to_string(),
+            ),
         ];
 
         assert_eq!(prune_completed_delegation_prompts(&mut history), 1);

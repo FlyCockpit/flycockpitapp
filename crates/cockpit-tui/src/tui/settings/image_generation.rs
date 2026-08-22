@@ -201,10 +201,11 @@ pub(crate) enum BudgetScopeKind {
 /// `(Finite|Unlimited, positive-generation)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BudgetScopeRow {
+    /// The non-lossy budget policy. A `Finite` policy carries its `usd_micros`
+    /// amount directly (no side-channel amount field), matching the
+    /// spend-ledger / control-plane wire DTO.
     pub policy: cockpit_core::image_generation_control_plane::BudgetPolicy,
     pub generation: Option<String>,
-    /// Editable USD micros suggestion (non-authoritative until confirmed).
-    pub suggestion_usd_micros: Option<u64>,
 }
 
 impl BudgetScopeRow {
@@ -212,7 +213,6 @@ impl BudgetScopeRow {
         Self {
             policy: cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured,
             generation: None,
-            suggestion_usd_micros: None,
         }
     }
 }
@@ -273,9 +273,9 @@ impl BudgetEditorState {
             BudgetScopeKind::Session => &mut self.session,
             BudgetScopeKind::Project => &mut self.project,
         };
-        row.policy = cockpit_core::image_generation_control_plane::BudgetPolicy::Finite;
+        row.policy =
+            cockpit_core::image_generation_control_plane::BudgetPolicy::Finite { usd_micros };
         row.generation = Some("1".to_string());
-        row.suggestion_usd_micros = Some(usd_micros);
         self.blocks_paid_generation = false;
     }
 
@@ -1272,7 +1272,9 @@ impl SettingsPage for BudgetEditorPage {
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured => {
                     "Unconfigured"
                 }
-                cockpit_core::image_generation_control_plane::BudgetPolicy::Finite => "Finite",
+                cockpit_core::image_generation_control_plane::BudgetPolicy::Finite { .. } => {
+                    "Finite"
+                }
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unlimited => {
                     "Unlimited"
                 }
@@ -1281,7 +1283,9 @@ impl SettingsPage for BudgetEditorPage {
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured => {
                     "Unconfigured"
                 }
-                cockpit_core::image_generation_control_plane::BudgetPolicy::Finite => "Finite",
+                cockpit_core::image_generation_control_plane::BudgetPolicy::Finite { .. } => {
+                    "Finite"
+                }
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unlimited => {
                     "Unlimited"
                 }
@@ -2170,7 +2174,9 @@ mod tests {
         state.set_finite(BudgetScopeKind::Session, 10_000_000);
         assert_eq!(
             state.session.policy,
-            cockpit_core::image_generation_control_plane::BudgetPolicy::Finite
+            cockpit_core::image_generation_control_plane::BudgetPolicy::Finite {
+                usd_micros: 10_000_000
+            }
         );
         assert!(!state.blocks_paid_generation);
         state.set_unlimited(BudgetScopeKind::Project);

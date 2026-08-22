@@ -24,6 +24,11 @@ pub enum RelayGrantScope {
     Agent,
     AgentReadonly,
     ProjectFiles,
+    /// Image-generation management authority (foundation capability
+    /// ordinal 15). Maps to `PrincipalScope::ImageGenerationAdmin` and, like
+    /// its principal counterpart, confers no terminal/agent/project-file
+    /// authority; it is only ever honored bound to an exact canonical project.
+    ImageGenerationAdmin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +620,41 @@ mod tests {
             }
             IncomingRelayFrame::System(_) => panic!("expected client frame"),
             IncomingRelayFrame::Unknown { .. } => panic!("expected client frame"),
+        }
+    }
+
+    #[test]
+    fn relay_grant_scope_image_generation_admin_roundtrips_snake_case() {
+        // The unified image-admin scope is a wire-representable relay grant
+        // scope that round-trips through the canonical snake_case string.
+        assert_eq!(
+            serde_json::to_string(&RelayGrantScope::ImageGenerationAdmin).unwrap(),
+            "\"image_generation_admin\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RelayGrantScope>("\"image_generation_admin\"").unwrap(),
+            RelayGrantScope::ImageGenerationAdmin
+        );
+        // A stamped client frame carrying the new scope parses through the real
+        // production entry point.
+        let raw = r#"{
+          "v": 1,
+          "channelId": "ch-1",
+          "from": "client",
+          "principal": {
+            "userId": "user-1",
+            "grants": [{ "scope": "image_generation_admin", "projectRoot": "/workspace/app" }]
+          },
+          "payload": { "kind": "req" }
+        }"#;
+        match parse_incoming(raw).unwrap() {
+            IncomingRelayFrame::Client(frame) => {
+                assert_eq!(
+                    frame.principal.grants[0].scope,
+                    RelayGrantScope::ImageGenerationAdmin
+                );
+            }
+            _ => panic!("expected client frame"),
         }
     }
 

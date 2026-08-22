@@ -249,7 +249,7 @@ impl Driver {
         skill_name: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
-        use crate::engine::message::{AssistantContent, Message, OneOrMany, ToolCall};
+        use crate::engine::message::{AssistantContent, Message, ToolCall};
         use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
 
         let agent = self.stack.last().expect("stack never empty").agent.clone();
@@ -438,9 +438,12 @@ impl Driver {
         // native pair so the next inference carries the skill body. Pushed as
         // a fresh assistant turn (carrying just this call) followed by its
         // tool_result — well-formed regardless of what preceded it.
+        // Preserve one exact Rig correlation handle across the synthesized
+        // call/result pair; `call_id` remains available for durable ownership.
+        let rig_call_id = rig::message::ToolCallId::new_or_mint(call_id.clone());
         let call = ToolCall {
-            id: call_id.clone(),
-            call_id: provider_call_id.clone(),
+            id: rig_call_id.clone(),
+            provider: (provider_call_id.clone()).and_then(rig::message::ProviderCallId::new),
             function: ToolFunction {
                 name: "skill".to_string(),
                 arguments: args,
@@ -451,14 +454,15 @@ impl Driver {
         let history = &mut self.stack.last_mut().expect("stack never empty").history;
         history.push(Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(call)),
+            content: vec![AssistantContent::ToolCall(call)],
         });
         history.push(Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: call_id.clone(),
-                call_id: provider_call_id,
-                content: OneOrMany::one(ToolResultContent::text(body)),
-            })),
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig_call_id,
+                provider: provider_call_id.and_then(rig::message::ProviderCallId::new),
+                name: "skill".to_string(),
+                content: vec![ToolResultContent::text(body)],
+            })],
         });
 
         // Record ownership so a later primary swap can strip this pair if the

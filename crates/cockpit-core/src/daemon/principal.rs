@@ -114,6 +114,21 @@ pub enum PrincipalScope {
     Agent,
     AgentReadonly,
     ProjectFiles,
+    /// Image-generation management authority (foundation capability
+    /// ordinal 15).
+    ///
+    /// This scope carries NO terminal, agent, agent-readonly, or project-file
+    /// authority: the daemon's principal helpers (`has_scope`,
+    /// `has_project_scope`, `can_agent_*`, `has_project_files`, `has_terminal`)
+    /// only ever query the four access scopes, so an `ImageGenerationAdmin`
+    /// grant is inert through every one of them — it can never be mistaken for
+    /// terminal/agent/file access. Its authority is enforced solely by the
+    /// image-generation control plane, and only for the exact canonical
+    /// project it is bound to: a grant carrying this scope is valid only with
+    /// `project_root: Some(canonical_root)` (validated by
+    /// `crate::image_generation_control_plane::scope_project_root_is_valid`),
+    /// never inheriting the `None`-matches-any-project wildcard.
+    ImageGenerationAdmin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +262,12 @@ impl ClientPrincipal {
 impl PrincipalGrant {
     fn matches_project(&self, project_root: &str) -> bool {
         match self.project_root.as_deref() {
-            None => true,
+            // An `ImageGenerationAdmin` grant NEVER inherits the rootless
+            // wildcard: a missing root fails closed here rather than matching
+            // every project, even if such a grant were constructed directly
+            // (bypassing the mint/decode funnel). The four access scopes keep
+            // their reviewed instance-wide (`None`-matches-any) grant.
+            None => self.scope != PrincipalScope::ImageGenerationAdmin,
             Some(grant_root) => roots_equal(grant_root, project_root),
         }
     }
@@ -402,6 +422,66 @@ mod tests {
     }
 
     #[test]
+    fn image_generation_admin_scope_grants_no_terminal_agent_or_file_access() {
+        // AC1: `ImageGenerationAdmin` must NEVER imply terminal, agent, or
+        // project-file access through any principal helper. A remote grant
+        // carrying only this scope is inert through every access path, even
+        // when bound to the exact project it names and even with the rootless
+        // wildcard (`project_root: None`) that would widen an access scope.
+        for root in [Some("/workspace/app".to_string()), None] {
+            let admin = remote(PrincipalScope::ImageGenerationAdmin, root);
+            assert!(!admin.has_terminal(), "admin scope must not grant terminal");
+            assert!(
+                !admin.can_agent_write_project("/workspace/app"),
+                "admin scope must not grant agent write"
+            );
+            assert!(
+                !admin.can_agent_read_project("/workspace/app"),
+                "admin scope must not grant agent read"
+            );
+            assert!(
+                !admin.has_project_files("/workspace/app"),
+                "admin scope must not grant project files"
+            );
+            // It is also inert when queried directly for the four access scopes.
+            assert!(!admin.has_scope(PrincipalScope::Terminal));
+            assert!(!admin.has_project_scope(PrincipalScope::Agent, "/workspace/app"));
+            assert!(!admin.has_project_scope(PrincipalScope::AgentReadonly, "/workspace/app"));
+            assert!(!admin.has_project_scope(PrincipalScope::ProjectFiles, "/workspace/app"));
+        }
+    }
+
+    #[test]
+    fn rootless_image_generation_admin_grant_does_not_wildcard_match() {
+        // A directly-constructed `ImageGenerationAdmin` grant with no project
+        // root (bypassing the mint/decode funnel) must NOT inherit the
+        // `None`-matches-any-project wildcard: `has_project_scope` fails closed
+        // for it against every project, unlike a rootless access scope which
+        // legitimately grants instance-wide.
+        let rootless_admin = remote(PrincipalScope::ImageGenerationAdmin, None);
+        assert!(!rootless_admin.has_project_scope(PrincipalScope::ImageGenerationAdmin, "/any"));
+        assert!(
+            !rootless_admin
+                .has_project_scope(PrincipalScope::ImageGenerationAdmin, "/workspace/app")
+        );
+        // Contrast: a rootless ProjectFiles grant DOES match any project.
+        let rootless_files = remote(PrincipalScope::ProjectFiles, None);
+        assert!(rootless_files.has_project_scope(PrincipalScope::ProjectFiles, "/any"));
+    }
+
+    #[test]
+    fn image_generation_admin_scope_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PrincipalScope::ImageGenerationAdmin).unwrap(),
+            "\"image_generation_admin\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PrincipalScope>("\"image_generation_admin\"").unwrap(),
+            PrincipalScope::ImageGenerationAdmin
+        );
+    }
+
+    #[test]
     fn from_verified_remote_is_the_only_remote_constructor() {
         // After the standalone relay cutover, the legacy
         // `ClientPrincipal::from_relay` constructor is gone. The daemon
@@ -430,6 +510,12 @@ mod tests {
             "fs_stat",
             "get_host_capabilities",
             "get_image_spend_policy",
+            "image_endpoint_list",
+            "image_endpoint_get",
+            "image_target_list",
+            "image_target_get",
+            "image_workflow_list",
+            "image_workflow_get",
             "get_provider_catalog_snapshot",
             "get_run_invocation_status",
             "get_usage_counts",

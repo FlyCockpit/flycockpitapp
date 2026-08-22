@@ -748,6 +748,15 @@ pub enum Event {
         outcome: DefaultModelStandaloneOutcome,
     },
 
+    /// LOCAL image-generation control-plane `config_changed` replay event: a
+    /// config mutation (endpoint/target create/update/delete/set_default)
+    /// committed a new config generation. SECURITY: the carried
+    /// [`ImageControlEventV1`](crate::image_control::ImageControlEventV1) holds
+    /// only safe projections — never a raw credential, header, or workflow blob.
+    ImageControlConfigChanged {
+        event: crate::image_control::ImageControlEventV1,
+    },
+
     /// Model inference started. TUI shows `Thinking…` until the first
     /// `AssistantTextDelta` arrives.
     ThinkingStarted {
@@ -1638,6 +1647,7 @@ macro_rules! event_variants {
             (Event::ActiveModelState { .. }, "active_model_state");
             (Event::ModelSelectionResult { .. }, "model_selection_result");
             (Event::DefaultModelUpdateResult { .. }, "default_model_update_result");
+            (Event::ImageControlConfigChanged { .. }, "image_control_config_changed");
             (Event::ThinkingStarted { .. }, "thinking_started");
             (Event::Reconnecting { .. }, "reconnecting");
             (Event::InferenceWarning { .. }, "inference_warning");

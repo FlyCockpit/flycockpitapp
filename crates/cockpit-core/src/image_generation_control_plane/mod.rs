@@ -36,7 +36,7 @@ use cockpit_proto::remote_public_service_policy::{
     permission_ceiling_digest,
 };
 
-use crate::daemon::principal::ClientPrincipal;
+use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,48 +80,6 @@ pub const MAX_ADMIN_GRANTS_PER_TUPLE: usize = 1;
 /// The scope string for `ImageGenerationAdmin` in the hosted access-grant
 /// workflow.
 pub const IMAGE_GENERATION_ADMIN_SCOPE_STRING: &str = "image_generation_admin";
-
-// ---------------------------------------------------------------------------
-// ImageGenerationAdmin scope
-// ---------------------------------------------------------------------------
-
-/// The hosted access-grant scope for image-generation management authority.
-///
-/// Every grant carrying this scope is valid only with
-/// `project_root: Some(canonical_root)`; minting, decode, and daemon
-/// authorization reject a missing root rather than inheriting the existing
-/// `None`-matches-any-project behavior. It authorizes generation-management
-/// mutations only for that exact canonical project. It does not grant
-/// terminal, agent, project-file, session, artifact-byte, local-path, or
-/// provider-credential access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostedAccessScope {
-    Terminal,
-    Agent,
-    AgentReadonly,
-    ProjectFiles,
-    /// Image-generation management authority. Requires a nonnull canonical
-    /// project ID plus nonnull project root.
-    ImageGenerationAdmin,
-}
-
-impl HostedAccessScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Terminal => "terminal",
-            Self::Agent => "agent",
-            Self::AgentReadonly => "agent_readonly",
-            Self::ProjectFiles => "project_files",
-            Self::ImageGenerationAdmin => IMAGE_GENERATION_ADMIN_SCOPE_STRING,
-        }
-    }
-
-    /// Returns `true` if this scope requires a nonnull project root.
-    pub fn requires_project_root(self) -> bool {
-        matches!(self, Self::ImageGenerationAdmin)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Operation kind codec
@@ -951,24 +909,88 @@ pub fn legacy_grants_can_authorize_mutation(_principal: &ClientPrincipal) -> boo
     false
 }
 
-/// Check whether a hosted access grant scope requires a project root.
+/// Check whether a principal grant scope requires a project root.
 ///
 /// `ImageGenerationAdmin` requires a nonnull project root; every other scope
-/// retains its reviewed project-binding rules.
-pub fn scope_requires_project_root(scope: HostedAccessScope) -> bool {
-    scope.requires_project_root()
+/// retains its reviewed project-binding rules (root optional).
+pub fn scope_requires_project_root(scope: PrincipalScope) -> bool {
+    matches!(scope, PrincipalScope::ImageGenerationAdmin)
+}
+
+/// Whether a grant of `scope` carries a project root that satisfies the
+/// scope's binding requirement.
+///
+/// `ImageGenerationAdmin` REQUIRES a nonnull, nonempty root — it fails closed
+/// rather than inheriting the `None`-matches-any-project wildcard the four
+/// access scopes use. Every other scope keeps its reviewed project-binding
+/// rules, where a missing root is a legitimate instance-wide grant.
+///
+/// This is the single funnel every mint/decode path routes through so an
+/// image-admin grant can never be admitted rootless (see
+/// [`mint_image_admin_grant`] and the relay-wire decoder).
+pub fn scope_project_root_is_valid(scope: PrincipalScope, project_root: Option<&str>) -> bool {
+    if scope_requires_project_root(scope) {
+        project_root.map(|r| !r.is_empty()).unwrap_or(false)
+    } else {
+        true
+    }
 }
 
 /// Validate that an `ImageGenerationAdmin` grant has a nonnull project root.
 ///
 /// Returns `false` if the root is missing — the existing rootless wildcard
 /// never applies for this scope.
-pub fn validate_admin_grant_root(scope: HostedAccessScope, project_root: Option<&str>) -> bool {
-    if scope.requires_project_root() {
-        project_root.map(|r| !r.is_empty()).unwrap_or(false)
-    } else {
-        true
+pub fn validate_admin_grant_root(scope: PrincipalScope, project_root: Option<&str>) -> bool {
+    scope_project_root_is_valid(scope, project_root)
+}
+
+/// Mint an `ImageGenerationAdmin` principal grant, failing closed when the
+/// project root is missing or empty.
+///
+/// An image-admin grant NEVER inherits the `None`-matches-any-project
+/// wildcard: minting requires `project_root: Some(canonical_root)`. The root
+/// is normalized through the canonical project-identity form the daemon's
+/// authorization layer trusts ([`crate::secret_ownership::canonical_owner_root`],
+/// itself anchored on [`crate::daemon::fs_api::canonical_project_root`]), so two
+/// spellings of the same project mint one binding.
+pub fn mint_image_admin_grant(
+    project_root: Option<&str>,
+) -> Result<PrincipalGrant, ImageControlErrorCode> {
+    match project_root {
+        Some(root) if !root.is_empty() => Ok(PrincipalGrant {
+            scope: PrincipalScope::ImageGenerationAdmin,
+            project_root: Some(crate::secret_ownership::canonical_owner_root(root)),
+        }),
+        _ => Err(ImageControlErrorCode::Forbidden),
     }
+}
+
+/// AC13: resolve whether an admin grant's project root binds the target
+/// project by CANONICAL project identity, not raw string equality.
+///
+/// Two path spellings of the same project (trailing slash, symlinked, or
+/// otherwise non-canonical) normalize to one binding, while a different
+/// project can never match through a string-prefix trick (`/workspace/app`
+/// does not bind `/workspace/app-evil`). Both roots are normalized through the
+/// same canonical form the daemon's authz layer anchors on
+/// ([`crate::secret_ownership::canonical_owner_root`] →
+/// [`crate::daemon::fs_api::canonical_project_root`]); this module invents no
+/// canonicalizer of its own.
+///
+/// Fails closed on a missing or empty grant root — an image-admin binding is
+/// never rootless.
+pub fn admin_grant_root_matches_project(
+    grant_root: Option<&str>,
+    target_project_root: &str,
+) -> bool {
+    let Some(root) = grant_root else {
+        return false;
+    };
+    if root.is_empty() {
+        return false;
+    }
+    crate::secret_ownership::canonical_owner_root(root)
+        == crate::secret_ownership::canonical_owner_root(target_project_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,14 +1367,15 @@ pub fn validate_config_change_set(changes: &[ConfigChange]) -> bool {
 // Budget scope
 // ---------------------------------------------------------------------------
 
-/// The budget policy DTO (dependency-owned `Unconfigured|Finite|Unlimited`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BudgetPolicy {
-    Unconfigured,
-    Finite,
-    Unlimited,
-}
+/// The budget policy DTO. This is the single non-lossy spend-ledger type
+/// (`Unconfigured | Finite { usd_micros } | Unlimited`), re-exported so the
+/// control-plane wire, the spend ledger, and the FCOR
+/// `ImageSpendSettings` encoder all share exactly one representation. A
+/// `Finite` policy is uninhabitable without a positive `usd_micros`, and its
+/// custom `Deserialize` rejects `usd_micros: 0`, so a lossy amount-free
+/// `Finite` cannot cross this wire. `Unconfigured` is a distinct variant and
+/// can never be smuggled as a `Finite` with an absent/zero amount.
+pub use cockpit_config::config::image_spend::BudgetPolicy;
 
 /// `ImageBudgetSafeV1` scope-nullability contract.
 ///
@@ -1373,9 +1396,11 @@ impl BudgetScopeProjection {
         }
     }
 
-    pub fn finite(generation: String) -> Self {
+    /// A `Finite` projection carries the non-lossy `usd_micros` amount from the
+    /// spend-ledger DTO alongside its positive generation.
+    pub fn finite(usd_micros: u64, generation: String) -> Self {
         Self {
-            policy: BudgetPolicy::Finite,
+            policy: BudgetPolicy::Finite { usd_micros },
             generation: Some(generation),
         }
     }
@@ -1388,11 +1413,16 @@ impl BudgetScopeProjection {
     }
 
     /// Validate the nullability contract: `Unconfigured` requires null
-    /// generation; `Finite|Unlimited` requires positive generation.
+    /// generation; `Finite|Unlimited` requires positive generation. A `Finite`
+    /// additionally requires a positive `usd_micros` amount, mirroring the
+    /// spend-ledger deserializer that rejects `usd_micros: 0`, so a zero-amount
+    /// `Finite` built directly in memory is rejected exactly as it is on the
+    /// wire.
     pub fn validate(&self) -> bool {
         match self.policy {
             BudgetPolicy::Unconfigured => self.generation.is_none(),
-            BudgetPolicy::Finite | BudgetPolicy::Unlimited => self
+            BudgetPolicy::Finite { usd_micros: 0 } => false,
+            BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited => self
                 .generation
                 .as_ref()
                 .map(|g| validate_canonical_decimal(g) && g != "0")
@@ -1416,8 +1446,11 @@ pub fn validate_budget_set_pair(
     match (policy, expected_generation) {
         (None, None) => true,                           // unchanged
         (Some(BudgetPolicy::Unconfigured), _) => false, // Unconfigured in a save rejects
-        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), None) => true, // create generation 1
-        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), Some(generation)) => {
+        // A zero-amount `Finite` is not a savable policy (matches the wire
+        // deserializer), even when constructed directly in memory.
+        (Some(BudgetPolicy::Finite { usd_micros: 0 }), _) => false,
+        (Some(BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited), None) => true, // create generation 1
+        (Some(BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited), Some(generation)) => {
             validate_canonical_decimal(generation) && generation != "0" // CAS-update
         }
         (None, Some(_)) => false, // half-present tuple rejects

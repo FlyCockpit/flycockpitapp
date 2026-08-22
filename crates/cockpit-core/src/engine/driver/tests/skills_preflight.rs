@@ -57,13 +57,19 @@ async fn seed_forced_skill_records_and_folds_a_real_skill_call() {
         })
         .expect("the skill call's tool_result was folded in");
     assert_eq!(
-        assistant_skill_call.call_id.as_deref(),
+        assistant_skill_call
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
         Some(assistant_skill_call.id.as_str()),
         "synthetic Responses calls use the cockpit call id as provider call id"
     );
-    assert_eq!(tool_result.id, assistant_skill_call.id);
+    assert_eq!(tool_result.call, assistant_skill_call.id);
     assert_eq!(
-        tool_result.call_id.as_deref(),
+        tool_result
+            .provider
+            .as_ref()
+            .map(|provider| provider.call_id.as_str()),
         Some(assistant_skill_call.id.as_str()),
         "tool_result must carry the same synthetic provider call id"
     );

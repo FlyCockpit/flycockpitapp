@@ -172,7 +172,7 @@ pub fn files_changed_from_history(history: &[Message]) -> Vec<FileEdit> {
             };
             let hash = super::compact::arg_hash(&tc.function.arguments).or_else(|| {
                 outputs
-                    .get(&tc.id)
+                    .get(tc.id.as_str())
                     .and_then(|o| super::compact::hash_from_output(o))
             });
             super::compact::record_edit(&mut edited, path, hash);
@@ -202,7 +202,7 @@ fn tool_result_outputs(history: &[Message]) -> std::collections::HashMap<String,
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                out.insert(tr.id.clone(), text);
+                out.insert(tr.call.to_string(), text);
             }
         }
     }
@@ -220,34 +220,39 @@ fn string_field(args: &Value, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::OneOrMany;
     use rig::message::{ToolCall, ToolFunction};
     use serde_json::json;
 
     fn assistant_write(id: &str, path: &str) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: id.to_string(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+                provider: None,
                 function: ToolFunction {
                     name: "write".to_string(),
                     arguments: json!({ "path": path }),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }
     }
 
     fn tool_result(id: &str, output: &str) -> Message {
-        Message::tool_result_with_call_id(id.to_string(), None, output.to_string())
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            id.to_string(),
+            None,
+            None,
+            "write",
+            output.to_string(),
+        )
     }
 
     fn assistant_text(text: &str) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::text(text)),
+            content: vec![AssistantContent::text(text)],
         }
     }
 

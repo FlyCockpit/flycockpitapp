@@ -327,7 +327,7 @@ pub(crate) async fn execute_ordinary_call(
         .tx
         .send(TurnEvent::ToolStart {
             agent: env.agent.name.clone(),
-            call_id: tc.id.clone(),
+            call_id: tc.id.to_string(),
             tool: resolved_name.to_string(),
             args: args.clone(),
         })
@@ -394,17 +394,26 @@ pub(crate) async fn execute_ordinary_call(
     // evaluated for schema-valid, non-loop-rejected gated calls.
     let replay_gate_memo = crate::engine::interrupt::current_interrupt_park_payload()
         .filter(|payload| {
-            payload.tool == resolved_name && payload.args == args && payload.call_id == tc.id
+            payload.tool == resolved_name
+                && payload.args == args
+                && payload.call_id == tc.id.as_str()
         })
         .and_then(|payload| payload.gate);
     let base_park_payload = InterruptParkPayload {
         tool: resolved_name.to_string(),
         args: args.clone(),
-        call_id: tc.id.clone(),
+        call_id: tc.id.to_string(),
         resume: InterruptResumeAnchor {
             agent_id: env.agent.name.clone(),
-            call_id: tc.id.clone(),
-            provider_call_id: tc.call_id.clone(),
+            call_id: tc.id.to_string(),
+            provider_item_id: tc
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.clone()),
+            provider_call_id: tc
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.clone()),
             assistant_seq: None,
             call_origin: env.ctx.skill_write_origin,
         },
@@ -656,11 +665,18 @@ pub(crate) async fn execute_ordinary_call(
         let payload = InterruptParkPayload {
             tool: resolved_name.to_string(),
             args: args.clone(),
-            call_id: tc.id.clone(),
+            call_id: tc.id.to_string(),
             resume: InterruptResumeAnchor {
                 agent_id: env.agent.name.clone(),
-                call_id: tc.id.clone(),
-                provider_call_id: tc.call_id.clone(),
+                call_id: tc.id.to_string(),
+                provider_item_id: tc
+                    .provider
+                    .as_ref()
+                    .and_then(|provider| provider.item_id.clone()),
+                provider_call_id: tc
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.call_id.clone()),
                 assistant_seq,
                 call_origin: env.ctx.skill_write_origin,
             },
@@ -1009,6 +1025,17 @@ pub(crate) async fn execute_ordinary_call(
     let providers = env.ctx.config.providers();
     let active_provider = env.session.active_provider();
     let active_model = env.session.active_model();
+    // Responses has two durable provider handles: its output-item id (`fc_…`)
+    // and its result-correlation call id (`call_…`). Rig keeps the former on
+    // `provider.item_id` and exposes the latter as `tc.id`; store the output
+    // item whenever it exists. Single-id/no-item wires retain the correlation
+    // handle as the only available item fallback, while `provider.call_id`
+    // below remains a separate durable field.
+    let provider_item_id = tc
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.item_id.clone())
+        .unwrap_or_else(|| tc.id.to_string());
     // Journal (or fail-closed scrub) the co-persisted audit row against the SAME
     // pinned `tool_frame()` the timeline events use — one frame drives both the
     // ToolCall event and this audit row, so they classify against identical
@@ -1022,7 +1049,7 @@ pub(crate) async fn execute_ordinary_call(
                 event_id: Uuid::new_v4(),
                 timestamp: Utc::now(),
                 agent: env.agent.name.clone(),
-                call_id: tc.id.clone(),
+                call_id: tc.id.to_string(),
                 parent_call_id: None,
                 parent_child_index: None,
                 identity: crate::session::ToolCallProviderIdentity::from_provider_call(
@@ -1030,8 +1057,10 @@ pub(crate) async fn execute_ordinary_call(
                     active_model.as_deref(),
                     Some(&providers),
                     Some(env.model.current_wire_api()),
-                    tc.id.clone(),
-                    tc.call_id.clone(),
+                    provider_item_id,
+                    tc.provider
+                        .as_ref()
+                        .map(|provider| provider.call_id.clone()),
                 ),
                 tool: resolved_name.to_string(),
                 path: tool_path,
@@ -1163,7 +1192,7 @@ pub(crate) async fn execute_ordinary_call(
             .tx
             .send(TurnEvent::ToolError {
                 agent: env.agent.name.clone(),
-                call_id: tc.id.clone(),
+                call_id: tc.id.to_string(),
                 tool: resolved_name.to_string(),
                 error: event_data["output"].as_str().unwrap_or("").to_string(),
                 kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
@@ -1175,7 +1204,7 @@ pub(crate) async fn execute_ordinary_call(
             .tx
             .send(TurnEvent::ToolEnd {
                 agent: env.agent.name.clone(),
-                call_id: tc.id.clone(),
+                call_id: tc.id.to_string(),
                 tool: resolved_name.to_string(),
                 output: event_data["output"].as_str().unwrap_or("").to_string(),
                 truncated,
@@ -1326,7 +1355,11 @@ pub(crate) async fn execute_ordinary_call(
     if loop_guard_reject {
         collapse_loop_run(history, &args, resolved_name);
     }
-    history.push(tool_result_message(tc, wire_output));
+    history.push(crate::engine::message::tool_result_message_for(
+        tc,
+        resolved_name,
+        wire_output,
+    ));
     Ok(())
 }
 
@@ -1335,7 +1368,6 @@ mod tests {
     use super::*;
     use crate::approval::{Approver, store::GrantStore};
     use crate::config::extended::ApprovalMode;
-    use crate::engine::message::OneOrMany;
     use crate::engine::tool::Tool as _;
     use async_trait::async_trait;
     use rig::message::{AssistantContent, ToolFunction, ToolResultContent, UserContent};
@@ -1851,8 +1883,8 @@ mod tests {
 
     fn tool_call(name: &str, args: Value) -> ToolCall {
         ToolCall {
-            id: "call-1".to_string(),
-            call_id: Some("provider-call-1".to_string()),
+            id: rig::message::ToolCallId::new_or_mint("call-1".to_string()),
+            provider: rig::message::ProviderCallId::new("provider-call-1".to_string()),
             function: ToolFunction {
                 name: name.to_string(),
                 arguments: args,
@@ -2028,7 +2060,7 @@ mod tests {
     fn push_assistant_call(history: &mut Vec<Message>, call: &ToolCall) {
         history.push(Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(call.clone())),
+            content: vec![AssistantContent::ToolCall(call.clone())],
         });
     }
 
@@ -2054,7 +2086,7 @@ mod tests {
     fn history_has_tool_result(history: &[Message], call_id: &str) -> bool {
         history.iter().any(|message| match message {
             Message::User { content } => content.iter().any(|part| match part {
-                UserContent::ToolResult(result) => result.id == call_id,
+                UserContent::ToolResult(result) => result.call == call_id,
                 _ => false,
             }),
             _ => false,
@@ -2598,6 +2630,181 @@ mod tests {
         assert_eq!(rows[0].output, "hello");
     }
 
+    #[tokio::test]
+    async fn name_repaired_call_uses_executed_name_in_tool_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo_alias", serde_json::json!({ "text": "hello" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "echo",
+            Recovery::NameRepair {
+                stage: "rebind",
+                original: "echo_alias".to_string(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let Message::Assistant { content, .. } = &history[0] else {
+            panic!("expected repaired assistant call");
+        };
+        let AssistantContent::ToolCall(repaired_call) = &content[0] else {
+            panic!("expected repaired tool call");
+        };
+        assert_eq!(repaired_call.function.name, "echo");
+
+        let Message::User { content } = &history[1] else {
+            panic!("expected tool result");
+        };
+        let UserContent::ToolResult(result) = &content[0] else {
+            panic!("expected tool result content");
+        };
+        assert_eq!(result.call, call.id);
+        assert_eq!(result.name, "echo");
+    }
+
+    #[tokio::test]
+    async fn execute_ordinary_call_round_trips_responses_dual_identity_through_rehydrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = ToolCall::from_dual_wire(
+            "fc_responses_item_1",
+            "call_responses_1",
+            ToolFunction {
+                name: "echo".to_string(),
+                arguments: serde_json::json!({ "text": "hello" }),
+            },
+        );
+        assert_eq!(call.id, "call_responses_1");
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .expect("tool audit rows load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "call_responses_1");
+        assert_eq!(
+            rows[0].provider_item_id.as_deref(),
+            Some("fc_responses_item_1")
+        );
+        assert_eq!(
+            rows[0].provider_call_id.as_deref(),
+            Some("call_responses_1")
+        );
+
+        let rehydrated = crate::engine::rehydrate::rehydrate_session_with_policy(
+            &session.db,
+            session.id,
+            "Build",
+            crate::engine::rehydrate::RehydratePolicy::strict(),
+        )
+        .await
+        .unwrap()
+        .expect("recorded tool turn rehydrates");
+        crate::engine::rehydrate::validate_pairing(&rehydrated.history)
+            .expect("rehydrated tool result correlates with its call");
+
+        let Message::Assistant { content, .. } = &rehydrated.history[0] else {
+            panic!("expected rehydrated assistant tool call");
+        };
+        let rehydrated_call = content
+            .iter()
+            .find_map(|content| match content {
+                AssistantContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("rehydrated tool call");
+        assert_eq!(rehydrated_call.id, "call_responses_1");
+        assert_eq!(
+            rehydrated_call
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_responses_item_1")
+        );
+        assert_eq!(
+            rehydrated_call
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_responses_1")
+        );
+
+        let Message::User { content } = &rehydrated.history[1] else {
+            panic!("expected rehydrated tool result");
+        };
+        let rehydrated_result = content
+            .iter()
+            .find_map(|content| match content {
+                UserContent::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("rehydrated tool result");
+        assert_eq!(rehydrated_result.call, "call_responses_1");
+        assert_eq!(
+            rehydrated_result
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_responses_item_1")
+        );
+        assert_eq!(
+            rehydrated_result
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_responses_1")
+        );
+    }
+
     /// Finding 7 (ordinary-path one-frame): the co-persisted audit row and the
     /// ToolCall session event are classified against ONE pinned authoring frame
     /// (`tool_frame()` = `env.model`), never the session's live/after-turn active
@@ -3132,7 +3339,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].call_id, call.id);
+        assert_eq!(rows[0].call_id, call.id.as_str());
     }
 
     #[tokio::test]
@@ -3223,7 +3430,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].call_id, call.id);
+        assert_eq!(rows[0].call_id, call.id.as_str());
     }
 
     #[tokio::test]

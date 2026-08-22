@@ -143,13 +143,13 @@ mod loop_collapse_tests {
     //! USER timeline / session-DB rows keep one entry per attempt.
 
     use super::*;
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use crate::engine::message::{AssistantContent, ToolCall, tool_result_message};
     use rig::message::{ToolFunction, ToolResultContent, UserContent};
 
     fn call(name: &str, args: Value) -> ToolCall {
         ToolCall {
-            id: format!("call-{}", Uuid::new_v4()),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint(format!("call-{}", Uuid::new_v4())),
+            provider: None,
             function: ToolFunction {
                 name: name.to_string(),
                 arguments: args,
@@ -172,7 +172,7 @@ mod loop_collapse_tests {
     ) -> String {
         history.push(Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(tc.clone())),
+            content: vec![AssistantContent::ToolCall(tc.clone())],
         });
         // The dispatcher prefixes `Error: ` onto the invalid-input body.
         let body = format!(
@@ -280,10 +280,10 @@ mod loop_collapse_tests {
         // result (not a collapse tool_result). This breaks the run.
         history.push(Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(call(
+            content: vec![AssistantContent::ToolCall(call(
                 "bash",
                 serde_json::json!({"command": "pwd"}),
-            ))),
+            ))],
         });
         history.push(Message::from(ToolResultContent::text("/repo")));
 

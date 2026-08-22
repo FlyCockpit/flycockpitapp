@@ -212,7 +212,7 @@ async fn check_inner(
     {
         Ok(calls) => calls,
         Err(e) => {
-            tracing::debug!(error = %e, "injection_check: call failed; failing open");
+            crate::engine::model::log_utility_model_failure("injection_check", &e);
             return None;
         }
     };
@@ -323,8 +323,8 @@ mod tests {
     fn parse_verdict_reads_first_risk_call_level() {
         use crate::engine::message::ToolCall;
         let mk = |name: &str, level: &str| ToolCall {
-            id: "1".into(),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint("1"),
+            provider: None,
             function: rig::message::ToolFunction {
                 name: name.into(),
                 arguments: json!({ "level": level }),

@@ -837,6 +837,57 @@
     "kind": "evt",
     "v": 11
   },
+  "image_control_config_changed": {
+    "data": {
+      "event": {
+        "schemaVersion": 1,
+        "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
+        "projectId": "/tmp/project",
+        "kind": "config_changed",
+        "changeSet": {
+          "schemaVersion": 1,
+          "configGeneration": "4",
+          "changes": [
+            {
+              "type": "target_upserted",
+              "entityId": "t1",
+              "entityGeneration": "4",
+              "item": {
+                "schemaVersion": 1,
+                "targetId": "t1",
+                "entityGeneration": "4",
+                "endpointId": "ep1",
+                "displayName": null,
+                "enabled": true,
+                "isDefault": true,
+                "adapterKind": "openai_images",
+                "hostedIdentity": "gpt-image-1",
+                "workflowId": null,
+                "workflowDigest": null,
+                "formats": ["png"],
+                "referenceSupport": "unsupported",
+                "maxReferences": 0,
+                "maxSamples": 1,
+                "dimensionDescriptor": { "type": "provider_default" },
+                "typedParameterSchema": [],
+                "openRouterRouting": null,
+                "costEvidence": {
+                  "known": false,
+                  "usdMicros": null,
+                  "unit": null,
+                  "method": null,
+                  "variant": null
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "event": "image_control_config_changed",
+    "kind": "evt",
+    "v": 11
+  },
   "llm_mode_changed": {
     "data": {
       "mode": "normal",

@@ -1,6 +1,6 @@
 //! Provider-side completion model dispatch.
 //!
-//! Host-owned inference boundary (rig 0.41): Cockpit builds
+//! Host-owned inference boundary (rig 0.42): Cockpit builds
 //! [`rig::completion::CompletionRequest`] values via
 //! `CompletionModel::completion_request` and streams or sends them. Rig
 //! owns transport, SSE parsing, and message types; Cockpit owns the tool
@@ -109,12 +109,15 @@ pub use build::{
 #[allow(unused_imports)]
 pub use dispatch::TandemOutcome;
 #[allow(unused_imports)]
+pub(crate) use dispatch::terminal_inference_failure;
+#[allow(unused_imports)]
 pub use failure::{
     InferenceCancelled, InferenceErrorClass, InferenceFailure, InferenceGated, InferencePhase,
     InferenceTiming, PROVIDER_DETAIL_OMITTED, ProviderRecoverySignal, SafeProviderDetail,
     as_inference_failure, auth_failure_kind, cancellation_phase, failure_engages_backup,
     is_cancelled, is_gated, safe_completion_error_detail, safe_provider_detail,
 };
+pub(crate) use failure::{log_utility_model_failure, safe_inference_error_detail};
 #[allow(unused_imports)]
 pub use http_client::UsageAliasHttpClient;
 pub(crate) use outbound_guard::OutboundGuard;
@@ -192,22 +195,17 @@ use crate::config::providers::{
     ProvidersConfig,
 };
 use crate::db::session_log::InferenceRequestStatus;
-use crate::engine::message::{AssistantContent, OneOrMany, ToolDefinition};
+use crate::engine::message::{AssistantContent, ToolDefinition};
 use crate::providers::models_fetch;
 use crate::redact::RedactionTable;
 use crate::tokens::TokenUsage;
-use rig::completion::GetTokenUsage;
 
 /// The aggregated result of one streaming completion attempt: the
 /// `message_id`, the assistant content, and the (optional) provider-
 /// reported usage. Shared by the provider-flavor arms of
 /// [`Model::complete_captured`] and the generic [`drain_completion_stream`]
 /// helper they both call.
-type CompleteOut = (
-    Option<String>,
-    OneOrMany<AssistantContent>,
-    Option<TokenUsage>,
-);
+type CompleteOut = (Option<String>, Vec<AssistantContent>, Option<TokenUsage>);
 
 #[derive(Debug, Clone)]
 pub struct LiveWireApiState {

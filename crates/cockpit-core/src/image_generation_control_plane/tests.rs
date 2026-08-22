@@ -31,6 +31,7 @@ fn remote_principal(scope: RelayGrantScope, project_root: Option<String>) -> Cli
         RelayGrantScope::Agent => PrincipalScope::Agent,
         RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
         RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
+        RelayGrantScope::ImageGenerationAdmin => PrincipalScope::ImageGenerationAdmin,
     };
     ClientPrincipal::from_verified_remote(
         "user-1".to_string(),
@@ -224,18 +225,23 @@ mod old_behavior_rejection {
 
     #[test]
     fn rootless_wildcard_does_not_apply_for_image_admin() {
-        // The existing rootless wildcard (project_root: None matches any
-        // project) never applies for ImageGenerationAdmin.
+        // The unified `PrincipalScope::ImageGenerationAdmin` replaces the
+        // deleted parallel `HostedAccessScope` island. The existing rootless
+        // wildcard (project_root: None matches any project) never applies for
+        // it: a missing or empty root fails closed.
+        assert!(scope_requires_project_root(
+            PrincipalScope::ImageGenerationAdmin
+        ));
         assert!(!validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             None
         ));
         assert!(!validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             Some("")
         ));
         assert!(validate_admin_grant_root(
-            HostedAccessScope::ImageGenerationAdmin,
+            PrincipalScope::ImageGenerationAdmin,
             Some("/workspace/app")
         ));
     }
@@ -244,16 +250,78 @@ mod old_behavior_rejection {
     fn non_admin_scopes_do_not_require_root() {
         // Every other scope retains its reviewed project-binding rules.
         for scope in [
-            HostedAccessScope::Terminal,
-            HostedAccessScope::Agent,
-            HostedAccessScope::AgentReadonly,
-            HostedAccessScope::ProjectFiles,
+            PrincipalScope::Terminal,
+            PrincipalScope::Agent,
+            PrincipalScope::AgentReadonly,
+            PrincipalScope::ProjectFiles,
         ] {
-            assert!(!scope.requires_project_root());
+            assert!(!scope_requires_project_root(scope));
             // Root is optional for non-admin scopes.
             assert!(validate_admin_grant_root(scope, None));
             assert!(validate_admin_grant_root(scope, Some("/workspace/app")));
         }
+    }
+
+    #[test]
+    fn mint_image_admin_grant_fails_closed_without_root() {
+        // AC1: minting/decoding an `ImageGenerationAdmin` grant REQUIRES a
+        // present, nonempty project root. A missing or empty root fails closed
+        // instead of producing a rootless (project-wide) authority.
+        assert_eq!(
+            mint_image_admin_grant(None).unwrap_err(),
+            ImageControlErrorCode::Forbidden
+        );
+        assert_eq!(
+            mint_image_admin_grant(Some("")).unwrap_err(),
+            ImageControlErrorCode::Forbidden
+        );
+        let grant = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert_eq!(grant.scope, PrincipalScope::ImageGenerationAdmin);
+        assert!(
+            grant.project_root.is_some(),
+            "a minted admin grant is always rooted"
+        );
+    }
+
+    #[test]
+    fn admin_grant_root_canonical_matches_two_spellings_of_one_project() {
+        // AC13: two path spellings of the SAME project (here a trailing-slash
+        // variant, which canonicalizes identically for a not-yet-created root)
+        // normalize to one binding. The grant is minted from one spelling and
+        // matches the target expressed with the other.
+        let grant = mint_image_admin_grant(Some("/workspace/app/")).unwrap();
+        assert!(admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/app"
+        ));
+        // Reverse spelling also binds.
+        let grant2 = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert!(admin_grant_root_matches_project(
+            grant2.project_root.as_deref(),
+            "/workspace/app/"
+        ));
+    }
+
+    #[test]
+    fn admin_grant_root_rejects_string_prefix_trick_and_missing_root() {
+        // A different project must never match by string-prefix trick: a raw
+        // `starts_with` would wrongly treat `/workspace/app` as authority over
+        // `/workspace/app-evil`. Canonical-identity matching rejects it.
+        let grant = mint_image_admin_grant(Some("/workspace/app")).unwrap();
+        assert!(!admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/app-evil"
+        ));
+        assert!(!admin_grant_root_matches_project(
+            grant.project_root.as_deref(),
+            "/workspace/application"
+        ));
+        // Fail closed on a missing/empty grant root.
+        assert!(!admin_grant_root_matches_project(None, "/workspace/app"));
+        assert!(!admin_grant_root_matches_project(
+            Some(""),
+            "/workspace/app"
+        ));
     }
 
     #[test]
@@ -891,10 +959,81 @@ mod budget_and_config {
 
     #[test]
     fn budget_finite_requires_positive_generation() {
-        let proj = BudgetScopeProjection::finite("1".to_string());
+        // A `Finite` projection now carries the non-lossy `usd_micros` amount
+        // as well as its positive generation.
+        let proj = BudgetScopeProjection::finite(1_000_000, "1".to_string());
         assert!(proj.validate());
-        let proj = BudgetScopeProjection::finite("0".to_string());
+        assert_eq!(
+            proj.policy,
+            BudgetPolicy::Finite {
+                usd_micros: 1_000_000
+            }
+        );
+        let proj = BudgetScopeProjection::finite(1_000_000, "0".to_string());
         assert!(!proj.validate(), "generation 0 must reject");
+    }
+
+    #[test]
+    fn image_generation_budget_wire_carries_usd_micros() {
+        // AC10: a `Finite` budget policy carries its `usd_micros` amount on the
+        // control-plane wire, and the lossy amount-free `Finite` is
+        // unrepresentable. The amount round-trips at the full `u64::MAX`
+        // boundary with no precision loss: Rust serializes it as a bare JSON
+        // integer, and the TypeScript mirror holds it as a `bigint`
+        // (`apps/web/src/lib/image-generation-remote.ts`), so no value in
+        // `1..=u64::MAX` is truncated by a JS `number`.
+        let proj = BudgetScopeProjection::finite(u64::MAX, "1".to_string());
+        let json = serde_json::to_string(&proj).unwrap();
+        assert_eq!(
+            json,
+            r#"{"policy":{"finite":{"usd_micros":18446744073709551615}},"generation":"1"}"#
+        );
+        let round: BudgetScopeProjection = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, proj);
+        assert_eq!(
+            round.policy,
+            BudgetPolicy::Finite {
+                usd_micros: u64::MAX
+            }
+        );
+
+        // The lossy string tag `"finite"` can no longer decode to a policy:
+        // `Finite` requires its `usd_micros` object, so the pre-inc2 wire is
+        // rejected rather than silently coerced.
+        assert!(serde_json::from_str::<BudgetPolicy>(r#""finite""#).is_err());
+        assert!(serde_json::from_str::<BudgetPolicy>(r#"{"finite":{}}"#).is_err());
+        // `Unconfigured` can never be smuggled as a `Finite` with a zero amount.
+        assert!(serde_json::from_str::<BudgetPolicy>(r#"{"finite":{"usd_micros":0}}"#).is_err());
+
+        // `Unconfigured` and `Unlimited` keep their bare-string tags.
+        assert_eq!(
+            serde_json::to_string(&BudgetPolicy::Unconfigured).unwrap(),
+            r#""unconfigured""#
+        );
+        assert_eq!(
+            serde_json::to_string(&BudgetPolicy::Unlimited).unwrap(),
+            r#""unlimited""#
+        );
+
+        // The zero-amount `Finite` is rejected by the projection and save
+        // validators too, not only at the serde boundary — a directly
+        // constructed `Finite { usd_micros: 0 }` cannot slip past as a valid
+        // policy, keeping Rust in lockstep with the TS mirror.
+        assert!(!BudgetScopeProjection::finite(0, "1".to_string()).validate());
+        assert!(!validate_budget_set_pair(
+            Some(BudgetPolicy::Finite { usd_micros: 0 }),
+            None
+        ));
+        assert!(!validate_budget_set_pair(
+            Some(BudgetPolicy::Finite { usd_micros: 0 }),
+            Some("1")
+        ));
+        // A positive amount is still accepted through the same paths.
+        assert!(BudgetScopeProjection::finite(1, "1".to_string()).validate());
+        assert!(validate_budget_set_pair(
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
+            None
+        ));
     }
 
     #[test]
@@ -916,7 +1055,7 @@ mod budget_and_config {
     #[test]
     fn budget_finite_without_generation_rejects() {
         let proj = BudgetScopeProjection {
-            policy: BudgetPolicy::Finite,
+            policy: BudgetPolicy::Finite { usd_micros: 1 },
             generation: None,
         };
         assert!(!proj.validate());
@@ -930,7 +1069,10 @@ mod budget_and_config {
     #[test]
     fn budget_set_pair_create() {
         // Nonnull policy with null expected generation creates generation 1.
-        assert!(validate_budget_set_pair(Some(BudgetPolicy::Finite), None));
+        assert!(validate_budget_set_pair(
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
+            None
+        ));
         assert!(validate_budget_set_pair(
             Some(BudgetPolicy::Unlimited),
             None
@@ -941,7 +1083,7 @@ mod budget_and_config {
     fn budget_set_pair_cas_update() {
         // Nonnull policy with positive expected generation CAS-updates.
         assert!(validate_budget_set_pair(
-            Some(BudgetPolicy::Finite),
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
             Some("1")
         ));
         assert!(validate_budget_set_pair(
@@ -972,7 +1114,7 @@ mod budget_and_config {
     #[test]
     fn budget_set_pair_zero_generation_rejects() {
         assert!(!validate_budget_set_pair(
-            Some(BudgetPolicy::Finite),
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
             Some("0")
         ));
     }
@@ -981,7 +1123,7 @@ mod budget_and_config {
     fn budget_set_at_least_one_policy() {
         assert!(!validate_at_least_one_policy(None, None, None));
         assert!(validate_at_least_one_policy(
-            Some(BudgetPolicy::Finite),
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
             None,
             None
         ));
@@ -993,12 +1135,12 @@ mod budget_and_config {
         assert!(validate_at_least_one_policy(
             None,
             None,
-            Some(BudgetPolicy::Finite)
+            Some(BudgetPolicy::Finite { usd_micros: 1 })
         ));
         assert!(validate_at_least_one_policy(
-            Some(BudgetPolicy::Finite),
+            Some(BudgetPolicy::Finite { usd_micros: 1 }),
             Some(BudgetPolicy::Unlimited),
-            Some(BudgetPolicy::Finite)
+            Some(BudgetPolicy::Finite { usd_micros: 1 })
         ));
     }
 

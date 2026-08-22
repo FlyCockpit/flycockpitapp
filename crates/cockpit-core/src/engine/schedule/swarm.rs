@@ -350,6 +350,7 @@ async fn run_swarm_loop(
                 write_scope,
                 model,
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
             } => {
                 let pointer = route_child_spawn(
@@ -363,7 +364,13 @@ async fn run_swarm_loop(
                 )
                 .await;
                 next_prompt =
-                    Message::tool_result_with_call_id(task_call_id, task_function_call_id, pointer);
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "spawn",
+                        pointer,
+                    );
             }
             // A `bee` child is leaf-terminated for every edge *except*
             // bee→bee (handled above via `spawn`): it holds `task` only to
@@ -699,6 +706,39 @@ fn collect_final_text(history: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_swarm_spawn_responses_result_keeps_dual_identity_and_name() {
+        let result = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "call_spawn_background",
+            Some("fc_spawn_background".to_string()),
+            Some("call_spawn_background".to_string()),
+            "spawn",
+            "queued",
+        );
+        let Message::User { content } = result else {
+            panic!("spawn result must be a user tool-result message");
+        };
+        let Some(rig::message::UserContent::ToolResult(result)) = content.first() else {
+            panic!("spawn result must contain a tool result");
+        };
+        assert_eq!(result.call.as_str(), "call_spawn_background");
+        assert_eq!(result.name, "spawn");
+        assert_eq!(
+            result
+                .provider
+                .as_ref()
+                .map(|provider| provider.call_id.as_str()),
+            Some("call_spawn_background")
+        );
+        assert_eq!(
+            result
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.item_id.as_deref()),
+            Some("fc_spawn_background")
+        );
+    }
 
     fn spec(depth: u32, max_depth: u32) -> SpawnSpec {
         SpawnSpec {

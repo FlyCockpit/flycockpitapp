@@ -709,6 +709,34 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
     }
 }
 
+/// Narrow cross-module test seam for export regressions. Keeps the production
+/// failure-event builder as the sole path under test without exposing its
+/// per-turn UI plumbing outside this module.
+#[cfg(test)]
+pub(crate) async fn record_inference_outcome_for_export_test(
+    session: Arc<Session>,
+    call_id: Uuid,
+    ordinal: i64,
+    err: &anyhow::Error,
+) {
+    let (tx, _rx) = mpsc::channel(1);
+    record_inference_outcome(
+        InferenceOutcomeRecord {
+            session,
+            call_id,
+            ordinal,
+            agent_name: "builder",
+            wire_api: "responses",
+            routing_metadata: serde_json::json!({}),
+            emit_inference_error_ui: false,
+            goal_provenance: None,
+            tx: &tx,
+        },
+        err,
+    )
+    .await;
+}
+
 #[derive(Debug)]
 struct InferenceFailureDiagnostics {
     provider_status: Option<u16>,
@@ -1013,6 +1041,103 @@ mod inference_outcome_tests {
             .expect("inference failure event");
         assert_eq!(fail.data["retry_attempts"]["known"], true);
         assert_eq!(fail.data["retry_attempts"]["attempts"], 3);
+    }
+
+    #[tokio::test]
+    async fn detailed_provider_headers_stay_out_of_stored_and_emitted_failure_details() {
+        const SENTINEL: &str = "RAW_INFERENCE_PROVIDER_HEADER_3d75_must_not_persist";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = in_memory_session(tmp.path());
+        let call_id = Uuid::new_v4();
+        session
+            .record_inference_request(
+                call_id,
+                &serde_json::json!({ "model": "mock-model" }),
+                InferenceRequestStatus::Pending,
+                &crate::redact::RedactionTable::empty(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = rig::http_client::HeaderMap::new();
+        headers.insert(
+            "x-flycockpit-sentinel",
+            rig::http_client::HeaderValue::from_static(SENTINEL),
+        );
+        let raw = rig::completion::CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCodeWithDetails {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "insufficient balance".to_string(),
+                headers: Box::new(headers),
+            },
+        );
+        // Rig itself retains the header, proving this regression cannot pass by
+        // merely using a fixture that never carried sensitive metadata.
+        assert!(format!("{raw:?}").contains(SENTINEL));
+
+        // This is the production dispatch conversion: it applies
+        // `classify_terminal_failure_with_floor` and `failure_detail` before
+        // `record_inference_outcome` sees the resulting typed failure.
+        let failure = crate::engine::model::terminal_inference_failure(
+            &raw,
+            "mock-provider",
+            "mock-model",
+            crate::engine::model::InferencePhase::Dispatched,
+            42,
+            3,
+            crate::engine::model::ProviderRecoverySignal::None,
+        );
+        assert_eq!(failure.class, InferenceErrorClass::BillingOrQuotaExhausted);
+        assert_eq!(failure.observed_status, Some(429));
+        assert_eq!(
+            failure.recovery,
+            crate::engine::model::ProviderRecoverySignal::BillingExhausted
+        );
+
+        let err = anyhow::Error::new(failure);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(4);
+        record_inference_outcome(
+            InferenceOutcomeRecord {
+                session: session.clone(),
+                call_id,
+                ordinal: 0,
+                agent_name: "builder",
+                wire_api: "responses",
+                routing_metadata: serde_json::json!({}),
+                emit_inference_error_ui: true,
+                goal_provenance: None,
+                tx: &tx,
+            },
+            &err,
+        )
+        .await;
+
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let fail = events
+            .iter()
+            .find(|event| event.kind == "inference_failure")
+            .expect("inference failure event");
+        assert!(!fail.data.to_string().contains(SENTINEL));
+        assert_eq!(
+            fail.data["detail"],
+            crate::engine::model::PROVIDER_DETAIL_OMITTED
+        );
+        assert_eq!(fail.data["provider_status"], 429);
+        assert_eq!(fail.data["recovery"], "billing_exhausted");
+
+        match rx.recv().await.expect("inference failed event") {
+            TurnEvent::InferenceFailed {
+                detail,
+                error_class,
+                ..
+            } => {
+                assert!(!detail.contains(SENTINEL));
+                assert_eq!(detail, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+                assert_eq!(error_class, InferenceErrorClass::BillingOrQuotaExhausted);
+            }
+            event => panic!("expected inference failure, got {event:?}"),
+        }
     }
 
     #[tokio::test]

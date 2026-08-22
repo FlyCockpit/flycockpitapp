@@ -51,9 +51,9 @@
     }
   ],
   "counts": {
-    "event": 77,
-    "request": 200,
-    "response": 142
+    "event": 83,
+    "request": 213,
+    "response": 144
   },
   "messages": {
     "event": [
@@ -100,6 +100,12 @@
         "tag": "default_model_update_result"
       },
       {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_control_config_changed"
+      },
+      {
         "class": "model_delta",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
@@ -128,6 +134,36 @@
         "inlinePayloadBound": "stream_chunked",
         "lane": "interactive",
         "tag": "reasoning_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_text_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_reasoning_delta"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_display_attempt_reset"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_complete"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_display_error"
       },
       {
         "class": "model_delta",
@@ -1446,6 +1482,84 @@
         "tag": "save_image_spend_policy"
       },
       {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_get"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_get"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_get"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_create"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_update"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_delete"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_create"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_update"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_delete"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_set_default"
+      },
+      {
         "class": "liveness",
         "inlinePayloadBound": "bounded",
         "lane": "control",
@@ -2381,6 +2495,18 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "image_control_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_control_mutated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "provider_oauth_started"
       },
       {
@@ -2789,6 +2915,18 @@
     {
       "kind": "event",
       "tag": "reasoning_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_text_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_reasoning_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_complete"
     },
     {
       "kind": "event",

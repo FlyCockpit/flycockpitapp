@@ -270,7 +270,21 @@ fn save_extended_config_sync(
         return Err(bad_request("extended config target must be config.json"));
     }
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    let current = std::fs::read(&target).unwrap_or_default();
+    // Read the config generation FIRST — before reading/merging the file — so a
+    // concurrent image-control mutation that lands between here and the CAS
+    // below fails the bump closed rather than persisting a config built on a
+    // stale registry. Mirrors the ordering in `dispatch_image_control_mutation`.
+    let current_generation = crate::daemon::server::inventory::current_config_generation();
+    // Only a genuinely-absent file is an empty config. A non-NotFound read error
+    // (EACCES/EIO/EMFILE/…) must NOT be coerced to empty: the merge would then
+    // find no on-disk `image_generation` to preserve and the atomic write would
+    // WIPE the registry — the exact data loss this path exists to prevent. Fail
+    // closed instead, writing nothing.
+    let current = match std::fs::read(&target) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(internal(error)),
+    };
     let current_hash = content_hash(&current);
     if let Some(expected) = base_hash.as_deref()
         && expected != current_hash
@@ -280,10 +294,30 @@ fn save_extended_config_sync(
             message: format!("configuration changed before write; current hash is {current_hash}"),
         });
     }
-    let desired_hash = content_hash(content.as_bytes());
+    // `SaveExtendedConfig` is never the authoritative writer of
+    // `image_generation`: the daemon redacts the registry to the empty default
+    // before the snapshot ever reaches a client, so a verbatim write of the
+    // round-tripped doc would WIPE the on-disk endpoints/targets/workflows/
+    // allowlist. Route the write through the merge that strips the incoming
+    // (client-authored) `image_generation` and preserves the on-disk registry;
+    // every other config section is taken verbatim from the incoming doc.
+    let merged =
+        cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
+            content.as_bytes(),
+            &current,
+        )
+        .map_err(bad_request_config)?;
+    let desired_hash = content_hash(&merged);
     if desired_hash != current_hash {
-        cockpit_config::config::write_config_bytes_atomic(&target, content.as_bytes())
-            .map_err(internal)?;
+        // Advance the daemon config generation so the image-control-plane
+        // generation CAS observes this config.json write. Fail closed (nothing
+        // written) if it moved concurrently.
+        crate::daemon::server::inventory::compare_and_bump_config_generation(current_generation)
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "configuration generation changed concurrently; retry the save".into(),
+            })?;
+        cockpit_config::config::write_config_bytes_atomic(&target, &merged).map_err(internal)?;
     }
     Ok(Response::ExtendedConfigSaved { hash: desired_hash })
 }
@@ -892,6 +926,18 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
+/// Fail-closed mapping for a `SaveExtendedConfig` merge failure. The underlying
+/// serde/anyhow error is DELIBERATELY discarded: a config.json parse error can
+/// echo attacker/legacy-supplied bytes (`invalid type: string "…"`) and
+/// config.json can carry literal secrets in pre-redaction legacy layers, so the
+/// error detail must never reach the client. Names only the boundary.
+fn bad_request_config<E>(_error: E) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "configuration payload is not valid config.json".into(),
+    }
+}
+
 fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,
@@ -1259,6 +1305,162 @@ mod tests {
         assert_eq!(
             serde_json::to_value(sync).unwrap(),
             serde_json::to_value(async_result).unwrap()
+        );
+    }
+
+    /// A valid, non-empty registry: one hosted OpenAI-images endpoint plus an
+    /// enabled default target referencing it. Built through the single
+    /// `ImageGenerationConfig::new` validation funnel.
+    fn sample_image_registry() -> cockpit_config::config::image_generation::ImageGenerationConfig {
+        use cockpit_config::config::image_generation::{
+            IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageCapabilityEvidence,
+            ImageDimensionDescriptor, ImageDimensionRequestPolicy, ImageEndpoint, ImageFormat,
+            ImageGenerationConfig, ImageGenerationTarget, ImageLocationClass, ImagePrice,
+            ImageTargetIdentity, ReferenceImageSupport,
+        };
+        use cockpit_config::config::providers::CapabilityStatus;
+
+        let endpoint = ImageEndpoint {
+            id: "openai-main".into(),
+            adapter: ImageAdapterKind::OpenaiImages,
+            origin: "https://api.openai.com/".into(),
+            path_prefix: None,
+            credential_ref: Some("openai-key".into()),
+            headers: Vec::new(),
+            allow_insecure_transport: false,
+            location: ImageLocationClass::PublicCloud,
+            enabled: true,
+            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+            exclusive_server: false,
+        };
+        let target = ImageGenerationTarget {
+            id: "gpt-image".into(),
+            display_name: None,
+            endpoint_id: "openai-main".into(),
+            identity: ImageTargetIdentity::HostedModel {
+                model: "gpt-image-1".into(),
+            },
+            enabled: true,
+            is_default: true,
+            formats: vec![ImageFormat::Png],
+            reference_support: ReferenceImageSupport::Unsupported,
+            max_reference_images: 0,
+            max_samples: 1,
+            max_outputs: 1,
+            dimensions: ImageDimensionDescriptor::ProviderDefault,
+            dimension_policy: ImageDimensionRequestPolicy::ProviderDefault,
+            parameters: Vec::new(),
+            openrouter_routing: None,
+            generation_capability: ImageCapabilityEvidence::new(CapabilityStatus::Unknown, None)
+                .unwrap(),
+            price: ImagePrice::Unknown,
+        };
+        ImageGenerationConfig::new(vec![endpoint], vec![target], Vec::new(), Vec::new())
+            .expect("valid sample registry")
+    }
+
+    /// Regression: a generic `SaveExtendedConfig` whose incoming
+    /// `image_generation` is the redacted EMPTY default (exactly what a client
+    /// round-trips from the snapshot, where the daemon replaced the registry via
+    /// `redacted_for_snapshot`) must NOT wipe the non-empty on-disk registry.
+    /// Before the fix this wrote the incoming doc verbatim and destroyed the
+    /// endpoints/targets/workflows/allowlist.
+    #[test]
+    fn save_extended_config_preserves_on_disk_image_generation_registry() {
+        use cockpit_config::config::image_generation::ImageGenerationConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_text = root.to_str().unwrap();
+
+        // Seed a non-empty registry on disk (NOT via SaveExtendedConfig, which
+        // strips it — that is the whole point).
+        let registry = sample_image_registry();
+        let on_disk_value = serde_json::json!({
+            "redact": { "enabled": true, "denylist": ["SEED-KEEP"] },
+            "image_generation": serde_json::to_value(&registry).unwrap(),
+        });
+        let on_disk_str = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&on_disk_value).unwrap()
+        );
+        std::fs::write(root.join("config.json"), &on_disk_str).unwrap();
+
+        // Precondition / non-vacuity: the registry really is on disk.
+        assert!(
+            on_disk_str.contains("openai-main"),
+            "seed must persist the endpoint"
+        );
+        let seeded: ImageGenerationConfig =
+            serde_json::from_value(on_disk_value.get("image_generation").unwrap().clone()).unwrap();
+        assert_eq!(seeded.endpoints().len(), 1);
+
+        // Incoming = faithful redacted round-trip: same doc, but with an EMPTY
+        // image_generation (the redacted value) and one OTHER field changed.
+        let mut incoming = on_disk_value.clone();
+        incoming["image_generation"] =
+            serde_json::to_value(ImageGenerationConfig::default()).unwrap();
+        incoming["name"] = serde_json::json!("Renamed Project");
+        let incoming_str = serde_json::to_string(&incoming).unwrap();
+        // Precondition: a VERBATIM write of this payload would wipe the registry.
+        assert!(
+            !incoming_str.contains("openai-main"),
+            "the redacted incoming payload must not carry the registry"
+        );
+
+        let resp =
+            save_extended_config_sync(root_text, "config.json", &incoming_str, None).unwrap();
+        assert!(matches!(resp, Response::ExtendedConfigSaved { .. }));
+
+        // The registry is preserved AND the other change landed.
+        let after = std::fs::read_to_string(root.join("config.json")).unwrap();
+        assert!(
+            after.contains("Renamed Project"),
+            "other config sections must still be saved verbatim"
+        );
+        let after_value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        let preserved: ImageGenerationConfig = serde_json::from_value(
+            after_value
+                .get("image_generation")
+                .expect("image_generation must be preserved on disk")
+                .clone(),
+        )
+        .expect("preserved image_generation is a valid registry");
+        assert_eq!(
+            preserved.endpoints().len(),
+            1,
+            "the on-disk endpoint registry must survive a generic settings save"
+        );
+        assert_eq!(preserved.endpoints()[0].id, "openai-main");
+        assert_eq!(preserved.targets().len(), 1);
+    }
+
+    /// A `SaveExtendedConfig` that actually changes config.json advances the
+    /// daemon config generation (so the image-control-plane generation CAS
+    /// observes the write); a no-op save writes nothing and does NOT bump.
+    #[test]
+    fn save_extended_config_bumps_generation_only_on_a_real_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_text = root.to_str().unwrap();
+        std::fs::write(root.join("config.json"), "{}\n").unwrap();
+
+        let content = serde_json::json!({ "name": "Alpha" }).to_string();
+        let before = crate::daemon::server::inventory::current_config_generation();
+        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        let after_write = crate::daemon::server::inventory::current_config_generation();
+        assert_eq!(
+            after_write,
+            before + 1,
+            "a config.json write must advance the config generation"
+        );
+
+        // Identical content renders to identical merged bytes -> no write.
+        save_extended_config_sync(root_text, "config.json", &content, None).unwrap();
+        let after_noop = crate::daemon::server::inventory::current_config_generation();
+        assert_eq!(
+            after_noop, after_write,
+            "an unchanged save must not bump the generation (no bump-without-write)"
         );
     }
 }

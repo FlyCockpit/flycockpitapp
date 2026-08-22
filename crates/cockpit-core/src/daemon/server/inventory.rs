@@ -67,6 +67,15 @@ pub fn current_config_generation() -> u64 {
     CONFIG_GENERATION.load(Ordering::SeqCst)
 }
 
+/// A stable-per-boot daemon instance identifier, lazily minted on first read.
+/// Used as the `daemonInstanceId` in image-control read replies so a client can
+/// tell a snapshot apart across daemon restarts. A restart mints a fresh value
+/// (fail-closed: cursors/snapshots from a prior boot are not revived).
+pub fn daemon_instance_id() -> &'static str {
+    static DAEMON_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DAEMON_INSTANCE_ID.get_or_init(|| Uuid::new_v4().to_string())
+}
+
 pub fn compare_and_bump_config_generation(expected: u64) -> Option<u64> {
     let next = expected.checked_add(1)?;
     CONFIG_GENERATION

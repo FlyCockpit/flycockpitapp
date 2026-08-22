@@ -256,7 +256,7 @@ pub async fn predict(
     {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!(error = %e, "predict: call failed; no ghost text");
+            crate::engine::model::log_utility_model_failure("predict", &e);
             return None;
         }
     };
@@ -282,7 +282,6 @@ mod tests {
 
     #[test]
     fn turns_from_messages_pairs_user_and_agent_skipping_tool_rounds() {
-        use rig::OneOrMany;
         use rig::message::{
             AssistantContent, ToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
         };
@@ -293,28 +292,29 @@ mod tests {
         fn assistant_text(text: &str) -> Message {
             Message::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::text(text)),
+                content: vec![AssistantContent::text(text)],
             }
         }
         fn assistant_call() -> Message {
             Message::Assistant {
                 id: None,
-                content: OneOrMany::one(AssistantContent::ToolCall(ToolCall::new(
-                    "c1".into(),
+                content: vec![AssistantContent::ToolCall(ToolCall::new(
+                    rig::message::ToolCallId::new_or_mint("c1".to_string()),
                     ToolFunction {
                         name: "bash".into(),
                         arguments: serde_json::json!({}),
                     },
-                ))),
+                ))],
             }
         }
         fn tool_result() -> Message {
             Message::User {
-                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                    id: "c1".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::text("ran")),
-                })),
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig::message::ToolCallId::new_or_mint("c1"),
+                    provider: None,
+                    name: "bash".into(),
+                    content: vec![ToolResultContent::text("ran")],
+                })],
             }
         }
 

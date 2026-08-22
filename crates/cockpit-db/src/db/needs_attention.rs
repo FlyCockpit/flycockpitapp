@@ -72,6 +72,8 @@ pub struct InterruptResumeAnchor {
     pub agent_id: String,
     pub call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_seq: Option<i64>,
@@ -761,6 +763,7 @@ mod tests {
             resume: InterruptResumeAnchor {
                 agent_id: "Build".into(),
                 call_id: "call-1".into(),
+                provider_item_id: Some("provider-item-1".into()),
                 provider_call_id: Some("provider-call-1".into()),
                 assistant_seq: Some(42),
                 call_origin: InterruptCallOrigin::Foreground,
@@ -963,6 +966,7 @@ mod tests {
             resume: InterruptResumeAnchor {
                 agent_id: "builder".into(),
                 call_id: "call-1".into(),
+                provider_item_id: Some("provider-item-1".into()),
                 provider_call_id: Some("provider-call-1".into()),
                 assistant_seq: Some(42),
                 call_origin: InterruptCallOrigin::BackgroundReview,
@@ -1043,6 +1047,7 @@ mod tests {
             resume: InterruptResumeAnchor {
                 agent_id: "builder".into(),
                 call_id: "call-1".into(),
+                provider_item_id: None,
                 provider_call_id: None,
                 assistant_seq: Some(42),
                 call_origin: InterruptCallOrigin::Foreground,

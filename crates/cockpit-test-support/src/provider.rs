@@ -565,6 +565,7 @@ fn emit_responses_turn(turn: &Turn, usage: Option<&Usage>) -> String {
             let usage = responses_usage_value(usage);
             let completed = serde_json::json!({
                 "type": "response.completed",
+                "sequence_number": 2,
                 "response": {
                     "id": "resp_1",
                     "object": "response",
@@ -591,7 +592,7 @@ fn emit_responses_turn(turn: &Turn, usage: Option<&Usage>) -> String {
                 }
             });
             format!(
-                "data: {{\"type\":\"response.output_text.delta\",\"delta\":{delta}}}\n\ndata: {completed}\n\n"
+                "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"sequence_number\":1,\"delta\":{delta}}}\n\ndata: {completed}\n\n"
             )
         }
         Turn::ToolCall {
@@ -629,6 +630,7 @@ fn emit_responses_tool_calls<'a>(
         .collect::<Vec<_>>();
     let completed = serde_json::json!({
         "type": "response.completed",
+        "sequence_number": 1,
         "response": {
             "id": "resp_1",
             "object": "response",
@@ -883,12 +885,27 @@ mod tests {
         let response = request(&provider, "/responses", json!({"stream": true})).await;
 
         assert_eq!(response.status, 200);
-        assert!(
-            response
-                .body
-                .contains("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}")
-        );
-        assert!(response.body.contains("\"type\":\"response.completed\""));
+        let frames: Vec<serde_json::Value> = response
+            .body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("Responses SSE frame is JSON"))
+            .collect();
+        let delta = frames
+            .iter()
+            .find(|frame| frame["type"] == "response.output_text.delta")
+            .expect("text delta frame");
+        assert_eq!(delta["item_id"], "msg_1");
+        assert_eq!(delta["output_index"], 0);
+        assert_eq!(delta["content_index"], 0);
+        assert_eq!(delta["sequence_number"], 1);
+        assert_eq!(delta["delta"], "ok");
+        let completed = frames
+            .iter()
+            .find(|frame| frame["type"] == "response.completed")
+            .expect("completed frame");
+        assert_eq!(completed["sequence_number"], 2);
     }
 
     #[tokio::test]

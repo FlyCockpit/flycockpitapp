@@ -43,7 +43,6 @@ pub use crate::db::prune_ledger::{LedgerEntry, PruneLedger};
 use crate::config::providers::{CacheConfig, CacheMode};
 use crate::engine::message::{AssistantContent, Message};
 use crate::tools::shell_compress;
-use rig::OneOrMany;
 use rig::message::{ToolResultContent, UserContent};
 
 mod overlap;
@@ -267,7 +266,7 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
                         tc.function.name,
                         canonical_args(&tc.function.arguments)
                     );
-                    call_identity.insert(tc.id.clone(), key);
+                    call_identity.insert(tc.id.to_string(), key);
                 }
             }
         }
@@ -288,14 +287,14 @@ pub fn dedup_plan(history: &[Message]) -> DedupPlan {
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
-                    let Some(key) = call_identity.get(&tr.id) else {
+                    let Some(key) = call_identity.get(tr.call.as_str()) else {
                         continue;
                     };
                     let body = tool_result_body(&tr.content);
                     let elided = Elision::is_marker(&body);
                     groups.entry(key.clone()).or_default().push(ResultLoc {
                         history_index: idx,
-                        call_id: tr.id.clone(),
+                        call_id: tr.call.to_string(),
                         body,
                         elided,
                     });
@@ -407,7 +406,7 @@ fn count_plan_matches(history: &[Message], plan: &DedupPlan) -> usize {
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c
-                    && tr.id == target.target_call_id
+                    && tr.call.as_str() == target.target_call_id
                 {
                     n += 1;
                 }
@@ -425,14 +424,14 @@ fn apply_plan_direct(history: &mut [Message], plan: &DedupPlan) {
         if let Message::User { content } = msg {
             for c in content.iter_mut() {
                 if let UserContent::ToolResult(tr) = c
-                    && tr.id == target.target_call_id
+                    && tr.call.as_str() == target.target_call_id
                 {
                     // Rewrite the body only; keep id/call_id intact so
                     // the tool_use↔tool_result pairing stays valid. An
                     // overlap-merge target writes its pre-rendered partial
                     // body (non-overlapping remainder + marker); an
                     // exact-identity target writes the whole-body marker.
-                    tr.content = OneOrMany::one(ToolResultContent::text(target.replacement_body()));
+                    tr.content = vec![ToolResultContent::text(target.replacement_body())];
                 }
             }
         }
@@ -465,7 +464,7 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    calls.insert(tc.id.clone(), (tool.to_string(), command));
+                    calls.insert(tc.id.to_string(), (tool.to_string(), command));
                 }
             }
         }
@@ -476,7 +475,7 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
-                    let Some((tool, command)) = calls.get(&tr.id) else {
+                    let Some((tool, command)) = calls.get(tr.call.as_str()) else {
                         continue;
                     };
                     let body = tool_result_body(&tr.content);
@@ -491,7 +490,7 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
                     candidates.push(CondenseCandidate {
                         history_index: idx,
                         tool: tool.clone(),
-                        call_id: tr.id.clone(),
+                        call_id: tr.call.to_string(),
                         original_body: body,
                         condensed_body,
                     });
@@ -568,9 +567,9 @@ fn apply_condensed_tool_result_direct(
     if let Message::User { content } = msg {
         for c in content.iter_mut() {
             if let UserContent::ToolResult(tr) = c
-                && tr.id == candidate.call_id
+                && tr.call.as_str() == candidate.call_id
             {
-                tr.content = OneOrMany::one(ToolResultContent::text(replacement));
+                tr.content = vec![ToolResultContent::text(replacement)];
                 return true;
             }
         }
@@ -584,7 +583,7 @@ fn tool_names_by_call_id(history: &[Message]) -> std::collections::HashMap<Strin
         if let Message::Assistant { content, .. } = msg {
             for c in content.iter() {
                 if let AssistantContent::ToolCall(tc) = c {
-                    tools.insert(tc.id.clone(), tc.function.name.clone());
+                    tools.insert(tc.id.to_string(), tc.function.name.clone());
                 }
             }
         }
@@ -629,9 +628,12 @@ pub fn current_elided_ids(history: &[Message]) -> Vec<String> {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
                     let body = tool_result_body(&tr.content);
-                    if is_generated_prune_body(&body, &tr.id, tools.get(&tr.id).map(String::as_str))
-                    {
-                        ids.push(tr.id.clone());
+                    if is_generated_prune_body(
+                        &body,
+                        tr.call.as_str(),
+                        tools.get(tr.call.as_str()).map(String::as_str),
+                    ) {
+                        ids.push(tr.call.to_string());
                     }
                 }
             }
@@ -691,12 +693,14 @@ pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
                     let body = tool_result_body(&tr.content);
-                    let tool = tools.get(&tr.id).map(String::as_str);
-                    if tool.is_some_and(is_snapshot_tool) && exact_snapshot_marker(&body, &tr.id) {
+                    let tool = tools.get(tr.call.as_str()).map(String::as_str);
+                    if tool.is_some_and(is_snapshot_tool)
+                        && exact_snapshot_marker(&body, tr.call.as_str())
+                    {
                         // Whole-body exact-identity marker: re-renders from
                         // id + reason, no body to store.
                         elided.push(LedgerEntry {
-                            original_event_id: tr.id.clone(),
+                            original_event_id: tr.call.to_string(),
                             reason: REASON_SNAPSHOT_SUPERSEDED.to_string(),
                             partial_body: None,
                         });
@@ -706,7 +710,7 @@ pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
                         // geometry is not re-derived from a possibly-shifted
                         // file).
                         elided.push(LedgerEntry {
-                            original_event_id: tr.id.clone(),
+                            original_event_id: tr.call.to_string(),
                             reason: overlap::OVERLAP_REASON.to_string(),
                             partial_body: Some(body),
                         });
@@ -721,7 +725,7 @@ pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
                         // reproduces the pruned context exactly. The exact
                         // full body lives in compressed_tool_results.
                         elided.push(LedgerEntry {
-                            original_event_id: tr.id.clone(),
+                            original_event_id: tr.call.to_string(),
                             reason: REASON_TOOL_RESULT_CONDENSED.to_string(),
                             partial_body: Some(body),
                         });
@@ -761,7 +765,7 @@ pub fn reapply_ledger(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
-                    by_id.insert(tr.id.as_str(), (idx, tool_result_body(&tr.content)));
+                    by_id.insert(tr.call.as_str(), (idx, tool_result_body(&tr.content)));
                 }
             }
         }
@@ -908,7 +912,7 @@ pub fn cache_state(
 /// Concatenate a tool-result's text content into one body string.
 /// Images contribute nothing to the textual body (snapshot tools never
 /// emit images anyway).
-fn tool_result_body(content: &OneOrMany<ToolResultContent>) -> String {
+fn tool_result_body(content: &[ToolResultContent]) -> String {
     content
         .iter()
         .filter_map(|c| match c {
@@ -947,15 +951,14 @@ fn canonical_args(args: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::engine::message::ToolCall;
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResult};
     use serde_json::json;
 
     /// Build an assistant message carrying one snapshot tool call.
     fn assistant_call(call_id: &str, tool: &str, args: serde_json::Value) -> Message {
         let tc = ToolCall {
-            id: call_id.to_string(),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+            provider: None,
             function: rig::message::ToolFunction {
                 name: tool.to_string(),
                 arguments: args,
@@ -965,43 +968,42 @@ mod tests {
         };
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(tc)),
+            content: vec![AssistantContent::ToolCall(tc)],
         }
     }
 
     /// Build a user message carrying one tool result body.
     fn tool_result(call_id: &str, body: &str) -> Message {
         Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: call_id.to_string(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(body)),
-            })),
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                provider: None,
+                name: "tool".to_string(),
+                content: vec![ToolResultContent::text(body)],
+            })],
         }
     }
 
     fn tool_results(results: &[(&str, &str)]) -> Message {
         Message::User {
-            content: OneOrMany::many(
-                results
-                    .iter()
-                    .map(|(call_id, body)| {
-                        UserContent::ToolResult(ToolResult {
-                            id: (*call_id).to_string(),
-                            call_id: None,
-                            content: OneOrMany::one(ToolResultContent::text(*body)),
-                        })
+            content: results
+                .iter()
+                .map(|(call_id, body)| {
+                    UserContent::ToolResult(ToolResult {
+                        call: rig::message::ToolCallId::new_or_mint((*call_id).to_string()),
+                        provider: None,
+                        name: "tool".to_string(),
+                        content: vec![ToolResultContent::text(*body)],
                     })
-                    .collect::<Vec<_>>(),
-            )
-            .expect("non-empty tool results"),
+                })
+                .collect::<Vec<_>>(),
         }
     }
 
     fn body_at(history: &[Message], idx: usize) -> String {
         match &history[idx] {
-            Message::User { content } => tool_result_body(match content.first_ref() {
-                UserContent::ToolResult(tr) => &tr.content,
+            Message::User { content } => tool_result_body(match content.first() {
+                Some(UserContent::ToolResult(tr)) => &tr.content,
                 _ => panic!("not a tool result"),
             }),
             _ => panic!("not a user message"),
@@ -1010,8 +1012,8 @@ mod tests {
 
     fn tool_result_id_at(history: &[Message], idx: usize) -> String {
         match &history[idx] {
-            Message::User { content } => match content.first_ref() {
-                UserContent::ToolResult(tr) => tr.id.clone(),
+            Message::User { content } => match content.first() {
+                Some(UserContent::ToolResult(tr)) => tr.call.to_string(),
                 _ => panic!("not a tool result"),
             },
             _ => panic!("not a user message"),

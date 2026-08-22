@@ -969,6 +969,7 @@ mod safety_gate_tests {
             resume: crate::db::needs_attention::InterruptResumeAnchor {
                 agent_id: "builder".to_string(),
                 call_id: "call-1".to_string(),
+                provider_item_id: None,
                 provider_call_id: None,
                 assistant_seq: None,
                 call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
@@ -1458,6 +1459,7 @@ mod safety_gate_tests {
             resume: crate::db::needs_attention::InterruptResumeAnchor {
                 agent_id: "builder".to_string(),
                 call_id: "call-1".to_string(),
+                provider_item_id: None,
                 provider_call_id: None,
                 assistant_seq: None,
                 call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,
@@ -1492,6 +1494,7 @@ mod safety_gate_tests {
                 resume: crate::db::needs_attention::InterruptResumeAnchor {
                     agent_id: "builder".to_string(),
                     call_id: "call-1".to_string(),
+                    provider_item_id: None,
                     provider_call_id: None,
                     assistant_seq: None,
                     call_origin: crate::db::needs_attention::InterruptCallOrigin::Foreground,

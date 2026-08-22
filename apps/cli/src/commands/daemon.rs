@@ -222,8 +222,14 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             offline,
             no_sandbox,
         } => {
+            // Offline in-process fallback: passing `None` (no daemon handle)
+            // makes `cli_snapshot` open the DB once via the core daemon-layer
+            // diagnostics probe to report openability / schema health. The CLI
+            // itself opens no session DB (its ratchet ALLOWED stays empty); the
+            // single permitted default-path opener lives in cockpit-core.
             let snapshot =
-                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline).await?;
+                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline, None)
+                    .await?;
             println!(
                 "{}",
                 serde_json::json!({

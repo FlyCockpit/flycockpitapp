@@ -51,10 +51,40 @@ pub struct DiagnosticsSnapshot {
     pub has_failures: bool,
 }
 
+/// The database a diagnostics snapshot renders against. Diagnostics never opens
+/// SQLite from this module: a running daemon injects its already-open handle,
+/// and the offline `doctor` path opens the DB through the single daemon-layer
+/// [`crate::daemon::diagnostics_probe`] opener, threading the open result
+/// (success or failure) through here so the database section can report
+/// openability / schema-rejection accurately.
+enum DiagnosticDb<'a> {
+    /// An already-open, healthy handle (the daemon's `ctx.db`, or a successful
+    /// offline probe open). Real reads are performed.
+    Open(&'a crate::db::Db),
+    /// An offline probe open that failed; the error drives the openability /
+    /// schema lines (a schema rejection vs. an unopenable database).
+    OpenFailed(&'a anyhow::Error),
+    /// No database is available at all (e.g. a TUI client, which never opens
+    /// one). DB-internal fields render "unavailable".
+    Unavailable,
+}
+
+impl<'a> DiagnosticDb<'a> {
+    /// The healthy handle to read through, if any. `OpenFailed`/`Unavailable`
+    /// yield `None`, so journal/trust readers degrade to "unavailable".
+    fn handle(&self) -> Option<&'a crate::db::Db> {
+        match self {
+            DiagnosticDb::Open(db) => Some(db),
+            DiagnosticDb::OpenFailed(_) | DiagnosticDb::Unavailable => None,
+        }
+    }
+}
+
 pub async fn cli_snapshot(
     path: Option<&Path>,
     no_sandbox: bool,
     offline: bool,
+    db: Option<&crate::db::Db>,
 ) -> Result<DiagnosticsSnapshot> {
     #[cfg(feature = "test-support")]
     if std::env::var_os("COCKPIT_TEST_DOCTOR_FORCE_FAILURE").is_some() {
@@ -64,18 +94,36 @@ pub async fn cli_snapshot(
     let launch = crate::welcome::load_bundle_bootstrap(path, false);
     let dependency_cwd = launch.launch.cwd.clone();
     let extended = launch.extended;
-    let mut snapshot = build_snapshot(DiagnosticsInput {
-        cwd: launch.launch.cwd,
-        session_id: None,
-        session_short_id: None,
-        // A fresh daemon session resolves its root primary through the LLM
-        // mode, which makes the default Defensive mode start as Careful
-        // rather than the narrower `default_primary_agent` config value.
-        active_agent: effective_default_agent(&extended),
-        active_model: launch.launch.active_model,
-        pending_model_selection: None,
-        sandbox_enabled: Some(!no_sandbox),
-    })?;
+    // A running daemon injects its already-open `ctx.db` handle, so the snapshot
+    // never opens a second DB. When no handle is injected this is the offline
+    // in-process `doctor`, which cannot route through a daemon; it opens the DB
+    // exactly once via the single daemon-layer probe (never the default-path
+    // opener from this module) and reports its open result — a failed open too.
+    let offline_probe = match db {
+        Some(_) => None,
+        None => Some(crate::daemon::diagnostics_probe::open_diagnostic_db()),
+    };
+    let db_source = match (db, offline_probe.as_ref()) {
+        (Some(handle), _) => DiagnosticDb::Open(handle),
+        (None, Some(Ok(opened))) => DiagnosticDb::Open(opened),
+        (None, Some(Err(error))) => DiagnosticDb::OpenFailed(error),
+        (None, None) => DiagnosticDb::Unavailable,
+    };
+    let mut snapshot = build_snapshot(
+        DiagnosticsInput {
+            cwd: launch.launch.cwd,
+            session_id: None,
+            session_short_id: None,
+            // A fresh daemon session resolves its root primary through the LLM
+            // mode, which makes the default Defensive mode start as Careful
+            // rather than the narrower `default_primary_agent` config value.
+            active_agent: effective_default_agent(&extended),
+            active_model: launch.launch.active_model,
+            pending_model_selection: None,
+            sandbox_enabled: Some(!no_sandbox),
+        },
+        db_source.handle(),
+    )?;
     snapshot.dependencies = tokio::task::spawn_blocking(move || {
         dependency_projection_with_deadline_for_run(
             dependency_cwd,
@@ -90,7 +138,7 @@ pub async fn cli_snapshot(
     let (network, network_failed) = provider_network_lines(&providers, offline).await;
     snapshot.network = network;
     snapshot.has_failures |= network_failed;
-    let (database, database_failed) = database_lines(&extended).await;
+    let (database, database_failed) = database_lines(&db_source, &extended).await;
     snapshot.database = database;
     snapshot.has_failures |= database_failed;
     let (mut daemon, _) = daemon_lines().await;
@@ -105,7 +153,8 @@ pub async fn cli_snapshot(
 pub fn tui_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let cwd = input.cwd.clone();
     let sandbox_enabled = input.sandbox_enabled.unwrap_or(true);
-    let mut snapshot = build_snapshot(input)?;
+    // The TUI is a daemon client and never opens the DB itself.
+    let mut snapshot = build_snapshot(input, None)?;
     snapshot.dependencies =
         dependency_projection_with_deadline_for_run(cwd, Duration::from_secs(2), sandbox_enabled)?;
     snapshot.has_failures |= snapshot.dependencies.has_required_failures();
@@ -159,12 +208,15 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     out
 }
 
-fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
+fn build_snapshot(
+    input: DiagnosticsInput,
+    db: Option<&crate::db::Db>,
+) -> Result<DiagnosticsSnapshot> {
     let trust_root = crate::config::trust::resolve_trust_root(&input.cwd).ok();
     let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
     let extended = crate::config::extended::load_for_cwd(&input.cwd);
     let harnesses = crate::config::extended::resolve_harnesses(&input.cwd);
-    let trust_mode = workspace_trust_mode(&input.cwd);
+    let trust_mode = workspace_trust_mode(db, &input.cwd);
     let trust_resolved = trust_mode != "unresolved";
     let container = crate::container::availability_snapshot();
     let container_reason = container
@@ -174,7 +226,7 @@ fn build_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
 
     let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
     let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
-    let (external_journal, external_journal_failed) = external_journal_lines();
+    let (external_journal, external_journal_failed) = external_journal_lines(db);
 
     let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
         Some((snapshot, descriptors)) => {
@@ -345,18 +397,12 @@ pub fn external_journal_section(
 /// Reporting needs no spool HMAC key material, so this deliberately reads only
 /// SQLite counts plus on-disk capsule/quarantine sizes and never resolves a
 /// key: diagnostics output can never disclose one.
-fn external_journal_lines() -> (Vec<String>, bool) {
-    let db = match crate::db::Db::open_default() {
-        Ok(db) => db,
-        Err(error) => {
-            return (
-                vec![format!(
-                    "status: FAILED (database unavailable: {})",
-                    one_line(&format!("{error:#}"))
-                )],
-                true,
-            );
-        }
+fn external_journal_lines(db: Option<&crate::db::Db>) -> (Vec<String>, bool) {
+    let Some(db) = db else {
+        return (
+            vec!["status: unavailable (requires daemon)".to_string()],
+            true,
+        );
     };
     let now_wall_ms = chrono::Utc::now().timestamp_millis();
     // The journal's integrity latch is persisted, so a doctor run that holds
@@ -405,7 +451,12 @@ fn effective_default_agent(extended: &crate::config::extended::ExtendedConfig) -
     crate::daemon::session_worker::initial_active_agent_for_llm_mode(extended, extended.llm_mode)
 }
 
-async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (Vec<String>, bool) {
+async fn database_lines(
+    db: &DiagnosticDb<'_>,
+    extended: &crate::config::extended::ExtendedConfig,
+) -> (Vec<String>, bool) {
+    // `default_path` only resolves the on-disk location; it does NOT open,
+    // create, or migrate anything, so the real path is always safe to report.
     let path = match crate::db::Db::default_path() {
         Ok(path) => path,
         Err(error) => {
@@ -419,42 +470,12 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
         }
     };
     let mut lines = vec![format!("path: {}", path.display())];
-    match crate::db::Db::open_default() {
-        Ok(db) => {
-            lines.push("openability: ok".to_string());
-            match (
-                db.schema_version().await,
-                db.applied_migration_version().await,
-            ) {
-                (Ok(schema), Ok(migration)) => {
-                    lines.push(format!(
-                        "schema: ok (actual {schema}, expected {})",
-                        crate::db::EXPECTED_SCHEMA_VERSION
-                    ));
-                    lines.push(format!(
-                        "ledger: migration {migration}; checksum verification enabled"
-                    ));
-                }
-                (schema, migration) => {
-                    let error = schema
-                        .err()
-                        .or(migration.err())
-                        .expect("one database read failed");
-                    lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
-                    return (lines, true);
-                }
-            }
-            match std::fs::metadata(&path) {
-                Ok(metadata) => lines.push(format!("size: {} bytes", metadata.len())),
-                Err(error) => lines.push(format!(
-                    "size: unavailable ({})",
-                    one_line(&error.to_string())
-                )),
-            }
-            lines.push(retention_line(&extended.retention));
-            (lines, false)
-        }
-        Err(error) => {
+    let db = match db {
+        DiagnosticDb::Open(db) => db,
+        // The offline probe attempted an open and it FAILED. Distinguish a
+        // schema/migration rejection (SQLite opened, Cockpit rejected it) from a
+        // database that could not be opened at all.
+        DiagnosticDb::OpenFailed(error) => {
             let message = format!("{error:#}");
             if is_schema_rejection(&message) {
                 lines.push(
@@ -468,9 +489,48 @@ async fn database_lines(extended: &crate::config::extended::ExtendedConfig) -> (
                 );
             }
             lines.push(retention_line(&extended.retention));
-            (lines, true)
+            return (lines, true);
+        }
+        // No DB at all (e.g. a TUI client): the resolved path stays visible but
+        // the DB-internal fields are unavailable. Diagnostics opens nothing.
+        DiagnosticDb::Unavailable => {
+            lines.push("openability: unavailable (daemon not running)".to_string());
+            lines.push("schema: unavailable".to_string());
+            return (lines, true);
+        }
+    };
+    lines.push("openability: ok".to_string());
+    match (
+        db.schema_version().await,
+        db.applied_migration_version().await,
+    ) {
+        (Ok(schema), Ok(migration)) => {
+            lines.push(format!(
+                "schema: ok (actual {schema}, expected {})",
+                crate::db::EXPECTED_SCHEMA_VERSION
+            ));
+            lines.push(format!(
+                "ledger: migration {migration}; checksum verification enabled"
+            ));
+        }
+        (schema, migration) => {
+            let error = schema
+                .err()
+                .or(migration.err())
+                .expect("one database read failed");
+            lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
+            return (lines, true);
         }
     }
+    match std::fs::metadata(&path) {
+        Ok(metadata) => lines.push(format!("size: {} bytes", metadata.len())),
+        Err(error) => lines.push(format!(
+            "size: unavailable ({})",
+            one_line(&error.to_string())
+        )),
+    }
+    lines.push(retention_line(&extended.retention));
+    (lines, false)
 }
 
 #[allow(dead_code)]
@@ -588,8 +648,8 @@ fn session_label(id: Option<uuid::Uuid>, short_id: Option<&str>) -> String {
     }
 }
 
-fn workspace_trust_mode(cwd: &Path) -> String {
-    let Ok(db) = crate::db::Db::open_default() else {
+fn workspace_trust_mode(db: Option<&crate::db::Db>, cwd: &Path) -> String {
+    let Some(db) = db else {
         return "unresolved".to_string();
     };
     let Ok(root) = crate::config::trust::resolve_trust_root(cwd) else {
@@ -1493,7 +1553,9 @@ mod tests {
             root: crate::config::trust::resolve_trust_root(&cwd).unwrap(),
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
-        crate::config::trust::with_workspace_trust_policy(policy, || build_snapshot(input).unwrap())
+        crate::config::trust::with_workspace_trust_policy(policy, || {
+            build_snapshot(input, None).unwrap()
+        })
     }
 
     fn trusted_tui_snapshot(input: DiagnosticsInput) -> DiagnosticsSnapshot {
@@ -1545,7 +1607,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = build_snapshot(base_input(tmp.path())).unwrap();
+        let snapshot = build_snapshot(base_input(tmp.path()), None).unwrap();
 
         assert!(snapshot.workspace_trust.contains("unresolved"));
         assert!(

@@ -3732,7 +3732,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             project_root,
             no_sandbox,
             offline,
-        } => get_doctor_snapshot_response(project_root, no_sandbox, offline).await,
+        } => {
+            get_doctor_snapshot_response(Some(ctx.db.clone()), project_root, no_sandbox, offline)
+                .await
+        }
         // Owner-remoted, read-only, serialized: the docs pipeline creates a
         // `"docs"` session and runs a full turn, so it is not a snapshot-correct
         // concurrent read. Runs on this per-client serialized executor.
@@ -8871,7 +8874,10 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             project_root,
             no_sandbox,
             offline,
-        } => get_doctor_snapshot_response(project_root, no_sandbox, offline).await,
+        } => {
+            get_doctor_snapshot_response(Some(ctx.db.clone()), project_root, no_sandbox, offline)
+                .await
+        }
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
             message: format!("request `{request_kind}` is not marked concurrent"),
@@ -12934,6 +12940,7 @@ async fn diagnose_media_reservation_response(
 }
 
 async fn get_doctor_snapshot_response(
+    db: Option<crate::db::Db>,
     project_root: Option<String>,
     no_sandbox: bool,
     offline: bool,
@@ -12942,7 +12949,9 @@ async fn get_doctor_snapshot_response(
     // across `.await`). Drive it to completion on a dedicated current-thread
     // runtime inside `spawn_blocking` so it never crosses the concurrent
     // dispatch task's `Send` boundary. Only the rendered `String` and the
-    // failure flag (both `Send`) leave the closure.
+    // failure flag (both `Send`) leave the closure. The daemon injects its own
+    // already-open `Db` (a cheap Arc-backed shared handle) so the snapshot never
+    // opens a second DB.
     let (rendered, has_failures) = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -12954,6 +12963,7 @@ async fn get_doctor_snapshot_response(
                 path.as_deref(),
                 no_sandbox,
                 offline,
+                db.as_ref(),
             ))
             .map_err(|error| error.to_string())?;
         Ok::<(String, bool), String>((crate::diagnostics::render(&snapshot), snapshot.has_failures))

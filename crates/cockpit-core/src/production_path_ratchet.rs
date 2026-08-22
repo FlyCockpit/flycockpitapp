@@ -3,7 +3,9 @@
 //! Later owner-RPC prompts shrink this list. A warning is not enough.
 //! Each entry is an exact file + forbidden symbol + occurrence count. A new
 //! open in an allow-listed file fails. The only permitted production
-//! `Db::open_default` in the daemon is boot.
+//! `Db::open_default` opens are daemon boot, and the offline `doctor`
+//! diagnostic (`daemon/diagnostics_probe.rs`) which reports database health
+//! in-process when no daemon is available.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ const FORBIDDEN: &[&str] = &[
 /// modules are stripped.
 const ALLOWED: &[(&str, &str, usize)] = &[
     ("daemon/server/mod.rs", "Db::open_default", 1),
+    ("daemon/diagnostics_probe.rs", "Db::open_default", 1),
     ("daemon/server/mod.rs", "open_for_db", 1),
     ("secure_key/mod.rs", "vault_for_db", 1),
     ("secure_key/mod.rs", "open_for_db", 1),

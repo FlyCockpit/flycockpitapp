@@ -650,6 +650,14 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::PolicyImported { .. }
         | proto::Response::ImageSpendPolicy { .. }
         | proto::Response::ImageSpendPolicySaved { .. } => {}
+        // Redacted image-control read reply. Every secret-BEARING field
+        // (credential_ref/headers/graph_json/target source_urls) is dropped at
+        // the `cockpit_proto::image_control` projection funnel, exactly as the
+        // sibling `ProviderCatalogSnapshot` safe projection above excludes its
+        // secret material and is likewise not re-scrubbed. The remaining strings
+        // are non-secret config identifiers (display names, model names,
+        // origins).
+        proto::Response::ImageControlRead(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -5219,6 +5227,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+mod image_control_reads;
 mod run_invocation;
 mod sealed_capabilities;
 pub use run_invocation::{

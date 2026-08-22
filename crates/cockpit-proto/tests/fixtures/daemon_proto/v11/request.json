@@ -1555,6 +1555,51 @@
     },
     "request": "save_image_spend_policy"
   },
+  "image_endpoint_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "ZXAx"
+    },
+    "request": "image_endpoint_list"
+  },
+  "image_endpoint_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1"
+    },
+    "request": "image_endpoint_get"
+  },
+  "image_target_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "dDE"
+    },
+    "request": "image_target_list"
+  },
+  "image_target_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_id": "t1"
+    },
+    "request": "image_target_get"
+  },
+  "image_workflow_list": {
+    "params": {
+      "project_root": "/tmp/project",
+      "limit": 50,
+      "cursor": "d2Yx"
+    },
+    "request": "image_workflow_list"
+  },
+  "image_workflow_get": {
+    "params": {
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1"
+    },
+    "request": "image_workflow_get"
+  },
   "list_packages": {
     "request": "list_packages"
   },

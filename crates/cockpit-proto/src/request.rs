@@ -1630,6 +1630,63 @@ pub enum Request {
         expected_policy_version: Option<u64>,
     },
 
+    /// LOCAL owner READ: list the redacted image-generation endpoints for a
+    /// project. Owner-only, local-only, concurrent. Secret-bearing fields
+    /// (credential_ref/headers) are dropped by the safe projection.
+    ImageEndpointList {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+
+    /// LOCAL owner READ: get one redacted image-generation endpoint.
+    ImageEndpointGet {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        endpoint_id: String,
+    },
+
+    /// LOCAL owner READ: list the redacted image-generation targets.
+    ImageTargetList {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+
+    /// LOCAL owner READ: get one redacted image-generation target.
+    ImageTargetGet {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        target_id: String,
+    },
+
+    /// LOCAL owner READ: list the redacted registered image workflows. The
+    /// safe projection drops the opaque `graph_json` blob.
+    ImageWorkflowList {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+
+    /// LOCAL owner READ: get one redacted registered image workflow.
+    ImageWorkflowGet {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        workflow_id: String,
+    },
+
     /// Remove a provider entry through the daemon's trust-aware writer.
     DeleteProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
@@ -2556,6 +2613,12 @@ macro_rules! request_variants {
             (Request::ImportPolicy { .. }, "import_policy");
             (Request::GetImageSpendPolicy { .. }, "get_image_spend_policy");
             (Request::SaveImageSpendPolicy { .. }, "save_image_spend_policy");
+            (Request::ImageEndpointList { .. }, "image_endpoint_list");
+            (Request::ImageEndpointGet { .. }, "image_endpoint_get");
+            (Request::ImageTargetList { .. }, "image_target_list");
+            (Request::ImageTargetGet { .. }, "image_target_get");
+            (Request::ImageWorkflowList { .. }, "image_workflow_list");
+            (Request::ImageWorkflowGet { .. }, "image_workflow_get");
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
@@ -2809,6 +2872,12 @@ macro_rules! command {
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
             (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
+            (Request::ImageEndpointList { project_root, limit, cursor }, "image_endpoint_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            (Request::ImageEndpointGet { project_root, endpoint_id }, "image_endpoint_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|endpoint_id:String", [project_root: String => project_root, endpoint_id: String => param]);
+            (Request::ImageTargetList { project_root, limit, cursor }, "image_target_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            (Request::ImageTargetGet { project_root, target_id }, "image_target_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|target_id:String", [project_root: String => project_root, target_id: String => param]);
+            (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
+            (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
             (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);

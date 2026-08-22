@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 82,
-    "request": 200,
-    "response": 142
+    "request": 206,
+    "response": 143
   },
   "messages": {
     "event": [
@@ -1476,6 +1476,42 @@
         "tag": "save_image_spend_policy"
       },
       {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_get"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_get"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_get"
+      },
+      {
         "class": "liveness",
         "inlinePayloadBound": "bounded",
         "lane": "control",
@@ -2406,6 +2442,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "image_spend_policy_saved"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_control_read"
       },
       {
         "class": "bounded_request_response",

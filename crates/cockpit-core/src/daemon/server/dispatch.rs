@@ -1512,6 +1512,112 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
     }
 }
 
+/// LOCAL owner image-generation control-plane READ dispatch, shared by the
+/// serialized and concurrent surfaces. These commands are declared
+/// `owner_only` + `local_only` + `concurrent`, so at runtime they route to the
+/// concurrent surface; the arm is duplicated on the (exhaustive) serialized
+/// surface for match completeness. Every reply is a redacted safe projection
+/// assembled through the single `cockpit_proto::image_control` funnel.
+async fn dispatch_image_control_read(
+    ctx: &Arc<DaemonContext>,
+    request: Request,
+) -> std::result::Result<Response, ErrorPayload> {
+    // Every image-control read carries the project root. Resolve it once, then
+    // load the image-generation registry through the SAME trust-gated daemon
+    // config contract every other owner config read uses
+    // (`resolve_workspace_trust_policy_from_db` + `load_effective_for_daemon`):
+    // untrusted project layers are filtered out and remote `image_generation`
+    // is stripped before it can be projected. `project_root` is only a config
+    // cwd here, never authority — the RPC is already `owner_only`-gated.
+    let project_root = match &request {
+        Request::ImageEndpointList { project_root, .. }
+        | Request::ImageEndpointGet { project_root, .. }
+        | Request::ImageTargetList { project_root, .. }
+        | Request::ImageTargetGet { project_root, .. }
+        | Request::ImageWorkflowList { project_root, .. }
+        | Request::ImageWorkflowGet { project_root, .. } => project_root.clone(),
+        other => {
+            return Err(internal(format!(
+                "dispatch_image_control_read called with non-image-control request `{}`",
+                principal::request_kind(other)
+            )));
+        }
+    };
+    if project_root.trim().is_empty() {
+        return Err(bad_request("project_root must not be empty"));
+    }
+    let cwd = std::path::PathBuf::from(&project_root);
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+        .await
+        .map_err(internal)?;
+    let (_, extended) = ctx
+        .config_source
+        .load_effective_for_daemon(&cwd, &trust_policy)
+        .map_err(internal)?;
+    let cfg = &extended.image_generation;
+    let generation = inventory::current_config_generation().to_string();
+    let daemon_instance_id = inventory::daemon_instance_id().to_string();
+    match request {
+        Request::ImageEndpointList { limit, cursor, .. } => image_control_reads::endpoint_list(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            limit,
+            cursor.as_deref(),
+        )
+        .map(Response::ImageControlRead),
+        Request::ImageEndpointGet { endpoint_id, .. } => image_control_reads::endpoint_get(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            &endpoint_id,
+        )
+        .map(Response::ImageControlRead),
+        Request::ImageTargetList { limit, cursor, .. } => image_control_reads::target_list(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            limit,
+            cursor.as_deref(),
+        )
+        .map(Response::ImageControlRead),
+        Request::ImageTargetGet { target_id, .. } => image_control_reads::target_get(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            &target_id,
+        )
+        .map(Response::ImageControlRead),
+        Request::ImageWorkflowList { limit, cursor, .. } => image_control_reads::workflow_list(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            limit,
+            cursor.as_deref(),
+        )
+        .map(Response::ImageControlRead),
+        Request::ImageWorkflowGet { workflow_id, .. } => image_control_reads::workflow_get(
+            cfg,
+            &generation,
+            daemon_instance_id,
+            project_root,
+            &workflow_id,
+        )
+        .map(Response::ImageControlRead),
+        // The project_root pre-match already rejected any non-image-control
+        // variant, so this arm is unreachable.
+        other => Err(internal(format!(
+            "dispatch_image_control_read called with non-image-control request `{}`",
+            principal::request_kind(&other)
+        ))),
+    }
+}
+
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
     state: &mut MutableClientState,
@@ -4160,6 +4266,16 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 policy_version: current.map(|policy| policy.policy_version),
             })
         }
+
+        // LOCAL owner image-control reads are `concurrent`, so they normally
+        // route to the concurrent surface; this arm keeps the exhaustive
+        // serialized match complete and shares the one redacting handler.
+        Request::ImageEndpointList { .. }
+        | Request::ImageEndpointGet { .. }
+        | Request::ImageTargetList { .. }
+        | Request::ImageTargetGet { .. }
+        | Request::ImageWorkflowList { .. }
+        | Request::ImageWorkflowGet { .. } => dispatch_image_control_read(ctx, request).await,
 
         Request::SaveImageSpendPolicy {
             project_key,
@@ -8831,6 +8947,14 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                 policy_version: current.map(|policy| policy.policy_version),
             })
         }
+        // LOCAL owner image-generation control-plane reads (declared
+        // `concurrent`). Redacted safe projections only.
+        Request::ImageEndpointList { .. }
+        | Request::ImageEndpointGet { .. }
+        | Request::ImageTargetList { .. }
+        | Request::ImageTargetGet { .. }
+        | Request::ImageWorkflowList { .. }
+        | Request::ImageWorkflowGet { .. } => dispatch_image_control_read(&ctx, request).await,
         // Owner-only catalog read. It resolves only from `ctx` (config source +
         // vault) and takes its own config-publication lock, so it needs no
         // per-connection session state and is safe to run concurrently. Its

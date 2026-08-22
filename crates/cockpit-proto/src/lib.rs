@@ -26,6 +26,7 @@
 
 pub mod es256;
 pub mod host_capabilities;
+pub mod image_control;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,

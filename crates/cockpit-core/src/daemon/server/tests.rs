@@ -13690,6 +13690,17 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // Owner-remoted settings/policy reads project the effective config; the
         // owner cell resolves to a `Response` like the other read snapshots.
         "export_policy" | "get_image_spend_policy" => AuthzAllowedOutcome::Response,
+        // LOCAL owner image-control LIST reads project the (empty, on the
+        // ephemeral matrix daemon) registry, so the owner cell is a `Response`.
+        "image_endpoint_list" | "image_target_list" | "image_workflow_list" => {
+            AuthzAllowedOutcome::Response
+        }
+        // LOCAL owner image-control GET reads reference an id absent from the
+        // ephemeral daemon's empty registry, so the owner-allowed cell surfaces
+        // the daemon-layer not-found mapping (`bad_request`) post-auth.
+        "image_endpoint_get" | "image_target_get" | "image_workflow_get" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
         // Owner-remoted settings/setup/flycockpit mutations validate their
         // caller-supplied payload after the owner gate; the matrix request's
         // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
@@ -13918,6 +13929,12 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("import_policy"),
         authz_owner_only("get_image_spend_policy"),
         authz_owner_only("save_image_spend_policy"),
+        authz_owner_only("image_endpoint_list"),
+        authz_owner_only("image_endpoint_get"),
+        authz_owner_only("image_target_list"),
+        authz_owner_only("image_target_get"),
+        authz_owner_only("image_workflow_list"),
+        authz_owner_only("image_workflow_get"),
         authz_owner_only("set_flycockpit_connector_enabled"),
         authz_owner_only("sync_flycockpit_org_policy"),
         authz_owner_only("enroll_flycockpit_org_sync"),
@@ -15390,6 +15407,33 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
+        },
+        "image_endpoint_list" => Request::ImageEndpointList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_endpoint_get" => Request::ImageEndpointGet {
+            project_root: root.clone(),
+            endpoint_id: "ep-authz".into(),
+        },
+        "image_target_list" => Request::ImageTargetList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_target_get" => Request::ImageTargetGet {
+            project_root: root.clone(),
+            target_id: "t-authz".into(),
+        },
+        "image_workflow_list" => Request::ImageWorkflowList {
+            project_root: root.clone(),
+            limit: None,
+            cursor: None,
+        },
+        "image_workflow_get" => Request::ImageWorkflowGet {
+            project_root: root.clone(),
+            workflow_id: "wf-authz".into(),
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
             project_key: root.clone(),
@@ -20299,6 +20343,12 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_stat",
         "get_host_capabilities",
         "get_image_spend_policy",
+        "image_endpoint_list",
+        "image_endpoint_get",
+        "image_target_list",
+        "image_target_get",
+        "image_workflow_list",
+        "image_workflow_get",
         "get_provider_catalog_snapshot",
         "get_run_invocation_status",
         "get_usage_counts",
@@ -22150,6 +22200,12 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageTargetList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_target_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageTargetGet { project_root: "/tmp/project".into(), target_id: "t1".into() }, kind: "image_target_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageWorkflowList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_workflow_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ImageWorkflowGet { project_root: "/tmp/project".into(), workflow_id: "wf1".into() }, kind: "image_workflow_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
@@ -22376,6 +22432,12 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImportPolicy,
         GetImageSpendPolicy,
         SaveImageSpendPolicy,
+        ImageEndpointList,
+        ImageEndpointGet,
+        ImageTargetList,
+        ImageTargetGet,
+        ImageWorkflowList,
+        ImageWorkflowGet,
         ListPackages,
         AddPackage,
         ImportPackage,

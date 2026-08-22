@@ -98,6 +98,8 @@ pub(crate) mod wire_schema;
 pub(crate) use display_dispatch::DisplayAttemptSlot;
 
 #[allow(unused_imports)]
+pub use build::EndpointRecoveryAdditionalParams;
+#[allow(unused_imports)]
 pub use build::ModelParams;
 #[allow(unused_imports)]
 pub use build::{
@@ -782,6 +784,17 @@ impl Model {
         &self,
         providers: &crate::config::providers::ProvidersConfig,
     ) -> Option<serde_json::Value> {
+        self.resolve_reasoning_params_for_endpoint(providers, self.current_wire_api())
+    }
+
+    /// Resolve the selected reasoning control for a concrete endpoint. The
+    /// endpoint-recovery retry uses this for the alternate route, so catalog
+    /// mappings never leak across wire APIs.
+    pub fn resolve_reasoning_params_for_endpoint(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+        endpoint: crate::config::providers::WireApi,
+    ) -> Option<serde_json::Value> {
         let active = providers.active_model.as_ref()?;
         if providers.has_reasoning_effort_capability(self.provider_id(), self.model_id_ref()) {
             let selected = active
@@ -796,11 +809,13 @@ impl Model {
             } else {
                 crate::config::providers::ReasoningEffortWire::OpenAiCompatible
             };
-            return match providers.resolve_reasoning_effort_params_for_wire(
+            let endpoint = (!self.is_anthropic_native_wire()).then_some(endpoint);
+            return match providers.resolve_reasoning_effort_params_for_openai_endpoint(
                 self.provider_id(),
                 self.model_id_ref(),
                 selected,
                 wire,
+                endpoint,
                 self.resolved_max_tokens(),
             ) {
                 Ok(params) => params,
@@ -834,6 +849,21 @@ impl Model {
                 providers.resolve_default_thinking_mode(self.provider_id(), self.model_id_ref())
             })?;
         providers.resolve_thinking_params(self.provider_id(), self.model_id_ref(), mode)
+    }
+
+    /// Parameters to use if OpenAI-compatible endpoint recovery retries the
+    /// opposite route. Native providers never perform that recovery.
+    pub fn endpoint_recovery_reasoning_params(
+        &self,
+        providers: &crate::config::providers::ProvidersConfig,
+    ) -> Option<EndpointRecoveryAdditionalParams> {
+        matches!(self, Model::OpenAi { .. }).then(|| EndpointRecoveryAdditionalParams {
+            primary_wire_api: self.current_wire_api(),
+            alternate: self.resolve_reasoning_params_for_endpoint(
+                providers,
+                self.current_wire_api().opposite(),
+            ),
+        })
     }
 
     /// Provider wire API family used by diagnostics/export. This is not a
@@ -947,6 +977,15 @@ impl Model {
                 let normalized = normalize_probe_base_url(base_url);
                 if let Some(endpoint) = state.session_confirmed.get(&normalized) {
                     return *endpoint;
+                }
+                // A freshly fetched model catalog is stronger evidence than a
+                // process-local probe from an earlier catalog generation. In
+                // particular, Copilot may move a model from Chat Completions
+                // to Responses while the old learned endpoint is still in the
+                // TTL cache. Session-confirmed recovery stays above this so a
+                // successful swap remains stable for the current session.
+                if !state.configured.is_auto() {
+                    return state.configured;
                 }
                 drop(state);
                 if let Some(learned) = learned_working_endpoint(provider_id, model_id, base_url) {

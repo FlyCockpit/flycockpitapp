@@ -2821,6 +2821,7 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
         thinking_params: Default::default(),
         system_prompt: None,
         wire_api: Default::default(),
+        wire_api_provenance: Default::default(),
         extra: Default::default(),
         capabilities: Default::default(),
         capability_overrides: Default::default(),

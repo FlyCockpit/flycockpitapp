@@ -717,6 +717,9 @@ pub(super) async fn run_worker(
     model: Arc<Model>,
     model_override: Option<Arc<Model>>,
     thinking_params: Option<serde_json::Value>,
+    endpoint_recovery_thinking_params: Option<
+        crate::engine::model::EndpointRecoveryAdditionalParams,
+    >,
     project_root: PathBuf,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
@@ -843,6 +846,7 @@ pub(super) async fn run_worker(
         // request via `ModelParams`; the rest are defaults as before.
         params: ModelParams {
             additional_params: thinking_params,
+            endpoint_recovery_additional_params: endpoint_recovery_thinking_params,
             // Top-level `prompt_cache_key` = session id for OpenAI-compatible
             // backends (prompt `prompt-caching-strategy.md`, decision 3),
             // held constant across the session so per-key prefix caching keeps

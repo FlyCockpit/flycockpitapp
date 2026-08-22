@@ -428,14 +428,15 @@ mod tests {
 }
 
 /// Persist a self-healed wire-API endpoint back into config
-/// (implementation note): pin `resolved` (a concrete
+/// (implementation note): record `resolved` (a concrete
 /// `completions`/`responses`, never `auto`) onto the `(provider_id, model_id)`
-/// model entry, reusing the same read-modify-write `ConfigDoc` path that caches
-/// the fetched `/models` list. Only the `wire_api` field is touched — every
-/// other field on the entry is preserved. When the model isn't yet listed in
-/// config (e.g. a manually-typed id never fetched) the entry is created so the
-/// pin survives the next `/models` refresh
-/// ([`crate::config::providers::merge_fetched_models`] carries it over).
+/// model entry with `recovered` provenance, reusing the same read-modify-write
+/// `ConfigDoc` path that caches the fetched `/models` list. This preserves the
+/// working fallback when no catalog can name the endpoint, while letting a
+/// later live catalog supersede stale learned state. A user endpoint pin is
+/// never overwritten. When the model isn't yet listed in config (e.g. a
+/// manually-typed id never fetched) the entry is created so the learned value
+/// survives the next `/models` refresh.
 /// Best-effort: a self-heal that can't be persisted still served the turn
 /// correctly, so any IO error is logged, never propagated into the live turn.
 pub(super) fn persist_wire_api(
@@ -444,7 +445,7 @@ pub(super) fn persist_wire_api(
     model_id: &str,
     resolved: crate::config::providers::WireApi,
 ) {
-    use crate::config::providers::{ConfigDoc, ModelEntry};
+    use crate::config::providers::{ConfigDoc, ModelEntry, WireApiProvenance};
     let mut doc = match ConfigDoc::load(config_path) {
         Ok(d) => d,
         Err(e) => {
@@ -459,14 +460,21 @@ pub(super) fn persist_wire_api(
         return;
     };
     if let Some(model) = entry.models.iter_mut().find(|m| m.id == model_id) {
-        if model.wire_api == resolved {
+        if !model.wire_api.is_auto() && model.wire_api_provenance.is_user_configured() {
+            return;
+        }
+        if model.wire_api == resolved
+            && matches!(model.wire_api_provenance, WireApiProvenance::Recovered)
+        {
             return; // already pinned — no write.
         }
         model.wire_api = resolved;
+        model.wire_api_provenance = WireApiProvenance::Recovered;
     } else {
         entry.models.push(ModelEntry {
             id: model_id.to_string(),
             wire_api: resolved,
+            wire_api_provenance: WireApiProvenance::Recovered,
             // Mark manual so the pin survives a refetch as a standalone entry
             // even if the provider's `/models` never lists this id.
             manual: true,

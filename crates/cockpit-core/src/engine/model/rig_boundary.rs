@@ -207,6 +207,7 @@ pub(crate) fn is_endpoint_mismatch_error_text(message: &str) -> bool {
         || lower.contains("not supported on this endpoint")
         || lower.contains("not supported with this endpoint")
         || lower.contains("chat completions endpoint")
+        || lower.contains("/chat/completions endpoint")
         || lower.contains("responses endpoint")
         || lower.contains("unsupported endpoint")
 }
@@ -662,6 +663,7 @@ mod tests {
             "not supported on this endpoint",
             "not supported with this endpoint",
             "chat completions endpoint",
+            "model is not accessible via the /chat/completions endpoint",
             "responses endpoint",
             "unsupported endpoint",
         ] {
@@ -687,6 +689,7 @@ mod tests {
             "not supported on this endpoint",
             "not supported with this endpoint",
             "chat completions endpoint",
+            "model is not accessible via the /chat/completions endpoint",
             "responses endpoint",
             "unsupported endpoint",
         ] {

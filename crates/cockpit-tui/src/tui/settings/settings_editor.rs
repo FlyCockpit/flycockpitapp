@@ -64,8 +64,8 @@ use cockpit_config::providers::{
     ClientSideToolsCapability, ContextConfig, MODEL_SYSTEM_PROMPT_MAX_BYTES,
     ModelCapabilityOverrides, ModelEntry, ModelLocation, ModelTrust, PromptCacheRetention,
     ProviderEntry, ProvidersConfig, ShrinkConfig, ShrinkStrategy, ThinkingMode, TimeoutConfig,
-    WireApi, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url, is_xai_grok_provider,
-    model_system_prompt_too_large, normalize_model_system_prompt,
+    WireApi, WireApiProvenance, XAI_MULTI_AGENT_TOOLS_ENTITLEMENT, is_anthropic_native_base_url,
+    is_xai_grok_provider, model_system_prompt_too_large, normalize_model_system_prompt,
 };
 
 use super::multimodal_capability_editor::{
@@ -459,6 +459,11 @@ pub(super) struct SettingsEditor {
     shrink_present: bool,
     timeout_present: bool,
     wire_api_present: bool,
+    /// Whether the user explicitly changed or cleared the model-level Wire
+    /// API row during this editing session. A recovered endpoint is a durable
+    /// runtime hint, not a model override, so an unrelated model-settings save
+    /// must leave it intact.
+    wire_api_edited: bool,
     show_wire_api: bool,
     /// The derived, ordered field list for this editor. Computed once at
     /// construction from `scope` / `show_wire_api` /
@@ -533,6 +538,7 @@ impl SettingsEditor {
             shrink_present: true,
             timeout_present: true,
             wire_api_present: true,
+            wire_api_edited: false,
             show_wire_api,
             fields: Self::derive_fields(
                 false,
@@ -581,6 +587,7 @@ impl SettingsEditor {
             .and_then(|m| m.timeout.clone())
             .unwrap_or_else(|| entry.timeout.clone());
         let wire_api = model
+            .filter(|m| m.wire_api_provenance.is_user_configured())
             .map(|m| m.wire_api)
             .filter(|w| !w.is_auto())
             .or_else(|| (!entry.wire_api.is_auto()).then_some(entry.wire_api))
@@ -654,7 +661,10 @@ impl SettingsEditor {
             active_prompt_cache_retention_status: CapabilityStatus::Unknown,
             shrink_present: model.is_some_and(|m| m.shrink.is_some()),
             timeout_present: model.is_some_and(|m| m.timeout.is_some()),
-            wire_api_present: model.is_some_and(|m| !m.wire_api.is_auto()),
+            wire_api_present: model.is_some_and(|m| {
+                !m.wire_api.is_auto() && m.wire_api_provenance.is_user_configured()
+            }),
+            wire_api_edited: false,
             show_wire_api,
             fields: Self::derive_fields(
                 true,
@@ -1066,7 +1076,10 @@ impl SettingsEditor {
             ProviderSettingId::TimeoutTtftSecs | ProviderSettingId::TimeoutIdleSecs => {
                 self.timeout_present = true
             }
-            ProviderSettingId::WireApi => self.wire_api_present = true,
+            ProviderSettingId::WireApi => {
+                self.wire_api_present = true;
+                self.wire_api_edited = true;
+            }
             ProviderSettingId::CapabilityContextTokens => {
                 if self.capability_context_tokens.is_none() {
                     self.capability_context_tokens = self.detected_capabilities.context_tokens;
@@ -1161,6 +1174,7 @@ impl SettingsEditor {
             ProviderSettingId::WireApi => {
                 self.wire_api_present = false;
                 self.wire_api = WireApi::Auto;
+                self.wire_api_edited = true;
             }
             ProviderSettingId::Backup => self.backup = None,
             ProviderSettingId::Mode => {
@@ -1351,6 +1365,7 @@ impl SettingsEditor {
                 self.mark_present(field);
             }
             ProviderSettingId::WireApi => {
+                self.wire_api_edited = true;
                 if self.is_model_scope() {
                     match (self.wire_api_present, self.wire_api) {
                         (true, WireApi::Completions) => {
@@ -2334,11 +2349,16 @@ fn apply_model_overrides(m: &mut ModelEntry, e: &SettingsEditor) {
     } else {
         None
     };
-    m.wire_api = if e.wire_api_present {
-        e.wire_api
-    } else {
-        WireApi::Auto
-    };
+    if e.wire_api_edited {
+        m.wire_api = if e.wire_api_present {
+            e.wire_api
+        } else {
+            WireApi::Auto
+        };
+        // An explicit model-settings edit is a user configuration decision,
+        // including clearing a recovered endpoint back to auto.
+        m.wire_api_provenance = WireApiProvenance::UserConfigured;
+    }
     // Backup tracks presence via its `Option` directly (like `mode`).
     m.backup = e.backup.clone();
     m.mode = e.mode;
@@ -2686,6 +2706,7 @@ mod tests {
             thinking_params: Default::default(),
             system_prompt: None,
             wire_api: Default::default(),
+            wire_api_provenance: Default::default(),
             extra: Default::default(),
             capabilities: Default::default(),
             capability_overrides: Default::default(),
@@ -3716,6 +3737,25 @@ mod tests {
         e.write_into(&mut inherited);
         let m = inherited.models.iter().find(|m| m.id == "m1").unwrap();
         assert_eq!(m.wire_api, WireApi::Auto);
+    }
+
+    #[test]
+    fn unrelated_model_save_preserves_recovered_wire_api_hint() {
+        let mut entry = provider_with_model();
+        entry.models[0].wire_api = WireApi::Responses;
+        entry.models[0].wire_api_provenance = WireApiProvenance::Recovered;
+
+        let mut editor = SettingsEditor::for_model("p", &entry, "m1");
+        editor
+            .commit_text(ProviderSettingId::SystemPrompt, "Use concise answers.")
+            .expect("unrelated model setting commits");
+
+        let mut written = entry.clone();
+        editor.write_into(&mut written);
+        let model = written.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(model.system_prompt.as_deref(), Some("Use concise answers."));
+        assert_eq!(model.wire_api, WireApi::Responses);
+        assert_eq!(model.wire_api_provenance, WireApiProvenance::Recovered);
     }
 
     #[test]

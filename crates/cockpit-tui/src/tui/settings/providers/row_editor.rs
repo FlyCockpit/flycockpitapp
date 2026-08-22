@@ -663,6 +663,7 @@ impl RowListEditor for ModelEditor {
                     text_embedded_recovery: None,
                     thinking_params: Default::default(),
                     wire_api: Default::default(),
+                    wire_api_provenance: Default::default(),
                     extra: Default::default(),
                     capabilities: Default::default(),
                     capability_overrides: Default::default(),

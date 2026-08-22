@@ -987,6 +987,7 @@ fn round_trips_a_provider_entry() {
                 thinking_params: Default::default(),
                 system_prompt: None,
                 wire_api: WireApi::default(),
+                wire_api_provenance: Default::default(),
                 inputs: Some(Inputs {
                     images: Some(true),
                     video: None,
@@ -1231,6 +1232,7 @@ fn resolve_cache_prefers_model_override() {
         thinking_params: Default::default(),
         system_prompt: None,
         wire_api: WireApi::default(),
+        wire_api_provenance: Default::default(),
         inputs: None,
         extra: Default::default(),
         capabilities: Default::default(),
@@ -1881,6 +1883,7 @@ fn model(id: &str, manual: bool) -> ModelEntry {
         thinking_params: Default::default(),
         system_prompt: None,
         wire_api: WireApi::default(),
+        wire_api_provenance: Default::default(),
         extra: Default::default(),
         capabilities: Default::default(),
         capability_overrides: Default::default(),

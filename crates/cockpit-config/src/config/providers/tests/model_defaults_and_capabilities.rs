@@ -82,6 +82,7 @@ fn resolve_reasoning_effort_params_uses_native_mapping_and_default() {
                             field: "reasoning_effort".into(),
                             values: mapping,
                         }),
+                        endpoint_request_mappings: Vec::new(),
                         source: Some(CapabilitySource::Live),
                     }),
                     ..ModelCapabilities::default()
@@ -118,6 +119,71 @@ fn resolve_reasoning_effort_params_uses_native_mapping_and_default() {
     assert_eq!(
         cfg.resolve_active_model_reasoning_params(),
         Some(serde_json::json!({ "reasoning_effort": "xhigh" }))
+    );
+}
+
+#[test]
+fn responses_reasoning_effort_mapping_serializes_a_nested_json_path() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "copilot".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "gpt-5.6-terra".into(),
+                capabilities: ModelCapabilities {
+                    reasoning_effort: Some(ReasoningEffortCapability {
+                        values: vec![CapabilityValue {
+                            value: "ultra".into(),
+                            ..CapabilityValue::default()
+                        }],
+                        default: None,
+                        request_mapping: None,
+                        endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+                            wire_api: WireApi::Responses,
+                            request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                                path: vec!["reasoning".into(), "effort".into()],
+                                values: BTreeMap::new(),
+                            },
+                        }],
+                        source: Some(CapabilitySource::Live),
+                    }),
+                    supported_wire_apis: vec![WireApi::Responses],
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+
+    assert_eq!(
+        cfg.resolve_reasoning_effort_params_for_openai_endpoint(
+            "copilot",
+            "gpt-5.6-terra",
+            Some("ultra"),
+            ReasoningEffortWire::OpenAiCompatible,
+            Some(WireApi::Responses),
+            None,
+        )
+        .unwrap(),
+        Some(serde_json::json!({ "reasoning": { "effort": "ultra" } }))
+    );
+    assert_eq!(
+        cfg.resolve_reasoning_effort_params_for_openai_endpoint(
+            "copilot",
+            "gpt-5.6-terra",
+            Some("ultra"),
+            ReasoningEffortWire::OpenAiCompatible,
+            Some(WireApi::Completions),
+            None,
+        )
+        .unwrap(),
+        None,
+        "a Responses-only mapping must not leak onto an explicit completions pin"
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
+        WireApi::Responses
     );
 }
 
@@ -1428,6 +1494,37 @@ fn codex_oauth_defaults_to_responses_wire_api() {
     );
 }
 
+#[test]
+fn copilot_gpt5_fallback_defaults_to_responses_wire_api() {
+    assert_eq!(
+        WireApi::detect_for_provider("copilot", "gpt-5.6-terra"),
+        WireApi::Responses
+    );
+    assert_eq!(
+        WireApi::detect_for_provider("copilot", "gpt-4o"),
+        WireApi::Completions
+    );
+}
+
+#[test]
+fn renamed_copilot_gpt5_fallback_uses_template_identity() {
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "team-github".into(),
+        ProviderEntry {
+            template: Some("copilot".into()),
+            models: vec![model("gpt-5.6-terra", false)],
+            ..ProviderEntry::default()
+        },
+    );
+
+    assert_eq!(
+        cfg.resolve_wire_api("team-github", "gpt-5.6-terra"),
+        WireApi::Responses,
+        "a renamed Copilot connection must retain the Copilot GPT-5 fallback"
+    );
+}
+
 /// `opposite` is the bidirectional swap target the fallback retries.
 #[test]
 fn wire_api_opposite_is_bidirectional() {
@@ -1449,9 +1546,11 @@ fn resolve_wire_api_explicit_config_wins() {
         ..ProviderEntry::default()
     };
     // A `gpt-5` model that the heuristic would route to responses, but is
-    // explicitly pinned to completions: the pin must win.
+    // explicitly pinned to completions: the pin must win even when the live
+    // catalog advertises Responses.
     let mut pinned = model("gpt-5.4-mini", false);
     pinned.wire_api = WireApi::Completions;
+    pinned.capabilities.supported_wire_apis = vec![WireApi::Responses];
     entry.models.push(pinned);
     // A model left on `auto`.
     entry.models.push(model("gpt-4o", false));
@@ -1479,7 +1578,9 @@ fn resolve_wire_api_provider_default_between_model_and_auto() {
         wire_api: WireApi::Completions,
         ..ProviderEntry::default()
     };
-    entry.models.push(model("inherits", false));
+    let mut inherits = model("inherits", false);
+    inherits.capabilities.supported_wire_apis = vec![WireApi::Responses];
+    entry.models.push(inherits);
     let mut pinned = model("pins-responses", false);
     pinned.wire_api = WireApi::Responses;
     entry.models.push(pinned);
@@ -1516,6 +1617,26 @@ fn wire_api_defaults_auto_and_skips_serialize() {
     assert!(json.contains("\"wire_api\":\"responses\""), "{json}");
     let back: ModelEntry = serde_json::from_str(&json).unwrap();
     assert_eq!(back.wire_api, WireApi::Responses);
+    assert_eq!(
+        back.wire_api_provenance,
+        WireApiProvenance::UserConfigured,
+        "legacy concrete wire_api values remain explicit user pins"
+    );
+
+    let mut recovered = model("recovered", false);
+    recovered.wire_api = WireApi::Responses;
+    recovered.wire_api_provenance = WireApiProvenance::Recovered;
+    let json = serde_json::to_string(&recovered).unwrap();
+    assert!(
+        json.contains("\"wire_api_provenance\":\"recovered\""),
+        "learned endpoint provenance must persist: {json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<ModelEntry>(&json)
+            .unwrap()
+            .wire_api_provenance,
+        WireApiProvenance::Recovered
+    );
 
     let provider = ProviderEntry {
         url: "https://example.test/v1".into(),
@@ -1561,13 +1682,13 @@ fn allow_insecure_http_defaults_false_skips_false_and_persists_true() {
     assert_eq!(back.url, "https://example.test/v1");
 }
 
-/// A user-or-fallback-pinned `wire_api` survives a `/models` refresh: the
-/// refetched (always-`auto`) entry inherits the prior pin instead of
-/// resetting it.
+/// A recovered endpoint survives a `/models` refresh that contains no endpoint
+/// metadata, so existing users retain the self-healing behavior.
 #[test]
 fn merge_preserves_pinned_wire_api_across_refetch() {
     let mut prev = model("gpt-5.4-mini", false);
     prev.wire_api = WireApi::Responses; // self-healed last session
+    prev.wire_api_provenance = WireApiProvenance::Recovered;
     let existing = vec![prev];
     // The refetch returns the same id, freshly `auto` (upstream never
     // carries wire_api), plus a new unrelated model.
@@ -1583,11 +1704,67 @@ fn merge_preserves_pinned_wire_api_across_refetch() {
     assert_eq!(
         healed.wire_api,
         WireApi::Responses,
-        "a pinned endpoint must survive a /models refresh"
+        "a recovered endpoint must survive a metadata-free /models refresh"
     );
     // An unpinned new model stays auto.
     let fresh = merged.iter().find(|m| m.id == "gpt-4o").unwrap();
     assert_eq!(fresh.wire_api, WireApi::Auto);
+}
+
+/// A recovered endpoint remains useful when the catalog cannot answer, but is
+/// never a durable override of a later live endpoint advertisement.
+#[test]
+fn live_catalog_supersedes_recovered_wire_api_but_not_user_pin() {
+    let mut recovered = model("gpt-5.6-terra", false);
+    recovered.wire_api = WireApi::Completions;
+    recovered.wire_api_provenance = WireApiProvenance::Recovered;
+
+    let mut fetched = model("gpt-5.6-terra", false);
+    fetched.capabilities.supported_wire_apis = vec![WireApi::Responses];
+    let merged = merge_fetched_models_with_policy(
+        Some("copilot"),
+        &[recovered],
+        vec![fetched],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    assert_eq!(merged[0].wire_api, WireApi::Auto);
+    assert_eq!(
+        merged[0].wire_api_provenance,
+        WireApiProvenance::UserConfigured,
+        "fresh catalog rows must not inherit stale recovered provenance"
+    );
+
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "copilot".into(),
+        ProviderEntry {
+            models: merged,
+            ..ProviderEntry::default()
+        },
+    );
+    assert_eq!(
+        cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
+        WireApi::Responses
+    );
+
+    let mut user_pinned = model("gpt-5.6-terra", false);
+    user_pinned.wire_api = WireApi::Completions;
+    // The default provenance intentionally represents both new explicit pins
+    // and legacy concrete wire_api values.
+    let mut fetched = model("gpt-5.6-terra", false);
+    fetched.capabilities.supported_wire_apis = vec![WireApi::Responses];
+    let merged = merge_fetched_models_with_policy(
+        Some("copilot"),
+        &[user_pinned],
+        vec![fetched],
+        ModelMergePolicy::KeepUnlisted,
+    );
+    cfg.providers.get_mut("copilot").unwrap().models = merged;
+    assert_eq!(
+        cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
+        WireApi::Completions,
+        "an explicit model endpoint pin remains authoritative over catalog metadata"
+    );
 }
 
 #[test]
@@ -2088,6 +2265,7 @@ fn anthropic_reasoning_capability(
             .collect(),
         default: Some("high".into()),
         request_mapping: Some(mapping),
+        endpoint_request_mappings: Vec::new(),
         source: Some(CapabilitySource::Live),
     }
 }

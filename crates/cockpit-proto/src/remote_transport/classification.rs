@@ -2451,6 +2451,12 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Event, "queue_updated"),
     (RemoteMessageKind::Event, "assistant_text_delta"),
     (RemoteMessageKind::Event, "reasoning_delta"),
+    (RemoteMessageKind::Event, "assistant_display_text_delta"),
+    (
+        RemoteMessageKind::Event,
+        "assistant_display_reasoning_delta",
+    ),
+    (RemoteMessageKind::Event, "assistant_display_complete"),
     (RemoteMessageKind::Event, "assistant_text"),
     (RemoteMessageKind::Event, "user_message_recorded"),
     (RemoteMessageKind::Event, "queued_user_messages_folded"),
@@ -2667,7 +2673,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 71);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 74);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

@@ -51,7 +51,7 @@
     }
   ],
   "counts": {
-    "event": 77,
+    "event": 82,
     "request": 200,
     "response": 142
   },
@@ -128,6 +128,36 @@
         "inlinePayloadBound": "stream_chunked",
         "lane": "interactive",
         "tag": "reasoning_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_text_delta"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_reasoning_delta"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_display_attempt_reset"
+      },
+      {
+        "class": "model_delta",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "assistant_display_complete"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_display_error"
       },
       {
         "class": "model_delta",
@@ -2789,6 +2819,18 @@
     {
       "kind": "event",
       "tag": "reasoning_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_text_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_reasoning_delta"
+    },
+    {
+      "kind": "event",
+      "tag": "assistant_display_complete"
     },
     {
       "kind": "event",

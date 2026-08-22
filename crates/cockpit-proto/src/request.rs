@@ -1769,6 +1769,48 @@ pub enum Request {
         expected_config_generation: Option<u64>,
     },
 
+    /// LOCAL owner CONFIG MUTATION: register a new ComfyUI workflow. Owner-only,
+    /// local-only, serialized. The workflow (including the opaque `graph_json`
+    /// blob, where a token can hide anywhere) is carried as one OPAQUE JSON blob;
+    /// it is validated through the single `ImageGenerationConfig::new` funnel —
+    /// which parses `graph_json`, REJECTS a `graph_digest` that does not match the
+    /// actual graph (a client cannot register a lying digest), and enforces
+    /// unique ids — before any write.
+    ImageWorkflowUpload {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        workflow_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: replace an existing workflow by id with the
+    /// supplied opaque workflow JSON (updated bindings/outputs over the same
+    /// graph). The `graph_digest` is re-verified against `graph_json` by
+    /// `ImageGenerationConfig::new`.
+    ImageWorkflowBind {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        workflow_id: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        bindings_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: remove a workflow by id. Fails closed if a
+    /// still-enabled target binds it.
+    ImageWorkflowDelete {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        workflow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
     /// Remove a provider entry through the daemon's trust-aware writer.
     DeleteProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
@@ -2708,6 +2750,9 @@ macro_rules! request_variants {
             (Request::ImageTargetUpdate { .. }, "image_target_update");
             (Request::ImageTargetDelete { .. }, "image_target_delete");
             (Request::ImageTargetSetDefault { .. }, "image_target_set_default");
+            (Request::ImageWorkflowUpload { .. }, "image_workflow_upload");
+            (Request::ImageWorkflowBind { .. }, "image_workflow_bind");
+            (Request::ImageWorkflowDelete { .. }, "image_workflow_delete");
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
@@ -2975,6 +3020,9 @@ macro_rules! command {
             (Request::ImageTargetUpdate { project_root, target_id, target_json, expected_config_generation }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|target_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, target_json: String => param, expected_config_generation: Option<u64> => param]);
             (Request::ImageTargetDelete { project_root, target_id, expected_config_generation }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, expected_config_generation: Option<u64> => param]);
             (Request::ImageTargetSetDefault { project_root, target_id, expected_config_generation }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageWorkflowUpload { project_root, workflow_json, expected_config_generation }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|workflow_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, workflow_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageWorkflowBind { project_root, workflow_id, bindings_json, expected_config_generation }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|workflow_id:String|bindings_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, workflow_id: String => param, bindings_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageWorkflowDelete { project_root, workflow_id, expected_config_generation }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|workflow_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, workflow_id: String => param, expected_config_generation: Option<u64> => param]);
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);

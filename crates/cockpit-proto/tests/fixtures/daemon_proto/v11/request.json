@@ -1658,6 +1658,31 @@
     },
     "request": "image_target_set_default"
   },
+  "image_workflow_upload": {
+    "params": {
+      "project_root": "/tmp/project",
+      "workflow_json": "{\"id\":\"wf1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_workflow_upload"
+  },
+  "image_workflow_bind": {
+    "params": {
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1",
+      "bindings_json": "{\"id\":\"wf1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_workflow_bind"
+  },
+  "image_workflow_delete": {
+    "params": {
+      "project_root": "/tmp/project",
+      "workflow_id": "wf1",
+      "expected_config_generation": 3
+    },
+    "request": "image_workflow_delete"
+  },
   "list_packages": {
     "request": "list_packages"
   },

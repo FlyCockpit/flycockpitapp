@@ -52,7 +52,7 @@
   ],
   "counts": {
     "event": 83,
-    "request": 213,
+    "request": 216,
     "response": 144
   },
   "messages": {
@@ -1558,6 +1558,24 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "image_target_set_default"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_upload"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_bind"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_workflow_delete"
       },
       {
         "class": "liveness",

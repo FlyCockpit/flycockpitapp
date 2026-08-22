@@ -169,7 +169,7 @@ pub async fn select_with_diagnostics(
     {
         Ok(result) => result,
         Err(e) => {
-            tracing::debug!(error = %e, "skills auto-select: pass ended without a skill");
+            crate::engine::model::log_utility_model_failure("skills_auto_select", &e);
             (Selection::None, SelectionDiagnostics::default())
         }
     }

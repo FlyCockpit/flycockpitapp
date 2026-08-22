@@ -356,7 +356,7 @@ pub fn assemble_context(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    results_by_id.entry(tr.id.clone()).or_insert(body);
+                    results_by_id.entry(tr.call.to_string()).or_insert(body);
                 }
             }
         }
@@ -396,7 +396,10 @@ pub fn assemble_context(
             for tc in crate::engine::message::collect_tool_calls(content) {
                 let args = truncate(&tc.function.arguments.to_string(), TOOL_ARGS_CAP);
                 activity.calls.push(format!("{}({args})", tc.function.name));
-                if let Some(res) = results_by_id.get(&tc.id).filter(|r| !r.trim().is_empty()) {
+                if let Some(res) = results_by_id
+                    .get(tc.id.as_str())
+                    .filter(|r| !r.trim().is_empty())
+                {
                     activity.results.push(truncate(res.trim(), TOOL_RESULT_CAP));
                 }
             }
@@ -643,7 +646,7 @@ async fn rewrite(
     {
         Ok(text) => Some(text),
         Err(e) => {
-            tracing::debug!(error = %e, "preflight: rewrite call failed; failing open");
+            crate::engine::model::log_utility_model_failure("preflight", &e);
             None
         }
     }
@@ -881,7 +884,6 @@ mod tests {
     // --- Context assembly / rendering / budgeting -----------------------------
 
     use crate::engine::message::{Message, ToolCall};
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolFunction};
 
     /// Build an assistant turn carrying `text` plus one tool call `(id, name,
@@ -892,8 +894,8 @@ mod tests {
             parts.push(AssistantContent::text(text));
         }
         parts.push(AssistantContent::ToolCall(ToolCall {
-            id: id.to_string(),
-            call_id: None,
+            id: rig::message::ToolCallId::new_or_mint(id.to_string()),
+            provider: None,
             function: ToolFunction {
                 name: name.to_string(),
                 arguments: args,
@@ -903,13 +905,19 @@ mod tests {
         }));
         Message::Assistant {
             id: None,
-            content: OneOrMany::many(parts).unwrap(),
+            content: parts,
         }
     }
 
     /// A tool-result `User` message answering call `id` with `output`.
-    fn tool_result(id: &str, output: &str) -> Message {
-        Message::tool_result_with_call_id(id.to_string(), None, output.to_string())
+    fn tool_result(id: &str, name: &str, output: &str) -> Message {
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            id.to_string(),
+            None,
+            None,
+            name,
+            output.to_string(),
+        )
     }
 
     #[test]
@@ -918,7 +926,7 @@ mod tests {
             Message::user("first user message here"),
             Message::user("second user message here"),
             // A tool-result User message must NOT count as a user message.
-            tool_result("tc-x", "irrelevant tool answer"),
+            tool_result("tc-x", "read", "irrelevant tool answer"),
             Message::user("third user message here"),
             Message::user("fourth user message here"),
         ];
@@ -945,7 +953,7 @@ mod tests {
                 "edit",
                 serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}),
             ),
-            tool_result("tc-1", &big_result),
+            tool_result("tc-1", "edit", &big_result),
         ];
         let ctx = assemble_context(&history, "role", None);
         assert_eq!(ctx.recent_assistant.len(), 1);
@@ -1003,7 +1011,7 @@ mod tests {
                 "edit",
                 serde_json::json!({"path": "a.rs"}),
             ),
-            tool_result("tc-1", "edited a.rs ok"),
+            tool_result("tc-1", "edit", "edited a.rs ok"),
         ];
         let ctx = assemble_context(&history, "build role", Some("PROJECT RULES"));
         let msg = build_message("TEMPLATE", "do that again for the other file", &ctx);
@@ -1124,7 +1132,7 @@ mod tests {
                 "edit",
                 serde_json::json!({"path": "a.rs"}),
             ),
-            tool_result("tc-1", "wrote a.rs"),
+            tool_result("tc-1", "edit", "wrote a.rs"),
         ];
         let ctx = assemble_context(&history, "the build agent role", Some("FOLLOW THE RULES"));
         let (url, rx) = capture_server("Add the same logging helper to b.rs.").await;
@@ -1193,7 +1201,7 @@ mod tests {
                 "read",
                 serde_json::json!({"path": ".env"}),
             ),
-            tool_result("tc-1", &format!("API_KEY={SECRET}")),
+            tool_result("tc-1", "read", &format!("API_KEY={SECRET}")),
         ];
         let ctx = assemble_context(&history, "role", None);
         let (url, rx) = capture_server("Summarize the env file.").await;

@@ -542,7 +542,7 @@ pub(super) fn partial_progress_from_history(history: &[Message]) -> DelegationPa
                         let hash = crate::engine::compact::arg_hash(&tc.function.arguments)
                             .or_else(|| {
                                 outputs
-                                    .get(&tc.id)
+                                    .get(tc.id.as_str())
                                     .and_then(|out| crate::engine::compact::hash_from_output(out))
                             });
                         crate::engine::compact::record_edit(&mut files_edited, path.clone(), hash);
@@ -628,7 +628,7 @@ fn partial_progress_tool_outputs(history: &[Message]) -> std::collections::HashM
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                outputs.insert(result.id.clone(), text);
+                outputs.insert(result.call.to_string(), text);
             }
         }
     }

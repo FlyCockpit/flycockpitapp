@@ -1,4 +1,5 @@
 use super::*;
+use rig::message::ProviderCallId;
 
 static ENDPOINT_PROBES: OnceLock<Mutex<HashMap<EndpointProbeKey, EndpointProbeState>>> =
     OnceLock::new();
@@ -348,6 +349,7 @@ pub(super) struct ResponsesToolIdentityError {
 struct OpenResponsesCall {
     id: String,
     call_id: String,
+    provider: ProviderCallId,
     covered: bool,
 }
 
@@ -376,24 +378,30 @@ fn normalize_responses_message(
             open.clear();
             for part in content.iter_mut() {
                 if let AssistantContent::ToolCall(tc) = part {
-                    let cockpit_call_id = tc.id.clone();
-                    let (call_id, source) = match tc.call_id.clone() {
-                        Some(call_id) => (call_id, "provider"),
+                    let cockpit_call_id = tc.id.to_string();
+                    let (provider, source) = match tc.provider.clone() {
+                        Some(provider) => (provider, "provider"),
                         None => {
-                            let call_id = tc.id.clone();
-                            tc.call_id = Some(call_id.clone());
-                            (call_id, "normalized_from_assistant_id")
+                            let provider = ProviderCallId::new(cockpit_call_id.clone())
+                                .expect("ToolCallId is never empty");
+                            tc.provider = Some(provider.clone());
+                            (provider, "normalized_from_assistant_id")
                         }
                     };
+                    let call_id = provider.call_id.clone();
                     records.push(ResponsesToolIdentityRecord {
                         cockpit_call_id: cockpit_call_id.clone(),
-                        provider_item_id: tc.id.clone(),
+                        provider_item_id: provider
+                            .item_id
+                            .clone()
+                            .unwrap_or_else(|| cockpit_call_id.clone()),
                         provider_call_id: call_id.clone(),
                         provider_call_id_source: source,
                     });
                     open.push(OpenResponsesCall {
                         id: cockpit_call_id,
                         call_id,
+                        provider,
                         covered: false,
                     });
                 }
@@ -404,25 +412,39 @@ fn normalize_responses_message(
             for part in content.iter_mut() {
                 if let UserContent::ToolResult(tr) = part {
                     saw_result = true;
-                    let Some(open_call) = open
-                        .iter_mut()
-                        .find(|call| call.id == tr.id || call.call_id == tr.id)
-                    else {
+                    let Some(open_call) = open.iter_mut().find(|call| {
+                        call.id == tr.call.as_str() || call.call_id == tr.call.as_str()
+                    }) else {
                         return Err(responses_identity_error(
                             ResponsesToolIdentityFailureKind::OrphanToolResult,
-                            tr.id.clone(),
+                            tr.call.to_string(),
                         ));
                     };
-                    match tr.call_id.as_deref() {
-                        Some(call_id) if call_id != open_call.call_id => {
+                    match tr.provider.as_ref() {
+                        Some(provider) if provider.call_id != open_call.call_id => {
                             return Err(responses_identity_error(
                                 ResponsesToolIdentityFailureKind::MismatchedPair,
-                                tr.id.clone(),
+                                tr.call.to_string(),
                             ));
                         }
-                        Some(_) => {}
+                        Some(provider)
+                            if provider.item_id.is_some()
+                                && provider.item_id != open_call.provider.item_id =>
+                        {
+                            return Err(responses_identity_error(
+                                ResponsesToolIdentityFailureKind::MismatchedPair,
+                                tr.call.to_string(),
+                            ));
+                        }
+                        Some(_) => {
+                            // Older in-memory turns retained only the
+                            // provider function-call id. Complete that
+                            // partial identity with the paired call's item
+                            // handle before a Responses replay.
+                            tr.provider = Some(open_call.provider.clone());
+                        }
                         None => {
-                            tr.call_id = Some(open_call.call_id.clone());
+                            tr.provider = Some(open_call.provider.clone());
                         }
                     }
                     open_call.covered = true;

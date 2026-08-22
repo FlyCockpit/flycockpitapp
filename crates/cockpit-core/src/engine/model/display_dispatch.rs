@@ -333,7 +333,7 @@ mod tests {
         slot.begin_successful_attempt("main", Some(&tx), t0).await;
 
         let mut stream = Box::pin(stream::iter(vec![
-            Ok::<_, rig::completion::CompletionError>(StreamedAssistantContent::<()>::text(
+            Ok::<_, rig::completion::CompletionError>(StreamedAssistantContent::text(
                 "partial visible",
             )),
         ]));
@@ -462,10 +462,8 @@ mod tests {
         slot.begin_successful_attempt("Build", Some(&tx), t0).await;
 
         let mut stream = Box::pin(stream::iter(vec![
-            Ok::<_, rig::completion::CompletionError>(StreamedAssistantContent::<()>::text(
-                "Hello ",
-            )),
-            Ok(StreamedAssistantContent::<()>::text("world")),
+            Ok::<_, rig::completion::CompletionError>(StreamedAssistantContent::text("Hello ")),
+            Ok(StreamedAssistantContent::text("world")),
         ]));
         let timeout = TimeoutConfig {
             ttft_secs: 30,

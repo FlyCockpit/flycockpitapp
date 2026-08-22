@@ -1,4 +1,5 @@
 use super::*;
+use rig::message::AdditionalParams;
 
 const COCKPIT_OWNED_REQUEST_KEYS: &[&str] = &[
     "model",
@@ -107,37 +108,46 @@ pub(super) fn scrub_message(
             content: redact.scrub(content),
         }),
         Message::User { content } => {
-            let mut parts: Vec<UserContent> = Vec::with_capacity(content.iter().count());
+            let mut parts: Vec<UserContent> = Vec::with_capacity(content.len());
             for part in content.iter() {
                 parts.push(scrub_user_content(redact, part)?);
             }
-            // `parts` is rebuilt 1:1 from a non-empty `OneOrMany`, so it is
-            // non-empty; `many` cannot fail. Fall back to the original on the
-            // impossible empty case rather than panic.
-            match OneOrMany::many(parts) {
-                Ok(content) => Ok(Message::User { content }),
-                Err(_) => Ok(msg.clone()),
-            }
+            Ok(Message::User { content: parts })
         }
         Message::Assistant { id, content } => {
-            let mut parts: Vec<AssistantContent> = Vec::with_capacity(content.iter().count());
+            let mut parts: Vec<AssistantContent> = Vec::with_capacity(content.len());
             for part in content.iter() {
                 parts.push(scrub_assistant_content(redact, part)?);
             }
-            match OneOrMany::many(parts) {
-                Ok(content) => Ok(Message::Assistant {
-                    id: id.clone(),
-                    content,
-                }),
-                Err(_) => Ok(msg.clone()),
-            }
+            Ok(Message::Assistant {
+                id: id.clone(),
+                content: parts,
+            })
         }
     }
 }
 
-/// Scrub one optional `additional_params` JSON blob (present on `Text`,
-/// `ToolCall`, and every media part). `None` stays `None`.
+/// Scrub one optional provider-params object (present on `Text` and every
+/// media part). `None` stays `None`. `AdditionalParams` is non-empty by
+/// construction; scrubbing preserves every key/value pair (or replaces only a
+/// colliding nested object with the terminal redaction marker), so the result
+/// remains non-empty as well.
 fn scrub_additional_params(
+    redact: &RedactionTable,
+    params: &Option<AdditionalParams>,
+) -> Option<AdditionalParams> {
+    params.as_ref().map(|params| {
+        let serde_json::Value::Object(map) = scrub_json_object(redact, params.as_map()) else {
+            unreachable!("scrubbing an additional-params object always returns an object")
+        };
+        AdditionalParams::new(map)
+            .expect("scrubbing a non-empty additional-params object preserves content")
+    })
+}
+
+/// Tool calls still use Rig's unconstrained JSON extra-params field. Preserve
+/// its configured shape while recursively redacting every string channel.
+fn scrub_tool_call_additional_params(
     redact: &RedactionTable,
     params: &Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
@@ -241,18 +251,13 @@ fn scrub_user_content(
             Ok(UserContent::Text(t))
         }
         UserContent::ToolResult(tr) => {
-            let mut scrubbed: Vec<ToolResultContent> =
-                Vec::with_capacity(tr.content.iter().count());
+            let mut scrubbed: Vec<ToolResultContent> = Vec::with_capacity(tr.content.len());
             for c in tr.content.iter() {
                 scrubbed.push(scrub_tool_result_content(redact, c)?);
             }
-            let content = OneOrMany::many(scrubbed).unwrap_or_else(|_| tr.content.clone());
-            Ok(match &tr.call_id {
-                Some(call_id) => {
-                    UserContent::tool_result_with_call_id(tr.id.clone(), call_id.clone(), content)
-                }
-                None => UserContent::tool_result(tr.id.clone(), content),
-            })
+            let mut result = tr.clone();
+            result.content = scrubbed;
+            Ok(UserContent::ToolResult(result))
         }
         UserContent::Image(image) => {
             let mut image = image.clone();
@@ -331,12 +336,12 @@ fn scrub_assistant_content(
             let mut tc = tc.clone();
             tc.function.name = redact.scrub(&tc.function.name);
             tc.function.arguments = scrub_json_value(redact, &tc.function.arguments);
-            tc.additional_params = scrub_additional_params(redact, &tc.additional_params);
+            tc.additional_params = scrub_tool_call_additional_params(redact, &tc.additional_params);
             Ok(AssistantContent::ToolCall(tc))
         }
         AssistantContent::Reasoning(reasoning) => Ok(AssistantContent::Reasoning(scrub_reasoning(
             redact, reasoning,
-        )?)),
+        ))),
         AssistantContent::Image(image) => {
             let mut image = image.clone();
             image.data = scrub_media_source(redact, &image.data, "assistant.image.data")?;
@@ -346,10 +351,7 @@ fn scrub_assistant_content(
     }
 }
 
-fn scrub_reasoning(
-    redact: &RedactionTable,
-    reasoning: &Reasoning,
-) -> Result<Reasoning, UnrenderableWireField> {
+fn scrub_reasoning(redact: &RedactionTable, reasoning: &Reasoning) -> Reasoning {
     let mut out = reasoning.clone();
     let mut content = Vec::with_capacity(out.content.len());
     for block in out.content.into_iter() {
@@ -363,19 +365,10 @@ fn scrub_reasoning(
             // are enumerated-safe: they carry no user free text we can render.
             ReasoningContent::Encrypted(data) => ReasoningContent::Encrypted(data),
             ReasoningContent::Redacted { data } => ReasoningContent::Redacted { data },
-            // `ReasoningContent` is `#[non_exhaustive]` in rig, so this crate
-            // (external to rig) CANNOT write a compile-forced exhaustive match —
-            // the wildcard arm is unavoidable, not a lazy `_`, and is the
-            // maximal enforcement possible here. It is deliberately fail-CLOSED:
-            // a future reasoning variant might carry unrendered free text, so it
-            // errors on untrusted egress rather than replaying another
-            // provider's raw reasoning verbatim. AC6's variant walk asserts this
-            // arm returns `UnrenderableWireField` (not a silent pass).
-            _ => return Err(UnrenderableWireField::new("assistant.reasoning")),
         });
     }
     out.content = content;
-    Ok(out)
+    out
 }
 
 /// Remove unsigned reasoning blocks before replaying history to native
@@ -393,13 +386,10 @@ pub(super) fn strip_unsigned_reasoning(msg: &Message) -> Option<Message> {
                 })
                 .cloned()
                 .collect();
-            match OneOrMany::many(kept) {
-                Ok(new_content) => Some(Message::Assistant {
-                    id: id.clone(),
-                    content: new_content,
-                }),
-                Err(_) => None,
-            }
+            (!kept.is_empty()).then_some(Message::Assistant {
+                id: id.clone(),
+                content: kept,
+            })
         }
         other => Some(other.clone()),
     }
@@ -436,21 +426,17 @@ pub(super) fn strip_reasoning(msg: &Message) -> Option<Message> {
                 .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
                 .cloned()
                 .collect();
-            // `OneOrMany::many` errors on empty input: filtering reasoning
-            // left no content, so this was a degenerate reasoning-only
+            // Filtering reasoning can leave no content, so this was a degenerate reasoning-only
             // assistant turn (no text, no tool call — e.g. a length-
             // truncated response that stopped mid-reasoning). Drop it
             // rather than ship the reasoning block verbatim, mirroring the
             // store-time policy that drops blank/body-less assistant turns
             // (`agent.rs:770`). A reasoning-only turn carries no tool_use
             // id, so dropping it can never orphan a tool_result.
-            match OneOrMany::many(kept) {
-                Ok(new_content) => Some(Message::Assistant {
-                    id: id.clone(),
-                    content: new_content,
-                }),
-                Err(_) => None,
-            }
+            (!kept.is_empty()).then_some(Message::Assistant {
+                id: id.clone(),
+                content: kept,
+            })
         }
         other => Some(other.clone()),
     }

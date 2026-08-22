@@ -6119,6 +6119,44 @@ async fn auto_title_failure_leaves_session_unrenamed() {
 }
 
 #[tokio::test]
+async fn auto_title_rpc_omits_provider_request_id_and_body_from_error() {
+    const BODY_SENTINEL: &str = "RAW_AUTO_TITLE_PROVIDER_BODY_MUST_NOT_ESCAPE";
+    const REQUEST_ID_SENTINEL: &str = "req_RAW_AUTO_TITLE_PROVIDER_REQUEST_ID_MUST_NOT_ESCAPE";
+
+    let project = tempfile::tempdir().unwrap();
+    let url = auto_title_error_model_server(BODY_SENTINEL, REQUEST_ID_SENTINEL).await;
+    let ctx = test_ctx_with_config_source(auto_title_config_source(&url));
+    ctx.db
+        .set_workspace_trust(
+            project.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let session = ctx
+        .db
+        .create_session("p", project.path().to_str().unwrap(), "Build")
+        .await
+        .unwrap();
+    let mut state = owner_state();
+
+    let error = handle_request(
+        Request::AutoTitle {
+            session_id: session.session_id,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("provider failure rejects auto title");
+
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(error.message, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+    assert!(!error.message.contains(BODY_SENTINEL));
+    assert!(!error.message.contains(REQUEST_ID_SENTINEL));
+}
+
+#[tokio::test]
 async fn concurrent_auto_title_second_attempt_is_rejected() {
     let project = tempfile::tempdir().unwrap();
     let url = auto_title_model_server(Some("Concurrent Title".to_string())).await;
@@ -7277,6 +7315,33 @@ async fn auto_title_model_server(content: Option<String>) -> String {
                 payload
             );
             let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+async fn auto_title_error_model_server(
+    body_sentinel: &'static str,
+    request_id: &'static str,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = format!("{{\"error\":\"{body_sentinel}\"}}");
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                 x-request-id: {request_id}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
         }
     });

@@ -341,6 +341,7 @@ mod tests {
             resume: InterruptResumeAnchor {
                 agent_id: ctx.agent_id.clone(),
                 call_id: call_id.to_string(),
+                provider_item_id: None,
                 provider_call_id: None,
                 assistant_seq: None,
                 call_origin: ctx.skill_write_origin,
@@ -946,6 +947,7 @@ mod tests {
                 resume: InterruptResumeAnchor {
                     agent_id: ctx.agent_id.clone(),
                     call_id: "skill-manage-call".to_string(),
+                    provider_item_id: None,
                     provider_call_id: None,
                     assistant_seq: None,
                     call_origin: ctx.skill_write_origin,

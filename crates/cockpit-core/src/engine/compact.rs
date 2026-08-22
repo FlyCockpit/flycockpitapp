@@ -670,7 +670,7 @@ fn canonical(args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+    use crate::engine::message::{AssistantContent, ToolCall};
     use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
     use serde_json::json;
     use uuid::Uuid;
@@ -949,27 +949,27 @@ mod tests {
     fn tail_never_splits_tool_pairs() {
         let call = Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "call-1".into(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("call-1"),
+                provider: None,
                 function: ToolFunction {
                     name: "read".into(),
                     arguments: serde_json::json!({"path": "src/lib.rs"}),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         };
         let result = Message::User {
-            content: OneOrMany::many(vec![
+            content: vec![
                 UserContent::ToolResult(ToolResult {
-                    id: "call-1".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::text("result")),
+                    call: rig::message::ToolCallId::new_or_mint("call-1"),
+                    provider: None,
+                    name: "read".into(),
+                    content: vec![ToolResultContent::text("result")],
                 }),
                 UserContent::text("and continue with this observation"),
-            ])
-            .unwrap(),
+            ],
         };
         let history = vec![
             Message::user("first"),

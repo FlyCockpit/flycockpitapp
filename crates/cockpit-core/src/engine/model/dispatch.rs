@@ -2,7 +2,7 @@ use super::*;
 use futures::StreamExt;
 use rig::completion::{CompletionModel, CompletionRequestBuilder};
 
-fn configured_completion_request<M: CompletionModel>(
+fn configured_completion_request<M: CompletionModel + Clone>(
     model: M,
     system: &str,
     history: &[Message],
@@ -27,7 +27,7 @@ fn configured_completion_request<M: CompletionModel>(
     request
 }
 
-fn choice_text(choice: &OneOrMany<AssistantContent>) -> String {
+fn choice_text(choice: &[AssistantContent]) -> String {
     choice
         .iter()
         .filter_map(|content| match content {
@@ -392,11 +392,7 @@ impl Model {
         cancel: &CancellationToken,
         endpoint_recovery: Option<EndpointRecoveryContext>,
     ) -> Result<(
-        (
-            Option<String>,
-            OneOrMany<AssistantContent>,
-            Option<TokenUsage>,
-        ),
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
         InferenceTiming,
     )> {
@@ -429,11 +425,7 @@ impl Model {
         agent_name: &str,
         cancel: &CancellationToken,
     ) -> Result<(
-        (
-            Option<String>,
-            OneOrMany<AssistantContent>,
-            Option<TokenUsage>,
-        ),
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
         InferenceTiming,
     )> {
@@ -457,11 +449,7 @@ impl Model {
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
     ) -> Result<(
-        (
-            Option<String>,
-            OneOrMany<AssistantContent>,
-            Option<TokenUsage>,
-        ),
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
         InferenceTiming,
     )> {
@@ -496,11 +484,7 @@ impl Model {
         pre_drain: Option<PreDrainFuture>,
         compact_utility: bool,
     ) -> Result<(
-        (
-            Option<String>,
-            OneOrMany<AssistantContent>,
-            Option<TokenUsage>,
-        ),
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
         InferenceTiming,
     )> {
@@ -561,11 +545,7 @@ impl Model {
         compact_utility: bool,
         display: Option<crate::engine::model::DisplayAttemptSlot>,
     ) -> Result<(
-        (
-            Option<String>,
-            OneOrMany<AssistantContent>,
-            Option<TokenUsage>,
-        ),
+        (Option<String>, Vec<AssistantContent>, Option<TokenUsage>),
         serde_json::Value,
         InferenceTiming,
     )> {
@@ -1127,35 +1107,28 @@ impl Model {
                 let recovery_floor = crate::engine::model::ProviderRecoverySignal::from_rank(
                     recovery_signal.load(std::sync::atomic::Ordering::SeqCst),
                 );
-                let rig_boundary::ClassifiedFailure {
-                    class,
-                    observed_status,
-                    recovery,
-                } = rig_boundary::classify_terminal_failure_with_floor(&err, recovery_floor);
-                let mut detail = failure_detail(&err, &class);
+                let mut failure = terminal_inference_failure(
+                    &err,
+                    self.provider_id(),
+                    self.model_id(),
+                    phase,
+                    elapsed_ms,
+                    retry_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .max(1),
+                    recovery_floor,
+                );
                 if !tools.is_empty()
                     && self.xai_multi_agent_tools_entitlement_enabled()
-                    && provider_rejected_xai_multi_agent_tools(&detail)
+                    && provider_rejected_xai_multi_agent_tools(&failure.detail)
                 {
-                    detail.push_str(" Disable the xAI beta tools entitlement in provider/model settings or choose a non-multi-agent model if the account lacks beta access.");
+                    failure.detail.push_str(" Disable the xAI beta tools entitlement in provider/model settings or choose a non-multi-agent model if the account lacks beta access.");
                 }
                 // Keep a visible partial classifier open. The backup wrapper
                 // either starts a replacement (which emits Reset) or, after
                 // failover is exhausted, emits the single terminal display
                 // error. Closing it here would make that decision impossible.
-                Err(anyhow::Error::new(InferenceFailure {
-                    provider: self.provider_id().to_string(),
-                    model: self.model_id().to_string(),
-                    phase: phase.as_str().to_string(),
-                    class,
-                    elapsed_ms,
-                    retry_attempts: retry_attempts
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                        .max(1),
-                    detail,
-                    observed_status,
-                    recovery,
-                }))
+                Err(anyhow::Error::new(failure))
             }
         }
     }
@@ -1653,8 +1626,7 @@ impl Model {
         prompt: &Message,
         tools: &[ToolDefinition],
         params: &ModelParams,
-    ) -> Result<(OneOrMany<AssistantContent>, Option<TokenUsage>), rig::completion::CompletionError>
-    {
+    ) -> Result<(Vec<AssistantContent>, Option<TokenUsage>), rig::completion::CompletionError> {
         match self {
             Model::OpenAi {
                 client, model_id, ..
@@ -1730,6 +1702,37 @@ impl Model {
                 Ok(tandem_choice_usage(r.choice, r.usage))
             }
         }
+    }
+}
+
+/// Converts the terminal Rig error at the dispatch boundary into the typed
+/// failure seam consumed by recording and failover. Keeping this conversion
+/// standalone lets regression tests exercise the exact production classifier
+/// without constructing an already-sanitized `InferenceFailure`.
+pub(crate) fn terminal_inference_failure(
+    err: &rig::completion::CompletionError,
+    provider: &str,
+    model: &str,
+    phase: InferencePhase,
+    elapsed_ms: u64,
+    retry_attempts: u32,
+    recovery_floor: ProviderRecoverySignal,
+) -> InferenceFailure {
+    let rig_boundary::ClassifiedFailure {
+        class,
+        observed_status,
+        recovery,
+    } = rig_boundary::classify_terminal_failure_with_floor(err, recovery_floor);
+    InferenceFailure {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        phase: phase.as_str().to_string(),
+        detail: failure_detail(err, &class),
+        class,
+        elapsed_ms,
+        retry_attempts,
+        observed_status,
+        recovery,
     }
 }
 
@@ -1906,9 +1909,9 @@ pub(super) const TANDEM_TIMEOUT_SECS: u64 = 300;
 /// [`Model::tandem_send`] so each provider's distinct `CompletionResponse<T>`
 /// is reduced to the same shape.
 pub(super) fn tandem_choice_usage(
-    choice: OneOrMany<AssistantContent>,
+    choice: Vec<AssistantContent>,
     usage: rig::completion::Usage,
-) -> (OneOrMany<AssistantContent>, Option<TokenUsage>) {
+) -> (Vec<AssistantContent>, Option<TokenUsage>) {
     let usage = Some(TokenUsage::from(usage)).filter(|u| !u.is_empty());
     (choice, usage)
 }
@@ -2100,7 +2103,7 @@ where
     .await?;
     // rig requests `stream_options.include_usage = true` on every stream;
     // providers that omit it now surface as an empty default usage value.
-    let usage = TokenUsage::from(stream.response.token_usage());
+    let usage = TokenUsage::from(stream.usage());
     let usage = (!usage.is_empty()).then_some(usage);
     Ok((stream.message_id.clone(), stream.choice.clone(), usage))
 }
@@ -2133,7 +2136,7 @@ pub(super) async fn await_pre_drain_record(
 /// backup is configured the current attempt hard-aborts with a timeout
 /// sentinel so backup fallback can engage. A ctrl+c returns [`AttemptCancelled`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn drain_items<S, R>(
+pub(crate) async fn drain_items<S>(
     stream: &mut S,
     timeout: &crate::config::providers::TimeoutConfig,
     hard_timeout_on_stall: bool,
@@ -2149,9 +2152,8 @@ pub(crate) async fn drain_items<S, R>(
     display: Option<&crate::engine::model::DisplayAttemptSlot>,
 ) -> Result<(), rig::completion::CompletionError>
 where
-    S: futures::Stream<
-            Item = Result<StreamedAssistantContent<R>, rig::completion::CompletionError>,
-        > + Unpin,
+    S: futures::Stream<Item = Result<StreamedAssistantContent, rig::completion::CompletionError>>
+        + Unpin,
 {
     // The first chunk is watched by TTFT; every later chunk by the idle
     // threshold. `first_token` flips after the first chunk so the warning phase
@@ -2254,8 +2256,8 @@ where
                         .await;
                 }
             }
-            StreamedAssistantContent::Reasoning(r) => {
-                let combined = collect_reasoning_text(&r);
+            StreamedAssistantContent::Reasoning { reasoning, .. } => {
+                let combined = collect_reasoning_text(&reasoning);
                 if !combined.is_empty() {
                     output_sent.store(true, std::sync::atomic::Ordering::SeqCst);
                     if let Some(slot) = display {

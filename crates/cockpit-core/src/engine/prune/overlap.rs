@@ -167,7 +167,7 @@ pub fn overlap_targets(
                     && is_read_tool(&tc.function.name)
                     && let Some(p) = canonical_path_of(&tc.function.name, &tc.function.arguments)
                 {
-                    path_of_call.insert(tc.id.clone(), p);
+                    path_of_call.insert(tc.id.to_string(), p);
                 }
             }
         }
@@ -179,7 +179,7 @@ pub fn overlap_targets(
         if let Message::User { content } = msg {
             for c in content.iter() {
                 if let UserContent::ToolResult(tr) = c {
-                    let Some(path) = path_of_call.get(&tr.id) else {
+                    let Some(path) = path_of_call.get(tr.call.as_str()) else {
                         continue;
                     };
                     let body = super::tool_result_body(&tr.content);
@@ -198,7 +198,7 @@ pub fn overlap_targets(
                     };
                     reads.push(ReadLoc {
                         history_index: idx,
-                        call_id: tr.id.clone(),
+                        call_id: tr.call.to_string(),
                         canonical_path: path.clone(),
                         range,
                         body,
@@ -329,33 +329,33 @@ mod tests {
     use super::*;
     use crate::engine::message::{Message, ToolCall};
     use crate::engine::tool::{Tool, ToolEffect};
-    use rig::OneOrMany;
     use rig::message::{AssistantContent, ToolResult, ToolResultContent};
     use serde_json::json;
 
     fn assistant_call(call_id: &str, args: serde_json::Value) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: call_id.to_string(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                provider: None,
                 function: rig::message::ToolFunction {
                     name: "read".to_string(),
                     arguments: args,
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }
     }
 
     fn tool_result(call_id: &str, body: &str) -> Message {
         Message::User {
-            content: OneOrMany::one(rig::message::UserContent::ToolResult(ToolResult {
-                id: call_id.to_string(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(body)),
-            })),
+            content: vec![rig::message::UserContent::ToolResult(ToolResult {
+                call: rig::message::ToolCallId::new_or_mint(call_id.to_string()),
+                provider: None,
+                name: "read".to_string(),
+                content: vec![ToolResultContent::text(body)],
+            })],
         }
     }
 

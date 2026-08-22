@@ -1265,7 +1265,7 @@ async fn shadow_killswitch_restores_sync() {
 }
 
 async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
-    use crate::engine::message::{AssistantContent, OneOrMany};
+    use crate::engine::message::AssistantContent;
     use rig::message::{ToolCall, ToolFunction};
 
     let (mut driver, tmp) = test_driver_without_network(8);
@@ -1334,18 +1334,24 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         Message::user("run the suite"),
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "bash-condense".into(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("bash-condense"),
+                provider: None,
                 function: ToolFunction {
                     name: "bash".into(),
                     arguments: serde_json::json!({"command": "cargo test"}),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         },
-        Message::tool_result_with_call_id("bash-condense".to_string(), None, original),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "bash-condense".to_string(),
+            None,
+            None,
+            "bash",
+            original,
+        ),
         Message::assistant("suite complete"),
         Message::user("next step"),
         Message::assistant("continue"),
@@ -1622,10 +1628,13 @@ async fn compact_end_to_end_unchanged() {
         "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n## Context tags\nUse these @file, @file:XX-YY, @dir/, and /skill tags to resolve the working set through the shared tag policy:\n- @seed.txt\n\n\n{}",
         crate::engine::compact::HISTORY_AGENT_NUDGE
     );
+    // Rig 0.42 serializes the required `ToolResult.name` field. This fixture's
+    // canonical `bash` result therefore adds 12 cl100k tokens to both wire
+    // snapshots, and intentionally changes their deterministic JSON hashes.
     assert_eq!(
         snapshot,
         serde_json::json!({
-            "history_hash": "86a65ec681935e0d3d0364beeda1f0906408bb2fdd3fa099bc7b5fd269dccdb8",
+            "history_hash": "f81e45c57cd430c7f22c39adf015cb627e1e76b9c56179b96117242632ad1858",
             "compact_ready": {
                 "brief": "test compact brief",
                 "handoff": expected_handoff,
@@ -1634,12 +1643,12 @@ async fn compact_end_to_end_unchanged() {
                 "source": "manual",
                 "tail_kept": 2,
                 "tail_trimmed": 0,
-                "tokens_after": 2381,
-                "tokens_before": 3642,
+                "tokens_after": 2393,
+                "tokens_before": 3654,
                 "trigger_ctx_pct": null,
                 "turns_summarized": 0,
             },
-            "session_compacted_hash": "afdb4820cef864b98fc54e284ab98e60213387ccd3e1b691ed35d9a243322567",
+            "session_compacted_hash": "2ef8ed86370834ec6abbccf1d3eea834925a3a823463ea5f9981f98aca9229c3",
         })
     );
     assert!(
@@ -2452,7 +2461,7 @@ async fn compact_prune_stage_does_not_mutate_live_history() {
 #[tokio::test]
 async fn compact_private_prune_preserves_shell_condensation() {
     use crate::config::providers::{CacheMode, ContextConfig};
-    use crate::engine::message::{AssistantContent, OneOrMany};
+    use crate::engine::message::AssistantContent;
     use rig::message::{ToolCall, ToolFunction};
 
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -2465,18 +2474,24 @@ async fn compact_private_prune_preserves_shell_condensation() {
         Message::user("run the suite"),
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "bash-condense".into(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: rig::message::ToolCallId::new_or_mint("bash-condense"),
+                provider: None,
                 function: ToolFunction {
                     name: "bash".into(),
                     arguments: serde_json::json!({"command": "cargo test"}),
                 },
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         },
-        Message::tool_result_with_call_id("bash-condense".to_string(), None, original.clone()),
+        crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+            "bash-condense".to_string(),
+            None,
+            None,
+            "bash",
+            original.clone(),
+        ),
         Message::assistant("suite complete"),
     ];
     install_test_providers(

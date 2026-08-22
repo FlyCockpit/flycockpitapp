@@ -135,7 +135,16 @@ pub async fn generate_session_title(
                     );
                 });
             } else {
-                tracing::warn!(error = %e, "auto_title: pass failed");
+                if let Some(safe) = crate::engine::model::safe_inference_error_detail(&e) {
+                    tracing::warn!(
+                        provider_detail = safe.marker,
+                        observed_status = ?safe.observed_status,
+                        recovery = safe.recovery.as_str(),
+                        "auto_title: pass failed"
+                    );
+                } else {
+                    tracing::warn!(error = %e, "auto_title: pass failed");
+                }
                 // A configured utility model that erred is a genuine failure:
                 // arm the durable Monty title-recovery nudge.
                 session.arm_title_recovery_nudge().await;

@@ -81,7 +81,7 @@ reqwest = { version = "0.13", default-features = false }
 # `image` (message/provider image paths), `rustls` (TLS stance), `reqwest`
 # (http2/system-proxy/charset; not enabled by default-features = false alone).
 # Never enable facade `agent` / companion features — Cockpit owns the tool loop.
-rig = { version = "0.41", package = "rig-core", default-features = false, features = ["image", "rustls", "reqwest"] }
+rig = { version = "0.42", package = "rig-core", default-features = false, features = ["image", "rustls", "reqwest"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

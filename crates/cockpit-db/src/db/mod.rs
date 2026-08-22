@@ -36,6 +36,7 @@
 //! Database path: `~/.local/share/cockpit/cockpit.db`
 //! (XDG-canonical via [`crate::config::resolve::cockpit_data_dir`]).
 
+pub mod agent_installations;
 pub mod app_flags;
 pub mod assistants;
 pub mod compressed_results;

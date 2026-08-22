@@ -5183,3 +5183,144 @@ CREATE TABLE secret_credential_ownership (
 
 CREATE INDEX secret_credential_ownership_item
 ON secret_credential_ownership(item_id);
+
+-- ---- versioned agent installations ---------------------------------------
+--
+-- The daemon owns definition resolution and provider configuration.  This
+-- schema deliberately records only the resulting non-secret identities,
+-- digests, and canonical snapshots.  In particular, there is no credential,
+-- token, API-key, or provider-route payload column in this subsystem.
+
+CREATE TABLE agent_installations (
+    installation_id              TEXT PRIMARY KEY,
+    scope                        TEXT NOT NULL CHECK (scope IN ('global', 'workspace_private', 'workspace_shared')),
+    -- Empty only for global.  A non-null key avoids SQLite's NULL-unique
+    -- behaviour making two global same-name definitions accidentally distinct.
+    scope_workspace_key          TEXT NOT NULL DEFAULT '',
+    canonical_workspace_id       TEXT,
+    source_agent_id              TEXT NOT NULL,
+    source_identity              TEXT NOT NULL,
+    source_revision              TEXT,
+    source_digest                TEXT NOT NULL,
+    fetched_at_unix_ms           INTEGER NOT NULL,
+    installation_revision        INTEGER NOT NULL DEFAULT 1 CHECK (installation_revision >= 1),
+    deleted_at_unix_ms            INTEGER,
+    CHECK ((scope = 'global' AND scope_workspace_key = '' AND canonical_workspace_id IS NULL)
+        OR (scope <> 'global' AND scope_workspace_key <> '' AND canonical_workspace_id = scope_workspace_key)),
+    UNIQUE (scope, scope_workspace_key, source_agent_id)
+);
+
+CREATE TABLE installation_observations (
+    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    observed_digest              TEXT NOT NULL,
+    observation_revision         INTEGER NOT NULL CHECK (observation_revision >= 1),
+    review_state                  TEXT NOT NULL CHECK (review_state IN ('reviewed', 'rebind_required')),
+    observed_at_unix_ms           INTEGER NOT NULL
+);
+
+CREATE TABLE agent_model_bindings (
+    binding_id                    TEXT PRIMARY KEY,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    definition_digest             TEXT NOT NULL,
+    slot_id                       TEXT NOT NULL,
+    provider_profile_handle       TEXT NOT NULL,
+    model_id                      TEXT NOT NULL,
+    -- Canonical redacted non-secret provenance: recommendation ids/order,
+    -- upstream identities, aliases, capability result, etc.  This is an
+    -- opaque DB payload; it is resolved and validated by the caller.
+    provenance_payload            BLOB NOT NULL,
+    provenance_digest             TEXT NOT NULL,
+    -- Bind is admitted only after daemon-side hard capability validation.
+    -- Persist the result so a snapshot must prove its evidence against an
+    -- immutable accepted binding, rather than trusting a caller-provided bit.
+    hard_capability_verified      INTEGER NOT NULL CHECK (hard_capability_verified = 1),
+    binding_revision              INTEGER NOT NULL CHECK (binding_revision >= 1),
+    retired_at_unix_ms            INTEGER,
+    created_at_unix_ms            INTEGER NOT NULL,
+    UNIQUE (installation_id, definition_digest, slot_id, binding_revision)
+);
+CREATE UNIQUE INDEX agent_model_bindings_current_slot
+    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    WHERE retired_at_unix_ms IS NULL;
+
+-- Bind requests get their own receipt because a retry must be distinguished
+-- from a different mutation that happens to choose identical model metadata.
+CREATE TABLE agent_binding_receipts (
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    definition_digest             TEXT NOT NULL,
+    slot_id                       TEXT NOT NULL,
+    idempotency_key               TEXT NOT NULL,
+    request_fingerprint           TEXT NOT NULL,
+    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT,
+    created_at_unix_ms            INTEGER NOT NULL,
+    PRIMARY KEY (installation_id, definition_digest, slot_id, idempotency_key)
+);
+
+CREATE TABLE agent_profile_snapshots (
+    snapshot_id                   TEXT PRIMARY KEY,
+    session_id                    TEXT NOT NULL UNIQUE REFERENCES sessions(session_id) ON DELETE CASCADE,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    schema_version                INTEGER NOT NULL CHECK (schema_version >= 1),
+    canonical_payload             BLOB NOT NULL,
+    canonical_payload_digest      TEXT NOT NULL,
+    definition_digest             TEXT NOT NULL,
+    binding_revision_map_payload  BLOB NOT NULL,
+    binding_revision_map_digest   TEXT NOT NULL,
+    created_at_unix_ms            INTEGER NOT NULL
+);
+
+CREATE TABLE agent_session_preparations (
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    idempotency_key               TEXT NOT NULL,
+    request_fingerprint           TEXT NOT NULL,
+    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE,
+    -- This receipt is the module-owned Prepared marker.  A pre-existing
+    -- ordinary active session can never acquire a profile snapshot later.
+    -- `0` means the caller atomically claimed a pre-registered, idle
+    -- session through `agent_session_preparation_claims`; `1` means this
+    -- transaction created the session.  Neither spelling permits attaching a
+    -- profile to an arbitrary active session.
+    created_session               INTEGER NOT NULL CHECK (created_session IN (0, 1)),
+    lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('prepared', 'running', 'terminal')),
+    created_at_unix_ms            INTEGER NOT NULL,
+    started_at_unix_ms            INTEGER,
+    terminal_at_unix_ms           INTEGER,
+    PRIMARY KEY (session_id, idempotency_key)
+);
+
+-- An existing normal session is preparable only after its owner records this
+-- durable, single-use marker.  Preparation CASes `eligible` to `claimed` in
+-- the same transaction as its immutable snapshot; an ordinary active session
+-- has no marker and is therefore never silently adopted.
+CREATE TABLE agent_session_preparation_claims (
+    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    claim_token                   TEXT NOT NULL UNIQUE,
+    claim_state                   TEXT NOT NULL CHECK (claim_state IN ('eligible', 'claimed', 'running', 'terminal')),
+    created_at_unix_ms            INTEGER NOT NULL,
+    claimed_at_unix_ms            INTEGER,
+    terminal_at_unix_ms           INTEGER
+);
+
+-- Once an owner has offered an existing idle session to agent preparation,
+-- ordinary dispatch must not race in work before the preparation claim either
+-- starts or terminals.  The start CAS changes the marker to `running` before
+-- any event can be recorded.
+CREATE TRIGGER agent_session_preparation_claim_blocks_events
+BEFORE INSERT ON session_events
+WHEN EXISTS (
+    SELECT 1 FROM agent_session_preparation_claims AS claim
+    WHERE claim.session_id = NEW.session_id
+      AND claim.claim_state IN ('eligible', 'claimed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'agent session preparation claim is pending');
+END;
+
+CREATE TRIGGER agent_profile_snapshot_immutable
+BEFORE UPDATE ON agent_profile_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'agent profile snapshots are immutable');
+END;
+
+CREATE INDEX agent_model_bindings_lookup
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);

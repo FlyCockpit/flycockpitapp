@@ -62,3 +62,40 @@ pub enum ProviderTransportError {
     /// a reason other than a deadline.
     Malformed,
 }
+
+/// The billing-safe submission disposition for a transport *error* (the success
+/// path is decided by the caller, which inspects the parsed 2xx body). This is
+/// the single mapping every adapter uses so no provider re-derives — and subtly
+/// diverges on — the accepted/rejected/unknown boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionDisposition {
+    /// No paid submission occurred (or the provider definitively rejected the
+    /// request). The slot may safely resubmit under a fresh idempotency identity.
+    DefinitivelyRejected,
+    /// The request bytes were written and the provider may have processed a paid
+    /// request; the outcome must be reconciled, never blindly retried.
+    SubmissionUnknown,
+}
+
+impl ProviderTransportError {
+    /// Map a submission error onto its billing-safe disposition.
+    ///
+    /// * [`Self::Connect`] / [`Self::Tls`] — no byte was accepted, so a fresh
+    ///   resubmit is safe → [`SubmissionDisposition::DefinitivelyRejected`].
+    /// * [`Self::Status`] — a definitive provider non-acceptance (3xx never
+    ///   followed, or 4xx) with no paid submission → `DefinitivelyRejected`.
+    /// * [`Self::BodyLimit`] / [`Self::Malformed`] — only reachable for a 3xx/4xx
+    ///   status (a post-2xx/5xx body-read failure widens to
+    ///   [`Self::AmbiguousAcceptance`] via `classify_body_read_failure`), so the
+    ///   request was definitively not accepted → `DefinitivelyRejected`.
+    /// * [`Self::Timeout`] / [`Self::AmbiguousAcceptance`] — the request may have
+    ///   been processed and paid → [`SubmissionDisposition::SubmissionUnknown`].
+    pub fn submission_disposition(&self) -> SubmissionDisposition {
+        match self {
+            Self::Connect | Self::Tls | Self::Status { .. } | Self::BodyLimit | Self::Malformed => {
+                SubmissionDisposition::DefinitivelyRejected
+            }
+            Self::Timeout | Self::AmbiguousAcceptance => SubmissionDisposition::SubmissionUnknown,
+        }
+    }
+}

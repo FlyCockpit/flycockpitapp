@@ -11,4 +11,5 @@
 //! spend, and effect recovery.
 
 pub mod adapters;
+pub mod http_transport;
 pub mod transport;

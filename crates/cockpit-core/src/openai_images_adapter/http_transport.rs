@@ -17,18 +17,15 @@
 //! every log, error, and `Debug` rendering.
 
 use std::fmt;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures::StreamExt as _;
-use reqwest::Url;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{Method, Url};
 
 use super::{OpenaiImagesRoute, OpenaiImagesTransport, openai_images_adapter_sealed};
+use crate::image_generation::http_transport::VettedHttpClient;
 use crate::image_generation::transport::{ProviderTransportError, ProviderTransportOutcome};
-use crate::image_generation_runtime::{
-    AddressClass, BODY_TIMEOUT, CONNECT_TIMEOUT, DnsResolver, HEADER_TIMEOUT, classify_address,
-};
+use crate::image_generation_runtime::{AddressClass, DnsResolver};
 
 /// A production pinned HTTPS transport bound to one OpenAI Images origin.
 pub struct OpenaiImagesHttpTransport {
@@ -143,171 +140,30 @@ impl OpenaiImagesHttpTransport {
             .origin
             .join(route.path().trim_start_matches('/'))
             .map_err(|_| ProviderTransportError::Connect)?;
-        let host = url
-            .host_str()
-            .ok_or(ProviderTransportError::Connect)?
-            .to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or(ProviderTransportError::Connect)?;
 
-        // Resolve and vet the full answer set BEFORE any byte is sent. Reject
-        // the whole set if even one answer is outside the required class, so DNS
-        // ordering / rebinding cannot become an SSRF bypass.
-        let addresses = self
-            .dns
-            .resolve(&host)
-            .await
-            .map_err(|_| ProviderTransportError::Connect)?;
-        if addresses.is_empty()
-            || addresses
-                .iter()
-                .any(|ip| classify_address(*ip) != self.required_location)
-        {
-            return Err(ProviderTransportError::Connect);
-        }
-        let socket_addrs: Vec<SocketAddr> = addresses
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, port))
-            .collect();
-
-        // Pin the process-global rustls provider before building any TLS client
-        // so production never initializes rustls under a foreign default. A
-        // conflict fails closed as a pre-handoff (no byte sent) TLS failure.
-        if crate::tls_crypto_provider::install_process_default().is_err() {
-            return Err(ProviderTransportError::Tls);
-        }
-
-        let client = reqwest::Client::builder()
-            // An environment/system proxy would bypass the vetted peer set and
-            // could receive URL or credential material.
-            .no_proxy()
-            // No automatic redirects: every 3xx is a stable failure, so a
-            // credential-bearing request can never cross an origin boundary.
-            .redirect(reqwest::redirect::Policy::none())
-            .referer(false)
-            .connect_timeout(CONNECT_TIMEOUT)
-            // Keep the URL host for Host/SNI/cert checks while dialing only the
-            // vetted socket addresses.
-            .resolve_to_addrs(&host, &socket_addrs)
-            .build()
-            .map_err(|_| ProviderTransportError::Tls)?;
-
+        // The credential is kept in a sensitive header value; a malformed
+        // content-type is a build error with no byte sent.
         let content_type_value =
             HeaderValue::from_str(content_type).map_err(|_| ProviderTransportError::Connect)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, self.authorization.clone());
+        headers.insert(CONTENT_TYPE, content_type_value);
 
-        let send = client
-            .post(url.clone())
-            .header(AUTHORIZATION, self.authorization.clone())
-            .header(CONTENT_TYPE, content_type_value)
-            .body(body.to_vec())
-            .send();
-        let response = match tokio::time::timeout(HEADER_TIMEOUT, send).await {
-            // Deadline after the request was written: ambiguous, must reconcile.
-            Err(_elapsed) => return Err(ProviderTransportError::Timeout),
-            Ok(Err(error)) => {
-                if error.is_connect() {
-                    // The connection was never established: no byte accepted.
-                    return Err(ProviderTransportError::Tls);
-                }
-                if error.is_timeout() {
-                    return Err(ProviderTransportError::Timeout);
-                }
-                // The request was written and then failed: ambiguous.
-                return Err(ProviderTransportError::AmbiguousAcceptance);
-            }
-            Ok(Ok(response)) => response,
-        };
-
-        // Defense in depth: the socket peer must still be a vetted, in-class
-        // address. A missing peer address is unverifiable and — since request
-        // bytes may already have been written — fails closed as ambiguous
-        // rather than trusting the response (mirroring the runtime probe
-        // client, which rejects a `None` peer instead of proceeding).
-        verify_response_peer(
-            response.remote_addr(),
-            self.required_location,
-            &socket_addrs,
-        )?;
-
-        let status = response.status();
-        let stream = response.bytes_stream();
-        let body_bytes =
-            match tokio::time::timeout(BODY_TIMEOUT, read_body_bounded(stream, self.body_limit))
-                .await
-            {
-                // Body deadline after a status was received: reconcile.
-                Err(_elapsed) => return Err(ProviderTransportError::Timeout),
-                Ok(Ok(bytes)) => bytes,
-                // A body-read failure after a status line is a definitive,
-                // safe-to-resubmit non-acceptance only for a 3xx/4xx. On a 2xx
-                // (accepted, likely charged) or 5xx (ambiguous) it must widen to
-                // ambiguous, never collapse into the safe pre-handoff class.
-                Ok(Err(read_error)) => {
-                    return Err(classify_body_read_failure(status, read_error));
-                }
-            };
-
-        let code = status.as_u16();
-        if status.is_success() {
-            Ok(ProviderTransportOutcome {
-                status: code,
-                body: body_bytes,
-            })
-        } else if status.is_server_error() {
-            // 5xx: the provider received the request but its disposition is
-            // unclear; reconcile rather than assume a definitive rejection.
-            Err(ProviderTransportError::AmbiguousAcceptance)
-        } else {
-            // 3xx (never followed) and 4xx: a definitive non-acceptance with no
-            // paid submission.
-            Err(ProviderTransportError::Status {
-                status: code,
-                body: body_bytes,
-            })
-        }
+        // Every byte leaves through the single pinned/vetted client, which vets
+        // the full DNS answer set to the required class before sending, refuses
+        // proxies and credential-bearing redirects, verifies the response peer,
+        // reads the body bounded, and maps failures onto the billing-safe
+        // transport vocabulary.
+        VettedHttpClient::new(self.dns.clone(), self.required_location)
+            .execute(
+                Method::POST,
+                &url,
+                headers,
+                Some(body.to_vec()),
+                self.body_limit,
+            )
+            .await
     }
-}
-
-/// Classify a bounded-body read failure that occurred *after* a status line was
-/// received, preserving billing safety. A body-read failure is a definitive,
-/// safe-to-resubmit non-acceptance only for a 3xx/4xx (no paid submission). For
-/// a 2xx (accepted, likely charged) or a 5xx (ambiguous provider disposition),
-/// widening it to `BodyLimit`/`Malformed` — which the adapter maps to
-/// `DefinitivelyRejected` — would let the dispatcher resubmit a paid
-/// generation, so it fails closed to `AmbiguousAcceptance`.
-fn classify_body_read_failure(
-    status: reqwest::StatusCode,
-    error: ReadBodyError,
-) -> ProviderTransportError {
-    if status.is_success() || status.is_server_error() {
-        return ProviderTransportError::AmbiguousAcceptance;
-    }
-    match error {
-        ReadBodyError::Limit => ProviderTransportError::BodyLimit,
-        ReadBodyError::Chunk => ProviderTransportError::Malformed,
-    }
-}
-
-/// Verify the response's socket peer is still a vetted, in-class address. A
-/// missing peer address is unverifiable; since request bytes may already have
-/// been written, it fails closed as ambiguous rather than trusting the response
-/// (the runtime probe client rejects a `None` peer likewise). An out-of-set or
-/// out-of-class peer is treated the same way.
-fn verify_response_peer(
-    peer: Option<SocketAddr>,
-    required_location: AddressClass,
-    socket_addrs: &[SocketAddr],
-) -> Result<(), ProviderTransportError> {
-    let Some(peer) = peer else {
-        return Err(ProviderTransportError::AmbiguousAcceptance);
-    };
-    if classify_address(peer.ip()) != required_location
-        || !socket_addrs.iter().any(|addr| addr.ip() == peer.ip())
-    {
-        return Err(ProviderTransportError::AmbiguousAcceptance);
-    }
-    Ok(())
 }
 
 impl openai_images_adapter_sealed::Sealed for OpenaiImagesHttpTransport {}
@@ -324,46 +180,12 @@ impl OpenaiImagesTransport for OpenaiImagesHttpTransport {
     }
 }
 
-/// Why a bounded body read stopped short of success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadBodyError {
-    /// The cumulative body size exceeded the limit.
-    Limit,
-    /// A chunk could not be read.
-    Chunk,
-}
-
-/// Reads a chunked body into a `Vec`, enforcing `limit` **while reading**: the
-/// stream is stopped and rejected the moment the cumulative size would exceed
-/// `limit`, before the offending chunk is buffered and before any further chunk
-/// is pulled. This is the single production body-reading funnel; unit tests
-/// drive it directly with a synthetic stream.
-async fn read_body_bounded<S, B, E>(mut stream: S, limit: usize) -> Result<Vec<u8>, ReadBodyError>
-where
-    S: futures::Stream<Item = Result<B, E>> + Unpin,
-    B: AsRef<[u8]>,
-{
-    let mut body = Vec::new();
-    let mut total = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ReadBodyError::Chunk)?;
-        let chunk = chunk.as_ref();
-        total = total.checked_add(chunk.len()).ok_or(ReadBodyError::Limit)?;
-        if total > limit {
-            return Err(ReadBodyError::Limit);
-        }
-        body.extend_from_slice(chunk);
-    }
-    Ok(body)
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::net::IpAddr;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::image_generation_runtime::RuntimeError;
@@ -474,133 +296,5 @@ mod tests {
             .submit(OpenaiImagesRoute::Generations, "application/json", b"{}")
             .await;
         assert_eq!(outcome, Err(ProviderTransportError::Connect));
-    }
-
-    fn counting_stream(
-        chunks: Vec<Vec<u8>>,
-        counter: Arc<AtomicUsize>,
-    ) -> impl futures::Stream<Item = Result<Vec<u8>, ()>> + Unpin {
-        futures::stream::iter(chunks.into_iter().map(Ok)).map(move |item| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            item
-        })
-    }
-
-    #[tokio::test]
-    async fn read_body_bounded_rejects_oversize_while_reading() {
-        // 1000 chunks of 1 KiB each = ~1 MiB available, but the limit is 4 KiB.
-        // A correct implementation stops the moment cumulative size crosses the
-        // limit, having pulled only a handful of chunks — not all 1000. A
-        // buffer-then-check implementation would pull every chunk.
-        let counter = Arc::new(AtomicUsize::new(0));
-        let chunks: Vec<Vec<u8>> = (0..1000).map(|_| vec![7u8; 1024]).collect();
-        let stream = counting_stream(chunks, counter.clone());
-        let result = read_body_bounded(stream, 4 * 1024).await;
-        assert_eq!(result, Err(ReadBodyError::Limit));
-        let pulled = counter.load(Ordering::SeqCst);
-        assert!(
-            pulled <= 6,
-            "expected the read to short-circuit within a few chunks, pulled {pulled}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_body_bounded_accepts_exactly_at_limit() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let chunks = vec![vec![1u8; 512], vec![2u8; 512]];
-        let stream = counting_stream(chunks, counter.clone());
-        let body = read_body_bounded(stream, 1024).await.unwrap();
-        assert_eq!(body.len(), 1024);
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn read_body_bounded_rejects_one_byte_over_limit() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let chunks = vec![vec![1u8; 1024], vec![2u8; 1]];
-        let stream = counting_stream(chunks, counter.clone());
-        let result = read_body_bounded(stream, 1024).await;
-        assert_eq!(result, Err(ReadBodyError::Limit));
-    }
-
-    // --- billing-safety: post-status body-read failure classification ---
-
-    #[test]
-    fn body_read_failure_on_2xx_is_ambiguous_not_definitive_reject() {
-        // A 2xx means the provider accepted (and likely charged); a body-read
-        // failure must NOT collapse into a safe-to-resubmit rejection, or the
-        // dispatcher could duplicate a paid generation.
-        assert_eq!(
-            classify_body_read_failure(reqwest::StatusCode::OK, ReadBodyError::Limit),
-            ProviderTransportError::AmbiguousAcceptance
-        );
-        assert_eq!(
-            classify_body_read_failure(reqwest::StatusCode::CREATED, ReadBodyError::Chunk),
-            ProviderTransportError::AmbiguousAcceptance
-        );
-    }
-
-    #[test]
-    fn body_read_failure_on_5xx_is_ambiguous() {
-        assert_eq!(
-            classify_body_read_failure(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                ReadBodyError::Limit
-            ),
-            ProviderTransportError::AmbiguousAcceptance
-        );
-        assert_eq!(
-            classify_body_read_failure(reqwest::StatusCode::BAD_GATEWAY, ReadBodyError::Chunk),
-            ProviderTransportError::AmbiguousAcceptance
-        );
-    }
-
-    #[test]
-    fn body_read_failure_on_3xx_4xx_is_definitive_non_acceptance() {
-        // 3xx (never followed) and 4xx are definitive non-acceptances with no
-        // paid submission: preserving BodyLimit/Malformed (→ DefinitivelyRejected)
-        // is billing-safe.
-        assert_eq!(
-            classify_body_read_failure(reqwest::StatusCode::BAD_REQUEST, ReadBodyError::Limit),
-            ProviderTransportError::BodyLimit
-        );
-        assert_eq!(
-            classify_body_read_failure(reqwest::StatusCode::FOUND, ReadBodyError::Chunk),
-            ProviderTransportError::Malformed
-        );
-    }
-
-    // --- fail-closed response-peer verification ---
-
-    #[test]
-    fn response_peer_missing_addr_fails_closed_ambiguous() {
-        let vetted: Vec<SocketAddr> = vec!["93.184.216.34:443".parse().unwrap()];
-        assert_eq!(
-            verify_response_peer(None, AddressClass::PublicRemote, &vetted),
-            Err(ProviderTransportError::AmbiguousAcceptance)
-        );
-    }
-
-    #[test]
-    fn response_peer_outside_vetted_set_is_ambiguous() {
-        // In-class but not a dialed address: still fail closed.
-        let vetted: Vec<SocketAddr> = vec!["93.184.216.34:443".parse().unwrap()];
-        let rogue: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        assert_eq!(classify_address(rogue.ip()), AddressClass::PublicRemote);
-        assert_eq!(
-            verify_response_peer(Some(rogue), AddressClass::PublicRemote, &vetted),
-            Err(ProviderTransportError::AmbiguousAcceptance)
-        );
-    }
-
-    #[test]
-    fn response_peer_in_vetted_public_set_is_accepted() {
-        let good: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        assert_eq!(classify_address(good.ip()), AddressClass::PublicRemote);
-        let vetted = vec![good];
-        assert_eq!(
-            verify_response_peer(Some(good), AddressClass::PublicRemote, &vetted),
-            Ok(())
-        );
     }
 }

@@ -4261,6 +4261,270 @@ mod tests {
         assert_eq!(evidence_outcome, "definitively_rejected");
     }
 
+    // -----------------------------------------------------------------------
+    // Per-kind dispatch-trait wiring (AC7-rest): drive the REAL Gemini,
+    // OpenRouter, and ComfyUI adapters through `run_scheduler_pass` with a
+    // scripted transport (no network), asserting the transport classification
+    // maps onto the recorded handoff evidence and attempt state. The fixture
+    // and dispatcher are provider-agnostic: only the adapter varies.
+    // -----------------------------------------------------------------------
+
+    async fn read_evidence_and_state(db: &cockpit_db::Db, job_id: Uuid) -> (String, String) {
+        db.read(move |conn| {
+            let outcome: String = conn.query_row(
+                "SELECT outcome FROM image_generation_handoff_evidence WHERE job_id=?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let state: String = conn.query_row(
+                "SELECT state FROM image_generation_attempts WHERE job_id=?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            Ok((outcome, state))
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn dispatch_gemini_once(
+        suffix: &str,
+        transport_outcome: Result<
+            crate::image_generation::transport::ProviderTransportOutcome,
+            crate::image_generation::transport::ProviderTransportError,
+        >,
+    ) -> (usize, String, String) {
+        use crate::image_generation::adapters::gemini::GeminiImagesAdapter;
+        use crate::image_generation::adapters::gemini::test_support::{
+            FixedGeminiPlanSource, ScriptedGeminiTransport, sample_attempt_input,
+        };
+
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let fixture = setup_real_ledger_scheduler_job(db, suffix).await;
+        let transport = Arc::new(ScriptedGeminiTransport::new(vec![transport_outcome]));
+        let adapter = GeminiImagesAdapter::new(
+            transport.clone(),
+            Arc::new(FixedGeminiPlanSource::new(sample_attempt_input())),
+        );
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.dispatched, 1,
+            "expected exactly one dispatched attempt"
+        );
+        let (outcome, state) = read_evidence_and_state(&fixture.db, fixture.job_id).await;
+        (transport.submissions().len(), outcome, state)
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_gemini_accepted() {
+        use crate::image_generation::adapters::gemini::test_support::sample_success_body;
+        use crate::image_generation::transport::ProviderTransportOutcome;
+
+        let (submissions, outcome, state) = dispatch_gemini_once(
+            "gemini-accept",
+            Ok(ProviderTransportOutcome {
+                status: 200,
+                body: sample_success_body(),
+            }),
+        )
+        .await;
+        assert_eq!(submissions, 1, "a request was built and submitted");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(state, "accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_gemini_definitive_rejection() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (submissions, outcome, state) = dispatch_gemini_once(
+            "gemini-reject",
+            Err(ProviderTransportError::Status {
+                status: 400,
+                body: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(submissions, 1);
+        assert_eq!(outcome, "definitively_rejected");
+        assert_eq!(state, "rejected_not_accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_gemini_submission_unknown() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (submissions, outcome, state) = dispatch_gemini_once(
+            "gemini-unknown",
+            Err(ProviderTransportError::AmbiguousAcceptance),
+        )
+        .await;
+        assert_eq!(submissions, 1);
+        assert_eq!(outcome, "submission_unknown");
+        assert_eq!(state, "submission_unknown");
+    }
+
+    async fn dispatch_openrouter_once(
+        suffix: &str,
+        transport_outcome: Result<
+            crate::image_generation::transport::ProviderTransportOutcome,
+            crate::image_generation::transport::ProviderTransportError,
+        >,
+    ) -> (usize, String, String) {
+        use crate::image_generation::adapters::openrouter::OpenrouterImagesAdapter;
+        use crate::image_generation::adapters::openrouter::test_support::{
+            FixedOpenrouterPlanSource, ScriptedOpenrouterTransport, sample_attempt_input,
+        };
+
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let fixture = setup_real_ledger_scheduler_job(db, suffix).await;
+        let transport = Arc::new(ScriptedOpenrouterTransport::new(vec![transport_outcome]));
+        let adapter = OpenrouterImagesAdapter::new(
+            transport.clone(),
+            Arc::new(FixedOpenrouterPlanSource::new(sample_attempt_input())),
+        );
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.dispatched, 1,
+            "expected exactly one dispatched attempt"
+        );
+        let (outcome, state) = read_evidence_and_state(&fixture.db, fixture.job_id).await;
+        (transport.submissions().len(), outcome, state)
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_openrouter_accepted() {
+        use crate::image_generation::adapters::openrouter::test_support::sample_success_body;
+        use crate::image_generation::transport::ProviderTransportOutcome;
+
+        let (submissions, outcome, state) = dispatch_openrouter_once(
+            "openrouter-accept",
+            Ok(ProviderTransportOutcome {
+                status: 200,
+                body: sample_success_body(),
+            }),
+        )
+        .await;
+        assert_eq!(submissions, 1, "a request was built and submitted");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(state, "accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_openrouter_definitive_rejection() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (submissions, outcome, state) = dispatch_openrouter_once(
+            "openrouter-reject",
+            Err(ProviderTransportError::Status {
+                status: 400,
+                body: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(submissions, 1);
+        assert_eq!(outcome, "definitively_rejected");
+        assert_eq!(state, "rejected_not_accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_openrouter_submission_unknown() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (submissions, outcome, state) = dispatch_openrouter_once(
+            "openrouter-unknown",
+            Err(ProviderTransportError::AmbiguousAcceptance),
+        )
+        .await;
+        assert_eq!(submissions, 1);
+        assert_eq!(outcome, "submission_unknown");
+        assert_eq!(state, "submission_unknown");
+    }
+
+    async fn dispatch_comfyui_once(
+        suffix: &str,
+        transport_outcome: Result<
+            crate::image_generation::transport::ProviderTransportOutcome,
+            crate::image_generation::transport::ProviderTransportError,
+        >,
+    ) -> (usize, String, String) {
+        use crate::image_generation::adapters::comfyui::ComfyuiImagesAdapter;
+        use crate::image_generation::adapters::comfyui::test_support::{
+            ScriptedComfyuiTransport, resolved_handoff_source,
+        };
+
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let fixture = setup_real_ledger_scheduler_job(db, suffix).await;
+        let transport = Arc::new(ScriptedComfyuiTransport::new(vec![transport_outcome]));
+        let adapter =
+            ComfyuiImagesAdapter::new(transport.clone(), Arc::new(resolved_handoff_source()));
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.dispatched, 1,
+            "expected exactly one dispatched attempt"
+        );
+        let (outcome, state) = read_evidence_and_state(&fixture.db, fixture.job_id).await;
+        (transport.calls().len(), outcome, state)
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_comfyui_accepted() {
+        use crate::image_generation::adapters::comfyui::test_support::sample_prompt_accept_body;
+        use crate::image_generation::transport::ProviderTransportOutcome;
+
+        let (calls, outcome, state) = dispatch_comfyui_once(
+            "comfyui-accept",
+            Ok(ProviderTransportOutcome {
+                status: 200,
+                body: sample_prompt_accept_body(),
+            }),
+        )
+        .await;
+        assert_eq!(calls, 1, "a POST /prompt was built and submitted");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(state, "accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_comfyui_definitive_rejection() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (calls, outcome, state) = dispatch_comfyui_once(
+            "comfyui-reject",
+            Err(ProviderTransportError::Status {
+                status: 400,
+                body: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(outcome, "definitively_rejected");
+        assert_eq!(state, "rejected_not_accepted");
+    }
+
+    #[tokio::test]
+    async fn image_generation_dispatcher_comfyui_submission_unknown() {
+        use crate::image_generation::transport::ProviderTransportError;
+
+        let (calls, outcome, state) = dispatch_comfyui_once(
+            "comfyui-unknown",
+            Err(ProviderTransportError::AmbiguousAcceptance),
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert_eq!(outcome, "submission_unknown");
+        assert_eq!(state, "submission_unknown");
+    }
+
     async fn setup_real_ledger_scheduler_job_with_attempts(
         db: cockpit_db::Db,
         suffix: &str,

@@ -303,6 +303,7 @@ fn build_fork_agent(
         write_scope: parent.write_scope.clone(),
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
+        vnext_grant: parent.vnext_grant.clone(),
     }
 }
 
@@ -411,6 +412,7 @@ mod tests {
             write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             assistant_identity_prefix: None,
         })

@@ -1176,7 +1176,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::agents::AgentMode;
     use crate::assistants::{CreateAssistantSpec, create_assistant};
     use crate::config::extended::ExtendedConfig;
     use crate::config::providers::ProvidersConfig;
@@ -1800,10 +1799,6 @@ mod tests {
             CreateAssistantSpec {
                 name: "helper-bot".to_string(),
                 description: "Helper bot".to_string(),
-                mode: AgentMode::Primary,
-                tools: Some(vec!["read".to_string()]),
-                tool_tiers: std::collections::BTreeMap::new(),
-                model: None,
                 prompt: "You help with scheduled workspace maintenance.".to_string(),
                 home_dir,
             },

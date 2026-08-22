@@ -13147,6 +13147,11 @@ async fn run_docs_ask_pipeline(
         delegation_model: None,
         delegated: true,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
+        vnext_host_policy: None,
+        vnext_local_installation_resolver:
+            crate::agents::LocalInstallationResolver::no_installations(),
+        parent_vnext_grant: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),

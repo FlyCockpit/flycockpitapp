@@ -53,6 +53,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         write_scope: None,
         delegated: old.delegated,
         delegation_recursion: old.delegation_recursion.clone(),
+        vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
         assistant_identity_prefix: None,
     });

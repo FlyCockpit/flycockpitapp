@@ -101,6 +101,7 @@ pub struct Agent {
     pub write_scope: Option<std::path::PathBuf>,
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
+    pub vnext_grant: Option<crate::agents::EffectiveVnextGrant>,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// The assistant identity prefix (SOUL/USER identity + instructions) that was
     /// prepended to [`Self::system`] at build time, retained so a per-candidate

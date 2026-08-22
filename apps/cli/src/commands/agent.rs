@@ -4,27 +4,18 @@ use anyhow::{Context, Result, bail};
 
 use crate::agents::{AgentDef, AgentKind};
 use crate::cli::AgentCommand;
+use cockpit_core::agents::{
+    DelegationPolicy, ExecutionKind, ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
+};
 
 pub async fn run(cmd: AgentCommand) -> Result<()> {
     match cmd {
-        AgentCommand::Create {
-            path,
-            description,
-            mode,
-            tools,
-            model,
-        } => create(path, description, mode.unwrap_or_default(), tools, model),
+        AgentCommand::Create { path, description } => create(path, description),
         AgentCommand::List => list(),
     }
 }
 
-fn create(
-    path: Option<PathBuf>,
-    description: Option<String>,
-    mode: crate::agents::AgentMode,
-    tools: Option<String>,
-    model: Option<String>,
-) -> Result<()> {
+fn create(path: Option<PathBuf>, description: Option<String>) -> Result<()> {
     let path =
         path.ok_or_else(|| anyhow::anyhow!("--path is required for `cockpit agent create`"))?;
     if path.is_dir() {
@@ -40,28 +31,38 @@ fn create(
         .ok_or_else(|| anyhow::anyhow!("--path must have a usable file stem"))?
         .to_string();
     let description = description.unwrap_or_else(|| format!("Custom agent `{name}`"));
-    let tools = tools
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty());
     let def = AgentDef {
         name: name.clone(),
         description,
-        mode,
-        model,
+        mode: crate::agents::AgentMode::default(),
+        model: None,
         temperature: None,
-        tools,
+        tools: None,
         tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        vnext: Some(VnextAgentDef {
+            schema_version: cockpit_core::agents::SCHEMA_VERSION,
+            agent_id: format!("authored/{name}"),
+            execution_kind: ExecutionKind::Coding,
+            model_slots: std::collections::BTreeMap::from([(
+                "primary".to_string(),
+                ModelSlot {
+                    purpose: "Primary model for this workspace agent.".to_string(),
+                    min_context_tokens: 1,
+                    required_capabilities: vec![ModelCapability::TextGeneration],
+                    locality: ModelLocality::Any,
+                    allow_default_fallback: true,
+                    suggested_models: Vec::new(),
+                },
+            )]),
+            delegation: DelegationPolicy::default(),
+            questions: None,
+            verification: None,
+        }),
         prompt: format!("You are the `{name}` Cockpit agent."),
         prompt_variants: std::collections::HashMap::new(),
         source: path.clone(),
@@ -101,7 +102,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    use crate::cli::{Cli, Command};
+    use crate::cli::Cli;
 
     #[tokio::test]
     async fn agent_create_then_list() {
@@ -114,9 +115,6 @@ mod tests {
         run(AgentCommand::Create {
             path: Some(path.clone()),
             description: Some("Helps with tests".to_string()),
-            mode: Some(crate::agents::AgentMode::Primary),
-            tools: Some("read,bash".to_string()),
-            model: Some("openai/gpt-5.5".to_string()),
         })
         .await
         .unwrap();
@@ -124,8 +122,8 @@ mod tests {
         let loaded = crate::agents::load_from_file(&path).unwrap();
         assert_eq!(loaded.name, "helper");
         assert_eq!(loaded.description, "Helps with tests");
-        assert_eq!(loaded.mode, crate::agents::AgentMode::Primary);
-        assert_eq!(loaded.tools.unwrap(), vec!["read", "bash"]);
+        assert!(loaded.vnext.is_some());
+        assert!(loaded.tools.is_none());
 
         let cwd = temp.path();
         let policy = cockpit_config::trust::WorkspaceTrustPolicy {
@@ -143,8 +141,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_create_cli_accepts_prompt_required_flags() {
-        let cli = Cli::try_parse_from([
+    fn agent_create_cli_rejects_removed_legacy_authority_flags() {
+        let error = Cli::try_parse_from([
             "cockpit",
             "agent",
             "create",
@@ -159,10 +157,7 @@ mod tests {
             "--model",
             "openai/gpt-5.5",
         ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Agent(AgentCommand::Create { .. }))
-        ));
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

@@ -18843,10 +18843,6 @@ async fn create_test_assistant(
         crate::assistants::CreateAssistantSpec {
             name: name.to_string(),
             description: "test assistant".to_string(),
-            mode: crate::agents::AgentMode::Primary,
-            tools: None,
-            tool_tiers: std::collections::BTreeMap::new(),
-            model: None,
             prompt: "You are a test assistant.".to_string(),
             home_dir: tmp.path().join(name),
         },
@@ -24028,7 +24024,7 @@ async fn list_agents_respects_workspace_trust() {
     std::fs::create_dir_all(tmp.path().join(".cockpit").join("agents")).unwrap();
     std::fs::write(
         tmp.path().join(".cockpit").join("agents").join("Custom.md"),
-        "---\ndescription: custom primary\nmode: primary\n---\nBody\n",
+        "---\ndescription: custom primary\nschemaVersion: 2\nagentId: authored/custom\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    purpose: Assist the user\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: true\n---\nBody\n",
     )
     .unwrap();
     let ctx = test_ctx();

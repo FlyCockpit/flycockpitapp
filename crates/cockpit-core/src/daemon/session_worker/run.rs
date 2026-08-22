@@ -822,11 +822,42 @@ pub(super) async fn run_worker(
                     },
                     NoticeSource::DaemonDirect,
                 );
-                None
+                // Preserve the daemon-authenticated assistant-root marker
+                // even when optional SOUL/USER prompt material is malformed.
+                // Root definition resolution must still select the private
+                // installation snapshot ahead of a same-named workspace file.
+                Some(String::new())
             }
         },
         None => None,
     };
+    // Capture the daemon-owned installation table once for the entire
+    // session.  UUID child references select these authenticated definition
+    // snapshots directly; neither child preflight nor construction may fall
+    // back to a checkout name lookup.
+    let vnext_local_installation_resolver =
+        match crate::assistants::local_installation_resolver(&session.db).await {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                // The authenticated local-installation table is part of vNext
+                // launch authority.  Starting a session without it would make
+                // UUID children ambiguous (or invite a name-lookup fallback),
+                // so report a terminal worker failure and refuse the session.
+                let message =
+                    format!("could not load daemon-local agent installation bindings: {error:#}");
+                tracing::error!(%message, %session_id, "session startup refused");
+                let mut driver_failed = false;
+                emit_session_driver_failed_once(
+                    &event_tx,
+                    &turn_completions,
+                    &redaction,
+                    session_id,
+                    &mut driver_failed,
+                    message,
+                );
+                return;
+            }
+        };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses
@@ -875,6 +906,15 @@ pub(super) async fn run_worker(
             &root_agent_name,
             None,
         ),
+        vnext_grant: None,
+        // vNext definitions are declarative requests only; the daemon
+        // snapshots the core-owned host policy at root construction so their
+        // effective grants are both usable and bounded for the whole tree.
+        vnext_host_policy: Some(std::sync::Arc::new(
+            crate::agents::VnextHostPolicy::for_session_config(&extended_cfg),
+        )),
+        vnext_local_installation_resolver,
+        parent_vnext_grant: None,
         // Recursive-`Swarm` depth (GOALS §24): the `Swarm` root is depth 0;
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.
@@ -1120,6 +1160,11 @@ pub(super) async fn run_worker(
         project_root.clone(),
         root,
         max_concurrent_schedules,
+    );
+    // Keep the exact daemon-owned binding input for every descendant spawn;
+    // the driver never reconstructs local UUID references from display names.
+    driver.set_vnext_local_installation_resolver(
+        spawn_args.vnext_local_installation_resolver.clone(),
     );
     // Install the session config reader before the loop starts so the driver
     // and every `ToolCtx` it builds read config through the generationed

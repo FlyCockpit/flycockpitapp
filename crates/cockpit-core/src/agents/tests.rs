@@ -74,8 +74,332 @@ fn configured_agent_dirs_resolve_relative_to_defining_config_file() {
 
 // ── Parsing ──────────────────────────────────────────────────────────────
 
+fn vnext_document(extra_frontmatter: &str) -> String {
+    format!(
+        "---\ndescription: Reviewer\nschemaVersion: 2\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n{extra_frontmatter}---\nbody\n"
+    )
+}
+
+fn vnext_agent_document(description: &str, body: &str) -> String {
+    format!(
+        "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/reviewer\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Review source changes\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{body}\n"
+    )
+}
+
+fn builtin_override_document(name: &str, description: &str, body: &str) -> String {
+    let mut definition = embedded_default(name).expect("known bundled definition");
+    definition.description = description.to_string();
+    definition.prompt = body.to_string();
+    definition.prompt_variants.clear();
+    definition.to_markdown().expect("vNext bundled override")
+}
+
 #[test]
-fn parse_agent_reads_frontmatter_and_body() {
+fn agent_vnext_parse_round_trip_preserves_advisory_model_metadata() {
+    let text = r#"---
+description: Reviewer
+schemaVersion: 2
+agentId: authored/reviewer
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 32768
+    requiredCapabilities: [text_generation, tool_calling]
+    locality: any
+    allowDefaultFallback: false
+    suggestedModels:
+      - recommendationId: claude-sonnet
+        upstreamIdentity: anthropic/claude-sonnet
+        providerAliases:
+          - providerId: anthropic
+            modelId: claude-sonnet-4
+        authorLabel: Sonnet
+        rationale: Strong code review
+questions:
+  autoAnswer: recommended_low_risk
+  decisionTimeoutSeconds: 30
+  resolverOrder: warm_parent_then_utility
+  neverAutoResolve: [authorization, credential]
+---
+
+Review only the declared scope.
+"#;
+
+    let parsed = parse_agent(text, "reviewer", "reviewer.md".into()).unwrap();
+    let vnext = parsed.vnext.as_ref().expect("v2 definition");
+    assert_eq!(vnext.agent_id, "authored/reviewer");
+    assert_eq!(vnext.model_slots["primary"].suggested_models.len(), 1);
+    assert_eq!(
+        vnext.model_slots["primary"].suggested_models[0].recommendation_id,
+        "claude-sonnet"
+    );
+    assert_eq!(
+        parse_agent(
+            &parsed.to_markdown().unwrap(),
+            "reviewer",
+            "reviewer.md".into()
+        )
+        .unwrap()
+        .vnext,
+        parsed.vnext
+    );
+}
+
+#[test]
+fn agent_vnext_rejects_legacy_authority_fields_and_unsorted_capabilities() {
+    let authority = r#"---
+schemaVersion: 2
+agentId: authored/reviewer
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+tools: [write]
+---
+body
+"#;
+    assert!(parse_agent(authority, "reviewer", "reviewer.md".into()).is_err());
+
+    let unsorted = authority.replace("tools: [write]\n", "").replace(
+        "requiredCapabilities: [text_generation]",
+        "requiredCapabilities: [tool_calling, text_generation]",
+    );
+    assert!(parse_agent(&unsorted, "reviewer", "reviewer.md".into()).is_err());
+}
+
+#[test]
+fn agent_vnext_rejects_empty_duplicate_and_unknown_capabilities() {
+    let base = vnext_document("");
+    for invalid in [
+        base.replace("[text_generation]", "[]"),
+        base.replace("[text_generation]", "[text_generation, text_generation]"),
+        base.replace("[text_generation]", "[unbounded_authority]"),
+    ] {
+        assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+    }
+}
+
+#[test]
+fn agent_vnext_rejects_legacy_keys_by_raw_presence_even_when_default_or_null() {
+    let base = r#"---
+schemaVersion: 2
+agentId: authored/reviewer
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+---
+body
+"#;
+    for legacy in [
+        "mode: all",
+        "forkEligible: false",
+        "tools: null",
+        "model: null",
+    ] {
+        let invalid = base.replacen("---\nbody", &format!("{legacy}\n---\nbody"), 1);
+        assert!(
+            parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err(),
+            "v2 accepted legacy key {legacy}"
+        );
+    }
+}
+
+#[test]
+fn agent_vnext_canonical_digest_bytes_ignore_authored_mapping_order() {
+    let first_source = r#"---
+schemaVersion: 2
+agentId: authored/reviewer
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+description: Reviewer
+---
+body
+"#;
+    let reordered_source = r#"---
+description: Reviewer
+modelSlots:
+  primary:
+    allowDefaultFallback: false
+    locality: any
+    requiredCapabilities: [text_generation]
+    minContextTokens: 1
+    purpose: Review source changes
+executionKind: coding
+agentId: authored/reviewer
+schemaVersion: 2
+---
+body
+"#;
+    let first = parse_agent(first_source, "reviewer", "reviewer.md".into()).unwrap();
+    let reordered = parse_agent(reordered_source, "reviewer", "reviewer.md".into()).unwrap();
+    assert_eq!(
+        first.vnext_digest_bytes().unwrap(),
+        reordered.vnext_digest_bytes().unwrap()
+    );
+    let different_body = parse_agent(
+        &reordered_source.replace("---\nbody", "---\na different body"),
+        "reviewer",
+        "reviewer.md".into(),
+    )
+    .unwrap();
+    assert_ne!(
+        first.vnext_digest_bytes().unwrap(),
+        different_body.vnext_digest_bytes().unwrap(),
+        "the markdown body is part of the canonical definition digest"
+    );
+}
+
+#[test]
+fn agent_vnext_rejects_schema_less_user_definitions_and_null_delegation() {
+    let schema_less = r#"---
+description: legacy
+mode: subagent
+---
+legacy body
+"#;
+    assert!(parse_agent(schema_less, "legacy", "legacy.md".into()).is_err());
+
+    let null_delegation = r#"---
+schemaVersion: 2
+agentId: authored/reviewer
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+delegation: null
+---
+body
+"#;
+    assert!(parse_agent(null_delegation, "reviewer", "reviewer.md".into()).is_err());
+}
+
+#[test]
+fn agent_vnext_workspace_definition_cannot_claim_daemon_local_publisher() {
+    let text = r#"---
+description: Private reviewer
+schemaVersion: 2
+agentId: local/00000000-0000-0000-0000-000000000001
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Review source changes
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+delegation:
+  allowedChildren:
+    - kind: local_installation
+      installationId: 00000000-0000-0000-0000-000000000001
+  maxDescendantDepth: 1
+  maxConcurrentChildren: 1
+  targets: [same_root]
+---
+body
+"#;
+    let err = parse_agent(text, "private-reviewer", "workspace.md".into()).unwrap_err();
+    assert!(err.to_string().contains("daemon-local"), "{err}");
+}
+
+#[test]
+fn agent_vnext_rejects_duplicate_slots_and_invalid_delegation_combinations() {
+    let duplicate_slots = vnext_document(
+        "  primary:\n    purpose: Duplicate\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n",
+    );
+    assert!(parse_agent(&duplicate_slots, "reviewer", "reviewer.md".into()).is_err());
+
+    for delegation in [
+        // Computer agents are always leaves.
+        "executionKind: computer\ndelegation:\n  allowedChildren: [{ kind: portable_ref, ref: authored/child }]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n",
+        // Worktree and same-root are contradictory target authority.
+        "delegation:\n  allowedChildren: [{ kind: portable_ref, ref: authored/child }]\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root, managed_worktree]\n",
+    ] {
+        let text = if delegation.starts_with("executionKind") {
+            vnext_document("").replacen("executionKind: coding\n", delegation, 1)
+        } else {
+            vnext_document(delegation)
+        };
+        assert!(parse_agent(&text, "reviewer", "reviewer.md".into()).is_err());
+    }
+}
+
+#[test]
+fn agent_vnext_recommendation_aliases_are_ordered_exact_and_authority_free() {
+    let valid = vnext_document(
+        "    suggestedModels:\n      - recommendationId: alpha\n        upstreamIdentity: acme/model-one\n        providerAliases:\n          - providerId: provider-a\n            modelId: model-a\n          - providerId: provider-b\n            modelId: model-b\n      - recommendationId: beta\n        upstreamIdentity: acme/model-two\n",
+    );
+    let parsed = parse_agent(&valid, "reviewer", "reviewer.md".into()).unwrap();
+    assert_eq!(
+        parsed.vnext.unwrap().model_slots["primary"]
+            .suggested_models
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "beta"]
+    );
+
+    for invalid in [
+        valid.replace(
+            "providerId: provider-a\n            modelId: model-a",
+            "providerId: provider-b\n            modelId: model-b",
+        ),
+        valid.replace("providerId: provider-a", "providerId: \" provider-a\""),
+        valid.replace("upstreamIdentity: acme/model-one", "credential: secret"),
+        valid.replace("recommendationId: alpha", "providerProfile: private"),
+    ] {
+        assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+    }
+}
+
+#[test]
+fn agent_vnext_selector_schema_is_exact_and_closed() {
+    let valid = vnext_document(
+        "verification:\n  rules:\n    - selector:\n        allOf: [{ toolClass: artifact_write }]\n        anyOf: [{ toolId: write }, { namespace: mcp/server }]\n      action: verify\n      adjudicatorSlot: primary\n",
+    );
+    assert!(parse_agent(&valid, "reviewer", "reviewer.md".into()).is_ok());
+
+    for invalid in [
+        valid.replace("allOf: [{ toolClass: artifact_write }]\n        anyOf: [{ toolId: write }, { namespace: mcp/server }]", "allOf: []"),
+        valid.replace("{ toolId: write }", "{ toolName: write }"),
+        valid.replace("{ toolId: write }, { namespace: mcp/server }", "{ toolId: write }, { toolId: write }"),
+        valid.replace("{ toolId: write }", "{ toolId: Write* }"),
+        valid.replace("action: verify\n      adjudicatorSlot: primary", "action: off\n      maxCandidates: 1"),
+        valid.replace("adjudicatorSlot: primary\n", ""),
+    ] {
+        assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+    }
+}
+
+#[test]
+fn agent_vnext_rejects_enabled_question_auto_answer_without_timeout() {
+    let invalid = vnext_document(
+        "questions:\n  autoAnswer: recommended_low_risk\n  resolverOrder: warm_parent_then_utility\n",
+    );
+    assert!(parse_agent(&invalid, "reviewer", "reviewer.md".into()).is_err());
+}
+
+#[test]
+fn agent_vnext_rejects_legacy_frontmatter_contract() {
     let text = "---\n\
 description: A custom reviewer.\n\
 mode: subagent\n\
@@ -86,22 +410,14 @@ scanToolResults: true\n\
 ---\n\
 \n\
 You are a reviewer. Be terse.\n";
-    let def = parse_agent(text, "my-reviewer", "x.md".into()).unwrap();
-    assert_eq!(def.name, "my-reviewer");
-    assert_eq!(def.description, "A custom reviewer.");
-    assert_eq!(def.mode, AgentMode::Subagent);
-    assert_eq!(def.model.as_deref(), Some("anthropic/claude-opus-4-7"));
-    assert_eq!(def.temperature, Some(0.3));
-    assert_eq!(
-        def.tools,
-        Some(vec!["read".into(), "bash".into(), "search".into()])
-    );
-    assert_eq!(def.scan_tool_results, Some(true));
-    assert_eq!(def.prompt, "You are a reviewer. Be terse.");
+    let error = parse_agent(text, "my-reviewer", "x.md".into())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("schemaVersion: 2"), "{error}");
 }
 
 #[test]
-fn agent_def_parses_fork_eligible_frontmatter() {
+fn agent_vnext_rejects_fork_eligible_legacy_frontmatter() {
     let text = r#"---
 description: Forkable agent.
 mode: subagent
@@ -111,19 +427,19 @@ forkEligible: true
 Body.
 "#;
 
-    let def = parse_agent(text, "forker", "forker.md".into()).unwrap();
-
-    assert!(def.fork_eligible);
-    let md = def.to_markdown().unwrap();
-    assert!(md.contains("forkEligible: true"));
+    let error = parse_agent(text, "forker", "forker.md".into())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("schemaVersion: 2"), "{error}");
 }
 
 #[test]
-fn parse_agent_defaults_mode_to_all() {
+fn agent_vnext_rejects_missing_schema_version_instead_of_defaulting_mode() {
     let text = "---\ndescription: x\n---\nbody\n";
-    let def = parse_agent(text, "a", "a.md".into()).unwrap();
-    assert_eq!(def.mode, AgentMode::All);
-    assert!(def.tools.is_none());
+    let error = parse_agent(text, "a", "a.md".into())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("schemaVersion: 2"), "{error}");
 }
 
 #[test]
@@ -182,11 +498,7 @@ fn load_from_dir_rejects_oversized_mode_markdown() {
 fn list_all_excludes_oversized_custom_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = project_agents_dir(tmp.path());
-    fs::write(
-        dir.join("small.md"),
-        "---\ndescription: small\nmode: subagent\n---\nbody\n",
-    )
-    .unwrap();
+    fs::write(dir.join("small.md"), vnext_agent_document("small", "body")).unwrap();
     write_large_agent(&dir.join("large.md"), MAX_MARKDOWN_BYTES + 1);
 
     let names: Vec<String> = trusted_list_all(tmp.path())
@@ -205,16 +517,44 @@ fn to_markdown_round_trips_through_parse() {
     let def = embedded_default("builder").unwrap();
     let md = def.to_markdown().unwrap();
     // Re-parse the ejected form.
-    let parsed = parse_agent(&md, "builder", "builder.md".into()).unwrap();
+    let parsed = parse_agent_with_scope(
+        &md,
+        "builder",
+        "builder.md".into(),
+        DefinitionScope::BuiltinOverride,
+    )
+    .unwrap();
     assert_eq!(parsed.description, def.description);
-    assert_eq!(parsed.mode, def.mode);
-    assert_eq!(parsed.tools, def.tools);
-    assert_eq!(parsed.scan_tool_results, def.scan_tool_results);
+    assert_eq!(parsed.vnext, def.vnext);
+    // Ejection serializes the user-authorable v2 contract only. Built-in
+    // tool surfaces stay host-owned factory data and cannot become frontmatter
+    // authority by round-tripping through an editable file.
+    assert!(parsed.tools.is_none());
+    assert!(parsed.scan_tool_results.is_none());
     assert_eq!(parsed.prompt, def.prompt);
 }
 
 #[test]
-fn tool_tier_parse_and_round_trip() {
+fn agent_vnext_every_editable_builtin_ejects_closed_schema_v2() {
+    for &name in crate::agents::BUILTIN_AGENT_NAMES {
+        let embedded = embedded_default(name).unwrap();
+        let markdown = embedded.to_markdown().unwrap();
+        assert!(markdown.contains("schemaVersion: 2"), "{name}");
+        assert!(
+            parse_agent_with_scope(
+                &markdown,
+                name,
+                format!("{name}.md").into(),
+                DefinitionScope::BuiltinOverride,
+            )
+            .is_ok(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn legacy_tool_tier_frontmatter_is_rejected() {
     let text = r#"---
 description: Tiered agent
 mode: subagent
@@ -227,23 +567,7 @@ toolTiers:
 
 Body
 "#;
-    let def = parse_agent(text, "tiered", "tiered.md".into()).unwrap();
-    assert_eq!(
-        def.tool_tiers.get("read"),
-        Some(&crate::agents::ToolTier::Enabled)
-    );
-    assert_eq!(
-        def.tool_tiers.get("search"),
-        Some(&crate::agents::ToolTier::Discoverable)
-    );
-    assert_eq!(
-        def.tool_tiers.get("skill_manage"),
-        Some(&crate::agents::ToolTier::Disabled)
-    );
-
-    let md = def.to_markdown().unwrap();
-    let reparsed = parse_agent(&md, "tiered", "tiered.md".into()).unwrap();
-    assert_eq!(reparsed.tool_tiers, def.tool_tiers);
+    assert!(parse_agent(text, "tiered", "tiered.md".into()).is_err());
 }
 
 #[test]
@@ -284,6 +608,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        vnext: None,
         prompt: "body".into(),
         prompt_variants: std::collections::HashMap::new(),
         source: "x.md".into(),
@@ -553,14 +878,15 @@ fn resolve_prefers_on_disk_override() {
     let dir = project_agents_dir(tmp.path());
     fs::write(
         dir.join("builder.md"),
-        "---\ndescription: edited builder\nmode: subagent\ntools: [read]\n---\nNEW BODY\n",
+        builtin_override_document("builder", "edited builder", "NEW BODY"),
     )
     .unwrap();
     let def = trusted_resolve(tmp.path(), "builder").unwrap().unwrap();
     assert!(!def.source.as_os_str().is_empty(), "override has a source");
     assert_eq!(def.description, "edited builder");
     assert_eq!(def.prompt, "NEW BODY");
-    assert_eq!(def.tools, Some(vec!["read".to_string()]));
+    assert!(def.vnext.is_some());
+    assert!(def.tools.is_none());
 }
 
 #[test]
@@ -603,7 +929,7 @@ fn custom_name_colliding_with_builtin_is_treated_as_override() {
     let dir = project_agents_dir(tmp.path());
     fs::write(
         dir.join("explore.md"),
-        "---\ndescription: my explore\n---\nbody\n",
+        builtin_override_document("explore", "my explore", "body"),
     )
     .unwrap();
     let listings = trusted_list_all(tmp.path());
@@ -642,8 +968,8 @@ fn resolve_malformed_override_fails_loudly() {
 
 #[test]
 fn resolve_rejects_override_with_invariant_violation() {
-    // An override that names a docs-answerer-only sandbox tool is rejected at
-    // resolve time (it never silently falls back to the embedded default).
+    // Legacy authority-bearing override frontmatter is rejected at resolve
+    // time (it never silently falls back to the embedded default).
     let tmp = tempfile::tempdir().unwrap();
     let dir = project_agents_dir(tmp.path());
     fs::write(
@@ -652,7 +978,7 @@ fn resolve_rejects_override_with_invariant_violation() {
     )
     .unwrap();
     let err = trusted_resolve(tmp.path(), "explore").unwrap_err();
-    assert!(format!("{err}").contains("docs-answerer-only"));
+    assert!(format!("{err}").contains("schemaVersion: 2"));
 }
 
 // ── list_all ─────────────────────────────────────────────────────────────
@@ -663,7 +989,7 @@ fn list_all_lists_builtins_and_custom() {
     let dir = project_agents_dir(tmp.path());
     fs::write(
         dir.join("my-reviewer.md"),
-        "---\ndescription: reviewer\nmode: subagent\n---\nbody\n",
+        vnext_agent_document("reviewer", "body"),
     )
     .unwrap();
     let listings = trusted_list_all(tmp.path());
@@ -689,10 +1015,20 @@ fn eject_writes_faithful_file() {
     assert!(written, "first eject writes a new file");
     assert!(path.exists());
     let on_disk = fs::read_to_string(&path).unwrap();
-    let parsed = parse_agent(&on_disk, "builder", path.clone()).unwrap();
+    // A bundled `cockpit/` identity is accepted only through the trusted
+    // built-in override resolver, never by the public workspace parser.
+    assert!(parse_agent(&on_disk, "builder", path.clone()).is_err());
+    let parsed = parse_agent_with_scope(
+        &on_disk,
+        "builder",
+        path.clone(),
+        DefinitionScope::BuiltinOverride,
+    )
+    .unwrap();
     let embedded = embedded_default("builder").unwrap();
     assert_eq!(parsed.description, embedded.description);
-    assert_eq!(parsed.tools, embedded.tools);
+    assert_eq!(parsed.vnext, embedded.vnext);
+    assert!(parsed.tools.is_none());
     assert_eq!(parsed.prompt, embedded.prompt);
     // And the ejected file is now the resolved override.
     let resolved = trusted_resolve(tmp.path(), "builder").unwrap().unwrap();
@@ -707,7 +1043,7 @@ fn eject_does_not_clobber_existing_override() {
     let existing = dir.join("builder.md");
     fs::write(
         &existing,
-        "---\ndescription: mine\ntools: [read]\n---\nMY EDITS\n",
+        builtin_override_document("builder", "mine", "MY EDITS"),
     )
     .unwrap();
     let (path, written) = trusted_eject_builtin(tmp.path(), &config_dir, "builder").unwrap();
@@ -733,11 +1069,15 @@ fn reset_all_removes_builtin_overrides_only() {
     // Two built-in overrides + one custom agent.
     fs::write(
         dir.join("builder.md"),
-        "---\ndescription: c\ntools: [read]\n---\nb\n",
+        builtin_override_document("builder", "c", "b"),
     )
     .unwrap();
-    fs::write(dir.join("explore.md"), "---\ndescription: e\n---\nb\n").unwrap();
-    fs::write(dir.join("my-reviewer.md"), "---\ndescription: r\n---\nb\n").unwrap();
+    fs::write(
+        dir.join("explore.md"),
+        builtin_override_document("explore", "e", "b"),
+    )
+    .unwrap();
+    fs::write(dir.join("my-reviewer.md"), vnext_agent_document("r", "b")).unwrap();
 
     let removed = trusted_reset_all_builtins(tmp.path()).unwrap();
     assert_eq!(removed.len(), 2, "only the two built-in overrides removed");
@@ -816,7 +1156,7 @@ use crate::config::extended::LlmMode;
 fn write_mode_file(agents: &Path, name: &str, mode: LlmMode, body: &str) {
     let dir = agents.join(name);
     fs::create_dir_all(&dir).unwrap();
-    let text = format!("---\ndescription: A custom agent.\nmode: subagent\n---\n\n{body}\n");
+    let text = vnext_agent_document("A custom agent.", body);
     fs::write(dir.join(mode.prompt_file()), text).unwrap();
 }
 
@@ -848,7 +1188,7 @@ fn dir_form_missing_mode_falls_back_to_flat_sibling() {
     write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
     fs::write(
         agents.join("rev.md"),
-        "---\ndescription: Flat fallback.\nmode: subagent\n---\n\nFLAT BODY\n",
+        vnext_agent_document("Flat fallback.", "FLAT BODY"),
     )
     .unwrap();
 
@@ -873,7 +1213,7 @@ fn dir_form_frontier_falls_back_to_normal_before_flat() {
     write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
     fs::write(
         agents.join("rev.md"),
-        "---\ndescription: Flat fallback.\nmode: subagent\n---\n\nFLAT BODY\n",
+        vnext_agent_document("Flat fallback.", "FLAT BODY"),
     )
     .unwrap();
 
@@ -927,7 +1267,7 @@ fn flat_file_agent_is_single_mode_in_both_modes() {
     let agents = project_agents_dir(tmp.path());
     fs::write(
         agents.join("rev.md"),
-        "---\ndescription: Single mode.\nmode: subagent\n---\n\nONE BODY\n",
+        vnext_agent_document("Single mode.", "ONE BODY"),
     )
     .unwrap();
     let def = trusted_resolve(tmp.path(), "rev")
@@ -966,10 +1306,7 @@ fn embedded_builtin_falls_back_to_flat_when_a_variant_is_absent() {
 
 #[test]
 fn dir_form_enforces_invariants_at_load() {
-    // Invariant validation runs for the per-mode (directory) form too: a
-    // per-mode agent that names a docs-answerer-only sandbox tool is rejected
-    // at load, regardless of mode. (Write/lock tools are no longer rejected by
-    // name — that guarantee now lives in the lock manager.)
+    // Legacy authority-bearing frontmatter is rejected in directory form too.
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
     let dir = agents.join("rev");
@@ -980,10 +1317,7 @@ fn dir_form_enforces_invariants_at_load() {
     )
     .unwrap();
     let err = trusted_resolve(tmp.path(), "rev").unwrap_err();
-    assert!(
-        format!("{err}").contains("docs-answerer-only"),
-        "core invariant must be enforced in the dir form: {err}"
-    );
+    assert!(format!("{err}").contains("schemaVersion: 2"), "{err}");
 }
 
 // ── chat-ownable primaries + cycle ─────────────────────────────────────────
@@ -1128,7 +1462,7 @@ fn next_primary_in_cycle_off_cycle_starts_at_front() {
 // ── Per-agent tool-description overrides ────────────────────────────────────
 
 #[test]
-fn parse_agent_reads_tool_descriptions_per_mode() {
+fn legacy_tool_description_frontmatter_is_rejected() {
     // Raw string so the YAML indentation is preserved literally (a `\`
     // line-continuation would eat the leading spaces and flatten the map).
     let text = r#"---
@@ -1146,28 +1480,7 @@ tool_descriptions:
 
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    let read = def.tool_descriptions.get("read").unwrap().to_override();
-    assert_eq!(
-        read.normal.as_deref(),
-        Some("Read the file you will edit yourself.")
-    );
-    assert_eq!(read.defensive.as_deref(), None);
-    assert_eq!(read.frontier.as_deref(), None);
-    // Per-mode object maps straight across.
-    let task = def.tool_descriptions.get("task").unwrap().to_override();
-    assert_eq!(
-        task.normal.as_deref(),
-        Some("Delegate substantive work here.")
-    );
-    assert_eq!(
-        task.frontier.as_deref(),
-        Some("Delegate only when the work is separable.")
-    );
-    assert_eq!(
-        task.defensive.as_deref(),
-        Some("Hand each well-scoped piece to a subagent in its own context.")
-    );
+    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
 }
 
 #[test]
@@ -1184,16 +1497,11 @@ Body.
 "#;
     let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("tool_descriptions.grep"), "{msg}");
-    assert!(
-        msg.contains("expected a {normal, frontier, defensive} map"),
-        "{msg}"
-    );
-    assert!(msg.contains("bare string is no longer accepted"), "{msg}");
+    assert!(msg.contains("schemaVersion: 2"), "{msg}");
 }
 
 #[test]
-fn partial_per_mode_tool_description_leaves_other_modes_unset() {
+fn legacy_partial_tool_description_frontmatter_is_rejected() {
     let text = r#"---
 description: A custom builder.
 mode: primary
@@ -1205,14 +1513,7 @@ tool_descriptions:
 
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    let grep = def.tool_descriptions.get("grep").unwrap().to_override();
-    assert_eq!(grep.normal.as_deref(), None);
-    assert_eq!(grep.frontier.as_deref(), None);
-    assert_eq!(
-        grep.defensive.as_deref(),
-        Some("Search with explicit defensive guidance.")
-    );
+    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
 }
 
 #[test]
@@ -1230,16 +1531,11 @@ Body.
 "#;
     let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains(
-            "unknown tool-description key `verbose` (expected `normal`, `frontier`, or `defensive`)"
-        ),
-        "{msg}"
-    );
+    assert!(msg.contains("schemaVersion: 2"), "{msg}");
 }
 
 #[test]
-fn tool_descriptions_round_trip_through_markdown() {
+fn legacy_tool_descriptions_do_not_round_trip_through_vnext() {
     let text = r#"---
 description: A custom builder.
 mode: subagent
@@ -1252,23 +1548,7 @@ tool_descriptions:
 
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    // Guard against a vacuous pass (empty == empty): the override is present.
-    assert!(!def.tool_descriptions.is_empty());
-    let md = def.to_markdown().unwrap();
-    let reparsed = parse_agent(&md, "builder", "x.md".into()).unwrap();
-    assert_eq!(def.tool_descriptions, reparsed.tool_descriptions);
-    let read = reparsed
-        .tool_descriptions
-        .get("read")
-        .unwrap()
-        .to_override();
-    assert_eq!(read.normal.as_deref(), Some("do-it-yourself wording"));
-    assert_eq!(read.frontier.as_deref(), None);
-    assert_eq!(
-        read.defensive.as_deref(),
-        Some("defensive do-it-yourself wording")
-    );
+    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
 }
 
 #[test]
@@ -1285,11 +1565,7 @@ tool_descriptions:
 ---
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    let err = validate_invariants(&def).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("does not grant"), "{msg}");
-    assert!(msg.contains("bash"), "{msg}");
+    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
 }
 
 #[test]
@@ -1304,20 +1580,12 @@ tool_descriptions:
 ---
 Body.
 "#;
-    let def = parse_agent(text, "builder", "x.md".into()).unwrap();
-    let err = validate_invariants(&def).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("unknown tool"), "{msg}");
+    assert!(parse_agent(text, "builder", "x.md".into()).is_err());
 }
 
 #[test]
 fn apply_tool_surface_override_replaces_tools_and_tiers() {
-    let mut def = parse_agent(
-        "---\ndescription: d\nmode: subagent\ntools: [read, bash]\n---\nBody.\n",
-        "worker",
-        "x.md".into(),
-    )
-    .unwrap();
+    let mut def = def_with_tools("worker", &["read", "bash"]);
     let selection = ToolSurfaceSelection {
         tools: vec![
             "read".to_string(),
@@ -1338,12 +1606,7 @@ fn apply_tool_surface_override_replaces_tools_and_tiers() {
 
 #[test]
 fn apply_tool_surface_override_rejects_invalid_surface() {
-    let mut def = parse_agent(
-        "---\ndescription: d\nmode: subagent\ntools: [read]\n---\nBody.\n",
-        "worker",
-        "x.md".into(),
-    )
-    .unwrap();
+    let mut def = def_with_tools("worker", &["read"]);
     let selection = ToolSurfaceSelection {
         tools: vec!["read".to_string()],
         tool_tiers: std::collections::BTreeMap::from([(

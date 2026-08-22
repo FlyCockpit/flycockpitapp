@@ -2165,6 +2165,11 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         delegation_model: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
+        vnext_host_policy: None,
+        vnext_local_installation_resolver:
+            crate::agents::LocalInstallationResolver::no_installations(),
+        parent_vnext_grant: None,
         swarm_depth: 0,
         swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
         granted_tools: Vec::new(),
@@ -2396,7 +2401,6 @@ async fn resolve_root_agent_deleted_assistant_falls_back_to_default_primary() {
 
 #[tokio::test]
 async fn assistant_session_root_agent_loads_assistant_definition() {
-    use crate::agents::AgentMode;
     use crate::assistants::{CreateAssistantSpec, create_assistant};
     use crate::config::extended::DefaultPrimaryAgent as D;
 
@@ -2411,10 +2415,6 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
         CreateAssistantSpec {
             name: "helper-bot".to_string(),
             description: "Helper bot".to_string(),
-            mode: AgentMode::Primary,
-            tools: Some(vec!["read".to_string()]),
-            tool_tiers: std::collections::BTreeMap::new(),
-            model: Some("lmstudio/assistant-model".to_string()),
             prompt: "ASSISTANT_DEFINITION_MARKER".to_string(),
             home_dir: tmp.path().join("assistants/helper-bot"),
         },

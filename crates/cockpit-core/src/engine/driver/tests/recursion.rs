@@ -18,6 +18,66 @@ fn task_recursion_rejects_delegated_child_without_budget() {
 }
 
 #[test]
+fn agent_vnext_runtime_uses_effective_grant_not_legacy_recursion_context() {
+    let (mut driver, tmp) = test_driver(1);
+    let definition = crate::agents::parse_agent(
+        r#"---
+description: Bounded root delegate
+schemaVersion: 2
+agentId: authored/root
+executionKind: coding
+modelSlots:
+  primary:
+    purpose: Delegate bounded work
+    minContextTokens: 1
+    requiredCapabilities: [text_generation]
+    locality: any
+    allowDefaultFallback: false
+delegation:
+  allowedChildren:
+    - kind: portable_ref
+      ref: authored/child
+  maxDescendantDepth: 2
+  maxConcurrentChildren: 1
+  targets: [same_root]
+---
+body
+"#,
+        "root",
+        tmp.path().join("root.md"),
+    )
+    .unwrap();
+    let grant = definition
+        .vnext
+        .as_ref()
+        .unwrap()
+        .resolve_grant(&crate::agents::VnextHostPolicy::for_session_config(
+            &driver.config.extended(),
+        ))
+        .unwrap();
+    let mut agent = (*driver.stack[0].agent).clone();
+    agent.delegated = true;
+    // A v2 frame can carry a deliberately hostile legacy context without
+    // changing its authority: task admission uses the effective grant below.
+    agent.delegation_recursion = crate::engine::builtin::DelegationRecursionContext {
+        enabled: false,
+        remaining_depth: 0,
+        allowed_targets: Vec::new(),
+        same_model_only: true,
+    };
+    agent.vnext_grant = Some(grant);
+    driver.stack[0].agent = Arc::new(agent);
+
+    let recursion = driver
+        .resolve_task_recursion("child", Some(99), &None)
+        .expect("v2 does not consult legacy recursion context");
+    assert_eq!(
+        recursion,
+        crate::engine::builtin::DelegationRecursionContext::default()
+    );
+}
+
+#[test]
 fn task_recursion_must_reduce_inherited_depth() {
     let (mut driver, _tmp) = test_driver(1);
     set_active_delegated_recursion(

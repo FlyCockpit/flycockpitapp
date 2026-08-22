@@ -33,7 +33,8 @@ use noninteractive::*;
 use noninteractive::{
     BackgroundNoninteractiveCompletion, BackgroundNoninteractiveJob, BatchNoninteractiveTask,
     DelegationPartialProgress, NoninteractiveDelegationRegistry, PartialProgressCommand,
-    PartialProgressFileEdit, SingleNoninteractiveTask, handle_footer, stale_handle_error,
+    PartialProgressFileEdit, SingleNoninteractiveTask, VnextChildAdmissionRegistry, handle_footer,
+    stale_handle_error,
 };
 pub(crate) use noninteractive::{NoninteractiveSteerTarget, run_noninteractive};
 use queue::*;
@@ -459,6 +460,9 @@ pub struct AgentSession {
     /// buffer is never read (the root has no parent to defer to).
     pub deferred_log: crate::engine::deferred::DeferredLog,
     pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+    /// Reservation held by this child for the lifetime of its interactive
+    /// frame. Dropping the frame releases its parent's vNext child slot.
+    _vnext_child_admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +555,13 @@ pub struct Driver {
     /// inline; this registry is the foundation for background completion,
     /// query snapshots, and turn-boundary steering.
     noninteractive_delegations: NoninteractiveDelegationRegistry,
+    /// Shared with background driver clones so child limits remain enforced
+    /// while a parent continues processing later turns.
+    vnext_child_admissions: VnextChildAdmissionRegistry,
+    /// Exact daemon-owned UUID bindings for daemon-local vNext definitions.
+    /// This arrives at root construction and is copied unchanged into every
+    /// child SpawnArgs; the driver never derives it from display names.
+    vnext_local_installation_resolver: crate::agents::LocalInstallationResolver,
     /// Job events drained at the turn boundary (loop-iteration-due,
     /// terminal completions). Same boundary as the user-input queue.
     job_event_rx: mpsc::Receiver<ScheduleEvent>,
@@ -1287,6 +1298,10 @@ impl Driver {
                     answering: frame.answering.clone(),
                     deferred_log: crate::engine::deferred::DeferredLog::new(),
                     fallback_decision: frame.fallback_decision.clone(),
+                    // This clone represents work already owned by the foreground
+                    // frame, whose reservation remains held there. New children
+                    // admitted by the clone use the shared registry below.
+                    _vnext_child_admission: None,
                 })
                 .collect(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
@@ -1298,6 +1313,8 @@ impl Driver {
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
             schedule,
             noninteractive_delegations: NoninteractiveDelegationRegistry::default(),
+            vnext_child_admissions: self.vnext_child_admissions.clone(),
+            vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
             job_event_rx,
             job_cmd_rx,
             noninteractive_complete_tx: self.noninteractive_complete_tx.clone(),
@@ -1604,6 +1621,7 @@ impl Driver {
                 answering: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
                 fallback_decision: None,
+                _vnext_child_admission: None,
             }],
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -1614,6 +1632,9 @@ impl Driver {
             unbounded_schedule_loops_approved: false,
             schedule,
             noninteractive_delegations: NoninteractiveDelegationRegistry::default(),
+            vnext_child_admissions: VnextChildAdmissionRegistry::default(),
+            vnext_local_installation_resolver:
+                crate::agents::LocalInstallationResolver::no_installations(),
             job_event_rx,
             job_cmd_rx,
             noninteractive_complete_tx,
@@ -2017,6 +2038,16 @@ impl Driver {
 
     pub fn set_assistant_identity_prefix(&mut self, prefix: Option<String>) {
         self.assistant_identity_prefix = prefix;
+    }
+
+    /// Install the daemon-owned local installation mapping captured at root
+    /// construction.  It is intentionally an explicit input rather than a
+    /// lookup by display name, and every delegated spawn reuses this snapshot.
+    pub fn set_vnext_local_installation_resolver(
+        &mut self,
+        resolver: crate::agents::LocalInstallationResolver,
+    ) {
+        self.vnext_local_installation_resolver = resolver;
     }
 
     pub fn set_lsp_manager(&mut self, lsp: Arc<crate::daemon::lsp::LspManager>) {
@@ -7394,17 +7425,24 @@ impl Driver {
                             }
                         };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
                     // Per-delegation tool grants (prompt `parent-granted-tools.md`):
                     // validate against the target's role invariants before the
                     // handoff. An invalid grant is rejected as this `task`
                     // call's result — the conversation stays with the parent.
                     if let Some(err) = grant_rejection(
                         &self.cwd,
+                        &self.cwd,
                         &self.config,
                         &parent_agent,
+                        parent_vnext_grant.as_ref(),
                         &child_agent,
                         &granted_tools,
                         &self.session.db,
+                        &self.vnext_local_installation_resolver,
                     )
                     .await
                     {
@@ -7415,6 +7453,21 @@ impl Driver {
                         );
                         continue;
                     }
+                    // Interactive children normally serialize their parent, but
+                    // they can overlap a previously backgrounded task. Reserve a
+                    // vNext direct-child slot here as well so that route cannot
+                    // bypass the same live-concurrency ceiling.
+                    let mut vnext_admissions = match self.admit_current_vnext_children(1) {
+                        Ok(permits) => permits,
+                        Err(err) => {
+                            next_prompt = Message::tool_result_with_call_id(
+                                task_call_id,
+                                task_function_call_id,
+                                prepend_task_repair_notes(err, &repair_notes),
+                            );
+                            continue;
+                        }
+                    };
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
@@ -7564,6 +7617,10 @@ impl Driver {
                         }),
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
                         fallback_decision: None,
+                        // Exactly one permit was reserved above. Holding it on
+                        // the child frame releases the parent slot when this
+                        // interactive child returns or the stack unwinds.
+                        _vnext_child_admission: vnext_admissions.pop(),
                     });
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
@@ -7659,13 +7716,20 @@ impl Driver {
                         }
                     };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
                     if let Some(err) = grant_rejection(
+                        &self.cwd,
                         &child_cwd.resolved,
                         &self.config,
                         &parent_agent,
+                        parent_vnext_grant.as_ref(),
                         &child_agent,
                         &granted_tools,
                         &self.session.db,
+                        &self.vnext_local_installation_resolver,
                     )
                     .await
                     {
@@ -7740,15 +7804,22 @@ impl Driver {
                         continue;
                     }
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
                     let mut unknown_agent_error = None;
                     for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
                         if let Some(err) = grant_rejection(
+                            &self.cwd,
                             &child_cwd.resolved,
                             &self.config,
                             &parent_agent,
+                            parent_vnext_grant.as_ref(),
                             &entry.child_agent,
                             &entry.granted_tools,
                             &self.session.db,
+                            &self.vnext_local_installation_resolver,
                         )
                         .await
                         {
@@ -8122,6 +8193,17 @@ impl Driver {
             delegation_model: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            // Keep the root's already-snapshotted daemon policy available for
+            // root replacement/handoff construction. Delegated vNext children
+            // use their parent's effective grant rather than re-reading this.
+            vnext_host_policy: self
+                .stack
+                .first()
+                .and_then(|frame| frame.agent.vnext_grant.as_ref())
+                .map(|grant| Arc::new(grant.host_policy.clone())),
+            vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
+            parent_vnext_grant: None,
             // The foreground frame's recursive-`Swarm` depth (GOALS §24).
             // Background `Swarm` children are spawned off-stack with an
             // explicit advanced depth (see `dispatch_spawn`); on-stack
@@ -8162,6 +8244,13 @@ impl Driver {
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            // The child factory consumes this immutable parent snapshot and
+            // derives the child grant under the same host ceilings. It never
+            // reinterprets the parent markdown declaration.
+            parent_vnext_grant: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.vnext_grant.clone()),
             model_override,
             ..self.spawn_args(interactive)
         }
@@ -8204,6 +8293,10 @@ impl Driver {
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            parent_vnext_grant: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.vnext_grant.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
@@ -8219,6 +8312,16 @@ impl Driver {
         model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     ) -> Result<crate::engine::builtin::DelegationRecursionContext, String> {
         let parent = self.stack.last().expect("stack never empty").agent.as_ref();
+        if parent.vnext_grant.is_some() {
+            // v2 has no projection onto the legacy recursive-task context.
+            // The asynchronous task-admission seam resolves the selected child
+            // under this parent's EffectiveVnextGrant immediately before
+            // construction, including depth, targets, and the caller/child
+            // kind matrix. `remaining_depth` is legacy wire input and cannot
+            // widen a v2 grant.
+            let _ = (child_agent, requested_depth, model);
+            return Ok(crate::engine::builtin::DelegationRecursionContext::default());
+        }
         let cfg = self.config.extended().delegation;
         let root_parent_ctx = if parent.delegated {
             None

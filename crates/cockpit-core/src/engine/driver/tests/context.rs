@@ -25,6 +25,7 @@ async fn prune_targets_foreground_subagent_only() {
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        _vnext_child_admission: None,
     });
 
     // Prune the foreground (the subagent on top).
@@ -1285,6 +1286,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
         assistant_identity_prefix: None,
     });

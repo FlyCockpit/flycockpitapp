@@ -18,7 +18,10 @@
 
 use std::path::PathBuf;
 
-use super::{AgentDef, AgentMode, ToolDescriptionSpec, ToolTier};
+use super::{
+    AgentDef, AgentMode, AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind,
+    ModelCapability, ModelLocality, ModelSlot, ToolDescriptionSpec, ToolTier, VnextAgentDef,
+};
 
 /// Names of the built-in agents in scope for user editing, in canonical
 /// listing order. Drives the override-resolution, listing, and reset
@@ -153,6 +156,14 @@ fn def_with_normal(
         prompt_variants.insert(LlmMode::Defensive, defensive.clone());
         prompt_variants.insert(LlmMode::Normal, n.trim_end().to_string());
     }
+    let vnext = if matches!(name, "docs-resolver" | "docs-answerer") {
+        // The docs pipeline is an internal two-stage implementation, not a
+        // user-authored AgentDef language. Keep its fixed surfaces outside
+        // vNext discovery and serialization.
+        None
+    } else {
+        Some(builtin_vnext(name, mode))
+    };
     AgentDef {
         name: name.to_string(),
         description: description.to_string(),
@@ -162,14 +173,73 @@ fn def_with_normal(
         tools: Some(tools.iter().map(|t| t.to_string()).collect()),
         tool_tiers: std::collections::BTreeMap::<String, ToolTier>::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
-        scan_tool_results: Some(super::default_scan_tool_results(name, mode)),
+        scan_tool_results: Some(super::default_scan_tool_results(name)),
         goal_supervision: super::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        vnext,
         prompt: defensive,
         prompt_variants,
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
+    }
+}
+
+/// Bundled definitions are authored by the binary, not by an editable
+/// frontmatter file. Their historic tool arrays remain host-owned factory
+/// inputs, while their ejected form is the closed v2 contract below.
+fn builtin_vnext(name: &str, mode: AgentMode) -> VnextAgentDef {
+    let execution_kind = if name == "computer" {
+        ExecutionKind::Computer
+    } else if mode.is_chat_ownable() {
+        ExecutionKind::Assistant
+    } else {
+        ExecutionKind::Coding
+    };
+    // These are binary-owned reachability declarations mirroring the current
+    // built-in task surfaces. They are serializable policy requests, never a
+    // tool grant: the daemon still intersects them with its host policy and
+    // resolves the portable ids uniquely before launch.
+    let children: &[&str] = match name {
+        "Build" | "Careful" => &["builder", "explore", "history", "deepthink", "scout"],
+        "Plan" => &["explore", "history"],
+        "Multireview" => &["scout"],
+        "builder" | "bee" => &["explore"],
+        _ => &[],
+    };
+    let delegation = if children.is_empty() {
+        DelegationPolicy::default()
+    } else {
+        DelegationPolicy {
+            allowed_children: children
+                .iter()
+                .map(|child| AllowedChild::PortableRef {
+                    portable_agent_ref: format!("cockpit/{child}"),
+                })
+                .collect(),
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+        }
+    };
+    VnextAgentDef {
+        schema_version: super::SCHEMA_VERSION,
+        agent_id: format!("cockpit/{}", name.to_ascii_lowercase()),
+        execution_kind,
+        model_slots: std::collections::BTreeMap::from([(
+            "primary".to_string(),
+            ModelSlot {
+                purpose: "Primary model for this built-in role.".to_string(),
+                min_context_tokens: 1,
+                required_capabilities: vec![ModelCapability::TextGeneration],
+                locality: ModelLocality::Any,
+                allow_default_fallback: true,
+                suggested_models: Vec::new(),
+            },
+        )]),
+        delegation,
+        questions: None,
+        verification: None,
     }
 }
 

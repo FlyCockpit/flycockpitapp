@@ -9,12 +9,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use crate::agents::{AgentDef, AgentMode, ToolSurfaceSelection, ToolTier};
+use crate::agents::{
+    AgentDef, AgentMode, ExecutionKind, ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
+};
 use crate::db::Db;
 use crate::db::assistants::AssistantRow;
 use crate::wizard::{
-    SelectOption, StepDescriptor, StepKind, WizardAnswer, WizardDescriptor, WizardRun, WritePolicy,
+    StepDescriptor, StepKind, WizardAnswer, WizardDescriptor, WizardRun, WritePolicy,
 };
 
 pub const ASSISTANT_WIZARD_ID: &str = "assistant";
@@ -32,6 +35,11 @@ pub struct AssistantDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantConfig {
+    /// Daemon-owned installation identity.  This is deliberately distinct
+    /// from the editable assistant display name and is the sole source of
+    /// the `local/<UUID>` vNext publisher identity.
+    #[serde(rename = "installationId")]
+    pub installation_id: Uuid,
     #[serde(default)]
     pub agent_source: String,
     #[serde(default)]
@@ -49,6 +57,7 @@ pub struct AssistantConfig {
 impl Default for AssistantConfig {
     fn default() -> Self {
         Self {
+            installation_id: Uuid::nil(),
             agent_source: String::new(),
             soul_edit_mode: identity::SoulEditMode::default(),
             identity_max_tokens: identity::default_identity_max_tokens(),
@@ -63,10 +72,6 @@ impl Default for AssistantConfig {
 pub struct CreateAssistantSpec {
     pub name: String,
     pub description: String,
-    pub mode: AgentMode,
-    pub tools: Option<Vec<String>>,
-    pub tool_tiers: std::collections::BTreeMap<String, ToolTier>,
-    pub model: Option<String>,
     pub prompt: String,
     pub home_dir: PathBuf,
 }
@@ -105,7 +110,7 @@ pub fn assistant_definition_path(home_dir: &Path) -> PathBuf {
 pub fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
     validate_assistant_name(name)?;
     let path = assistant_definition_path(home_dir);
-    let agent = crate::agents::load_named_from_file(&path, name)
+    let agent = crate::agents::load_daemon_local_named_from_file(&path, name)
         .with_context(|| format!("loading assistant definition {}", path.display()))?;
     Ok(AssistantDef {
         name: name.to_string(),
@@ -116,7 +121,29 @@ pub fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
 }
 
 pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
-    load_from_home(&row.name, Path::new(&row.home_dir))
+    let config: AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+    if config.installation_id.is_nil() {
+        bail!(
+            "assistant `{}` has no daemon-owned installation ID",
+            row.name
+        );
+    }
+    let definition = load_from_home(&row.name, Path::new(&row.home_dir))?;
+    let expected_agent_id = format!("local/{}", config.installation_id);
+    if definition
+        .agent
+        .vnext
+        .as_ref()
+        .map(|vnext| vnext.agent_id.as_str())
+        != Some(expected_agent_id.as_str())
+    {
+        bail!(
+            "assistant `{}` definition identity does not match its daemon-owned installation ID",
+            row.name
+        );
+    }
+    Ok(definition)
 }
 
 pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantRow> {
@@ -130,19 +157,27 @@ pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<Assi
     std::fs::create_dir_all(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
+    let installation_id = Uuid::new_v4();
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description,
-        mode: spec.mode,
-        model: spec.model,
+        // These retained in-memory fields are ignored by schemaVersion 2.
+        // They cannot be configured from the assistant specification.
+        mode: AgentMode::Primary,
+        model: None,
         temperature: None,
-        tools: spec.tools,
-        tool_tiers: spec.tool_tiers,
+        tools: None,
+        tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         goal_supervision: crate::agents::GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        // Assistant homes are daemon-owned definition locations, so they are
+        // the sole constructor allowed to use the local publisher. Tool/model
+        // selections from the legacy wizard remain host-side setup inputs and
+        // are intentionally absent from the serialized v2 definition.
+        vnext: Some(vnext_for_private_assistant(installation_id)),
         prompt: spec.prompt,
         prompt_variants: std::collections::HashMap::new(),
         source: path.clone(),
@@ -153,6 +188,7 @@ pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<Assi
         .with_context(|| format!("writing assistant definition {}", path.display()))?;
     identity::seed_identity_files(&spec.home_dir)?;
     let config = AssistantConfig {
+        installation_id,
         agent_source: path.to_string_lossy().into_owned(),
         soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
         user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
@@ -167,6 +203,61 @@ pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<Assi
         &content_hash,
     )
     .await
+}
+
+/// The sole daemon-owned v2 template for private assistants.  CLI-side
+/// creation reuses it so both persistence paths produce the same provenance
+/// and never serialize the retired tool/model/mode contract.
+pub fn vnext_for_private_assistant(installation_id: Uuid) -> VnextAgentDef {
+    VnextAgentDef {
+        schema_version: crate::agents::SCHEMA_VERSION,
+        agent_id: format!("local/{installation_id}"),
+        execution_kind: ExecutionKind::Assistant,
+        model_slots: std::collections::BTreeMap::from([(
+            "primary".to_string(),
+            ModelSlot {
+                purpose: "Primary model for this private assistant.".to_string(),
+                min_context_tokens: 1,
+                required_capabilities: vec![ModelCapability::TextGeneration],
+                locality: ModelLocality::Any,
+                allow_default_fallback: true,
+                suggested_models: Vec::new(),
+            },
+        )]),
+        delegation: Default::default(),
+        questions: None,
+        verification: None,
+    }
+}
+
+/// Snapshot every persisted private-assistant definition into the session's
+/// daemon-owned UUID resolver.  Definitions are loaded once under the trusted
+/// assistant-home boundary and then used directly for every child launch.
+pub async fn local_installation_resolver(
+    db: &Db,
+) -> Result<crate::agents::LocalInstallationResolver> {
+    let mut definitions = std::collections::BTreeMap::new();
+    for row in db.list_assistants().await? {
+        let config: AssistantConfig = serde_json::from_str(&row.config_json)
+            .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+        if config.installation_id.is_nil() {
+            bail!(
+                "assistant `{}` has no daemon-owned installation ID",
+                row.name
+            );
+        }
+        let definition = load_from_row(&row)?.agent;
+        if definitions
+            .insert(config.installation_id, definition)
+            .is_some()
+        {
+            bail!(
+                "multiple persisted assistants claim daemon-local installation ID `{}`",
+                config.installation_id
+            );
+        }
+    }
+    crate::agents::LocalInstallationResolver::from_bound_definitions(definitions)
 }
 
 pub fn descriptor() -> WizardDescriptor {
@@ -186,60 +277,6 @@ pub fn descriptor() -> WizardDescriptor {
                 default_answer: None,
                 prefill: None,
                 validate: Some(non_empty_text),
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
-                id: "mode",
-                prompt: "Assistant reachability",
-                help: "Primary assistants can own chat; subagents can only receive delegated tasks.",
-                help_hook: None,
-                kind: StepKind::Select {
-                    options: vec![
-                        SelectOption {
-                            id: "primary".into(),
-                            label: "Primary".into(),
-                            description: "Owns top-level chats.".into(),
-                        },
-                        SelectOption {
-                            id: "all".into(),
-                            label: "Primary + subagent".into(),
-                            description: "Can own chats and receive delegated tasks.".into(),
-                        },
-                        SelectOption {
-                            id: "subagent".into(),
-                            label: "Subagent".into(),
-                            description: "Only receives delegated tasks.".into(),
-                        },
-                    ],
-                },
-                default_answer: Some(WizardAnswer::Select("primary".to_string())),
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
-                id: "model",
-                prompt: "Model override (blank to inherit)",
-                help: "Optional provider/model override.",
-                help_hook: None,
-                kind: StepKind::Text,
-                default_answer: Some(WizardAnswer::Text(String::new())),
-                prefill: None,
-                validate: None,
-                write: None,
-                branch: None,
-            },
-            StepDescriptor {
-                id: "tools",
-                prompt: "Tool surface",
-                help: "Choose granted tools and per-tool tiers.",
-                help_hook: None,
-                kind: StepKind::ToolSurface,
-                default_answer: Some(WizardAnswer::ToolSurface(ToolSurfaceSelection::default())),
-                prefill: None,
-                validate: Some(validate_tool_surface),
                 write: None,
                 branch: None,
             },
@@ -282,22 +319,10 @@ pub fn spec_from_wizard(
 ) -> Result<CreateAssistantSpec> {
     validate_assistant_name(name)?;
     let description = text_answer(run, "description").context("assistant description missing")?;
-    let mode = match select_answer(run, "mode").as_deref() {
-        Some("all") => AgentMode::All,
-        Some("subagent") => AgentMode::Subagent,
-        _ => AgentMode::Primary,
-    };
-    let model = text_answer(run, "model").and_then(non_blank);
-    let surface = tool_surface_answer(run, "tools").unwrap_or_default();
-    let tools = (!surface.tools.is_empty()).then_some(surface.tools);
     let prompt = text_answer(run, "prompt").context("assistant prompt missing")?;
     Ok(CreateAssistantSpec {
         name: name.to_string(),
         description,
-        mode,
-        tools,
-        tool_tiers: surface.tool_tiers,
-        model,
         prompt,
         home_dir,
     })
@@ -315,60 +340,6 @@ fn text_answer(run: &WizardRun, step: &str) -> Option<String> {
         Some(WizardAnswer::Text(value)) => Some(value.clone()),
         _ => None,
     }
-}
-
-fn select_answer(run: &WizardRun, step: &str) -> Option<String> {
-    match run.answer(step) {
-        Some(WizardAnswer::Select(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn tool_surface_answer(run: &WizardRun, step: &str) -> Option<ToolSurfaceSelection> {
-    match run.answer(step) {
-        Some(WizardAnswer::ToolSurface(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn validate_tool_surface(
-    run: &WizardRun,
-    answer: &WizardAnswer,
-) -> std::result::Result<(), String> {
-    let WizardAnswer::ToolSurface(surface) = answer else {
-        return Err("tool surface answer required".to_string());
-    };
-    let mode = match select_answer(run, "mode").as_deref() {
-        Some("all") => AgentMode::All,
-        Some("subagent") => AgentMode::Subagent,
-        _ => AgentMode::Primary,
-    };
-    let mut def = AgentDef {
-        name: "__assistant_draft__".to_string(),
-        description: "draft".to_string(),
-        mode,
-        model: None,
-        temperature: None,
-        tools: (!surface.tools.is_empty()).then_some(surface.tools.clone()),
-        tool_tiers: surface.tool_tiers.clone(),
-        tool_descriptions: std::collections::BTreeMap::new(),
-        scan_tool_results: None,
-        goal_supervision: crate::agents::GoalSettingsOverride::default(),
-        permission: None,
-        fork_eligible: false,
-        prompt: "draft".to_string(),
-        prompt_variants: std::collections::HashMap::new(),
-        source: PathBuf::new(),
-    };
-    if surface.tools.iter().any(|tool| tool == "spawn") {
-        def.name = "assistant-draft".to_string();
-    }
-    crate::agents::validate_invariants(&def).map_err(|e| e.to_string())
-}
-
-fn non_blank(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -390,7 +361,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
             assistant_definition_path(&home),
-            "---\ndescription: Helps with tests\nmode: primary\ntools: [read]\n---\n\nStay focused.\n",
+            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Helps with tests\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nStay focused.\n",
         )
         .unwrap();
 
@@ -400,6 +371,10 @@ mod tests {
         assert_eq!(def.description, "Helps with tests");
         assert_eq!(def.agent.name, "my-helper");
         assert_eq!(def.agent.prompt, "Stay focused.");
-        assert_eq!(def.agent.tools.as_deref(), Some(&["read".to_string()][..]));
+        assert_eq!(
+            def.agent.vnext.as_ref().map(|v| v.execution_kind),
+            Some(ExecutionKind::Assistant)
+        );
+        assert!(def.agent.tools.is_none());
     }
 }

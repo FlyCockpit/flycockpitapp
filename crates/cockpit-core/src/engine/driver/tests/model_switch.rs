@@ -2063,7 +2063,7 @@ fn write_custom_agent(root: &std::path::Path, name: &str) {
     std::fs::write(
         agents.join(format!("{name}.md")),
         format!(
-            "---\ndescription: test agent\nmode: subagent\ntools: [read]\n---\n\n{name} body\n"
+            "---\ndescription: test agent\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Test model refresh\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\n{name} body\n"
         ),
     )
     .unwrap();

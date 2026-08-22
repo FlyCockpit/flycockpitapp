@@ -53,13 +53,13 @@ fn outcome_tool_result_text(outcome: crate::engine::agent::TurnOutcome) -> Strin
     }
 }
 
-fn write_test_agent(root: &std::path::Path, name: &str, fork_eligible: bool) {
+fn write_test_agent(root: &std::path::Path, name: &str, _fork_eligible: bool) {
     let dir = root.join(".cockpit").join("agents");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join(format!("{name}.md")),
         format!(
-            "---\ndescription: Test agent.\nmode: subagent\nforkEligible: {fork_eligible}\ntools: []\n---\n\nTest prompt.\n"
+            "---\ndescription: Test agent.\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute a coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n\nTest prompt.\n"
         ),
     )
     .unwrap();
@@ -193,7 +193,7 @@ async fn fork_rejected_with_redundant_seed_tags() {
 }
 
 #[tokio::test]
-async fn valid_fork_dispatch_spawns_noninteractive_same_agent() {
+async fn vnext_agent_refuses_retired_fork_eligibility_contract() {
     let (mut driver, tmp) = test_driver_without_network(8);
     write_test_agent(tmp.path(), "forker", true);
     set_active_agent_name_and_mode(
@@ -202,19 +202,8 @@ async fn valid_fork_dispatch_spawns_noninteractive_same_agent() {
         crate::config::extended::LlmMode::Frontier,
     );
 
-    match dispatch_task_args(&driver, fork_delegate_args("forker", "steer")).await {
-        crate::engine::agent::TurnOutcome::SpawnNoninteractive {
-            child_agent,
-            context,
-            model,
-            ..
-        } => {
-            assert_eq!(child_agent, "forker");
-            assert_eq!(context, crate::engine::agent::TaskContext::Fork);
-            assert!(model.is_none());
-        }
-        other => panic!("expected forked noninteractive spawn, got {other:?}"),
-    }
+    let body = fork_refusal_text(&driver, fork_delegate_args("forker", "steer")).await;
+    assert!(body.contains("is not fork eligible"), "{body}");
 }
 
 #[tokio::test]
@@ -649,11 +638,14 @@ async fn grant_rejection_unknown_agent_lists_reachable_agents() {
 
     let message = grant_rejection(
         &driver.cwd,
+        &driver.cwd,
         &driver.config,
         "Build",
+        None,
         "no-such-agent",
         &[],
         &driver.session.db,
+        &driver.vnext_local_installation_resolver,
     )
     .await
     .unwrap();

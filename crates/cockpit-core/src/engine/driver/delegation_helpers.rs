@@ -421,23 +421,169 @@ mod files_touched_tests {
 /// primary-only rules are evaluated for that agent. A resolution failure is
 /// itself a clear error — the grant is never silently honored.
 pub(super) async fn grant_rejection(
+    parent_cwd: &std::path::Path,
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     parent_agent: &str,
+    parent_vnext_grant: Option<&crate::agents::EffectiveVnextGrant>,
     child_agent: &str,
     grant: &[String],
     assistant_db: &crate::db::Db,
+    local_installations: &crate::agents::LocalInstallationResolver,
 ) -> Option<String> {
-    if let Some(message) = crate::engine::builtin::unknown_agent_rejection(
-        cwd,
-        config,
-        parent_agent,
-        child_agent,
-        assistant_db,
-    )
-    .await
+    // The live frame is the only authority for classifying a vNext parent.
+    // Never re-resolve `parent_agent` from the child cwd: an edited checkout
+    // could otherwise replace its already-admitted identity/policy between a
+    // task call and this final launch gate.
+    let parent_is_vnext = parent_vnext_grant.is_some();
+    if !parent_is_vnext
+        && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
+            cwd,
+            config,
+            parent_agent,
+            child_agent,
+            assistant_db,
+        )
+        .await
     {
         return Some(format!("Error: {message}"));
+    }
+    // A local UUID grant is an exact daemon-owned launch authority, not a
+    // display-name permission. Resolve it before workspace discovery so a
+    // checkout file with the same name cannot shadow the selected private
+    // installation during preflight.
+    let local_reference = match parent_vnext_grant {
+        Some(parent) => {
+            match local_installations.local_reference_for_launch_target(parent, child_agent) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    return Some(format!(
+                        "Error: cannot resolve daemon-local child `{child_agent}`: {error:#}"
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    let child_definition = match if let Some(installation_id) = local_reference {
+        // Own the authenticated snapshot so the local UUID and workspace
+        // resolution paths have one type, and so no borrow of the resolver
+        // crosses the later async/runtime admission seams.
+        local_installations
+            .definition(installation_id)
+            .map(|definition| Some(definition.clone()))
+    } else {
+        crate::agents::resolve_with_assistant_db(cwd, child_agent, assistant_db).await
+    } {
+        Ok(definition) => definition,
+        Err(error) => {
+            return Some(format!(
+                "Error: cannot resolve delegated agent `{child_agent}`: {error:#}"
+            ));
+        }
+    };
+    let child_vnext = child_definition
+        .as_ref()
+        .and_then(|definition| definition.vnext.as_ref());
+    match (parent_is_vnext, parent_vnext_grant, child_vnext) {
+        (true, Some(_), None) => {
+            return Some(format!(
+                "Error: vNext agent `{parent_agent}` may only delegate to a resolved vNext child; legacy reachability is not available"
+            ));
+        }
+        (false, _, Some(_)) => {
+            return Some(format!(
+                "Error: legacy agent `{parent_agent}` cannot launch a vNext child; use a vNext parent definition"
+            ));
+        }
+        (true, Some(parent), Some(child)) => {
+            let portable_references: Vec<_> = parent
+                .delegation
+                .as_ref()
+                .into_iter()
+                .flat_map(|delegation| delegation.allowed_children.iter())
+                .filter(|reference| {
+                    matches!(reference,
+                        crate::agents::AllowedChild::PortableRef { portable_agent_ref }
+                            if portable_agent_ref == &child.agent_id)
+                })
+                .collect();
+            let exact_local_reference = local_reference.map(|installation_id| {
+                crate::agents::AllowedChild::LocalInstallation { installation_id }
+            });
+            if portable_references.len() > 1 {
+                return Some(format!(
+                    "Error: vNext agent `{}` has ambiguous portable grants for child `{}`",
+                    parent.agent_id, child.agent_id
+                ));
+            }
+            if let Some(reference) = portable_references.first() {
+                if !parent.permits_child(reference, child.execution_kind) {
+                    return Some(format!(
+                        "Error: vNext caller `{}` cannot delegate to child `{}` under its effective host grant",
+                        parent.agent_id, child.agent_id
+                    ));
+                }
+            } else if let Some(reference) = exact_local_reference.as_ref() {
+                let crate::agents::AllowedChild::LocalInstallation { installation_id } = reference
+                else {
+                    unreachable!("constructed local reference")
+                };
+                // Keep the full resolved definition for the immutable digest
+                // comparison; the nested vNext value alone intentionally does
+                // not carry the prompt bytes that participate in that digest.
+                let child_definition = child_definition
+                    .as_ref()
+                    .expect("vNext child was resolved above");
+                if !local_installations.matches_definition(
+                    *installation_id,
+                    child_agent,
+                    child_definition,
+                ) || !parent.permits_child(reference, child.execution_kind)
+                {
+                    return Some(format!(
+                        "Error: vNext caller `{}` has no exact daemon-local installation grant for child `{child_agent}`",
+                        parent.agent_id
+                    ));
+                }
+            } else {
+                return Some(format!(
+                    "Error: vNext caller `{}` cannot delegate to child `{}` under its effective host grant",
+                    parent.agent_id, child.agent_id
+                ));
+            }
+            if !parent.permits_target(parent_cwd, cwd) {
+                return Some(format!(
+                    "Error: vNext caller `{}` does not permit child cwd `{}` under its effective delegation targets",
+                    parent.agent_id,
+                    cwd.display(),
+                ));
+            }
+            let resolved_reference = portable_references
+                .first()
+                .copied()
+                .or(exact_local_reference.as_ref());
+            if let Some(reference) = resolved_reference
+                && let Err(error) =
+                    child.resolve_child_grant(&parent.host_policy, parent, reference)
+            {
+                return Some(format!(
+                    "Error: vNext child `{}` is refused by the effective delegation grant: {error:#}",
+                    child.agent_id
+                ));
+            }
+        }
+        (false, _, None) => {}
+        // `parent_is_vnext` is exactly `parent_vnext_grant.is_some()`, so the
+        // remaining `None` parent branch is intentionally legacy.  A vNext
+        // definition with no live grant cannot be rediscovered from disk and
+        // treated as authority here.
+        (true, None, _) => unreachable!("vNext classification is live-grant based"),
+    }
+    if (parent_is_vnext || child_vnext.is_some()) && !grant.is_empty() {
+        return Some(
+            "Error: vNext delegation cannot use legacy granted_tools authority".to_string(),
+        );
     }
     if grant.is_empty() {
         return None;

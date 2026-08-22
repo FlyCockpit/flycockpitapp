@@ -4287,7 +4287,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         | Request::ImageTargetCreate { .. }
         | Request::ImageTargetUpdate { .. }
         | Request::ImageTargetDelete { .. }
-        | Request::ImageTargetSetDefault { .. } => {
+        | Request::ImageTargetSetDefault { .. }
+        | Request::ImageWorkflowUpload { .. }
+        | Request::ImageWorkflowBind { .. }
+        | Request::ImageWorkflowDelete { .. } => {
             image_control_mutations::dispatch_image_control_mutation(ctx, request).await
         }
 

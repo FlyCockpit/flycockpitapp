@@ -1,9 +1,10 @@
 //! LOCAL owner image-generation control-plane CONFIG-MUTATION handlers
-//! (`image-generation-control-plane` inc3b).
+//! (`image-generation-control-plane` inc3b + inc3c).
 //!
-//! Seven `owner_only` + `local_only` + `serialized` mutations
+//! Ten `owner_only` + `local_only` + `serialized` mutations
 //! (`image_endpoint_create/update/delete`,
-//! `image_target_create/update/delete/set_default`) that edit the secret-bearing
+//! `image_target_create/update/delete/set_default`, and the inc3c workflow
+//! mutations `image_workflow_upload/bind/delete`) that edit the secret-bearing
 //! image-generation registry. Each one:
 //!
 //! 1. loads the registry through the SAME trust-gated daemon config contract the
@@ -37,11 +38,11 @@ use std::sync::Arc;
 use cockpit_config::config::extended::{ExtendedConfig, ExtendedConfigDoc};
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageEndpoint, ImageGenerationConfig, ImageGenerationConfigError,
-    ImageGenerationTarget,
+    ImageGenerationTarget, ImageTargetIdentity, RegisteredComfyWorkflow,
 };
 use cockpit_proto::image_control::{
     ImageConfigChangeSetSafeV1, ImageConfigChangeV1, ImageControlEventV1,
-    ImageControlMutationResponseV1, ImageEndpointSafeV1, ImageTargetSafeV1,
+    ImageControlMutationResponseV1, ImageEndpointSafeV1, ImageTargetSafeV1, ImageWorkflowSafeV1,
 };
 
 use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
@@ -83,6 +84,8 @@ enum PendingChange {
     EndpointDelete(String),
     TargetUpsert(String),
     TargetDelete(String),
+    WorkflowUpsert(String),
+    WorkflowDelete(String),
 }
 
 /// A pure edit over the loaded registry. Returns the reconstructed (validated)
@@ -97,6 +100,9 @@ enum Edit {
     TargetUpdate { target_id: String, json: String },
     TargetDelete(String),
     TargetSetDefault(String),
+    WorkflowUpload(String),
+    WorkflowBind { workflow_id: String, json: String },
+    WorkflowDelete(String),
 }
 
 fn parse_endpoint(json: &str) -> Result<ImageEndpoint, ErrorPayload> {
@@ -109,15 +115,21 @@ fn parse_target(json: &str) -> Result<ImageGenerationTarget, ErrorPayload> {
         .map_err(|error| bad_request(format!("invalid image target: {error}")))
 }
 
+fn parse_workflow(json: &str) -> Result<RegisteredComfyWorkflow, ErrorPayload> {
+    serde_json::from_str(json)
+        .map_err(|error| bad_request(format!("invalid image workflow: {error}")))
+}
+
 fn rebuild(
     endpoints: Vec<ImageEndpoint>,
     targets: Vec<ImageGenerationTarget>,
+    workflows: Vec<RegisteredComfyWorkflow>,
     old: &ImageGenerationConfig,
 ) -> Result<ImageGenerationConfig, ErrorPayload> {
     ImageGenerationConfig::new(
         endpoints,
         targets,
-        old.workflows().to_vec(),
+        workflows,
         old.openrouter_provider_allowlist().to_vec(),
     )
     .map_err(map_config_error)
@@ -135,7 +147,12 @@ fn apply_edit(
             // create with the same id never double-applies).
             let mut endpoints = old.endpoints().to_vec();
             endpoints.push(endpoint);
-            let cfg = rebuild(endpoints, old.targets().to_vec(), old)?;
+            let cfg = rebuild(
+                endpoints,
+                old.targets().to_vec(),
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::EndpointUpsert(id)]))
         }
         Edit::EndpointUpdate { endpoint_id, json } => {
@@ -151,7 +168,12 @@ fn apply_edit(
                 .position(|e| e.id == endpoint_id)
                 .ok_or_else(|| bad_request("image endpoint not found"))?;
             endpoints[position] = endpoint;
-            let cfg = rebuild(endpoints, old.targets().to_vec(), old)?;
+            let cfg = rebuild(
+                endpoints,
+                old.targets().to_vec(),
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::EndpointUpsert(endpoint_id)]))
         }
         Edit::EndpointDelete(endpoint_id) => {
@@ -163,7 +185,12 @@ fn apply_edit(
             endpoints.remove(position);
             // `::new` fails closed if a still-enabled target references the
             // removed endpoint, so a dangling delete never persists.
-            let cfg = rebuild(endpoints, old.targets().to_vec(), old)?;
+            let cfg = rebuild(
+                endpoints,
+                old.targets().to_vec(),
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::EndpointDelete(endpoint_id)]))
         }
         Edit::TargetCreate(json) => {
@@ -171,7 +198,12 @@ fn apply_edit(
             let id = target.id.clone();
             let mut targets = old.targets().to_vec();
             targets.push(target);
-            let cfg = rebuild(old.endpoints().to_vec(), targets, old)?;
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                targets,
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::TargetUpsert(id)]))
         }
         Edit::TargetUpdate { target_id, json } => {
@@ -187,7 +219,12 @@ fn apply_edit(
                 .position(|t| t.id == target_id)
                 .ok_or_else(|| bad_request("image target not found"))?;
             targets[position] = target;
-            let cfg = rebuild(old.endpoints().to_vec(), targets, old)?;
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                targets,
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::TargetUpsert(target_id)]))
         }
         Edit::TargetDelete(target_id) => {
@@ -197,7 +234,12 @@ fn apply_edit(
                 .position(|t| t.id == target_id)
                 .ok_or_else(|| bad_request("image target not found"))?;
             targets.remove(position);
-            let cfg = rebuild(old.endpoints().to_vec(), targets, old)?;
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                targets,
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, vec![PendingChange::TargetDelete(target_id)]))
         }
         Edit::TargetSetDefault(target_id) => {
@@ -215,8 +257,73 @@ fn apply_edit(
             }
             // `::new` enforces exactly-one-enabled-default and rejects making a
             // disabled target the default (`DefaultTargetDisabled`).
-            let cfg = rebuild(old.endpoints().to_vec(), targets, old)?;
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                targets,
+                old.workflows().to_vec(),
+                old,
+            )?;
             Ok((cfg, changed))
+        }
+        Edit::WorkflowUpload(json) => {
+            let workflow = parse_workflow(&json)?;
+            let id = workflow.id.clone();
+            // A duplicate id is rejected by `::new` (idempotency: a repeated
+            // upload with the same id never double-applies). `::new` also runs
+            // `RegisteredComfyWorkflow::validate`, which parses `graph_json`,
+            // rejects a `graph_digest` that does not match the actual graph (a
+            // client cannot register a lying digest), and checks the bindings.
+            let mut workflows = old.workflows().to_vec();
+            workflows.push(workflow);
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                old.targets().to_vec(),
+                workflows,
+                old,
+            )?;
+            Ok((cfg, vec![PendingChange::WorkflowUpsert(id)]))
+        }
+        Edit::WorkflowBind { workflow_id, json } => {
+            let workflow = parse_workflow(&json)?;
+            if workflow.id != workflow_id {
+                return Err(bad_request(
+                    "image workflow bind must not change the workflow id",
+                ));
+            }
+            let mut workflows = old.workflows().to_vec();
+            let position = workflows
+                .iter()
+                .position(|w| w.id == workflow_id)
+                .ok_or_else(|| bad_request("image workflow not found"))?;
+            // Replace-by-id: the caller re-supplies the workflow with its updated
+            // bindings/outputs. `::new` re-verifies the `graph_digest` matches the
+            // `graph_json` and that every binding/output references a real node,
+            // so a lying digest or a binding to a missing node fails closed.
+            workflows[position] = workflow;
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                old.targets().to_vec(),
+                workflows,
+                old,
+            )?;
+            Ok((cfg, vec![PendingChange::WorkflowUpsert(workflow_id)]))
+        }
+        Edit::WorkflowDelete(workflow_id) => {
+            let mut workflows = old.workflows().to_vec();
+            let position = workflows
+                .iter()
+                .position(|w| w.id == workflow_id)
+                .ok_or_else(|| bad_request("image workflow not found"))?;
+            workflows.remove(position);
+            // `::new` fails closed if a still-enabled target binds the removed
+            // workflow (`MissingWorkflow`), so a dangling delete never persists.
+            let cfg = rebuild(
+                old.endpoints().to_vec(),
+                old.targets().to_vec(),
+                workflows,
+                old,
+            )?;
+            Ok((cfg, vec![PendingChange::WorkflowDelete(workflow_id)]))
         }
     }
 }
@@ -228,6 +335,25 @@ fn target_adapter(cfg: &ImageGenerationConfig, endpoint_id: &str) -> Option<Imag
         .iter()
         .find(|e| e.id == endpoint_id)
         .map(|e| e.adapter)
+}
+
+/// The ID-sorted-unique set of target ids that bind `workflow_id` (matches the
+/// read surface's `referencing_target_ids`).
+fn workflow_referencing_target_ids(cfg: &ImageGenerationConfig, workflow_id: &str) -> Vec<String> {
+    let mut ids: Vec<String> = cfg
+        .targets()
+        .iter()
+        .filter(|t| {
+            matches!(
+                &t.identity,
+                ImageTargetIdentity::Workflow { workflow_id: w, .. } if w == workflow_id
+            )
+        })
+        .map(|t| t.id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// The stable sort key for a change-set member: `(entityKind ordinal, entity
@@ -254,42 +380,60 @@ fn project_changes(
     pending: &[PendingChange],
     generation: &str,
 ) -> Vec<ImageConfigChangeV1> {
-    let mut changes: Vec<ImageConfigChangeV1> = pending
-        .iter()
-        .filter_map(|change| match change {
-            PendingChange::EndpointUpsert(id) => {
-                cfg.endpoints()
+    let mut changes: Vec<ImageConfigChangeV1> =
+        pending
+            .iter()
+            .filter_map(|change| match change {
+                PendingChange::EndpointUpsert(id) => cfg
+                    .endpoints()
                     .iter()
                     .find(|e| e.id == *id)
                     .map(|endpoint| ImageConfigChangeV1::EndpointUpserted {
                         entity_id: id.clone(),
                         entity_generation: generation.to_string(),
                         item: ImageEndpointSafeV1::project(endpoint, generation.to_string()),
+                    }),
+                PendingChange::EndpointDelete(id) => Some(ImageConfigChangeV1::EndpointDeleted {
+                    entity_id: id.clone(),
+                    entity_generation: generation.to_string(),
+                }),
+                PendingChange::TargetUpsert(id) => {
+                    cfg.targets().iter().find(|t| t.id == *id).map(|target| {
+                        ImageConfigChangeV1::TargetUpserted {
+                            entity_id: id.clone(),
+                            entity_generation: generation.to_string(),
+                            item: ImageTargetSafeV1::project(
+                                target,
+                                target_adapter(cfg, &target.endpoint_id),
+                                generation.to_string(),
+                            ),
+                        }
                     })
-            }
-            PendingChange::EndpointDelete(id) => Some(ImageConfigChangeV1::EndpointDeleted {
-                entity_id: id.clone(),
-                entity_generation: generation.to_string(),
-            }),
-            PendingChange::TargetUpsert(id) => {
-                cfg.targets().iter().find(|t| t.id == *id).map(|target| {
-                    ImageConfigChangeV1::TargetUpserted {
+                }
+                PendingChange::TargetDelete(id) => Some(ImageConfigChangeV1::TargetDeleted {
+                    entity_id: id.clone(),
+                    entity_generation: generation.to_string(),
+                }),
+                PendingChange::WorkflowUpsert(id) => cfg
+                    .workflows()
+                    .iter()
+                    .find(|w| w.id == *id)
+                    .map(|workflow| ImageConfigChangeV1::WorkflowUpserted {
                         entity_id: id.clone(),
                         entity_generation: generation.to_string(),
-                        item: ImageTargetSafeV1::project(
-                            target,
-                            target_adapter(cfg, &target.endpoint_id),
+                        // SafeV1 drops `graph_json`; only `graph_digest` crosses.
+                        item: ImageWorkflowSafeV1::project(
+                            workflow,
+                            workflow_referencing_target_ids(cfg, id),
                             generation.to_string(),
                         ),
-                    }
-                })
-            }
-            PendingChange::TargetDelete(id) => Some(ImageConfigChangeV1::TargetDeleted {
-                entity_id: id.clone(),
-                entity_generation: generation.to_string(),
-            }),
-        })
-        .collect();
+                    }),
+                PendingChange::WorkflowDelete(id) => Some(ImageConfigChangeV1::WorkflowDeleted {
+                    entity_id: id.clone(),
+                    entity_generation: generation.to_string(),
+                }),
+            })
+            .collect();
     changes.sort_by(|a, b| change_sort_key(a).cmp(&change_sort_key(b)));
     changes
 }
@@ -392,6 +536,37 @@ fn extract(request: &Request) -> Result<(String, Option<u64>, Edit), ErrorPayloa
             project_root.clone(),
             *expected_config_generation,
             Edit::TargetSetDefault(target_id.clone()),
+        ),
+        Request::ImageWorkflowUpload {
+            project_root,
+            workflow_json,
+            expected_config_generation,
+        } => (
+            project_root.clone(),
+            *expected_config_generation,
+            Edit::WorkflowUpload(workflow_json.clone()),
+        ),
+        Request::ImageWorkflowBind {
+            project_root,
+            workflow_id,
+            bindings_json,
+            expected_config_generation,
+        } => (
+            project_root.clone(),
+            *expected_config_generation,
+            Edit::WorkflowBind {
+                workflow_id: workflow_id.clone(),
+                json: bindings_json.clone(),
+            },
+        ),
+        Request::ImageWorkflowDelete {
+            project_root,
+            workflow_id,
+            expected_config_generation,
+        } => (
+            project_root.clone(),
+            *expected_config_generation,
+            Edit::WorkflowDelete(workflow_id.clone()),
         ),
         other => {
             return Err(internal(format!(

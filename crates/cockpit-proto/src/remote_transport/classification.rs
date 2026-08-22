@@ -1070,6 +1070,21 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "image_workflow_upload",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_workflow_bind",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_workflow_delete",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "daemon_status",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
@@ -2696,7 +2711,7 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 213);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 216);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 144);
         assert_eq!(EVENT_CLASSIFICATION.len(), 83);
     }

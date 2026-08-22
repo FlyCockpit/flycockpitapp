@@ -3607,6 +3607,86 @@
       "tag": "image_target_set_default"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|workflow_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "workflow_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|workflow_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_workflow_upload"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|workflow_id:string|bindings_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "workflow_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "bindings_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|workflow_id:String|bindings_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_workflow_bind"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|workflow_id:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "workflow_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|workflow_id:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_workflow_delete"
+    },
+    {
       "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|provider_id:string|delete_stored_secrets:bool",

@@ -13826,7 +13826,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "image_target_create"
         | "image_target_update"
         | "image_target_delete"
-        | "image_target_set_default" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        | "image_target_set_default"
+        | "image_workflow_upload"
+        | "image_workflow_bind"
+        | "image_workflow_delete" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // Owner-remoted settings/setup/flycockpit mutations validate their
         // caller-supplied payload after the owner gate; the matrix request's
         // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
@@ -14068,6 +14071,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("image_target_update"),
         authz_owner_only("image_target_delete"),
         authz_owner_only("image_target_set_default"),
+        authz_owner_only("image_workflow_upload"),
+        authz_owner_only("image_workflow_bind"),
+        authz_owner_only("image_workflow_delete"),
         authz_owner_only("set_flycockpit_connector_enabled"),
         authz_owner_only("sync_flycockpit_org_policy"),
         authz_owner_only("enroll_flycockpit_org_sync"),
@@ -15603,6 +15609,22 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "image_target_set_default" => Request::ImageTargetSetDefault {
             project_root: root.clone(),
             target_id: "t-authz".into(),
+            expected_config_generation: None,
+        },
+        "image_workflow_upload" => Request::ImageWorkflowUpload {
+            project_root: root.clone(),
+            workflow_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_workflow_bind" => Request::ImageWorkflowBind {
+            project_root: root.clone(),
+            workflow_id: "wf-authz".into(),
+            bindings_json: "not json".into(),
+            expected_config_generation: None,
+        },
+        "image_workflow_delete" => Request::ImageWorkflowDelete {
+            project_root: root.clone(),
+            workflow_id: "wf-authz".into(),
             expected_config_generation: None,
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
@@ -22379,6 +22401,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImageTargetUpdate { project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ImageTargetDelete { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ImageTargetSetDefault { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowUpload { project_root: "/tmp/project".into(), workflow_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_upload", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowBind { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), bindings_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_bind", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowDelete { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), expected_config_generation: None }, kind: "image_workflow_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
@@ -22618,6 +22643,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImageTargetUpdate,
         ImageTargetDelete,
         ImageTargetSetDefault,
+        ImageWorkflowUpload,
+        ImageWorkflowBind,
+        ImageWorkflowDelete,
         ListPackages,
         AddPackage,
         ImportPackage,

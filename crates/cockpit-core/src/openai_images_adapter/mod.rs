@@ -15,9 +15,13 @@
 
 mod catalog;
 mod dto;
+mod http_transport;
 mod preflight;
 mod response;
 mod wire;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use catalog::{
     CATALOG_PROVENANCE_DATE, CATALOG_REVISION, ImageModelDescriptor, ImageModelIdentity,
@@ -27,6 +31,7 @@ pub use dto::{
     EditMultipartPart, EditRequest, GenerationRequest, ImagesResponseItem, ParsedImageSlot,
     ParsedImagesResponse, ResponseBackground, ResponseOutputFormat, ResponseQuality,
 };
+pub use http_transport::{OpenaiImagesHttpTransport, OpenaiImagesTransportConfigError};
 pub use preflight::{
     PreflightFailure, PreflightInput, PreflightPlan, PreflightReference, PreflightResult, preflight,
 };
@@ -41,7 +46,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use uuid::Uuid;
 
-use crate::image_generation_job::ImageGenerationHandoffResult;
+use crate::image_generation::transport::{ProviderTransportError, ProviderTransportOutcome};
+use crate::image_generation_job::{
+    ImageGenerationAdapter, ImageGenerationCancelRequest, ImageGenerationCancelResult,
+    ImageGenerationHandoffRequest, ImageGenerationHandoffResult, ImageGenerationReconcileRequest,
+    ImageGenerationReconcileResult, image_generation_adapter_sealed,
+};
 
 /// Bounded base64 length checked before decode; decoded bytes capped by
 /// canonical output limits. See [`response::DecodeLimit`].
@@ -63,19 +73,44 @@ mod openai_images_adapter_sealed {
     pub trait Sealed {}
 }
 
-/// Transport seam injected into the adapter. Production wires this to a
-/// pinned reqwest client; tests wire deterministic fixtures. The seam is
-/// the only place a request byte leaves the process.
+/// Transport seam injected into the adapter. Production wires this to
+/// [`OpenaiImagesHttpTransport`] (a pinned reqwest client); tests wire
+/// deterministic fixtures. The seam is the only place a request byte leaves the
+/// process.
 #[async_trait::async_trait]
 pub trait OpenaiImagesTransport: openai_images_adapter_sealed::Sealed + Send + Sync {
-    /// Submits a fully encoded request body. Returns the raw bounded response
-    /// bytes on success, or a [`TransportError`] classifying the failure.
+    /// Submits a fully encoded request body. Returns the bounded response on a
+    /// 2xx, or a [`ProviderTransportError`] classifying the failure onto the
+    /// shared billing-safe transport vocabulary.
     async fn submit(
         &self,
         route: OpenaiImagesRoute,
         content_type: &str,
         body: &[u8],
-    ) -> Result<TransportOutcome, TransportError>;
+    ) -> Result<ProviderTransportOutcome, ProviderTransportError>;
+}
+
+/// Resolves the immutable per-attempt plan the adapter needs to build one
+/// provider request from a dispatch [`ImageGenerationHandoffRequest`], which
+/// carries only opaque identities. The production resolver (DB-backed plan
+/// lookup keyed by the attempt identity) is supplied by the daemon-integration
+/// layer that constructs and installs the adapter; this crate ships the seam
+/// plus a scripted resolver for tests. The seam is sealed so only in-crate
+/// resolvers can satisfy it.
+#[async_trait::async_trait]
+pub trait OpenaiImagesPlanSource: openai_images_adapter_sealed::Sealed + Send + Sync {
+    async fn resolve(&self, request: &ImageGenerationHandoffRequest) -> OpenaiImagesPlanResolution;
+}
+
+/// Outcome of resolving the per-attempt plan. A resolution failure means no
+/// request was ever built or sent, so the dispatch layer treats it as a
+/// definitive rejection (no paid submission) — never a submission-unknown.
+#[derive(Debug, Clone)]
+pub enum OpenaiImagesPlanResolution {
+    /// The immutable plan validated into provider request inputs.
+    Resolved(Box<PreflightPlan>),
+    /// The plan could not be resolved; the reason is redacted and safe to log.
+    Unresolvable { safe_reason: String },
 }
 
 /// The two routes this adapter ever contacts.
@@ -94,33 +129,6 @@ impl OpenaiImagesRoute {
             Self::Edits => "/v1/images/edits",
         }
     }
-}
-
-/// Outcome of a transport submission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransportOutcome {
-    /// HTTP status code observed at handoff completion.
-    pub status: u16,
-    /// Bounded response body bytes.
-    pub body: Vec<u8>,
-}
-
-/// Transport failure classification drives billing-safe submission semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportError {
-    /// Connection reset or write error before any request byte was accepted.
-    /// Safe to retry without risk of duplicate paid submission.
-    PreHandoffReset,
-    /// Timeout or reset after at least one request byte was accepted. The
-    /// provider may or may not have processed the request.
-    PostHandoffAmbiguous,
-    /// The provider returned a definitive non-acceptance (e.g. 4xx
-    /// authentication/quota). No paid submission occurred.
-    DefinitivelyRejected { status: u16, body: Vec<u8> },
-    /// The response body exceeded the bounded limit.
-    BodyLimit,
-    /// The response was malformed.
-    MalformedResponse,
 }
 
 /// Evidence recorded with the spend/journal. Never contains credential data
@@ -163,19 +171,29 @@ pub struct OpenaiImagesAttemptInput {
     pub provider_idempotency_identity: String,
 }
 
-/// The OpenAI Images adapter. Implements [`ImageGenerationAdapter`] with
-/// billing-safe submission semantics.
+/// The OpenAI Images adapter. Implements the sealed [`ImageGenerationAdapter`]
+/// dispatch trait (see the `impl` below) with billing-safe submission
+/// semantics: a plan is resolved from the dispatch identity, one bounded
+/// request is submitted through the pinned transport, and the transport
+/// classification maps onto handoff acceptance / definitive rejection /
+/// submission-unknown without ever inventing success.
 pub struct OpenaiImagesAdapter {
     transport: Arc<dyn OpenaiImagesTransport>,
+    plan_source: Arc<dyn OpenaiImagesPlanSource>,
     decode_limit: DecodeLimit,
 }
 
 impl openai_images_adapter_sealed::Sealed for OpenaiImagesAdapter {}
 
 impl OpenaiImagesAdapter {
-    pub fn new(transport: Arc<dyn OpenaiImagesTransport>, decode_limit: DecodeLimit) -> Self {
+    pub fn new(
+        transport: Arc<dyn OpenaiImagesTransport>,
+        plan_source: Arc<dyn OpenaiImagesPlanSource>,
+        decode_limit: DecodeLimit,
+    ) -> Self {
         Self {
             transport,
+            plan_source,
             decode_limit,
         }
     }
@@ -208,19 +226,25 @@ impl OpenaiImagesAdapter {
             .await
         {
             Ok(value) => value,
-            Err(TransportError::PreHandoffReset) => {
-                // Safe pre-handoff retry: no request byte was accepted. We do
-                // not retry here (the dispatcher owns retry policy); we report
-                // a definitive rejection so the slot retries with a fresh
+            Err(ProviderTransportError::Connect | ProviderTransportError::Tls) => {
+                // Pre-handoff failure: no request byte was accepted. We do not
+                // retry here (the dispatcher owns retry policy); we report a
+                // definitive rejection so the slot may resubmit under a fresh
                 // idempotency identity. Evidence proves no paid submission.
                 return (
                     ImageGenerationHandoffResult::DefinitivelyRejected {
-                        evidence: redacted_evidence(b"pre_handoff_reset", "no byte accepted"),
+                        evidence: redacted_evidence(
+                            b"pre_handoff_no_byte_accepted",
+                            "no byte accepted",
+                        ),
                     },
                     None,
                 );
             }
-            Err(TransportError::PostHandoffAmbiguous) => {
+            Err(ProviderTransportError::Timeout | ProviderTransportError::AmbiguousAcceptance) => {
+                // Post-handoff ambiguity: the request bytes were written and the
+                // provider may have processed a paid request. Must be reconciled,
+                // never blindly retried.
                 return (
                     ImageGenerationHandoffResult::SubmissionUnknown {
                         evidence: redacted_evidence(b"post_handoff_ambiguous", "handoff accepted"),
@@ -228,18 +252,18 @@ impl OpenaiImagesAdapter {
                     None,
                 );
             }
-            Err(TransportError::DefinitivelyRejected { status, body: _ }) => {
+            Err(ProviderTransportError::Status { status, body: _ }) => {
                 return (
                     ImageGenerationHandoffResult::DefinitivelyRejected {
                         evidence: redacted_evidence(
-                            b"definitively_rejected",
+                            b"definitive_nonacceptance",
                             &format!("status={status}"),
                         ),
                     },
                     None,
                 );
             }
-            Err(TransportError::BodyLimit) => {
+            Err(ProviderTransportError::BodyLimit) => {
                 return (
                     ImageGenerationHandoffResult::DefinitivelyRejected {
                         evidence: redacted_evidence(b"body_limit", "response exceeded bound"),
@@ -247,7 +271,7 @@ impl OpenaiImagesAdapter {
                     None,
                 );
             }
-            Err(TransportError::MalformedResponse) => {
+            Err(ProviderTransportError::Malformed) => {
                 return (
                     ImageGenerationHandoffResult::DefinitivelyRejected {
                         evidence: redacted_evidence(b"malformed_response", "unparseable"),
@@ -304,6 +328,71 @@ impl OpenaiImagesAdapter {
                     body: body.into_bytes(),
                 })
             }
+        }
+    }
+}
+
+impl image_generation_adapter_sealed::Sealed for OpenaiImagesAdapter {}
+
+/// Sealed dispatch-trait implementation. This is the real
+/// `ImageGenerationAdapter` for OpenAI Images, replacing the previous
+/// doc-only claim: `handoff` resolves the plan for the dispatch identity and
+/// submits exactly one bounded request; `reconcile` and `cancel` are honest
+/// no-op-authoritative because the OpenAI Images API is synchronous and exposes
+/// no operation-status or cancel endpoint (see each method).
+#[async_trait::async_trait]
+impl ImageGenerationAdapter for OpenaiImagesAdapter {
+    async fn handoff(
+        &self,
+        request: &ImageGenerationHandoffRequest,
+    ) -> ImageGenerationHandoffResult {
+        let plan = match self.plan_source.resolve(request).await {
+            OpenaiImagesPlanResolution::Resolved(plan) => *plan,
+            OpenaiImagesPlanResolution::Unresolvable { safe_reason } => {
+                // No request was built or sent, so no paid submission occurred:
+                // a definitive rejection (safe to resubmit), never a
+                // submission-unknown.
+                return ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: redacted_evidence(b"plan_unresolvable", &safe_reason),
+                };
+            }
+        };
+        let input = OpenaiImagesAttemptInput {
+            plan,
+            external_operation_id: request.external_operation_id,
+            provider_request_identity: request.provider_request_identity.clone(),
+            provider_idempotency_identity: request.provider_idempotency_identity.clone(),
+        };
+        let (result, _parsed) = self.attempt(&input).await;
+        result
+    }
+
+    async fn reconcile(
+        &self,
+        _request: &ImageGenerationReconcileRequest,
+    ) -> ImageGenerationReconcileResult {
+        // OpenAI Images generations/edits are synchronous request/response: the
+        // acceptance outcome is known at handoff and there is no server-side
+        // operation to re-query. A submission-unknown attempt therefore cannot
+        // be authoritatively reconciled without risking a duplicate paid
+        // submission, so we report an unknown outcome rather than invent one.
+        ImageGenerationReconcileResult::OutcomeUnknown {
+            evidence: redacted_evidence(
+                b"reconcile_unavailable",
+                "openai images api is synchronous; no operation-status endpoint",
+            ),
+        }
+    }
+
+    async fn cancel(&self, _request: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
+        // There is no OpenAI Images cancel endpoint. A synchronous submission
+        // has already resolved by the time a cancel could run, so we report an
+        // unknown outcome rather than claim a cancellation that did not happen.
+        ImageGenerationCancelResult::OutcomeUnknown {
+            evidence: redacted_evidence(
+                b"cancel_unavailable",
+                "openai images api is synchronous; no cancel endpoint",
+            ),
         }
     }
 }

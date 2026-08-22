@@ -1367,14 +1367,15 @@ pub fn validate_config_change_set(changes: &[ConfigChange]) -> bool {
 // Budget scope
 // ---------------------------------------------------------------------------
 
-/// The budget policy DTO (dependency-owned `Unconfigured|Finite|Unlimited`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BudgetPolicy {
-    Unconfigured,
-    Finite,
-    Unlimited,
-}
+/// The budget policy DTO. This is the single non-lossy spend-ledger type
+/// (`Unconfigured | Finite { usd_micros } | Unlimited`), re-exported so the
+/// control-plane wire, the spend ledger, and the FCOR
+/// `ImageSpendSettings` encoder all share exactly one representation. A
+/// `Finite` policy is uninhabitable without a positive `usd_micros`, and its
+/// custom `Deserialize` rejects `usd_micros: 0`, so a lossy amount-free
+/// `Finite` cannot cross this wire. `Unconfigured` is a distinct variant and
+/// can never be smuggled as a `Finite` with an absent/zero amount.
+pub use cockpit_config::config::image_spend::BudgetPolicy;
 
 /// `ImageBudgetSafeV1` scope-nullability contract.
 ///
@@ -1395,9 +1396,11 @@ impl BudgetScopeProjection {
         }
     }
 
-    pub fn finite(generation: String) -> Self {
+    /// A `Finite` projection carries the non-lossy `usd_micros` amount from the
+    /// spend-ledger DTO alongside its positive generation.
+    pub fn finite(usd_micros: u64, generation: String) -> Self {
         Self {
-            policy: BudgetPolicy::Finite,
+            policy: BudgetPolicy::Finite { usd_micros },
             generation: Some(generation),
         }
     }
@@ -1410,11 +1413,16 @@ impl BudgetScopeProjection {
     }
 
     /// Validate the nullability contract: `Unconfigured` requires null
-    /// generation; `Finite|Unlimited` requires positive generation.
+    /// generation; `Finite|Unlimited` requires positive generation. A `Finite`
+    /// additionally requires a positive `usd_micros` amount, mirroring the
+    /// spend-ledger deserializer that rejects `usd_micros: 0`, so a zero-amount
+    /// `Finite` built directly in memory is rejected exactly as it is on the
+    /// wire.
     pub fn validate(&self) -> bool {
         match self.policy {
             BudgetPolicy::Unconfigured => self.generation.is_none(),
-            BudgetPolicy::Finite | BudgetPolicy::Unlimited => self
+            BudgetPolicy::Finite { usd_micros: 0 } => false,
+            BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited => self
                 .generation
                 .as_ref()
                 .map(|g| validate_canonical_decimal(g) && g != "0")
@@ -1438,8 +1446,11 @@ pub fn validate_budget_set_pair(
     match (policy, expected_generation) {
         (None, None) => true,                           // unchanged
         (Some(BudgetPolicy::Unconfigured), _) => false, // Unconfigured in a save rejects
-        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), None) => true, // create generation 1
-        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), Some(generation)) => {
+        // A zero-amount `Finite` is not a savable policy (matches the wire
+        // deserializer), even when constructed directly in memory.
+        (Some(BudgetPolicy::Finite { usd_micros: 0 }), _) => false,
+        (Some(BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited), None) => true, // create generation 1
+        (Some(BudgetPolicy::Finite { .. } | BudgetPolicy::Unlimited), Some(generation)) => {
             validate_canonical_decimal(generation) && generation != "0" // CAS-update
         }
         (None, Some(_)) => false, // half-present tuple rejects

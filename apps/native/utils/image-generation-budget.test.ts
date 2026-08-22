@@ -17,7 +17,11 @@ import {
   validateCanonicalDecimal,
   yoloShowsNoModal,
 } from "./image-generation-budget";
-import { unconfiguredBudgetScope } from "./image-generation-contracts";
+import {
+  finiteBudgetPolicy,
+  isFinitePolicy,
+  unconfiguredBudgetScope,
+} from "./image-generation-contracts";
 
 describe("image generation budget and approval", () => {
   it("initial budget views are Unconfigured with editable suggestions only", () => {
@@ -48,15 +52,22 @@ describe("image generation budget and approval", () => {
   });
 
   it("validateBudgetSetPair: nonnull policy with null generation creates generation 1", () => {
-    expect(validateBudgetSetPair("finite", null).valid).toBe(true);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), null).valid).toBe(true);
     expect(validateBudgetSetPair("unlimited", null).valid).toBe(true);
   });
 
   it("validateBudgetSetPair: nonnull policy with positive generation CAS-updates", () => {
-    expect(validateBudgetSetPair("finite", "1").valid).toBe(true);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), "1").valid).toBe(true);
     expect(validateBudgetSetPair("unlimited", "10").valid).toBe(true);
-    expect(validateBudgetSetPair("finite", "0").valid).toBe(false);
-    expect(validateBudgetSetPair("finite", "invalid").valid).toBe(false);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), "0").valid).toBe(false);
+    expect(validateBudgetSetPair(finiteBudgetPolicy(1_000_000n), "invalid").valid).toBe(false);
+  });
+
+  it("validateBudgetSetPair: Finite with a zero amount rejects", () => {
+    // Mirrors the Rust deserializer rejecting `usd_micros: 0`.
+    const result = validateBudgetSetPair(finiteBudgetPolicy(0n), null);
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.errorCode).toBe("invalid_amount");
   });
 
   it("validateBudgetSetPair: half-present tuple rejects", () => {
@@ -73,7 +84,7 @@ describe("image generation budget and approval", () => {
   });
 
   it("validateAtLeastOnePolicy requires at least one nonnull policy", () => {
-    expect(validateAtLeastOnePolicy("finite", null, null)).toBe(true);
+    expect(validateAtLeastOnePolicy(finiteBudgetPolicy(1_000_000n), null, null)).toBe(true);
     expect(validateAtLeastOnePolicy(null, "unlimited", null)).toBe(true);
     expect(validateAtLeastOnePolicy(null, null, null)).toBe(false);
   });
@@ -87,9 +98,16 @@ describe("image generation budget and approval", () => {
   });
 
   it("budgetScopeProjection: Finite -> (Finite,positive-generation)", () => {
-    const view: BudgetScopeView = { scope: "request", policy: "finite", generation: "1" };
+    const view: BudgetScopeView = {
+      scope: "request",
+      policy: finiteBudgetPolicy(1_000_000n),
+      generation: "1",
+    };
     const projection = budgetScopeProjection(view);
-    expect(projection.policy).toBe("finite");
+    expect(isFinitePolicy(projection.policy)).toBe(true);
+    if (isFinitePolicy(projection.policy)) {
+      expect(projection.policy.finite.usd_micros).toBe(1_000_000n);
+    }
     expect(projection.generation).toBe("1");
   });
 

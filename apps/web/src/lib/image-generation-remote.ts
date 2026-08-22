@@ -172,8 +172,70 @@ export function safeReadOnlyProjection<T>(state: T): T {
 // Budget
 // ---------------------------------------------------------------------------
 
-/** The budget policy: Unconfigured blocks paid use; Finite/Unlimited allow it. */
-export type BudgetPolicy = "unconfigured" | "finite" | "unlimited";
+/** The largest representable `u64` (spend-ledger `usd_micros` upper bound). */
+export const MAX_U64_USD_MICROS = 18446744073709551615n;
+
+/**
+ * The non-lossy budget policy, mirroring the Rust spend-ledger DTO
+ * (`crates/cockpit-db/src/db/image_spend.rs` `BudgetPolicy`) exactly:
+ * `Unconfigured` blocks paid use, `Unlimited` allows it, and `Finite` allows
+ * it while carrying its explicit `usd_micros` amount. The wire form is serde's
+ * external tagging — `"unconfigured"`, `"unlimited"`, and
+ * `{ "finite": { "usd_micros": <integer> } }` — so a `Finite` can never appear
+ * without an amount, and an amount-free lossy `"finite"` string is not a valid
+ * policy.
+ *
+ * `usd_micros` is a `bigint`, never a `number`: the wire carries a bare `u64`
+ * integer up to `u64::MAX`, which exceeds `Number.MAX_SAFE_INTEGER`, so a
+ * `number` would silently truncate large amounts. Serialize/parse the policy
+ * with {@link serializeBudgetPolicy}/{@link parseBudgetPolicy} rather than
+ * `JSON.stringify`/`JSON.parse`, which cannot round-trip a `bigint` amount.
+ */
+export type BudgetPolicy = "unconfigured" | "unlimited" | { finite: { usd_micros: bigint } };
+
+/** Narrow a {@link BudgetPolicy} to its `Finite` case. */
+export function isFinitePolicy(policy: BudgetPolicy): policy is { finite: { usd_micros: bigint } } {
+  return typeof policy === "object" && policy !== null && "finite" in policy;
+}
+
+/** Construct a `Finite` budget policy from a positive `u64` micros amount. */
+export function finiteBudgetPolicy(usdMicros: bigint): { finite: { usd_micros: bigint } } {
+  return { finite: { usd_micros: usdMicros } };
+}
+
+/** Whether a `Finite` amount is a positive `u64` (`1..=u64::MAX`), mirroring
+ *  the Rust `BudgetPolicy` deserializer that rejects `usd_micros: 0`. */
+export function isValidBudgetAmount(usdMicros: bigint): boolean {
+  return usdMicros >= 1n && usdMicros <= MAX_U64_USD_MICROS;
+}
+
+/**
+ * Serialize a budget policy to its canonical wire JSON, byte-identical to Rust
+ * `serde_json::to_string`. The `usd_micros` amount is emitted from `bigint`
+ * via `toString()`, so no value in `1..=u64::MAX` is truncated.
+ */
+export function serializeBudgetPolicy(policy: BudgetPolicy): string {
+  if (policy === "unconfigured") return '"unconfigured"';
+  if (policy === "unlimited") return '"unlimited"';
+  return `{"finite":{"usd_micros":${policy.finite.usd_micros.toString()}}}`;
+}
+
+/**
+ * Parse the canonical wire JSON produced by Rust into a budget policy, or
+ * `null` if malformed. Precision-safe: the `u64` amount is read from its
+ * decimal digits with `BigInt`, never through `Number`/`JSON.parse`, so values
+ * up to `u64::MAX` round-trip exactly. A zero amount, leading zeros, or an
+ * out-of-range value are rejected, matching the Rust deserializer.
+ */
+export function parseBudgetPolicy(text: string): BudgetPolicy | null {
+  if (text === '"unconfigured"') return "unconfigured";
+  if (text === '"unlimited"') return "unlimited";
+  const match = /^\{"finite":\{"usd_micros":(0|[1-9][0-9]*)\}\}$/.exec(text);
+  if (match === null) return null;
+  const amount = BigInt(match[1]!);
+  if (!isValidBudgetAmount(amount)) return null;
+  return { finite: { usd_micros: amount } };
+}
 
 /** A budget scope projection: (policy, generation). */
 export interface BudgetScopeProjection {
@@ -218,7 +280,14 @@ export function validateBudgetScope(scope: BudgetScopeProjection): boolean {
   }
   // Finite/Unlimited requires positive canonical decimal generation.
   if (scope.generation === null) return false;
-  return validateCanonicalDecimal(scope.generation) && scope.generation !== "0";
+  if (!validateCanonicalDecimal(scope.generation) || scope.generation === "0") {
+    return false;
+  }
+  // Finite additionally requires a positive `u64` amount.
+  if (isFinitePolicy(scope.policy)) {
+    return isValidBudgetAmount(scope.policy.finite.usd_micros);
+  }
+  return true;
 }
 
 /** Validate a canonical decimal string: `0|[1-9][0-9]{0,19}`. */
@@ -251,12 +320,14 @@ export function validateBudgetSetPair(
 ): boolean {
   if (policy === null && expectedGeneration === null) return true;
   if (policy === "unconfigured") return false;
-  if (policy !== null && expectedGeneration === null) return true;
-  if (policy !== null && expectedGeneration !== null) {
-    return validateCanonicalDecimal(expectedGeneration) && expectedGeneration !== "0";
-  }
   // policy === null with nonnull generation: half-present, reject.
-  return false;
+  if (policy === null) return false;
+  // A `Finite` policy is invalid without a positive `u64` amount.
+  if (isFinitePolicy(policy) && !isValidBudgetAmount(policy.finite.usd_micros)) {
+    return false;
+  }
+  if (expectedGeneration === null) return true; // create generation 1
+  return validateCanonicalDecimal(expectedGeneration) && expectedGeneration !== "0";
 }
 
 /** Validate that at least one policy is nonnull in budget_set. */

@@ -17,6 +17,8 @@ import {
   type BudgetPolicy,
   type BudgetScopeProjection,
   type ImageControlRequestTag,
+  isFinitePolicy,
+  isValidBudgetAmount,
   unconfiguredBudgetScope,
 } from "./image-generation-contracts";
 
@@ -86,7 +88,11 @@ export type BudgetSetValidation =
   | { valid: true }
   | {
       valid: false;
-      errorCode: "unconfigured_in_save" | "half_present_tuple" | "invalid_generation";
+      errorCode:
+        | "unconfigured_in_save"
+        | "half_present_tuple"
+        | "invalid_generation"
+        | "invalid_amount";
     };
 
 /** Validate a `image_budget_set` scope pair: `(policy, expected_generation)`. */
@@ -100,17 +106,21 @@ export function validateBudgetSetPair(
   if (policy === "unconfigured") {
     return { valid: false, errorCode: "unconfigured_in_save" };
   }
-  if (policy === "finite" || policy === "unlimited") {
-    if (expectedGeneration === null) {
-      return { valid: true }; // create generation 1
-    }
-    if (!validateCanonicalDecimal(expectedGeneration) || expectedGeneration === "0") {
-      return { valid: false, errorCode: "invalid_generation" };
-    }
-    return { valid: true }; // CAS-update
+  if (policy === null) {
+    // policy === null with nonnull generation: half-present tuple rejects.
+    return { valid: false, errorCode: "half_present_tuple" };
   }
-  // policy === null with nonnull generation: half-present tuple rejects.
-  return { valid: false, errorCode: "half_present_tuple" };
+  // policy is "unlimited" or a Finite carrying its amount.
+  if (isFinitePolicy(policy) && !isValidBudgetAmount(policy.finite.usd_micros)) {
+    return { valid: false, errorCode: "invalid_amount" };
+  }
+  if (expectedGeneration === null) {
+    return { valid: true }; // create generation 1
+  }
+  if (!validateCanonicalDecimal(expectedGeneration) || expectedGeneration === "0") {
+    return { valid: false, errorCode: "invalid_generation" };
+  }
+  return { valid: true }; // CAS-update
 }
 
 /** Validate a canonical decimal string matching `0|[1-9][0-9]{0,19}`. */

@@ -1035,6 +1035,41 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "image_endpoint_create",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_update",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_endpoint_delete",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_create",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_update",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_delete",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_target_set_default",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "daemon_status",
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
@@ -1839,6 +1874,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "image_control_mutated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "provider_oauth_started",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -2043,6 +2083,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "default_model_update_result",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "image_control_config_changed",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2651,9 +2696,9 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 206);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 143);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 82);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 213);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 144);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 83);
     }
 
     #[test]

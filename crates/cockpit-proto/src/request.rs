@@ -1687,6 +1687,88 @@ pub enum Request {
         workflow_id: String,
     },
 
+    /// LOCAL owner CONFIG MUTATION: append a new image endpoint. Owner-only,
+    /// local-only, serialized. The endpoint is carried as one OPAQUE JSON blob
+    /// (the raw `credential_ref`/`headers` never appear as typed wire fields);
+    /// it is validated through the single `ImageGenerationConfig::new` funnel
+    /// before any write. `expected_config_generation`, when present, fences the
+    /// mutation against a moved config generation (optimistic CAS).
+    ImageEndpointCreate {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        endpoint_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: replace an existing image endpoint by id
+    /// with the supplied opaque endpoint JSON.
+    ImageEndpointUpdate {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        endpoint_id: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        endpoint_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: remove an image endpoint by id.
+    ImageEndpointDelete {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        endpoint_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: append a new image target (opaque JSON).
+    ImageTargetCreate {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        target_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: replace an existing image target by id.
+    ImageTargetUpdate {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        target_id: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
+        target_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: remove an image target by id.
+    ImageTargetDelete {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
+    /// LOCAL owner CONFIG MUTATION: make the target with `target_id` the single
+    /// enabled default (clearing any prior default). Enforced by the
+    /// exactly-one-default invariant in `ImageGenerationConfig::new`.
+    ImageTargetSetDefault {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_provider_id")]
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_config_generation: Option<u64>,
+    },
+
     /// Remove a provider entry through the daemon's trust-aware writer.
     DeleteProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
@@ -2619,6 +2701,13 @@ macro_rules! request_variants {
             (Request::ImageTargetGet { .. }, "image_target_get");
             (Request::ImageWorkflowList { .. }, "image_workflow_list");
             (Request::ImageWorkflowGet { .. }, "image_workflow_get");
+            (Request::ImageEndpointCreate { .. }, "image_endpoint_create");
+            (Request::ImageEndpointUpdate { .. }, "image_endpoint_update");
+            (Request::ImageEndpointDelete { .. }, "image_endpoint_delete");
+            (Request::ImageTargetCreate { .. }, "image_target_create");
+            (Request::ImageTargetUpdate { .. }, "image_target_update");
+            (Request::ImageTargetDelete { .. }, "image_target_delete");
+            (Request::ImageTargetSetDefault { .. }, "image_target_set_default");
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
@@ -2879,6 +2968,13 @@ macro_rules! command {
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
             (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
+            (Request::ImageEndpointCreate { project_root, endpoint_json, expected_config_generation }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageEndpointUpdate { project_root, endpoint_id, endpoint_json, expected_config_generation }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_id:String|endpoint_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_id: String => param, endpoint_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageEndpointDelete { project_root, endpoint_id, expected_config_generation }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_id: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageTargetCreate { project_root, target_json, expected_config_generation }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageTargetUpdate { project_root, target_id, target_json, expected_config_generation }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|target_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, target_json: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageTargetDelete { project_root, target_id, expected_config_generation }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, expected_config_generation: Option<u64> => param]);
+            (Request::ImageTargetSetDefault { project_root, target_id, expected_config_generation }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|target_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, target_id: String => param, expected_config_generation: Option<u64> => param]);
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);

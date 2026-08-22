@@ -321,5 +321,139 @@ impl ImageControlReadResponseV1 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Config mutation change set + `config_changed` event
+// ---------------------------------------------------------------------------
+
+/// One member of a LOCAL image-config change set. SECURITY: every member
+/// carries ONLY the safe projection of the affected entity — the same redacting
+/// [`ImageEndpointSafeV1`]/[`ImageTargetSafeV1`]/[`ImageWorkflowSafeV1`] funnel
+/// the read surface uses — so no raw `credential_ref`, `headers`, or
+/// `graph_json` ever rides a change set or the event that carries it. A deleted
+/// member carries no `item` (only the tombstone id + generation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ImageConfigChangeV1 {
+    EndpointUpserted {
+        entity_id: String,
+        entity_generation: String,
+        item: ImageEndpointSafeV1,
+    },
+    EndpointDeleted {
+        entity_id: String,
+        entity_generation: String,
+    },
+    TargetUpserted {
+        entity_id: String,
+        entity_generation: String,
+        item: ImageTargetSafeV1,
+    },
+    TargetDeleted {
+        entity_id: String,
+        entity_generation: String,
+    },
+    WorkflowUpserted {
+        entity_id: String,
+        entity_generation: String,
+        item: ImageWorkflowSafeV1,
+    },
+    WorkflowDeleted {
+        entity_id: String,
+        entity_generation: String,
+    },
+}
+
+/// The safe, atomic change set applied by one config mutation. `changes` is the
+/// full sorted delta the mutation produced (e.g. a `set_default` carries both
+/// the prior and the new default target). Only safe projections appear inside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageConfigChangeSetSafeV1 {
+    pub schema_version: u8,
+    pub config_generation: String,
+    pub changes: Vec<ImageConfigChangeV1>,
+}
+
+impl ImageConfigChangeSetSafeV1 {
+    pub fn new(config_generation: String, changes: Vec<ImageConfigChangeV1>) -> Self {
+        Self {
+            schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
+            config_generation,
+            changes,
+        }
+    }
+}
+
+/// The replayable `config_changed` event kind. A closed enum so an unknown kind
+/// fails rather than silently degrading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageControlEventKindV1 {
+    ConfigChanged,
+}
+
+/// The daemon → client `config_changed` replay event emitted by a LOCAL
+/// image-config mutation. SECURITY: it carries only the safe
+/// [`ImageConfigChangeSetSafeV1`] — never a raw credential, header, or workflow
+/// blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageControlEventV1 {
+    pub schema_version: u8,
+    pub daemon_instance_id: String,
+    pub project_id: String,
+    pub kind: ImageControlEventKindV1,
+    pub change_set: ImageConfigChangeSetSafeV1,
+}
+
+impl ImageControlEventV1 {
+    pub fn config_changed(
+        daemon_instance_id: String,
+        project_id: String,
+        change_set: ImageConfigChangeSetSafeV1,
+    ) -> Self {
+        Self {
+            schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
+            daemon_instance_id,
+            project_id,
+            kind: ImageControlEventKindV1::ConfigChanged,
+            change_set,
+        }
+    }
+}
+
+/// The daemon reply for a successful LOCAL image-config mutation: the
+/// authoritative new config generation plus the safe change set that was
+/// applied and emitted. Carries only safe projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageControlMutationResponseV1 {
+    pub schema_version: u8,
+    pub daemon_instance_id: String,
+    pub project_id: String,
+    pub config_generation: String,
+    pub change_set: ImageConfigChangeSetSafeV1,
+}
+
+impl ImageControlMutationResponseV1 {
+    pub fn new(
+        daemon_instance_id: String,
+        project_id: String,
+        change_set: ImageConfigChangeSetSafeV1,
+    ) -> Self {
+        Self {
+            schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
+            daemon_instance_id,
+            project_id,
+            config_generation: change_set.config_generation.clone(),
+            change_set,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -1965,6 +1965,45 @@
     },
     "response": "image_control_read"
   },
+  "image_control_mutated": {
+    "data": {
+      "schemaVersion": 1,
+      "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
+      "projectId": "/tmp/project",
+      "configGeneration": "4",
+      "changeSet": {
+        "schemaVersion": 1,
+        "configGeneration": "4",
+        "changes": [
+          {
+            "type": "endpoint_upserted",
+            "entityId": "ep1",
+            "entityGeneration": "4",
+            "item": {
+              "schemaVersion": 1,
+              "endpointId": "ep1",
+              "entityGeneration": "4",
+              "displayName": null,
+              "adapterKind": "openai_images",
+              "normalizedOrigin": "https://api.example.com",
+              "normalizedPathPrefix": "/v1",
+              "enabled": true,
+              "routeProfileVersion": 1,
+              "declaredLocationClass": "public_cloud",
+              "credentialConfigured": true,
+              "headerReferenceCount": 1
+            }
+          },
+          {
+            "type": "target_deleted",
+            "entityId": "t1",
+            "entityGeneration": "4"
+          }
+        ]
+      }
+    },
+    "response": "image_control_mutated"
+  },
   "packages": {
     "data": {
       "packages_json": "[]"

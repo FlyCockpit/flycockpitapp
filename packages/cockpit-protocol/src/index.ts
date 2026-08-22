@@ -1559,6 +1559,7 @@ export const knownEventKindSchema = z.enum([
   "goal_supervision_progress",
   "history_replay",
   "host_capabilities_changed",
+  "image_control_config_changed",
   "inference_failed",
   "inference_succeeded",
   "inference_warning",

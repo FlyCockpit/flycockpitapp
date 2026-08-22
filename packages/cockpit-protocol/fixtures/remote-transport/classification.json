@@ -51,9 +51,9 @@
     }
   ],
   "counts": {
-    "event": 82,
-    "request": 206,
-    "response": 143
+    "event": 83,
+    "request": 213,
+    "response": 144
   },
   "messages": {
     "event": [
@@ -98,6 +98,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "default_model_update_result"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_control_config_changed"
       },
       {
         "class": "model_delta",
@@ -1512,6 +1518,48 @@
         "tag": "image_workflow_get"
       },
       {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_create"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_update"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_endpoint_delete"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_create"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_update"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_delete"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_target_set_default"
+      },
+      {
         "class": "liveness",
         "inlinePayloadBound": "bounded",
         "lane": "control",
@@ -2448,6 +2496,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "image_control_read"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "image_control_mutated"
       },
       {
         "class": "bounded_request_response",

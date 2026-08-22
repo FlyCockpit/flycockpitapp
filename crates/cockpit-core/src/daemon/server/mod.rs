@@ -658,6 +658,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // are non-secret config identifiers (display names, model names,
         // origins).
         proto::Response::ImageControlRead(..) => {}
+        // Redacted image-control config-mutation reply. Its change set carries
+        // only `cockpit_proto::image_control` safe projections (credential_ref/
+        // headers/graph_json/source_urls are dropped at the projection funnel,
+        // exactly like the sibling `ImageControlRead` above), so there is no
+        // secret free text to scrub.
+        proto::Response::ImageControlMutated(..) => {}
         proto::Response::Unknown => {}
     }
 }
@@ -718,6 +724,13 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             mode: _,
         }
+        // Redacted LOCAL image-control `config_changed` event. Its change set
+        // carries only the `cockpit_proto::image_control` safe projections
+        // (every secret-bearing field — credential_ref/headers/graph_json/
+        // source_url — is dropped at the projection funnel, exactly like the
+        // sibling `ImageControlRead` response above), so there is no free text
+        // to scrub.
+        | proto::Event::ImageControlConfigChanged { event: _ }
         | proto::Event::ContextProjection {
             session_id: _,
             prunable_tokens: _,
@@ -5227,6 +5240,7 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+mod image_control_mutations;
 mod image_control_reads;
 mod run_invocation;
 mod sealed_capabilities;

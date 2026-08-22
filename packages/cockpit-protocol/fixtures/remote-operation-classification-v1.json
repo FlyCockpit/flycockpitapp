@@ -3422,6 +3422,191 @@
       "tag": "save_image_spend_policy"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|endpoint_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "endpoint_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|endpoint_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_endpoint_create"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|endpoint_id:string|endpoint_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "endpoint_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "endpoint_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|endpoint_id:String|endpoint_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_endpoint_update"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|endpoint_id:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "endpoint_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|endpoint_id:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_endpoint_delete"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|target_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "target_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|target_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_target_create"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|target_id:string|target_json:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "target_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "target_json",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|target_id:String|target_json:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_target_update"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|target_id:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "target_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|target_id:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_target_delete"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|target_id:string|expected_config_generation:option<u64>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "target_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_config_generation",
+          "role": "param",
+          "type": "Option<u64>"
+        }
+      ],
+      "fcorSchema": "project_root:String|target_id:String|expected_config_generation:Option<u64>",
+      "strategy": "none",
+      "tag": "image_target_set_default"
+    },
+    {
       "class": "nonrepeatable_mutation",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|provider_id:string|delete_stored_secrets:bool",

@@ -1600,6 +1600,64 @@
     },
     "request": "image_workflow_get"
   },
+  "image_endpoint_create": {
+    "params": {
+      "project_root": "/tmp/project",
+      "endpoint_json": "{\"id\":\"ep1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_endpoint_create"
+  },
+  "image_endpoint_update": {
+    "params": {
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1",
+      "endpoint_json": "{\"id\":\"ep1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_endpoint_update"
+  },
+  "image_endpoint_delete": {
+    "params": {
+      "project_root": "/tmp/project",
+      "endpoint_id": "ep1",
+      "expected_config_generation": 3
+    },
+    "request": "image_endpoint_delete"
+  },
+  "image_target_create": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_json": "{\"id\":\"t1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_target_create"
+  },
+  "image_target_update": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "target_json": "{\"id\":\"t1\"}",
+      "expected_config_generation": 3
+    },
+    "request": "image_target_update"
+  },
+  "image_target_delete": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "expected_config_generation": 3
+    },
+    "request": "image_target_delete"
+  },
+  "image_target_set_default": {
+    "params": {
+      "project_root": "/tmp/project",
+      "target_id": "t1",
+      "expected_config_generation": 3
+    },
+    "request": "image_target_set_default"
+  },
   "list_packages": {
     "request": "list_packages"
   },

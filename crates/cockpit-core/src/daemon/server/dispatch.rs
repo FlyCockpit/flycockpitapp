@@ -4277,6 +4277,20 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         | Request::ImageWorkflowList { .. }
         | Request::ImageWorkflowGet { .. } => dispatch_image_control_read(ctx, request).await,
 
+        // LOCAL owner image-config MUTATIONS (owner_only + local_only +
+        // serialized). No remote operation is ever reserved for a local_only
+        // request, so these run the load → validate(`ImageGenerationConfig::new`)
+        // → generation-CAS → write → `config_changed` sequence directly.
+        Request::ImageEndpointCreate { .. }
+        | Request::ImageEndpointUpdate { .. }
+        | Request::ImageEndpointDelete { .. }
+        | Request::ImageTargetCreate { .. }
+        | Request::ImageTargetUpdate { .. }
+        | Request::ImageTargetDelete { .. }
+        | Request::ImageTargetSetDefault { .. } => {
+            image_control_mutations::dispatch_image_control_mutation(ctx, request).await
+        }
+
         Request::SaveImageSpendPolicy {
             project_key,
             settings_json,

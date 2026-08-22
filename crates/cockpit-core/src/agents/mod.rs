@@ -32,11 +32,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 mod builtin_defs;
 pub(crate) mod invariants;
+mod profile;
 mod vnext;
 
 pub(crate) use builtin_defs::embedded_internal_default;
@@ -45,6 +46,13 @@ pub use builtin_defs::{
     is_builtin_primary, is_hidden_primary, is_removed_primary, resolve_primary_for_llm_mode,
 };
 pub use invariants::validate_invariants;
+pub use profile::{
+    AgentProfileDefinition, AgentProfileFallbackRoute, AgentProfileInstallationCatalog,
+    AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
+    AgentProfileResolutionInput, ProfileQuestionOverride, ProfileVerificationReduction,
+    ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
+    resolve_agent_profile,
+};
 use vnext::DefinitionScope;
 pub use vnext::{
     AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
@@ -1154,6 +1162,68 @@ pub fn load_daemon_local_named_from_file(path: &Path, name: &str) -> Result<Agen
     )?;
     validate_invariants(&def)?;
     Ok(def)
+}
+
+/// Load exactly the daemon-owned path recorded for one selected installation
+/// into the profile catalog.  This deliberately takes the installation UUID
+/// and observation receipt from the installation service: display names are
+/// diagnostics only and are never used to rediscover a same-named candidate.
+///
+/// Built-ins remain on their protected override loader, which verifies the
+/// canonical `cockpit/<name>` identity before the definition can enter the
+/// catalog.  Every other source uses the supplied owned path exactly once.
+pub fn load_profile_definition_from_owned_path(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    source: AgentProfileInstallationSource,
+    owned_path: &Path,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        observation.installation_id == installation.installation_id,
+        "profile observation belongs to a different installation"
+    );
+    let definition = match source {
+        AgentProfileInstallationSource::Builtin => {
+            let name = installation
+                .source_agent_id
+                .strip_prefix("cockpit/")
+                .filter(|name| is_builtin_agent(name))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "builtin installation has an unprotected source agent identity `{}`",
+                        installation.source_agent_id
+                    )
+                })?;
+            load_builtin_override_from_file(owned_path, name)?
+        }
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate => {
+            // These records are daemon-local state.  In particular, they
+            // retain the local-installation child-reference contract and may
+            // not be parsed through ordinary workspace discovery.
+            load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
+        }
+        AgentProfileInstallationSource::WorkspaceShared => {
+            // The logical parse name is daemon-owned source metadata, not a
+            // user-facing display name.  The vNext identity check below is
+            // the authority boundary.
+            load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
+        }
+    };
+    let vnext = definition
+        .vnext
+        .as_ref()
+        .context("profile installation did not load a vNext AgentDef")?;
+    ensure!(
+        vnext.agent_id == installation.source_agent_id,
+        "owned profile path identity does not match its selected installation"
+    );
+    Ok(AgentProfileDefinition {
+        installation,
+        observation,
+        source,
+        definition,
+    })
 }
 
 /// Load a per-`llm_mode` directory-form agent

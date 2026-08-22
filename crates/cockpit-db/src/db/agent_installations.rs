@@ -282,16 +282,24 @@ pub enum DelegationTarget {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RedactedAllowedChild {
-    LocalInstallation { installation_id: Uuid },
-    PortableRef { canonical_agent_ref: String },
+    LocalInstallation {
+        installation_id: Uuid,
+        /// The child execution kind was checked against the parent and host
+        /// grant before the snapshot was written.  Reload uses this durable
+        /// fact instead of rediscovering the child's editable definition.
+        execution_kind: AgentExecutionKind,
+    },
+    PortableRef {
+        canonical_agent_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactedEffectiveDelegation {
-    /// Fully resolved child identities, sorted and deduplicated.  The tagged
-    /// representation preserves the distinction between a daemon-local UUID
-    /// and a portable canonical definition reference.
+    /// Fully resolved daemon-local child identities, sorted and deduplicated.
+    /// Canonical persisted snapshots reject portable references: profile
+    /// resolution must convert each of those to one local installation first.
     pub allowed_children: Vec<RedactedAllowedChild>,
     pub max_descendant_depth: u16,
     pub max_concurrent_children: u16,
@@ -304,16 +312,24 @@ pub struct RedactedEffectiveDelegation {
 
 impl RedactedEffectiveDelegation {
     /// Determine whether this already-resolved snapshot authorizes a child of
-    /// the requested execution kind.  Portable and local child identities must
-    /// match exactly; computer children additionally require the immutable
-    /// host-policy result captured above.
+    /// the requested execution kind. Computer children additionally require
+    /// the immutable host-policy result captured above.
     pub fn permits_child_kind(
         &self,
         child: &RedactedAllowedChild,
         child_kind: AgentExecutionKind,
     ) -> bool {
-        self.allowed_children.contains(child)
-            && (child_kind != AgentExecutionKind::Computer || self.computer_delegation_enabled)
+        match child {
+            RedactedAllowedChild::LocalInstallation { execution_kind, .. } => {
+                self.allowed_children.contains(child)
+                    && *execution_kind == child_kind
+                    && (child_kind != AgentExecutionKind::Computer
+                        || self.computer_delegation_enabled)
+            }
+            // Portable references must have been resolved to a concrete local
+            // installation before a session snapshot is used for delegation.
+            RedactedAllowedChild::PortableRef { .. } => false,
+        }
     }
 }
 
@@ -324,10 +340,66 @@ pub enum VerificationEffectiveAction {
     Verify,
 }
 
+/// A closed, durable selector representation.  It retains boolean structure
+/// instead of flattening predicates into display strings, so reload can apply
+/// first-match exclusions without consulting mutable definitions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RedactedVerificationPredicate {
+    ToolClass { tool_class: String },
+    ToolId { tool_id: String },
+    Namespace { namespace: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedVerificationSelector {
+    pub all_of: Vec<RedactedVerificationPredicate>,
+    pub any_of: Vec<RedactedVerificationPredicate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RedactedVerificationSubject {
+    pub tool_class: Option<String>,
+    pub tool_id: Option<String>,
+    pub namespace: Option<String>,
+}
+
+impl RedactedVerificationSelector {
+    pub fn matches(&self, subject: &RedactedVerificationSubject) -> bool {
+        self.all_of
+            .iter()
+            .all(|predicate| predicate.matches(subject))
+            && (self.any_of.is_empty()
+                || self
+                    .any_of
+                    .iter()
+                    .any(|predicate| predicate.matches(subject)))
+    }
+}
+
+impl RedactedVerificationPredicate {
+    fn matches(&self, subject: &RedactedVerificationSubject) -> bool {
+        match self {
+            Self::ToolClass { tool_class } => subject.tool_class.as_deref() == Some(tool_class),
+            Self::ToolId { tool_id } => subject.tool_id.as_deref() == Some(tool_id),
+            Self::Namespace { namespace } => subject.namespace.as_deref() == Some(namespace),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedactedVerificationRegion {
     pub source_rule_id: String,
+    /// The source rule selector before first-match subtraction.
+    pub source_selector: RedactedVerificationSelector,
+    /// Every earlier source selector.  An effective region matches only when
+    /// none of these match, preserving `rule - earlier_rules` exactly.
+    pub excluded_prior_selectors: Vec<RedactedVerificationSelector>,
+    /// Optional session reduction, evaluated as a further intersection with
+    /// the source selector. `None` means no session selector reduction.
+    pub session_selector: Option<RedactedVerificationSelector>,
     /// The already-resolved intersection which remains enabled for this
     /// source rule.  Reload must consume it, not re-run first-match rules.
     pub enabled_intersection_mask: Vec<String>,
@@ -348,7 +420,24 @@ pub struct RedactedVerificationRegion {
     pub count_ceiling: Option<u64>,
     pub token_ceiling: Option<u64>,
     pub cost_ceiling_micros: Option<u64>,
-    pub monotonic_deadline_unix_ms: Option<u64>,
+    /// A bounded collection duration, not an absolute deadline.  The
+    /// resolver has no clock input, so persisting this as a Unix timestamp
+    /// would misrepresent its semantics on reload.
+    pub max_collection_duration_ms: Option<u64>,
+}
+
+impl RedactedVerificationRegion {
+    pub fn matches(&self, subject: &RedactedVerificationSubject) -> bool {
+        self.source_selector.matches(subject)
+            && !self
+                .excluded_prior_selectors
+                .iter()
+                .any(|selector| selector.matches(subject))
+            && self
+                .session_selector
+                .as_ref()
+                .is_none_or(|selector| selector.matches(subject))
+    }
 }
 
 /// The complete canonical non-secret payload pinned to a session.  These
@@ -1546,13 +1635,12 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             "effective delegation requires children and targets"
         );
         ensure!(
-            delegation.allowed_children.iter().all(|child| match child {
-                RedactedAllowedChild::LocalInstallation { .. } => true,
-                RedactedAllowedChild::PortableRef {
-                    canonical_agent_ref,
-                } => !canonical_agent_ref.is_empty(),
-            }) && sorted_unique(&delegation.allowed_children),
-            "effective delegation children must be canonical, sorted, and unique"
+            delegation
+                .allowed_children
+                .iter()
+                .all(|child| matches!(child, RedactedAllowedChild::LocalInstallation { .. }))
+                && sorted_unique(&delegation.allowed_children),
+            "effective delegation must contain only resolved local child installations"
         );
         ensure!(
             sorted_unique(&delegation.targets),
@@ -1580,6 +1668,10 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             .iter()
             .all(validate_verification_region),
         "verification regions violate effective action/mask/budget invariants"
+    );
+    ensure!(
+        verification_region_precedence_is_canonical(&value.verification_regions),
+        "verification regions do not preserve canonical first-match precedence"
     );
     ensure!(
         value.verification_regions.iter().all(|region| {
@@ -1692,6 +1784,15 @@ fn validate_recommendations(recommendations: &[RedactedRecommendation]) -> Resul
 
 fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
     if region.source_rule_id.is_empty()
+        || !valid_verification_selector(&region.source_selector)
+        || region
+            .excluded_prior_selectors
+            .iter()
+            .any(|selector| !valid_verification_selector(selector))
+        || region
+            .session_selector
+            .as_ref()
+            .is_some_and(|selector| !valid_verification_selector(selector))
         || !sorted_unique(&region.enabled_intersection_mask)
         || !sorted_unique(&region.explicit_off_remainder_mask)
         || !sorted_unique(&region.whole_region_off_mask)
@@ -1714,10 +1815,19 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
         region.count_ceiling.map(u64::from),
         region.token_ceiling,
         region.cost_ceiling_micros,
-        region.monotonic_deadline_unix_ms,
+        region.max_collection_duration_ms,
     ]
     .into_iter()
     .all(|value| value.is_some_and(|value| value > 0));
+    let source_mask = verification_selector_mask(&region.source_selector);
+    let enabled_and_disabled = sorted_union(
+        &region.enabled_intersection_mask,
+        &region.explicit_off_remainder_mask,
+    );
+    let selector_and_mask_agree = match &region.session_selector {
+        Some(selector) => verification_selector_mask(selector) == region.enabled_intersection_mask,
+        None => region.enabled_intersection_mask == source_mask,
+    };
     match (
         region.enabled,
         region.whole_region_off,
@@ -1726,6 +1836,8 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
         (true, false, VerificationEffectiveAction::Verify) => {
             region.whole_region_off_mask.is_empty()
                 && !region.enabled_intersection_mask.is_empty()
+                && enabled_and_disabled == source_mask
+                && selector_and_mask_agree
                 && budget_complete_and_positive
                 && region
                     .adjudicator_slot
@@ -1733,16 +1845,78 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
                     .is_some_and(|slot| !slot.is_empty())
         }
         (false, true, VerificationEffectiveAction::Off) => {
-            !region.whole_region_off_mask.is_empty()
+            region.whole_region_off_mask == source_mask
                 && region.enabled_intersection_mask.is_empty()
                 && region.count_ceiling.is_none()
                 && region.token_ceiling.is_none()
                 && region.cost_ceiling_micros.is_none()
-                && region.monotonic_deadline_unix_ms.is_none()
+                && region.max_collection_duration_ms.is_none()
                 && region.adjudicator_slot.is_none()
         }
         _ => false,
     }
+}
+
+/// The array order is the source-rule order. Every region must retain the
+/// complete ordered prefix of earlier source selectors, not merely a set of
+/// selectors which happens to be locally well formed. Otherwise a forged
+/// snapshot could omit an earlier off rule and allow later-rule fallthrough
+/// after reload.
+fn verification_region_precedence_is_canonical(regions: &[RedactedVerificationRegion]) -> bool {
+    let mut earlier = Vec::with_capacity(regions.len());
+    for region in regions {
+        if region.excluded_prior_selectors != earlier {
+            return false;
+        }
+        earlier.push(region.source_selector.clone());
+    }
+    true
+}
+
+fn sorted_union(left: &[String], right: &[String]) -> Vec<String> {
+    let mut values = left.iter().chain(right).cloned().collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn verification_selector_mask(selector: &RedactedVerificationSelector) -> Vec<String> {
+    let mut masks = selector
+        .all_of
+        .iter()
+        .map(|predicate| format!("all:{}", verification_predicate_label(predicate)))
+        .chain(
+            selector
+                .any_of
+                .iter()
+                .map(|predicate| format!("any:{}", verification_predicate_label(predicate))),
+        )
+        .collect::<Vec<_>>();
+    masks.sort();
+    masks
+}
+
+fn verification_predicate_label(predicate: &RedactedVerificationPredicate) -> String {
+    match predicate {
+        RedactedVerificationPredicate::ToolClass { tool_class } => {
+            format!("tool_class:{tool_class}")
+        }
+        RedactedVerificationPredicate::ToolId { tool_id } => format!("tool_id:{tool_id}"),
+        RedactedVerificationPredicate::Namespace { namespace } => format!("namespace:{namespace}"),
+    }
+}
+
+fn valid_verification_selector(selector: &RedactedVerificationSelector) -> bool {
+    let predicate_valid = |predicate: &RedactedVerificationPredicate| match predicate {
+        RedactedVerificationPredicate::ToolClass { tool_class } => !tool_class.is_empty(),
+        RedactedVerificationPredicate::ToolId { tool_id } => !tool_id.is_empty(),
+        RedactedVerificationPredicate::Namespace { namespace } => !namespace.is_empty(),
+    };
+    (!selector.all_of.is_empty() || !selector.any_of.is_empty())
+        && sorted_unique(&selector.all_of)
+        && sorted_unique(&selector.any_of)
+        && selector.all_of.iter().all(predicate_valid)
+        && selector.any_of.iter().all(predicate_valid)
 }
 
 fn validate_question_policy(
@@ -2034,6 +2208,15 @@ mod tests {
         }
     }
 
+    fn verification_selector() -> RedactedVerificationSelector {
+        RedactedVerificationSelector {
+            all_of: vec![RedactedVerificationPredicate::ToolId {
+                tool_id: "read".into(),
+            }],
+            any_of: Vec::new(),
+        }
+    }
+
     async fn prepared_fixture(db: &Db) -> (Uuid, Uuid, String) {
         let install = installation(AgentInstallationScope::Global, None);
         let installation_id = install.installation_id;
@@ -2116,7 +2299,10 @@ mod tests {
             },
             verification_regions: vec![RedactedVerificationRegion {
                 source_rule_id: "r1".into(),
-                enabled_intersection_mask: vec!["tool:read".into()],
+                source_selector: verification_selector(),
+                excluded_prior_selectors: Vec::new(),
+                session_selector: None,
+                enabled_intersection_mask: vec!["all:tool_id:read".into()],
                 enabled: true,
                 explicit_off_remainder_mask: vec![],
                 whole_region_off: false,
@@ -2126,7 +2312,7 @@ mod tests {
                 count_ceiling: Some(1),
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
-                monotonic_deadline_unix_ms: Some(12),
+                max_collection_duration_ms: Some(12),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -2583,7 +2769,10 @@ mod tests {
             },
             verification_regions: vec![RedactedVerificationRegion {
                 source_rule_id: "rule".into(),
-                enabled_intersection_mask: vec!["tool:read".into()],
+                source_selector: verification_selector(),
+                excluded_prior_selectors: Vec::new(),
+                session_selector: None,
+                enabled_intersection_mask: vec!["all:tool_id:read".into()],
                 enabled: true,
                 explicit_off_remainder_mask: vec![],
                 whole_region_off: false,
@@ -2593,7 +2782,7 @@ mod tests {
                 count_ceiling: Some(1),
                 token_ceiling: Some(1),
                 cost_ceiling_micros: Some(1),
-                monotonic_deadline_unix_ms: Some(1),
+                max_collection_duration_ms: Some(1),
             }],
             bindings: vec![RedactedBindingEvidence {
                 slot_id: "primary".into(),
@@ -2739,15 +2928,13 @@ mod tests {
         let local_child_installation_id = Uuid::now_v7();
         let local_child = RedactedAllowedChild::LocalInstallation {
             installation_id: local_child_installation_id,
-        };
-        let portable_child = RedactedAllowedChild::PortableRef {
-            canonical_agent_ref: "authored/reviewer".into(),
+            execution_kind: AgentExecutionKind::Coding,
         };
         let profile = RedactedAgentProfileSnapshot {
             agent_id: "authored/builder".into(),
             execution_kind: AgentExecutionKind::Coding,
             effective_delegation: Some(RedactedEffectiveDelegation {
-                allowed_children: vec![local_child.clone(), portable_child.clone()],
+                allowed_children: vec![local_child.clone()],
                 max_descendant_depth: 1,
                 max_concurrent_children: 1,
                 targets: vec![DelegationTarget::SameRoot],
@@ -2790,9 +2977,12 @@ mod tests {
             verification_regions: vec![
                 RedactedVerificationRegion {
                     source_rule_id: "source-allow".into(),
-                    enabled_intersection_mask: vec!["repo:src/**".into()],
+                    source_selector: verification_selector(),
+                    excluded_prior_selectors: Vec::new(),
+                    session_selector: None,
+                    enabled_intersection_mask: vec!["all:tool_id:read".into()],
                     enabled: true,
-                    explicit_off_remainder_mask: vec!["repo:src/private/**".into()],
+                    explicit_off_remainder_mask: vec![],
                     whole_region_off: false,
                     whole_region_off_mask: vec![],
                     effective_action: VerificationEffectiveAction::Verify,
@@ -2800,21 +2990,24 @@ mod tests {
                     count_ceiling: Some(2),
                     token_ceiling: Some(100),
                     cost_ceiling_micros: Some(42),
-                    monotonic_deadline_unix_ms: Some(999),
+                    max_collection_duration_ms: Some(999),
                 },
                 RedactedVerificationRegion {
                     source_rule_id: "source-deny".into(),
+                    source_selector: verification_selector(),
+                    excluded_prior_selectors: vec![verification_selector()],
+                    session_selector: None,
                     enabled_intersection_mask: vec![],
                     enabled: false,
                     explicit_off_remainder_mask: vec![],
                     whole_region_off: true,
-                    whole_region_off_mask: vec!["repo:deny/**".into()],
+                    whole_region_off_mask: vec!["all:tool_id:read".into()],
                     effective_action: VerificationEffectiveAction::Off,
                     adjudicator_slot: None,
                     count_ceiling: None,
                     token_ceiling: None,
                     cost_ceiling_micros: None,
-                    monotonic_deadline_unix_ms: None,
+                    max_collection_duration_ms: None,
                 },
             ],
             bindings: vec![RedactedBindingEvidence {
@@ -2837,7 +3030,6 @@ mod tests {
         assert_eq!(reconstructed, profile);
         let delegation = reconstructed.effective_delegation.as_ref().unwrap();
         assert!(delegation.permits_child_kind(&local_child, AgentExecutionKind::Coding));
-        assert!(delegation.permits_child_kind(&portable_child, AgentExecutionKind::Coding));
         assert!(!delegation.permits_child_kind(&local_child, AgentExecutionKind::Computer));
         let unmatched = reconstructed
             .recommendations
@@ -2875,13 +3067,14 @@ mod tests {
             outcome => panic!("expected prepared computer snapshot, got {outcome:?}"),
         };
         assert!(
-            computer_enabled_snapshot
+            !computer_enabled_snapshot
                 .reconstruct()
                 .unwrap()
                 .effective_delegation
                 .as_ref()
                 .unwrap()
-                .permits_child_kind(&local_child, AgentExecutionKind::Computer)
+                .permits_child_kind(&local_child, AgentExecutionKind::Computer),
+            "a host computer grant cannot change the durable coding child kind"
         );
     }
 
@@ -2892,6 +3085,30 @@ mod tests {
         let mut profile =
             decode_canonical_snapshot(&input.canonical_snapshot_payload, "test canonical snapshot")
                 .unwrap();
+        let mut unresolved_portable_child = profile.clone();
+        unresolved_portable_child.effective_delegation = Some(RedactedEffectiveDelegation {
+            allowed_children: vec![RedactedAllowedChild::PortableRef {
+                canonical_agent_ref: "authored/reviewer".into(),
+            }],
+            max_descendant_depth: 1,
+            max_concurrent_children: 1,
+            targets: vec![DelegationTarget::SameRoot],
+            computer_delegation_enabled: false,
+        });
+        let unresolved_portable_child = serde_json::to_vec(&unresolved_portable_child).unwrap();
+        assert!(
+            decode_canonical_snapshot(&unresolved_portable_child, "unresolved portable child")
+                .is_err()
+        );
+        let mut forged_precedence = profile.clone();
+        let mut later_region = forged_precedence.verification_regions[0].clone();
+        later_region.source_rule_id = "r2".into();
+        later_region.excluded_prior_selectors.clear();
+        forged_precedence.verification_regions.push(later_region);
+        let forged_precedence = serde_json::to_vec(&forged_precedence).unwrap();
+        assert!(
+            decode_canonical_snapshot(&forged_precedence, "forged first-match precedence").is_err()
+        );
         profile.question_policy = RedactedQuestionPolicy::Off;
         let off = serde_json::to_vec(&profile).unwrap();
         assert!(decode_canonical_snapshot(&off, "off policy").is_ok());
@@ -2912,17 +3129,24 @@ mod tests {
         let missing_adjudicator = serde_json::to_vec(&profile).unwrap();
         assert!(decode_canonical_snapshot(&missing_adjudicator, "missing adjudicator").is_err());
 
+        profile.verification_regions[0].adjudicator_slot = Some("primary".into());
+        profile.verification_regions[0].enabled_intersection_mask =
+            vec!["all:tool_id:forged".into()];
+        let forged_selector_mask = serde_json::to_vec(&profile).unwrap();
+        assert!(decode_canonical_snapshot(&forged_selector_mask, "forged selector mask").is_err());
+        profile.verification_regions[0].enabled_intersection_mask = vec!["all:tool_id:read".into()];
+
         profile.verification_regions[0].effective_action = VerificationEffectiveAction::Off;
         profile.verification_regions[0].enabled = false;
         profile.verification_regions[0].whole_region_off = true;
-        profile.verification_regions[0].whole_region_off_mask = vec!["tool:read".into()];
+        profile.verification_regions[0].whole_region_off_mask = vec!["all:tool_id:read".into()];
         profile.verification_regions[0]
             .enabled_intersection_mask
             .clear();
         profile.verification_regions[0].count_ceiling = None;
         profile.verification_regions[0].token_ceiling = None;
         profile.verification_regions[0].cost_ceiling_micros = None;
-        profile.verification_regions[0].monotonic_deadline_unix_ms = None;
+        profile.verification_regions[0].max_collection_duration_ms = None;
         profile.verification_regions[0].adjudicator_slot = Some("primary".into());
         let off_with_slot = serde_json::to_vec(&profile).unwrap();
         assert!(decode_canonical_snapshot(&off_with_slot, "off region with slot").is_err());

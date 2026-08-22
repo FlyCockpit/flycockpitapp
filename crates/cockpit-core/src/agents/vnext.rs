@@ -769,11 +769,11 @@ pub fn resolve_question_policy(
         }
         return Ok(None);
     };
-    if base.decision_timeout_seconds > host.max_question_timeout_seconds {
-        bail!("questions.decisionTimeoutSeconds exceeds the host resource ceiling");
-    }
     if matches!(override_policy, QuestionOverride::Disable) {
         return Ok(None);
+    }
+    if base.decision_timeout_seconds > host.max_question_timeout_seconds {
+        bail!("questions.decisionTimeoutSeconds exceeds the host resource ceiling");
     }
     let chosen = match override_policy {
         QuestionOverride::Inherit => base,
@@ -1160,7 +1160,7 @@ pub enum ProhibitedQuestionClass {
 }
 
 impl ProhibitedQuestionClass {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Credential => "credential",
             Self::Authorization => "authorization",
@@ -1306,7 +1306,7 @@ impl VerificationRule {
         self.max_candidates.unwrap_or(DEFAULT_MAX_CANDIDATES)
     }
 
-    fn requested_budget(&self, ceiling: VerificationBudget) -> Result<VerificationBudget> {
+    pub fn requested_budget(&self, ceiling: VerificationBudget) -> Result<VerificationBudget> {
         let requested = VerificationBudget {
             max_candidates: self.resolved_max_candidates(),
             max_total_tokens: self.max_total_tokens.unwrap_or(ceiling.max_total_tokens),

@@ -7,6 +7,90 @@ use std::path::Path;
 use super::invariants::{LOCK_WRITE_TOOLS, SANDBOX_ONLY_TOOLS};
 use super::*;
 
+#[test]
+fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
+    use cockpit_db::db::agent_installations::{
+        AgentInstallationRow, AgentInstallationScope, AgentObservationRow,
+    };
+
+    fn installation(
+        source_agent_id: &str,
+        scope: AgentInstallationScope,
+        workspace: Option<&str>,
+    ) -> AgentInstallationRow {
+        AgentInstallationRow {
+            installation_id: uuid::Uuid::now_v7(),
+            scope,
+            canonical_workspace_id: workspace.map(str::to_owned),
+            source_agent_id: source_agent_id.into(),
+            source_identity: "owned-path-test".into(),
+            source_revision: None,
+            source_digest: "digest".into(),
+            fetched_at_unix_ms: 0,
+            installation_revision: 1,
+            deleted_at_unix_ms: None,
+        }
+    }
+
+    fn observation(installation: &AgentInstallationRow) -> AgentObservationRow {
+        AgentObservationRow {
+            installation_id: installation.installation_id,
+            observed_digest: installation.source_digest.clone(),
+            observation_revision: 1,
+            reviewed: true,
+            observed_at_unix_ms: 0,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local.md");
+    fs::write(
+        &local,
+        "---\ndescription: local\nschemaVersion: 2\nagentId: local/private\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+    )
+    .unwrap();
+    let global = installation("local/private", AgentInstallationScope::Global, None);
+    assert!(
+        load_profile_definition_from_owned_path(
+            global.clone(),
+            observation(&global),
+            AgentProfileInstallationSource::Global,
+            &local,
+        )
+        .is_ok()
+    );
+
+    let shared = installation(
+        "authored/shared",
+        AgentInstallationScope::WorkspaceShared,
+        Some("workspace"),
+    );
+    assert!(
+        load_profile_definition_from_owned_path(
+            shared.clone(),
+            observation(&shared),
+            AgentProfileInstallationSource::WorkspaceShared,
+            &local,
+        )
+        .is_err()
+    );
+    let authored = tmp.path().join("shared.md");
+    fs::write(
+        &authored,
+        "---\ndescription: shared\nschemaVersion: 2\nagentId: authored/shared\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+    )
+    .unwrap();
+    assert!(
+        load_profile_definition_from_owned_path(
+            shared.clone(),
+            observation(&shared),
+            AgentProfileInstallationSource::WorkspaceShared,
+            &authored,
+        )
+        .is_ok()
+    );
+}
+
 /// A `.cockpit/` config dir under `cwd`, so the discovery walk-up finds a
 /// project-scoped layer. Returns the `agents/` subdir.
 fn project_agents_dir(cwd: &Path) -> std::path::PathBuf {

@@ -1001,6 +1001,14 @@ pub struct ModelParams {
     /// vendor keys only; cockpit's own keys are stripped from it before the
     /// merge so it can never clobber them.
     pub additional_params: Option<serde_json::Value>,
+    /// The alternate vendor fragment for OpenAI endpoint routing. This is
+    /// populated alongside catalog-derived reasoning controls so an
+    /// endpoint-scoped Responses mapping is omitted on Chat Completions both
+    /// during recovery and on later turns after that endpoint is persisted.
+    /// Endpoint-agnostic mappings supply the same value for both routes.
+    /// Hand-authored `additional_params` leave this unset and are retained on
+    /// either endpoint.
+    pub endpoint_recovery_additional_params: Option<EndpointRecoveryAdditionalParams>,
     /// Top-level `prompt_cache_key` for OpenAI-compatible backends
     /// (prompt `prompt-caching-strategy.md`, decision 3) — the session id,
     /// held constant for the session so the backend's per-key prefix cache
@@ -1021,6 +1029,32 @@ pub struct ModelParams {
     /// the gating prompt is responsible for attaching it only to approved
     /// computer-use subagent turns.
     pub native_computer: Option<crate::computer::NativeComputerToolConfig>,
+}
+
+impl ModelParams {
+    /// Select the catalog-derived vendor fragment for the endpoint that will
+    /// actually receive this request. Endpoint recovery is persisted on the
+    /// model, while a session's [`ModelParams`] are intentionally long-lived,
+    /// so this selection must happen at dispatch time rather than only on the
+    /// one recovery retry.
+    pub fn additional_params_for_wire(
+        &self,
+        wire_api: crate::config::providers::WireApi,
+    ) -> Option<serde_json::Value> {
+        match &self.endpoint_recovery_additional_params {
+            Some(recovery) if wire_api != recovery.primary_wire_api => recovery.alternate.clone(),
+            Some(_) | None => self.additional_params.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EndpointRecoveryAdditionalParams {
+    /// Endpoint for which [`ModelParams::additional_params`] was resolved.
+    /// The alternate fragment is selected whenever dispatch uses its opposite,
+    /// including turns after a successful endpoint recovery was persisted.
+    pub primary_wire_api: crate::config::providers::WireApi,
+    pub alternate: Option<serde_json::Value>,
 }
 
 /// Utility/non-streaming model dispatch budget and override seam.

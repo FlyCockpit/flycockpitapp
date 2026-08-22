@@ -252,9 +252,11 @@ impl Provider for CopilotProvider {
     }
 
     fn matches(&self, provider_id: &str, entry: &ProviderEntry) -> bool {
-        provider_id.eq_ignore_ascii_case("copilot")
-            || entry.credential_ref.as_deref() == Some("copilot")
-            || entry.url.contains("githubcopilot.com")
+        // Unified with `ProviderEntry::is_copilot_identity` so URL recognition
+        // uses the host-boundary check (not substring matching), which avoids
+        // injecting the ambient GitHub token toward a `githubcopilot.com`
+        // look-alike host.
+        entry.is_copilot_identity(provider_id)
     }
 
     fn request_kind(&self) -> ProviderRequestKind {

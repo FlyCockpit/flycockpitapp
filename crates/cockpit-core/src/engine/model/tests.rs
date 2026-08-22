@@ -1553,6 +1553,29 @@ fn assembled_request_additional_params_null_when_absent() {
     assert_eq!(body["additional_params"], serde_json::Value::Null);
 }
 
+#[test]
+fn assembled_dispatch_request_uses_persisted_endpoint_extra_params() {
+    let model = openai_model_at_with_wire("http://127.0.0.1:1/v1", WireApi::Completions, true);
+    let params = ModelParams {
+        additional_params: Some(json!({ "reasoning": { "effort": "ultra" } })),
+        endpoint_recovery_additional_params: Some(EndpointRecoveryAdditionalParams {
+            primary_wire_api: WireApi::Responses,
+            alternate: None,
+        }),
+        ..ModelParams::default()
+    };
+
+    let body = model
+        .assemble_dispatch_request("system", &[], &Message::user("hi"), &[], &params)
+        .expect("dispatch request must assemble");
+
+    assert_eq!(
+        body["additional_params"],
+        serde_json::Value::Null,
+        "a record assembled after recovery must not retain Responses-only extras"
+    );
+}
+
 /// Baseten Model APIs rides the generic OpenAI-compatible Chat Completions
 /// path: tools, structured outputs, SSE/usage, and attachment gates keep
 /// generic behavior, and no automatic `chat_template_kwargs`, reasoning
@@ -2934,6 +2957,10 @@ fn persist_wire_api_pins_resolved_endpoint_without_clobbering() {
         .find(|m| m.id == "gpt-5.4-mini")
         .unwrap();
     assert_eq!(saved.wire_api, WireApi::Responses);
+    assert_eq!(
+        saved.wire_api_provenance,
+        crate::config::providers::WireApiProvenance::Recovered
+    );
     assert_eq!(saved.name.as_deref(), Some("GPT-5.4 mini"));
     assert_eq!(saved.context_length, Some(123_456));
     assert!(saved.favorite);
@@ -2955,6 +2982,10 @@ fn persist_wire_api_pins_resolved_endpoint_without_clobbering() {
         .find(|m| m.id == "gpt-5-new")
         .unwrap();
     assert_eq!(created.wire_api, WireApi::Responses);
+    assert_eq!(
+        created.wire_api_provenance,
+        crate::config::providers::WireApiProvenance::Recovered
+    );
     assert!(
         created.manual,
         "an auto-created pin entry is manual so it survives refetch"
@@ -3423,6 +3454,7 @@ fn resolve_native_reasoning_params(
             .collect(),
         default: Some("medium".into()),
         request_mapping: Some(request_mapping),
+        endpoint_request_mappings: Vec::new(),
         source: None,
     };
     let mut providers = ProvidersConfig::default();
@@ -3509,6 +3541,7 @@ async fn capture_openai_body(
                                     field: "reasoning_effort".into(),
                                     values: Default::default(),
                                 }),
+                                endpoint_request_mappings: Vec::new(),
                                 source: None,
                             }),
                             ..ModelCapabilities::default()
@@ -4027,13 +4060,31 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
             "properties": { "optional": { "type": "string" } }
         }),
     }];
+    let params = ModelParams {
+        // Models fetched from a Responses catalog use this nested shape. The
+        // recovery retry below must not replay it to Chat Completions.
+        // `effort` uses a value rig's typed Responses `ReasoningEffort` accepts
+        // (its variants are none/minimal/low/medium/high/xhigh/max — there is no
+        // `ultra`); an unknown value makes rig reject the whole
+        // `additional_params` payload before dispatch. The specific level is
+        // incidental to this test, which asserts the nested `reasoning` shape is
+        // sent on Responses and suppressed on the Chat Completions retry.
+        additional_params: Some(serde_json::json!({
+            "reasoning": { "effort": "high" }
+        })),
+        endpoint_recovery_additional_params: Some(EndpointRecoveryAdditionalParams {
+            primary_wire_api: WireApi::Responses,
+            alternate: None,
+        }),
+        ..ModelParams::default()
+    };
     let ((_message_id, _choice, _usage), captured, _timing) = model
         .complete_captured(
             "system",
             &[],
             Message::user("hi"),
             &tools,
-            ModelParams::default(),
+            params.clone(),
             "Build",
             Some(&tx),
             &CancellationToken::new(),
@@ -4041,19 +4092,18 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
         )
         .await
         .expect("approved endpoint swap succeeds");
+    let responses_request = provider.next_request().await;
+    assert!(responses_request.request_line.contains("/responses"));
+    assert!(request_body_string(&responses_request).contains("\"reasoning\""));
+    let completions_request = provider.next_request().await;
     assert!(
-        provider
-            .next_request()
-            .await
-            .request_line
-            .contains("/responses")
-    );
-    assert!(
-        provider
-            .next_request()
-            .await
+        completions_request
             .request_line
             .contains("/chat/completions")
+    );
+    assert!(
+        !request_body_string(&completions_request).contains("\"reasoning\""),
+        "endpoint-scoped Responses parameters must be suppressed on the retry"
     );
     assert_eq!(
         captured["tools"][0]["parameters"]["properties"]["optional"]["type"], "string",
@@ -4064,6 +4114,85 @@ async fn approved_responses_404_retries_chat_and_persists_completions() {
         doc.providers().resolve_wire_api("p", "m"),
         WireApi::Completions,
         "successful alternate endpoint must persist completions"
+    );
+
+    model
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("the next turn"),
+            &[],
+            params,
+            "Build",
+            Some(&tx),
+            &CancellationToken::new(),
+            Some(EndpointRecoveryContext {
+                approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+            }),
+        )
+        .await
+        .expect("persisted Chat Completions endpoint succeeds on the next turn");
+    let next_request = provider.next_request().await;
+    assert!(
+        next_request.request_line.contains("/chat/completions"),
+        "the persisted recovery endpoint must be used directly on later turns"
+    );
+    assert!(
+        !request_body_string(&next_request).contains("\"reasoning\""),
+        "a later chat-completions turn must not replay Responses-only parameters"
+    );
+}
+
+#[tokio::test]
+async fn endpoint_recovery_keeps_endpoint_agnostic_extra_params() {
+    use crate::config::providers::WireApi;
+
+    let mut provider = responses_404_then_chat_ok_provider(2).await;
+    let model = openai_model_at_with_wire(&provider.base_url(), WireApi::Responses, false);
+    let recovery = EndpointRecoveryContext {
+        approve: std::sync::Arc::new(|_| Box::pin(async { true })),
+    };
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    model
+        .complete_captured(
+            "system",
+            &[],
+            Message::user("hi"),
+            &[],
+            ModelParams {
+                // The endpoint-agnostic extra is carried in the `metadata`
+                // passthrough so it survives on BOTH wires: rig's typed OpenAI
+                // Responses model only serializes recognized keys (bare unknown
+                // top-level keys like a raw `vendor_knob` are silently dropped),
+                // whereas `metadata` is its sanctioned free-form channel and is
+                // equally accepted on Chat Completions. The value still appears
+                // verbatim in the body, so the substring assertions below are
+                // unchanged.
+                additional_params: Some(serde_json::json!({
+                    "metadata": { "vendor_knob": "on" }
+                })),
+                endpoint_recovery_additional_params: Some(EndpointRecoveryAdditionalParams {
+                    primary_wire_api: WireApi::Responses,
+                    alternate: Some(serde_json::json!({ "reasoning_effort": "high" })),
+                }),
+                ..ModelParams::default()
+            },
+            "Build",
+            Some(&tx),
+            &CancellationToken::new(),
+            Some(recovery),
+        )
+        .await
+        .expect("approved endpoint swap succeeds");
+
+    let responses_request = provider.next_request().await;
+    assert!(request_body_string(&responses_request).contains("vendor_knob"));
+    let completions_request = provider.next_request().await;
+    let completions_body = request_body_string(&completions_request);
+    assert!(completions_body.contains("reasoning_effort"));
+    assert!(
+        !completions_body.contains("vendor_knob"),
+        "the alternate endpoint must use its own mapping rather than replaying the original"
     );
 }
 
@@ -4203,6 +4332,59 @@ fn resolve_live_endpoint_precedence_order() {
     assert_eq!(
         model.resolve_live_wire_api_for_base_url("http://localhost:1234/v1"),
         WireApi::Responses
+    );
+}
+
+#[test]
+fn live_catalog_endpoint_supersedes_stale_learned_endpoint() {
+    use crate::config::providers::ModelCapabilities;
+    let _guard = endpoint_probe_test_guard();
+    endpoint_probes().lock().unwrap().clear();
+    let url = "http://localhost:1234/v1";
+    let model = openai_model_at_with_wire(url, WireApi::Auto, false);
+
+    record_endpoint_observation(
+        "p",
+        "m",
+        url,
+        WireApi::Completions,
+        EndpointObservation::Works,
+    );
+    assert_eq!(
+        model.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions,
+        "the learned endpoint remains the best route before catalog metadata arrives"
+    );
+
+    let mut providers = ProvidersConfig::default();
+    providers.providers.insert(
+        "p".into(),
+        ProviderEntry {
+            url: url.into(),
+            models: vec![ModelEntry {
+                id: "m".into(),
+                capabilities: ModelCapabilities {
+                    supported_wire_apis: vec![WireApi::Responses],
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+    model.refresh_wire_api_config(&providers);
+
+    assert_eq!(
+        model.resolve_live_wire_api_for_base_url(url),
+        WireApi::Responses,
+        "live catalog metadata must supersede a stale learned endpoint"
+    );
+
+    model.confirm_wire_api_for_base_url(url, WireApi::Completions);
+    assert_eq!(
+        model.resolve_live_wire_api_for_base_url(url),
+        WireApi::Completions,
+        "a successful recovery remains authoritative for the current session"
     );
 }
 
@@ -5029,6 +5211,68 @@ async fn utility_params_applied_on_openai_arm() {
     assert_eq!(body["max_tokens"], 99, "{body}");
     assert_eq!(body["prompt_cache_key"], "session-cache-key", "{body}");
     assert_eq!(body["vendor_knob"], "on", "{body}");
+}
+
+#[tokio::test]
+async fn utility_omits_responses_only_extra_params_on_live_completions_wire() {
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, false)]).await;
+    let url = provider.base_url();
+    let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+    let params = ModelParams {
+        additional_params: Some(json!({ "reasoning": { "effort": "ultra" } })),
+        endpoint_recovery_additional_params: Some(EndpointRecoveryAdditionalParams {
+            primary_wire_api: WireApi::Responses,
+            alternate: None,
+        }),
+        ..ModelParams::default()
+    };
+
+    model
+        .text_completion_with_params(UtilityCallSite::Predict, params, "hi")
+        .await
+        .unwrap();
+
+    let request = provider.next_request().await;
+    assert!(request.request_line.contains("/chat/completions"));
+    assert!(
+        !request_body_string(&request).contains("\"reasoning\""),
+        "utility requests must not replay Responses-only extras to Chat Completions"
+    );
+}
+
+#[tokio::test]
+async fn tandem_omits_responses_only_extra_params_on_live_completions_wire() {
+    let mut provider =
+        provider_with_turns([raw_json_turn_for_wire(WireApi::Completions, false)]).await;
+    let url = provider.base_url();
+    let model = openai_model_at_with_wire(&url, WireApi::Completions, true);
+    let params = ModelParams {
+        additional_params: Some(json!({ "reasoning": { "effort": "ultra" } })),
+        endpoint_recovery_additional_params: Some(EndpointRecoveryAdditionalParams {
+            primary_wire_api: WireApi::Responses,
+            alternate: None,
+        }),
+        ..ModelParams::default()
+    };
+
+    let outcome = model
+        .complete_tandem("system", &[], &Message::user("hi"), &[], &params)
+        .await;
+    assert_eq!(
+        outcome.status,
+        crate::db::session_log::InferenceRequestStatus::Completed
+    );
+    assert!(
+        !outcome.request.to_string().contains("\"reasoning\""),
+        "the recorded tandem request must match the endpoint-safe payload"
+    );
+    let request = provider.next_request().await;
+    assert!(request.request_line.contains("/chat/completions"));
+    assert!(
+        !request_body_string(&request).contains("\"reasoning\""),
+        "tandem requests must not replay Responses-only extras to Chat Completions"
+    );
 }
 
 #[tokio::test]

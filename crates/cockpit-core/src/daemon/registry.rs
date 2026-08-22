@@ -1149,6 +1149,8 @@ impl SessionRegistry {
         let mut session_providers = providers_cfg.clone();
         session_providers.active_model = Some(session_active.clone());
         let thinking_params = model.resolve_reasoning_params(&session_providers);
+        let endpoint_recovery_thinking_params =
+            model.endpoint_recovery_reasoning_params(&session_providers);
 
         // A plan-level pin is a second behavioral use of the authoritative
         // session model, not a parallel selection. Reuse the already-validated
@@ -1181,6 +1183,7 @@ impl SessionRegistry {
             model,
             model_override,
             thinking_params,
+            endpoint_recovery_thinking_params,
             project_root.clone(),
             client_no_sandbox,
             daemon_no_sandbox,

@@ -23,9 +23,10 @@ use reqwest::{StatusCode, Url};
 use serde_json::{Map, Value};
 
 use crate::config::providers::{
-    CapabilitySource, CapabilityStatus, CapabilityValue, ClientSideToolsCapability, HeaderSpec,
-    ModelCapabilities, ModelEntry, ProviderEntry, ProviderModelCatalog, ReasoningEffortCapability,
-    ReasoningEffortRequestMapping, ThinkingMode, validate_anthropic_model_configuration,
+    CapabilitySource, CapabilityStatus, CapabilityValue, ClientSideToolsCapability,
+    EndpointReasoningEffortRequestMapping, HeaderSpec, ModelCapabilities, ModelEntry,
+    ProviderEntry, ProviderModelCatalog, ReasoningEffortCapability, ReasoningEffortRequestMapping,
+    ThinkingMode, WireApi, validate_anthropic_model_configuration,
 };
 use crate::envref;
 #[cfg(not(test))]
@@ -638,7 +639,7 @@ async fn fetch_models_at(
     headers: &[ResolvedHeader],
     timeout: Duration,
 ) -> Result<FetchOutcome> {
-    fetch_models_at_detailed(url, headers, timeout)
+    fetch_models_at_detailed(url, headers, timeout, ModelCatalogAbi::Generic)
         .await
         .map(|result| result.outcome)
 }
@@ -653,6 +654,7 @@ async fn fetch_models_at_detailed(
     url: &str,
     headers: &[ResolvedHeader],
     timeout: Duration,
+    catalog_abi: ModelCatalogAbi,
 ) -> Result<FetchModelsAtResult> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -680,7 +682,7 @@ async fn fetch_models_at_detailed(
 
     let body = read_success_body_limited(resp).await?;
     let body_nonempty = !body.trim().is_empty();
-    let models = parse_models_body(&body)?;
+    let models = parse_models_body_with_abi(&body, catalog_abi)?;
     Ok(FetchModelsAtResult {
         outcome: FetchOutcome::Models {
             models,
@@ -768,9 +770,14 @@ pub async fn fetch_models_for_provider_with_store(
     let url = provider.models_url(entry, &request.base_url);
     let fallback_models = provider.fallback_models();
     let fallback_catalog = provider.fallback_catalog();
-    let outcome = fetch_models_at_detailed(&url, &request.headers, timeout)
-        .await
-        .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
+    let outcome = fetch_models_at_detailed(
+        &url,
+        &request.headers,
+        timeout,
+        ModelCatalogAbi::from(provider.request_kind()),
+    )
+    .await
+    .and_then(|result| validate_anthropic_fetch_result(entry, &request.base_url, result));
     if fallback_models.is_empty() {
         return outcome.map(|result| result.outcome);
     }
@@ -871,6 +878,30 @@ async fn read_success_body_limited(mut resp: reqwest::Response) -> Result<String
 }
 
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
+    parse_models_body_with_abi(body, ModelCatalogAbi::Generic)
+}
+
+/// Request-body ABI whose metadata projections are understood for a fetched
+/// model catalog. Endpoint availability is provider-neutral, but a capability
+/// list alone does not establish how to encode that capability on a request.
+/// Keep provider-specific encodings opt-in here rather than inferring them
+/// from fields that an OpenAI-compatible gateway might happen to share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelCatalogAbi {
+    Generic,
+    Copilot,
+}
+
+impl From<ProviderRequestKind> for ModelCatalogAbi {
+    fn from(request_kind: ProviderRequestKind) -> Self {
+        match request_kind {
+            ProviderRequestKind::Template => Self::Generic,
+            ProviderRequestKind::Copilot => Self::Copilot,
+        }
+    }
+}
+
+fn parse_models_body_with_abi(body: &str, catalog_abi: ModelCatalogAbi) -> Result<Vec<ModelEntry>> {
     let parsed: Value = serde_json::from_str(body)
         .with_context(|| format!("parsing /models response: {}", response_body_snippet(body)))?;
     let entries: Vec<Value> = match parsed {
@@ -918,7 +949,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 serde_json::from_value::<crate::config::providers::Inputs>(v.clone()).ok()
             });
 
-            let capabilities = match model_capabilities_from_metadata(obj) {
+            let capabilities = match model_capabilities_from_metadata(obj, catalog_abi) {
                 Ok(capabilities) => capabilities,
                 Err(error) => return Some(Err(anyhow!("model `{id}` capabilities: {error}"))),
             };
@@ -981,6 +1012,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 // carried over by `merge_fetched_models`
                 // (implementation note).
                 wire_api: Default::default(),
+                wire_api_provenance: Default::default(),
                 extra: extra.clone(),
                 capabilities,
                 capability_overrides: Default::default(),
@@ -990,7 +1022,10 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
         .collect()
 }
 
-fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCapabilities> {
+fn model_capabilities_from_metadata(
+    obj: &Map<String, Value>,
+    catalog_abi: ModelCatalogAbi,
+) -> Result<ModelCapabilities> {
     let context_tokens = context_tokens_from_metadata(obj);
     let max_output_tokens = max_output_tokens_from_metadata(obj);
     let input_modalities = input_modalities_from_metadata(obj);
@@ -1043,7 +1078,8 @@ fn model_capabilities_from_metadata(obj: &Map<String, Value>) -> Result<ModelCap
             ],
         ),
         prompt_cache_retention: Default::default(),
-        reasoning_effort: reasoning_effort_capability_from_metadata(obj)?,
+        reasoning_effort: reasoning_effort_capability_from_metadata(obj, catalog_abi)?,
+        supported_wire_apis: supported_wire_apis_from_metadata(obj),
         client_side_tools: client_side_tools_capability_from_metadata(obj).unwrap_or_default(),
         computer_use: Default::default(),
     })
@@ -1358,6 +1394,7 @@ fn client_side_tools_status(raw: &str) -> Option<CapabilityStatus> {
 
 fn reasoning_effort_capability_from_metadata(
     obj: &Map<String, Value>,
+    catalog_abi: ModelCatalogAbi,
 ) -> Result<Option<ReasoningEffortCapability>> {
     if let Some(raw) = obj
         .get("capabilities")
@@ -1371,10 +1408,27 @@ fn reasoning_effort_capability_from_metadata(
     }
 
     let mut values = Vec::new();
-    if let Some(raw_values) = obj
+    // `supported_reasoning_levels` is our established generic catalog
+    // contract and maps to OpenAI's top-level `reasoning_effort` parameter.
+    // Copilot's similarly-shaped nested metadata instead describes its
+    // Responses-only `reasoning.effort` ABI. Do not turn a lookalike field
+    // from an arbitrary gateway into a request parameter.
+    let raw_values = obj
         .get("supported_reasoning_levels")
         .and_then(Value::as_array)
-    {
+        .or_else(|| {
+            (catalog_abi == ModelCatalogAbi::Copilot)
+                .then(|| {
+                    obj.get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|capabilities| capabilities.get("supports"))
+                        .and_then(Value::as_object)
+                        .and_then(|supports| supports.get("reasoning_effort"))
+                        .and_then(Value::as_array)
+                })
+                .flatten()
+        });
+    if let Some(raw_values) = raw_values {
         for raw in raw_values {
             let Some(value) = reasoning_level_value(raw) else {
                 continue;
@@ -1389,34 +1443,89 @@ fn reasoning_effort_capability_from_metadata(
         }
     }
 
+    // Codex-style catalogs use `default_reasoning_level`; Copilot's model
+    // catalog calls the same concept `default_reasoning_effort`. Prefer the
+    // former when both are present for backwards-compatible precedence.
     let default = obj
         .get("default_reasoning_level")
+        .or_else(|| obj.get("default_reasoning_effort"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
 
-    if values.is_empty() && default.is_none() {
+    // A default without selectable values cannot establish either a valid UI
+    // choice or an outbound request encoding. Treat it as informational
+    // provider metadata only (it remains in `provider_metadata`).
+    if values.is_empty() {
         return Ok(None);
     }
 
-    let request_mapping = if values.is_empty() {
-        None
+    let (request_mapping, endpoint_request_mappings) = if catalog_abi == ModelCatalogAbi::Copilot
+        && has_responses_reasoning_effort_metadata(obj)
+    {
+        (
+            None,
+            vec![EndpointReasoningEffortRequestMapping {
+                wire_api: WireApi::Responses,
+                request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                    path: vec!["reasoning".to_string(), "effort".to_string()],
+                    values: values
+                        .iter()
+                        .map(|value| (value.value.clone(), Value::String(value.value.clone())))
+                        .collect::<BTreeMap<_, _>>(),
+                },
+            }],
+        )
     } else {
-        Some(ReasoningEffortRequestMapping::JsonField {
-            field: "reasoning_effort".to_string(),
-            values: values
-                .iter()
-                .map(|value| (value.value.clone(), Value::String(value.value.clone())))
-                .collect::<BTreeMap<_, _>>(),
-        })
+        (
+            Some(ReasoningEffortRequestMapping::JsonField {
+                field: "reasoning_effort".to_string(),
+                values: values
+                    .iter()
+                    .map(|value| (value.value.clone(), Value::String(value.value.clone())))
+                    .collect::<BTreeMap<_, _>>(),
+            }),
+            Vec::new(),
+        )
     };
 
     Ok(Some(ReasoningEffortCapability {
         values,
         default,
         request_mapping,
+        endpoint_request_mappings,
         source: Some(CapabilitySource::Live),
     }))
+}
+
+fn has_responses_reasoning_effort_metadata(obj: &Map<String, Value>) -> bool {
+    supported_wire_apis_from_metadata(obj).contains(&WireApi::Responses)
+        && obj
+            .get("capabilities")
+            .and_then(Value::as_object)
+            .and_then(|capabilities| capabilities.get("supports"))
+            .and_then(Value::as_object)
+            .and_then(|supports| supports.get("reasoning_effort"))
+            .is_some_and(Value::is_array)
+}
+
+fn supported_wire_apis_from_metadata(obj: &Map<String, Value>) -> Vec<WireApi> {
+    let Some(endpoints) = obj.get("supported_endpoints").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut wire_apis = Vec::new();
+    for endpoint in endpoints.iter().filter_map(Value::as_str) {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        let wire_api = match endpoint {
+            "/responses" | "responses" => WireApi::Responses,
+            "/chat/completions" | "chat/completions" => WireApi::Completions,
+            _ => continue,
+        };
+        if !wire_apis.contains(&wire_api) {
+            wire_apis.push(wire_api);
+        }
+    }
+    wire_apis
 }
 
 fn reasoning_level_value(raw: &Value) -> Option<CapabilityValue> {
@@ -1718,6 +1827,164 @@ mod tests {
         assert_eq!(field, "reasoning_effort");
         assert_eq!(values.get("xhigh"), Some(&serde_json::json!("xhigh")));
         assert!(model.thinking_modes.is_empty());
+    }
+
+    #[test]
+    fn parses_copilot_responses_capabilities_without_static_effort_levels() {
+        let body = r#"{
+            "data": [{
+                "id": "gpt-5.6-terra",
+                "default_reasoning_effort": "high",
+                "supported_endpoints": ["/chat/completions", "/responses"],
+                "capabilities": {
+                    "supports": {
+                        "reasoning_effort": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                    }
+                }
+            }]
+        }"#;
+
+        let entries = parse_models_body_with_abi(body, ModelCatalogAbi::Copilot).unwrap();
+        let model = entries.first().expect("Copilot model");
+        assert_eq!(
+            model.capabilities.supported_wire_apis,
+            vec![WireApi::Completions, WireApi::Responses]
+        );
+        let reasoning = model
+            .capabilities
+            .reasoning_effort
+            .as_ref()
+            .expect("Copilot reasoning capability");
+        assert_eq!(
+            reasoning
+                .values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        let mapping = reasoning
+            .endpoint_request_mappings
+            .iter()
+            .find(|mapping| mapping.wire_api == WireApi::Responses)
+            .expect("Responses mapping");
+        let ReasoningEffortRequestMapping::JsonPath { path, values } = &mapping.request_mapping
+        else {
+            panic!("Responses-capable catalog must use nested reasoning.effort");
+        };
+        assert_eq!(path, &["reasoning", "effort"]);
+        assert_eq!(values.get("ultra"), Some(&serde_json::json!("ultra")));
+    }
+
+    #[test]
+    fn renamed_copilot_template_uses_copilot_request_kind_and_catalog_abi() {
+        let entry = ProviderEntry {
+            template: Some("CoPiLoT".into()),
+            // The persisted template, rather than a mutable key, credential,
+            // or URL spelling, establishes this provider's special identity.
+            url: "https://custom-proxy.example/v1".into(),
+            ..ProviderEntry::default()
+        };
+        let registry = ProviderRegistry::standard();
+        let provider = registry.provider_for("work-copilot", &entry);
+
+        assert_eq!(provider.request_kind(), ProviderRequestKind::Copilot);
+
+        let body = r#"{
+            "data": [{
+                "id": "gpt-5.6-terra",
+                "default_reasoning_effort": "high",
+                "supported_endpoints": ["/responses"],
+                "capabilities": {
+                    "supports": { "reasoning_effort": ["low", "high", "ultra"] }
+                }
+            }]
+        }"#;
+        let entries = parse_models_body_with_abi(body, provider.request_kind().into()).unwrap();
+        let reasoning = entries[0]
+            .capabilities
+            .reasoning_effort
+            .as_ref()
+            .expect("Copilot catalog exposes reasoning effort");
+        let mapping = reasoning
+            .endpoint_request_mappings
+            .iter()
+            .find(|mapping| mapping.wire_api == WireApi::Responses)
+            .expect("Copilot Responses ABI mapping");
+        let ReasoningEffortRequestMapping::JsonPath { path, values } = &mapping.request_mapping
+        else {
+            panic!("Copilot Responses ABI must use nested reasoning.effort");
+        };
+        assert_eq!(path, &["reasoning", "effort"]);
+        assert_eq!(values.get("ultra"), Some(&serde_json::json!("ultra")));
+    }
+
+    #[test]
+    fn mixed_case_copilot_url_uses_copilot_request_kind() {
+        let entry = ProviderEntry {
+            url: "https://API.GitHubCopilot.COM".into(),
+            ..ProviderEntry::default()
+        };
+        let registry = ProviderRegistry::standard();
+        let provider = registry.provider_for("work-copilot", &entry);
+
+        assert_eq!(provider.id(), "copilot");
+        assert_eq!(provider.request_kind(), ProviderRequestKind::Copilot);
+    }
+
+    #[test]
+    fn generic_catalog_does_not_infer_copilot_responses_request_abi() {
+        let body = r#"{
+            "data": [{
+                "id": "gateway-model",
+                "default_reasoning_effort": "high",
+                "supported_endpoints": ["/chat/completions", "/responses"],
+                "capabilities": {
+                    "supports": {
+                        "reasoning_effort": ["low", "medium", "high"]
+                    }
+                }
+            }]
+        }"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let model = entries.first().expect("generic catalog model");
+        assert_eq!(
+            model.capabilities.supported_wire_apis,
+            vec![WireApi::Completions, WireApi::Responses]
+        );
+        assert!(
+            model.capabilities.reasoning_effort.is_none(),
+            "an unknown catalog's capability list does not establish a request ABI"
+        );
+    }
+
+    #[test]
+    fn generic_catalog_retains_established_top_level_reasoning_contract() {
+        let body = r#"{
+            "data": [{
+                "id": "generic-reasoning-model",
+                "supported_endpoints": ["/responses"],
+                "supported_reasoning_levels": ["low", "high"]
+            }]
+        }"#;
+
+        let entries = parse_models_body(body).unwrap();
+        let reasoning = entries[0]
+            .capabilities
+            .reasoning_effort
+            .as_ref()
+            .expect("established generic capability");
+        let ReasoningEffortRequestMapping::JsonField { field, .. } = reasoning
+            .request_mapping
+            .as_ref()
+            .expect("generic request mapping")
+        else {
+            panic!("top-level generic capability must retain its known ABI");
+        };
+        assert_eq!(field, "reasoning_effort");
+        assert!(reasoning.endpoint_request_mappings.is_empty());
     }
 
     #[test]

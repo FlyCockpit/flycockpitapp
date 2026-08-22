@@ -946,6 +946,7 @@ fn install_test_providers(
         thinking_params: Default::default(),
         system_prompt: None,
         wire_api: WireApi::Completions,
+        wire_api_provenance: Default::default(),
         extra: Default::default(),
         capabilities: Default::default(),
         capability_overrides: Default::default(),

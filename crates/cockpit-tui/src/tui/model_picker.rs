@@ -40,7 +40,10 @@ use cockpit_config::providers::{
     ProviderEntry, ProvidersConfig, ReasoningEffortCapability, ThinkingMode,
 };
 #[cfg(test)]
-use cockpit_config::providers::{CapabilityStatus, ConfigDoc, ModelCapabilities};
+use cockpit_config::providers::{
+    CapabilityStatus, ConfigDoc, EndpointReasoningEffortRequestMapping, ModelCapabilities,
+    ReasoningEffortRequestMapping, WireApi,
+};
 use unicode_width::UnicodeWidthStr;
 
 pub const DIALOG_HEIGHT: u16 = 18;
@@ -112,13 +115,34 @@ impl Entry {
 
 fn picker_entry(provider_id: &str, provider: &ProviderEntry, model: &ModelEntry) -> Entry {
     let native_anthropic = cockpit_config::providers::is_anthropic_native_base_url(&provider.url);
+    let wire_api = if !model.wire_api.is_auto() && model.wire_api_provenance.is_user_configured() {
+        model.wire_api
+    } else if !provider.wire_api.is_auto() {
+        provider.wire_api
+    } else if let Some(wire_api) = model.capabilities.preferred_wire_api() {
+        wire_api
+    } else if !model.wire_api.is_auto() {
+        // A recovered endpoint remains useful when no fresh catalog declares
+        // an endpoint, but never outranks that catalog above.
+        model.wire_api
+    } else {
+        cockpit_config::providers::WireApi::detect_for_provider_entry(
+            provider_id,
+            provider,
+            &model.id,
+        )
+    };
     let reasoning_effort = if native_anthropic
         && cockpit_config::providers::validate_anthropic_model_configuration(provider, &model.id)
             .is_err()
     {
         None
     } else {
-        model.capabilities.reasoning_effort.clone()
+        model
+            .capabilities
+            .reasoning_effort
+            .clone()
+            .filter(|capability| native_anthropic || capability.supports_wire_api(wire_api))
     };
     Entry {
         provider_id: provider_id.to_string(),
@@ -1160,16 +1184,9 @@ pub fn cycle_active_favorite(
     for (pid, entry) in &cfg.providers {
         for model in &entry.models {
             if model.favorite {
-                entries.push(Entry {
-                    provider_id: pid.clone(),
-                    model_id: model.id.clone(),
-                    display_name: model.name.clone(),
-                    is_favorite: model.favorite,
-                    reasoning_effort: model.capabilities.reasoning_effort.clone(),
-                    thinking_modes: model.thinking_modes.clone(),
-                    failure_annotation: None,
-                    trust: cfg.resolve_trust(pid, &model.id),
-                });
+                let mut picker = picker_entry(pid, entry, model);
+                picker.trust = cfg.resolve_trust(pid, &model.id);
+                entries.push(picker);
             }
         }
     }
@@ -1383,6 +1400,7 @@ mod tests {
                     ]),
                 },
             ),
+            endpoint_request_mappings: Vec::new(),
             source: Some(cockpit_config::providers::CapabilitySource::Live),
         }
     }
@@ -1407,6 +1425,88 @@ mod tests {
         let entry = picker_entry("anthropic", &provider, &model);
         assert!(entry.thinking_modes.is_empty());
         assert!(entry.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn copilot_gpt5_favorite_uses_responses_fallback_for_effort_picker() {
+        let responses_only_effort = ReasoningEffortCapability {
+            values: vec![CapabilityValue {
+                value: "ultra".into(),
+                label: None,
+                description: None,
+            }],
+            default: Some("ultra".into()),
+            request_mapping: None,
+            endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+                wire_api: WireApi::Responses,
+                request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                    path: vec!["reasoning".into(), "effort".into()],
+                    values: BTreeMap::from([("ultra".into(), serde_json::json!("ultra"))]),
+                },
+            }],
+            source: Some(cockpit_config::providers::CapabilitySource::Live),
+        };
+        let model = ModelEntry {
+            id: "gpt-5.6-terra".into(),
+            favorite: true,
+            capabilities: ModelCapabilities {
+                reasoning_effort: Some(responses_only_effort),
+                // No catalog endpoint is present: this must follow the same
+                // Copilot GPT-5 fallback as the request resolver.
+                supported_wire_apis: Vec::new(),
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        };
+        let provider = ProviderEntry::default();
+
+        let entry = picker_entry("copilot", &provider, &model);
+
+        assert!(entry.is_favorite);
+        assert!(
+            entry.reasoning_effort.is_some(),
+            "the favorite must expose its Responses-only effort picker"
+        );
+    }
+
+    #[test]
+    fn renamed_copilot_gpt5_uses_responses_fallback_for_effort_picker() {
+        let responses_only_effort = ReasoningEffortCapability {
+            values: vec![CapabilityValue {
+                value: "ultra".into(),
+                label: None,
+                description: None,
+            }],
+            default: Some("ultra".into()),
+            request_mapping: None,
+            endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+                wire_api: WireApi::Responses,
+                request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                    path: vec!["reasoning".into(), "effort".into()],
+                    values: BTreeMap::from([("ultra".into(), serde_json::json!("ultra"))]),
+                },
+            }],
+            source: Some(cockpit_config::providers::CapabilitySource::Live),
+        };
+        let model = ModelEntry {
+            id: "gpt-5.6-terra".into(),
+            capabilities: ModelCapabilities {
+                reasoning_effort: Some(responses_only_effort),
+                supported_wire_apis: Vec::new(),
+                ..ModelCapabilities::default()
+            },
+            ..ModelEntry::default()
+        };
+        let provider = ProviderEntry {
+            template: Some("copilot".into()),
+            ..ProviderEntry::default()
+        };
+
+        assert!(
+            picker_entry("team-github", &provider, &model)
+                .reasoning_effort
+                .is_some()
+        );
     }
 
     fn reasoning_entry(model: &str) -> Entry {
@@ -1849,6 +1949,68 @@ mod tests {
             .expect("the different sole favorite is a valid target");
         assert_eq!(next.provider, "p");
         assert_eq!(next.model, "favorite");
+    }
+
+    #[test]
+    fn cycle_active_favorite_filters_responses_only_effort_on_completions_pin() {
+        let responses_only_effort = ReasoningEffortCapability {
+            values: vec![CapabilityValue {
+                value: "ultra".into(),
+                label: None,
+                description: None,
+            }],
+            default: Some("ultra".into()),
+            request_mapping: None,
+            endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+                wire_api: WireApi::Responses,
+                request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                    path: vec!["reasoning".into(), "effort".into()],
+                    values: BTreeMap::from([("ultra".into(), serde_json::json!("ultra"))]),
+                },
+            }],
+            source: Some(cockpit_config::providers::CapabilitySource::Live),
+        };
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p".into(),
+            ProviderEntry {
+                models: vec![
+                    ModelEntry {
+                        id: "active".into(),
+                        ..ModelEntry::default()
+                    },
+                    ModelEntry {
+                        id: "favorite".into(),
+                        favorite: true,
+                        wire_api: WireApi::Completions,
+                        capabilities: ModelCapabilities {
+                            reasoning_effort: Some(responses_only_effort),
+                            ..ModelCapabilities::default()
+                        },
+                        ..ModelEntry::default()
+                    },
+                ],
+                ..ProviderEntry::default()
+            },
+        );
+        let active = ActiveModelRef {
+            provider: "p".into(),
+            model: "active".into(),
+            reasoning_effort: Some(ActiveReasoningEffort {
+                value: "ultra".into(),
+            }),
+            thinking_mode: None,
+            prompt_cache_retention: None,
+        };
+
+        let next = cycle_active_favorite(&cfg, Some(&active), &HashMap::new(), true)
+            .unwrap()
+            .expect("favorite target");
+        assert_eq!(next.model, "favorite");
+        assert_eq!(
+            next.reasoning_effort, None,
+            "Responses-only effort must not survive onto a Completions-pinned favorite"
+        );
     }
 
     /// The think step is a non-typing list: `j`/`k` (and arrows) navigate

@@ -1679,6 +1679,9 @@ pub fn spawn(
     model: Arc<Model>,
     model_override: Option<Arc<Model>>,
     thinking_params: Option<serde_json::Value>,
+    endpoint_recovery_thinking_params: Option<
+        crate::engine::model::EndpointRecoveryAdditionalParams,
+    >,
     project_root: PathBuf,
     client_no_sandbox: bool,
     daemon_no_sandbox: bool,
@@ -1842,6 +1845,7 @@ pub fn spawn(
             model,
             model_override,
             thinking_params,
+            endpoint_recovery_thinking_params,
             project_root,
             worker_trust_policy,
             work_rx,

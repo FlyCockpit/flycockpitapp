@@ -393,10 +393,18 @@ pub struct ImageGenerationTerminalEventV1 {
     pub job_version: u64,
     pub terminal_state: ImageGenerationJobState,
     pub slot_count: u32,
+    /// Ordinary published slots (state='published' AND result_after_cancel=0).
     pub published_count: u32,
     pub failed_count: u32,
     pub cancelled_count: u32,
-    pub late_count: u32,
+    /// Slots published after a cancellation raced the result
+    /// (state='published' AND result_after_cancel=1). Disjoint from
+    /// `published_count`; a late-then-published slot is counted here only.
+    pub late_published_count: u32,
+    /// Slots that stayed quarantined after a late result (state='late_quarantined').
+    pub late_quarantined_count: u32,
+    /// Slots discarded after a late result (state='discarded').
+    pub discarded_count: u32,
     pub emitted_at_unix_ms: i64,
 }
 
@@ -406,7 +414,7 @@ impl Db {
         job_id: Uuid,
     ) -> Result<Option<ImageGenerationTerminalEventV1>> {
         conn.query_row(
-            "SELECT event_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_count,emitted_at_unix_ms FROM image_generation_terminal_events WHERE job_id=?1",
+            "SELECT event_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms FROM image_generation_terminal_events WHERE job_id=?1",
             [job_id.to_string()],
             |row| {
                 let state: String = row.get(2)?;
@@ -420,8 +428,10 @@ impl Db {
                     published_count: row.get::<_, i64>(4)? as u32,
                     failed_count: row.get::<_, i64>(5)? as u32,
                     cancelled_count: row.get::<_, i64>(6)? as u32,
-                    late_count: row.get::<_, i64>(7)? as u32,
-                    emitted_at_unix_ms: row.get(8)?,
+                    late_published_count: row.get::<_, i64>(7)? as u32,
+                    late_quarantined_count: row.get::<_, i64>(8)? as u32,
+                    discarded_count: row.get::<_, i64>(9)? as u32,
+                    emitted_at_unix_ms: row.get(10)?,
                 })
             },
         )
@@ -546,16 +556,25 @@ fn commit_terminal_job_projection_conn(
     let next_version = current_version
         .checked_add(1)
         .context("terminal job version overflow")?;
-    let count = |state: &str| -> i64 {
+    // Disjoint partition: each slot lands in exactly one bucket, keyed by state
+    // and (for published slots) the result_after_cancel bit. This mirrors the
+    // terminal-event insert-guard trigger so the projection is representable
+    // without double-counting a late-then-published slot.
+    let count_where = |predicate: &dyn Fn(&str, i64) -> bool| -> i64 {
         rows.iter()
-            .filter(|(candidate, _, _)| candidate == state)
+            .filter(|(state, _, result)| predicate(state, *result))
             .count() as i64
     };
-    let late_count = rows.iter().filter(|(_, _, result)| *result == 1).count() as i64;
+    let published_count = count_where(&|state, result| state == "published" && result == 0);
+    let late_published_count = count_where(&|state, result| state == "published" && result == 1);
+    let failed_count = count_where(&|state, _| state == "failed");
+    let cancelled_count = count_where(&|state, _| state == "cancelled");
+    let late_quarantined_count = count_where(&|state, _| state == "late_quarantined");
+    let discarded_count = count_where(&|state, _| state == "discarded");
     let event_id = format!("image-generation-terminal:{job_id}:{next_version}");
     conn.execute(
-        "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_count,emitted_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![event_id,job_id.to_string(),next_version,terminal.as_str(),i64::try_from(rows.len())?,count("published"),count("failed"),count("cancelled"),late_count,emitted_at_unix_ms],
+        "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![event_id,job_id.to_string(),next_version,terminal.as_str(),i64::try_from(rows.len())?,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms],
     )?;
     ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,terminal_event_version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6 AND terminal_event_version IS NULL",params![terminal.as_str(),next_version,emitted_at_unix_ms,job_id.to_string(),current_state,current_version])?==1,"terminal job compare-and-set lost");
     Ok(Some(terminal))
@@ -5243,6 +5262,240 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// One terminal slot for the disjoint-partition fixture. `disposition` and
+    /// `disposition_generation` are only set for published slots.
+    struct TerminalSlotSpec {
+        state: &'static str,
+        result_after_cancel: i64,
+        applied_cancellation_version: Option<i64>,
+        disposition: Option<&'static str>,
+    }
+
+    /// Seal a job whose slots are already in the given terminal states (INSERTed
+    /// directly, which bypasses the UPDATE-only slot transition guard) so the
+    /// terminal-event projection can be exercised for exotic partitions such as
+    /// late-then-published. Returns the job id.
+    fn seal_terminal_partition_job(conn: &Connection, specs: &[TerminalSlotSpec]) -> Result<Uuid> {
+        let job_id = Uuid::now_v7();
+        let slot_ids = specs.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let artifacts = specs.iter().map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let (bytes, _) = canonical_test_plan(job_id, slot_ids[0], artifacts[0], 1, 1, 100);
+        let mut plan: ImageGenerationPlanV1 = serde_json::from_slice(&bytes)?;
+        let template = plan.targets[0].slots[0].clone();
+        plan.targets[0].slots = slot_ids
+            .iter()
+            .zip(&artifacts)
+            .enumerate()
+            .map(|(index, (slot_id, artifact_id))| {
+                let mut slot = template.clone();
+                slot.slot_id = *slot_id;
+                slot.managed_artifact_id = *artifact_id;
+                slot.slot_index = index as u32;
+                slot.sample_index = index as u32;
+                slot.publication_name = format!("generated-{index}.png");
+                slot.attempts[0].provider_request_identity = format!("request:{index}");
+                slot.attempts[0].provider_idempotency_identity = format!("idem:{index}");
+                slot
+            })
+            .collect();
+        plan.targets[0].sample_count = specs.len() as u32;
+        plan.central_resources[0].units = specs.len() as u64;
+        plan.spend.maximum_usd_micros = Some(specs.len() as u64);
+        let bytes = plan.canonical_bytes()?;
+        let digest = plan.digest()?;
+        let verified = CreateImageGenerationJob::from_verified_canonical_plan(&bytes, &digest, 1)?;
+        Db::create_image_generation_job_conn(conn, &verified)?;
+        if specs
+            .iter()
+            .any(|spec| spec.applied_cancellation_version.is_some())
+        {
+            conn.execute(
+                "INSERT INTO image_generation_cancellation_facts(job_id,cancellation_version,requested_at_unix_ms,request_operation_id) VALUES(?1,1,1,?2)",
+                params![job_id.to_string(), format!("cancel:{job_id}")],
+            )?;
+        }
+        for (index, (spec, (slot_id, artifact_id))) in specs
+            .iter()
+            .zip(slot_ids.iter().zip(&artifacts))
+            .enumerate()
+        {
+            let version: i64 = 5;
+            conn.execute(
+                "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,max_attempt_count,state,version,applied_cancellation_version,result_after_cancel,published_disposition,published_disposition_generation) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10,?11)",
+                params![
+                    job_id.to_string(),
+                    slot_id.to_string(),
+                    index as i64,
+                    index as i64,
+                    artifact_id.to_string(),
+                    spec.state,
+                    version,
+                    spec.applied_cancellation_version,
+                    spec.result_after_cancel,
+                    spec.disposition,
+                    spec.disposition.map(|_| version),
+                ],
+            )?;
+        }
+        Ok(job_id)
+    }
+
+    // AC9: terminal-event counts are a disjoint partition. A late-then-published
+    // slot (published + result_after_cancel=1) is counted once, and the old
+    // overlapping shape (counting it as ordinary published) is CHECK-rejected.
+    #[test]
+    fn image_generation_terminal_event_disjoint_partition_check() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            // Mixed after-cancel job: late-published, late-quarantined, discarded,
+            // and a plain failed slot. Under the OLD formula this double-counted
+            // the late-published slot (published_count AND late_count both 1), so
+            // published+failed+cancelled+late = 1+1+0+3 = 5 > slot_count 4 and the
+            // insert was impossible. The disjoint partition makes it representable.
+            let mixed = seal_terminal_partition_job(
+                conn,
+                &[
+                    TerminalSlotSpec {
+                        state: "published",
+                        result_after_cancel: 1,
+                        applied_cancellation_version: Some(1),
+                        disposition: Some("late_authorized"),
+                    },
+                    TerminalSlotSpec {
+                        state: "late_quarantined",
+                        result_after_cancel: 1,
+                        applied_cancellation_version: Some(1),
+                        disposition: None,
+                    },
+                    TerminalSlotSpec {
+                        state: "discarded",
+                        result_after_cancel: 1,
+                        applied_cancellation_version: Some(1),
+                        disposition: None,
+                    },
+                    TerminalSlotSpec {
+                        state: "failed",
+                        result_after_cancel: 0,
+                        applied_cancellation_version: None,
+                        disposition: None,
+                    },
+                ],
+            )?;
+
+            // (b) The old overlapping shape -- counting the late-published slot as
+            // ordinary published (published_count=1) -- is rejected by the guard,
+            // because published_count must equal count(published AND
+            // result_after_cancel=0) = 0.
+            let old_shape = conn.execute(
+                "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms) VALUES(?1,?2,2,'completed_after_cancel',4,1,1,0,0,1,1,9)",
+                params![format!("forged:{mixed}"), mixed.to_string()],
+            );
+            assert!(
+                old_shape.is_err(),
+                "double-counting the late-published slot as ordinary published must be rejected"
+            );
+
+            // The exact numeric signature of the OLD bug -- the late-published
+            // slot counted in BOTH the published bucket AND a "late" bucket -- is
+            // also rejected. It both violates the disjoint per-partition guard
+            // and would overflow the sum invariant (1+1+0+1+1+1 = 5 > slot_count
+            // 4): under the disjoint scheme such an overlap can no longer be
+            // expressed as a valid row at all, which is exactly why a
+            // late-then-published job was unrepresentable under the old formula.
+            let old_overlap = conn.execute(
+                "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms) VALUES(?1,?2,2,'completed_after_cancel',4,1,1,0,1,1,1,9)",
+                params![format!("forged-overlap:{mixed}"), mixed.to_string()],
+            );
+            assert!(
+                old_overlap.is_err(),
+                "double-counting the late slot in both published and late buckets must overflow the sum CHECK"
+            );
+
+            // (a) The disjoint projection commits cleanly with completed_after_cancel.
+            let terminal = commit_terminal_job_projection_conn(conn, mixed, 10)?;
+            assert_eq!(terminal, Some(ImageGenerationJobState::CompletedAfterCancel));
+            let event = Db::replay_image_generation_terminal_event_conn(conn, mixed)?
+                .context("mixed terminal event missing")?;
+            assert_eq!(event.slot_count, 4);
+            assert_eq!(event.published_count, 0);
+            assert_eq!(event.late_published_count, 1);
+            assert_eq!(event.late_quarantined_count, 1);
+            assert_eq!(event.discarded_count, 1);
+            assert_eq!(event.failed_count, 1);
+            assert_eq!(event.cancelled_count, 0);
+            assert_eq!(
+                event.terminal_state,
+                ImageGenerationJobState::CompletedAfterCancel
+            );
+            // Sum of the disjoint partitions equals slot_count by construction.
+            assert_eq!(
+                event.published_count
+                    + event.late_published_count
+                    + event.late_quarantined_count
+                    + event.discarded_count
+                    + event.failed_count
+                    + event.cancelled_count,
+                event.slot_count
+            );
+
+            // A pure all-published job still projects to Completed.
+            let all_published = seal_terminal_partition_job(
+                conn,
+                &[
+                    TerminalSlotSpec {
+                        state: "published",
+                        result_after_cancel: 0,
+                        applied_cancellation_version: None,
+                        disposition: Some("ordinary"),
+                    },
+                    TerminalSlotSpec {
+                        state: "published",
+                        result_after_cancel: 0,
+                        applied_cancellation_version: None,
+                        disposition: Some("ordinary"),
+                    },
+                ],
+            )?;
+            assert_eq!(
+                commit_terminal_job_projection_conn(conn, all_published, 11)?,
+                Some(ImageGenerationJobState::Completed)
+            );
+            let completed = Db::replay_image_generation_terminal_event_conn(conn, all_published)?
+                .context("all-published terminal event missing")?;
+            assert_eq!(completed.published_count, 2);
+            assert_eq!(completed.late_published_count, 0);
+
+            // A pure all-cancelled job still projects to Cancelled.
+            let all_cancelled = seal_terminal_partition_job(
+                conn,
+                &[
+                    TerminalSlotSpec {
+                        state: "cancelled",
+                        result_after_cancel: 0,
+                        applied_cancellation_version: Some(1),
+                        disposition: None,
+                    },
+                    TerminalSlotSpec {
+                        state: "cancelled",
+                        result_after_cancel: 0,
+                        applied_cancellation_version: Some(1),
+                        disposition: None,
+                    },
+                ],
+            )?;
+            assert_eq!(
+                commit_terminal_job_projection_conn(conn, all_cancelled, 12)?,
+                Some(ImageGenerationJobState::Cancelled)
+            );
+            let cancelled = Db::replay_image_generation_terminal_event_conn(conn, all_cancelled)?
+                .context("all-cancelled terminal event missing")?;
+            assert_eq!(cancelled.cancelled_count, 2);
+            assert_eq!(cancelled.published_count, 0);
+            Ok(())
+        })
+        .unwrap();
     }
 
     fn cancel_mixed(

@@ -421,24 +421,127 @@ pub struct ImageGenerationSchedulerPass {
     pub claimed: u32,
     pub dispatched: u32,
     pub skipped: u32,
-    #[cfg(test)]
-    pub trace: Vec<String>,
 }
 
-fn record_scheduler_error(
-    pass: &mut ImageGenerationSchedulerPass,
-    stage: &str,
-    error: &anyhow::Error,
-) {
-    #[cfg(test)]
-    pass.trace.push(format!("{stage}:{error:#}"));
-    #[cfg(not(test))]
-    let _ = (pass, stage, error);
+/// Stable, greppable identity for a scheduler-error attention row. There is no
+/// dedicated `code` column on `needs_attention`; this string is the stable
+/// prefix of the raised row's `description` and its `agent_id`.
+const IMAGE_GENERATION_SCHEDULER_ATTENTION_CODE: &str = "image_generation_scheduler";
+/// Raise a single attention row once the SAME
+/// `(worker_boot_id, job_id, slot_id, attempt_number, stage)` tuple has recorded
+/// this many failures. Failures 1 and 2 log only; failure 3 logs and raises;
+/// later failures update the existing row rather than inserting duplicates.
+const IMAGE_GENERATION_SCHEDULER_ATTENTION_THRESHOLD: u32 = 3;
+
+/// The durable identity a scheduler error is recorded against.
+struct SchedulerErrorIdentity {
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    owner_session_id: Uuid,
 }
 
 impl ImageGenerationDispatcher {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
+    }
+
+    /// Record a scheduler-pass failure: emit a structured log AND durably bump
+    /// the per-tuple failure counter, raising a single `needs_attention` row at
+    /// the threshold. This is production-real (no `#[cfg(test)]` gating).
+    ///
+    /// Redaction: the underlying `_error` value is deliberately NEVER logged or
+    /// persisted. Claim/prepare/dispatch errors can transitively carry
+    /// reservation, journal, or destination detail, so the emitted surface is
+    /// restricted to opaque identifiers (job/slot/attempt/boot ids and the
+    /// stage) plus the failure count. This guarantees no prompt text, credential
+    /// header, or destination secret can cross the log or attention boundary.
+    async fn record_scheduler_error(
+        &self,
+        worker_boot_id: Uuid,
+        identity: &SchedulerErrorIdentity,
+        stage: &'static str,
+        _error: &anyhow::Error,
+        at_unix_ms: i64,
+    ) {
+        let job_id = identity.job_id;
+        let slot_id = identity.slot_id;
+        let attempt_number = identity.attempt_number;
+        let owner_session_id = identity.owner_session_id;
+        let outcome = self
+            .db
+            .transaction(move |conn| {
+                let (failure_count, existing_interrupt): (i64, Option<String>) = conn.query_row(
+                    "INSERT INTO image_generation_scheduler_error_counts(worker_boot_id,job_id,slot_id,attempt_number,stage,failure_count,first_failed_at_unix_ms,last_failed_at_unix_ms) \
+                     VALUES(?1,?2,?3,?4,?5,1,?6,?6) \
+                     ON CONFLICT(worker_boot_id,job_id,slot_id,attempt_number,stage) \
+                     DO UPDATE SET failure_count=failure_count+1,last_failed_at_unix_ms=?6 \
+                     RETURNING failure_count,attention_interrupt_id",
+                    params![
+                        worker_boot_id.to_string(),
+                        job_id.to_string(),
+                        slot_id.to_string(),
+                        i64::from(attempt_number),
+                        stage,
+                        at_unix_ms
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let failure_count = u32::try_from(failure_count)?;
+                let raised = failure_count >= IMAGE_GENERATION_SCHEDULER_ATTENTION_THRESHOLD
+                    && existing_interrupt.is_none();
+                if raised {
+                    let interrupt_id = Uuid::new_v4();
+                    conn.execute(
+                        "INSERT INTO needs_attention(interrupt_id,session_id,agent_id,description,raised_at) VALUES(?1,?2,?3,?4,?5)",
+                        params![
+                            interrupt_id.to_string(),
+                            owner_session_id.to_string(),
+                            IMAGE_GENERATION_SCHEDULER_ATTENTION_CODE,
+                            format!(
+                                "{IMAGE_GENERATION_SCHEDULER_ATTENTION_CODE}: repeated scheduler pass failure (stage={stage}) for slot {slot_id} attempt {attempt_number}"
+                            ),
+                            at_unix_ms
+                        ],
+                    )?;
+                    conn.execute(
+                        "UPDATE image_generation_scheduler_error_counts SET attention_interrupt_id=?1 \
+                         WHERE worker_boot_id=?2 AND job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND stage=?6",
+                        params![
+                            interrupt_id.to_string(),
+                            worker_boot_id.to_string(),
+                            job_id.to_string(),
+                            slot_id.to_string(),
+                            i64::from(attempt_number),
+                            stage
+                        ],
+                    )?;
+                }
+                Ok((failure_count, raised))
+            })
+            .await;
+        match outcome {
+            Ok((failure_count, attention_raised)) => tracing::warn!(
+                target: "image_generation_scheduler",
+                stage,
+                job_id = %job_id,
+                slot_id = %slot_id,
+                attempt_number,
+                worker_boot_id = %worker_boot_id,
+                failure_count,
+                attention_raised,
+                "image generation scheduler pass error"
+            ),
+            Err(record_error) => tracing::error!(
+                target: "image_generation_scheduler",
+                stage,
+                job_id = %job_id,
+                slot_id = %slot_id,
+                worker_boot_id = %worker_boot_id,
+                error = %record_error,
+                "failed to persist image generation scheduler error"
+            ),
+        }
     }
 
     pub async fn run_reconciliation_pass<A: ImageGenerationAdapter>(
@@ -742,6 +845,14 @@ impl ImageGenerationDispatcher {
         };
         for candidate in candidates {
             before_claim(&candidate)?;
+            // Capture the durable identity before `candidate` is moved into
+            // prepare, so prepare/dispatch errors record against the same tuple.
+            let identity = SchedulerErrorIdentity {
+                job_id: candidate.candidate.job_id,
+                slot_id: candidate.candidate.slot_id,
+                attempt_number: candidate.candidate.attempt_number,
+                owner_session_id: candidate.plan.owner_session_id,
+            };
             let claim = cockpit_db::db::image_generation::ClaimImageGenerationDispatch {
                 job_id: candidate.candidate.job_id,
                 slot_id: candidate.candidate.slot_id,
@@ -756,7 +867,8 @@ impl ImageGenerationDispatcher {
                 })
                 .await
             {
-                record_scheduler_error(&mut pass, "claim", &error);
+                self.record_scheduler_error(worker_boot_id, &identity, "claim", &error, at_unix_ms)
+                    .await;
                 pass.skipped += 1;
                 continue;
             }
@@ -774,7 +886,14 @@ impl ImageGenerationDispatcher {
             let (prepared, plans) = match prepared_result {
                 Ok(value) => value,
                 Err(error) => {
-                    record_scheduler_error(&mut pass, "prepare", &error);
+                    self.record_scheduler_error(
+                        worker_boot_id,
+                        &identity,
+                        "prepare",
+                        &error,
+                        at_unix_ms,
+                    )
+                    .await;
                     pass.skipped += 1;
                     continue;
                 }
@@ -791,7 +910,14 @@ impl ImageGenerationDispatcher {
                 )
                 .await
             {
-                record_scheduler_error(&mut pass, "dispatch", &error);
+                self.record_scheduler_error(
+                    worker_boot_id,
+                    &identity,
+                    "dispatch",
+                    &error,
+                    at_unix_ms,
+                )
+                .await;
                 pass.skipped += 1;
             } else {
                 pass.dispatched += 1;
@@ -2220,6 +2346,10 @@ impl ImageGenerationResolutionAuthorityV1 {
             .map(|snapshot| {
                 RuntimeTargetAuthorityV1::from_registry_snapshot(
                     snapshot,
+                    // The operation's monotonic start is an independent "now"
+                    // reading: health retrieved before enqueue whose TTL has
+                    // since elapsed is no longer dispatchable.
+                    proofs.enqueue_started_monotonic_ms,
                     proofs.operation_deadline_monotonic_ms,
                 )
             })
@@ -3762,12 +3892,20 @@ pub(crate) fn plan_image_generation(
 }
 
 impl RuntimeTargetAuthorityV1 {
+    /// Build the sealed runtime authority from a live health snapshot.
+    ///
+    /// `now` is the caller's monotonic clock reading at authority construction.
+    /// It MUST be an independent reading -- never `snapshot.retrieved_at`, which
+    /// would make the dispatchability gate a tautology (elapsed always zero). A
+    /// snapshot whose capability TTL has already elapsed relative to `now`, or
+    /// that has expired by `now`, is not dispatchable and is rejected here.
     pub fn from_registry_snapshot(
         snapshot: &ImageHealthSnapshot,
+        now: u64,
         operation_deadline_monotonic_ms: u64,
     ) -> Result<Self> {
         ensure!(
-            snapshot.dispatchable_at(snapshot.retrieved_at),
+            snapshot.dispatchable_at(now),
             "runtime target is not dispatchable"
         );
         ensure!(
@@ -3827,7 +3965,7 @@ impl RuntimeTargetAuthorityV1 {
                     &capability.model_or_workflow_digest,
                     &canonical_constraints,
                 ]),
-                health_observed_at_monotonic_ms: snapshot.retrieved_at,
+                health_observed_at_monotonic_ms: now,
                 health_expires_at_monotonic_ms: snapshot.expires_at.min(capability.expires_at),
             },
             destination: TargetDestinationV1 {
@@ -4055,6 +4193,306 @@ mod tests {
             ImageGenerationHandoffResult::Accepted { .. }
         ));
         assert_eq!(adapter.requests(), vec![request]);
+    }
+
+    fn dispatchable_health_snapshot() -> ImageHealthSnapshot {
+        use crate::image_generation_runtime::{
+            AddressClass, CapabilitySnapshot, ConnectionProof, CredentialIdentityDigest,
+            ImageHealthState, SnapshotProvenance,
+        };
+        let constraints = BTreeMap::from([
+            ("formats".to_string(), "png".to_string()),
+            ("max_width".to_string(), "512".to_string()),
+            ("max_height".to_string(), "512".to_string()),
+            ("max_attempts".to_string(), "1".to_string()),
+            ("required_grant".to_string(), "image_generation".to_string()),
+        ]);
+        ImageHealthSnapshot {
+            endpoint_id: "endpoint".into(),
+            adapter_kind: cockpit_config::config::image_generation::ImageAdapterKind::OpenaiImages,
+            target_id: "target".into(),
+            target_immutable_identity: "immutable".into(),
+            config_generation: 1,
+            refresh_epoch: 1,
+            request_id: 1,
+            state: ImageHealthState::Healthy,
+            provenance: SnapshotProvenance::Live,
+            // Retrieved at monotonic 0 and valid for a long window; a snapshot that
+            // was dispatchable when retrieved but whose capability TTL has since
+            // elapsed (or which has expired) must be rejected against an injected
+            // later `now`.
+            retrieved_at: 0,
+            expires_at: 2_000_000,
+            endpoint_origin: "https://example.test".into(),
+            connection: Some(ConnectionProof {
+                authority: "example.test".into(),
+                connected_ip: "203.0.113.10".parse().unwrap(),
+                location: AddressClass::PublicRemote,
+                established_at: 0,
+                hops: vec![],
+            }),
+            model_or_workflow_digest: Some("m".repeat(64)),
+            capability: Some(CapabilitySnapshot {
+                target_id: "target".into(),
+                model_or_workflow_digest: "m".repeat(64),
+                retrieved_at: 0,
+                expires_at: 2_000_000,
+                provenance: SnapshotProvenance::Live,
+                constraints,
+            }),
+            unavailable_reason: None,
+            credential_identity_digest: Some(CredentialIdentityDigest::from_sha256([7; 32])),
+        }
+    }
+
+    // AC7: the health gate is not a tautology. `from_registry_snapshot` takes an
+    // independent `now`; a snapshot dispatchable at `retrieved_at` is rejected
+    // once `now` is past its capability TTL or its expiry.
+    #[test]
+    fn image_generation_from_registry_snapshot_uses_injected_now() {
+        let snapshot = dispatchable_health_snapshot();
+        let deadline = 1_000;
+
+        // At the retrieval instant the snapshot is dispatchable and the authority
+        // builds, and it records the injected observation time (not retrieved_at).
+        let now_at_retrieval = 0;
+        let authority =
+            RuntimeTargetAuthorityV1::from_registry_snapshot(&snapshot, now_at_retrieval, deadline)
+                .expect("fresh snapshot is dispatchable");
+        assert_eq!(
+            authority
+                .capability_provenance
+                .health_observed_at_monotonic_ms,
+            now_at_retrieval
+        );
+
+        // The old tautology `dispatchable_at(snapshot.retrieved_at)` would still
+        // pass here, but with an independent `now` past the 15-minute capability
+        // dispatch TTL the snapshot is no longer dispatchable.
+        let now_ttl_elapsed = 1_000_000; // > CAPABILITY_DISPATCH_TTL (900_000 ms)
+        assert!(snapshot.dispatchable_at(snapshot.retrieved_at));
+        assert!(!snapshot.dispatchable_at(now_ttl_elapsed));
+        assert!(
+            RuntimeTargetAuthorityV1::from_registry_snapshot(&snapshot, now_ttl_elapsed, deadline)
+                .is_err(),
+            "capability TTL elapsed relative to injected now must reject dispatch"
+        );
+
+        // And a `now` past the snapshot's expiry is likewise not dispatchable.
+        let now_past_expiry = 3_000_000;
+        assert!(
+            RuntimeTargetAuthorityV1::from_registry_snapshot(&snapshot, now_past_expiry, deadline)
+                .is_err(),
+            "expired snapshot relative to injected now must reject dispatch"
+        );
+    }
+
+    // AC8: `record_scheduler_error` is production-real. Three failures for the
+    // same tuple within one boot raise exactly one attention row; earlier
+    // failures only bump the durable counter, and a fourth failure does not add
+    // a second row. A different tuple keeps its own counter and raises its own
+    // row. The clock is injected (at_unix_ms) -- no real-time sleeps.
+    #[tokio::test]
+    async fn image_generation_record_scheduler_error_logs_and_attention() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("attn-project", "/attn-project", "scheduler attention")
+            .await
+            .unwrap();
+        let dispatcher = ImageGenerationDispatcher::new(db.clone());
+        let worker_boot_id = Uuid::now_v7();
+        let identity = SchedulerErrorIdentity {
+            job_id: Uuid::now_v7(),
+            slot_id: Uuid::now_v7(),
+            attempt_number: 1,
+            owner_session_id: session.session_id,
+        };
+        let error = anyhow::anyhow!("prepare failed: spend reservation is unavailable");
+
+        let boot = worker_boot_id.to_string();
+        let job = identity.job_id.to_string();
+        let slot = identity.slot_id.to_string();
+        let session_id = session.session_id.to_string();
+        let failure_count = {
+            let (boot, job, slot) = (boot.clone(), job.clone(), slot.clone());
+            move |db: cockpit_db::Db, stage: &'static str| {
+                let (boot, job, slot) = (boot.clone(), job.clone(), slot.clone());
+                async move {
+                    db.read(move |conn| {
+                        conn.query_row(
+                            "SELECT failure_count FROM image_generation_scheduler_error_counts WHERE worker_boot_id=?1 AND job_id=?2 AND slot_id=?3 AND attempt_number=1 AND stage=?4",
+                            params![boot, job, slot, stage],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(Into::into)
+                    })
+                    .await
+                    .unwrap()
+                }
+            }
+        };
+        let open_attention = {
+            let session_id = session_id.clone();
+            move |db: cockpit_db::Db| {
+                let session_id = session_id.clone();
+                async move {
+                    db.read(move |conn| {
+                        conn.query_row(
+                            "SELECT count(*) FROM needs_attention WHERE session_id=?1 AND description LIKE 'image_generation_scheduler:%'",
+                            params![session_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                    })
+                    .await
+                    .unwrap()
+                }
+            }
+        };
+
+        // Failure 1: durable counter records, no attention row yet.
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &identity, "prepare", &error, 10)
+            .await;
+        assert_eq!(failure_count(db.clone(), "prepare").await, Some(1));
+        assert_eq!(open_attention(db.clone()).await, 0);
+
+        // Failure 2: still below threshold.
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &identity, "prepare", &error, 11)
+            .await;
+        assert_eq!(failure_count(db.clone(), "prepare").await, Some(2));
+        assert_eq!(open_attention(db.clone()).await, 0);
+
+        // Failure 3: threshold reached -> exactly one attention row.
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &identity, "prepare", &error, 12)
+            .await;
+        assert_eq!(failure_count(db.clone(), "prepare").await, Some(3));
+        assert_eq!(open_attention(db.clone()).await, 1);
+        let interrupt_after_third = db
+            .read({
+                let session_id = session_id.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT interrupt_id,agent_id FROM needs_attention WHERE session_id=?1 AND description LIKE 'image_generation_scheduler:%'",
+                        params![session_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .map_err(Into::into)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(interrupt_after_third.1, "image_generation_scheduler");
+
+        // Failure 4: same tuple updates the counter but does NOT add a second row.
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &identity, "prepare", &error, 13)
+            .await;
+        assert_eq!(failure_count(db.clone(), "prepare").await, Some(4));
+        assert_eq!(open_attention(db.clone()).await, 1);
+        let interrupt_after_fourth = db
+            .read({
+                let session_id = session_id.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT interrupt_id FROM needs_attention WHERE session_id=?1 AND description LIKE 'image_generation_scheduler:%'",
+                        params![session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(Into::into)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupt_after_third.0, interrupt_after_fourth,
+            "the fourth failure must reuse the same attention row"
+        );
+
+        // A different tuple (distinct stage) keeps its own counter and raises its
+        // own row only at its own third failure -- proving the full tuple keys the
+        // threshold rather than the job alone.
+        for (n, at) in [(1, 20), (2, 21)] {
+            dispatcher
+                .record_scheduler_error(worker_boot_id, &identity, "dispatch", &error, at)
+                .await;
+            assert_eq!(failure_count(db.clone(), "dispatch").await, Some(n));
+            assert_eq!(open_attention(db.clone()).await, 1);
+        }
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &identity, "dispatch", &error, 22)
+            .await;
+        assert_eq!(failure_count(db.clone(), "dispatch").await, Some(3));
+        assert_eq!(open_attention(db.clone()).await, 2);
+
+        // The counter key is the FULL tuple, not just (boot, job, stage): a
+        // sibling slot and a sibling attempt of the same (boot, job, "prepare")
+        // each start their own count at 1 rather than inheriting the exhausted
+        // "prepare" counter (which is already at 4). A regression that dropped
+        // slot_id or attempt_number from the key would fail these.
+        let count_specific = |db: cockpit_db::Db,
+                              boot: String,
+                              job: String,
+                              slot: String,
+                              attempt: i64| async move {
+            db.read(move |conn| {
+                    conn.query_row(
+                        "SELECT failure_count FROM image_generation_scheduler_error_counts WHERE worker_boot_id=?1 AND job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND stage='prepare'",
+                        params![boot, job, slot, attempt],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+                })
+                .await
+                .unwrap()
+        };
+        let sibling_slot = SchedulerErrorIdentity {
+            job_id: identity.job_id,
+            slot_id: Uuid::now_v7(),
+            attempt_number: identity.attempt_number,
+            owner_session_id: session.session_id,
+        };
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &sibling_slot, "prepare", &error, 30)
+            .await;
+        assert_eq!(
+            count_specific(
+                db.clone(),
+                worker_boot_id.to_string(),
+                sibling_slot.job_id.to_string(),
+                sibling_slot.slot_id.to_string(),
+                1
+            )
+            .await,
+            1,
+            "a sibling slot must not inherit the exhausted prepare counter"
+        );
+        let sibling_attempt = SchedulerErrorIdentity {
+            job_id: identity.job_id,
+            slot_id: identity.slot_id,
+            attempt_number: identity.attempt_number + 1,
+            owner_session_id: session.session_id,
+        };
+        dispatcher
+            .record_scheduler_error(worker_boot_id, &sibling_attempt, "prepare", &error, 31)
+            .await;
+        assert_eq!(
+            count_specific(
+                db.clone(),
+                worker_boot_id.to_string(),
+                sibling_attempt.job_id.to_string(),
+                sibling_attempt.slot_id.to_string(),
+                i64::from(sibling_attempt.attempt_number)
+            )
+            .await,
+            1,
+            "a sibling attempt must not inherit the exhausted prepare counter"
+        );
+        // Neither sibling crossed the threshold, so no new attention row was added.
+        assert_eq!(open_attention(db.clone()).await, 2);
     }
 
     struct RealLedgerSchedulerFixture {

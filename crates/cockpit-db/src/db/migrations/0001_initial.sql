@@ -4163,12 +4163,35 @@ CREATE TABLE image_generation_attempts (
     applied_cancellation_version INTEGER,
     response_digest TEXT CHECK(response_digest IS NULL OR length(response_digest)=64),
     nonacceptance_evidence_digest TEXT CHECK(nonacceptance_evidence_digest IS NULL OR length(nonacceptance_evidence_digest)=64),
+    -- Dispatch-time destination/health proof bound at prepare (never reused across
+    -- a location-class or configuration-generation change; a stale proof cannot be
+    -- reissued because prepare always re-runs revalidation and writes the fresh
+    -- result under the single 'prepared' transition below). Credential material is
+    -- never stored here -- only opaque endpoint/config/epoch identifiers and the
+    -- connection observation (connected IP, location class, and a digest of the
+    -- ordered connection hops).
+    dispatch_proof_endpoint_id TEXT,
+    dispatch_proof_config_generation INTEGER CHECK(dispatch_proof_config_generation IS NULL OR dispatch_proof_config_generation >= 0),
+    dispatch_proof_refresh_epoch INTEGER CHECK(dispatch_proof_refresh_epoch IS NULL OR dispatch_proof_refresh_epoch >= 0),
+    dispatch_proof_connected_ip TEXT,
+    dispatch_proof_location_class TEXT CHECK(dispatch_proof_location_class IS NULL OR dispatch_proof_location_class IN ('loopback','private_lan','public_remote','forbidden')),
+    dispatch_proof_hops_digest TEXT CHECK(dispatch_proof_hops_digest IS NULL OR length(dispatch_proof_hops_digest)=64),
     PRIMARY KEY(job_id,slot_id,attempt_number),
     UNIQUE(provider_request_identity),
     UNIQUE(provider_idempotency_identity),
     FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
     FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
-    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1))
+    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1)),
+    -- The six proof columns are written as one indivisible group or not at all,
+    -- so a half-written proof can never exist.
+    CHECK((dispatch_proof_endpoint_id IS NULL AND dispatch_proof_config_generation IS NULL AND dispatch_proof_refresh_epoch IS NULL AND dispatch_proof_connected_ip IS NULL AND dispatch_proof_location_class IS NULL AND dispatch_proof_hops_digest IS NULL) OR (dispatch_proof_endpoint_id IS NOT NULL AND dispatch_proof_config_generation IS NOT NULL AND dispatch_proof_refresh_epoch IS NOT NULL AND dispatch_proof_connected_ip IS NOT NULL AND dispatch_proof_location_class IS NOT NULL AND dispatch_proof_hops_digest IS NOT NULL)),
+    -- A 'prepared' or 'dispatching' attempt cannot exist without its proof: both
+    -- states are reached in production only through prepare_image_generation_dispatch_conn
+    -- (the single writer of 'prepared', which binds the full proof in the same
+    -- UPDATE) and begin_image_generation_handoff_conn ('prepared' -> 'dispatching').
+    -- This is the DB-level fail-closed invariant behind that single-writer discipline,
+    -- so no attempt can be handed to a provider without a successful revalidation.
+    CHECK(state NOT IN ('prepared','dispatching') OR dispatch_proof_endpoint_id IS NOT NULL)
 );
 CREATE TABLE image_generation_handoff_evidence (
  job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,

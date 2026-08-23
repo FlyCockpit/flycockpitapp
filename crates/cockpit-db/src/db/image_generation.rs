@@ -923,6 +923,25 @@ pub struct PrepareImageGenerationDispatch<'a> {
     pub deadline_observation: DeadlineObservationV1,
     pub worker_boot_id: Uuid,
     pub claim_generation: u64,
+    /// Dispatch-time destination/health proof produced by a successful
+    /// revalidation at the injected clock's now. It is bound onto the attempt in
+    /// the same statement that transitions it to `prepared`; there is no code
+    /// path that reaches `prepared`/`dispatching` without it.
+    pub dispatch_proof: DispatchConnectionProofV1<'a>,
+}
+
+/// The durable dispatch proof bound onto an attempt at prepare time. Carries only
+/// opaque destination identifiers and the observed connection facts -- never a
+/// credential value or any prompt text (a credential is represented, elsewhere,
+/// solely by its identity digest, and none of that flows into this row).
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchConnectionProofV1<'a> {
+    pub endpoint_id: &'a str,
+    pub config_generation: u64,
+    pub refresh_epoch: u64,
+    pub connected_ip: &'a str,
+    pub location_class: &'a str,
+    pub hops_digest: &'a str,
 }
 
 /// A daemon-owned observation of the monotonic clock. A value from another
@@ -1508,7 +1527,7 @@ impl Db {
                 },
             )?;
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?])?==1,"image generation attempt preparation lost compare-and-set");
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='dispatching',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='queued' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job dispatch lost compare-and-set");
             Ok(PreparedImageGenerationDispatch {
@@ -4400,7 +4419,7 @@ mod tests {
                 ("downloading", 6),
                 ("response_adopted", 7),
             ] {
-                conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=1,response_digest=CASE WHEN ?1='response_adopted' THEN ?4 ELSE response_digest END WHERE job_id=?5 AND slot_id=?6",params![state,version,operations[index].to_string(),"a".repeat(64),job_id.to_string(),slot_id.to_string()])?;
+                conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,dispatch_proof_endpoint_id='seed-endpoint',dispatch_proof_config_generation=1,dispatch_proof_refresh_epoch=1,dispatch_proof_connected_ip='127.0.0.1',dispatch_proof_location_class='loopback',dispatch_proof_hops_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',external_operation_id=?3,observed_journal_version=1,response_digest=CASE WHEN ?1='response_adopted' THEN ?4 ELSE response_digest END WHERE job_id=?5 AND slot_id=?6",params![state,version,operations[index].to_string(),"a".repeat(64),job_id.to_string(),slot_id.to_string()])?;
             }
             for (state, version) in [
                 ("queued", 2),
@@ -4433,7 +4452,7 @@ mod tests {
             ("submission_unknown", 5),
             ("reconciling", 6),
         ] {
-            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operations[2].to_string(),job_id.to_string(),slots[3].to_string()])?;
+            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,dispatch_proof_endpoint_id='seed-endpoint',dispatch_proof_config_generation=1,dispatch_proof_refresh_epoch=1,dispatch_proof_connected_ip='127.0.0.1',dispatch_proof_location_class='loopback',dispatch_proof_hops_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operations[2].to_string(),job_id.to_string(),slots[3].to_string()])?;
         }
         for (state, version) in [("queued", 2), ("dispatching", 3), ("submission_unknown", 4)] {
             conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4",params![state,version,job_id.to_string(),slots[3].to_string()])?;
@@ -4494,7 +4513,7 @@ mod tests {
             ("accepted", 5),
             ("downloading", 6),
         ] {
-            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=1 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=1",params![state,version,operation_id.to_string(),job_id.to_string(),slot_id.to_string()])?;
+            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,dispatch_proof_endpoint_id='seed-endpoint',dispatch_proof_config_generation=1,dispatch_proof_refresh_epoch=1,dispatch_proof_connected_ip='127.0.0.1',dispatch_proof_location_class='loopback',dispatch_proof_hops_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',external_operation_id=?3,observed_journal_version=1 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=1",params![state,version,operation_id.to_string(),job_id.to_string(),slot_id.to_string()])?;
         }
         for (state, version) in [
             ("queued", 2),
@@ -4851,7 +4870,7 @@ mod tests {
             ("submission_unknown", 5),
             ("reconciling", 6),
         ] {
-            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operation_id.to_string(),job_id.to_string(),slot_id.to_string()])?;
+            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,dispatch_proof_endpoint_id='seed-endpoint',dispatch_proof_config_generation=1,dispatch_proof_refresh_epoch=1,dispatch_proof_connected_ip='127.0.0.1',dispatch_proof_location_class='loopback',dispatch_proof_hops_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operation_id.to_string(),job_id.to_string(),slot_id.to_string()])?;
         }
         for (state, version) in [("queued", 2), ("dispatching", 3), ("submission_unknown", 4)] {
             conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4",params![state,version,job_id.to_string(),slot_id.to_string()])?;

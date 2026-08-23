@@ -215,6 +215,19 @@ pub enum AddressClass {
     PublicRemote,
     Forbidden,
 }
+impl AddressClass {
+    /// Stable, storage-facing spelling used for the persisted dispatch proof's
+    /// `location_class`. Must stay in lockstep with the CHECK constraint on
+    /// `image_generation_attempts.dispatch_proof_location_class`.
+    pub fn as_canonical_str(self) -> &'static str {
+        match self {
+            AddressClass::Loopback => "loopback",
+            AddressClass::PrivateLan => "private_lan",
+            AddressClass::PublicRemote => "public_remote",
+            AddressClass::Forbidden => "forbidden",
+        }
+    }
+}
 pub fn classify_address(ip: IpAddr) -> AddressClass {
     if let IpAddr::V6(v6) = ip {
         let octets = v6.octets();
@@ -361,6 +374,43 @@ pub struct BoundProbeResponse {
     pub status: reqwest::StatusCode,
     pub body: Vec<u8>,
     pub connection: ConnectionProof,
+}
+
+/// The durable binding a successful dispatch revalidation produces. It ties the
+/// attempt to the exact `(endpoint_id, config_generation, refresh_epoch,
+/// connected_ip, location_class, hops_digest)` observed at prepare time. A proof
+/// captured under one location class or configuration generation cannot satisfy a
+/// later prepare under a different one -- the tuple would differ, and revalidation
+/// re-derives it from scratch every time (it is never read back from storage).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchProofBinding {
+    pub endpoint_id: String,
+    pub config_generation: u64,
+    pub refresh_epoch: u64,
+    pub connected_ip: IpAddr,
+    pub location_class: AddressClass,
+    /// Lowercase-hex SHA-256 over the ordered connection hops (initial connection
+    /// followed by every redirect), so a proof observed across a different path is
+    /// distinguishable from one observed on the direct route.
+    pub hops_digest: String,
+}
+
+/// Canonical digest of the ordered connection hops in a `ConnectionProof`. Encodes
+/// each hop's authority, hostname, connected IP, and location class in order with
+/// unambiguous field/record separators so no two distinct hop chains collide.
+pub fn connection_hops_digest(proof: &ConnectionProof) -> String {
+    let mut hasher = Sha256::new();
+    for hop in &proof.hops {
+        hasher.update(hop.authority.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(hop.hostname.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(hop.connected_ip.to_string().as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(hop.location.as_canonical_str().as_bytes());
+        hasher.update([0x1e]);
+    }
+    crate::intel::hex_lower(&hasher.finalize())
 }
 
 impl fmt::Debug for BoundProbeResponse {
@@ -1249,7 +1299,7 @@ impl ImageRuntimeRegistry {
     }
 
     #[cfg(test)]
-    fn apply_test_target(
+    pub(crate) fn apply_test_target(
         &self,
         target_id: &str,
         endpoint_id: &str,
@@ -1940,6 +1990,50 @@ impl ImageRuntimeRegistry {
         target_id: &str,
         credential_identity_digest: &CredentialIdentityDigest,
     ) -> Result<ConnectionProof, RuntimeError> {
+        self.revalidate_dispatch_inner(endpoint, target_id, credential_identity_digest)
+            .await
+            .map(|(_, proof)| proof)
+    }
+
+    /// Revalidate dispatchability and return the durable proof binding pinned to
+    /// the single health snapshot the check validated. Used by the dispatcher's
+    /// prepare transaction: the `config_generation`/`refresh_epoch` are read from
+    /// the very snapshot that passed revalidation (no second, racy read), and the
+    /// connection facts come from the freshly established probe. The registry's own
+    /// injected clock supplies "now" -- callers never pass `retrieved_at`.
+    ///
+    /// `config_generation` is the snapshot's generation. Revalidation rejects a
+    /// substantive endpoint/target/credential change (immutable-identity, location,
+    /// origin, or credential mismatch), but it does NOT compare the snapshot's
+    /// generation against the registry's live current generation: a pure generation
+    /// bump that leaves the cached snapshot's identity unchanged and within TTL is
+    /// not caught here. The caller binds this generation to the sealed plan's
+    /// generation, which is the obsolescence gate against a re-planned destination.
+    pub async fn revalidate_dispatch_binding(
+        &self,
+        endpoint: &ImageEndpoint,
+        target_id: &str,
+        credential_identity_digest: &CredentialIdentityDigest,
+    ) -> Result<DispatchProofBinding, RuntimeError> {
+        let (snap, proof) = self
+            .revalidate_dispatch_inner(endpoint, target_id, credential_identity_digest)
+            .await?;
+        Ok(DispatchProofBinding {
+            endpoint_id: endpoint.id.clone(),
+            config_generation: snap.config_generation,
+            refresh_epoch: snap.refresh_epoch,
+            connected_ip: proof.connected_ip,
+            location_class: proof.location,
+            hops_digest: connection_hops_digest(&proof),
+        })
+    }
+
+    async fn revalidate_dispatch_inner(
+        &self,
+        endpoint: &ImageEndpoint,
+        target_id: &str,
+        credential_identity_digest: &CredentialIdentityDigest,
+    ) -> Result<(ImageHealthSnapshot, ConnectionProof), RuntimeError> {
         let snap = self
             .snapshot(&endpoint.id, target_id)
             .ok_or(RuntimeError::new(
@@ -2056,7 +2150,158 @@ impl ImageRuntimeRegistry {
             self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(error);
         }
-        Ok(proof)
+        Ok((snap, proof))
+    }
+}
+
+/// Test-only scaffolding shared with the dispatcher's prepare-time proof tests
+/// (`image_generation_job`). It lives here because `ImageRuntimeAdapter` is a
+/// sealed trait -- a fake adapter can only be implemented inside this module.
+#[cfg(test)]
+pub(crate) mod dispatch_proof_support {
+    use super::*;
+    use cockpit_config::config::image_generation::ImageLocationClass;
+    use std::net::IpAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A settable clock so tests can drive dispatchability past the capability TTL.
+    pub(crate) struct FixedClock(pub AtomicU64);
+    impl RuntimeClock for FixedClock {
+        fn now_millis(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FixedDns(IpAddr);
+    impl DnsResolver for FixedDns {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, RuntimeError>> + Send + 'a>> {
+            let ip = self.0;
+            Box::pin(async move { Ok(vec![ip]) })
+        }
+    }
+
+    /// Reports the connection it was told to establish, so the observed proof's
+    /// location class equals the class of the resolved IP.
+    struct EchoConnector;
+    impl BoundConnector for EchoConnector {
+        fn execute<'a>(
+            &'a self,
+            request: ReadOnlyProbeRequest,
+            candidates: &'a [IpAddr],
+            _: AddressClass,
+            _: ProbeLimits,
+        ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let hostname = request.url.host_str().unwrap();
+                let authority = origin_authority(&request.url, hostname);
+                Ok(BoundProbeResponse {
+                    status: reqwest::StatusCode::OK,
+                    body: Vec::new(),
+                    connection: ConnectionProof {
+                        authority: authority.clone(),
+                        connected_ip: candidates[0],
+                        location: classify_address(candidates[0]),
+                        established_at: 0,
+                        hops: vec![ConnectionHop {
+                            authority,
+                            hostname: hostname.into(),
+                            connected_ip: candidates[0],
+                            location: classify_address(candidates[0]),
+                        }],
+                    },
+                })
+            })
+        }
+    }
+
+    struct HealthyAdapter;
+    impl adapter_sealed::Sealed for HealthyAdapter {}
+    impl ImageRuntimeAdapter for HealthyAdapter {
+        fn kind(&self) -> ImageAdapterKind {
+            ImageAdapterKind::OpenaiImages
+        }
+        fn request(&self, request: &ProbeRequest) -> Result<ReadOnlyProbeRequest, RuntimeError> {
+            let url = reqwest::Url::parse(&request.endpoint.origin).unwrap();
+            Ok(request.read_only_request(url))
+        }
+        fn parse(
+            &self,
+            request: &ProbeRequest,
+            _response: &BoundProbeResponse,
+        ) -> Result<ProbeResult, RuntimeError> {
+            Ok(ProbeResult {
+                state: ImageHealthState::Healthy,
+                // The capability must describe the configured target identity, or
+                // `refresh` rejects it as Incompatible.
+                capability: Some(CapabilitySnapshot {
+                    target_id: request.target_id.clone(),
+                    model_or_workflow_digest: "digest".into(),
+                    retrieved_at: 0,
+                    expires_at: CAPABILITY_DISPATCH_TTL.as_millis() as u64,
+                    provenance: SnapshotProvenance::Live,
+                    constraints: BTreeMap::new(),
+                }),
+                model_or_workflow_digest: Some("digest".into()),
+                unavailable_reason: None,
+            })
+        }
+    }
+
+    /// A loopback (`ImageLocationClass::Local`) endpoint whose connection resolves
+    /// to `127.0.0.1`.
+    pub(crate) fn loopback_endpoint() -> ImageEndpoint {
+        ImageEndpoint {
+            id: "endpoint-loopback".into(),
+            adapter: ImageAdapterKind::OpenaiImages,
+            origin: "https://loopback.test".into(),
+            path_prefix: None,
+            credential_ref: None,
+            headers: vec![],
+            allow_insecure_transport: false,
+            location: ImageLocationClass::Local,
+            enabled: true,
+            route_profile_version: 1,
+            exclusive_server: false,
+        }
+    }
+
+    /// Build a registry whose single `endpoint`/`target_id` is refreshed to a
+    /// dispatchable snapshot at `generation`/`epoch`, bound to `credential` and
+    /// connecting to `127.0.0.1`. `clock` (start it at 0) drives dispatchability.
+    pub(crate) async fn dispatchable_registry(
+        clock: Arc<FixedClock>,
+        endpoint: &ImageEndpoint,
+        target_id: &str,
+        generation: u64,
+        epoch: u64,
+        credential: CredentialIdentityDigest,
+    ) -> ImageRuntimeRegistry {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let registry = ImageRuntimeRegistry::new(
+            clock,
+            Arc::new(FixedDns(ip)),
+            Arc::new(EchoConnector),
+            vec![Arc::new(HealthyAdapter)],
+        )
+        .unwrap();
+        registry.apply_endpoint(endpoint, generation, epoch);
+        registry.apply_test_target(target_id, &endpoint.id, generation, epoch, "digest");
+        registry
+            .refresh(
+                endpoint.clone(),
+                target_id.to_owned(),
+                ConfigRevision::new(generation, epoch),
+                1,
+                RefreshKind::Capabilities,
+                credential,
+            )
+            .await
+            .unwrap();
+        registry
     }
 }
 

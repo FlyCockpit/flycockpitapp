@@ -4,9 +4,11 @@
 //! output slot. Its canonical bytes are the authorization, queue, spend, and
 //! provider-dispatch binding; no dispatcher may reinterpret caller input.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
+use std::pin::Pin;
 
 use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -14,7 +16,11 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
-use crate::image_generation_runtime::ImageHealthSnapshot;
+use crate::image_generation_runtime::{
+    CredentialIdentityDigest, DispatchProofBinding, ImageHealthSnapshot, ImageRuntimeRegistry,
+    RuntimeError, RuntimeErrorCode,
+};
+use cockpit_config::config::image_generation::ImageEndpoint;
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
@@ -423,6 +429,129 @@ pub struct ImageGenerationSchedulerPass {
     pub skipped: u32,
 }
 
+/// What a dispatch revalidation needs to identify the destination it must probe.
+/// Carries only the sealed plan target identity -- never credential material.
+pub struct DispatchRevalidationRequest<'a> {
+    pub target_id: &'a str,
+    pub destination: &'a TargetDestinationV1,
+}
+
+/// Produces the dispatch-time destination/health proof for a claimed candidate, or
+/// fails closed. `prepare_claimed_candidate` calls this INSIDE the prepare flow and
+/// refuses to journal `dispatching` (or contact any provider) unless it returns a
+/// binding. The binding is always re-derived from a live revalidation -- a stored
+/// proof is never read back, so a stale or location-changed proof cannot be reused.
+pub trait ImageDispatchProofSource: Send + Sync {
+    fn revalidate<'a>(
+        &'a self,
+        request: DispatchRevalidationRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<DispatchProofBinding, RuntimeError>> + Send + 'a>>;
+}
+
+/// The endpoint and credential identity a target resolves to for revalidation. In
+/// production the worker builds this from the same materialized config that sealed
+/// the plan, so the resolved identity matches what the plan bound.
+/// The endpoint and identities a target resolves to for revalidation. In production
+/// the worker builds this from the same materialized config that sealed the plan;
+/// `adapter_kind` and `endpoint_identity_digest` are the destination identity that
+/// config resolution produced (identical spelling to `TargetDestinationV1`), and
+/// they are checked against the sealed plan before any provider contact.
+#[derive(Clone)]
+pub struct ResolvedDispatchDestination {
+    pub adapter_kind: String,
+    pub endpoint: ImageEndpoint,
+    pub endpoint_identity_digest: String,
+    pub credential_identity_digest: CredentialIdentityDigest,
+}
+
+/// The production dispatch-proof source: it resolves the plan target's destination
+/// to a live endpoint/credential, verifies the resolved identity equals the identity
+/// the plan sealed, and calls `ImageRuntimeRegistry::revalidate_dispatch` (via the
+/// binding wrapper) with the registry's own injected clock.
+///
+/// It fails closed (`Obsolete`) when the target is not configured, when the resolved
+/// destination identity (`adapter_kind` / `endpoint_identity_digest` /
+/// `credential_identity_digest`) differs from the sealed plan, or when the health
+/// snapshot's configuration generation differs from the generation the plan sealed.
+///
+/// Trust boundary and a known gap: `destinations` is built by the daemon worker
+/// (inc3) from the same materialized `ExtendedConfig.image_generation` that sealed
+/// the plan. A substantive destination change (endpoint origin, target immutable
+/// identity, credential rotation, disable) invalidates the registry health cache and
+/// surfaces here as `Obsolete`, and the sealed-identity checks below reject a
+/// map/plan divergence at the SAME generation. What is NOT separately caught here is
+/// a pure LIVE configuration-generation bump that leaves the endpoint/target
+/// immutable identity unchanged and the cached snapshot within TTL: the snapshot
+/// retains its old generation, still equals the sealed plan's generation, and passes.
+/// Comparing the snapshot generation against the registry's live current generation
+/// is deferred to the inc3 worker if warranted.
+pub struct RegistryDispatchProofSource {
+    registry: ImageRuntimeRegistry,
+    destinations: HashMap<String, ResolvedDispatchDestination>,
+}
+
+impl RegistryDispatchProofSource {
+    pub fn new(
+        registry: ImageRuntimeRegistry,
+        destinations: HashMap<String, ResolvedDispatchDestination>,
+    ) -> Self {
+        Self {
+            registry,
+            destinations,
+        }
+    }
+}
+
+impl ImageDispatchProofSource for RegistryDispatchProofSource {
+    fn revalidate<'a>(
+        &'a self,
+        request: DispatchRevalidationRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<DispatchProofBinding, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let destination = self.destinations.get(request.target_id).ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation target configuration changes.",
+                )
+            })?;
+            // Bind the proof to the SEALED destination identity before any provider
+            // contact: the resolved adapter kind, endpoint identity digest, and
+            // credential identity digest must equal what the plan sealed. This fails
+            // closed on a map/plan divergence even at the same configuration
+            // generation, so a proof can never be issued for a different endpoint,
+            // adapter, or credential than the one the plan authorized.
+            if destination.adapter_kind != request.destination.adapter_kind
+                || destination.endpoint_identity_digest
+                    != request.destination.endpoint_identity_digest
+                || destination.credential_identity_digest.plan_identity_hex()
+                    != request.destination.credential_identity_digest
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation destination identity changes.",
+                ));
+            }
+            let binding = self
+                .registry
+                .revalidate_dispatch_binding(
+                    &destination.endpoint,
+                    request.target_id,
+                    &destination.credential_identity_digest,
+                )
+                .await?;
+            // A configuration-generation bump between plan and prepare must abort:
+            // the health snapshot's generation no longer matches the sealed plan.
+            if binding.config_generation != request.destination.destination_generation {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after image generation configuration generation changes.",
+                ));
+            }
+            Ok(binding)
+        })
+    }
+}
+
 /// Stable, greppable identity for a scheduler-error attention row. There is no
 /// dedicated `code` column on `needs_attention`; this string is the stable
 /// prefix of the raised row's `description` and its `agent_id`.
@@ -776,11 +905,48 @@ impl ImageGenerationDispatcher {
     async fn prepare_claimed_candidate(
         &self,
         candidate: DecodedImageGenerationDispatchCandidate,
+        proof_source: &dyn ImageDispatchProofSource,
         worker_boot_id: Uuid,
         claim_generation: u64,
         at_unix_ms: i64,
         now_monotonic_ms: u64,
     ) -> Result<(PreparedImageGenerationDispatch, Vec<MediaReservationPlan>)> {
+        // Prove the destination is dispatchable BEFORE the prepare transaction can
+        // commit. `revalidate` uses the registry's own injected clock (never a
+        // snapshot's `retrieved_at`) and fails closed on a stale epoch, an identity
+        // or location-class change, or a configuration-generation bump. On failure
+        // we return before opening the transaction, so the attempt never reaches
+        // `prepared`/`dispatching` and no provider is contacted. The binding is
+        // re-derived here every time -- a prior proof is never read back, so a
+        // stale or location-changed proof cannot be reused.
+        let slot_id = candidate.candidate.slot_id;
+        let target = candidate
+            .plan
+            .targets
+            .iter()
+            .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
+            .context("scheduler candidate slot is absent from immutable plan")?;
+        let binding = proof_source
+            .revalidate(DispatchRevalidationRequest {
+                target_id: &target.target_id,
+                destination: &target.destination,
+            })
+            .await
+            .map_err(|error| {
+                // Only the opaque runtime error code crosses this boundary; the
+                // remediation is a fixed string and no credential/prompt text is
+                // present. `record_scheduler_error` discards even this.
+                anyhow::anyhow!(
+                    "image generation dispatch revalidation rejected (code={:?})",
+                    error.code
+                )
+            })?;
+        let proof_endpoint_id = binding.endpoint_id;
+        let proof_config_generation = binding.config_generation;
+        let proof_refresh_epoch = binding.refresh_epoch;
+        let proof_connected_ip = binding.connected_ip.to_string();
+        let proof_location_class = binding.location_class.as_canonical_str();
+        let proof_hops_digest = binding.hops_digest;
         self.db.transaction(move |conn| {
             let c=&candidate.candidate;
             ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND worker_boot_id=?4 AND claim_generation=?5 AND expires_at_unix_ms>CAST(unixepoch('subsec')*1000 AS INTEGER))",params![c.job_id.to_string(),c.slot_id.to_string(),i64::from(c.attempt_number),worker_boot_id.to_string(),i64::try_from(claim_generation)?],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is stale");
@@ -792,14 +958,17 @@ impl ImageGenerationDispatcher {
             ensure!(spend_exists,"scheduler spend reservation is unavailable");
             let token=ExternalJournalToken::parse(&crate::intel::hex_lower(&Sha256::digest(attempt.provider_idempotency_identity.as_bytes())))?;
             let journal=PrepareExternalOperation{operation_kind:ExternalJournalToken::parse("image_generation")?,owner_session_id:ExternalJournalToken::for_session(candidate.plan.owner_session_id),idempotency_key:token.clone(),payload_digest:ExternalJournalDigest::of(&c.canonical_plan),payload_len:c.canonical_plan.len(),provider_idempotency:Some(ProviderIdempotency{key:token,contract:ExternalJournalToken::parse("image_generation_v1")?})};
-            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,media_plan_digest:&c.media_plan_digest,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,deadline_observation:cockpit_db::db::image_generation::DeadlineObservationV1::new(worker_boot_id,now_monotonic_ms)?,worker_boot_id,claim_generation})?;
+            let dispatch_proof=cockpit_db::db::image_generation::DispatchConnectionProofV1{endpoint_id:&proof_endpoint_id,config_generation:proof_config_generation,refresh_epoch:proof_refresh_epoch,connected_ip:&proof_connected_ip,location_class:proof_location_class,hops_digest:&proof_hops_digest};
+            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,media_plan_digest:&c.media_plan_digest,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,deadline_observation:cockpit_db::db::image_generation::DeadlineObservationV1::new(worker_boot_id,now_monotonic_ms)?,worker_boot_id,claim_generation,dispatch_proof})?;
             Ok((prepared,vec![candidate.media_plan]))
         }).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_scheduler_pass<A>(
         &self,
         adapter: &A,
+        proof_source: &dyn ImageDispatchProofSource,
         worker_boot_id: Uuid,
         now_monotonic_ms: u64,
         at_unix_ms: i64,
@@ -811,6 +980,7 @@ impl ImageGenerationDispatcher {
     {
         self.run_scheduler_pass_with_hook(
             adapter,
+            proof_source,
             worker_boot_id,
             now_monotonic_ms,
             at_unix_ms,
@@ -825,6 +995,7 @@ impl ImageGenerationDispatcher {
     async fn run_scheduler_pass_with_hook<A, H>(
         &self,
         adapter: &A,
+        proof_source: &dyn ImageDispatchProofSource,
         worker_boot_id: Uuid,
         now_monotonic_ms: u64,
         at_unix_ms: i64,
@@ -877,6 +1048,7 @@ impl ImageGenerationDispatcher {
             let prepared_result = self
                 .prepare_claimed_candidate(
                     candidate,
+                    proof_source,
                     worker_boot_id,
                     generation,
                     at_unix_ms,
@@ -4165,6 +4337,74 @@ fn valid_path_component(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::image_generation_runtime::AddressClass;
+
+    /// A canned successful dispatch proof for the many existing scheduler-pass
+    /// tests that only care about the downstream dispatch, not the proof binding.
+    /// The values satisfy every CHECK on `image_generation_attempts` and are
+    /// distinguishable from the loopback proofs the binding tests assert on.
+    fn sample_dispatch_proof_binding() -> DispatchProofBinding {
+        DispatchProofBinding {
+            endpoint_id: "endpoint-fixture".into(),
+            config_generation: 6,
+            refresh_epoch: 3,
+            connected_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
+            location_class: AddressClass::PublicRemote,
+            hops_digest: "a".repeat(64),
+        }
+    }
+
+    /// A deterministic `ImageDispatchProofSource`: either always yields a fixed
+    /// binding, or always fails closed. Counts its invocations so tests can assert
+    /// prepare actually consults it (never bypasses revalidation).
+    struct FixedDispatchProofSource {
+        binding: Option<DispatchProofBinding>,
+        calls: AtomicUsize,
+    }
+
+    impl FixedDispatchProofSource {
+        fn ok() -> Self {
+            Self {
+                binding: Some(sample_dispatch_proof_binding()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                binding: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ImageDispatchProofSource for FixedDispatchProofSource {
+        fn revalidate<'a>(
+            &'a self,
+            _request: DispatchRevalidationRequest<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<DispatchProofBinding, RuntimeError>> + Send + 'a>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = match &self.binding {
+                Some(binding) => Ok(binding.clone()),
+                None => Err(RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "test dispatch revalidation refused",
+                )),
+            };
+            Box::pin(async move { outcome })
+        }
+    }
+
+    fn proof_ok() -> FixedDispatchProofSource {
+        FixedDispatchProofSource::ok()
+    }
 
     struct SchedulerClock;
     impl crate::media_reservation::MonotonicClock for SchedulerClock {
@@ -4285,6 +4525,321 @@ mod tests {
                 .is_err(),
             "expired snapshot relative to injected now must reject dispatch"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // AC4/5/6: prepare-time dispatch proof.
+    // -------------------------------------------------------------------
+
+    /// The persisted dispatch proof on an attempt row, plus the attempt state.
+    type StoredDispatchProof = (
+        Option<String>, // endpoint_id
+        Option<i64>,    // config_generation
+        Option<i64>,    // refresh_epoch
+        Option<String>, // connected_ip
+        Option<String>, // location_class
+        Option<String>, // hops_digest
+        String,         // state
+    );
+
+    async fn read_attempt_proof(
+        db: cockpit_db::Db,
+        job_id: Uuid,
+        slot_id: Uuid,
+        attempt_number: u32,
+    ) -> StoredDispatchProof {
+        db.read(move |conn| {
+            conn.query_row(
+                "SELECT dispatch_proof_endpoint_id,dispatch_proof_config_generation,dispatch_proof_refresh_epoch,dispatch_proof_connected_ip,dispatch_proof_location_class,dispatch_proof_hops_digest,state FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+                params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number)],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn prepare_error_count(db: cockpit_db::Db, job_id: Uuid, slot_id: Uuid) -> Option<i64> {
+        db.read(move |conn| {
+            conn.query_row(
+                "SELECT failure_count FROM image_generation_scheduler_error_counts WHERE job_id=?1 AND slot_id=?2 AND stage='prepare'",
+                params![job_id.to_string(), slot_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    // AC4: a candidate that was dispatchable at plan time but whose revalidation
+    // fails at prepare (stale epoch / identity change / not dispatchable at the
+    // injected now) never journals `dispatching` or hands off, and its attempt
+    // carries no successful proof. The failure is surfaced via
+    // `record_scheduler_error`. Proven with a fail-closed proof source: a prepare
+    // that ignored revalidation would still dispatch and record a proof.
+    #[tokio::test]
+    async fn image_generation_prepare_requires_revalidate_dispatch_proof() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let fixture = setup_real_ledger_scheduler_job(db.clone(), "ac4-proof").await;
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"unreachable-accepted".to_vec(),
+            },
+        ]);
+        let proof_source = FixedDispatchProofSource::failing();
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, &proof_source, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.claimed, 1, "the candidate is claimable at plan time");
+        assert_eq!(
+            pass.dispatched, 0,
+            "a failed revalidation must not dispatch"
+        );
+        assert_eq!(pass.skipped, 1, "the failed prepare is skipped");
+        assert_eq!(
+            proof_source.calls(),
+            1,
+            "prepare must consult the revalidation source exactly once"
+        );
+        assert!(
+            adapter.requests().is_empty(),
+            "no provider handoff may occur without a dispatch proof"
+        );
+        let proof = read_attempt_proof(db.clone(), fixture.job_id, fixture.slot_id, 1).await;
+        assert_eq!(proof.6, "planned", "the attempt never advanced to prepared");
+        assert!(
+            proof.0.is_none() && proof.5.is_none(),
+            "no dispatch proof may be persisted on a failed revalidation"
+        );
+        assert_eq!(
+            prepare_error_count(db, fixture.job_id, fixture.slot_id).await,
+            Some(1),
+            "the prepare abort must be surfaced via record_scheduler_error"
+        );
+    }
+
+    /// A loopback-dispatchable registry for "target-a" (generation 6 / epoch 3,
+    /// refreshed with credential `[cred_seed; 32]`) plus the resolved destination.
+    /// The fixture `plan()`'s target-a destination seals adapter "fixture", endpoint
+    /// identity digest `"9"*64` (== `digest('9')`), and credential identity digest
+    /// `"a"*64` (== `digest('a')` == the sha256 identity of the `0xaa` credential).
+    /// Pass those exact values for the honest success path; pass a divergent value to
+    /// exercise the sealed-identity rejection.
+    async fn loopback_target(
+        cred_seed: u8,
+        adapter_kind: &str,
+        endpoint_identity_digest: &str,
+    ) -> (ImageRuntimeRegistry, ResolvedDispatchDestination) {
+        use crate::image_generation_runtime::dispatch_proof_support::{
+            FixedClock, dispatchable_registry, loopback_endpoint,
+        };
+        let clock = Arc::new(FixedClock(std::sync::atomic::AtomicU64::new(0)));
+        let endpoint = loopback_endpoint();
+        let credential = CredentialIdentityDigest::from_sha256([cred_seed; 32]);
+        let registry =
+            dispatchable_registry(clock, &endpoint, "target-a", 6, 3, credential.clone()).await;
+        let destination = ResolvedDispatchDestination {
+            adapter_kind: adapter_kind.to_owned(),
+            endpoint,
+            endpoint_identity_digest: endpoint_identity_digest.to_owned(),
+            credential_identity_digest: credential,
+        };
+        (registry, destination)
+    }
+
+    // AC5: a successful prepare persists the exact bound tuple observed from the
+    // live registry; and a second prepare after a location-class change cannot
+    // reuse the old proof -- revalidation is re-derived every time (never read
+    // back from storage), so the changed destination aborts with no proof. Drives
+    // the REAL `RegistryDispatchProofSource` + `ImageRuntimeRegistry` so the
+    // persisted values are a genuine connection observation.
+    #[tokio::test]
+    async fn image_generation_prepare_persists_connection_proof_binding() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let (registry, destination) = loopback_target(0xaa, "fixture", &"9".repeat(64)).await;
+        let endpoint = destination.endpoint.clone();
+        let mut destinations = HashMap::new();
+        destinations.insert("target-a".to_owned(), destination);
+        let proof_source = RegistryDispatchProofSource::new(registry.clone(), destinations);
+
+        // Job A: prepare succeeds and stores the bound tuple.
+        let job_a = setup_real_ledger_scheduler_job(db.clone(), "ac5-a").await;
+        let adapter_a = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"ac5-accepted".to_vec(),
+            },
+        ]);
+        let pass_a = ImageGenerationDispatcher::new(db.clone())
+            .run_scheduler_pass(&adapter_a, &proof_source, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass_a.dispatched, 1, "job A dispatches with a fresh proof");
+        let proof_a = read_attempt_proof(db.clone(), job_a.job_id, job_a.slot_id, 1).await;
+        assert_eq!(proof_a.0.as_deref(), Some("endpoint-loopback"));
+        assert_eq!(proof_a.1, Some(6), "config_generation is bound");
+        assert_eq!(proof_a.2, Some(3), "refresh_epoch is bound");
+        assert_eq!(
+            proof_a.3.as_deref(),
+            Some("127.0.0.1"),
+            "connected_ip is bound"
+        );
+        assert_eq!(
+            proof_a.4.as_deref(),
+            Some("loopback"),
+            "location_class is bound"
+        );
+        let hops_digest_a = proof_a.5.expect("hops_digest is bound");
+        assert_eq!(hops_digest_a.len(), 64);
+        assert!(hops_digest_a.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The endpoint's location class changes from loopback to public. Applying
+        // it invalidates the cached loopback health, so the next prepare cannot
+        // reuse job A's proof.
+        let mut public_endpoint = endpoint.clone();
+        public_endpoint.location =
+            cockpit_config::config::image_generation::ImageLocationClass::PublicCloud;
+        registry.apply_endpoint(&public_endpoint, 6, 3);
+
+        // Job B: same target, but the destination's location class no longer
+        // matches -- revalidation aborts, so job B never dispatches and stores no
+        // proof, while job A's stored proof is untouched.
+        let job_b = setup_real_ledger_scheduler_job(db.clone(), "ac5-b").await;
+        let adapter_b = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"ac5-unreachable".to_vec(),
+            },
+        ]);
+        let pass_b = ImageGenerationDispatcher::new(db.clone())
+            .run_scheduler_pass(&adapter_b, &proof_source, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass_b.dispatched, 0,
+            "a location-changed destination cannot reuse the old proof"
+        );
+        assert!(adapter_b.requests().is_empty(), "job B performs no handoff");
+        let proof_b = read_attempt_proof(db.clone(), job_b.job_id, job_b.slot_id, 1).await;
+        assert_eq!(proof_b.6, "planned");
+        assert!(proof_b.0.is_none(), "job B stores no dispatch proof");
+        let proof_a_again = read_attempt_proof(db.clone(), job_a.job_id, job_a.slot_id, 1).await;
+        assert_eq!(
+            proof_a_again.5.as_deref(),
+            Some(hops_digest_a.as_str()),
+            "job A's proof is per-attempt and unchanged by job B"
+        );
+    }
+
+    // AC6: a plan under a loopback/private class whose connected proof becomes
+    // public before prepare aborts prepare with ZERO `ImageGenerationAdapter::handoff`
+    // invocations. Drives the real registry: the loopback health is invalidated by
+    // the class change, so revalidation fails closed.
+    #[tokio::test]
+    async fn image_generation_loopback_to_public_blocks_handoff() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let (registry, destination) = loopback_target(0xaa, "fixture", &"9".repeat(64)).await;
+        let endpoint = destination.endpoint.clone();
+        let mut destinations = HashMap::new();
+        destinations.insert("target-a".to_owned(), destination);
+        let proof_source = RegistryDispatchProofSource::new(registry.clone(), destinations);
+
+        let fixture = setup_real_ledger_scheduler_job(db.clone(), "ac6-loopback").await;
+
+        // Before prepare, the endpoint's class transitions loopback -> public.
+        let mut public_endpoint = endpoint.clone();
+        public_endpoint.location =
+            cockpit_config::config::image_generation::ImageLocationClass::PublicCloud;
+        registry.apply_endpoint(&public_endpoint, 6, 3);
+
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"ac6-unreachable".to_vec(),
+            },
+        ]);
+        let pass = ImageGenerationDispatcher::new(db.clone())
+            .run_scheduler_pass(&adapter, &proof_source, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.dispatched, 0,
+            "a loopback->public transition blocks dispatch"
+        );
+        assert_eq!(pass.skipped, 1);
+        assert!(
+            adapter.requests().is_empty(),
+            "zero provider handoff invocations after a location-class change"
+        );
+        let proof = read_attempt_proof(db.clone(), fixture.job_id, fixture.slot_id, 1).await;
+        assert_eq!(proof.6, "planned", "the attempt never advanced to prepared");
+        assert!(proof.0.is_none(), "no dispatch proof persisted after abort");
+        assert_eq!(
+            prepare_error_count(db, fixture.job_id, fixture.slot_id).await,
+            Some(1),
+            "the aborted prepare is surfaced via record_scheduler_error"
+        );
+    }
+
+    // AC5 (identity binding): a resolved destination whose sealed identity differs
+    // from the plan -- even at the SAME configuration generation, and even when the
+    // underlying registry would otherwise be dispatchable -- must fail closed before
+    // any provider contact. Each variant diverges in exactly one sealed field
+    // (endpoint identity digest, credential identity digest, or adapter kind); the
+    // registry itself accepts the resolved credential, so a revalidation that
+    // checked only the generation would dispatch all three. The fixture plan()'s
+    // target-a seals adapter "fixture", endpoint digest "9"*64, credential "a"*64.
+    #[tokio::test]
+    async fn image_generation_prepare_rejects_unsealed_destination_identity() {
+        // (label, cred_seed, adapter_kind, endpoint_identity_digest)
+        let variants: [(&str, u8, &str, String); 3] = [
+            ("endpoint_identity", 0xaa, "fixture", "0".repeat(64)),
+            // Registry refreshed+resolved with 0xbb (so revalidation would succeed),
+            // but the sealed plan credential digest is "a"*64 (the 0xaa identity).
+            ("credential_identity", 0xbb, "fixture", "9".repeat(64)),
+            ("adapter_kind", 0xaa, "openai_images", "9".repeat(64)),
+        ];
+        for (label, cred_seed, adapter_kind, endpoint_identity_digest) in variants {
+            let db = cockpit_db::Db::open_in_memory().unwrap();
+            let (registry, destination) =
+                loopback_target(cred_seed, adapter_kind, &endpoint_identity_digest).await;
+            let mut destinations = HashMap::new();
+            destinations.insert("target-a".to_owned(), destination);
+            let proof_source = RegistryDispatchProofSource::new(registry, destinations);
+
+            let fixture = setup_real_ledger_scheduler_job(db.clone(), label).await;
+            let adapter = DeterministicImageGenerationAdapter::new(vec![
+                ImageGenerationHandoffResult::Accepted {
+                    evidence: b"unsealed-unreachable".to_vec(),
+                },
+            ]);
+            let pass = ImageGenerationDispatcher::new(db.clone())
+                .run_scheduler_pass(&adapter, &proof_source, deadline_boot(), 100, 2, 2, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                pass.dispatched, 0,
+                "{label}: a divergent sealed identity must not dispatch"
+            );
+            assert!(
+                adapter.requests().is_empty(),
+                "{label}: no provider handoff for an unsealed destination"
+            );
+            let proof = read_attempt_proof(db.clone(), fixture.job_id, fixture.slot_id, 1).await;
+            assert_eq!(proof.6, "planned", "{label}: attempt never prepared");
+            assert!(proof.0.is_none(), "{label}: no dispatch proof persisted");
+        }
     }
 
     // AC8: `record_scheduler_error` is production-real. Three failures for the
@@ -4530,7 +5085,7 @@ mod tests {
             },
         ]);
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1);
@@ -4573,7 +5128,7 @@ mod tests {
             DecodeLimit::canonical(),
         );
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(
@@ -4676,7 +5231,7 @@ mod tests {
             DecodeLimit::canonical(),
         );
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1);
@@ -4745,7 +5300,7 @@ mod tests {
             Arc::new(FixedGeminiPlanSource::new(sample_attempt_input())),
         );
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(
@@ -4825,7 +5380,7 @@ mod tests {
             Arc::new(FixedOpenrouterPlanSource::new(sample_attempt_input())),
         );
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(
@@ -4903,7 +5458,7 @@ mod tests {
         let adapter =
             ComfyuiImagesAdapter::new(transport.clone(), Arc::new(resolved_handoff_source()));
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(
@@ -5223,7 +5778,7 @@ mod tests {
             },
         ]);
         let first = dispatcher
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(first.dispatched, 1, "{first:#?}");
@@ -5253,7 +5808,7 @@ mod tests {
         .await
         .unwrap();
         let second = dispatcher
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 3, 3, 8)
             .await
             .unwrap();
         assert_eq!(second.dispatched, 0, "{second:#?}");
@@ -5287,7 +5842,15 @@ mod tests {
         ]);
         for at in 2..=4 {
             let pass = dispatcher
-                .run_scheduler_pass(&adapter, deadline_boot(), 100, at, at as u64, 8)
+                .run_scheduler_pass(
+                    &adapter,
+                    &proof_ok(),
+                    deadline_boot(),
+                    100,
+                    at,
+                    at as u64,
+                    8,
+                )
                 .await
                 .unwrap();
             assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -5324,7 +5887,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(exhausted.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         exhausted
@@ -5362,7 +5925,7 @@ mod tests {
         ]);
         assert_eq!(
             dispatcher
-                .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+                .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
                 .await
                 .unwrap()
                 .dispatched,
@@ -5370,7 +5933,7 @@ mod tests {
         );
         assert_eq!(
             dispatcher
-                .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
+                .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 3, 3, 8)
                 .await
                 .unwrap()
                 .dispatched,
@@ -5396,7 +5959,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(fixture.db)
-            .run_scheduler_pass(&first, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&first, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         let reopened = cockpit_db::Db::open(&path).unwrap();
@@ -5407,7 +5970,7 @@ mod tests {
         ]);
         assert_eq!(
             ImageGenerationDispatcher::new(reopened)
-                .run_scheduler_pass(&second, deadline_boot(), 100, 3, 3, 8)
+                .run_scheduler_pass(&second, &proof_ok(), deadline_boot(), 100, 3, 3, 8)
                 .await
                 .unwrap()
                 .dispatched,
@@ -5470,7 +6033,7 @@ mod tests {
                 },
             ]);
             let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-                .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+                .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
                 .await
                 .unwrap();
             assert_eq!(pass.dispatched, 0, "{name}: {pass:#?}");
@@ -5555,7 +6118,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         let fact = fixture
@@ -5601,7 +6164,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(fixture.db)
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         let reopened = cockpit_db::Db::open(&path).unwrap();
@@ -5854,7 +6417,15 @@ mod tests {
         let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
         for at in 2..=3 {
             let pass = dispatcher
-                .run_scheduler_pass(&adapter, deadline_boot(), 100, at, at as u64, 8)
+                .run_scheduler_pass(
+                    &adapter,
+                    &proof_ok(),
+                    deadline_boot(),
+                    100,
+                    at,
+                    at as u64,
+                    8,
+                )
                 .await
                 .unwrap();
             assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -6364,7 +6935,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(fixture.db)
-            .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&handoff, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(handoff.requests().len(), 1);
@@ -6439,7 +7010,7 @@ mod tests {
         ]);
         let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
         dispatcher
-            .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&handoff, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         let recovery = DeterministicImageGenerationAdapter::with_recovery(
@@ -6509,7 +7080,7 @@ mod tests {
                 },
             ]);
             ImageGenerationDispatcher::new(fixture.db.clone())
-                .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+                .run_scheduler_pass(&handoff, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
                 .await
                 .unwrap();
             fixture
@@ -6580,7 +7151,7 @@ mod tests {
                 ]);
                 let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
                 dispatcher
-                    .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+                    .run_scheduler_pass(&handoff, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
                     .await
                     .unwrap();
                 if cancel_first {
@@ -6756,7 +7327,7 @@ mod tests {
             },
         ]);
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 0);
@@ -6822,7 +7393,7 @@ mod tests {
             },
         ]);
         let pass = dispatcher
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -7287,7 +7858,7 @@ mod tests {
             },
         ]);
         let pass = dispatcher
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -7295,7 +7866,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].job_id, second.job_id);
         let replay = dispatcher
-            .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 3, 3, 8)
             .await
             .unwrap();
         assert_eq!(replay.dispatched, 0, "{replay:#?}");

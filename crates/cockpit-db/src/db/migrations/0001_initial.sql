@@ -967,6 +967,103 @@ CREATE TABLE lock_reads (
 -- proto::InterruptQuestionSet; the single-question `question_json` column
 -- serves the `jobs` needs-attention nudge. A row never populates both.
 
+-- ---- recursive agent tree and decision persistence ---------------------------
+-- These rows are daemon-owned durable control state. Contracts below are
+-- redacted summaries, never a prompt, credential, or resolver context.
+CREATE TABLE agent_instances (
+    agent_instance_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parent_agent_instance_id TEXT,
+    task_delegation_job_id TEXT UNIQUE,
+    task_delegation_child_uuid TEXT UNIQUE,
+    resolved_profile_snapshot_id TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+        'created', 'running', 'waiting_for_user', 'waiting_for_approval',
+        'completed', 'failed', 'cancelled'
+    )),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (agent_instance_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT,
+    FOREIGN KEY (resolved_profile_snapshot_id, session_id)
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_agent_instances_session_state
+    ON agent_instances(session_id, state, updated_at_unix_ms);
+CREATE INDEX idx_agent_instances_parent
+    ON agent_instances(parent_agent_instance_id)
+    WHERE parent_agent_instance_id IS NOT NULL;
+
+CREATE TABLE decision_requests (
+    decision_request_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    options_contract_json TEXT NOT NULL,
+    free_text_contract_json TEXT,
+    recommendation_json TEXT,
+    rationale_redaction_class TEXT NOT NULL CHECK (rationale_redaction_class IN ('public', 'sensitive', 'secret')),
+    deadline_unix_ms INTEGER,
+    policy_receipt_json TEXT NOT NULL,
+    resolver_route TEXT CHECK (resolver_route IN ('user', 'policy', 'utility', 'timeout', 'cancellation')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'resolving', 'answered', 'auto_resolved', 'timed_out', 'cancelled')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (decision_request_id, session_id),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_decision_requests_agent_state
+    ON decision_requests(agent_instance_id, state, updated_at_unix_ms);
+
+CREATE TABLE decision_receipts (
+    decision_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    terminal_state TEXT NOT NULL CHECK (terminal_state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')),
+    terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
+    receipt_json TEXT NOT NULL,
+    session_event_seq INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE TABLE agent_transition_receipts (
+    agent_instance_id TEXT NOT NULL,
+    terminal_state TEXT NOT NULL CHECK (terminal_state IN ('completed', 'failed', 'cancelled')),
+    session_id TEXT NOT NULL,
+    terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
+    receipt_json TEXT NOT NULL,
+    session_event_seq INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (agent_instance_id, terminal_state),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER decision_receipts_immutable
+BEFORE UPDATE ON decision_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'decision receipts are immutable');
+END;
+
+CREATE TRIGGER agent_transition_receipts_immutable
+BEFORE UPDATE ON agent_transition_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'agent transition receipts are immutable');
+END;
+
 CREATE TABLE needs_attention (
     interrupt_id   TEXT    PRIMARY KEY,
     session_id     TEXT    NOT NULL,
@@ -983,6 +1080,15 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    -- Recursive-agent decisions use this typed ownership edge. Legacy
+    -- interrupts leave it NULL; a decision row never carries legacy question
+    -- or parked-call authority.
+    decision_request_id TEXT UNIQUE,
+    -- A decision-owned row is a durable projection of its decision state,
+    -- rather than an independently mutable interrupt.  Legacy rows retain
+    -- their historical unversioned API; the decision state machine advances
+    -- this revision under its own transaction-only guard.
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
     CHECK (question_json IS NULL OR questions_json IS NULL),
     CHECK (
         (parked_tool IS NULL AND parked_args_json IS NULL AND parked_call_id IS NULL AND parked_resume_json IS NULL)
@@ -993,10 +1099,92 @@ CREATE TABLE needs_attention (
     CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
     CHECK (state IN ('executing', 'interrupted', 'resolved') OR response_json IS NULL),
     CHECK (state <> 'executing' OR response_json IS NOT NULL),
+    CHECK (
+        decision_request_id IS NULL OR
+        (question_json IS NULL AND questions_json IS NULL
+         AND parked_tool IS NULL AND parked_args_json IS NULL
+         AND parked_call_id IS NULL AND parked_resume_json IS NULL
+         AND parked_gate_json IS NULL)
+    ),
+    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_na_session_open ON needs_attention (session_id, state);
+
+-- `agent_tree_decisions` installs this guard only for the short portion of
+-- its transaction which resolves a decision-owned projection.  Existing
+-- interrupt APIs never create a guard, so they cannot accidentally race or
+-- mutate rows owned by the decision state machine.  It is intentionally
+-- empty outside that transaction (and is removed before commit).
+CREATE TABLE decision_attention_mutation_guards (
+    decision_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER needs_attention_decision_session_insert
+BEFORE INSERT ON needs_attention
+WHEN NEW.decision_request_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM decision_requests d
+    WHERE d.decision_request_id = NEW.decision_request_id
+      AND d.session_id = NEW.session_id
+      AND d.agent_instance_id = NEW.agent_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
+END;
+
+CREATE TRIGGER needs_attention_decision_session_update
+BEFORE UPDATE OF decision_request_id, session_id, agent_id ON needs_attention
+WHEN NEW.decision_request_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM decision_requests d
+    WHERE d.decision_request_id = NEW.decision_request_id
+      AND d.session_id = NEW.session_id
+      AND d.agent_instance_id = NEW.agent_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
+END;
+
+CREATE TRIGGER needs_attention_decision_owned_update
+BEFORE UPDATE ON needs_attention
+WHEN OLD.decision_request_id IS NOT NULL
+ AND (
+    NEW.interrupt_id IS NOT OLD.interrupt_id
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.description IS NOT OLD.description
+    OR NEW.question_json IS NOT OLD.question_json
+    OR NEW.raised_at IS NOT OLD.raised_at
+    OR NEW.questions_json IS NOT OLD.questions_json
+    OR NEW.parked_tool IS NOT OLD.parked_tool
+    OR NEW.parked_args_json IS NOT OLD.parked_args_json
+    OR NEW.parked_call_id IS NOT OLD.parked_call_id
+    OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
+    OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
+    OR NEW.decision_request_id IS NOT OLD.decision_request_id
+    OR NEW.state <> 'resolved'
+    OR NEW.resolved_at IS NULL
+    OR NEW.revision <> OLD.revision + 1
+    OR NOT EXISTS (
+        SELECT 1 FROM decision_attention_mutation_guards g
+        WHERE g.decision_request_id = OLD.decision_request_id
+          AND g.session_id = OLD.session_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM decision_requests d
+        WHERE d.decision_request_id = OLD.decision_request_id
+          AND d.session_id = OLD.session_id
+          AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision-owned needs-attention is managed by decision state machine');
+END;
 
 -- ---- tool_call_stats view ----------------------------------------------------
 
@@ -2060,6 +2248,7 @@ CREATE TABLE task_delegation_jobs (
 CREATE TABLE task_delegation_children (
     task_call_id TEXT NOT NULL,
     label TEXT NOT NULL,
+    child_uuid TEXT NOT NULL UNIQUE,
     child_agent TEXT NOT NULL,
     model TEXT,
     status TEXT NOT NULL CHECK (status IN (
@@ -2549,6 +2738,9 @@ CREATE TABLE write_scope_leases (
     session_id              TEXT NOT NULL,
     -- Owning task / async job, when the lease is bound to delegated work.
     task_id                 TEXT,
+    -- Recursive-agent ownership is an edge from the lease to its agent, not
+    -- an agent-held lease capability. Legacy task leases leave this NULL.
+    agent_instance_id       TEXT,
     -- Canonical absolute directory subtree this lease grants write authority over.
     scope_path              TEXT NOT NULL,
     -- Bumped by every authority-changing transition; invalidates older tokens.
@@ -2564,6 +2756,8 @@ CREATE TABLE write_scope_leases (
     updated_at_wall_ms      INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
     FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
 );
 
@@ -5308,7 +5502,8 @@ CREATE TABLE agent_profile_snapshots (
     definition_digest             TEXT NOT NULL,
     binding_revision_map_payload  BLOB NOT NULL,
     binding_revision_map_digest   TEXT NOT NULL,
-    created_at_unix_ms            INTEGER NOT NULL
+    created_at_unix_ms            INTEGER NOT NULL,
+    UNIQUE (snapshot_id, session_id)
 );
 
 CREATE TABLE agent_session_preparations (

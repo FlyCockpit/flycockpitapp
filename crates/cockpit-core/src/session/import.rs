@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use cockpit_db::db::Db;
@@ -349,15 +350,22 @@ fn restore_archive_conn(
         for child in &job.children {
             conn.execute(
                 "INSERT INTO task_delegation_children (
-                    task_call_id, label, child_agent, model, status, report, output_dir,
+                    task_call_id, label, child_uuid, child_agent, model, status, report, output_dir,
                     todo_ids_json, result_delivered, started_at, finished_at, created_at,
                     updated_at, requested_cwd, resolved_cwd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     task_call_id_map
                         .get(&job.task_call_id)
                         .unwrap_or(&job.task_call_id),
                     child.label,
+                    imported_delegation_child_uuid(
+                        task_call_id_map
+                            .get(&job.task_call_id)
+                            .unwrap_or(&job.task_call_id),
+                        &child.label,
+                    )
+                    .to_string(),
                     child.child_agent,
                     child.model,
                     child.status,
@@ -588,6 +596,25 @@ fn restore_archive_conn(
         imported,
         redacted: archive.redacted,
     })
+}
+
+/// Historical exports did not carry a child UUID. Derive one from the final
+/// imported task identity and label, which makes a retry of the same import
+/// stable while avoiding collisions between `as_new` imports that remap task
+/// IDs. This UUID is an opaque durable mapping, never user-controlled routing.
+fn imported_delegation_child_uuid(task_call_id: &str, label: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit-imported-delegation-child/v1\0");
+    digest.update(task_call_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(label.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.finalize()[..16]);
+    // Mark the opaque digest as an RFC 4122 variant/version-5-shaped UUID;
+    // no v5 crate feature is required and the value is deterministic.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 fn remap_task_call_id_references(value: &mut Value, task_call_id_map: &BTreeMap<String, String>) {
@@ -1322,6 +1349,88 @@ mod tests {
 
     use super::*;
     use zip::write::{SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn imported_delegation_child_uuid_is_stable_and_uses_final_task_identity() {
+        let first = imported_delegation_child_uuid("task-a", "worker");
+        assert_eq!(first, imported_delegation_child_uuid("task-a", "worker"));
+        assert_ne!(first, imported_delegation_child_uuid("task-b", "worker"));
+        assert_ne!(first, imported_delegation_child_uuid("task-a", "reviewer"));
+        assert_eq!(first.get_version_num(), 5);
+    }
+
+    #[tokio::test]
+    async fn import_persists_deterministic_child_uuid_for_legacy_delegation_archives() {
+        let db = Db::open_in_memory().unwrap();
+        let source_session_id = Uuid::new_v4();
+        let archive = ImportArchive {
+            project_id: "import-test".into(),
+            project_root: "/tmp/import-test".into(),
+            redacted: true,
+            sessions: vec![ImportedSession {
+                source_id: source_session_id,
+                parent_source_id: None,
+                short_id: Some("imported".into()),
+                fork_point_turn_id: None,
+                active_model: None,
+                active_agent: "Build".into(),
+                started_at: 1,
+                ended_at: None,
+                title: Some("Imported".into()),
+            }],
+            events: Vec::new(),
+            compressed_results: Vec::new(),
+            delegation_jobs: vec![ImportedDelegationJob {
+                task_call_id: "legacy-task".into(),
+                function_call_id: None,
+                parent_source_id: source_session_id,
+                parent_agent: "Build".into(),
+                original_args_json: None,
+                status: "completed".into(),
+                ack_delivered: true,
+                final_delivered: true,
+                created_at: 1,
+                updated_at: 2,
+                children: vec![ImportedDelegationChild {
+                    label: "worker".into(),
+                    child_agent: "worker".into(),
+                    model: None,
+                    status: "completed".into(),
+                    report: None,
+                    output_dir: None,
+                    todo_ids_json: None,
+                    result_delivered: true,
+                    started_at: Some(1),
+                    finished_at: Some(2),
+                    created_at: 1,
+                    updated_at: 2,
+                    requested_cwd: None,
+                    resolved_cwd: None,
+                }],
+            }],
+            delegation_payloads: Vec::new(),
+            delegation_steers: Vec::new(),
+            inference_calls: Vec::new(),
+            tool_calls: Vec::new(),
+        };
+        import_archive(&db, archive, false).await.unwrap();
+        let child_uuid: String = db
+            .read(|conn| {
+                let child_uuid = conn.query_row(
+                    "SELECT child_uuid FROM task_delegation_children
+                     WHERE task_call_id = 'legacy-task' AND label = 'worker'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(child_uuid)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            child_uuid,
+            imported_delegation_child_uuid("legacy-task", "worker").to_string()
+        );
+    }
 
     fn session(id: Uuid, parent: Option<Uuid>) -> Value {
         json!({

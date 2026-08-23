@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -82,6 +82,7 @@ pub struct TaskDelegationJobUpsert<'a> {
 #[derive(Debug, Clone)]
 struct DelegationChildInitOwned {
     label: String,
+    child_uuid: String,
     child_agent: String,
     model: Option<String>,
     output_dir: Option<String>,
@@ -121,6 +122,7 @@ impl From<&DelegationChildInit<'_>> for DelegationChildInitOwned {
     fn from(value: &DelegationChildInit<'_>) -> Self {
         Self {
             label: value.label.to_owned(),
+            child_uuid: Uuid::new_v4().to_string(),
             child_agent: value.child_agent.to_owned(),
             model: value.model.map(str::to_owned),
             output_dir: value.output_dir.map(str::to_owned),
@@ -221,7 +223,12 @@ impl Db {
             original_args_json,
             children,
         });
-        self.write(move |conn| Self::upsert_task_delegation_job_conn(conn, job, now))
+        // The ownership read in `upsert_task_delegation_job_conn` must share a
+        // `BEGIN IMMEDIATE` transaction with the conflict insert and every
+        // child write.  A plain queued write only serializes one process: two
+        // daemon connections could both observe no owner and let the loser
+        // update the winner's job on the conflict path.
+        self.transaction(move |conn| Self::upsert_task_delegation_job_conn(conn, job, now))
             .await
     }
 
@@ -248,7 +255,10 @@ impl Db {
             .into_iter()
             .map(|payload| self.prepare_task_delegation_payload(payload))
             .collect::<Result<Vec<_>>>()?;
-        self.write(move |conn| {
+        // Keep the owner check, job, children, and payload rows under the
+        // same immediate transaction.  `upsert_task_delegation_job_conn` is a
+        // connection helper specifically so this does not nest transactions.
+        self.transaction(move |conn| {
             Self::upsert_task_delegation_job_conn(conn, job, now)?;
             let mut rows = Vec::with_capacity(prepared_payloads.len());
             for prepared_payload in prepared_payloads {
@@ -273,6 +283,20 @@ impl Db {
         let parent_agent = job.parent_agent;
         let original_args_json = job.original_args_json;
         let children = job.children;
+        let existing_owner: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM task_delegation_jobs WHERE task_call_id = ?1",
+                [&task_call_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("checking task delegation job ownership")?;
+        if let Some(existing_owner) = existing_owner {
+            anyhow::ensure!(
+                existing_owner == session_id.to_string(),
+                "task delegation job belongs to another session"
+            );
+        }
         conn.execute(
             "INSERT INTO task_delegation_jobs (
                     task_call_id, function_call_id, parent_session_id, parent_agent,
@@ -280,7 +304,6 @@ impl Db {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?6)
                  ON CONFLICT(task_call_id) DO UPDATE SET
                     function_call_id = excluded.function_call_id,
-                    parent_session_id = excluded.parent_session_id,
                     parent_agent = excluded.parent_agent,
                     original_args_json = COALESCE(excluded.original_args_json, task_delegation_jobs.original_args_json),
                     updated_at = excluded.updated_at",
@@ -298,10 +321,10 @@ impl Db {
         for child in children {
             conn.execute(
                 "INSERT INTO task_delegation_children (
-                        task_call_id, label, child_agent, model, status, output_dir,
+                        task_call_id, label, child_uuid, child_agent, model, status, output_dir,
                         requested_cwd, resolved_cwd, todo_ids_json, started_at,
                         created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, ?9, ?9)
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?10, ?10)
                      ON CONFLICT(task_call_id, label) DO UPDATE SET
                         child_agent = excluded.child_agent,
                         model = excluded.model,
@@ -313,6 +336,7 @@ impl Db {
                 params![
                     &task_call_id,
                     &child.label,
+                    &child.child_uuid,
                     &child.child_agent,
                     child.model.as_deref(),
                     child.output_dir.as_deref(),

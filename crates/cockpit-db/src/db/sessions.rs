@@ -2407,7 +2407,9 @@ impl Db {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM needs_attention
-                  WHERE session_id = ?1 AND resolved_at IS NULL",
+                  WHERE session_id = ?1
+                    AND decision_request_id IS NULL
+                    AND resolved_at IS NULL",
                 [session_id.to_string()],
                 |row| row.get(0),
             )
@@ -2422,8 +2424,9 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT state, question_json, questions_json
-                   FROM needs_attention
+                  FROM needs_attention
                   WHERE session_id = ?1
+                    AND decision_request_id IS NULL
                     AND state IN ('open', 'parked', 'interrupted')
                   ORDER BY CASE state WHEN 'open' THEN 0 WHEN 'parked' THEN 0 ELSE 1 END,
                            raised_at ASC, rowid ASC

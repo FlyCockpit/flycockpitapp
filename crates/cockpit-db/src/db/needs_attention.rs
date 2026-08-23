@@ -258,7 +258,8 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET resolved_at = ?1, response_json = ?2, state = 'resolved'
-                      WHERE interrupt_id = ?3 AND state = 'open'",
+                      WHERE interrupt_id = ?3 AND state = 'open'
+                        AND decision_request_id IS NULL",
                     params![now, response_json, interrupt_id.to_string()],
                 )
                 .context("resolving needs_attention")?;
@@ -279,7 +280,9 @@ impl Db {
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
-                      WHERE session_id = ?1 AND state IN ('open', 'parked')
+                      WHERE session_id = ?1
+                        AND decision_request_id IS NULL
+                        AND state IN ('open', 'parked')
                       ORDER BY raised_at ASC, rowid ASC",
                 )
                 .context("preparing list_open_interrupts")?;
@@ -307,7 +310,9 @@ impl Db {
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
-                      WHERE session_id = ?1 AND state IN ('open', 'parked', 'executing')
+                      WHERE session_id = ?1
+                        AND decision_request_id IS NULL
+                        AND state IN ('open', 'parked', 'executing')
                       ORDER BY raised_at ASC, rowid ASC",
                 )
                 .context("preparing list_reconcilable_interrupts")?;
@@ -332,7 +337,7 @@ impl Db {
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
-                      WHERE interrupt_id = ?1",
+                      WHERE interrupt_id = ?1 AND decision_request_id IS NULL",
                 )
                 .context("preparing get_interrupt")?;
             let mut rows = stmt
@@ -358,7 +363,7 @@ impl Db {
                 .query_row(
                     "SELECT rowid, session_id, agent_id, description, questions_json
                        FROM needs_attention
-                      WHERE interrupt_id = ?1",
+                      WHERE interrupt_id = ?1 AND decision_request_id IS NULL",
                     [interrupt_id.to_string()],
                     |row| {
                         Ok((
@@ -376,6 +381,7 @@ impl Db {
                     "SELECT COUNT(*)
                        FROM needs_attention
                       WHERE session_id = ?1
+                        AND decision_request_id IS NULL
                         AND rowid <= ?2
                         AND agent_id = ?3
                         AND description = ?4
@@ -398,7 +404,8 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'parked'
-                      WHERE interrupt_id = ?1 AND state = 'open'",
+                      WHERE interrupt_id = ?1 AND state = 'open'
+                        AND decision_request_id IS NULL",
                     params![interrupt_id.to_string()],
                 )
                 .context("parking needs_attention")?;
@@ -413,7 +420,9 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'interrupted'
-                      WHERE interrupt_id = ?1 AND state IN ('open', 'parked', 'executing')",
+                      WHERE interrupt_id = ?1
+                        AND decision_request_id IS NULL
+                        AND state IN ('open', 'parked', 'executing')",
                     params![interrupt_id.to_string()],
                 )
                 .context("marking needs_attention interrupted")?;
@@ -429,7 +438,9 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'resolved', resolved_at = ?1
-                      WHERE session_id = ?2 AND state = 'interrupted'",
+                      WHERE session_id = ?2
+                        AND decision_request_id IS NULL
+                        AND state = 'interrupted'",
                     params![now, session_id.to_string()],
                 )
                 .context("acknowledging interrupted needs_attention markers")?;
@@ -480,7 +491,8 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'executing', response_json = ?1
-                      WHERE interrupt_id = ?2 AND state = 'parked'",
+                      WHERE interrupt_id = ?2 AND state = 'parked'
+                        AND decision_request_id IS NULL",
                     params![response_json, interrupt_id.to_string()],
                 )
                 .context("marking parked interrupt executing")?;
@@ -496,7 +508,8 @@ impl Db {
                 .execute(
                     "UPDATE needs_attention
                         SET state = 'resolved', resolved_at = ?1
-                      WHERE interrupt_id = ?2 AND state = 'executing'",
+                      WHERE interrupt_id = ?2 AND state = 'executing'
+                        AND decision_request_id IS NULL",
                     params![now, interrupt_id.to_string()],
                 )
                 .context("completing executing interrupt")?;

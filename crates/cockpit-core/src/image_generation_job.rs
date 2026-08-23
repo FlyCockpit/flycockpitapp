@@ -20,7 +20,7 @@ use crate::image_generation_runtime::{
     CredentialIdentityDigest, DispatchProofBinding, ImageHealthSnapshot, ImageRuntimeRegistry,
     RuntimeError, RuntimeErrorCode,
 };
-use cockpit_config::config::image_generation::ImageEndpoint;
+use cockpit_config::config::image_generation::{ImageAdapterKind, ImageEndpoint};
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
@@ -552,6 +552,135 @@ impl ImageDispatchProofSource for RegistryDispatchProofSource {
     }
 }
 
+/// Map a sealed plan destination `adapter_kind` string onto the typed
+/// [`ImageAdapterKind`]. The spellings are the canonical wire strings the
+/// planner seals into `TargetDestinationV1::adapter_kind`. An unrecognized
+/// spelling returns `None`, which the scheduler pass turns into a typed
+/// `adapter_missing` skip rather than a panic.
+fn parse_image_adapter_kind(adapter_kind: &str) -> Option<ImageAdapterKind> {
+    match adapter_kind {
+        "openai_images" => Some(ImageAdapterKind::OpenaiImages),
+        "openrouter_images" => Some(ImageAdapterKind::OpenrouterImages),
+        "gemini_images" => Some(ImageAdapterKind::GeminiImages),
+        "comfyui" => Some(ImageAdapterKind::Comfyui),
+        _ => None,
+    }
+}
+
+/// A typed multi-provider adapter registry the daemon image-generation worker
+/// consults per dispatch candidate. Keyed by [`ImageAdapterKind`]; a claimed
+/// candidate whose sealed destination kind is absent from the map yields a typed
+/// `adapter_missing` skip (recorded via the scheduler-error path — never a panic
+/// or a silent no-op). Production may ship with zero or partial kinds until
+/// `wire-image-generation-adapters-to-dispatch` installs the concrete provider
+/// adapters; tests inject `DeterministicImageGenerationAdapter` / scripted fakes.
+#[derive(Clone, Default)]
+pub struct ImageGenerationAdapterMap {
+    adapters: HashMap<ImageAdapterKind, std::sync::Arc<dyn ImageGenerationAdapter>>,
+}
+
+impl ImageGenerationAdapterMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register (or replace) the adapter for a kind, builder-style.
+    #[must_use]
+    pub fn with(
+        mut self,
+        kind: ImageAdapterKind,
+        adapter: std::sync::Arc<dyn ImageGenerationAdapter>,
+    ) -> Self {
+        self.adapters.insert(kind, adapter);
+        self
+    }
+
+    pub fn insert(
+        &mut self,
+        kind: ImageAdapterKind,
+        adapter: std::sync::Arc<dyn ImageGenerationAdapter>,
+    ) {
+        self.adapters.insert(kind, adapter);
+    }
+
+    pub fn get(
+        &self,
+        kind: ImageAdapterKind,
+    ) -> Option<&std::sync::Arc<dyn ImageGenerationAdapter>> {
+        self.adapters.get(&kind)
+    }
+
+    pub fn len(&self) -> usize {
+        self.adapters.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
+}
+
+/// Resolves which [`ImageGenerationAdapter`] handles a claimed dispatch
+/// candidate. `Ok(None)` is a typed adapter_missing skip; `Err` is an internal
+/// decode failure (the scan already guarantees the slot is in the plan). Two
+/// public entry points feed it: `run_scheduler_pass` (one adapter, any kind —
+/// existing single-provider tests) and `run_scheduler_pass_with_adapters` (the
+/// typed [`ImageGenerationAdapterMap`] the daemon worker holds).
+trait CandidateDispatch: Sync {
+    fn adapter_for<'a>(
+        &'a self,
+        plan: &ImageGenerationPlanV1,
+        slot_id: Uuid,
+    ) -> Result<Option<&'a dyn ImageGenerationAdapter>>;
+}
+
+/// Dispatch every candidate through a single adapter regardless of its sealed
+/// kind (the historical `run_scheduler_pass` contract).
+struct SingleAdapterDispatch<'a>(&'a dyn ImageGenerationAdapter);
+
+impl CandidateDispatch for SingleAdapterDispatch<'_> {
+    fn adapter_for<'a>(
+        &'a self,
+        _plan: &ImageGenerationPlanV1,
+        _slot_id: Uuid,
+    ) -> Result<Option<&'a dyn ImageGenerationAdapter>> {
+        Ok(Some(self.0))
+    }
+}
+
+/// Route each candidate to the adapter registered for its sealed destination
+/// kind, or `None` (typed adapter_missing) when no adapter is installed for it.
+struct MapAdapterDispatch<'a>(&'a ImageGenerationAdapterMap);
+
+impl CandidateDispatch for MapAdapterDispatch<'_> {
+    fn adapter_for<'a>(
+        &'a self,
+        plan: &ImageGenerationPlanV1,
+        slot_id: Uuid,
+    ) -> Result<Option<&'a dyn ImageGenerationAdapter>> {
+        let target = plan
+            .targets
+            .iter()
+            .find(|target| target.slots.iter().any(|slot| slot.slot_id == slot_id))
+            .context("scheduler candidate slot is absent from immutable plan")?;
+        Ok(parse_image_adapter_kind(&target.destination.adapter_kind)
+            .and_then(|kind| self.0.get(kind))
+            .map(std::sync::Arc::as_ref))
+    }
+}
+
+/// Outcome of the worker's prior-boot reconciliation sweep (AC2). Runs BEFORE
+/// this boot claims any scheduler work so a pre-crash boot's artifact read
+/// leases can never gate — or be revived by — the current boot. Immutable claim
+/// tables self-expire on their wall-clock TTL and are not swept (see
+/// [`ImageGenerationDispatcher::run_prior_boot_reconciliation`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PriorBootReconciliation {
+    /// Prior-boot artifact read leases released via the foundation's
+    /// boot-scoped repair (a prior boot's monotonic lease deadline is
+    /// meaningless and must never be revived).
+    pub artifact_leases_released: u64,
+}
+
 /// Stable, greppable identity for a scheduler-error attention row. There is no
 /// dedicated `code` column on `needs_attention`; this string is the stable
 /// prefix of the raised row's `description` and its `agent_id`.
@@ -673,7 +802,42 @@ impl ImageGenerationDispatcher {
         }
     }
 
-    pub async fn run_reconciliation_pass<A: ImageGenerationAdapter>(
+    /// Release resources owned by *other* daemon boots before this boot accepts
+    /// new scheduler work (AC2). The one boot-scoped resource the foundation
+    /// models with a *monotonic* deadline — an artifact read lease — is released
+    /// through the foundation's boot-scoped repair, because a prior boot's
+    /// monotonic lease deadline is meaningless (and must never be revived) across
+    /// a restart. The claim tables (scheduler / reconciliation / provider-cancel)
+    /// are immutable by construction (delete/update triggers) and instead carry a
+    /// bounded *wall-clock* TTL (`expires_at_unix_ms ≤ claimed+60s`), so a
+    /// pre-crash boot's claim simply expires on wall time and cannot be — and
+    /// need not be — swept here. Must run BEFORE the first `run_scheduler_pass*`
+    /// of this boot.
+    pub async fn run_prior_boot_reconciliation(
+        &self,
+        worker_boot_id: Uuid,
+    ) -> Result<PriorBootReconciliation> {
+        ensure!(
+            !worker_boot_id.is_nil(),
+            "prior-boot reconciliation requires a boot id"
+        );
+        // The boot-scoped artifact-lease repair opens its own transaction, so it
+        // runs on a bare (non-transaction) writer connection.
+        let artifact_leases_released = self
+            .db
+            .write(move |conn| {
+                cockpit_db::Db::repair_image_generation_artifact_leases_for_boot_conn(
+                    conn,
+                    worker_boot_id,
+                )
+            })
+            .await?;
+        Ok(PriorBootReconciliation {
+            artifact_leases_released,
+        })
+    }
+
+    pub async fn run_reconciliation_pass<A: ImageGenerationAdapter + ?Sized>(
         &self,
         adapter: &A,
         worker_boot_id: Uuid,
@@ -780,7 +944,7 @@ impl ImageGenerationDispatcher {
         Ok(completed)
     }
 
-    pub async fn run_provider_cancel_pass<A: ImageGenerationAdapter>(
+    pub async fn run_provider_cancel_pass<A: ImageGenerationAdapter + ?Sized>(
         &self,
         adapter: &A,
         worker_boot_id: Uuid,
@@ -979,7 +1143,36 @@ impl ImageGenerationDispatcher {
         A: ImageGenerationAdapter,
     {
         self.run_scheduler_pass_with_hook(
-            adapter,
+            &SingleAdapterDispatch(adapter),
+            proof_source,
+            worker_boot_id,
+            now_monotonic_ms,
+            at_unix_ms,
+            media_wall_ms,
+            limit,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Drive one scheduler pass routing each candidate through the typed
+    /// [`ImageGenerationAdapterMap`]. A candidate whose sealed destination kind
+    /// has no registered adapter is a typed `adapter_missing` skip (AC11): it
+    /// increments `skipped`, records a scheduler error, and never panics. Used
+    /// by the daemon worker.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_scheduler_pass_with_adapters(
+        &self,
+        adapters: &ImageGenerationAdapterMap,
+        proof_source: &dyn ImageDispatchProofSource,
+        worker_boot_id: Uuid,
+        now_monotonic_ms: u64,
+        at_unix_ms: i64,
+        media_wall_ms: u64,
+        limit: u32,
+    ) -> Result<ImageGenerationSchedulerPass> {
+        self.run_scheduler_pass_with_hook(
+            &MapAdapterDispatch(adapters),
             proof_source,
             worker_boot_id,
             now_monotonic_ms,
@@ -992,9 +1185,9 @@ impl ImageGenerationDispatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn run_scheduler_pass_with_hook<A, H>(
+    async fn run_scheduler_pass_with_hook<H>(
         &self,
-        adapter: &A,
+        dispatch: &dyn CandidateDispatch,
         proof_source: &dyn ImageDispatchProofSource,
         worker_boot_id: Uuid,
         now_monotonic_ms: u64,
@@ -1004,7 +1197,6 @@ impl ImageGenerationDispatcher {
         mut before_claim: H,
     ) -> Result<ImageGenerationSchedulerPass>
     where
-        A: ImageGenerationAdapter,
         H: FnMut(&DecodedImageGenerationDispatchCandidate) -> Result<()>,
     {
         let candidates = self
@@ -1024,6 +1216,29 @@ impl ImageGenerationDispatcher {
                 attempt_number: candidate.candidate.attempt_number,
                 owner_session_id: candidate.plan.owner_session_id,
             };
+            // Resolve the adapter for this candidate's sealed kind BEFORE
+            // claiming. A missing adapter is a typed `adapter_missing` skip
+            // (AC11): record it and move on without consuming a claim
+            // generation or contacting any provider.
+            let adapter =
+                match dispatch.adapter_for(&candidate.plan, candidate.candidate.slot_id)? {
+                    Some(adapter) => adapter,
+                    None => {
+                        self.record_scheduler_error(
+                            worker_boot_id,
+                            &identity,
+                            "adapter_missing",
+                            &anyhow::anyhow!(
+                                "no image generation adapter registered (code={:?})",
+                                RuntimeErrorCode::AdapterMissing
+                            ),
+                            at_unix_ms,
+                        )
+                        .await;
+                        pass.skipped += 1;
+                        continue;
+                    }
+                };
             let claim = cockpit_db::db::image_generation::ClaimImageGenerationDispatch {
                 job_id: candidate.candidate.job_id,
                 slot_id: candidate.candidate.slot_id,
@@ -1239,7 +1454,7 @@ impl ImageGenerationDispatcher {
     /// Performs exactly one provider call after the durable dispatch token is
     /// committed, then atomically records the closed handoff result.
     #[allow(clippy::too_many_arguments)]
-    pub async fn dispatch_once<A: ImageGenerationAdapter>(
+    pub async fn dispatch_once<A: ImageGenerationAdapter + ?Sized>(
         &self,
         adapter: &A,
         prepared: PreparedImageGenerationDispatch,
@@ -1289,6 +1504,150 @@ impl ImageGenerationDispatcher {
         )
         .await?;
         Ok(result)
+    }
+}
+
+/// The daemon worker's reconcile/cancel adapter until
+/// `image-generation-real-dispatch-and-chokepoint-integration` installs
+/// per-kind reconcilers. Reconcile/cancel requests do not carry an adapter
+/// kind, so this increment cannot route them per-provider; it uses the trait's
+/// retry-safe `OutcomeUnknown` defaults (identical to shipping no adapter),
+/// leaving a submission-unknown attempt to be re-observed on a later pass.
+/// `handoff` is never reached from the reconcile/cancel passes and fails closed
+/// to `SubmissionUnknown` (never a panic) if it somehow were.
+pub(crate) struct DeferredImageReconciler;
+
+impl image_generation_adapter_sealed::Sealed for DeferredImageReconciler {}
+
+#[async_trait::async_trait]
+impl ImageGenerationAdapter for DeferredImageReconciler {
+    async fn handoff(
+        &self,
+        _request: &ImageGenerationHandoffRequest,
+    ) -> ImageGenerationHandoffResult {
+        ImageGenerationHandoffResult::SubmissionUnknown {
+            evidence: b"deferred_reconciler_handoff_unavailable".to_vec(),
+        }
+    }
+}
+
+/// One canonical media-reservation-plan snapshot bound to a slot/attempt. The
+/// caller supplies these from the media reservation it already authorized; the
+/// service does not re-open the media ledger.
+#[derive(Debug, Clone)]
+pub struct ImageGenerationMediaSnapshotInput {
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub canonical_bytes: Vec<u8>,
+    pub digest: String,
+}
+
+/// Outcome of [`ImageGenerationJobService::create_queued_job`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationJobCreation {
+    /// The plan was committed; its slots/attempts are `queued` and claimable by
+    /// the daemon worker's scheduler pass.
+    Queued { job_id: Uuid },
+    /// Preflight rejected the request; nothing was persisted.
+    Incompatible(Vec<ImageGenerationTargetAlternativeV1>),
+}
+
+/// Session-scoped funnel that turns an already-authorized image-generation
+/// request into a durable, `queued` job the daemon worker can dispatch (AC10).
+///
+/// It runs the pure preflight (`resolve_image_generation`) and then commits
+/// plan → job → slots → attempts inside a single transaction, leaving every
+/// attempt `queued`. Spend and media reservations must already be authorized by
+/// the caller (their handles arrive as `spend`/`central_resources` on the
+/// authority and as `media_snapshots`); the service never re-opens a reservation
+/// transaction. It calls no agent tool and no Approver — the chokepoint prompt
+/// (`image-generation-real-dispatch-and-chokepoint-integration`) drives this
+/// service after it authorizes.
+pub struct ImageGenerationJobService {
+    db: cockpit_db::Db,
+}
+
+impl ImageGenerationJobService {
+    pub fn new(db: cockpit_db::Db) -> Self {
+        Self { db }
+    }
+
+    /// Resolve preflight, then commit the plan as a `queued` job. Returns
+    /// [`ImageGenerationJobCreation::Incompatible`] (persisting nothing) when the
+    /// request cannot be sealed against its sealed target capability.
+    pub async fn create_queued_job(
+        &self,
+        request: ImageGenerationRequestV1,
+        authority: ImageGenerationResolutionAuthorityV1,
+        media_snapshots: Vec<ImageGenerationMediaSnapshotInput>,
+        created_at_unix_ms: i64,
+    ) -> Result<ImageGenerationJobCreation> {
+        let plan = match resolve_image_generation(request, authority)? {
+            ImageGenerationResolutionV1::Ready(plan) => *plan,
+            ImageGenerationResolutionV1::Incompatible(alternatives) => {
+                return Ok(ImageGenerationJobCreation::Incompatible(alternatives));
+            }
+        };
+        let job_id = plan.job_id;
+        let canonical = plan.canonical_bytes()?;
+        let plan_digest = plan.digest()?;
+        self.db
+            .transaction(move |conn| {
+                let verified =
+                    cockpit_db::db::image_generation::CreateImageGenerationJob::from_verified_canonical_plan(
+                        &canonical,
+                        &plan_digest,
+                        created_at_unix_ms,
+                    )?;
+                let slots = plan
+                    .targets
+                    .iter()
+                    .flat_map(|target| &target.slots)
+                    .map(|slot| cockpit_db::db::image_generation::CreateImageGenerationSlot {
+                        slot_id: slot.slot_id,
+                        slot_index: slot.slot_index,
+                        sample_index: slot.sample_index,
+                        managed_artifact_id: slot.managed_artifact_id,
+                        attempts: slot
+                            .attempts
+                            .iter()
+                            .map(|attempt| {
+                                cockpit_db::db::image_generation::CreateImageGenerationAttempt {
+                                    attempt_number: attempt.attempt_number,
+                                    provider_request_identity: attempt
+                                        .provider_request_identity
+                                        .clone(),
+                                    provider_idempotency_identity: attempt
+                                        .provider_idempotency_identity
+                                        .clone(),
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                cockpit_db::Db::create_image_generation_graph_conn(conn, &verified, &slots)?;
+                let queue_authority =
+                    cockpit_db::Db::image_generation_queue_authority_conn(conn, job_id)?;
+                let media = media_snapshots
+                    .iter()
+                    .map(|snapshot| {
+                        cockpit_db::db::image_generation::ImageGenerationMediaPlanSnapshot {
+                            slot_id: snapshot.slot_id,
+                            attempt_number: snapshot.attempt_number,
+                            canonical_bytes: &snapshot.canonical_bytes,
+                            digest: &snapshot.digest,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                cockpit_db::Db::queue_image_generation_job_conn(
+                    conn,
+                    queue_authority,
+                    &media,
+                    created_at_unix_ms,
+                )?;
+                Ok(ImageGenerationJobCreation::Queued { job_id })
+            })
+            .await
     }
 }
 
@@ -5762,6 +6121,410 @@ mod tests {
             spend_reservation_id: fixture_spend,
             media_reservation_id: fixture_media,
         }
+    }
+
+    // A fixed clock + a sleeper that begins the shutdown drain on its first call
+    // so the worker runs exactly one cycle and stops (no real-time sleep).
+    struct WorkerFixedClock {
+        monotonic_ms: u64,
+        wall_unix_ms: i64,
+    }
+    impl crate::daemon::image_generation_worker::ImageGenerationWorkerClock for WorkerFixedClock {
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic_ms
+        }
+        fn wall_unix_ms(&self) -> i64 {
+            self.wall_unix_ms
+        }
+    }
+    struct WorkerDrainAfterOneCycle(crate::daemon::shutdown::ShutdownSignal);
+    impl crate::daemon::image_generation_worker::ImageGenerationWorkerSleeper
+        for WorkerDrainAfterOneCycle
+    {
+        fn sleep(
+            &self,
+            _duration: std::time::Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.0.begin_drain();
+            Box::pin(async {})
+        }
+    }
+
+    // AC11: a claimed candidate whose sealed adapter kind has no registered
+    // adapter is a typed adapter_missing skip. `skipped` increments, a scheduler
+    // error is recorded with adapter_missing semantics, nothing panics or
+    // dispatches, and the attempt stays `planned` (re-claimable later).
+    #[tokio::test]
+    async fn image_generation_adapter_missing_is_typed_skip() {
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "adapter-missing",
+        )
+        .await;
+        // Empty map: the plan's sealed destination kind ("fixture") has no
+        // adapter, so the candidate must skip at adapter_missing.
+        let adapters = ImageGenerationAdapterMap::new();
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass_with_adapters(&adapters, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.scanned, 1,
+            "the queued candidate is visible: {pass:#?}"
+        );
+        assert_eq!(pass.claimed, 0, "adapter_missing skips before claiming");
+        assert_eq!(pass.dispatched, 0);
+        assert_eq!(pass.skipped, 1);
+        let job = fixture.job_id;
+        let (stage, count): (String, i64) = fixture
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT stage,failure_count FROM image_generation_scheduler_error_counts WHERE job_id=?1",
+                    [job.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stage, "adapter_missing");
+        assert_eq!(count, 1);
+        let state: String = fixture
+            .db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state FROM image_generation_attempts WHERE job_id=?1",
+                    [job.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "planned");
+    }
+
+    // The prior-boot reconciliation runs its boot-scoped artifact-lease repair
+    // without error on the production path. (Lease *release* of a real prior-boot
+    // lease is exercised by the cockpit-db `repair_..._for_boot_conn` unit test;
+    // the worker invokes exactly that helper before its loop.)
+    #[tokio::test]
+    async fn image_generation_prior_boot_reconciliation_runs_lease_repair() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let swept = ImageGenerationDispatcher::new(db)
+            .run_prior_boot_reconciliation(Uuid::now_v7())
+            .await
+            .unwrap();
+        assert_eq!(swept.artifact_leases_released, 0);
+    }
+
+    // AC2: the worker runs prior-boot reconciliation BEFORE the current boot can
+    // claim scheduler work, and a crashed prior boot's scheduler claim never
+    // strands the current boot. Scheduler claims are immutable and carry a
+    // bounded wall-clock TTL, so a prior boot's claim simply expires and does not
+    // gate this boot's scan; the worker's active prior-boot step is the
+    // artifact-lease repair (invoked before the loop, observed via
+    // `prior_boot_swept`). The worker's boot id is the plan's deadline boot id
+    // (the shared daemon boot UUID), so the queued candidate is visible on the
+    // SAME boot's first scheduler pass.
+    #[tokio::test]
+    async fn image_generation_worker_prior_boot_reconciliation_before_schedule() {
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "prior-boot",
+        )
+        .await;
+        let other_boot = Uuid::now_v7();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let job = fixture.job_id;
+        let slot = fixture.slot_id;
+        // A crashed prior boot left a scheduler claim whose bounded wall-clock TTL
+        // has since lapsed (`expires_at_unix_ms` in the past).
+        fixture
+            .db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO image_generation_scheduler_claims(job_id,slot_id,attempt_number,worker_boot_id,claim_generation,claimed_at_unix_ms,expires_at_unix_ms) VALUES(?1,?2,1,?3,1,?4,?5)",
+                    params![
+                        job.to_string(),
+                        slot.to_string(),
+                        other_boot.to_string(),
+                        now_ms - 120_000,
+                        now_ms - 61_000
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
+        let worker = crate::daemon::image_generation_worker::ImageGenerationWorker::new(
+            fixture.db.clone(),
+            deadline_boot(),
+            ImageGenerationAdapterMap::new(),
+            Arc::new(proof_ok()),
+            Arc::new(WorkerFixedClock {
+                monotonic_ms: 100,
+                wall_unix_ms: 2,
+            }),
+            Arc::new(WorkerDrainAfterOneCycle(shutdown.clone())),
+            crate::daemon::image_generation_worker::ImageGenerationWorkerConfig::default(),
+        );
+        let metrics = worker.metrics();
+        worker.run(shutdown).await;
+
+        assert!(
+            metrics.prior_boot_swept(),
+            "prior-boot reconciliation must run before the schedule loop"
+        );
+        assert!(
+            metrics.scanned() >= 1,
+            "the queued candidate reaches the schedule pass despite the crashed prior-boot claim"
+        );
+        assert!(
+            metrics.skipped() >= 1,
+            "the empty adapter map skips the visible candidate at adapter_missing"
+        );
+        assert_eq!(
+            metrics.dispatched(),
+            0,
+            "no dispatch without a registered adapter for the sealed kind"
+        );
+    }
+
+    // AC10: `ImageGenerationJobService` turns an authorized request into a
+    // durable `queued` job (resolve preflight, then commit graph + queue) without
+    // calling any agent tool or Approver. The committed job is claimable by
+    // `run_scheduler_pass` with a `DeterministicImageGenerationAdapter` and
+    // reaches an `accepted` terminal.
+    #[tokio::test]
+    async fn image_generation_job_service_creates_queued_job_without_tool() {
+        use crate::media_reservation::{
+            MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
+        };
+        use cockpit_config::config::media_budget::{
+            MediaDimension, MediaEvaluationRequest, MediaResourcePolicy,
+        };
+        use cockpit_db::image_spend::{
+            AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
+        };
+
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let suffix = "service";
+        let project_id = format!("svc-project-{suffix}");
+        let project_root = format!("/svc-project-{suffix}");
+        let session = db
+            .create_session(
+                &project_id,
+                &project_root,
+                "Image generation service fixture",
+            )
+            .await
+            .unwrap();
+
+        let policy = MediaResourcePolicy::default();
+        let evaluated = |dimension, requested| {
+            policy
+                .evaluate(MediaEvaluationRequest {
+                    dimension,
+                    requested: Some(requested),
+                    current_scope: 0,
+                    profile: None,
+                    adapter_limit: None,
+                    request_limit: None,
+                })
+                .unwrap()
+        };
+        let deadline = evaluated(MediaDimension::OperationDeadlineSeconds, 1);
+        let queued_global = evaluated(MediaDimension::QueuedOperationsGlobal, 1);
+        let queued_session = evaluated(MediaDimension::QueuedOperationsPerSession, 1);
+        let local = evaluated(MediaDimension::LocalCpuJobsGlobal, 1);
+        let handoff = evaluated(MediaDimension::OutboundSubmissionsGlobal, 1);
+        let per_attempt_resource =
+            resource_reservation_from_media_reservation(&handoff, format!("svc-gpu:{suffix}"))
+                .unwrap();
+
+        // Build request + authority: single attempt, png/quality, retargeted to
+        // this session and the media-policy resource shape.
+        let base = plan();
+        let base_target = base.targets[0].clone();
+        let request = ImageGenerationRequestV1 {
+            width: base_target.requested.width,
+            height: base_target.requested.height,
+            format: base_target.requested.format.clone(),
+            samples_per_target: 1,
+            target_ids: vec![base_target.target_id.clone()],
+            parameters: base_target.typed_parameters.clone(),
+            reference_attachment_ids: vec![],
+        };
+        let job_id = id(6_000);
+        let slot_id = id(6_001);
+        let artifact_id = id(6_002);
+        let mut spend = base.spend.clone();
+        spend.reservation_id = format!("svc-spend:{suffix}");
+        spend.maximum_usd_micros = Some(10);
+        let authority = ImageGenerationResolutionAuthorityV1 {
+            job_id,
+            owner: ImageGenerationOwnerContextAuthority {
+                session_id: session.session_id,
+                project_id: project_id.clone(),
+                principal_digest: crate::intel::hex_lower(&Sha256::digest(
+                    serde_json::to_vec(&ClientPrincipal::Owner).unwrap(),
+                )),
+                project_identity_digest: crate::intel::hex_lower(&Sha256::digest(
+                    project_root.as_bytes(),
+                )),
+                config_generation: base.config_generation,
+            },
+            deadline_boot_id: base.deadline_boot_id,
+            enqueue_started_monotonic_ms: base.enqueue_started_monotonic_ms,
+            operation_deadline_monotonic_ms: base.operation_deadline_monotonic_ms,
+            required_grants: base.required_grants.clone(),
+            central_resources: vec![per_attempt_resource.clone()],
+            spend,
+            output_authority: VerifiedOutputDirectoryAuthority(base.output_authority.clone()),
+            targets: vec![ImageGenerationTargetResolutionAuthorityV1 {
+                runtime: RuntimeTargetAuthorityV1 {
+                    target_id: base_target.target_id.clone(),
+                    target_config_generation: base_target.target_config_generation,
+                    normalized_config_digest: base_target.normalized_config_digest.clone(),
+                    capability_provenance: base_target.capability_provenance.clone(),
+                    destination: base_target.destination.clone(),
+                    supported_formats: BTreeMap::from([("png".into(), "image/png".into())]),
+                    maximum_width: 512,
+                    maximum_height: 512,
+                    allowed_parameters: BTreeMap::from([("quality".into(), "integer".into())]),
+                    max_attempts: 1,
+                    required_grant: "image_generation".into(),
+                },
+                references: base_target.reference_artifacts.clone(),
+                slot_artifact_ids: vec![(slot_id, artifact_id)],
+                max_attempts: 1,
+                attempt_resources: vec![per_attempt_resource.clone()],
+                attempt_maximum_usd_micros: vec![Some(10)],
+                spend_attempt_identities: vec![format!("svc-idem:{suffix}:1")],
+            }],
+        };
+
+        // Resolve once to learn the exact plan the service will commit; reserve
+        // spend + media against THAT plan (no round-trip equality assumption).
+        let ImageGenerationResolutionV1::Ready(resolved) =
+            resolve_image_generation(request.clone(), authority.clone()).unwrap()
+        else {
+            panic!("service authority did not resolve")
+        };
+        let plan_digest = resolved.digest().unwrap();
+        let media_identity = resolved.central_resources[0].reservation_identity.clone();
+        let attempt_idem = resolved.targets[0].slots[0].attempts[0]
+            .provider_idempotency_identity
+            .clone();
+
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(SchedulerClock));
+        let receipt = ledger
+            .reserve(ReserveRequest {
+                reservation_id: media_identity.clone(),
+                recovery_id: format!("svc-recovery-{suffix}"),
+                owner: MediaOwner {
+                    project_id: project_id.clone(),
+                    session_id: session.session_id.to_string(),
+                },
+                operation: "image_generation".into(),
+                purpose: format!("svc_{suffix}"),
+                plans: vec![
+                    deadline,
+                    queued_global,
+                    queued_session,
+                    local.clone(),
+                    handoff.clone(),
+                ],
+                wall_ms: 1,
+            })
+            .await
+            .unwrap();
+        ledger
+            .mark_execution_ready(&receipt.reservation_id, 2)
+            .await
+            .unwrap();
+        let executing = ledger
+            .claim_ready_fair(&receipt.reservation_id, local, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(executing.state, ReservationState::ExecutingLocal);
+        db.save_image_spend_policy(
+            project_id.clone(),
+            ImageSpendSettings {
+                request: BudgetPolicy::Finite { usd_micros: 100 },
+                session: BudgetPolicy::Finite { usd_micros: 100 },
+                project: BudgetPolicy::Finite { usd_micros: 100 },
+                project_epoch: Some(ProjectEpochPolicy::CalendarMonth {
+                    time_zone: "UTC".into(),
+                }),
+            },
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        db.reserve_image_spend(
+            resolved.spend.reservation_id.clone(),
+            SpendScopeKeys {
+                plan_digest: plan_digest.clone(),
+                session_id: cockpit_db::image_spend::SessionId::new(session.session_id.to_string())
+                    .unwrap(),
+                project_key: cockpit_db::image_spend::ProjectKey::new(project_id).unwrap(),
+            },
+            vec![AttemptMaximum {
+                attempt_id: attempt_idem,
+                usd_micros: Some(10),
+            }],
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+
+        // The service commits the job (resolve + graph + queue). No tool call.
+        let (media_bytes, media_digest) = canonical_media_plan_snapshot(&handoff).unwrap();
+        let created = ImageGenerationJobService::new(db.clone())
+            .create_queued_job(
+                request,
+                authority,
+                vec![ImageGenerationMediaSnapshotInput {
+                    slot_id,
+                    attempt_number: 1,
+                    canonical_bytes: media_bytes,
+                    digest: media_digest,
+                }],
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created, ImageGenerationJobCreation::Queued { job_id });
+
+        // The queued job is claimable and dispatches to an accepted terminal.
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"svc-accepted".to_vec(),
+            },
+        ]);
+        let pass = ImageGenerationDispatcher::new(db.clone())
+            .run_scheduler_pass(&adapter, &proof_ok(), deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.dispatched, 1, "{pass:#?}");
+        assert_eq!(adapter.requests().len(), 1, "exactly one provider handoff");
+        let state: String = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state FROM image_generation_attempts WHERE job_id=?1",
+                    [job_id.to_string()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "accepted");
     }
 
     async fn run_real_ledger_scheduler_fixture(suffix: &str) {

@@ -17,7 +17,7 @@ use super::providers::{CapabilityStatus, HeaderSpec};
 
 pub const IMAGE_GENERATION_ROUTE_PROFILE_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageAdapterKind {
     OpenaiImages,

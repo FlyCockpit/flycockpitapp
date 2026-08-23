@@ -809,7 +809,10 @@ mod adapter_sealed {
     pub trait Sealed {}
 }
 
+pub mod comfyui;
 pub mod gemini;
+pub mod openai;
+pub mod openrouter;
 
 pub trait ImageRuntimeAdapter: adapter_sealed::Sealed + Send + Sync {
     fn kind(&self) -> ImageAdapterKind;
@@ -852,6 +855,24 @@ impl StandardImageRuntimeAdapters {
             }
         }
         Ok(adapters.into_iter().map(|(_, adapter)| adapter).collect())
+    }
+}
+
+/// Construct the production standard image runtime adapter set: one health /
+/// capability probe adapter per [`ImageAdapterKind`], each backed by the pinned
+/// / vetted connector the registry owns. This is the single production
+/// construction point for the four standard adapters; it is not test-only.
+///
+/// The daemon image-generation worker
+/// (`image-generation-job-daemon-integration`) installs the runtime registry
+/// through [`crate::daemon::image_runtime::install_standard_image_runtime_registry`],
+/// which threads this set into [`ImageRuntimeRegistry::production_standard`].
+pub fn production_standard_image_runtime_adapters() -> StandardImageRuntimeAdapters {
+    StandardImageRuntimeAdapters {
+        openai_images: openai::standard_adapter(),
+        openrouter_images: openrouter::standard_adapter(),
+        gemini_images: gemini::standard_adapter(),
+        comfyui: comfyui::standard_adapter(),
     }
 }
 
@@ -1075,6 +1096,16 @@ impl ImageRuntimeRegistry {
             connector,
             adapters.into_checked()?,
         )
+    }
+    /// Construct the production registry with the four standard health /
+    /// capability probe adapters (OpenAI Images, OpenRouter Images, Gemini
+    /// Images, ComfyUI) over the pinned/vetted connector. This is the
+    /// production factory referenced from the daemon install seam; it is not
+    /// test-only. Attach a [`crate::credentials::CredentialStore`] with
+    /// [`Self::with_store`] and apply the loaded configuration with
+    /// [`Self::apply_config`] before dispatch.
+    pub fn production_standard() -> Result<Self, RuntimeError> {
+        Self::standard(production_standard_image_runtime_adapters())
     }
     pub fn adapter(
         &self,

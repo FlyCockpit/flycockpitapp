@@ -253,6 +253,85 @@ pub enum AuthorizationRequest<'a> {
         /// True if a host lease token is held (physical target).
         has_host_lease: bool,
     },
+    /// The single central composite authorization for an image-generation
+    /// dispatch. It is the one decision issuer for image generation; the pure
+    /// classifier ([`crate::image_generation_agent_tools::classify_risk`])
+    /// informs it but never issues a decision.
+    ///
+    /// It carries only a secret-free plan-projection **digest** plus the
+    /// redacted decision facts the composite decision needs: the
+    /// destinations/location classes, fanout/output counts, known/unknown cost
+    /// micros, the reference-egress fact, the hard-gate booleans resolved by
+    /// immutable preflight, the request/session/project spend choices, the
+    /// base-tier known-cost threshold, and the output-path write-authority
+    /// identity. It carries **no** prompt full text, **no** provider secret,
+    /// **no** raw workflow JSON, and **no** reference bytes — those never reach
+    /// this seam.
+    ImageGeneration {
+        /// Digest of the immutable plan projection under decision. Identifies
+        /// the exact plan without carrying its prompt text or references.
+        plan_digest: &'a str,
+        /// Redacted per-destination facts (target id, location class, adapter
+        /// kind). No endpoint URLs, credentials, or workflow bytes.
+        destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
+        /// Distinct-target fanout.
+        fanout: u32,
+        /// Total output count across all targets.
+        total_outputs: u32,
+        /// Known maximum cost in USD micros, or `None` for unknown cost.
+        cost_maximum: Option<u64>,
+        /// True when a reference egresses to a destination without a matching
+        /// grant (raises the risk tier).
+        reference_egress_unmatched: bool,
+        /// Base-tier known-cost threshold (micros) the risk classifier compares
+        /// against. Sourced from the const default this increment; a later
+        /// increment sources it from a cockpit-config field.
+        base_threshold_usd_micros: u64,
+        /// Spend policy choice at request scope.
+        spend_request: crate::image_generation_agent_tools::SpendPolicyChoice,
+        /// Spend policy choice at session scope.
+        spend_session: crate::image_generation_agent_tools::SpendPolicyChoice,
+        /// Spend policy choice at project scope.
+        spend_project: crate::image_generation_agent_tools::SpendPolicyChoice,
+        /// Preflight resolved: reference local-path read authority granted.
+        path_read_authorized: bool,
+        /// Preflight resolved: output write-path authority granted.
+        output_write_authorized: bool,
+        /// Preflight resolved: every destination is enabled.
+        destination_enabled: bool,
+        /// Preflight resolved: the capability snapshot is fresh.
+        capability_fresh: bool,
+        /// Preflight resolved: insecure-transport policy permits the
+        /// destinations.
+        insecure_transport_allowed: bool,
+        /// Redacted identity of the output-path write authority (a stable
+        /// label/digest — never a raw absolute path or secret).
+        output_path_authority: &'a str,
+    },
+}
+
+/// Secret-free facts the image-generation composite decision consumes. It is
+/// the destructured [`AuthorizationRequest::ImageGeneration`] payload, threaded
+/// to [`Approver::approve_image_generation_inner`] so the arm stays a thin
+/// dispatch. Every field mirrors the variant's redacted contract — no prompt
+/// text, provider secret, or workflow bytes.
+pub(super) struct ImageGenerationAuthzFacts<'a> {
+    pub plan_digest: &'a str,
+    pub destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
+    pub fanout: u32,
+    pub total_outputs: u32,
+    pub cost_maximum: Option<u64>,
+    pub reference_egress_unmatched: bool,
+    pub base_threshold_usd_micros: u64,
+    pub spend_request: crate::image_generation_agent_tools::SpendPolicyChoice,
+    pub spend_session: crate::image_generation_agent_tools::SpendPolicyChoice,
+    pub spend_project: crate::image_generation_agent_tools::SpendPolicyChoice,
+    pub path_read_authorized: bool,
+    pub output_write_authorized: bool,
+    pub destination_enabled: bool,
+    pub capability_fresh: bool,
+    pub insecure_transport_allowed: bool,
+    pub output_path_authority: &'a str,
 }
 
 pub struct Approver {
@@ -305,6 +384,47 @@ impl Approver {
                 // CoordinatedOutcome.
                 self.approve_computer_action_inner(action_id, tier, action_label)
                     .await
+            }
+            AuthorizationRequest::ImageGeneration {
+                plan_digest,
+                destinations,
+                fanout,
+                total_outputs,
+                cost_maximum,
+                reference_egress_unmatched,
+                base_threshold_usd_micros,
+                spend_request,
+                spend_session,
+                spend_project,
+                path_read_authorized,
+                output_write_authorized,
+                destination_enabled,
+                capability_fresh,
+                insecure_transport_allowed,
+                output_path_authority,
+            } => {
+                // The one image-generation decision issuer: a genuine composite
+                // over the hard gates, the pure risk tier, the grant-matching
+                // seam, and the session approval mode. Never a faked allow.
+                self.approve_image_generation_inner(ImageGenerationAuthzFacts {
+                    plan_digest,
+                    destinations,
+                    fanout,
+                    total_outputs,
+                    cost_maximum,
+                    reference_egress_unmatched,
+                    base_threshold_usd_micros,
+                    spend_request,
+                    spend_session,
+                    spend_project,
+                    path_read_authorized,
+                    output_write_authorized,
+                    destination_enabled,
+                    capability_fresh,
+                    insecure_transport_allowed,
+                    output_path_authority,
+                })
+                .await
             }
         }
     }
@@ -2193,6 +2313,283 @@ mod tests {
     fn web_tools_are_never_gated() {
         assert!(!crate::engine::agent::is_gated_tool("webfetch"));
         assert!(!crate::engine::agent::is_gated_tool("websearch"));
+    }
+
+    // ---- Image-generation composite authorization (AC1 + AC10) ----
+    //
+    // These exercise the SINGLE image-generation decision issuer,
+    // `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`. The
+    // bespoke `authorize_generate_image` ladder was deleted; the composite
+    // decision (hard gates → pure risk tier → grant seam → approval-mode
+    // dispatch) lives only here now.
+
+    /// An owned scenario whose `request()` yields the borrowing
+    /// `AuthorizationRequest::ImageGeneration`. `base()` is an all-hard-gates-pass,
+    /// known-cost, single-target request; each test flips exactly one distinguishing
+    /// input so a broken arm gives a different answer.
+    struct ImgGenScenario {
+        destinations: Vec<crate::image_generation_agent_tools::ProjectionDestination>,
+        plan_digest: String,
+        output_path_authority: String,
+        fanout: u32,
+        total_outputs: u32,
+        cost_maximum: Option<u64>,
+        reference_egress_unmatched: bool,
+        base_threshold_usd_micros: u64,
+        spend_request: crate::image_generation_agent_tools::SpendPolicyChoice,
+        spend_session: crate::image_generation_agent_tools::SpendPolicyChoice,
+        spend_project: crate::image_generation_agent_tools::SpendPolicyChoice,
+        path_read_authorized: bool,
+        output_write_authorized: bool,
+        destination_enabled: bool,
+        capability_fresh: bool,
+        insecure_transport_allowed: bool,
+    }
+
+    impl ImgGenScenario {
+        fn base() -> Self {
+            use crate::image_generation_agent_tools::{
+                LocationClass, ProjectionDestination, SpendPolicyChoice,
+            };
+            let finite = SpendPolicyChoice::Finite {
+                usd_micros: 1_000_000,
+            };
+            Self {
+                destinations: vec![ProjectionDestination {
+                    target_id: "t1".to_string(),
+                    location_class: LocationClass::PublicCloud,
+                    adapter_kind: "openai_images".to_string(),
+                }],
+                // A non-empty digest prefix so the prompt copy is meaningful.
+                plan_digest: "0123456789abcdef0123".to_string(),
+                output_path_authority: "session-write-scope".to_string(),
+                fanout: 1,
+                total_outputs: 1,
+                cost_maximum: Some(100_000),
+                reference_egress_unmatched: false,
+                base_threshold_usd_micros:
+                    crate::image_generation_agent_tools::BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
+                spend_request: finite,
+                spend_session: finite,
+                spend_project: finite,
+                path_read_authorized: true,
+                output_write_authorized: true,
+                destination_enabled: true,
+                capability_fresh: true,
+                insecure_transport_allowed: true,
+            }
+        }
+
+        fn request(&self) -> AuthorizationRequest<'_> {
+            AuthorizationRequest::ImageGeneration {
+                plan_digest: &self.plan_digest,
+                destinations: &self.destinations,
+                fanout: self.fanout,
+                total_outputs: self.total_outputs,
+                cost_maximum: self.cost_maximum,
+                reference_egress_unmatched: self.reference_egress_unmatched,
+                base_threshold_usd_micros: self.base_threshold_usd_micros,
+                spend_request: self.spend_request,
+                spend_session: self.spend_session,
+                spend_project: self.spend_project,
+                path_read_authorized: self.path_read_authorized,
+                output_write_authorized: self.output_write_authorized,
+                destination_enabled: self.destination_enabled,
+                capability_fresh: self.capability_fresh,
+                insecure_transport_allowed: self.insecure_transport_allowed,
+                output_path_authority: &self.output_path_authority,
+            }
+        }
+    }
+
+    async fn open_interrupt_count(approver: &Approver) -> usize {
+        approver
+            .db
+            .list_open_interrupts(approver.session_id)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// AC1: the `ImageGeneration` variant exists and drives the exhaustive
+    /// `Approver::authorize` match. Non-vacuous: the same request allows under
+    /// Yolo (all gates pass) but denies when a single hard gate fails — a `_`
+    /// catch-all that ignored the payload could not produce both answers, and
+    /// the arm cannot be removed without a compile error (the match has no `_`).
+    #[tokio::test]
+    async fn image_generation_authorization_request_variant_exhaustive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+
+        let ok = ImgGenScenario::base();
+        assert_eq!(
+            approver.authorize(ok.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once },
+            "all hard gates pass under Yolo ⇒ allow"
+        );
+
+        let mut disabled = ImgGenScenario::base();
+        disabled.destination_enabled = false;
+        assert_eq!(
+            approver.authorize(disabled.request()).await.unwrap(),
+            Decision::Deny,
+            "a disabled destination must deny even under Yolo"
+        );
+    }
+
+    /// AC10: there is no public dual authorization entrypoint. The deleted
+    /// `authorize_generate_image` cannot be named here (it is gone); the only
+    /// issuer is the Approver arm. Proven behaviorally: the SAME facts yield
+    /// Allow under Yolo with ZERO prompts, but Manual (no grant available)
+    /// routes through a human prompt and honors its rejection — the composite
+    /// decision, not a second ladder, is what gates.
+    #[tokio::test]
+    async fn image_generation_bespoke_authorize_generate_image_gone_or_private_pure() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Yolo: allowed with no interrupt raised.
+        let yolo = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+        let scenario = ImgGenScenario::base();
+        assert_eq!(
+            yolo.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+        assert_eq!(
+            open_interrupt_count(&yolo).await,
+            0,
+            "Yolo must not raise a prompt"
+        );
+
+        // Manual: no grant exists (seam fails closed) ⇒ a human prompt is the
+        // sole gate; rejecting it denies.
+        let manual = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let resolver = resolve_sequence(&manual, &[ID_REJECT]);
+        let decision = manual.authorize(scenario.request()).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(
+            decision,
+            Decision::Deny,
+            "Manual routes the decision through the Approver prompt, not a bespoke ladder"
+        );
+    }
+
+    /// Deny path: a failed hard gate denies BEFORE any prompt is raised
+    /// (fail closed, no provider contact). Distinguishing input: stale
+    /// capability with everything else passing.
+    #[tokio::test]
+    async fn image_generation_yolo_cannot_bypass_stale_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+        let mut scenario = ImgGenScenario::base();
+        scenario.capability_fresh = false;
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Deny
+        );
+        assert_eq!(
+            open_interrupt_count(&approver).await,
+            0,
+            "a hard-gate denial must not raise a prompt"
+        );
+    }
+
+    /// Destination/location-class gate: a disabled destination denies and
+    /// raises no prompt, regardless of the (permissive) approval mode.
+    #[tokio::test]
+    async fn image_generation_disabled_destination_denies_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let mut scenario = ImgGenScenario::base();
+        scenario.destination_enabled = false;
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Deny
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
+    }
+
+    /// Allow path (Yolo): hard gates pass ⇒ allow with zero prompts and no
+    /// grant required.
+    #[tokio::test]
+    async fn image_generation_yolo_allows_after_hard_gates_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+        let scenario = ImgGenScenario::base();
+        assert_eq!(
+            approver.authorize(scenario.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+        assert_eq!(open_interrupt_count(&approver).await, 0);
+    }
+
+    /// Ask → allow: Manual with no grant raises exactly one approve/deny
+    /// prompt; approving it allows once.
+    #[tokio::test]
+    async fn image_generation_manual_no_grant_asks_then_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = ImgGenScenario::base();
+        let questions = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver.authorize(scenario.request()).await.unwrap();
+        let questions = questions.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        assert_eq!(questions.len(), 1, "exactly one prompt raised");
+        let InterruptQuestion::Single { options, .. } = &questions[0] else {
+            panic!("expected a single-question image-generation interrupt");
+        };
+        let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+        assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
+    }
+
+    /// Ask → deny: rejecting the Manual prompt denies.
+    #[tokio::test]
+    async fn image_generation_manual_no_grant_ask_reject_denies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver =
+            approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Manual);
+        let scenario = ImgGenScenario::base();
+        let resolver = resolve_sequence(&approver, &[ID_REJECT]);
+        let decision = approver.authorize(scenario.request()).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, Decision::Deny);
+    }
+
+    /// Unknown-cost dispatch gate: an unknown maximum cost denies unless the
+    /// request, session, AND project spend choices are all Unlimited. Uses
+    /// Yolo so the gate is isolated from the human-prompt path, and asserts the
+    /// exact boundary: a single Finite choice among three Unlimited denies.
+    #[tokio::test]
+    async fn image_generation_unknown_cost_requires_all_unlimited() {
+        use crate::image_generation_agent_tools::SpendPolicyChoice;
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+
+        // Unknown cost + all three Unlimited ⇒ allowed.
+        let mut all_unlimited = ImgGenScenario::base();
+        all_unlimited.cost_maximum = None;
+        all_unlimited.spend_request = SpendPolicyChoice::Unlimited;
+        all_unlimited.spend_session = SpendPolicyChoice::Unlimited;
+        all_unlimited.spend_project = SpendPolicyChoice::Unlimited;
+        assert_eq!(
+            approver.authorize(all_unlimited.request()).await.unwrap(),
+            Decision::Allow { scope: Scope::Once }
+        );
+
+        // Unknown cost + one Finite (project) ⇒ denied.
+        let mut one_finite = ImgGenScenario::base();
+        one_finite.cost_maximum = None;
+        one_finite.spend_request = SpendPolicyChoice::Unlimited;
+        one_finite.spend_session = SpendPolicyChoice::Unlimited;
+        one_finite.spend_project = SpendPolicyChoice::Finite {
+            usd_micros: 1_000_000,
+        };
+        assert_eq!(
+            approver.authorize(one_finite.request()).await.unwrap(),
+            Decision::Deny,
+            "unknown cost with any non-Unlimited spend choice must deny"
+        );
     }
 
     #[tokio::test]

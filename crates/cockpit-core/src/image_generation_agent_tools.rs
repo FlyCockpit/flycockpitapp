@@ -120,24 +120,6 @@ pub enum SpendPolicyChoice {
     Finite { usd_micros: u64 },
 }
 
-/// Approval mode disposition recorded by the composite decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDisposition {
-    /// Manual honored an exact matching standing grant.
-    StandingGrant,
-    /// Manual/Auto asked the human and the human approved.
-    HumanApproved,
-    /// Auto honored a grant and central safe-risk policy.
-    AutoPolicy,
-    /// Yolo opened no human prompt and recorded `agent_discretion`
-    /// after every hard gate passed. Never `allow_once` and never a
-    /// persisted grant.
-    AgentDiscretion,
-    /// The decision denied the request.
-    Denied,
-}
-
 /// Reference-egress grant scope. There is no global/unscoped variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -242,35 +224,6 @@ pub enum BudgetDisposition {
     Exhausted,
     UnknownCostBlocked,
     UnknownCostAllowed,
-}
-
-/// The composite authorization decision. One immutable decision covering
-/// destinations, reference egress, fanout, spend risk, and normal
-/// filesystem authority. Zero provider contact before a compatible
-/// immutable plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageGenerationAuthorization {
-    pub authorized: bool,
-    pub risk_tier: GenerateImageRiskTier,
-    pub disposition: ApprovalDisposition,
-    pub digest: String,
-    pub reasons: Vec<String>,
-    pub provider_contacted: bool,
-}
-
-impl ImageGenerationAuthorization {
-    /// Deny with a reason. The digest is empty because no compatible
-    /// immutable plan was formed.
-    pub fn deny(reason: impl Into<String>) -> Self {
-        Self {
-            authorized: false,
-            risk_tier: GenerateImageRiskTier::Elevated,
-            disposition: ApprovalDisposition::Denied,
-            digest: String::new(),
-            reasons: vec![reason.into()],
-            provider_contacted: false,
-        }
-    }
 }
 
 /// Return the strict JSON schema for one of the four canonical
@@ -428,7 +381,8 @@ fn cancel_image_generation_job_schema() -> Value {
 ///
 /// This is the schema-layer guard: it rejects raw URLs, provider JSON,
 /// workflow data, duplicate targets, and unknown fields. It does not
-/// perform authorization — that is [`authorize_generate_image`].
+/// perform authorization — that is the central chokepoint
+/// `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`.
 pub fn validate_generate_image_args(args: &Value) -> Result<()> {
     let obj = args
         .as_object()
@@ -694,157 +648,15 @@ pub fn classify_risk(
     }
 }
 
-/// Inputs to the composite authorization decision.
-#[derive(Debug, Clone)]
-pub struct AuthorizationInputs<'a> {
-    pub fanout: u32,
-    pub total_outputs: u32,
-    pub cost_maximum: Option<u64>,
-    pub reference_egress_unmatched: bool,
-    pub grants: &'a [ImageGenerationGrantTuple],
-    pub spend_request: SpendPolicyChoice,
-    pub spend_session: SpendPolicyChoice,
-    pub spend_project: SpendPolicyChoice,
-    pub base_threshold_usd_micros: u64,
-    pub approval_mode: ApprovalMode,
-    pub projection: &'a ImageGenerationPlanProjection,
-    pub path_read_authorized: bool,
-    pub output_write_authorized: bool,
-    pub destination_enabled: bool,
-    pub capability_fresh: bool,
-    pub insecure_transport_allowed: bool,
-}
-
-/// Approval mode (mirrors config, kept local).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalMode {
-    Manual,
-    Auto,
-    Yolo,
-}
-
-/// Decide the composite authorization for a generate-image request.
-///
-/// This is the one immutable composite authorization decision covering
-/// destinations, reference egress, fanout, spend risk, and normal
-/// filesystem authority. Zero provider contact before a compatible
-/// immutable plan.
-pub fn authorize_generate_image(inputs: &AuthorizationInputs<'_>) -> ImageGenerationAuthorization {
-    let mut reasons: Vec<String> = Vec::new();
-
-    // Hard gates that Yolo cannot bypass.
-    if !inputs.destination_enabled {
-        reasons.push("destination is disabled".to_string());
-    }
-    if !inputs.capability_fresh {
-        reasons.push("capability is stale".to_string());
-    }
-    if !inputs.path_read_authorized {
-        reasons.push("reference local-path read authorization failed".to_string());
-    }
-    if !inputs.output_write_authorized {
-        reasons.push("output write-path authorization failed".to_string());
-    }
-    if !inputs.insecure_transport_allowed {
-        reasons.push("insecure-transport policy denied the destination".to_string());
-    }
-
-    // Unknown maximum may dispatch only when request, session, and project
-    // spend choices are all explicitly Unlimited.
-    let unknown_cost = inputs.cost_maximum.is_none();
-    let unknown_dispatch_allowed = matches!(inputs.spend_request, SpendPolicyChoice::Unlimited)
-        && matches!(inputs.spend_session, SpendPolicyChoice::Unlimited)
-        && matches!(inputs.spend_project, SpendPolicyChoice::Unlimited);
-    if unknown_cost && !unknown_dispatch_allowed {
-        reasons.push(
-            "unknown maximum cost requires request, session, and project spend choices all Unlimited"
-                .to_string(),
-        );
-    }
-
-    // Grant matching: a grant must cover the fanout, total outputs, and
-    // cost (or unknown_cost_allowed). There is no wildcard destination
-    // or unbounded implicit maximum.
-    let grant_matches = inputs.grants.iter().any(|grant| {
-        inputs.fanout <= grant.maximum_fanout
-            && inputs.total_outputs <= grant.maximum_total_outputs
-            && (match inputs.cost_maximum {
-                Some(cost) => grant
-                    .maximum_known_cost_usd_micros
-                    .map(|max| cost <= max)
-                    .unwrap_or(false),
-                None => grant.unknown_cost_allowed,
-            })
-    });
-    if !grant_matches {
-        reasons.push("no matching grant covers the requested fanout/outputs/cost".to_string());
-    }
-
-    // Reference egress to a destination without a matching grant raises risk.
-    if inputs.reference_egress_unmatched {
-        reasons.push("reference egress to a destination without a matching grant".to_string());
-    }
-
-    let digest = match plan_projection_digest(inputs.projection) {
-        Ok(digest) => digest,
-        Err(err) => {
-            return ImageGenerationAuthorization::deny(format!("plan projection failed: {err}"));
-        }
-    };
-
-    let risk_tier = classify_risk(
-        inputs.fanout,
-        inputs.total_outputs,
-        inputs.cost_maximum,
-        inputs.reference_egress_unmatched,
-        inputs.base_threshold_usd_micros,
-    );
-
-    if !reasons.is_empty() {
-        return ImageGenerationAuthorization {
-            authorized: false,
-            risk_tier,
-            disposition: ApprovalDisposition::Denied,
-            digest,
-            reasons,
-            provider_contacted: false,
-        };
-    }
-
-    // All hard gates passed. Now apply the approval-mode disposition.
-    let disposition = match inputs.approval_mode {
-        ApprovalMode::Manual => {
-            if grant_matches {
-                ApprovalDisposition::StandingGrant
-            } else {
-                ApprovalDisposition::HumanApproved
-            }
-        }
-        ApprovalMode::Auto => {
-            if grant_matches {
-                ApprovalDisposition::AutoPolicy
-            } else {
-                ApprovalDisposition::HumanApproved
-            }
-        }
-        ApprovalMode::Yolo => {
-            // Yolo opens no human prompt and records disposition
-            // `agent_discretion` — never `allow_once` and never a
-            // persisted grant — after every hard gate passes.
-            ApprovalDisposition::AgentDiscretion
-        }
-    };
-
-    ImageGenerationAuthorization {
-        authorized: true,
-        risk_tier,
-        disposition,
-        digest,
-        reasons,
-        provider_contacted: false,
-    }
-}
+// NOTE: the bespoke `authorize_generate_image` composite ladder
+// (`AuthorizationInputs` + a local `ApprovalMode`/`ImageGenerationAuthorization`
+// mirror) was DELETED. It had zero non-test callers and re-implemented a
+// parallel ApprovalMode / hard-gate / grant-matching / risk ladder outside the
+// central chokepoint. The single decision issuer is now
+// `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`
+// (`approval/policy.rs::approve_image_generation_inner`). The reusable pure
+// risk classification stays here as [`classify_risk`], which the Approver arm
+// calls; it is not a second decision issuer.
 
 /// Validate that a grant tuple is representable: no wildcard
 /// destination, no unbounded implicit maximum. Global image grants are
@@ -1210,38 +1022,15 @@ mod tests {
         }
     }
 
-    /// A single default grant with a `'static` lifetime so `base_inputs` can
-    /// hand out a `&'a [ImageGenerationGrantTuple]` that outlives each test's
-    /// borrowed `AuthorizationInputs`.
-    static BASE_GRANTS: std::sync::LazyLock<[ImageGenerationGrantTuple; 1]> =
-        std::sync::LazyLock::new(|| [base_grant()]);
-
-    fn base_inputs<'a>(projection: &'a ImageGenerationPlanProjection) -> AuthorizationInputs<'a> {
-        AuthorizationInputs {
-            fanout: 1,
-            total_outputs: 1,
-            cost_maximum: Some(100_000),
-            reference_egress_unmatched: false,
-            grants: &BASE_GRANTS[..],
-            spend_request: SpendPolicyChoice::Finite {
-                usd_micros: 1_000_000,
-            },
-            spend_session: SpendPolicyChoice::Finite {
-                usd_micros: 1_000_000,
-            },
-            spend_project: SpendPolicyChoice::Finite {
-                usd_micros: 1_000_000,
-            },
-            base_threshold_usd_micros: BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
-            approval_mode: ApprovalMode::Manual,
-            projection,
-            path_read_authorized: true,
-            output_write_authorized: true,
-            destination_enabled: true,
-            capability_fresh: true,
-            insecure_transport_allowed: true,
-        }
-    }
+    // The composite-decision tests that used to live here (hard gates,
+    // ApprovalMode dispositions, unknown-cost dispatch) were REWRITTEN against
+    // the real chokepoint `Approver::authorize(AuthorizationRequest::
+    // ImageGeneration { .. })` and now live beside the Approver in
+    // `approval/policy.rs` / `approval/mod.rs`, because that is the single
+    // decision issuer after `authorize_generate_image` was deleted. The pure
+    // risk-classifier tests (`classify_risk`) remain below: `classify_risk` is
+    // the reusable pure classifier the Approver arm calls, not a decision
+    // issuer, so its unit coverage stays here.
 
     // ---- Acceptance criterion 1: tool schemas ----
 
@@ -1509,68 +1298,6 @@ mod tests {
         assert!(serde_json::from_value::<TypedParameter>(value).is_err());
     }
 
-    // ---- Acceptance criterion 4: authorization proves zero provider contact ----
-
-    #[test]
-    fn authorization_has_zero_provider_contact_before_plan() {
-        let projection = base_projection();
-        let inputs = base_inputs(&projection);
-        let auth = authorize_generate_image(&inputs);
-        assert!(
-            !auth.provider_contacted,
-            "provider must not be contacted before a compatible immutable plan"
-        );
-    }
-
-    #[test]
-    fn authorization_denies_when_destination_disabled() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.destination_enabled = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-        assert!(auth.reasons.iter().any(|r| r.contains("disabled")));
-    }
-
-    #[test]
-    fn authorization_denies_when_path_read_unauthorized() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.path_read_authorized = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn authorization_denies_when_output_write_unauthorized() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.output_write_authorized = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn authorization_denies_when_no_grant_matches() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.grants = &[];
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-        assert!(auth.reasons.iter().any(|r| r.contains("no matching grant")));
-    }
-
-    #[test]
-    fn authorization_authorizes_base_tier_manual_with_grant() {
-        let projection = base_projection();
-        let inputs = base_inputs(&projection);
-        let auth = authorize_generate_image(&inputs);
-        assert!(auth.authorized);
-        assert_eq!(auth.risk_tier, GenerateImageRiskTier::Base);
-        assert_eq!(auth.disposition, ApprovalDisposition::StandingGrant);
-        assert!(!auth.provider_contacted);
-    }
-
     // ---- Acceptance criterion 5: projection/digest tests ----
 
     #[test]
@@ -1647,91 +1374,6 @@ mod tests {
         assert!(serde_json::from_str::<ReferenceEgressScope>("\"global\"").is_err());
     }
 
-    // ---- Acceptance criterion 7: Manual/Auto/Yolo matrix ----
-
-    #[test]
-    fn yolo_emits_agent_discretion_and_no_approval_request() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        let auth = authorize_generate_image(&inputs);
-        assert!(auth.authorized);
-        assert_eq!(auth.disposition, ApprovalDisposition::AgentDiscretion);
-        // Yolo never records allow_once or a persisted grant.
-        assert_ne!(auth.disposition, ApprovalDisposition::HumanApproved);
-    }
-
-    #[test]
-    fn yolo_cannot_bypass_disabled_destination() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        inputs.destination_enabled = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(
-            !auth.authorized,
-            "Yolo cannot bypass a disabled destination"
-        );
-    }
-
-    #[test]
-    fn yolo_cannot_bypass_stale_capability() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        inputs.capability_fresh = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn yolo_cannot_bypass_path_authority() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        inputs.path_read_authorized = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn yolo_cannot_bypass_output_write_authority() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        inputs.output_write_authorized = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn yolo_cannot_bypass_insecure_transport_policy() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Yolo;
-        inputs.insecure_transport_allowed = false;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-    }
-
-    #[test]
-    fn manual_honors_standing_grant() {
-        let projection = base_projection();
-        let inputs = base_inputs(&projection);
-        let auth = authorize_generate_image(&inputs);
-        assert_eq!(auth.disposition, ApprovalDisposition::StandingGrant);
-    }
-
-    #[test]
-    fn auto_honors_grant_and_policy() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.approval_mode = ApprovalMode::Auto;
-        let auth = authorize_generate_image(&inputs);
-        assert!(auth.authorized);
-        assert_eq!(auth.disposition, ApprovalDisposition::AutoPolicy);
-    }
-
     // ---- Acceptance criterion 8: risk/spend tests ----
 
     #[test]
@@ -1772,46 +1414,9 @@ mod tests {
         assert_eq!(tier, GenerateImageRiskTier::Elevated);
     }
 
-    #[test]
-    fn unknown_cost_dispatch_requires_three_unlimited_choices() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.cost_maximum = None;
-        inputs.spend_request = SpendPolicyChoice::Unlimited;
-        inputs.spend_session = SpendPolicyChoice::Unlimited;
-        inputs.spend_project = SpendPolicyChoice::Unlimited;
-        // Grant must allow unknown cost.
-        let mut grant = base_grant();
-        grant.maximum_known_cost_usd_micros = None;
-        grant.unknown_cost_allowed = true;
-        let grants = [grant];
-        inputs.grants = &grants;
-        let auth = authorize_generate_image(&inputs);
-        assert!(
-            auth.authorized,
-            "unknown cost dispatch must succeed when all three spend choices are Unlimited and the grant allows unknown cost"
-        );
-    }
-
-    #[test]
-    fn unknown_cost_denied_when_any_spend_choice_is_finite() {
-        let projection = base_projection();
-        let mut inputs = base_inputs(&projection);
-        inputs.cost_maximum = None;
-        inputs.spend_request = SpendPolicyChoice::Unlimited;
-        inputs.spend_session = SpendPolicyChoice::Unlimited;
-        inputs.spend_project = SpendPolicyChoice::Finite {
-            usd_micros: 1_000_000,
-        };
-        let mut grant = base_grant();
-        grant.maximum_known_cost_usd_micros = None;
-        grant.unknown_cost_allowed = true;
-        let grants = [grant];
-        inputs.grants = &grants;
-        let auth = authorize_generate_image(&inputs);
-        assert!(!auth.authorized);
-        assert!(auth.reasons.iter().any(|r| r.contains("Unlimited")));
-    }
+    // The unknown-cost dispatch gate (all-Unlimited requirement) is now
+    // enforced by the Approver arm; its coverage moved to
+    // `approval/policy.rs` (`image_generation_unknown_cost_requires_all_unlimited`).
 
     // ---- Acceptance criterion 11: tool descriptions ----
 

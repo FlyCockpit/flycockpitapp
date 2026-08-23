@@ -662,6 +662,170 @@ impl Approver {
         // path, which records the decision here.)
         Ok(decision)
     }
+
+    /// The single composite authorization for an image-generation dispatch.
+    ///
+    /// This is the one decision issuer for image generation — the deleted
+    /// bespoke `authorize_generate_image` ladder had zero callers and is gone.
+    /// The decision layers, in order:
+    ///
+    /// 1. **Hard gates** (destination enabled, capability fresh, reference-read
+    ///    and output-write authority, insecure-transport policy, and the
+    ///    unknown-cost dispatch rule). Any failure denies. Yolo cannot bypass
+    ///    them.
+    /// 2. **Pure risk tier** via
+    ///    [`crate::image_generation_agent_tools::classify_risk`] — informs the
+    ///    Auto safe-risk policy branch; it never issues a decision itself.
+    /// 3. **Grant-matching seam** ([`Self::image_generation_grant_matches`]) —
+    ///    a matching persisted grant lets Manual short-circuit to a standing
+    ///    allow and Auto to a safe-risk policy allow without a prompt.
+    /// 4. **Approval-mode dispatch** over the shared session mode: Yolo
+    ///    auto-allows after the hard gates (agent discretion, no grant, no
+    ///    prompt); Manual/Auto honor a matching grant, else ask the human.
+    ///
+    /// Fail-closed everywhere: a missing decision input (a grant that does not
+    /// yet exist) never fakes an allow — Manual/Auto fall through to a human
+    /// prompt rather than assume a grant.
+    pub(super) async fn approve_image_generation_inner(
+        &self,
+        facts: ImageGenerationAuthzFacts<'_>,
+    ) -> Result<Decision> {
+        use crate::image_generation_agent_tools::{
+            GenerateImageRiskTier, SpendPolicyChoice, classify_risk,
+        };
+
+        // 1. Hard gates. Any failure denies, before any provider contact or
+        //    human prompt, and Yolo cannot bypass them.
+        let mut hard_gate_failed = false;
+        hard_gate_failed |= !facts.destination_enabled;
+        hard_gate_failed |= !facts.capability_fresh;
+        hard_gate_failed |= !facts.path_read_authorized;
+        hard_gate_failed |= !facts.output_write_authorized;
+        hard_gate_failed |= !facts.insecure_transport_allowed;
+
+        // Unknown maximum cost may dispatch only when the request, session, and
+        // project spend choices are all explicitly Unlimited.
+        let unknown_cost = facts.cost_maximum.is_none();
+        let unknown_dispatch_allowed = matches!(facts.spend_request, SpendPolicyChoice::Unlimited)
+            && matches!(facts.spend_session, SpendPolicyChoice::Unlimited)
+            && matches!(facts.spend_project, SpendPolicyChoice::Unlimited);
+        if unknown_cost && !unknown_dispatch_allowed {
+            hard_gate_failed = true;
+        }
+
+        if hard_gate_failed {
+            // Fail closed. No prompt is raised and no provider is contacted.
+            return Ok(Decision::Deny);
+        }
+
+        // 2. Pure risk tier (informational for the Auto safe-risk branch).
+        let risk_tier = classify_risk(
+            facts.fanout,
+            facts.total_outputs,
+            facts.cost_maximum,
+            facts.reference_egress_unmatched,
+            facts.base_threshold_usd_micros,
+        );
+
+        // 3. Grant-matching seam (fails closed this increment; see below).
+        let grant_matches = self.image_generation_grant_matches(&facts);
+
+        // 4. Approval-mode dispatch over the shared session mode.
+        match self.approval_mode() {
+            crate::config::extended::ApprovalMode::Yolo => {
+                // Yolo opens no human prompt and records agent discretion after
+                // every hard gate passed; it requires no grant and persists
+                // none. (A later increment records the `agent_discretion`
+                // disposition audit alongside grant persistence.)
+                Ok(Decision::Allow { scope: Scope::Once })
+            }
+            crate::config::extended::ApprovalMode::Manual => {
+                if grant_matches {
+                    // A matching standing grant is an explicit prior user
+                    // decision — short-circuit to a standing allow.
+                    Ok(Decision::Allow { scope: Scope::Once })
+                } else {
+                    // No grant input available: ask the human. Never assume a
+                    // grant that does not exist.
+                    self.raise_image_generation_prompt(&facts).await
+                }
+            }
+            crate::config::extended::ApprovalMode::Auto => {
+                // Auto auto-allows only a base-risk request already covered by a
+                // matching grant (the central safe-risk policy). Any elevated
+                // risk, or the absence of a grant, asks the human.
+                if grant_matches && matches!(risk_tier, GenerateImageRiskTier::Base) {
+                    Ok(Decision::Allow { scope: Scope::Once })
+                } else {
+                    self.raise_image_generation_prompt(&facts).await
+                }
+            }
+        }
+    }
+
+    /// Grant-matching hook for image generation. A matching persisted grant
+    /// lets Manual short-circuit to a standing-grant allow and Auto to a
+    /// safe-risk policy allow without a human prompt.
+    ///
+    /// TODO(image-generation-grant-persistence): this increment ships no
+    /// once/session/project grant SQLite schema or store yet, so the seam fails
+    /// closed — no grant ever matches, and Manual/Auto always ask the human. A
+    /// later increment folds the grant store into `0001_initial.sql` and
+    /// consults it here, keyed by the plan/destination digests carried on
+    /// `facts`. It must fail closed on any lookup error and never fake a match.
+    fn image_generation_grant_matches(&self, _facts: &ImageGenerationAuthzFacts<'_>) -> bool {
+        false
+    }
+
+    /// Raise the human image-generation approval prompt (Manual/Auto without a
+    /// matching grant). Mirrors the once-only computer-action prompt: a single
+    /// approve/deny question carrying only the secret-free destination count
+    /// and plan-digest prefix. Approve → allow once; deny/dismiss → deny.
+    async fn raise_image_generation_prompt(
+        &self,
+        facts: &ImageGenerationAuthzFacts<'_>,
+    ) -> Result<Decision> {
+        let digest_prefix: String = facts.plan_digest.chars().take(12).collect();
+        let destination_count = facts.destinations.len();
+        // Disclose the redacted output write-authority identity so the human
+        // sees WHERE artifacts will be written. It is a stable label/digest,
+        // never a raw path or secret.
+        let authority = facts.output_path_authority;
+        let prompt = format!(
+            "Approve image generation to {destination_count} destination(s) writing under `{authority}` (plan {digest_prefix})?"
+        );
+        let question = InterruptQuestion::Single {
+            prompt,
+            options: vec![
+                opt(ApprovalOptionId::ApproveOnce, "Yes, generate"),
+                opt(ApprovalOptionId::Reject, "Deny"),
+            ],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let description = format!(
+            "Image generation to {destination_count} destination(s) writing under `{authority}` (plan {digest_prefix})"
+        );
+        let set = ApprovalOptionSet::new(
+            "image_generation_approval",
+            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+        );
+        self.raise_and_decode(&description, question, |response| {
+            // Dismissal (no selection) denies, fail closed.
+            let Some(id) = decode_option_response(response, &set)? else {
+                return Ok(Decision::Deny);
+            };
+            match id {
+                ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                ApprovalOptionId::Reject => Ok(Decision::Deny),
+                _ => Err(ForeignOptionId::new(&set, id.as_str())),
+            }
+        })
+        .await
+    }
 }
 
 fn mcp_server_connect_prompt(server: &str, identity: &str) -> String {

@@ -1526,7 +1526,12 @@ CREATE TABLE verification_operations (
     CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
            (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
-    CHECK ((budget_action = 'dispatch_original') = (effective_candidate_count = 0))
+    -- Both estimate-unavailable dispositions are pre-candidate branches.
+    -- `refuse` suppresses the operation while `dispatch_original` dispatches
+    -- the original operation, but neither reserves verification candidates.
+    -- A normal estimable operation may legitimately use an effective count of
+    -- zero, so do not make zero count imply one particular budget action.
+    CHECK (budget_action IS NULL OR effective_candidate_count = 0)
 );
 
 CREATE INDEX idx_verification_operations_session_state
@@ -3371,6 +3376,10 @@ CREATE TABLE task_artifacts (
     created_at_unix_ms          INTEGER NOT NULL,
     updated_at_unix_ms          INTEGER NOT NULL,
     UNIQUE (artifact_id, session_id),
+    -- Artifact provenance is session-owned even though its source lease and
+    -- agent references use restrictive composite FKs for normal lifecycle
+    -- operations. Session teardown must collect the whole recovery graph.
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (source_workspace_lease_id, session_id)
         REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
@@ -3410,6 +3419,10 @@ CREATE TABLE task_artifact_integration_receipts (
     result_state                TEXT NOT NULL CHECK (result_state = 'integrated'),
     created_at_unix_ms          INTEGER NOT NULL,
     UNIQUE (artifact_id, session_id),
+    -- Keep the immutable receipt in the session-owned cascade graph as well
+    -- as under its artifact. This avoids a restrictive target-scope FK
+    -- disconnecting receipt cleanup from session lifecycle ownership.
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (artifact_id, session_id)
         REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE,
     FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
@@ -3417,6 +3430,9 @@ CREATE TABLE task_artifact_integration_receipts (
 
 CREATE INDEX idx_task_artifact_receipts_target
     ON task_artifact_integration_receipts (target_write_scope_lease_id, session_id);
+
+CREATE INDEX idx_task_artifact_receipts_session
+    ON task_artifact_integration_receipts (session_id, artifact_id);
 
 CREATE TRIGGER task_artifacts_revision_monotonic
 BEFORE UPDATE ON task_artifacts
@@ -3518,6 +3534,12 @@ END;
 
 CREATE TRIGGER task_artifact_receipts_not_deletable
 BEFORE DELETE ON task_artifact_integration_receipts
+-- Direct deletion remains forbidden while the owning session exists. During
+-- session teardown, SQLite removes the parent row before applying FK actions,
+-- so the session-owned cascade can delete this otherwise immutable receipt.
+WHEN EXISTS (
+    SELECT 1 FROM sessions WHERE session_id = OLD.session_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'task artifact integration receipt cannot be deleted');
 END;

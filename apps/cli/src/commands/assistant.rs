@@ -140,6 +140,17 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 /// Pure local IO — no daemon — so a parity test can compare its output against
 /// the canonical `create_assistant` and fail if the two ever drift.
 fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
+    write_assistant_home_with_installation_id(spec, Uuid::new_v4())
+}
+
+/// Write a home with a preallocated installation identity.
+///
+/// Keeping identity allocation explicit here allows the caller to use the
+/// exact same identity in the definition and persisted registry config.
+fn write_assistant_home_with_installation_id(
+    spec: &CreateAssistantSpec,
+    installation_id: Uuid,
+) -> Result<(String, String)> {
     crate::assistants::validate_assistant_name(&spec.name)?;
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
@@ -150,7 +161,6 @@ fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> 
     std::fs::create_dir_all(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
-    let installation_id = Uuid::new_v4();
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description.clone(),
@@ -425,7 +435,7 @@ impl TerminalActionHandler for AssistantNewAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assistants::create_assistant;
+    use crate::assistants::{create_assistant, create_assistant_with_installation_id};
     use crate::db::Db;
     use crate::wizard::WizardAnswer;
 
@@ -498,11 +508,19 @@ mod tests {
         let cli_home = temp.path().join("cli").join("helper-bot");
 
         let db = Db::open_in_memory().unwrap();
-        let core_row = create_assistant(&db, sample_spec(core_home.clone()))
-            .await
-            .unwrap();
-        let (_config_json, cli_hash) =
-            write_assistant_home(&sample_spec(cli_home.clone())).unwrap();
+        let installation_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let core_row = create_assistant_with_installation_id(
+            &db,
+            sample_spec(core_home.clone()),
+            installation_id,
+        )
+        .await
+        .unwrap();
+        let (_config_json, cli_hash) = write_assistant_home_with_installation_id(
+            &sample_spec(cli_home.clone()),
+            installation_id,
+        )
+        .unwrap();
 
         let core_md = std::fs::read(assistant_definition_path(&core_home)).unwrap();
         let cli_md = std::fs::read(assistant_definition_path(&cli_home)).unwrap();

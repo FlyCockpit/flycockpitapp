@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 83,
-    "request": 216,
-    "response": 144
+    "request": 220,
+    "response": 145
   },
   "messages": {
     "event": [
@@ -1852,6 +1852,30 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "docs_ask"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_installation_begin"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_installation_submit_choice"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_installation_list"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_installation_inspect"
       }
     ],
     "response": [
@@ -2718,6 +2742,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "docs_answer"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "agent_installation"
       }
     ]
   },

@@ -1093,11 +1093,15 @@ impl Driver {
         let vnext_admissions = match self.admit_current_vnext_children(1) {
             Ok(permits) => permits,
             Err(err) => {
-                return Ok(Message::tool_result_with_call_id(
-                    task.task_call_id.clone(),
-                    task.task_function_call_id.clone(),
-                    prepend_task_repair_notes(err, &task.repair_notes),
-                ));
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task.task_call_id.clone(),
+                        task.task_provider_item_id.clone(),
+                        task.task_function_call_id.clone(),
+                        "task",
+                        prepend_task_repair_notes(err, &task.repair_notes),
+                    ),
+                );
             }
         };
         let task_call_id = task.task_call_id.clone();
@@ -1371,17 +1375,17 @@ impl Driver {
             .stack
             .last()
             .and_then(|frame| frame.agent.vnext_grant.clone());
-        if let Some(err) = grant_rejection(
-            &self.cwd,
-            &child_cwd.resolved,
-            &self.config,
-            &parent_agent,
-            parent_vnext_grant.as_ref(),
-            &child_agent,
-            &granted_tools,
-            &self.session.db,
-            &self.vnext_local_installation_resolver,
-        )
+        if let Some(err) = grant_rejection(GrantRejectionInput {
+            parent_cwd: &self.cwd,
+            cwd: &child_cwd.resolved,
+            config: &self.config,
+            parent_agent: &parent_agent,
+            parent_vnext_grant: parent_vnext_grant.as_ref(),
+            child_agent: &child_agent,
+            grant: &granted_tools,
+            assistant_db: &self.session.db,
+            local_installations: &self.vnext_local_installation_resolver,
+        })
         .await
         {
             return Ok(SingleNoninteractiveCompletion {
@@ -3007,11 +3011,15 @@ impl Driver {
         let vnext_admissions = match self.admit_current_vnext_children(task.entries.len()) {
             Ok(permits) => permits,
             Err(err) => {
-                return Ok(Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(err, &task.repair_notes),
-                ));
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(err, &task.repair_notes),
+                    ),
+                );
             }
         };
         let child_todo_json = task
@@ -3716,20 +3724,20 @@ impl Driver {
                 // admissible.
                 let held_read = _read_guard.is_some();
                 let mut snapshot = NoninteractiveDelegationSnapshot::empty();
-                let outcome = if let Some(err) = grant_rejection(
-                    &driver.cwd,
-                    &child_cwd.resolved,
-                    &pinned,
-                    &parent,
-                    driver
+                let outcome = if let Some(err) = grant_rejection(GrantRejectionInput {
+                    parent_cwd: &driver.cwd,
+                    cwd: &child_cwd.resolved,
+                    config: &pinned,
+                    parent_agent: &parent,
+                    parent_vnext_grant: driver
                         .stack
                         .last()
                         .and_then(|frame| frame.agent.vnext_grant.as_ref()),
-                    &entry.child_agent,
-                    &entry.granted_tools,
-                    &driver.session.db,
-                    &driver.vnext_local_installation_resolver,
-                )
+                    child_agent: &entry.child_agent,
+                    grant: &entry.granted_tools,
+                    assistant_db: &driver.session.db,
+                    local_installations: &driver.vnext_local_installation_resolver,
+                })
                 .await
                 {
                     DelegationChildOutcome::failed(err)
@@ -5194,6 +5202,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 todo_ids: _,
                 repair_notes,
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
             } if agent.vnext_grant.is_some() => {
                 // A v2 child can itself be a noninteractive orchestrator.
@@ -5204,9 +5213,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 let _vnext_admission = match recursive_vnext_admissions.try_admit(&agent, 1) {
                     Ok(permits) => permits,
                     Err(error) => {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id.clone(),
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(error, &repair_notes),
                         );
                         continue;
@@ -5219,30 +5230,36 @@ pub(crate) async fn run_noninteractive_resumable(
                 ) {
                     Ok(path) => path,
                     Err(error) => {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id.clone(),
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
                         );
                         continue;
                     }
                 };
                 if let Some(error) = super::delegation_helpers::grant_rejection(
-                    &cwd,
-                    &child_cwd,
-                    &config,
-                    &agent.name,
-                    Some(&parent_grant),
-                    &child_agent,
-                    &granted_tools,
-                    &session.db,
-                    &local_installations,
+                    super::delegation_helpers::GrantRejectionInput {
+                        parent_cwd: &cwd,
+                        cwd: &child_cwd,
+                        config: &config,
+                        parent_agent: &agent.name,
+                        parent_vnext_grant: Some(&parent_grant),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &session.db,
+                        local_installations: &local_installations,
+                    },
                 )
                 .await
                 {
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id.clone(),
                         task_function_call_id,
+                        "task",
                         prepend_task_repair_notes(error, &repair_notes),
                     );
                     continue;
@@ -5254,9 +5271,11 @@ pub(crate) async fn run_noninteractive_resumable(
                 ) {
                     Ok(scope) => scope,
                     Err(error) => {
-                        next_prompt = Message::tool_result_with_call_id(
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                             task_call_id,
+                            task_provider_item_id.clone(),
                             task_function_call_id,
+                            "task",
                             prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
                         );
                         continue;
@@ -5319,17 +5338,21 @@ pub(crate) async fn run_noninteractive_resumable(
                     .unwrap_or_else(|error| format!("Error: {error}")),
                     Err(error) => format!("Error: {error:#}"),
                 };
-                next_prompt = Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(result, &repair_notes),
-                );
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(result, &repair_notes),
+                    );
             }
             TurnOutcome::SpawnNoninteractiveBatch {
                 entries,
                 why: _,
                 repair_notes,
                 task_call_id,
+                task_provider_item_id,
                 task_function_call_id,
             } if agent.vnext_grant.is_some() => {
                 // Recursive v2 batches stay in-process rather than re-entering
@@ -5355,15 +5378,17 @@ pub(crate) async fn run_noninteractive_resumable(
                         }
                     };
                     if let Some(error) = super::delegation_helpers::grant_rejection(
-                        &cwd,
-                        &child_cwd,
-                        &config,
-                        &agent.name,
-                        Some(&parent_grant),
-                        &entry.child_agent,
-                        &entry.granted_tools,
-                        &session.db,
-                        &local_installations,
+                        super::delegation_helpers::GrantRejectionInput {
+                            parent_cwd: &cwd,
+                            cwd: &child_cwd,
+                            config: &config,
+                            parent_agent: &agent.name,
+                            parent_vnext_grant: Some(&parent_grant),
+                            child_agent: &entry.child_agent,
+                            grant: &entry.granted_tools,
+                            assistant_db: &session.db,
+                            local_installations: &local_installations,
+                        },
                     )
                     .await
                     {
@@ -5429,25 +5454,30 @@ pub(crate) async fn run_noninteractive_resumable(
                 }
 
                 if let Some(error) = rejection {
-                    next_prompt = Message::tool_result_with_call_id(
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                         task_call_id,
+                        task_provider_item_id.clone(),
                         task_function_call_id,
+                        "task",
                         prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
                     );
                     continue;
                 }
-                let mut vnext_admissions =
-                    match recursive_vnext_admissions.try_admit(&agent, prepared.len()) {
-                        Ok(permits) => permits,
-                        Err(error) => {
-                            next_prompt = Message::tool_result_with_call_id(
+                let mut vnext_admissions = match recursive_vnext_admissions
+                    .try_admit(&agent, prepared.len())
+                {
+                    Ok(permits) => permits,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id.clone(),
                                 task_function_call_id,
+                                "task",
                                 prepend_task_repair_notes(error, &repair_notes),
                             );
-                            continue;
-                        }
-                    };
+                        continue;
+                    }
+                };
 
                 use futures::StreamExt as _;
                 let mut runs = futures::stream::FuturesUnordered::new();
@@ -5502,11 +5532,14 @@ pub(crate) async fn run_noninteractive_resumable(
                     reports.push(report);
                 }
                 let result = render_recursive_vnext_batch_result(reports);
-                next_prompt = Message::tool_result_with_call_id(
-                    task_call_id,
-                    task_function_call_id,
-                    prepend_task_repair_notes(result, &repair_notes),
-                );
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(result, &repair_notes),
+                    );
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }

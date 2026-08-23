@@ -582,9 +582,11 @@ where
         ) -> std::result::Result<Self::Value, A::Error> {
             let mut out = BTreeMap::new();
             while let Some(tool) = map.next_key::<String>()? {
-                let spec = map.next_value::<ToolDescriptionSpec>().map_err(|err| {
-                    serde::de::Error::custom(format!("tool_descriptions.{tool}: {err}"))
-                })?;
+                // `serde_yaml` already records the enclosing map key in its
+                // diagnostic path. Re-prefixing this error produces the
+                // confusing duplicate `tool_descriptions.<tool>` path while
+                // losing no useful validation context.
+                let spec = map.next_value::<ToolDescriptionSpec>()?;
                 out.insert(tool, spec);
             }
             Ok(out)
@@ -778,7 +780,7 @@ impl AgentDef {
         // The prompt body is part of the definition's authority-free but
         // behaviorally material contract.  Hash the complete canonical
         // markdown document rather than frontmatter alone.
-        Ok(self.to_markdown()?.into_bytes())
+        self.to_markdown().map(String::into_bytes)
     }
 
     fn vnext_canonical_frontmatter(&self) -> Result<String> {
@@ -957,7 +959,7 @@ fn parse_agent_with_scope(
     })?;
     let raw_keys = if let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter {
         if mapping
-            .get(&serde_yaml::Value::String("schemaVersion".to_string()))
+            .get(serde_yaml::Value::String("schemaVersion".to_string()))
             .is_some_and(serde_yaml::Value::is_null)
         {
             bail!(
@@ -967,7 +969,7 @@ fn parse_agent_with_scope(
         }
         for key in ["delegation", "questions", "verification"] {
             if mapping
-                .get(&serde_yaml::Value::String(key.to_string()))
+                .get(serde_yaml::Value::String(key.to_string()))
                 .is_some_and(serde_yaml::Value::is_null)
             {
                 bail!(
@@ -1094,10 +1096,7 @@ fn parse_agent_with_scope(
 }
 
 pub fn default_scan_tool_results(name: &str) -> bool {
-    match name {
-        "explore" | "scout" | "docs-answerer" => false,
-        _ => true,
-    }
+    !matches!(name, "explore" | "scout" | "docs-answerer")
 }
 
 /// Load a single agent file from an arbitrary path. The file does not

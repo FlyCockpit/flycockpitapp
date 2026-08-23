@@ -13668,20 +13668,23 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "toggle_pinned_message"
         | "list_project_notes"
         | "create_project_note" => AuthzAllowedOutcome::Response,
-        // v10-only owner-remoted sealed-owner channel: the durable directory /
-        // capability-table backing is the persistence sibling's, so an
-        // authorized owner request traverses dispatch and fails closed with a
-        // content-free Internal error.
+        // v10-only owner-remoted sealed-owner channel. The matrix daemon has
+        // an empty but available SQLite store, so natural empty/read and
+        // idempotent paths return their typed responses; generated missing
+        // record/action IDs produce BadRequest after authz. These cases must
+        // not be mistaken for unavailable-persistence Internal sentinels.
         "begin_sealed_owner_operation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        "apply_sealed_owner_operation"
-        | "cancel_sealed_owner_operation"
-        | "sealed_owner_inventory"
-        | "edit_sealed_owner_description"
+        "apply_sealed_owner_operation" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "cancel_sealed_owner_operation" => AuthzAllowedOutcome::Response,
+        "sealed_owner_inventory"
         | "list_sealed_actions"
         | "create_sealed_action"
+        | "retire_sealed_action" => AuthzAllowedOutcome::Response,
+        "edit_sealed_owner_description"
         | "revise_sealed_action_description"
-        | "revise_sealed_action_enabled"
-        | "retire_sealed_action" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "revise_sealed_action_enabled" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "begin_attachment_upload"
         | "upload_attachment_chunk"
         | "finish_attachment_upload"
@@ -13873,6 +13876,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_session_compactions"
         | "diagnose_media_reservation"
         | "get_doctor_snapshot" => AuthzAllowedOutcome::Response,
+        // Coordinator failures are carried in a typed redacted DTO, so every
+        // owner-authorized installation endpoint reaches a response rather
+        // than a dispatch-level error.
+        "agent_installation_begin"
+        | "agent_installation_submit_choice"
+        | "agent_installation_list"
+        | "agent_installation_inspect" => AuthzAllowedOutcome::Response,
         // `docs_ask` is authorized for the owner but then resolves workspace
         // trust for its (project_root:None ⇒ daemon canonical cwd) workspace,
         // which the ephemeral matrix daemon never trusts — so it fails closed
@@ -14031,6 +14041,13 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("repair_media_reservation"),
         authz_owner_only("get_doctor_snapshot"),
         authz_owner_only("docs_ask"),
+        // The command table makes all installation coordinator endpoints
+        // owner-only; List/Inspect are concurrent read projections, while
+        // Begin/SubmitChoice are serialized mutations.
+        authz_owner_only("agent_installation_begin"),
+        authz_owner_only("agent_installation_submit_choice"),
+        authz_owner_only("agent_installation_list"),
+        authz_owner_only("agent_installation_inspect"),
         authz_owner_only("list_secret_inventory"),
         authz_owner_only("put_named_secret"),
         authz_owner_only("put_subscription_ack"),
@@ -14949,11 +14966,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             scope_key: None,
         },
         "apply_sealed_owner_operation" => Request::ApplySealedOwnerOperation {
-            capability_id: "cap-authz".into(),
+            capability_id: Uuid::nil().to_string(),
             literal: Some(proto::SensitiveWireLiteral::new("s3cr3t".into())),
         },
         "cancel_sealed_owner_operation" => Request::CancelSealedOwnerOperation {
-            capability_id: "cap-authz".into(),
+            capability_id: Uuid::nil().to_string(),
         },
         "sealed_owner_inventory" => Request::SealedOwnerInventory {
             scope_kind: None,
@@ -20563,6 +20580,8 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         })
         .collect();
     let expected = BTreeSet::from([
+        "agent_installation_inspect",
+        "agent_installation_list",
         "daemon_status",
         "export_policy",
         "export_session_data",
@@ -24365,7 +24384,7 @@ async fn list_agents_returns_chat_ownable_primaries() {
     );
     for agent in &agents {
         assert!(agent.builtin);
-        assert_eq!(agent.mode, "primary");
+        assert_eq!(agent.mode, "assistant");
     }
 }
 
@@ -26371,6 +26390,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         sealed_owner_capabilities: base.sealed_owner_capabilities.clone(),
         oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
+        #[cfg(debug_assertions)]
+        agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
         _secure_key_actor: None,
         external_journal: None,
@@ -26576,6 +26597,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         sealed_owner_capabilities: base.sealed_owner_capabilities.clone(),
         oauth_flows: base.oauth_flows.clone(),
         config_source: base.config_source.clone(),
+        #[cfg(debug_assertions)]
+        agent_installation_fixture: base.agent_installation_fixture.clone(),
         secure_key: None,
         _secure_key_actor: None,
         external_journal: None,

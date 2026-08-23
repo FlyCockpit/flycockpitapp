@@ -45,7 +45,7 @@ fn fail_after_control_event(point: u8, subject_id: Uuid) -> Result<()> {
         .expect("control-event failure lock poisoned")
         .as_ref()
         .is_some_and(|(configured_point, configured_subject)| {
-            configured_point == point && configured_subject == subject_id
+            *configured_point == point && *configured_subject == subject_id
         });
     #[cfg(test)]
     if should_fail {
@@ -1440,10 +1440,9 @@ fn validate_safe_display(value: &str, field: &str) -> Result<()> {
 }
 
 fn redacted_marker(raw: &str) -> String {
-    let digest = Sha256::digest(raw.as_bytes());
     serde_json::to_string(&json!({
         "redacted": true,
-        "sha256": format!("{digest:x}"),
+        "sha256": Sha256::digest(raw.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "byte_len": raw.len(),
     }))
     .expect("fixed redaction marker is serializable")
@@ -3295,10 +3294,9 @@ mod tests {
                 "winner b payload",
             )
         };
-        let losing_error = if left.is_err() {
-            left.unwrap_err()
-        } else {
-            right.unwrap_err()
+        let losing_error = match (left, right) {
+            (Err(error), _) | (_, Err(error)) => error,
+            (Ok(_), Ok(_)) => panic!("one concurrent insert must lose"),
         };
         assert!(
             losing_error

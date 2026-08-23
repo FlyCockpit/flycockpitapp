@@ -1978,6 +1978,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
+            | proto::Event::ImageControlConfigChanged { .. }
     )
 }
 
@@ -3345,6 +3346,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         CaffeinateState { .. }
         | DaemonDraining { .. }
         | ConnectorStatus { .. }
+        // Image-control configuration changes are daemon-global: they are
+        // keyed by project, not by an attached chat session.
+        | ImageControlConfigChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -4311,7 +4315,11 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
-        InterruptRaised { .. }
+        // This daemon-global, project-scoped invalidation has no image-control
+        // TUI state to refresh yet. Consume its safe projection explicitly so
+        // it is neither treated as a session event nor rendered as history.
+        ImageControlConfigChanged { .. }
+        | InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
@@ -6488,6 +6496,20 @@ mod tests {
             proto_event_to_turn_event(draining),
             Some(TurnEvent::DaemonDraining { forced: true })
         ));
+
+        let image_config_changed = proto::Event::ImageControlConfigChanged {
+            event: proto::image_control::ImageControlEventV1::config_changed(
+                "daemon".into(),
+                "project".into(),
+                proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
+            ),
+        };
+        assert!(event_session(&image_config_changed).is_none());
+        assert!(is_global_event(&image_config_changed));
+        assert!(
+            proto_event_to_turn_event(image_config_changed).is_none(),
+            "image-control config changes are not chat-history events"
+        );
 
         let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
             source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,

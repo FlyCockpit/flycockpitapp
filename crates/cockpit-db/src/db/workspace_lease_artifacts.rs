@@ -12,6 +12,13 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A fixed, lower-case SHA-256 receipt. Raw patches, refs, manifests and
 /// provider values never cross this durable boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -32,7 +39,7 @@ impl WorkspaceDigest {
     }
 
     pub fn of(bytes: impl AsRef<[u8]>) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes.as_ref())))
+        Self(sha256_hex(bytes.as_ref()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -321,9 +328,7 @@ fn uuid(raw: String, index: usize) -> rusqlite::Result<Uuid> {
     })
 }
 fn digest(raw: String, index: usize) -> rusqlite::Result<WorkspaceDigest> {
-    WorkspaceDigest::parse(raw).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(e))
-    })
+    WorkspaceDigest::parse(raw).map_err(|error| invalid_persisted_error(index, error))
 }
 fn bounded_identity(value: &str, field: &str) -> Result<()> {
     if value.is_empty()
@@ -389,8 +394,21 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskArtifactRow> {
         updated_at_unix_ms: row.get(15)?,
     })
 }
+fn invalid_persisted_error(index: usize, error: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
+}
 fn to_sql(error: anyhow::Error) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        error.to_string(),
+    )))
 }
 fn lease_for_owner(
     conn: &Connection,
@@ -595,6 +613,9 @@ impl Db {
         )
         .await
     }
+    // Lease transitions intentionally expose each owner/CAS/state/reason
+    // predicate; a generic payload would weaken this lifecycle boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn transition_lease(
         &self,
         session: Uuid,
@@ -724,6 +745,9 @@ impl Db {
     ) -> Result<ArtifactCasOutcome> {
         self.transaction(move |c| { let Some(current)=artifact_for_owner(c,session,agent,id)? else{return Ok(ArtifactCasOutcome::RevisionConflict)}; if current.state.is_terminal(){return Ok(ArtifactCasOutcome::AlreadyTerminal(current))}; if current.revision != expected{return Ok(ArtifactCasOutcome::RevisionConflict)}; c.execute("UPDATE task_artifacts SET state='cancelled',revision=revision+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND revision=?3 AND state IN ('produced','integrating')",params![now,id.to_string(),expected])?; Ok(ArtifactCasOutcome::Transitioned(artifact_for_owner(c,session,agent,id)?.context("cancelled artifact missing")?)) }).await
     }
+    // Artifact transitions preserve distinct owner, revision and graph-state
+    // predicates for the same reason as lease transitions above.
+    #[allow(clippy::too_many_arguments)]
     async fn transition_artifact(
         &self,
         session: Uuid,
@@ -807,7 +831,7 @@ mod tests {
                 agent.agent_instance_id,
                 0,
                 AgentInstanceState::Running,
-                "running",
+                r#"{"state":"running"}"#,
                 now + 1
             )
             .await
@@ -1488,6 +1512,25 @@ mod tests {
             .await
             .is_err()
         );
+        db.write(move |conn| {
+            conn.execute("DELETE FROM sessions WHERE session_id=?1", [s.to_string()])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let receipt_id = artifact.artifact_id.to_string();
+        let receipt_count = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_artifact_integration_receipts WHERE artifact_id=?1",
+                    [receipt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .context("counting cascaded integration receipts")
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt_count, 0);
     }
 
     #[tokio::test]

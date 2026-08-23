@@ -169,6 +169,10 @@ impl Db {
     /// never replaces that operation's pinned source with bytes fetched by a
     /// later retry. This closes the otherwise observable crash window between
     /// operation creation and journal persistence.
+    // These are intentionally independent immutable operation/journal facts.
+    // Keeping them explicit makes the atomic crash-recovery boundary auditable
+    // at every daemon call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_installation_operation_with_staged_journal(
         &self,
         idempotency_key: String,
@@ -521,9 +525,18 @@ fn decode_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstallationOpe
             updated_at_unix_ms: row.get(8)?,
         })
     })()
-    .map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })
+    .map_err(invalid_persisted_error)
+}
+
+fn invalid_persisted_error(error: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
 }
 fn continuation_by_token(conn: &Connection, token: Uuid) -> Result<Option<(Uuid, i64, String)>> {
     conn.query_row("SELECT operation_id,expires_at_unix_ms,state FROM installation_continuations WHERE continuation_token=?1", [token.to_string()], |r| Ok((Uuid::parse_str(&r.get::<_, String>(0)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?, r.get(1)?, r.get(2)?))).optional().context("looking up installation continuation")
@@ -561,7 +574,7 @@ fn journal_by_operation(
     conn: &Connection,
     operation_id: Uuid,
 ) -> Result<Option<InstallationJournalRow>> {
-    conn.query_row("SELECT journal_id,operation_id,checkpoint,staged_file_metadata_json,prior_file_metadata_json,expected_digest FROM installation_journals WHERE operation_id=?1", [operation_id.to_string()], |r| { (|| -> Result<_> { Ok(InstallationJournalRow { journal_id: Uuid::parse_str(&r.get::<_, String>(0)?).context("invalid installation journal id")?, operation_id: Uuid::parse_str(&r.get::<_, String>(1)?).context("invalid installation operation id")?, checkpoint: InstallationJournalCheckpoint::parse(&r.get::<_, String>(2)?)?, staged_file_metadata_json: r.get(3)?, prior_file_metadata_json: r.get(4)?, expected_digest: r.get(5)? }) })().map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))) }).optional().context("looking up installation journal")
+    conn.query_row("SELECT journal_id,operation_id,checkpoint,staged_file_metadata_json,prior_file_metadata_json,expected_digest FROM installation_journals WHERE operation_id=?1", [operation_id.to_string()], |r| { (|| -> Result<_> { Ok(InstallationJournalRow { journal_id: Uuid::parse_str(&r.get::<_, String>(0)?).context("invalid installation journal id")?, operation_id: Uuid::parse_str(&r.get::<_, String>(1)?).context("invalid installation operation id")?, checkpoint: InstallationJournalCheckpoint::parse(&r.get::<_, String>(2)?)?, staged_file_metadata_json: r.get(3)?, prior_file_metadata_json: r.get(4)?, expected_digest: r.get(5)? }) })().map_err(invalid_persisted_error) }).optional().context("looking up installation journal")
 }
 fn checkpoint_rank(value: InstallationJournalCheckpoint) -> u8 {
     match value {

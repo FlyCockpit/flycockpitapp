@@ -43,6 +43,12 @@ const GITHUB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 struct BindChoiceSet {
     installation_id: String,
     definition_digest: String,
+    /// Binding generation observed when this exact choice set was created.
+    /// It is server-only continuation state: submit uses it as the DB CAS so
+    /// a legitimate rebind advances the current route while a concurrent
+    /// change is refused rather than overwritten.
+    #[serde(default)]
+    expected_binding_revision: Option<u64>,
     choices: Vec<AgentInstallationChoiceV1>,
     unmatched_recommendations: Vec<AgentInstallationUnmatchedRecommendationV1>,
     /// Server-only route lookup. Profile handles are daemon-local credential
@@ -400,9 +406,9 @@ impl AgentInstallationFetcher for GithubHttpsAgentFetcher {
             (200..300).contains(&response.status),
             "GitHub agent source authorization or fetch failed"
         );
-        let bytes = read_github_response_body(response)
-            .await
-            .context("reading GitHub agent Markdown")?;
+        // Keep the bounded-reader error as the outer error so callers can
+        // distinguish the hard 1MiB rejection from a transport failure.
+        let bytes = read_github_response_body(response).await?;
         Ok(FetchedAgentSource {
             commit_sha,
             markdown: bytes,
@@ -416,6 +422,19 @@ pub struct AgentInstallationService {
     fetcher: Arc<dyn AgentInstallationFetcher>,
     workspaces: Arc<dyn AgentWorkspaceAuthorizer>,
     providers: ProvidersConfig,
+}
+
+/// The durable context carried from an install/update publication into the
+/// optional binding continuation. Grouping it prevents this internal handoff
+/// from drifting into an unstructured long argument list.
+struct BindBeginInput {
+    request: AgentInstallationBeginV1,
+    workspace_id: Option<String>,
+    workspace_root: Option<PathBuf>,
+    now: i64,
+    installed_id: Option<Uuid>,
+    parent_receipt_status: Option<AgentInstallationReceiptStatusV1>,
+    parent_source_revision: Option<String>,
 }
 
 /// Development-only process-boundary fixture switch.  It is deliberately
@@ -534,18 +553,20 @@ pub fn debug_fixture_daemon_service(
                     !profile.trim().is_empty(),
                     "debug fixture provider profile must not be empty"
                 );
-                let mut entry = ProviderEntry::default();
-                entry.template = provider.template;
-                entry.models = provider
-                    .models
-                    .into_iter()
-                    .map(|model| ModelEntry {
-                        id: model.id,
-                        context_length: model.context_length,
-                        capabilities: model.capabilities,
-                        ..ModelEntry::default()
-                    })
-                    .collect();
+                let entry = ProviderEntry {
+                    template: provider.template,
+                    models: provider
+                        .models
+                        .into_iter()
+                        .map(|model| ModelEntry {
+                            id: model.id,
+                            context_length: model.context_length,
+                            capabilities: model.capabilities,
+                            ..ModelEntry::default()
+                        })
+                        .collect(),
+                    ..ProviderEntry::default()
+                };
                 Ok((profile, entry))
             })
             .collect::<Result<_>>()?,
@@ -776,8 +797,16 @@ impl AgentInstallationService {
                     .await
             }
             AgentInstallationOperationKind::Bind => {
-                self.bind_begin(request, workspace_id, workspace_root, now, None, None, None)
-                    .await
+                self.bind_begin(BindBeginInput {
+                    request,
+                    workspace_id,
+                    workspace_root,
+                    now,
+                    installed_id: None,
+                    parent_receipt_status: None,
+                    parent_source_revision: None,
+                })
+                .await
             }
         }
     }
@@ -945,7 +974,7 @@ impl AgentInstallationService {
                 .bind_agent_model(
                     installation_id,
                     choice_set.definition_digest,
-                    None,
+                    choice_set.expected_binding_revision,
                     operation.operation_id.to_string(),
                     operation.request_fingerprint.clone(),
                     cockpit_db::db::agent_installations::AgentBindingInput {
@@ -994,16 +1023,16 @@ impl AgentInstallationService {
         result.unwrap_or_else(redacted_error)
     }
 
-    async fn bind_begin(
-        &self,
-        request: AgentInstallationBeginV1,
-        workspace_id: Option<String>,
-        workspace_root: Option<PathBuf>,
-        now: i64,
-        installed_id: Option<Uuid>,
-        parent_receipt_status: Option<AgentInstallationReceiptStatusV1>,
-        parent_source_revision: Option<String>,
-    ) -> Result<AgentInstallationResultV1> {
+    async fn bind_begin(&self, input: BindBeginInput) -> Result<AgentInstallationResultV1> {
+        let BindBeginInput {
+            request,
+            workspace_id,
+            workspace_root,
+            now,
+            installed_id,
+            parent_receipt_status,
+            parent_source_revision,
+        } = input;
         let operation = self
             .db
             .installation_operation(request.idempotency_key.clone())
@@ -1056,6 +1085,15 @@ impl AgentInstallationService {
             .model_slots
             .get(slot_id)
             .context("requested model slot does not exist")?;
+        let expected_binding_revision = self
+            .db
+            .current_agent_binding(
+                installation_id,
+                installation.source_digest.clone(),
+                slot_id.to_owned(),
+            )
+            .await?
+            .map(|binding| binding.binding_revision);
         let offerings = self
             .providers
             .providers
@@ -1147,6 +1185,7 @@ impl AgentInstallationService {
                 serde_json::to_string(&BindChoiceSet {
                     installation_id: installation_id.to_string(),
                     definition_digest: installation.source_digest.clone(),
+                    expected_binding_revision,
                     choices: choices.clone(),
                     unmatched_recommendations: unmatched_recommendations.clone(),
                     routes,
@@ -1190,7 +1229,7 @@ impl AgentInstallationService {
                 .await?;
             let rows = self
                 .db
-                .list_agent_installations(db_scope(request.scope), workspace_id.as_deref())
+                .list_agent_installations(db_scope(request.scope), workspace_id)
                 .await?;
             let mut installations = Vec::with_capacity(rows.len());
             for row in rows {
@@ -1522,62 +1561,61 @@ impl AgentInstallationService {
         if needs_owned_target_preflight
             && request.scope == AgentInstallationScopeWire::WorkspaceShared
             && owned_file_exists(&target, false)?
+            && target_digest(&target)? == digest
+            && let Some(existing) = self
+                .db
+                .agent_installation_by_source(
+                    db_scope(request.scope),
+                    workspace_id.clone(),
+                    definition
+                        .vnext
+                        .as_ref()
+                        .expect("checked vnext")
+                        .agent_id
+                        .clone(),
+                )
+                .await?
+            && existing.source_identity == source.identity()
+            && existing.source_revision.as_deref() == Some(fetched.commit_sha.as_str())
+            && existing.source_digest == definition_digest
         {
-            if target_digest(&target)? == digest {
-                if let Some(existing) = self
-                    .db
-                    .agent_installation_by_source(
-                        db_scope(request.scope),
-                        workspace_id.clone(),
-                        definition
-                            .vnext
-                            .as_ref()
-                            .expect("checked vnext")
-                            .agent_id
-                            .clone(),
-                    )
-                    .await?
-                {
-                    if existing.source_identity == source.identity()
-                        && existing.source_revision.as_deref() == Some(fetched.commit_sha.as_str())
-                        && existing.source_digest == definition_digest
-                    {
-                        let install_status =
-                            if request.operation == AgentInstallationOperationKind::Install {
-                                AgentInstallationReceiptStatusV1::Installed
-                            } else {
-                                AgentInstallationReceiptStatusV1::Updated
-                            };
-                        let receipt = receipt(
-                            operation.operation_id,
-                            install_status,
-                            Some(existing.installation_id.to_string()),
-                            Some(fetched.commit_sha.clone()),
-                        );
-                        if request.auto_select_first_exact {
-                            return self
-                                .bind_begin(
-                                    request,
-                                    workspace_id,
-                                    workspace_root,
-                                    now,
-                                    Some(existing.installation_id),
-                                    Some(install_status),
-                                    Some(fetched.commit_sha),
-                                )
-                                .await;
-                        }
-                        self.db
-                            .finish_installation_operation(
-                                operation.operation_id,
-                                serde_json::to_string(&receipt)?,
-                                now,
-                            )
-                            .await?;
-                        return Ok(receipt);
-                    }
-                }
+            let install_status = if request.operation == AgentInstallationOperationKind::Install {
+                AgentInstallationReceiptStatusV1::Installed
+            } else {
+                AgentInstallationReceiptStatusV1::Updated
+            };
+            let receipt = receipt(
+                operation.operation_id,
+                install_status,
+                Some(existing.installation_id.to_string()),
+                Some(fetched.commit_sha.clone()),
+            );
+            if request.auto_select_first_exact {
+                return self
+                    .bind_begin(BindBeginInput {
+                        request,
+                        workspace_id,
+                        workspace_root,
+                        now,
+                        installed_id: Some(existing.installation_id),
+                        parent_receipt_status: Some(install_status),
+                        parent_source_revision: Some(fetched.commit_sha),
+                    })
+                    .await;
             }
+            self.db
+                .finish_installation_operation(
+                    operation.operation_id,
+                    serde_json::to_string(&receipt)?,
+                    now,
+                )
+                .await?;
+            return Ok(receipt);
+        }
+        if needs_owned_target_preflight
+            && request.scope == AgentInstallationScopeWire::WorkspaceShared
+            && owned_file_exists(&target, false)?
+        {
             bail!("dirty shared owned agent file collision")
         }
         // Replacement is explicit, never permission to overwrite an edited
@@ -1617,7 +1655,8 @@ impl AgentInstallationService {
                 .context("owned agent before replacement is not UTF-8")?,
                 name,
                 target.clone(),
-            )?;
+            )
+            .context("dirty shared owned agent file collision")?;
             let current_digest = sha256_hex(&current.vnext_digest_bytes()?);
             ensure!(
                 current_digest == existing.source_digest,
@@ -1660,44 +1699,40 @@ impl AgentInstallationService {
         );
         if checkpoint_rank(journal.checkpoint)
             >= checkpoint_rank(InstallationJournalCheckpoint::DbCommitted)
+            && let Some(replacement) = journal_replacement_receipt(&journal).transpose()?
+            && self
+                .db
+                .agent_replacement_is_compensated(replacement)
+                .await?
         {
-            if let Some(replacement) = journal_replacement_receipt(&journal).transpose()? {
-                if self
-                    .db
-                    .agent_replacement_is_compensated(replacement)
-                    .await?
-                {
-                    // A prior publish failure was compensated atomically but
-                    // the daemon crashed before writing its terminal receipt.
-                    // Never repeat the replacement or touch its immutable
-                    // historical snapshots during this recovery.
-                    rollback_stage(&target, operation.operation_id);
-                    discard_prior_backup(&target, operation.operation_id)?;
-                    let receipt = receipt(
-                        operation.operation_id,
-                        AgentInstallationReceiptStatusV1::Refused,
-                        None,
-                        Some(fetched.commit_sha),
-                    );
-                    self.db
-                        .record_installation_journal(
-                            InstallationJournalRow {
-                                checkpoint: InstallationJournalCheckpoint::Complete,
-                                ..journal
-                            },
-                            now,
-                        )
-                        .await?;
-                    self.db
-                        .finish_installation_operation(
-                            operation.operation_id,
-                            serde_json::to_string(&receipt)?,
-                            now,
-                        )
-                        .await?;
-                    return Ok(receipt);
-                }
-            }
+            // A prior publish failure was compensated atomically but the
+            // daemon crashed before writing its terminal receipt. Never repeat
+            // the replacement or touch its immutable historical snapshots.
+            rollback_stage(&target, operation.operation_id);
+            discard_prior_backup(&target, operation.operation_id)?;
+            let receipt = receipt(
+                operation.operation_id,
+                AgentInstallationReceiptStatusV1::Refused,
+                None,
+                Some(fetched.commit_sha),
+            );
+            self.db
+                .record_installation_journal(
+                    InstallationJournalRow {
+                        checkpoint: InstallationJournalCheckpoint::Complete,
+                        ..journal
+                    },
+                    now,
+                )
+                .await?;
+            self.db
+                .finish_installation_operation(
+                    operation.operation_id,
+                    serde_json::to_string(&receipt)?,
+                    now,
+                )
+                .await?;
+            return Ok(receipt);
         }
         if journal.checkpoint == InstallationJournalCheckpoint::Staged {
             stage_file(&target, operation.operation_id, &fetched.markdown)?;
@@ -1716,7 +1751,7 @@ impl AgentInstallationService {
         let installation_input = AgentInstallationInput {
             installation_id: operation.operation_id,
             scope: db_scope(request.scope),
-            canonical_workspace_id: workspace_id,
+            canonical_workspace_id: workspace_id.clone(),
             source_agent_id: definition
                 .vnext
                 .as_ref()
@@ -1981,15 +2016,15 @@ impl AgentInstallationService {
             .await?;
         if request.auto_select_first_exact {
             let result = self
-                .bind_begin(
+                .bind_begin(BindBeginInput {
                     request,
                     workspace_id,
                     workspace_root,
                     now,
-                    Some(installation.installation_id),
-                    Some(install_status),
-                    Some(fetched.commit_sha),
-                )
+                    installed_id: Some(installation.installation_id),
+                    parent_receipt_status: Some(install_status),
+                    parent_source_revision: Some(fetched.commit_sha),
+                })
                 .await?;
             discard_prior_backup(&target, operation.operation_id)?;
             return Ok(result);
@@ -2359,10 +2394,10 @@ fn request_fingerprint(request: &AgentInstallationBeginV1, workspace: Option<&st
         request.primary_slot_id.as_deref().unwrap_or(""),
         request.auto_select_first_exact,
     ));
-    format!("{:x}", hasher.finalize())
+    crate::intel::hex_lower(&hasher.finalize())
 }
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::intel::hex_lower(&Sha256::digest(bytes))
 }
 fn is_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -2447,10 +2482,13 @@ fn publish_stage(
     );
     let backup = prior_backup_path(target, operation)?;
     reject_reparse_leaf(&backup)?;
+    if owned_file_exists(target, false)?
+        && owned_file_exists(&backup, false)?
+        && target_digest(target)? == expected_digest
+    {
+        return Ok(());
+    }
     if owned_file_exists(target, false)? {
-        if owned_file_exists(&backup, false)? && target_digest(target)? == expected_digest {
-            return Ok(());
-        }
         ensure!(
             !owned_file_exists(&backup, false)?,
             "owned prior backup name is already occupied"
@@ -2462,16 +2500,20 @@ fn publish_stage(
         rename_owned_file(target, &backup)
             .context("backing up prior daemon-owned agent definition")?;
     };
-    if let Err(error) = rename_owned_file(&staged, target) {
-        if owned_file_exists(&backup, false)? {
-            ensure!(
-                !owned_file_exists(target, false)?,
-                "publish failed after creating an unexpected target; preserving prior backup"
-            );
-            rename_owned_file(&backup, target)
-                .context("restoring prior daemon-owned agent definition after publish failure")?;
+    match rename_owned_file(&staged, target) {
+        Ok(()) => {}
+        Err(error) => {
+            if owned_file_exists(&backup, false)? {
+                ensure!(
+                    !owned_file_exists(target, false)?,
+                    "publish failed after creating an unexpected target; preserving prior backup"
+                );
+                rename_owned_file(&backup, target).context(
+                    "restoring prior daemon-owned agent definition after publish failure",
+                )?;
+            }
+            return Err(error).context("publishing daemon-owned agent definition");
         }
-        return Err(error).context("publishing daemon-owned agent definition");
     }
     Ok(())
 }
@@ -2685,10 +2727,11 @@ fn read_owned_file(path: &Path, context: &str) -> Result<Vec<u8>> {
     ensure!(fd >= 0, "{context}");
     // SAFETY: openat returned a unique owned descriptor.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let metadata = file.metadata().context(context)?;
+    let metadata = file.metadata().with_context(|| context.to_owned())?;
     ensure!(metadata.is_file(), "owned agent file is not regular");
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).context(context)?;
+    file.read_to_end(&mut bytes)
+        .with_context(|| context.to_owned())?;
     Ok(bytes)
 }
 
@@ -2710,7 +2753,7 @@ fn write_owned_file_new(path: &Path, bytes: &[u8], context: &str) -> Result<()> 
     ensure!(fd >= 0, "{context}");
     // SAFETY: openat returned a unique owned descriptor.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(bytes).context(context)?;
+    file.write_all(bytes).with_context(|| context.to_owned())?;
     file.sync_all().context("syncing owned agent definition")?;
     Ok(())
 }
@@ -3069,7 +3112,8 @@ mod held_windows_agent_files {
         .map_err(|status| anyhow::anyhow!("{context}: NTSTATUS {status:#x}"))?;
         verify_file(&file)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).context(context)?;
+        file.read_to_end(&mut bytes)
+            .with_context(|| context.to_owned())?;
         Ok(bytes)
     }
     pub fn create(path: &Path, bytes: &[u8], context: &str) -> Result<()> {
@@ -3083,7 +3127,7 @@ mod held_windows_agent_files {
         )
         .map_err(|status| anyhow::anyhow!("{context}: NTSTATUS {status:#x}"))?;
         verify_file(&file)?;
-        file.write_all(bytes).context(context)?;
+        file.write_all(bytes).with_context(|| context.to_owned())?;
         file.sync_all()
             .context("syncing owned Windows agent definition")?;
         Ok(())
@@ -3208,7 +3252,7 @@ fn owned_file_exists(path: &Path, _create_parent: bool) -> Result<bool> {
 #[cfg(all(not(unix), not(windows)))]
 fn read_owned_file(path: &Path, context: &str) -> Result<Vec<u8>> {
     ensure!(owned_file_exists(path, false)?, "{context}");
-    std::fs::read(path).context(context)
+    std::fs::read(path).with_context(|| context.to_owned())
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -3216,9 +3260,9 @@ fn write_owned_file_new(path: &Path, bytes: &[u8], context: &str) -> Result<()> 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     std::fs::create_dir_all(path.parent().context("owned target missing parent")?)?;
-    let mut file = options.open(path).context(context)?;
+    let mut file = options.open(path).with_context(|| context.to_owned())?;
     use std::io::Write;
-    file.write_all(bytes).context(context)?;
+    file.write_all(bytes).with_context(|| context.to_owned())?;
     file.sync_all().context("syncing owned agent definition")?;
     Ok(())
 }
@@ -3524,7 +3568,7 @@ fn durable_binding_routes(
             .iter()
             .enumerate()
             .filter(|(index, offering)| {
-                choice.provider_id == wire_provider_id(offering, index)
+                choice.provider_id == wire_provider_id(offering, *index)
                     && choice.model_id == offering.model_id
                     && choice.offering_id == format!("offering-{index}")
             })
@@ -3584,6 +3628,12 @@ fn validate_durable_choice_set(choice_set: &BindChoiceSet) -> Result<()> {
         !choice_set.installation_id.trim().is_empty()
             && !choice_set.definition_digest.trim().is_empty(),
         "stored installation choice set is incomplete"
+    );
+    ensure!(
+        choice_set
+            .expected_binding_revision
+            .is_none_or(|revision| revision > 0),
+        "stored installation choice set has an invalid binding revision"
     );
     let choice_ids = choice_set
         .choices
@@ -3686,7 +3736,11 @@ fn replay_operation(receipt_json: Option<&str>) -> Result<AgentInstallationResul
     serde_json::from_str(receipt).context("stored installation receipt is corrupt")
 }
 fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
-    let text = error.to_string();
+    // `anyhow::Error::to_string()` only yields the outer context. Classifying
+    // from the complete local error chain keeps private credential failures
+    // and dirty-file invariants typed while the returned DTO stays fixed and
+    // redacted.
+    let text = format!("{error:#}");
     let code = if text.contains("idempotency") {
         AgentInstallationErrorCodeV1::IdempotencyConflict
     } else if text.contains("workspace authorization") {
@@ -3703,12 +3757,20 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
         AgentInstallationErrorCodeV1::ContinuationExpired
     } else if text.contains("dirty shared") {
         AgentInstallationErrorCodeV1::DirtySharedFile
-    } else if text.contains("collid") || text.contains("dirty") {
+    } else if text.contains("collision") || text.contains("dirty") {
         AgentInstallationErrorCodeV1::Collision
+    // Source-locator grammar errors legitimately mention a Markdown path, but
+    // are invalid requests rather than invalid fetched definitions. Keep this
+    // branch tied to parsed-definition contract failures only. This must
+    // precede the generic fetch classification because the durable parse
+    // boundary is intentionally named "invalid fetched AgentDef".
+    } else if text.contains("vNext")
+        || text.contains("invalid fetched AgentDef")
+        || text.contains("fetched agent Markdown")
+    {
+        AgentInstallationErrorCodeV1::InvalidDefinition
     } else if text.contains("fetch") {
         AgentInstallationErrorCodeV1::FetchFailed
-    } else if text.contains("vNext") || text.contains("Markdown") || text.contains("AgentDef") {
-        AgentInstallationErrorCodeV1::InvalidDefinition
     } else {
         AgentInstallationErrorCodeV1::InvalidRequest
     };
@@ -3728,7 +3790,8 @@ fn typed_installation_error(code: AgentInstallationErrorCodeV1) -> AgentInstalla
 mod tests {
     use super::*;
     use crate::agents::{
-        ModelCapability, ModelLocality, ModelRecommendation, ModelSlot, ProviderAlias,
+        AgentProfileModelOffering, ModelCapability, ModelLocality, ModelRecommendation, ModelSlot,
+        ProviderAlias,
     };
     use cockpit_config::config::providers::{ModelEntry, ProviderEntry};
     use std::collections::VecDeque;
@@ -4042,13 +4105,15 @@ mod tests {
             ("profile-b", "vendor", "exact-b"),
             ("profile-local", "local", "compatible"),
         ] {
-            let mut entry = ProviderEntry::default();
-            entry.template = Some(provider_id.into());
-            entry.models.push(ModelEntry {
-                id: model_id.into(),
-                context_length: Some(128),
-                ..ModelEntry::default()
-            });
+            let entry = ProviderEntry {
+                template: Some(provider_id.into()),
+                models: vec![ModelEntry {
+                    id: model_id.into(),
+                    context_length: Some(128),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            };
             providers.providers.insert(profile.into(), entry);
         }
         providers
@@ -4648,6 +4713,7 @@ mod tests {
         let choice_set = BindChoiceSet {
             installation_id: installation_id.to_string(),
             definition_digest,
+            expected_binding_revision: None,
             choices: vec![AgentInstallationChoiceV1 {
                 choice_id: choice_id.clone(),
                 slot_id: "primary".into(),
@@ -4760,6 +4826,38 @@ mod tests {
             };
             assert!(!error.message.contains("ghp_secret_value"));
             assert!(!error.message.contains("/private/workspace"));
+        }
+    }
+
+    #[test]
+    fn agent_installation_daemon_classifies_fetched_definitions_before_generic_fetches() {
+        for (detail, expected) in [
+            (
+                "fetching GitHub agent source: invalid fetched AgentDef: modelSlots is required",
+                AgentInstallationErrorCodeV1::InvalidDefinition,
+            ),
+            (
+                "source Markdown path has no agent filename",
+                AgentInstallationErrorCodeV1::InvalidRequest,
+            ),
+            (
+                "update source AgentDef identity does not match target installation",
+                AgentInstallationErrorCodeV1::InvalidRequest,
+            ),
+            (
+                "fetching GitHub agent source: remote response failed",
+                AgentInstallationErrorCodeV1::FetchFailed,
+            ),
+        ] {
+            let AgentInstallationResultV1::Error { error } =
+                redacted_error(anyhow::anyhow!(detail))
+            else {
+                panic!("expected typed installation refusal")
+            };
+            assert_eq!(
+                error.code, expected,
+                "unexpected classification for {detail}"
+            );
         }
     }
 
@@ -5817,13 +5915,15 @@ mod tests {
         );
         let mut providers = ProvidersConfig::default();
         for profile_handle in ["profile-work", "profile-personal"] {
-            let mut entry = ProviderEntry::default();
-            entry.template = Some("vendor".into());
-            entry.models.push(ModelEntry {
-                id: "model".into(),
-                context_length: Some(128),
-                ..ModelEntry::default()
-            });
+            let entry = ProviderEntry {
+                template: Some("vendor".into()),
+                models: vec![ModelEntry {
+                    id: "model".into(),
+                    context_length: Some(128),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            };
             providers.providers.insert(profile_handle.into(), entry);
         }
         let ranked = crate::agents::ranked_compatible_offerings(&slot, &offerings, &providers);
@@ -5862,6 +5962,7 @@ mod tests {
         let mut persisted = BindChoiceSet {
             installation_id: Uuid::new_v4().to_string(),
             definition_digest: "definition-digest".into(),
+            expected_binding_revision: None,
             choices,
             unmatched_recommendations: vec![],
             routes,

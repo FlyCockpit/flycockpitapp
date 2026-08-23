@@ -3439,6 +3439,29 @@ mod tests {
         test_spawn_args_with_provider_can_delegate(cwd, None)
     }
 
+    /// Give a vNext definition the same host-resolved grant a daemon-owned
+    /// session would carry.  Tests that inspect `task` must opt into this
+    /// explicit authority path: merely loading a manifest deliberately does
+    /// not project legacy task authority onto it.
+    fn test_spawn_args_with_vnext_grant(cwd: &Path, name: &str) -> SpawnArgs {
+        let mut args = test_spawn_args(cwd);
+        let host = Arc::new(crate::agents::VnextHostPolicy::for_session_config(
+            &args.config.extended(),
+        ));
+        let definition = crate::agents::embedded_default(name)
+            .unwrap_or_else(|| panic!("missing embedded vNext definition `{name}`"));
+        args.vnext_grant = Some(
+            definition
+                .vnext
+                .as_ref()
+                .unwrap_or_else(|| panic!("embedded `{name}` must have a vNext declaration"))
+                .resolve_grant(&host)
+                .unwrap_or_else(|err| panic!("embedded `{name}` vNext grant must resolve: {err}")),
+        );
+        args.vnext_host_policy = Some(host);
+        args
+    }
+
     fn test_assistant_db() -> crate::db::Db {
         crate::db::Db::open_in_memory().unwrap()
     }
@@ -4369,7 +4392,7 @@ mod tests {
     }
 
     #[test]
-    fn defensive_role_uses_tiered_recall_tools() {
+    fn defensive_role_uses_tiered_recall_tools_without_legacy_structural_authority() {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args(tmp.path());
         let agent = load("Careful", &args).unwrap();
@@ -4379,8 +4402,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "bash", "edit", "mcp", "question", "read", "schedule", "search", "task", "unlock",
-                "write",
+                "bash", "edit", "mcp", "question", "read", "search", "unlock", "write",
             ]
         );
         assert!(
@@ -4642,15 +4664,21 @@ mod tests {
     }
 
     #[test]
-    fn builtin_agent_grant_parent_grants_still_compose() {
+    fn vnext_builtin_rejects_legacy_granted_tools_authority() {
         let tmp = tempfile::tempdir().unwrap();
         let mut args = test_spawn_args(tmp.path());
         args.interactive = false;
         args.granted_tools = vec!["harness_list".to_string()];
 
-        let agent = load("explore", &args).unwrap();
-
-        assert!(agent.tools.names().contains(&"harness_list"));
+        let err = match load("explore", &args) {
+            Ok(_) => panic!("vNext explore must reject legacy granted_tools authority"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("vNext definitions cannot receive legacy granted_tools authority"),
+            "unexpected rejection: {err}"
+        );
     }
 
     #[test]
@@ -5188,10 +5216,7 @@ mod tests {
     }
 
     #[test]
-    fn grant_composes_onto_explore_for_one_run_only() {
-        // Per-delegation tool grants (prompt `parent-granted-tools.md`): a
-        // parent granting `mcp` to an `explore` delegation makes
-        // the child's effective surface = base + grants, for that run only.
+    fn vnext_explore_cannot_receive_legacy_mcp_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let base = test_spawn_args(tmp.path());
 
@@ -5199,16 +5224,23 @@ mod tests {
         let plain = load("explore", &base).unwrap();
         assert!(!plain.tools.names().contains(&"mcp"));
 
-        // A delegation that grants MCP: the child holds it for this spawn.
+        // A vNext delegation must use the typed effective-grant path instead
+        // of the legacy per-tool authority list.
         let granted_args = SpawnArgs {
             granted_tools: vec!["mcp".to_string()],
             ..test_spawn_args(tmp.path())
         };
-        let granted = load("explore", &granted_args).unwrap();
-        assert!(granted.tools.names().contains(&"mcp"));
+        let err = match load("explore", &granted_args) {
+            Ok(_) => panic!("vNext explore must reject legacy granted_tools authority"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("vNext definitions cannot receive legacy granted_tools authority"),
+            "unexpected rejection: {err}"
+        );
 
-        // A subsequent delegation WITHOUT the grant has the base surface again
-        // — grants don't persist or leak across delegations.
+        // The rejected legacy grant does not mutate another spawn.
         let after = load("explore", &test_spawn_args(tmp.path())).unwrap();
         assert!(!after.tools.names().contains(&"mcp"));
     }
@@ -5698,9 +5730,11 @@ mod tests {
         use crate::config::extended::LlmMode;
         let tmp = tempfile::tempdir().unwrap();
         for mode in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
-            let mut args = test_spawn_args(tmp.path());
-            args.llm_mode = mode;
-            for build_agent in [build(&args), builder(&args)] {
+            let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+            build_args.llm_mode = mode;
+            let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
+            builder_args.llm_mode = mode;
+            for build_agent in [load("Build", &build_args).unwrap(), builder(&builder_args)] {
                 let defs = build_agent.tools.definitions(mode);
                 let task = defs
                     .iter()
@@ -5819,11 +5853,16 @@ mod tests {
         )
         .unwrap();
 
-        let installation_id = uuid::Uuid::new_v4();
+        let installation_id =
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
         let mut local_child = crate::agents::embedded_default("explore").unwrap();
         local_child.name = "nested-child".to_string();
         local_child.prompt = "authenticated local snapshot".to_string();
-        local_child.vnext.as_mut().unwrap().agent_id = "local/nested-child".to_string();
+        // The authenticated snapshot replaces the full authored body; do not
+        // retain embedded per-mode prompt variants that would mask it.
+        local_child.prompt_variants.clear();
+        local_child.vnext.as_mut().unwrap().agent_id =
+            "local/00000000-0000-0000-0000-000000000004".to_string();
 
         let resolver = crate::agents::LocalInstallationResolver::from_bound_definitions(
             std::collections::BTreeMap::from([(installation_id, local_child)]),
@@ -5831,7 +5870,7 @@ mod tests {
         .unwrap();
         let mut parent = crate::agents::embedded_default("Build").unwrap();
         let parent_vnext = parent.vnext.as_mut().unwrap();
-        parent_vnext.agent_id = "local/root".to_string();
+        parent_vnext.agent_id = "local/00000000-0000-0000-0000-000000000005".to_string();
         parent_vnext.delegation = DelegationPolicy {
             allowed_children: vec![AllowedChild::LocalInstallation { installation_id }],
             max_descendant_depth: Some(1),
@@ -5859,35 +5898,29 @@ mod tests {
                 .vnext_grant
                 .as_ref()
                 .map(|grant| grant.agent_id.as_str()),
-            Some("local/nested-child")
+            Some("local/00000000-0000-0000-0000-000000000004")
         );
     }
 
     #[test]
-    fn delegated_builder_advertises_only_allowed_recursive_targets() {
+    fn delegated_builder_advertises_only_vnext_granted_targets() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
+        let mut args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
         args.delegated = true;
-        args.delegation_recursion = DelegationRecursionContext {
-            enabled: true,
-            remaining_depth: 1,
-            allowed_targets: vec!["docs".to_string()],
-            same_model_only: false,
-        };
 
         let agent = builder(&args);
         let task = task_definition(&agent, crate::config::extended::LlmMode::Normal);
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
-        assert_eq!(agent_enum, &vec![serde_json::json!("docs")]);
+        assert_eq!(agent_enum, &vec![serde_json::json!("explore")]);
     }
 
     #[test]
-    fn delegated_tool_using_subagent_can_advertise_deepthink_when_enabled_and_allowed() {
+    fn delegated_vnext_builder_cannot_expand_targets_with_legacy_recursion() {
         let tmp = tempfile::tempdir().unwrap();
         write_project_config(tmp.path(), r#"{"deepthink":{"enabled":true}}"#);
-        let mut args = test_spawn_args(tmp.path());
+        let mut args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
         args.delegated = true;
         args.delegation_recursion = DelegationRecursionContext {
             enabled: true,
@@ -5901,7 +5934,7 @@ mod tests {
         let agent_enum = task.parameters["properties"]["payload"]["properties"]["agent"]["enum"]
             .as_array()
             .expect("agent enum");
-        assert_eq!(agent_enum, &vec![serde_json::json!("deepthink")]);
+        assert_eq!(agent_enum, &vec![serde_json::json!("explore")]);
     }
 
     #[test]
@@ -6071,7 +6104,7 @@ mod tests {
     #[test]
     fn defensive_builder_prompt_and_task_description_preserve_scope_steer() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
+        let mut args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
         args.llm_mode = crate::config::extended::LlmMode::Defensive;
 
         let agent = builder(&args);
@@ -6117,7 +6150,7 @@ mod tests {
                 .iter()
                 .map(|value| value.as_str().expect("string enum value"))
                 .collect();
-        assert_eq!(enum_values, vec!["explore", "history", "docs"]);
+        assert_eq!(enum_values, vec!["explore"]);
     }
 
     #[test]
@@ -6180,15 +6213,17 @@ mod tests {
     #[test]
     fn normal_build_and_builder_task_descriptions_stay_terse() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut args = test_spawn_args(tmp.path());
-        args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let mut build_args = test_spawn_args_with_vnext_grant(tmp.path(), "Build");
+        build_args.llm_mode = crate::config::extended::LlmMode::Normal;
+        let mut builder_args = test_spawn_args_with_vnext_grant(tmp.path(), "builder");
+        builder_args.llm_mode = crate::config::extended::LlmMode::Normal;
 
         let build_task = task_definition(
-            &load("Build", &args).unwrap(),
+            &load("Build", &build_args).unwrap(),
             crate::config::extended::LlmMode::Normal,
         );
         let builder_task = task_definition(
-            &load("builder", &args).unwrap(),
+            &load("builder", &builder_args).unwrap(),
             crate::config::extended::LlmMode::Normal,
         );
 

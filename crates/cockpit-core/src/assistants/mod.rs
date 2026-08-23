@@ -147,6 +147,19 @@ pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
 }
 
 pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantRow> {
+    create_assistant_with_installation_id(db, spec, Uuid::new_v4()).await
+}
+
+/// Create an assistant using a caller-supplied installation identity.
+///
+/// The normal daemon-owned creation path uses [`create_assistant`], which
+/// mints a fresh UUID. This explicit form is for flows that must write the
+/// definition and registry configuration from one preallocated identity.
+pub async fn create_assistant_with_installation_id(
+    db: &Db,
+    spec: CreateAssistantSpec,
+    installation_id: Uuid,
+) -> Result<AssistantRow> {
     validate_assistant_name(&spec.name)?;
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
@@ -157,7 +170,6 @@ pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<Assi
     std::fs::create_dir_all(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
-    let installation_id = Uuid::new_v4();
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description,

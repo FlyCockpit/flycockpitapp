@@ -1802,6 +1802,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
         | HostCapabilitiesChanged { .. }
+        // Project-scoped image-control configuration invalidations have no
+        // session id and are not part of a headless run transcript.
+        | ImageControlConfigChanged { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -1816,6 +1819,19 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_control_config_changed_is_filtered_as_daemon_global() {
+        let event = proto::Event::ImageControlConfigChanged {
+            event: proto::image_control::ImageControlEventV1::config_changed(
+                "daemon".into(),
+                "project".into(),
+                proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
+            ),
+        };
+
+        assert_eq!(event_session(&event), None);
+    }
 
     fn run_args() -> RunArgs {
         RunArgs {

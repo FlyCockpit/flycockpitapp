@@ -46,10 +46,14 @@ fn agent_profile_resolution_owned_path_uses_the_source_specific_loader() {
     let local = tmp.path().join("local.md");
     fs::write(
         &local,
-        "---\ndescription: local\nschemaVersion: 2\nagentId: local/private\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
+        "---\ndescription: local\nschemaVersion: 2\nagentId: local/00000000-0000-0000-0000-000000000003\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 8\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nbody\n",
     )
     .unwrap();
-    let global = installation("local/private", AgentInstallationScope::Global, None);
+    let global = installation(
+        "local/00000000-0000-0000-0000-000000000003",
+        AgentInstallationScope::Global,
+        None,
+    );
     assert!(
         load_profile_definition_from_owned_path(
             global.clone(),
@@ -1581,7 +1585,13 @@ Body.
 "#;
     let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("schemaVersion: 2"), "{msg}");
+    assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
+    assert!(msg.contains("bare string is no longer accepted"), "{msg}");
+    assert_eq!(
+        msg.matches("tool_descriptions.grep:").count(),
+        1,
+        "nested field path must not be duplicated: {msg}"
+    );
 }
 
 #[test]
@@ -1615,7 +1625,16 @@ Body.
 "#;
     let err = parse_agent(text, "builder", "x.md".into()).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("schemaVersion: 2"), "{msg}");
+    assert!(msg.contains("tool_descriptions.grep:"), "{msg}");
+    assert!(
+        msg.contains("unknown tool-description key `verbose`"),
+        "{msg}"
+    );
+    assert_eq!(
+        msg.matches("tool_descriptions.grep:").count(),
+        1,
+        "nested field path must not be duplicated: {msg}"
+    );
 }
 
 #[test]

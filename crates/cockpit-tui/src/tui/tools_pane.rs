@@ -185,6 +185,15 @@ impl ToolsPane {
     }
 
     fn build_save(&mut self, target: ToolsSaveTarget) -> Result<ToolsOutcome> {
+        // vNext definitions deliberately reject legacy `tools` and
+        // `toolTiers` authority. Refuse before ejecting so the UI cannot
+        // report a successful agent save whose canonical markdown omits the
+        // selected surface.
+        if target == ToolsSaveTarget::Agent && self.def.vnext.is_some() {
+            anyhow::bail!(
+                "agent-scoped tool settings are unavailable for vNext agents; save them for this session instead"
+            );
+        }
         let mut def = self.def.clone();
         self.draft.write_to_def(&mut def);
         cockpit_core::agents::validate_invariants(&def)?;
@@ -461,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_agent_save_writes_disk_and_ejects_pristine_builtin() {
+    fn tools_agent_save_refuses_vnext_builtin_without_ejecting() {
         let tmp = tempfile::tempdir().unwrap();
         let mut pane = ToolsPane::open(tmp.path(), "Build", true).unwrap();
         focus_tool(&mut pane, "skill");
@@ -470,18 +479,18 @@ mod tests {
 
         let outcome = pane.confirmed_save();
 
-        assert!(matches!(
-            outcome,
-            ToolsOutcome::Apply {
-                persist_session: false,
-                ..
-            }
-        ));
+        assert_eq!(outcome, ToolsOutcome::Close);
+        let status = pane.status.as_deref();
+        assert!(
+            status.is_some_and(|message| message.contains("unavailable for vNext agents")),
+            "vNext agent save must explain why it was refused: {:?}",
+            status
+        );
         let path = tmp.path().join(".cockpit").join("agents").join("Build.md");
-        assert!(path.exists(), "agent save must eject pristine built-in");
-        let text = std::fs::read_to_string(path).unwrap();
-        assert!(text.contains("tools:"));
-        assert!(text.contains("skill"));
+        assert!(
+            !path.exists(),
+            "refused vNext agent save must not eject a pristine built-in"
+        );
     }
 
     #[test]

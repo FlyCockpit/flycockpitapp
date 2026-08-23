@@ -636,17 +636,17 @@ async fn task_unknown_agent_records_tool_rejected_event() {
 async fn grant_rejection_unknown_agent_lists_reachable_agents() {
     let (driver, _tmp) = test_driver(8);
 
-    let message = grant_rejection(
-        &driver.cwd,
-        &driver.cwd,
-        &driver.config,
-        "Build",
-        None,
-        "no-such-agent",
-        &[],
-        &driver.session.db,
-        &driver.vnext_local_installation_resolver,
-    )
+    let message = grant_rejection(GrantRejectionInput {
+        parent_cwd: &driver.cwd,
+        cwd: &driver.cwd,
+        config: &driver.config,
+        parent_agent: "Build",
+        parent_vnext_grant: None,
+        child_agent: "no-such-agent",
+        grant: &[],
+        assistant_db: &driver.session.db,
+        local_installations: &driver.vnext_local_installation_resolver,
+    })
     .await
     .unwrap();
 

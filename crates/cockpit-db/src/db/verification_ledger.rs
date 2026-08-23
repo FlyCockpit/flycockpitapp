@@ -17,10 +17,17 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
-const MAX_REDacted_JSON_BYTES: usize = 16 * 1024;
+const MAX_REDACTED_JSON_BYTES: usize = 16 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_PROJECTED_EVENTS: usize = 16;
 const MAX_CANDIDATES: i64 = 64;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 #[cfg(test)]
 static TEST_SETTLEMENT_FAULT: std::sync::Mutex<Option<Uuid>> = std::sync::Mutex::new(None);
@@ -55,7 +62,7 @@ pub struct VerificationDigest(String);
 
 impl VerificationDigest {
     pub fn of(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
+        Self(sha256_hex(bytes))
     }
 
     pub fn parse(value: &str) -> Result<Self> {
@@ -170,7 +177,7 @@ pub struct RedactedVerificationJson {
 impl RedactedVerificationJson {
     pub fn parse(value: &str) -> Result<Self> {
         ensure!(
-            value.len() <= MAX_REDacted_JSON_BYTES,
+            value.len() <= MAX_REDACTED_JSON_BYTES,
             "verification redacted JSON exceeds its bound"
         );
         let json: Value = serde_json::from_str(value).context("verification JSON must be valid")?;
@@ -191,10 +198,10 @@ impl RedactedVerificationJson {
             .get("digest")
             .and_then(Value::as_str)
             .context("verification digest must be a string")?;
-        Self::closed(
+        Ok(Self::closed(
             VerificationRedactionClass::parse(classification)?,
             VerificationDigest::parse(digest)?,
-        )
+        ))
     }
 
     /// The only host-supplied candidate summary shape.
@@ -502,6 +509,18 @@ pub struct NewVerificationCandidate {
     pub reserved_cost_microunits: i64,
     pub artifact_members: Vec<VerificationArtifactMember>,
 }
+
+/// SQL row shape for one persisted, digest-only write artifact member.  A
+/// named alias keeps the storage tuple local without promoting raw columns to
+/// the host-facing ledger API.
+type PersistedVerificationArtifact = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Digest-only write metadata. A member represents one add/delete/modify/
 /// rename/mode operation and never a raw path, diff, binary payload, or mode.
@@ -1043,6 +1062,10 @@ impl Db {
         row.context("verification collection deadline closed before candidate reservation")
     }
 
+    // Candidate transition is the public CAS boundary: operation/candidate
+    // identity, revision, proposed terminal state, immutable late evidence,
+    // and clock must remain independently visible to callers.
+    #[allow(clippy::too_many_arguments)]
     pub async fn transition_verification_candidate(
         &self,
         session_id: Uuid,
@@ -1239,7 +1262,7 @@ impl Db {
                     candidate.artifact_kind == VerificationArtifactKind::WriteChangeSet,
                     "write synthesis source is not a write change set"
                 );
-                let artifact: Option<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = conn.query_row(
+                let artifact: Option<PersistedVerificationArtifact> = conn.query_row(
                     "SELECT operation_kind, affected_path_digest, prior_path_digest, content_digest,
                             binary_metadata_digest, mode_digest
                      FROM verification_candidate_artifacts
@@ -2280,6 +2303,9 @@ fn insert_pending_synthesis_conn(
     Ok(synthesis_id)
 }
 
+// Synthesis fields map one-for-one to immutable selected/write audit columns;
+// a wrapper would only conceal which nullable column each terminal state owns.
+#[allow(clippy::too_many_arguments)]
 fn transition_synthesis_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -2463,6 +2489,10 @@ fn insert_suppressed_projection_with_receipt_conn(
 /// Derives the sole model-visible call/result pair from a durable validated
 /// envelope plus a typed host receipt. Neither normal settlement nor restart
 /// recovery accepts caller-supplied projected events.
+// Recovery and live settlement share this exact envelope/receipt derivation
+// boundary. The independently typed classes prevent a recovery receipt from
+// being rendered as a live one.
+#[allow(clippy::too_many_arguments)]
 fn envelope_projection_events_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -2545,6 +2575,10 @@ fn envelope_projection_events_conn(
     ])
 }
 
+// All parameters are independent CAS/effect predicates required to atomically
+// settle the attempt, operation, receipt and projection; do not hide them in
+// a loosely validated helper payload.
+#[allow(clippy::too_many_arguments)]
 fn settle_dispatch_conn(
     conn: &Connection,
     session_id: Uuid,
@@ -3526,9 +3560,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.state, VerificationOperationState::Succeeded);
-        let (closed_at, collection_revision, synthesis_count, projection_count): (
-            Option<i64>,
-            i64,
+        let ((closed_at, collection_revision), synthesis_count, projection_count): (
+            (Option<i64>, i64),
             i64,
             i64,
         ) = db
@@ -3638,30 +3671,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.state, VerificationOperationState::Dispatching);
-        let (closed_at, collection_revision, syntheses, projections): (Option<i64>, i64, i64, i64) =
-            closer
-                .read(move |conn| {
-                    Ok((
-                        conn.query_row(
-                            "SELECT collection_closed_at_unix_ms, collection_revision
+        let ((closed_at, collection_revision), syntheses, projections): (
+            (Option<i64>, i64),
+            i64,
+            i64,
+        ) = closer
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT collection_closed_at_unix_ms, collection_revision
                          FROM verification_operations WHERE operation_id = ?1",
-                            [created.operation_id.to_string()],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )?,
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM verification_syntheses WHERE operation_id = ?1",
-                            [created.operation_id.to_string()],
-                            |row| row.get(0),
-                        )?,
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM verification_projections WHERE operation_id = ?1",
-                            [created.operation_id.to_string()],
-                            |row| row.get(0),
-                        )?,
-                    ))
-                })
-                .await
-                .unwrap();
+                        [created.operation_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM verification_syntheses WHERE operation_id = ?1",
+                        [created.operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM verification_projections WHERE operation_id = ?1",
+                        [created.operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
         assert_eq!(
             (closed_at, collection_revision, syntheses, projections),
             (Some(8), 1, 1, 0)
@@ -3819,7 +3855,7 @@ mod tests {
                 .await
                 .is_err()
             );
-            let (state, closed_at, candidates): (String, Option<i64>, i64) = db
+            let ((state, closed_at), candidates): ((String, Option<i64>), i64) = db
                 .read(move |conn| {
                     Ok((
                         conn.query_row(
@@ -3870,9 +3906,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(replay.state, VerificationOperationState::Synthesizing);
-            let (closed_at, collection_revision, candidates, syntheses): (
-                Option<i64>,
-                i64,
+            let ((closed_at, collection_revision), candidates, syntheses): (
+                (Option<i64>, i64),
                 i64,
                 i64,
             ) = db
@@ -4050,8 +4085,8 @@ mod tests {
             .unwrap(),
             CandidateTransitionOutcome::AlreadyTerminal
         );
-        let (operation_state, closed_at, candidate_state, candidate_revision, syntheses):
-            (String, Option<i64>, String, i64, i64) = db
+        let ((operation_state, closed_at), (candidate_state, candidate_revision), syntheses):
+            ((String, Option<i64>), (String, i64), i64) = db
             .read(move |conn| {
                 Ok((
                     conn.query_row(
@@ -4468,7 +4503,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(terminal.state, VerificationOperationState::Failed);
-        let (synthesis_state, selected, envelopes, projections, events): (String, Option<String>, i64, i64, i64) = db
+        let ((synthesis_state, selected), envelopes, projections, events): ((String, Option<String>), i64, i64, i64) = db
             .read(move |conn| {
                 Ok((
                     conn.query_row(

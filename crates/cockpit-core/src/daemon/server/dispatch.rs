@@ -3867,6 +3867,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .await,
             ))
         }
+        Request::AgentInstallationList(request) => {
+            let service = ctx.agent_installation_service().map_err(internal)?;
+            Ok(Response::AgentInstallation(service.list(request).await))
+        }
+        Request::AgentInstallationInspect(request) => {
+            let service = ctx.agent_installation_service().map_err(internal)?;
+            Ok(Response::AgentInstallation(service.inspect(request).await))
+        }
 
         Request::CreateAssistantSession {
             name,

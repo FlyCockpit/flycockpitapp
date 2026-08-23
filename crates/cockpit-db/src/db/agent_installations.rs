@@ -292,13 +292,13 @@ pub enum RedactedQuestionPolicy {
 /// Closed snapshot counterpart of the core question resolver order.  Keeping
 /// this enum in cockpit-db avoids an upward dependency on cockpit-core while
 /// ensuring corrupt/unrecognized values cannot broaden a persisted policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionResolverOrder {
     WarmParentThenUtility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentExecutionKind {
     Assistant,
@@ -705,6 +705,11 @@ impl Db {
         .await
     }
 
+    // The durable bind CAS deliberately carries identity, definition, prior
+    // binding generation, idempotency identity, binding payload and clock as
+    // separate values. Collapsing them into a public request object would
+    // obscure the database boundary while adding no validation ownership.
+    #[allow(clippy::too_many_arguments)]
     pub async fn bind_agent_model(
         &self,
         installation_id: Uuid,
@@ -1178,6 +1183,8 @@ pub fn observe_agent_definition_conn(
     ))
 }
 
+// See `Db::bind_agent_model`: this conn helper mirrors the public atomic CAS
+// boundary so both callers preserve the same independent durable predicates.
 #[allow(clippy::too_many_arguments)]
 pub fn bind_agent_model_conn(
     conn: &Connection,
@@ -1295,12 +1302,12 @@ pub fn rebind_agent_conn(
     for binding in &input.bindings {
         validate_binding(binding)?;
     }
-    let mut slots = HashSet::new();
+    let mut slots: HashSet<String> = HashSet::new();
     ensure!(
         input
             .bindings
             .iter()
-            .all(|binding| slots.insert(&binding.slot_id)),
+            .all(|binding| slots.insert(binding.slot_id.clone())),
         "rebind request contains duplicate model slot ids"
     );
     ensure!(
@@ -1334,7 +1341,7 @@ pub fn prepare_agent_session_conn(
             "prepared" => PrepareAgentSessionOutcome::AlreadyPrepared(snapshot),
             "running" => PrepareAgentSessionOutcome::AlreadyStarted(snapshot),
             "terminal" => PrepareAgentSessionOutcome::Terminal(snapshot),
-            _ => bail!("invalid stored agent preparation lifecycle state `{state}`")?,
+            _ => bail!("invalid stored agent preparation lifecycle state `{state}`"),
         });
     }
     let preparation_target = match session_preparation_eligibility(conn, input.session_id)? {
@@ -1488,7 +1495,7 @@ pub fn start_prepared_agent_session_conn(
                 Ok(match state.as_str() {
                     "running" => StartAgentSessionOutcome::AlreadyStarted(snapshot),
                     "terminal" => StartAgentSessionOutcome::Terminal(snapshot),
-                    _ => bail!("invalid post-claim agent preparation state `{state}`")?,
+                    _ => bail!("invalid post-claim agent preparation state `{state}`"),
                 })
             }
         }
@@ -1871,7 +1878,7 @@ fn session_preparation_eligibility(
         Some((None, lifecycle)) if lifecycle == "deleting" => {
             SessionPreparationEligibility::Deleted
         }
-        Some((_, lifecycle)) => bail!("invalid stored session lifecycle `{lifecycle}`")?,
+        Some((_, lifecycle)) => bail!("invalid stored session lifecycle `{lifecycle}`"),
     })
 }
 
@@ -2000,7 +2007,7 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
             "effective delegation targets must be sorted and unique"
         );
     }
-    let mut slots = HashSet::new();
+    let mut slots: HashSet<String> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
             !binding.slot_id.is_empty()
@@ -2010,7 +2017,7 @@ fn decode_canonical_snapshot(payload: &[u8], label: &str) -> Result<RedactedAgen
                 && !binding.selected_provider_alias.model_id.is_empty()
                 && binding.selected_provider_alias.model_id == binding.model_id
                 && binding.hard_capability_verified
-                && slots.insert(&binding.slot_id)
+                && slots.insert(binding.slot_id.clone())
         }),
         "snapshot binding evidence must have distinct hard-compatible non-secret slots"
     );
@@ -2165,7 +2172,7 @@ fn validate_verification_region(region: &RedactedVerificationRegion) -> bool {
         return false;
     }
     let budget_complete_and_positive = [
-        region.count_ceiling.map(u64::from),
+        region.count_ceiling,
         region.token_ceiling,
         region.cost_ceiling_micros,
         region.max_collection_duration_ms,
@@ -2320,12 +2327,12 @@ fn decode_canonical_binding_revision_map(
         canonical == payload,
         "{label} must use canonical JSON encoding"
     );
-    let mut slots = HashSet::new();
+    let mut slots: HashSet<String> = HashSet::new();
     ensure!(
         value.bindings.iter().all(|binding| {
             !binding.slot_id.is_empty()
                 && binding.binding_revision > 0
-                && slots.insert(&binding.slot_id)
+                && slots.insert(binding.slot_id.clone())
         }),
         "binding revision map must contain distinct non-zero slot revisions"
     );
@@ -2514,7 +2521,14 @@ fn as_u64(value: i64) -> rusqlite::Result<u64> {
 }
 fn decode_scope(value: &str) -> rusqlite::Result<AgentInstallationScope> {
     AgentInstallationScope::from_str(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
     })
 }
 

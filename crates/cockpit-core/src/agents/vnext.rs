@@ -625,8 +625,7 @@ impl VnextAgentDef {
                 // Both seams may be present during the breaking migration;
                 // their intersection is the stricter budget, never a choice
                 // of one reduction that accidentally widens the other.
-                reduction.reduce(legacy)?;
-                Some(legacy)
+                Some(reduction.reduce(legacy)?)
             }
             (Some(reduction), None) => Some(reduction),
             (None, budget) => budget,
@@ -1115,10 +1114,10 @@ impl QuestionPolicy {
         if self.decision_timeout_seconds == 0 {
             bail!("questions.decisionTimeoutSeconds must be positive when auto-answer is enabled");
         }
-        if let Some(slot) = &self.resolver_slot {
-            if !slots.contains_key(slot) {
-                bail!("questions.resolverSlot `{slot}` does not name a model slot");
-            }
+        if let Some(slot) = &self.resolver_slot
+            && !slots.contains_key(slot)
+        {
+            bail!("questions.resolverSlot `{slot}` does not name a model slot");
         }
         let rendered: Vec<&str> = self
             .never_auto_resolve
@@ -1192,7 +1191,7 @@ impl VerificationPolicy {
 
     /// Deterministic first-match selection. `off` is deliberately a result,
     /// rather than a fallthrough, so explicit exclusions stay exclusions.
-    pub fn select<'a>(&'a self, subject: &VerificationSubject<'_>) -> Option<&'a VerificationRule> {
+    pub fn select(&self, subject: &VerificationSubject<'_>) -> Option<&VerificationRule> {
         self.rules
             .iter()
             .find(|rule| rule.selector.matches(subject))
@@ -1213,7 +1212,7 @@ impl VerificationPolicy {
 }
 
 impl CompiledVerificationPolicy {
-    pub fn select<'a>(&'a self, subject: &VerificationSubject<'_>) -> Option<&'a VerificationRule> {
+    pub fn select(&self, subject: &VerificationSubject<'_>) -> Option<&VerificationRule> {
         self.regions
             .iter()
             .find(|region| region.matches(subject))

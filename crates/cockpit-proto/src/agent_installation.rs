@@ -35,7 +35,6 @@ pub enum AgentInstallationExecutionKindV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationBeginV1 {
     pub dto_version: u32,
     pub idempotency_key: String,
@@ -73,7 +72,6 @@ pub struct AgentInstallationBeginV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationSubmitChoiceV1 {
     pub dto_version: u32,
     pub continuation_token: String,
@@ -88,7 +86,6 @@ pub struct AgentInstallationSubmitChoiceV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationReadV1 {
     pub dto_version: u32,
     pub scope: AgentInstallationScopeWire,
@@ -99,7 +96,6 @@ pub struct AgentInstallationReadV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationRecordV1 {
     pub installation_id: String,
     pub scope: AgentInstallationScopeWire,
@@ -125,7 +121,6 @@ pub enum AgentInstallationSlotBindingStateV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationSlotStatusV1 {
     pub slot_id: String,
     pub state: AgentInstallationSlotBindingStateV1,
@@ -133,7 +128,6 @@ pub struct AgentInstallationSlotStatusV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationChoiceV1 {
     pub choice_id: String,
     pub slot_id: String,
@@ -160,7 +154,6 @@ pub struct AgentInstallationChoiceV1 {
 /// hard-compatible alias.  It remains visible to a client but is never a
 /// selectable provider route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationUnmatchedRecommendationV1 {
     pub recommendation_id: String,
     pub canonical_upstream_identity: String,
@@ -171,7 +164,7 @@ pub struct AgentInstallationUnmatchedRecommendationV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum AgentInstallationResultV1 {
     NeedsChoice {
         continuation_token: String,
@@ -223,7 +216,6 @@ pub enum AgentInstallationBindingOutcomeV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentInstallationErrorV1 {
     pub code: AgentInstallationErrorCodeV1,
     /// Fixed redacted explanation; it must never include a credential, local
@@ -278,5 +270,105 @@ mod tests {
         assert!(!json.contains("credential"));
         assert!(serde_json::from_str::<AgentInstallationResultV1>(&json).is_ok());
         assert_eq!(AGENT_INSTALLATION_DTO_VERSION, 1);
+    }
+
+    #[test]
+    fn agent_installation_dtos_are_forward_open_but_keep_required_type_checks() {
+        let begin = serde_json::json!({
+            "dto_version": 1,
+            "idempotency_key": "key",
+            "operation": "create",
+            "scope": "global",
+            "source_locator": "authored/reviewer",
+            "future_field": true,
+        });
+        assert!(serde_json::from_value::<AgentInstallationBeginV1>(begin).is_ok());
+        assert!(
+            serde_json::from_value::<AgentInstallationBeginV1>(serde_json::json!({
+                "dto_version": 1,
+                "idempotency_key": "key",
+                "operation": "create",
+                "scope": "global",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AgentInstallationBeginV1>(serde_json::json!({
+                "dto_version": "one",
+                "idempotency_key": "key",
+                "operation": "create",
+                "scope": "global",
+                "source_locator": "authored/reviewer",
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<AgentInstallationSubmitChoiceV1>(serde_json::json!({
+                "dto_version": 1,
+                "continuation_token": "token",
+                "future_field": true,
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<AgentInstallationReadV1>(serde_json::json!({
+                "dto_version": 1,
+                "scope": "global",
+                "future_field": true,
+            }))
+            .is_ok()
+        );
+
+        let result = serde_json::json!({
+            "outcome": "needs_choice",
+            "continuation_token": "token",
+            "expires_at_unix_ms": 1,
+            "choices": [{
+                "choice_id": "choice",
+                "slot_id": "primary",
+                "offering_id": "offering",
+                "provider_id": "provider",
+                "model_id": "model",
+                "author_suggested": true,
+                "exact_alias_match": true,
+                "future_choice_field": true,
+            }],
+            "unmatched_recommendations": [{
+                "recommendation_id": "recommendation",
+                "canonical_upstream_identity": "upstream/model",
+                "future_recommendation_field": true,
+            }],
+            "future_result_field": true,
+        });
+        assert!(serde_json::from_value::<AgentInstallationResultV1>(result).is_ok());
+
+        let listed = serde_json::json!({
+            "outcome": "listed",
+            "installations": [{
+                "installation_id": "installation",
+                "scope": "global",
+                "source_agent_id": "authored/reviewer",
+                "source_identity": "authored/reviewer",
+                "source_digest": "digest",
+                "installation_revision": 1,
+                "bindings": [{
+                    "slot_id": "primary",
+                    "state": "bound",
+                    "model_id": "model",
+                    "future_binding_field": true,
+                }],
+                "future_record_field": true,
+            }],
+        });
+        assert!(serde_json::from_value::<AgentInstallationResultV1>(listed).is_ok());
+        assert!(
+            serde_json::from_value::<AgentInstallationErrorV1>(serde_json::json!({
+                "code": "invalid_request",
+                "message": "invalid request",
+                "future_error_field": true,
+            }))
+            .is_ok()
+        );
     }
 }

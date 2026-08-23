@@ -1741,13 +1741,13 @@ mod tests {
         global.installation.installation_id = Uuid::now_v7();
         global.installation.scope = AgentInstallationScope::Global;
         global.installation.canonical_workspace_id = None;
-        global.installation.source_agent_id = "local/profile-test".into();
+        global.installation.source_agent_id = "local/00000000-0000-0000-0000-000000000001".into();
         global
             .definition
             .vnext
             .as_mut()
             .expect("global vNext")
-            .agent_id = "local/profile-test".into();
+            .agent_id = "local/00000000-0000-0000-0000-000000000001".into();
         global.installation.source_digest = hex_digest(
             &global
                 .definition
@@ -1760,13 +1760,13 @@ mod tests {
         let mut private = selected.clone();
         private.installation.installation_id = Uuid::now_v7();
         private.installation.scope = AgentInstallationScope::WorkspacePrivate;
-        private.installation.source_agent_id = "local/profile-test".into();
+        private.installation.source_agent_id = "local/00000000-0000-0000-0000-000000000001".into();
         private
             .definition
             .vnext
             .as_mut()
             .expect("private vNext")
-            .agent_id = "local/profile-test".into();
+            .agent_id = "local/00000000-0000-0000-0000-000000000001".into();
         private.installation.source_digest = hex_digest(
             &private
                 .definition
@@ -2137,7 +2137,10 @@ mod tests {
             .selected(parent_id)
             .expect("parent fixture")
             .clone();
-        let child = |installation_id, scope, workspace, source| {
+        let child = |installation_id: Uuid,
+                     scope: AgentInstallationScope,
+                     workspace: Option<&str>,
+                     source: AgentProfileInstallationSource| {
             let mut child = parent.clone();
             child.installation.installation_id = installation_id;
             child.installation.scope = scope;
@@ -2145,17 +2148,26 @@ mod tests {
             child.source = source;
             let agent_id = match source {
                 AgentProfileInstallationSource::Global
-                | AgentProfileInstallationSource::WorkspacePrivate => "local/child",
+                | AgentProfileInstallationSource::WorkspacePrivate => {
+                    "local/00000000-0000-0000-0000-000000000002"
+                }
                 AgentProfileInstallationSource::WorkspaceShared => "authored/child",
                 AgentProfileInstallationSource::Builtin => "cockpit/child",
             };
             child.installation.source_agent_id = agent_id.into();
-            child
-                .definition
-                .vnext
-                .as_mut()
-                .expect("child vNext")
-                .agent_id = agent_id.into();
+            let vnext = child.definition.vnext.as_mut().expect("child vNext");
+            vnext.agent_id = agent_id.into();
+            // This fixture is a leaf child definition.  The parent owns the
+            // portable/local selection being exercised below; copying its
+            // portable child declaration into a daemon-local child would be
+            // invalid by design.
+            if matches!(
+                source,
+                AgentProfileInstallationSource::Global
+                    | AgentProfileInstallationSource::WorkspacePrivate
+            ) {
+                vnext.delegation = Default::default();
+            }
             let digest = hex_digest(&child.definition.vnext_digest_bytes().expect("child digest"));
             child.installation.source_digest = digest.clone();
             child.observation = AgentObservationRow {
@@ -2213,15 +2225,35 @@ mod tests {
             AgentProfileInstallationSource::WorkspacePrivate,
         );
         let private_id = private.installation.installation_id;
-        let local_parent_definition = definition(&format!(
-            "delegation:\n  allowedChildren:\n    - kind: local_installation\n      installationId: {private_id}\n  maxDescendantDepth: 1\n  maxConcurrentChildren: 1\n  targets: [same_root]\n"
-        ));
-        let (local_parent_catalog, local_parent_id, local_parent_digest) =
-            catalog(local_parent_definition);
-        let local_parent = local_parent_catalog
-            .selected(local_parent_id)
-            .expect("local parent fixture")
-            .clone();
+        let mut local_parent = parent.clone();
+        // Local-installation references are valid only on daemon-local
+        // definitions. Place the parent in another private workspace so this
+        // still exercises the required private-scope fail-closed branch.
+        local_parent.installation.scope = AgentInstallationScope::WorkspacePrivate;
+        local_parent.installation.canonical_workspace_id = Some("other-workspace".into());
+        local_parent.installation.source_agent_id =
+            "local/00000000-0000-0000-0000-000000000003".into();
+        local_parent.source = AgentProfileInstallationSource::WorkspacePrivate;
+        let local_parent_id = local_parent.installation.installation_id;
+        let parent_vnext = local_parent
+            .definition
+            .vnext
+            .as_mut()
+            .expect("local parent vNext");
+        parent_vnext.agent_id = "local/00000000-0000-0000-0000-000000000003".into();
+        parent_vnext.delegation.allowed_children =
+            vec![super::super::AllowedChild::LocalInstallation {
+                installation_id: private_id,
+            }];
+        let local_parent_digest = hex_digest(
+            &local_parent
+                .definition
+                .vnext_digest_bytes()
+                .expect("parent digest"),
+        );
+        local_parent.installation.source_digest = local_parent_digest.clone();
+        local_parent.observation.installation_id = local_parent_id;
+        local_parent.observation.observed_digest = local_parent_digest.clone();
         let scope_mismatch = AgentProfileInstallationCatalog::new([local_parent, private])
             .expect("source-valid private child catalog");
         let error = resolve_agent_profile(AgentProfileResolutionInput {
@@ -2409,8 +2441,8 @@ mod tests {
 
     #[tokio::test]
     async fn agent_profile_resolution_prepare_session_persists_and_reloads_only_durable_profile() {
-        let definition = definition("");
-        let (catalog, installation_id, definition_digest) = catalog(definition);
+        let initial_definition = definition("");
+        let (catalog, installation_id, definition_digest) = catalog(initial_definition);
         let selected = catalog
             .selected(installation_id)
             .expect("selected catalog installation")

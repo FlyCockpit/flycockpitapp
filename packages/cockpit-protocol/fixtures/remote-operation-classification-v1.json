@@ -4363,6 +4363,42 @@
       "tag": "docs_ask"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "agent_installation_begin"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "agent_installation_submit_choice"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "agent_installation_list"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "agent_installation_inspect"
+    },
+    {
       "class": "rejected",
       "evidence": null,
       "fcorCanonicalSchema": "-",

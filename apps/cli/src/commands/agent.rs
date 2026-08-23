@@ -60,19 +60,15 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             operation_key,
             yes,
         } => {
-            begin(
-                source,
-                AgentInstallationOperationKind::Install,
-                false,
-                None,
+            begin(BeginInput {
+                source_locator: source,
+                operation: AgentInstallationOperationKind::Install,
                 scope,
                 workspace,
                 operation_key,
                 yes,
-                false,
-                None,
-                None,
-            )
+                ..BeginInput::default()
+            })
             .await
         }
         AgentCommand::Update {
@@ -89,19 +85,17 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             // the requested scope; the CLI never reads the installed copy.
             uuid::Uuid::parse_str(&installation_id)
                 .context("update INSTALLATION_ID must be a UUID")?;
-            begin(
-                source,
-                AgentInstallationOperationKind::Update,
-                replace,
-                None,
+            begin(BeginInput {
+                source_locator: source,
+                operation: AgentInstallationOperationKind::Update,
+                replace_acknowledged: replace,
                 scope,
                 workspace,
                 operation_key,
                 yes,
-                false,
-                None,
-                Some(installation_id),
-            )
+                target_installation_id: Some(installation_id),
+                ..BeginInput::default()
+            })
             .await
         }
         AgentCommand::Bind {
@@ -115,19 +109,18 @@ pub async fn run(cmd: AgentCommand) -> Result<()> {
             model,
             defer,
         } => {
-            begin(
-                installation_id,
-                AgentInstallationOperationKind::Bind,
-                false,
-                Some(slot),
+            begin(BeginInput {
+                source_locator: installation_id,
+                operation: AgentInstallationOperationKind::Bind,
+                requested_slot: Some(slot),
                 scope,
                 workspace,
                 operation_key,
                 yes,
                 defer,
-                provider_profile.zip(model),
-                None,
-            )
+                displayed_choice_selector: provider_profile.zip(model),
+                ..BeginInput::default()
+            })
             .await
         }
         AgentCommand::SubmitChoice {
@@ -191,7 +184,7 @@ async fn submit_choice(
     render_agent_response(response, false, true)
 }
 
-async fn begin(
+struct BeginInput {
     source_locator: String,
     operation: AgentInstallationOperationKind,
     replace_acknowledged: bool,
@@ -203,7 +196,40 @@ async fn begin(
     defer: bool,
     displayed_choice_selector: Option<(String, String)>,
     target_installation_id: Option<String>,
-) -> Result<()> {
+}
+
+impl Default for BeginInput {
+    fn default() -> Self {
+        Self {
+            source_locator: String::new(),
+            operation: AgentInstallationOperationKind::Install,
+            replace_acknowledged: false,
+            requested_slot: None,
+            scope: None,
+            workspace: None,
+            operation_key: None,
+            yes: false,
+            defer: false,
+            displayed_choice_selector: None,
+            target_installation_id: None,
+        }
+    }
+}
+
+async fn begin(input: BeginInput) -> Result<()> {
+    let BeginInput {
+        source_locator,
+        operation,
+        replace_acknowledged,
+        requested_slot,
+        scope,
+        workspace,
+        operation_key,
+        yes,
+        defer,
+        displayed_choice_selector,
+        target_installation_id,
+    } = input;
     let (scope, workspace_path) = scope_request(
         scope,
         workspace,

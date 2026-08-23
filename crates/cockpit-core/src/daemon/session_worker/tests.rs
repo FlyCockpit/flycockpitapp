@@ -2446,7 +2446,10 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
     assert!(root.role_prompt.contains("ASSISTANT_DEFINITION_MARKER"));
     assert!(root.system.contains("ASSISTANT_DEFINITION_MARKER"));
     assert_eq!(root.model.provider_id(), "lmstudio");
-    assert_eq!(root.model.model_id_ref(), "assistant-model");
+    // Private assistant definitions declare only a compatible `primary` slot;
+    // they do not persist a provider/model selection. The session's active
+    // model therefore remains authoritative.
+    assert_eq!(root.model.model_id_ref(), "session-model");
     assert!(root.tools.names().contains(&"read"));
 }
 

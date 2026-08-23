@@ -2879,6 +2879,10 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
                 | "docs_ask"
+                | "agent_installation_begin"
+                | "agent_installation_submit_choice"
+                | "agent_installation_list"
+                | "agent_installation_inspect"
                 // The reclassified session export now returns the v10-only
                 // `redacted_export` bulk kind and requires the v10-only
                 // `ReadRedactedExportChunk` reader, so the WHOLE tag is v10: a v9
@@ -2951,6 +2955,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "media_reservation_repaired"
                 | "doctor_snapshot"
                 | "docs_answer"
+                | "agent_installation"
                 | "sealed_owner_operation_begun"
                 | "sealed_owner_operation_applied"
                 | "sealed_owner_operation_cancelled"

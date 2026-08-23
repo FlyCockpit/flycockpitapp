@@ -326,11 +326,15 @@ async fn agent_cli_management_daemon_install_malformed_source_and_create_collisi
     collision.source_locator = "authored/local-helper".into();
     collision.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
     collision.primary_slot_id = Some("primary".into());
-    assert!(matches!(
-        service.begin(collision, 3).await,
-        AgentInstallationResultV1::Error { error }
-            if error.code == AgentInstallationErrorCodeV1::Collision
-    ));
+    let collision = service.begin(collision, 3).await;
+    assert!(
+        matches!(
+            collision,
+            AgentInstallationResultV1::Error { ref error }
+                if error.code == AgentInstallationErrorCodeV1::Collision
+        ),
+        "unexpected create collision result: {collision:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -487,7 +491,7 @@ async fn agent_cli_management_socket_invalid_manifest_is_typed_and_has_zero_muta
     assert!(
         !daemon
             .home()
-            .state_home()
+            .xdg_state_home()
             .join("cockpit/agents/helper.md")
             .exists(),
         "invalid source must not create an owned file"
@@ -999,7 +1003,10 @@ async fn agent_cli_management_socket_update_targets_exact_installation_and_never
     assert!(after_update.contains(&"c".repeat(40)));
     assert_ne!(after_update, before);
 
-    let owned_copy = daemon.home().state_home().join("cockpit/agents/helper.md");
+    let owned_copy = daemon
+        .home()
+        .xdg_state_home()
+        .join("cockpit/agents/helper.md");
     let dirty_copy = format!(
         "{}\nLocally edited prompt body.\n",
         second_fixture["markdown"]

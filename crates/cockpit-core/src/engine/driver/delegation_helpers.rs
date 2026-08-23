@@ -486,17 +486,30 @@ mod files_touched_tests {
 /// resolving the target's own name + mode so the single-writer / spawn-only /
 /// primary-only rules are evaluated for that agent. A resolution failure is
 /// itself a clear error — the grant is never silently honored.
-pub(super) async fn grant_rejection(
-    parent_cwd: &std::path::Path,
-    cwd: &std::path::Path,
-    config: &crate::daemon::session_worker::SessionConfigHandle,
-    parent_agent: &str,
-    parent_vnext_grant: Option<&crate::agents::EffectiveVnextGrant>,
-    child_agent: &str,
-    grant: &[String],
-    assistant_db: &crate::db::Db,
-    local_installations: &crate::agents::LocalInstallationResolver,
-) -> Option<String> {
+pub(super) struct GrantRejectionInput<'a> {
+    pub parent_cwd: &'a std::path::Path,
+    pub cwd: &'a std::path::Path,
+    pub config: &'a crate::daemon::session_worker::SessionConfigHandle,
+    pub parent_agent: &'a str,
+    pub parent_vnext_grant: Option<&'a crate::agents::EffectiveVnextGrant>,
+    pub child_agent: &'a str,
+    pub grant: &'a [String],
+    pub assistant_db: &'a crate::db::Db,
+    pub local_installations: &'a crate::agents::LocalInstallationResolver,
+}
+
+pub(super) async fn grant_rejection(input: GrantRejectionInput<'_>) -> Option<String> {
+    let GrantRejectionInput {
+        parent_cwd,
+        cwd,
+        config,
+        parent_agent,
+        parent_vnext_grant,
+        child_agent,
+        grant,
+        assistant_db,
+        local_installations,
+    } = input;
     // The live frame is the only authority for classifying a vNext parent.
     // Never re-resolve `parent_agent` from the child cwd: an edited checkout
     // could otherwise replace its already-admitted identity/policy between a

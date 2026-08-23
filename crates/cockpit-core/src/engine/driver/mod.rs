@@ -7473,17 +7473,17 @@ impl Driver {
                     // validate against the target's role invariants before the
                     // handoff. An invalid grant is rejected as this `task`
                     // call's result — the conversation stays with the parent.
-                    if let Some(err) = grant_rejection(
-                        &self.cwd,
-                        &self.cwd,
-                        &self.config,
-                        &parent_agent,
-                        parent_vnext_grant.as_ref(),
-                        &child_agent,
-                        &granted_tools,
-                        &self.session.db,
-                        &self.vnext_local_installation_resolver,
-                    )
+                    if let Some(err) = grant_rejection(GrantRejectionInput {
+                        parent_cwd: &self.cwd,
+                        cwd: &self.cwd,
+                        config: &self.config,
+                        parent_agent: &parent_agent,
+                        parent_vnext_grant: parent_vnext_grant.as_ref(),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &self.session.db,
+                        local_installations: &self.vnext_local_installation_resolver,
+                    })
                     .await
                     {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -7502,9 +7502,11 @@ impl Driver {
                     let mut vnext_admissions = match self.admit_current_vnext_children(1) {
                         Ok(permits) => permits,
                         Err(err) => {
-                            next_prompt = Message::tool_result_with_call_id(
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
+                                task_provider_item_id,
                                 task_function_call_id,
+                                "task",
                                 prepend_task_repair_notes(err, &repair_notes),
                             );
                             continue;
@@ -7778,17 +7780,17 @@ impl Driver {
                         .stack
                         .last()
                         .and_then(|frame| frame.agent.vnext_grant.clone());
-                    if let Some(err) = grant_rejection(
-                        &self.cwd,
-                        &child_cwd.resolved,
-                        &self.config,
-                        &parent_agent,
-                        parent_vnext_grant.as_ref(),
-                        &child_agent,
-                        &granted_tools,
-                        &self.session.db,
-                        &self.vnext_local_installation_resolver,
-                    )
+                    if let Some(err) = grant_rejection(GrantRejectionInput {
+                        parent_cwd: &self.cwd,
+                        cwd: &child_cwd.resolved,
+                        config: &self.config,
+                        parent_agent: &parent_agent,
+                        parent_vnext_grant: parent_vnext_grant.as_ref(),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &self.session.db,
+                        local_installations: &self.vnext_local_installation_resolver,
+                    })
                     .await
                     {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -7876,17 +7878,17 @@ impl Driver {
                         .and_then(|frame| frame.agent.vnext_grant.clone());
                     let mut unknown_agent_error = None;
                     for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
-                        if let Some(err) = grant_rejection(
-                            &self.cwd,
-                            &child_cwd.resolved,
-                            &self.config,
-                            &parent_agent,
-                            parent_vnext_grant.as_ref(),
-                            &entry.child_agent,
-                            &entry.granted_tools,
-                            &self.session.db,
-                            &self.vnext_local_installation_resolver,
-                        )
+                        if let Some(err) = grant_rejection(GrantRejectionInput {
+                            parent_cwd: &self.cwd,
+                            cwd: &child_cwd.resolved,
+                            config: &self.config,
+                            parent_agent: &parent_agent,
+                            parent_vnext_grant: parent_vnext_grant.as_ref(),
+                            child_agent: &entry.child_agent,
+                            grant: &entry.granted_tools,
+                            assistant_db: &self.session.db,
+                            local_installations: &self.vnext_local_installation_resolver,
+                        })
                         .await
                         {
                             unknown_agent_error = Some(format!(

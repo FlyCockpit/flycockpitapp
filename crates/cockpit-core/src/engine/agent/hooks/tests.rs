@@ -2163,6 +2163,109 @@ async fn stop_hook_continuation_state_machine() {
     }
 }
 
+/// The 8-cap grants EXACTLY `STOP_HOOK_MAX_CONTINUATIONS` continuations for one
+/// latch, then force-ends the turn WITHOUT reconsulting (or recording) any stop
+/// hook — the cap is enforced solely at the entry check. Driven by threading ONE
+/// `StopGateState` (as the driver does per key) across repeated consultations of
+/// a block hook.
+#[tokio::test]
+async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting() {
+    let env = FakeProcessEnv::with_default_resolution();
+    let (db, sid) = db_session().await;
+    // A distinct, independently-derived expected count so the assertions do not
+    // re-derive from the constant under test's own arithmetic.
+    let expected_grants: usize = 8;
+    assert_eq!(
+        STOP_HOOK_MAX_CONTINUATIONS as usize, expected_grants,
+        "test literal pinned to the production cap"
+    );
+
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"block","reason":"keep going"}"#,
+    ));
+    let hook = test_hook(
+        HookEvent::Stop,
+        vec!["s".to_string()],
+        Some(vec!["end_turn".to_string()]),
+        BTreeMap::new(),
+        5,
+    );
+    let reg = registry(vec![hook]);
+    let mut state = StopGateState::default();
+
+    // The first `expected_grants` consultations each grant a continuation and
+    // run the hook once.
+    for round in 1..=expected_grants {
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &reg,
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            StopHookOutcome::Continue {
+                reason: "keep going".to_string(),
+                additional_context: None,
+            },
+            "round {round} must still grant a continuation"
+        );
+        assert_eq!(state.continuation_count as usize, round);
+        assert_eq!(
+            runner.invocations().len(),
+            round,
+            "each granted round consults the hook exactly once"
+        );
+    }
+
+    // The `stop` envelope carries first-class camelCase `stopReason` /
+    // `stopHookActive`: the first consultation is not yet inside a continuation
+    // loop (`false`); by the second the latch is active (`true`).
+    let invocations = runner.invocations();
+    let first: serde_json::Value = serde_json::from_str(&invocations[0].stdin).unwrap();
+    assert_eq!(first["hookEventName"], "stop");
+    assert_eq!(first["stopReason"], "end_turn");
+    assert_eq!(first["stopHookActive"], false);
+    assert!(
+        first.get("source").is_none() && first.get("reason").is_none(),
+        "the matcher token must not be overloaded onto generic source/reason"
+    );
+    let second: serde_json::Value = serde_json::from_str(&invocations[1].stdin).unwrap();
+    assert_eq!(second["stopHookActive"], true);
+
+    // The next consultation is capped: force-end, hook NOT reconsulted, and no
+    // additional ledger row beyond the `expected_grants` already recorded.
+    let outcome = run_stop_hooks(
+        &runner,
+        &env,
+        &reg,
+        HookEvent::Stop,
+        "end_turn",
+        sid,
+        workspace(),
+        &db,
+        &mut state,
+    )
+    .await;
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        runner.invocations().len(),
+        expected_grants,
+        "a capped latch must not reconsult its stop hooks"
+    );
+    assert_eq!(
+        hook_run_statuses(&db, sid).await.len(),
+        expected_grants,
+        "the forced end records no new ledger row"
+    );
+}
+
 #[test]
 fn tool_hook_session_config_snapshot_is_turn_stable() {
     use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};

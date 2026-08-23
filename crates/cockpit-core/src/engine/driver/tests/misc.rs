@@ -738,3 +738,196 @@ async fn orphaned_swarm_child_teardown_fires_paired_subagent_stop() {
         "a completed swarm child must not be re-fired at teardown (no double-stop)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Root stop-gate continuation machine (increment 2B-ii-a).
+//
+// These drive the REAL driver stop-gate: `consult_root_stop_gate` threads a
+// caller-owned per-turn `StopGateState` latch (a turn-scoped LOCAL in
+// `run_user_input`, one per `(session, root frame, originating user turn)`)
+// through the production `run_stop_hooks`. The runner / process-env seams are
+// injected so a `block` / `continue:false` decision can be exercised without
+// spawning a real process, no sleeps, and no `std::env` mutation. The full-loop
+// wiring (that the `Done` arm calls this, and that cancel / interrupt /
+// inference-error never do) is covered in `turn_loop.rs`.
+// ---------------------------------------------------------------------------
+
+/// A fake stop-hook runner that returns fixed stdout and counts invocations.
+struct StopScriptRunner {
+    stdout: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StopScriptRunner {
+    fn new(stdout: &str) -> Self {
+        Self {
+            stdout: stdout.to_string(),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::engine::agent::hooks::CommandRunner for StopScriptRunner {
+    async fn run(
+        &self,
+        _executable: &std::path::Path,
+        _args: &[String],
+        _env: &std::collections::BTreeMap<String, String>,
+        _cwd: &std::path::Path,
+        _stdin: &str,
+        _timeout: std::time::Duration,
+    ) -> crate::engine::agent::hooks::HookRawOutput {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::engine::agent::hooks::HookRawOutput {
+            stdout: self.stdout.clone(),
+            exit_code: Some(0),
+            duration_ms: 1,
+            spawn_failed: false,
+            timeout: false,
+        }
+    }
+}
+
+/// A runner that must never be invoked: proves a capped latch does not reconsult.
+struct PanicRunner;
+
+#[async_trait::async_trait]
+impl crate::engine::agent::hooks::CommandRunner for PanicRunner {
+    async fn run(
+        &self,
+        _executable: &std::path::Path,
+        _args: &[String],
+        _env: &std::collections::BTreeMap<String, String>,
+        _cwd: &std::path::Path,
+        _stdin: &str,
+        _timeout: std::time::Duration,
+    ) -> crate::engine::agent::hooks::HookRawOutput {
+        panic!("a capped stop gate must not reconsult its stop hooks");
+    }
+}
+
+/// A process-env that resolves any bare executable so the injected runner runs.
+struct ResolveEnv;
+
+impl crate::engine::agent::hooks::ProcessEnv for ResolveEnv {
+    fn resolve_executable(&self, name: &str) -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from("/fake/bin").join(name))
+    }
+    fn system_root(&self) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
+    use crate::engine::agent::hooks::{StopGateState, StopHookOutcome};
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(crate::config::extended::hooks::HookEvent::Stop, "end_turn"),
+    );
+
+    let env = ResolveEnv;
+    let block = StopScriptRunner::new(r#"{"decision":"block","reason":"keep going"}"#);
+    // Independently pinned expectation (not re-derived from the constant).
+    let expected_grants: usize = 8;
+    assert_eq!(
+        crate::engine::agent::hooks::STOP_HOOK_MAX_CONTINUATIONS as usize,
+        expected_grants
+    );
+
+    // Turn A owns its own latch (a turn-scoped local, exactly as the driver's
+    // `run_user_input` does): exactly `expected_grants` continuations, each
+    // running the hook once.
+    let mut turn_a = StopGateState::default();
+    for round in 1..=expected_grants {
+        let outcome = driver
+            .consult_root_stop_gate(&block, &env, &mut turn_a)
+            .await;
+        assert_eq!(
+            outcome,
+            StopHookOutcome::Continue {
+                reason: "keep going".to_string(),
+                additional_context: None,
+            },
+            "round {round} still open"
+        );
+        assert_eq!(turn_a.continuation_count as usize, round);
+        assert_eq!(
+            block.calls.load(std::sync::atomic::Ordering::SeqCst),
+            round,
+            "each granted round consults the hook once"
+        );
+    }
+
+    // The next consultation on turn A is capped: force-end WITHOUT reconsulting.
+    // A `PanicRunner` proves the hook is never run at the cap.
+    let outcome = driver
+        .consult_root_stop_gate(&PanicRunner, &env, &mut turn_a)
+        .await;
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+
+    // A DIFFERENT user turn owns a SEPARATE latch: turn B starts fresh and is
+    // granted a continuation even though turn A is capped (independence — the
+    // cap is not a process-global counter).
+    let block_b = StopScriptRunner::new(r#"{"decision":"block","reason":"more"}"#);
+    let mut turn_b = StopGateState::default();
+    let outcome = driver
+        .consult_root_stop_gate(&block_b, &env, &mut turn_b)
+        .await;
+    assert_eq!(
+        outcome,
+        StopHookOutcome::Continue {
+            reason: "more".to_string(),
+            additional_context: None,
+        },
+        "a fresh user turn is not affected by another turn's cap"
+    );
+    assert_eq!(turn_b.continuation_count, 1);
+
+    // `{"continue":false}` wins over block aggregation → ForcedEnd.
+    let stop = StopScriptRunner::new(r#"{"continue":false,"stopReason":"all done"}"#);
+    let mut turn_c = StopGateState::default();
+    let outcome = driver
+        .consult_root_stop_gate(&stop, &env, &mut turn_c)
+        .await;
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        turn_c.continuation_count, 0,
+        "continue:false ends the turn without counting a continuation"
+    );
+}
+
+#[test]
+fn stop_continuation_prompt_is_host_internal_and_carries_feedback() {
+    // The injected feedback is a host-generated message: it carries the
+    // aggregated block reason + additionalContext, and it uses
+    // `SubmissionOrigin::Internal`, whose `user_prompt_submit_source()` is `None`
+    // — so the continuation can never re-fire `userPromptSubmit` (which fires
+    // only from `record_user_message_event`, a path this prompt never touches).
+    let msg =
+        Driver::stop_continuation_prompt("keep going".to_string(), Some("more ctx".to_string()));
+    let Message::User { content } = &msg else {
+        panic!("stop continuation must be a user-role message");
+    };
+    assert_eq!(
+        crate::engine::message::extract_user_text(content),
+        "keep going\nmore ctx"
+    );
+    assert_eq!(
+        crate::engine::message::SubmissionOrigin::Internal.user_prompt_submit_source(),
+        None,
+        "the host-generated continuation origin must not fire userPromptSubmit"
+    );
+
+    // With no additionalContext the reason stands alone (no trailing newline).
+    let msg = Driver::stop_continuation_prompt("just the reason".to_string(), None);
+    let Message::User { content } = &msg else {
+        panic!("stop continuation must be a user-role message");
+    };
+    assert_eq!(
+        crate::engine::message::extract_user_text(content),
+        "just the reason"
+    );
+}

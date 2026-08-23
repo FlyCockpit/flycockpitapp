@@ -4765,6 +4765,16 @@ CREATE TABLE image_generation_jobs (
     CHECK(terminal_event_version IS NULL OR terminal_event_version >= 1)
 );
 
+-- Terminal-event counts are a DISJOINT partition of the job's slots: every slot
+-- contributes to EXACTLY ONE column, keyed by (state, and for published slots
+-- the result_after_cancel bit). The six buckets are ordinary-published
+-- (published & result_after_cancel=0), late-published-after-cancel
+-- (published & result_after_cancel=1), failed, cancelled, late-still-quarantined
+-- (late_quarantined), and discarded. Because the partitions are mutually
+-- exclusive by construction and every terminal slot lands in one, the sum equals
+-- slot_count identically -- not by an ordering accident. A late-then-published
+-- slot is counted once (late_published_count), never double-counted as both
+-- published and "late".
 CREATE TABLE image_generation_terminal_events (
     event_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL UNIQUE REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
@@ -4774,10 +4784,12 @@ CREATE TABLE image_generation_terminal_events (
     published_count INTEGER NOT NULL CHECK(published_count>=0),
     failed_count INTEGER NOT NULL CHECK(failed_count>=0),
     cancelled_count INTEGER NOT NULL CHECK(cancelled_count>=0),
-    late_count INTEGER NOT NULL CHECK(late_count>=0),
+    late_published_count INTEGER NOT NULL CHECK(late_published_count>=0),
+    late_quarantined_count INTEGER NOT NULL CHECK(late_quarantined_count>=0),
+    discarded_count INTEGER NOT NULL CHECK(discarded_count>=0),
     emitted_at_unix_ms INTEGER NOT NULL,
     UNIQUE(job_id,job_version),
-    CHECK(published_count+failed_count+cancelled_count+late_count<=slot_count)
+    CHECK(published_count+failed_count+cancelled_count+late_published_count+late_quarantined_count+discarded_count=slot_count)
 );
 CREATE TRIGGER image_generation_terminal_event_immutable BEFORE UPDATE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
 CREATE TRIGGER image_generation_terminal_event_no_delete BEFORE DELETE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
@@ -4785,13 +4797,15 @@ CREATE TRIGGER image_generation_terminal_event_insert_guard BEFORE INSERT ON ima
 WHEN NOT EXISTS(
   SELECT 1 FROM image_generation_jobs j WHERE j.job_id=NEW.job_id AND j.terminal_event_version IS NULL AND NEW.job_version=j.version+1
 ) OR NEW.slot_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id)
- OR NEW.published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published')
+ OR NEW.published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published' AND s.result_after_cancel=0)
  OR NEW.failed_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='failed')
  OR NEW.cancelled_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='cancelled')
- OR NEW.late_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.result_after_cancel=1)
+ OR NEW.late_published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published' AND s.result_after_cancel=1)
+ OR NEW.late_quarantined_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='late_quarantined')
+ OR NEW.discarded_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='discarded')
  OR EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state NOT IN ('published','failed','cancelled','discarded','late_quarantined'))
  OR NEW.terminal_state<>(CASE
-   WHEN NEW.late_count>0 THEN 'completed_after_cancel'
+   WHEN EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.result_after_cancel=1) THEN 'completed_after_cancel'
    WHEN NEW.published_count=NEW.slot_count THEN 'completed'
    WHEN NEW.published_count>0 THEN 'partially_failed'
    WHEN NEW.failed_count>0 THEN 'failed'
@@ -4804,6 +4818,27 @@ BEGIN SELECT RAISE(ABORT,'image generation terminal state requires exact event')
 CREATE TRIGGER image_generation_job_terminal_event_forbidden BEFORE UPDATE ON image_generation_jobs
 WHEN NEW.state NOT IN ('completed','completed_after_cancel','partially_failed','failed','cancelled') AND NEW.terminal_event_version IS NOT NULL
 BEGIN SELECT RAISE(ABORT,'nonterminal image generation job cannot cite terminal event'); END;
+
+-- Durable bookkeeping for the scheduler-error attention threshold. One row per
+-- (worker_boot_id, job_id, slot_id, attempt_number, stage). `failure_count` is
+-- incremented once per recorded scheduler pass error. When it reaches the
+-- attention threshold a SINGLE `needs_attention` row is raised and its id is
+-- stamped into `attention_interrupt_id`; further failures for the same tuple in
+-- the same boot bump `failure_count`/`last_failed_at_unix_ms` but never raise a
+-- second attention row. This is bookkeeping only -- the operator attention
+-- channel remains the shared `needs_attention` table.
+CREATE TABLE image_generation_scheduler_error_counts (
+    worker_boot_id TEXT NOT NULL CHECK(length(worker_boot_id)=36 AND worker_boot_id<>'00000000-0000-0000-0000-000000000000'),
+    job_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK(attempt_number>=1),
+    stage TEXT NOT NULL,
+    failure_count INTEGER NOT NULL CHECK(failure_count>=1),
+    attention_interrupt_id TEXT,
+    first_failed_at_unix_ms INTEGER NOT NULL,
+    last_failed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(worker_boot_id, job_id, slot_id, attempt_number, stage)
+);
 
 CREATE TABLE image_generation_slots (
     job_id TEXT NOT NULL REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
@@ -4848,12 +4883,35 @@ CREATE TABLE image_generation_attempts (
     applied_cancellation_version INTEGER,
     response_digest TEXT CHECK(response_digest IS NULL OR length(response_digest)=64),
     nonacceptance_evidence_digest TEXT CHECK(nonacceptance_evidence_digest IS NULL OR length(nonacceptance_evidence_digest)=64),
+    -- Dispatch-time destination/health proof bound at prepare (never reused across
+    -- a location-class or configuration-generation change; a stale proof cannot be
+    -- reissued because prepare always re-runs revalidation and writes the fresh
+    -- result under the single 'prepared' transition below). Credential material is
+    -- never stored here -- only opaque endpoint/config/epoch identifiers and the
+    -- connection observation (connected IP, location class, and a digest of the
+    -- ordered connection hops).
+    dispatch_proof_endpoint_id TEXT,
+    dispatch_proof_config_generation INTEGER CHECK(dispatch_proof_config_generation IS NULL OR dispatch_proof_config_generation >= 0),
+    dispatch_proof_refresh_epoch INTEGER CHECK(dispatch_proof_refresh_epoch IS NULL OR dispatch_proof_refresh_epoch >= 0),
+    dispatch_proof_connected_ip TEXT,
+    dispatch_proof_location_class TEXT CHECK(dispatch_proof_location_class IS NULL OR dispatch_proof_location_class IN ('loopback','private_lan','public_remote','forbidden')),
+    dispatch_proof_hops_digest TEXT CHECK(dispatch_proof_hops_digest IS NULL OR length(dispatch_proof_hops_digest)=64),
     PRIMARY KEY(job_id,slot_id,attempt_number),
     UNIQUE(provider_request_identity),
     UNIQUE(provider_idempotency_identity),
     FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
     FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
-    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1))
+    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1)),
+    -- The six proof columns are written as one indivisible group or not at all,
+    -- so a half-written proof can never exist.
+    CHECK((dispatch_proof_endpoint_id IS NULL AND dispatch_proof_config_generation IS NULL AND dispatch_proof_refresh_epoch IS NULL AND dispatch_proof_connected_ip IS NULL AND dispatch_proof_location_class IS NULL AND dispatch_proof_hops_digest IS NULL) OR (dispatch_proof_endpoint_id IS NOT NULL AND dispatch_proof_config_generation IS NOT NULL AND dispatch_proof_refresh_epoch IS NOT NULL AND dispatch_proof_connected_ip IS NOT NULL AND dispatch_proof_location_class IS NOT NULL AND dispatch_proof_hops_digest IS NOT NULL)),
+    -- A 'prepared' or 'dispatching' attempt cannot exist without its proof: both
+    -- states are reached in production only through prepare_image_generation_dispatch_conn
+    -- (the single writer of 'prepared', which binds the full proof in the same
+    -- UPDATE) and begin_image_generation_handoff_conn ('prepared' -> 'dispatching').
+    -- This is the DB-level fail-closed invariant behind that single-writer discipline,
+    -- so no attempt can be handed to a provider without a successful revalidation.
+    CHECK(state NOT IN ('prepared','dispatching') OR dispatch_proof_endpoint_id IS NOT NULL)
 );
 CREATE TABLE image_generation_handoff_evidence (
  job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,

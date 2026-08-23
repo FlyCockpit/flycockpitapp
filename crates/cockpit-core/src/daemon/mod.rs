@@ -36,6 +36,8 @@ pub mod effective_default_recovery;
 pub mod egress;
 pub mod ephemeral_guard;
 pub mod fs_api;
+pub mod image_generation_worker;
+pub mod image_runtime;
 pub mod image_upload;
 pub mod leak_reveal;
 pub mod leak_reveal_frame;

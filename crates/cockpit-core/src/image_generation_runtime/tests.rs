@@ -293,6 +293,46 @@ fn image_generation_standard_registry_requires_every_exact_adapter_slot() {
         Err(error) if error.code == RuntimeErrorCode::Incompatible
     ));
 }
+
+#[test]
+fn image_generation_production_standard_registry_resolves_all_four_kinds() {
+    // AC5: the production factory constructs the four *real* standard health
+    // adapters (OpenAI Images, OpenRouter Images, Gemini Images, ComfyUI) over
+    // the pinned/vetted connector and resolves every ImageAdapterKind. A
+    // missing or mis-slotted production adapter would fail construction or an
+    // adapter() lookup, so this rejects the pre-inc3 state where three kinds had
+    // no ImageRuntimeAdapter impl.
+    let registry = ImageRuntimeRegistry::production_standard()
+        .expect("production standard registry must construct");
+    for kind in [
+        ImageAdapterKind::OpenaiImages,
+        ImageAdapterKind::OpenrouterImages,
+        ImageAdapterKind::GeminiImages,
+        ImageAdapterKind::Comfyui,
+    ] {
+        let adapter = registry
+            .adapter(kind)
+            .unwrap_or_else(|_| panic!("production registry resolves {kind:?}"));
+        assert_eq!(adapter.kind(), kind);
+    }
+
+    // The standalone adapter-set builder yields the same four distinctly-kinded
+    // adapters (each in its exact standard slot).
+    let adapters = production_standard_image_runtime_adapters();
+    assert_eq!(
+        adapters.openai_images.kind(),
+        ImageAdapterKind::OpenaiImages
+    );
+    assert_eq!(
+        adapters.openrouter_images.kind(),
+        ImageAdapterKind::OpenrouterImages
+    );
+    assert_eq!(
+        adapters.gemini_images.kind(),
+        ImageAdapterKind::GeminiImages
+    );
+    assert_eq!(adapters.comfyui.kind(), ImageAdapterKind::Comfyui);
+}
 #[test]
 fn image_generation_runtime_health_states_and_ttls() {
     for state in [

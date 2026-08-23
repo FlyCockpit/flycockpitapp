@@ -2019,6 +2019,16 @@ pub struct DaemonContext {
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
     pub scheduler: Option<DaemonSchedulerHandle>,
+    /// Stable, nonzero daemon boot UUID for all image-generation scheduler
+    /// passes and deadline observation. The lifecycle worker uses it as its
+    /// `worker_boot_id`; a job-creation caller uses it as the plan's
+    /// `deadline_boot_id` so a job queued this boot is dispatchable this boot and
+    /// a pre-crash boot's monotonic deadlines are never revived.
+    image_generation_boot_id: Uuid,
+    /// Handle to the daemon-lifecycle image-generation worker (non-ephemeral
+    /// start only). Held for the daemon's lifetime; the worker exits
+    /// cooperatively when the shutdown gate drains.
+    _image_generation_worker: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)]
     credential_store_path: Option<PathBuf>,
     /// Daemon-held wrap-key vault. Flycockpit credential persist uses this
@@ -2276,6 +2286,54 @@ impl DaemonContext {
                 crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
             })
             .map(Arc::new);
+        // One stable, nonzero daemon boot UUID drives every image-generation
+        // scheduler pass and deadline observation. The lifecycle worker below
+        // uses it as `worker_boot_id`; a job-creation caller uses it as the
+        // plan's `deadline_boot_id`.
+        let image_generation_boot_id = Uuid::now_v7();
+        // Spawn the daemon-lifecycle image-generation worker on NON-ephemeral
+        // start only (same gating as the scheduler / media-ledger install). It
+        // shares `started_at` so its monotonic clock matches the media ledger and
+        // sealed plan deadlines. This increment ships an empty adapter map and no
+        // resolved destinations; concrete provider adapters + the destination map
+        // install with the wire-adapters / real-dispatch prompts, so a queued job
+        // records a typed `adapter_missing` skip rather than dispatching.
+        let image_generation_worker = (!paths.ephemeral)
+            .then(|| {
+                match crate::daemon::image_runtime::install_standard_image_runtime_registry(
+                    &cockpit_config::config::image_generation::ImageGenerationConfig::default(),
+                    1,
+                    1,
+                    None,
+                ) {
+                    Ok(registry) => {
+                        let proof_source = Arc::new(
+                            crate::image_generation_job::RegistryDispatchProofSource::new(
+                                registry,
+                                std::collections::HashMap::new(),
+                            ),
+                        );
+                        Some(
+                            crate::daemon::image_generation_worker::spawn_image_generation_worker(
+                                db.clone(),
+                                image_generation_boot_id,
+                                started_at,
+                                crate::image_generation_job::ImageGenerationAdapterMap::new(),
+                                proof_source,
+                                shutdown.clone(),
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "image generation runtime registry unavailable; worker not started"
+                        );
+                        None
+                    }
+                }
+            })
+            .flatten();
         Self {
             db,
             media_ledger,
@@ -2301,6 +2359,8 @@ impl DaemonContext {
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
             connector_wake,
             scheduler,
+            image_generation_boot_id,
+            _image_generation_worker: image_generation_worker,
             credential_store_path: None,
             secret_vault,
             sealed_owner_capabilities: Arc::new(StdMutex::new(
@@ -2863,6 +2923,14 @@ impl DaemonContext {
     /// single drain path both read it.
     pub fn shutdown_signal(&self) -> &crate::daemon::shutdown::ShutdownSignal {
         &self.shutdown
+    }
+
+    /// The stable, nonzero daemon boot UUID shared by the image-generation
+    /// lifecycle worker (`worker_boot_id`) and job creation (`deadline_boot_id`).
+    /// The chokepoint prompt calls `ImageGenerationJobService` with this so a job
+    /// queued this boot is dispatchable by the worker this boot.
+    pub fn image_generation_boot_id(&self) -> Uuid {
+        self.image_generation_boot_id
     }
 
     pub fn set_shutdown_grace_override(&self, grace: Duration) {

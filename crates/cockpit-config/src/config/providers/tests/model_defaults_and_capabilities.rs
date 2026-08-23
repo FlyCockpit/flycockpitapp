@@ -166,7 +166,10 @@ fn responses_reasoning_effort_mapping_serializes_a_nested_json_path() {
             None,
         )
         .unwrap(),
-        Some(serde_json::json!({ "reasoning": { "effort": "ultra" } }))
+        // `ultra` is advertised (a selectable tier above `max`) but rig's typed
+        // ReasoningEffort has no `ultra` variant and rejects the whole payload
+        // before send, so it clamps to the wire ceiling `max`.
+        Some(serde_json::json!({ "reasoning": { "effort": "max" } }))
     );
     assert_eq!(
         cfg.resolve_reasoning_effort_params_for_openai_endpoint(
@@ -184,6 +187,84 @@ fn responses_reasoning_effort_mapping_serializes_a_nested_json_path() {
     assert_eq!(
         cfg.resolve_wire_api("copilot", "gpt-5.6-terra"),
         WireApi::Responses
+    );
+}
+
+#[test]
+fn copilot_ultra_reasoning_effort_clamps_to_max_but_leaves_valid_efforts() {
+    // Regression: Copilot's catalog advertises an `ultra` tier and its
+    // catalog-derived mapping is an identity map (`ultra` -> `ultra`). rig's
+    // typed ReasoningEffort has no `ultra` variant and rejects the whole payload
+    // before send, so a model dispatched at `ultra` failed EVERY request. It
+    // must clamp to the wire ceiling `max`, while a rig-valid effort like `xhigh`
+    // passes through unchanged (the clamp is specific to `ultra`).
+    let mut cfg = ProvidersConfig::default();
+    cfg.providers.insert(
+        "copilot".into(),
+        ProviderEntry {
+            models: vec![ModelEntry {
+                id: "gpt-5.6-terra".into(),
+                capabilities: ModelCapabilities {
+                    reasoning_effort: Some(ReasoningEffortCapability {
+                        values: vec![
+                            CapabilityValue {
+                                value: "xhigh".into(),
+                                ..CapabilityValue::default()
+                            },
+                            CapabilityValue {
+                                value: "ultra".into(),
+                                ..CapabilityValue::default()
+                            },
+                        ],
+                        default: None,
+                        request_mapping: None,
+                        endpoint_request_mappings: vec![EndpointReasoningEffortRequestMapping {
+                            wire_api: WireApi::Responses,
+                            request_mapping: ReasoningEffortRequestMapping::JsonPath {
+                                path: vec!["reasoning".into(), "effort".into()],
+                                // Identity map, exactly as the Copilot catalog parse builds it.
+                                values: BTreeMap::from_iter([
+                                    ("xhigh".to_string(), serde_json::json!("xhigh")),
+                                    ("ultra".to_string(), serde_json::json!("ultra")),
+                                ]),
+                            },
+                        }],
+                        source: Some(CapabilitySource::Live),
+                    }),
+                    supported_wire_apis: vec![WireApi::Responses],
+                    ..ModelCapabilities::default()
+                },
+                ..ModelEntry::default()
+            }],
+            ..ProviderEntry::default()
+        },
+    );
+
+    // `ultra` (identity-mapped in the catalog) clamps to `max` — the bug fix.
+    assert_eq!(
+        cfg.resolve_reasoning_effort_params_for_openai_endpoint(
+            "copilot",
+            "gpt-5.6-terra",
+            Some("ultra"),
+            ReasoningEffortWire::OpenAiCompatible,
+            Some(WireApi::Responses),
+            None,
+        )
+        .unwrap(),
+        Some(serde_json::json!({ "reasoning": { "effort": "max" } }))
+    );
+    // A rig-valid effort is untouched (clamp is specific to `ultra`).
+    assert_eq!(
+        cfg.resolve_reasoning_effort_params_for_openai_endpoint(
+            "copilot",
+            "gpt-5.6-terra",
+            Some("xhigh"),
+            ReasoningEffortWire::OpenAiCompatible,
+            Some(WireApi::Responses),
+            None,
+        )
+        .unwrap(),
+        Some(serde_json::json!({ "reasoning": { "effort": "xhigh" } }))
     );
 }
 

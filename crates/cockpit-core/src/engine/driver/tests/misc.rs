@@ -569,3 +569,172 @@ async fn orphaned_child_teardown_fires_paired_subagent_stop() {
         "teardown at the root frame must fire no subagentStop"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Detached-`Swarm` subagent lifecycle observe-hook boundary wiring
+// (subagentStart / subagentStop, spawn mode 3 of 3). These drive the REAL
+// driver production helpers the `ScheduleEvent` drain calls
+// (`fire_swarm_subagent_start` on `SwarmChildStarted`,
+// `fire_swarm_subagent_stop_if_tracked` on `Completed`, and the teardown
+// backstop `drain_orphaned_swarm_stop_hooks`). The hook command is
+// unresolvable so it fails open (executable-not-found) WITHOUT spawning a
+// process; a `hook_run` row is still recorded — the wiring signal. On unwired
+// HEAD no such row exists, so each fails there.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn swarm_subagent_start_and_stop_pair_for_child_agent_type_matcher() {
+    // A genuine swarm child (`bee`) that starts then completes fires exactly one
+    // `subagentStart` and exactly one paired `subagentStop`, both matched on the
+    // child agent type. A different-agent-type hook fires neither.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let mut reg = observe_boundary_registry(
+        crate::config::extended::hooks::HookEvent::SubagentStart,
+        "bee",
+    );
+    reg.hooks.extend(
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        )
+        .hooks,
+    );
+    inject_hooks(&mut driver, reg);
+
+    driver.fire_swarm_subagent_start("sched-bee-1", "bee").await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStart").await,
+        vec!["failed".to_string()],
+        "a bee swarm child start must fire exactly one subagentStart hook"
+    );
+    // Its terminal `Completed` (failed = false → success) fires the paired stop.
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-1", false)
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "the same bee child's completion must fire exactly one paired subagentStop"
+    );
+
+    // A `scout`-only hook fires nothing for a `bee` child — proving the matcher
+    // is the child agent type, not an unconditional fire.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let mut reg = observe_boundary_registry(
+        crate::config::extended::hooks::HookEvent::SubagentStart,
+        "scout",
+    );
+    reg.hooks.extend(
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "scout",
+        )
+        .hooks,
+    );
+    inject_hooks(&mut driver, reg);
+    driver.fire_swarm_subagent_start("sched-bee-2", "bee").await;
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-2", false)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStart")
+            .await
+            .is_empty(),
+        "a scout-only hook must not fire on a bee child start"
+    );
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a scout-only hook must not fire on a bee child stop"
+    );
+}
+
+#[tokio::test]
+async fn swarm_subagent_stop_only_fires_for_a_tracked_started_child() {
+    // A `Completed` whose `job_id` never fired a `subagentStart` — a
+    // goal-supervision control worker (never tracked; guidance L22), a
+    // loop/timer/background job, or a stray/double completion — fires NO
+    // `subagentStop`. Only a child recorded by a prior start is paired.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        ),
+    );
+    // Never started (not in the map): stop is a no-op even though a matching
+    // hook is configured.
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-untracked", false)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a completion for an untracked job must fire no subagentStop"
+    );
+
+    // Start then stop fires exactly once; a SECOND stop for the same job fires
+    // nothing (the map removal makes the pairing exactly-once — no double-fire
+    // on a duplicate/late completion).
+    driver.fire_swarm_subagent_start("sched-bee-3", "bee").await;
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", false)
+        .await;
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", false)
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "a started child fires exactly one subagentStop even if Completed twice"
+    );
+}
+
+#[tokio::test]
+async fn orphaned_swarm_child_teardown_fires_paired_subagent_stop() {
+    // A driver-loop exit that abandons a live swarm child (its terminal
+    // `Completed` is never drained — detach loss / shutdown) must still fire
+    // exactly one paired `subagentStop` (`aborted`) so no `subagentStart` is
+    // left unpaired. Drive the real teardown helper.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        ),
+    );
+    driver.fire_swarm_subagent_start("sched-bee-4", "bee").await;
+    // `fire_swarm_subagent_start` also fires a subagentStart; clear the ledger
+    // expectation by only inspecting subagentStop below.
+    driver.drain_orphaned_swarm_stop_hooks().await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "an orphaned swarm child at teardown must fire exactly one subagentStop"
+    );
+
+    // A child that already completed (removed from the map) is NOT re-fired at
+    // teardown — no double-stop.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        ),
+    );
+    driver.fire_swarm_subagent_start("sched-bee-5", "bee").await;
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-5", false)
+        .await;
+    driver.drain_orphaned_swarm_stop_hooks().await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "a completed swarm child must not be re-fired at teardown (no double-stop)"
+    );
+}

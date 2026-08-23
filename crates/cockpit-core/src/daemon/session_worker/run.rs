@@ -1496,6 +1496,12 @@ pub(super) async fn run_worker(
             // child so no `subagentStart` is left unpaired. No-op when the stack
             // is already at root.
             driver.drain_orphaned_child_stop_hooks().await;
+            // Same pairing teardown for detached-`Swarm` children: any child
+            // still tracked (its terminal `Completed` was never drained — detach
+            // loss / shutdown) emits one paired `subagentStop` (`aborted`) so no
+            // `subagentStart` is left unpaired. No-op when every child already
+            // completed (each `Completed` removed it from the map).
+            driver.drain_orphaned_swarm_stop_hooks().await;
             match outcome {
                 Ok(()) => DriverOutcome::Ok,
                 Err(e) => {

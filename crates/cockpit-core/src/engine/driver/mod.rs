@@ -570,6 +570,15 @@ pub struct Driver {
         std::collections::VecDeque<BackgroundNoninteractiveCompletion>,
     /// Backgrounded noninteractive delegation jobs keyed by task call id.
     noninteractive_jobs: std::collections::HashMap<String, BackgroundNoninteractiveJob>,
+    /// Live detached-`Swarm` child subagents that have fired `subagentStart`,
+    /// keyed by schedule `job_id` → child agent type (`subagentType`). Populated
+    /// when a [`ScheduleEvent::SwarmChildStarted`] is drained and drained back
+    /// out when the same `job_id`'s [`ScheduleEvent::Completed`] arrives (firing
+    /// the paired `subagentStop`), so every started swarm child pairs with
+    /// exactly one stop. Goal-supervision control workers never enter this map
+    /// (they never emit `SwarmChildStarted`; guidance L22). Any residual entries
+    /// at driver-loop teardown are drained as `aborted` (detach loss).
+    swarm_subagents: std::collections::HashMap<String, String>,
     /// Which cache-safe capability hints have already been appended to the
     /// active history (GOALS §22). A branch is enabled by two cache-safe
     /// moves: the dispatcher starts accepting the action (always, here),
@@ -1313,6 +1322,10 @@ impl Driver {
             noninteractive_complete_rx,
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
+            // A rebuild installs a fresh schedule authority + event channel, so
+            // it starts with no tracked swarm children (mirrors
+            // `noninteractive_jobs`).
+            swarm_subagents: std::collections::HashMap::new(),
             appended_hints: self.appended_hints.clone(),
             emitted_command_capability_notices: self.emitted_command_capability_notices.clone(),
             prune_watermark: self.prune_watermark.clone(),
@@ -1629,6 +1642,7 @@ impl Driver {
             noninteractive_complete_rx,
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
+            swarm_subagents: std::collections::HashMap::new(),
             appended_hints: std::collections::HashSet::new(),
             emitted_command_capability_notices: HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
@@ -4557,6 +4571,77 @@ impl Driver {
                 crate::config::extended::hooks::HookEvent::SubagentStop,
                 &subagent_type,
                 subagent_id.as_deref(),
+                Some("aborted"),
+            )
+            .await;
+        }
+    }
+
+    /// Fire `subagentStart` for a detached-`Swarm` child that just started
+    /// (spawn mode 3 of 3), and record it so its paired `subagentStop` can fire
+    /// on completion. Driven by draining [`ScheduleEvent::SwarmChildStarted`],
+    /// which the schedule authority emits ONLY for genuine swarm children
+    /// (`bee` / `scout`) — never goal-supervision control workers (guidance
+    /// L22), so this only ever runs for real subagents. Child-only; matcher /
+    /// `subagentType` is the child agent type, `subagentId` is the schedule
+    /// `job_id` (the correlation the paired stop reuses).
+    async fn fire_swarm_subagent_start(&mut self, job_id: &str, subagent_type: &str) {
+        // Record before firing so a completion racing on the same turn boundary
+        // (it cannot: SwarmChildStarted is always drained first) still pairs.
+        self.swarm_subagents
+            .insert(job_id.to_string(), subagent_type.to_string());
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            subagent_type,
+            Some(job_id),
+            None,
+        )
+        .await;
+    }
+
+    /// Fire the paired `subagentStop` for a detached-`Swarm` child if — and only
+    /// if — its `job_id` was tracked by a prior [`Self::fire_swarm_subagent_start`].
+    /// Called when a swarm job's [`ScheduleEvent::Completed`] is drained (the
+    /// single terminal event per job — the runner sends it on success/failure,
+    /// and the authority synthesizes it on cancel), so every started child fires
+    /// exactly one stop and no path double-fires (the map removal is idempotent).
+    /// A `Completed` for a job never in the map — a goal-supervision worker, or a
+    /// loop/timer/background job — fires nothing. `endReason` is `completed` on a
+    /// non-failed terminal and `failed` otherwise (a cancel synthesizes a
+    /// non-failed terminal, so it settles as `completed`).
+    async fn fire_swarm_subagent_stop_if_tracked(&mut self, job_id: &str, failed: bool) {
+        let Some(subagent_type) = self.swarm_subagents.remove(job_id) else {
+            return;
+        };
+        let end_reason = if failed { "failed" } else { "completed" };
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            &subagent_type,
+            Some(job_id),
+            Some(end_reason),
+        )
+        .await;
+    }
+
+    /// Fire a paired `subagentStop` for every detached-`Swarm` child still
+    /// tracked at driver-loop teardown. The normal path pairs each start with a
+    /// stop when the child's `Completed` is drained; the one remaining escape is
+    /// a driver-loop exit that abandons a live child whose terminal `Completed`
+    /// will never be drained (detach loss / shutdown). Called once when the
+    /// driver loop resolves (alongside [`Self::drain_orphaned_child_stop_hooks`]),
+    /// this closes that gap: each residual child emits exactly one `subagentStop`
+    /// with `endReason` = `aborted`. On every clean exit the map is empty (each
+    /// child's `Completed` already removed it), so this fires nothing — no
+    /// double-stop.
+    pub(crate) async fn drain_orphaned_swarm_stop_hooks(&mut self) {
+        // Drain first so no borrow of `self.swarm_subagents` is held across the
+        // await inside `fire_subagent_hook`.
+        let orphans: Vec<(String, String)> = self.swarm_subagents.drain().collect();
+        for (job_id, subagent_type) in orphans {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &subagent_type,
+                Some(&job_id),
                 Some("aborted"),
             )
             .await;

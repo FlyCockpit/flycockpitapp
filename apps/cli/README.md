@@ -217,7 +217,9 @@ cockpit packages prune --dry-run
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |
 | `cockpit invocation status <id>` | Show durable status for a run invocation by client_submission_id. |
 | `cockpit invocation cancel <id>` | Request cancellation of a run invocation (idempotent). |
-| `cockpit agent list` | List configured agent definitions. |
+| `cockpit agent install OWNER/REPO[@REV]:PATH --scope global\|workspace-private\|workspace` | Ask the daemon to install a versioned agent definition. |
+| `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
+| `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
 | `cockpit assistant list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |

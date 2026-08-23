@@ -3852,17 +3852,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         } => docs_ask_response(ctx, question, package, project_root).await,
 
         Request::AgentInstallationBegin(request) => {
-            let service = crate::daemon::agent_installation::default_daemon_service(
-                ctx.db.clone(),
-                &ctx.paths,
-                ctx.secret_vault.clone(),
-                ctx.config_source()
-                    .load(&ctx.canonical_cwd)
-                    .map_err(internal)?
-                    .0,
-                vec![ctx.canonical_cwd.clone()],
-            )
-            .map_err(internal)?;
+            let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(
                 service
                     .begin(request, chrono::Utc::now().timestamp_millis())
@@ -3870,17 +3860,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             ))
         }
         Request::AgentInstallationSubmitChoice(request) => {
-            let service = crate::daemon::agent_installation::default_daemon_service(
-                ctx.db.clone(),
-                &ctx.paths,
-                ctx.secret_vault.clone(),
-                ctx.config_source()
-                    .load(&ctx.canonical_cwd)
-                    .map_err(internal)?
-                    .0,
-                vec![ctx.canonical_cwd.clone()],
-            )
-            .map_err(internal)?;
+            let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(
                 service
                     .submit_choice(request, chrono::Utc::now().timestamp_millis())
@@ -8499,31 +8479,11 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     apply_concurrent_request_test_hook(&request).await;
     match request {
         Request::AgentInstallationList(request) => {
-            let service = crate::daemon::agent_installation::default_daemon_service(
-                ctx.db.clone(),
-                &ctx.paths,
-                ctx.secret_vault.clone(),
-                ctx.config_source()
-                    .load(&ctx.canonical_cwd)
-                    .map_err(internal)?
-                    .0,
-                vec![ctx.canonical_cwd.clone()],
-            )
-            .map_err(internal)?;
+            let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.list(request).await))
         }
         Request::AgentInstallationInspect(request) => {
-            let service = crate::daemon::agent_installation::default_daemon_service(
-                ctx.db.clone(),
-                &ctx.paths,
-                ctx.secret_vault.clone(),
-                ctx.config_source()
-                    .load(&ctx.canonical_cwd)
-                    .map_err(internal)?
-                    .0,
-                vec![ctx.canonical_cwd.clone()],
-            )
-            .map_err(internal)?;
+            let service = ctx.agent_installation_service().map_err(internal)?;
             Ok(Response::AgentInstallation(service.inspect(request).await))
         }
         Request::SubagentTranscript {

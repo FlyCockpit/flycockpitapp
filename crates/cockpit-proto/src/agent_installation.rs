@@ -46,10 +46,15 @@ pub struct AgentInstallationBeginV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
     /// Canonical `OWNER/REPO[@REV]:PATH` for install/update, an installation
-    /// id for bind, or the client-provided requested filename for daemon-owned
-    /// create. The daemon alone validates/derives Create identity; this value
+    /// id for bind, or the declarative `authored/NAME` identity for daemon-owned
+    /// create. The daemon alone validates/derives Create filename/path; this value
     /// is never returned in a response or persisted outside its fingerprint.
     pub source_locator: String,
+    /// Update-only durable target. The daemon verifies that this exact
+    /// installation belongs to the requested scope/workspace and has the
+    /// same canonical source identity before replacing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_installation_id: Option<String>,
     #[serde(default)]
     pub replace_acknowledged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +109,27 @@ pub struct AgentInstallationRecordV1 {
     pub source_revision: Option<String>,
     pub source_digest: String,
     pub installation_revision: u64,
+    /// Redacted daemon-derived current slot state. Profile handles and
+    /// credentials are intentionally never represented here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<AgentInstallationSlotStatusV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstallationSlotBindingStateV1 {
+    Bound,
+    PrimaryUnusable,
+    OptionalUnbound,
+    RebindRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstallationSlotStatusV1 {
+    pub slot_id: String,
+    pub state: AgentInstallationSlotBindingStateV1,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

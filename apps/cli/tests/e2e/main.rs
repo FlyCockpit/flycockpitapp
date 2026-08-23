@@ -7,6 +7,7 @@
 mod support;
 
 mod agent_installation_daemon;
+mod agent_management;
 mod binary_smoke;
 #[cfg(unix)]
 mod daemon_lifecycle;

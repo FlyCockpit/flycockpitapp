@@ -15732,6 +15732,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 scope: cockpit_proto::AgentInstallationScopeWire::Global,
                 workspace_path: None,
                 source_locator: "authored/helper".into(),
+                target_installation_id: None,
                 replace_acknowledged: false,
                 requested_slot: None,
                 execution_kind: Some(cockpit_proto::AgentInstallationExecutionKindV1::Coding),

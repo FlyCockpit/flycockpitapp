@@ -164,6 +164,52 @@ impl Db {
         .await
     }
 
+    /// Atomically create a fresh install/update operation and its immutable
+    /// staged-source journal. A replay only reads the existing operation; it
+    /// never replaces that operation's pinned source with bytes fetched by a
+    /// later retry. This closes the otherwise observable crash window between
+    /// operation creation and journal persistence.
+    pub async fn begin_installation_operation_with_staged_journal(
+        &self,
+        idempotency_key: String,
+        request_fingerprint: String,
+        kind: InstallationOperationKind,
+        canonical_workspace_id: Option<String>,
+        staged_file_metadata_json: String,
+        expected_digest: String,
+        now_unix_ms: i64,
+    ) -> Result<BeginInstallationOperation> {
+        self.transaction(move |conn| {
+            let begun = begin_operation_conn(
+                conn,
+                &idempotency_key,
+                &request_fingerprint,
+                kind,
+                canonical_workspace_id.as_deref(),
+                now_unix_ms,
+            )?;
+            if let BeginInstallationOperation::Created(operation) = &begun {
+                record_journal_conn(
+                    conn,
+                    &InstallationJournalRow {
+                        journal_id: Uuid::new_v4(),
+                        operation_id: operation.operation_id,
+                        checkpoint: InstallationJournalCheckpoint::Staged,
+                        staged_file_metadata_json: Some(staged_file_metadata_json),
+                        // The daemon records the owned-file observation after
+                        // resolving its held target path, immediately before
+                        // staging. It must not trust a client path here.
+                        prior_file_metadata_json: None,
+                        expected_digest,
+                    },
+                    now_unix_ms,
+                )?;
+            }
+            Ok(begun)
+        })
+        .await
+    }
+
     pub async fn installation_operation(
         &self,
         key: String,

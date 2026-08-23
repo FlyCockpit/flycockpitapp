@@ -617,6 +617,8 @@ fn error_exit_code(err: &anyhow::Error) -> u8 {
         commands::REMOVED_COMMAND_EXIT_CODE
     } else if err.is::<commands::CommandUsageError>() {
         commands::USAGE_EXIT_CODE
+    } else if let Some(error) = err.downcast_ref::<commands::agent::AgentCommandError>() {
+        error.exit_code()
     } else {
         1
     }
@@ -1125,8 +1127,9 @@ mod tests {
         )));
         assert!(!command_requires_workspace_trust(Some(&Command::Agent(
             crate::cli::AgentCommand::List {
+                scope: None,
                 workspace: None,
-                shared: false,
+                json: false,
             }
         ))));
         assert!(!command_requires_workspace_trust(Some(&Command::Mcp(

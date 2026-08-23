@@ -12,10 +12,12 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use base64::Engine;
 use cockpit_config::config::providers::ProvidersConfig;
+#[cfg(debug_assertions)]
+use cockpit_config::config::providers::{ModelCapabilities, ModelEntry, ProviderEntry};
 use cockpit_db::db::Db;
 use cockpit_db::db::agent_installations::{
-    AgentInstallationInput, AgentInstallationScope, AgentReplacementCompensationReceipt,
-    InstallAgentOutcome,
+    AgentInstallationInput, AgentInstallationRow, AgentInstallationScope,
+    AgentReplacementCompensationReceipt, InstallAgentOutcome,
 };
 use cockpit_db::db::installation_operations::{
     BeginInstallationOperation, InstallationJournalCheckpoint, InstallationJournalRow,
@@ -26,8 +28,8 @@ use cockpit_proto::{
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
     AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
     AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
-    AgentInstallationScopeWire, AgentInstallationSubmitChoiceV1,
-    AgentInstallationUnmatchedRecommendationV1,
+    AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
+    AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -416,6 +418,153 @@ pub struct AgentInstallationService {
     providers: ProvidersConfig,
 }
 
+/// Development-only process-boundary fixture switch.  It is deliberately
+/// compiled out of release artifacts: production daemons always construct the
+/// HTTPS/vault-backed service and cannot be redirected by an environment
+/// variable.  The fixture file is test data, not a user configuration format.
+#[cfg(debug_assertions)]
+pub const DEBUG_AGENT_INSTALLATION_FIXTURE_ENV: &str = "COCKPIT_DEBUG_AGENT_INSTALLATION_FIXTURE";
+
+#[cfg(debug_assertions)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugAgentInstallationFixture {
+    commit_sha: String,
+    markdown: String,
+    workspace_path: PathBuf,
+    #[serde(default)]
+    providers: std::collections::BTreeMap<String, DebugFixtureProvider>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugFixtureProvider {
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    models: Vec<DebugFixtureModel>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DebugFixtureModel {
+    id: String,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    capabilities: ModelCapabilities,
+}
+
+#[cfg(debug_assertions)]
+struct DebugFixtureFetcher {
+    source: FetchedAgentSource,
+}
+
+#[cfg(debug_assertions)]
+#[async_trait]
+impl AgentInstallationFetcher for DebugFixtureFetcher {
+    async fn fetch_github_markdown(
+        &self,
+        _source: &CanonicalAgentSource,
+    ) -> Result<FetchedAgentSource> {
+        Ok(self.source.clone())
+    }
+}
+
+#[cfg(debug_assertions)]
+struct DebugFixtureWorkspaceAuthorizer {
+    workspace: PathBuf,
+}
+
+#[cfg(debug_assertions)]
+#[async_trait]
+impl AgentWorkspaceAuthorizer for DebugFixtureWorkspaceAuthorizer {
+    async fn authorize_workspace(&self, client_path: &str) -> Result<(String, PathBuf)> {
+        let requested = std::fs::canonicalize(client_path)
+            .context("canonicalizing debug fixture workspace request")?;
+        ensure!(
+            requested == self.workspace,
+            "debug fixture workspace request is not authorized"
+        );
+        Ok(("workspace:debug-fixture".to_owned(), self.workspace.clone()))
+    }
+}
+
+/// Construct the immutable scripted coordinator used by debug integration
+/// daemons.  The JSON contains only markdown, a commit SHA, provider catalog
+/// data, and an authorized workspace path; credentials and HTTP routing are
+/// intentionally not representable here.
+#[cfg(debug_assertions)]
+pub fn debug_fixture_daemon_service(
+    db: Db,
+    daemon_paths: &crate::daemon::DaemonPaths,
+) -> Result<Option<AgentInstallationService>> {
+    let Some(path) = std::env::var_os(DEBUG_AGENT_INSTALLATION_FIXTURE_ENV) else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(&path).context("reading debug agent-installation fixture")?;
+    let fixture: DebugAgentInstallationFixture =
+        serde_json::from_slice(&raw).context("decoding debug agent-installation fixture")?;
+    ensure!(
+        is_commit_sha(&fixture.commit_sha),
+        "debug agent-installation fixture commit SHA is invalid"
+    );
+    ensure!(
+        fixture.markdown.len() <= MAX_AGENT_MARKDOWN_BYTES,
+        "debug agent-installation fixture Markdown exceeds 1MiB"
+    );
+    let workspace = std::fs::canonicalize(&fixture.workspace_path)
+        .context("canonicalizing debug fixture workspace")?;
+    ensure!(
+        workspace.is_dir(),
+        "debug fixture workspace is not a directory"
+    );
+    let state = daemon_paths
+        .pid_file
+        .parent()
+        .context("daemon pid file has no state directory")?;
+    let providers = ProvidersConfig {
+        providers: fixture
+            .providers
+            .into_iter()
+            .map(|(profile, provider)| {
+                ensure!(
+                    !profile.trim().is_empty(),
+                    "debug fixture provider profile must not be empty"
+                );
+                let mut entry = ProviderEntry::default();
+                entry.template = provider.template;
+                entry.models = provider
+                    .models
+                    .into_iter()
+                    .map(|model| ModelEntry {
+                        id: model.id,
+                        context_length: model.context_length,
+                        capabilities: model.capabilities,
+                        ..ModelEntry::default()
+                    })
+                    .collect();
+                Ok((profile, entry))
+            })
+            .collect::<Result<_>>()?,
+        ..ProvidersConfig::default()
+    };
+    Ok(Some(AgentInstallationService::new(
+        db,
+        state.join("agents"),
+        Arc::new(DebugFixtureFetcher {
+            source: FetchedAgentSource {
+                commit_sha: fixture.commit_sha,
+                markdown: fixture.markdown.into_bytes(),
+            },
+        }),
+        Arc::new(DebugFixtureWorkspaceAuthorizer { workspace }),
+        providers,
+    )))
+}
+
 impl AgentInstallationService {
     pub fn new(
         db: Db,
@@ -465,34 +614,96 @@ impl AgentInstallationService {
             .db
             .installation_operation(request.idempotency_key.clone())
             .await?;
-        let shared_prefetch = if existing_operation.is_none()
-            && request.scope == AgentInstallationScopeWire::WorkspaceShared
+        // A fresh update authorizes its explicit target before it asks a
+        // remote source anything (or creates an idempotency row). This makes
+        // a wrong scope, workspace, source, or UUID a pure refusal. A replay
+        // deliberately skips this branch: its durable operation/journal is
+        // the source of truth and a terminal receipt always wins.
+        let fresh_update_target = if existing_operation.is_none()
+            && request.operation == AgentInstallationOperationKind::Update
+        {
+            ensure!(
+                request.replace_acknowledged,
+                "update requires explicit replacement acknowledgement"
+            );
+            Some(
+                self.validate_update_target(&request, workspace_id.as_deref())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        // Parse and fetch all fresh install/update requests before creating an
+        // operation. In particular, an invalid manifest must never leave an
+        // orphan operation or owned file behind. Nonterminal recovery never
+        // enters this branch and instead uses its pinned staged bytes below.
+        let fresh_prefetched = if existing_operation.is_none()
             && matches!(
                 request.operation,
                 AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
             ) {
+            Some(
+                self.prefetch_fresh_source(
+                    &request,
+                    fresh_update_target
+                        .as_ref()
+                        .map(|target| target.source_agent_id.as_str()),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let fresh_staged_journal = fresh_prefetched
+            .as_ref()
+            .map(|fetched| staged_source_journal_metadata(&request.source_locator, fetched))
+            .transpose()?;
+        if existing_operation.is_none()
+            && request.scope == AgentInstallationScopeWire::WorkspaceShared
+            && matches!(
+                request.operation,
+                AgentInstallationOperationKind::Install | AgentInstallationOperationKind::Update
+            )
+        {
             self.preflight_shared_collision(
                 &request,
                 workspace_id.as_deref(),
                 workspace_root.as_deref(),
+                fresh_prefetched
+                    .as_ref()
+                    .expect("fresh install/update source was prefetched"),
             )
-            .await?
-        } else {
-            None
-        };
+            .await?;
+        }
         let fingerprint = request_fingerprint(&request, workspace_id.as_deref());
         let kind = operation_kind(request.operation);
-        let created = match self
-            .db
-            .begin_installation_operation(
-                request.idempotency_key.clone(),
-                fingerprint,
-                kind,
-                workspace_id.clone(),
-                now,
-            )
-            .await?
-        {
+        let begun = match fresh_staged_journal {
+            Some((staged_file_metadata_json, expected_digest)) => {
+                self.db
+                    .begin_installation_operation_with_staged_journal(
+                        request.idempotency_key.clone(),
+                        fingerprint,
+                        kind,
+                        workspace_id.clone(),
+                        staged_file_metadata_json,
+                        expected_digest,
+                        now,
+                    )
+                    .await?
+            }
+            None => {
+                self.db
+                    .begin_installation_operation(
+                        request.idempotency_key.clone(),
+                        fingerprint,
+                        kind,
+                        workspace_id.clone(),
+                        now,
+                    )
+                    .await?
+            }
+        };
+        let created = match begun {
             BeginInstallationOperation::KeyConflict => {
                 bail!("idempotency key was previously used for a different request")
             }
@@ -555,7 +766,8 @@ impl AgentInstallationService {
                     workspace_id,
                     workspace_root,
                     now,
-                    created.then_some(shared_prefetch).flatten(),
+                    created.then_some(fresh_update_target).flatten(),
+                    created.then_some(fresh_prefetched).flatten(),
                 )
                 .await
             }
@@ -973,16 +1185,18 @@ impl AgentInstallationService {
                 request.dto_version == AGENT_INSTALLATION_DTO_VERSION,
                 "unsupported installation DTO version"
             );
-            let (workspace_id, _) = self
+            let (workspace_id, workspace_root) = self
                 .resolve_scope(request.scope, request.workspace_path.as_deref())
                 .await?;
             let rows = self
                 .db
                 .list_agent_installations(db_scope(request.scope), workspace_id.as_deref())
                 .await?;
-            Ok(AgentInstallationResultV1::Listed {
-                installations: rows.into_iter().map(record).collect(),
-            })
+            let mut installations = Vec::with_capacity(rows.len());
+            for row in rows {
+                installations.push(self.record(row, workspace_root.as_deref()).await?);
+            }
+            Ok(AgentInstallationResultV1::Listed { installations })
         }
         .await;
         result.unwrap_or_else(redacted_error)
@@ -994,7 +1208,7 @@ impl AgentInstallationService {
                 request.dto_version == AGENT_INSTALLATION_DTO_VERSION,
                 "unsupported installation DTO version"
             );
-            let (workspace_id, _) = self
+            let (workspace_id, workspace_root) = self
                 .resolve_scope(request.scope, request.workspace_path.as_deref())
                 .await?;
             let id = request
@@ -1006,24 +1220,123 @@ impl AgentInstallationService {
                 row.scope == db_scope(request.scope) && row.canonical_workspace_id == workspace_id
             });
             Ok(AgentInstallationResultV1::Inspected {
-                installation: row.map(record),
+                installation: match row {
+                    Some(row) => Some(self.record(row, workspace_root.as_deref()).await?),
+                    None => None,
+                },
             })
         }
         .await;
         result.unwrap_or_else(redacted_error)
     }
 
+    async fn validate_update_target(
+        &self,
+        request: &AgentInstallationBeginV1,
+        workspace_id: Option<&str>,
+    ) -> Result<AgentInstallationRow> {
+        ensure!(
+            request.operation == AgentInstallationOperationKind::Update,
+            "only update has an installation target"
+        );
+        let source = CanonicalAgentSource::parse(&request.source_locator)?;
+        let installation_id = Uuid::parse_str(
+            request
+                .target_installation_id
+                .as_deref()
+                .context("update requires target installation id")?,
+        )
+        .context("update target installation id is invalid")?;
+        let installation = self
+            .db
+            .agent_installation(installation_id)
+            .await?
+            .context("update target installation was not found")?;
+        ensure!(
+            installation.scope == db_scope(request.scope)
+                && installation.canonical_workspace_id.as_deref() == workspace_id,
+            "update target installation does not belong to requested scope"
+        );
+        ensure!(
+            installation.source_identity == source.identity(),
+            "update source does not match target installation provenance"
+        );
+        Ok(installation)
+    }
+
+    /// Validate all immutable source facts that are knowable before an
+    /// operation exists. The returned bytes are passed directly to staging so
+    /// a valid fresh request fetches exactly once, while an invalid source or
+    /// manifest has no durable side effects.
+    async fn prefetch_fresh_source(
+        &self,
+        request: &AgentInstallationBeginV1,
+        expected_agent_id: Option<&str>,
+    ) -> Result<FetchedAgentSource> {
+        let source = CanonicalAgentSource::parse(&request.source_locator)?;
+        let name = source
+            .markdown_path
+            .rsplit('/')
+            .next()
+            .and_then(|value| value.strip_suffix(".md"))
+            .filter(|value| !value.is_empty())
+            .context("source Markdown path has no agent filename")?;
+        let fetched = self
+            .fetcher
+            .fetch_github_markdown(&source)
+            .await
+            .context("fetching GitHub agent source")?;
+        ensure!(
+            is_commit_sha(&fetched.commit_sha),
+            "source fetch did not resolve an immutable commit SHA"
+        );
+        ensure!(
+            fetched.markdown.len() <= MAX_AGENT_MARKDOWN_BYTES,
+            "fetched agent Markdown exceeds 1MiB"
+        );
+        let markdown = std::str::from_utf8(&fetched.markdown)
+            .context("fetched agent Markdown is not UTF-8")?;
+        let definition =
+            crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
+                .context("invalid fetched AgentDef")?;
+        let vnext = definition
+            .vnext
+            .as_ref()
+            .context("installed agent must be a vNext AgentDef")?;
+        let defined_name = vnext
+            .agent_id
+            .rsplit('/')
+            .next()
+            .context("vNext agent id has no final name")?;
+        ensure!(
+            defined_name == name,
+            "installed AgentDef id must use the source Markdown filename"
+        );
+        ensure!(
+            !crate::agents::is_builtin_agent(defined_name),
+            "daemon installation may not impersonate a protected builtin agent"
+        );
+        if let Some(expected_agent_id) = expected_agent_id {
+            ensure!(
+                vnext.agent_id == expected_agent_id,
+                "update source AgentDef identity does not match target installation"
+            );
+        }
+        Ok(fetched)
+    }
+
     /// A fresh workspace-shared request may touch a user-visible path only
-    /// after proving it is absent or byte/provenance-identical. This performs
-    /// no operation/journal/installation mutation and returns the fetched
-    /// immutable source so the subsequently-created operation cannot refetch
-    /// a moving ref between preflight and staging.
+    /// after proving it is absent or byte/provenance-identical. The immutable
+    /// source has already been fetched and validated before this check, so
+    /// preflight cannot make an invalid manifest durable or refetch a moving
+    /// revision.
     async fn preflight_shared_collision(
         &self,
         request: &AgentInstallationBeginV1,
         workspace_id: Option<&str>,
         workspace_root: Option<&Path>,
-    ) -> Result<Option<FetchedAgentSource>> {
+        fetched: &FetchedAgentSource,
+    ) -> Result<()> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
         let name = source
             .markdown_path
@@ -1041,13 +1354,8 @@ impl AgentInstallationService {
         ensure_no_reparse_components(target.parent().context("owned target missing parent")?)?;
         reject_reparse_leaf(&target)?;
         if !owned_file_exists(&target, false)? {
-            return Ok(None);
+            return Ok(());
         }
-        let fetched = self
-            .fetcher
-            .fetch_github_markdown(&source)
-            .await
-            .context("fetching GitHub agent source for shared collision check")?;
         ensure!(
             is_commit_sha(&fetched.commit_sha)
                 && fetched.markdown.len() <= MAX_AGENT_MARKDOWN_BYTES,
@@ -1089,7 +1397,7 @@ impl AgentInstallationService {
                         && existing.source_digest == definition_digest
                 });
         ensure!(exact, "dirty shared owned agent file collision");
-        Ok(Some(fetched))
+        Ok(())
     }
 
     async fn install_or_update(
@@ -1098,6 +1406,7 @@ impl AgentInstallationService {
         workspace_id: Option<String>,
         workspace_root: Option<PathBuf>,
         now: i64,
+        update_target: Option<AgentInstallationRow>,
         prefetched: Option<FetchedAgentSource>,
     ) -> Result<AgentInstallationResultV1> {
         let source = CanonicalAgentSource::parse(&request.source_locator)?;
@@ -1112,6 +1421,23 @@ impl AgentInstallationService {
             !crate::agents::is_builtin_agent(name),
             "daemon installation may not overwrite a protected builtin agent"
         );
+        let update_target_id = if request.operation == AgentInstallationOperationKind::Update {
+            Some(
+                Uuid::parse_str(
+                    request
+                        .target_installation_id
+                        .as_deref()
+                        .context("update requires target installation id")?,
+                )
+                .context("update target installation id is invalid")?,
+            )
+        } else {
+            ensure!(
+                request.target_installation_id.is_none(),
+                "only update may include a target installation id"
+            );
+            None
+        };
         let operation = self
             .db
             .installation_operation(request.idempotency_key.clone())
@@ -1126,6 +1452,15 @@ impl AgentInstallationService {
         ensure_no_reparse_components(target.parent().context("owned target missing parent")?)?;
         reject_reparse_leaf(&target)?;
         let prior_journal = self.db.installation_journal(operation.operation_id).await?;
+        // A freshly-created operation already has its immutable source journal
+        // (atomically with the operation row), but has not yet observed the
+        // owned target. Treat that narrow state like a fresh preflight on a
+        // retry; once the observation is persisted, recovery uses it instead
+        // of reinterpreting a published file as a new collision.
+        let needs_owned_target_preflight = prior_journal.as_ref().is_none_or(|journal| {
+            journal.checkpoint == InstallationJournalCheckpoint::Staged
+                && journal.prior_file_metadata_json.is_none()
+        });
         let fetched = match prior_journal.as_ref().and_then(journal_staged_source) {
             Some(source) => source?,
             None => match prefetched {
@@ -1148,7 +1483,8 @@ impl AgentInstallationService {
         let markdown = std::str::from_utf8(&fetched.markdown)
             .context("fetched agent Markdown is not UTF-8")?;
         let definition =
-            crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))?;
+            crate::agents::parse_agent(markdown, name, PathBuf::from("<daemon-fetched-agent>"))
+                .context("invalid fetched AgentDef")?;
         ensure!(
             definition.vnext.is_some(),
             "installed agent must be a vNext AgentDef"
@@ -1169,6 +1505,13 @@ impl AgentInstallationService {
             !crate::agents::is_builtin_agent(defined_name),
             "daemon installation may not impersonate a protected builtin agent"
         );
+        if let Some(target) = update_target.as_ref() {
+            ensure!(
+                definition.vnext.as_ref().expect("checked vnext").agent_id
+                    == target.source_agent_id,
+                "update source AgentDef identity does not match target installation"
+            );
+        }
         let digest = sha256_hex(&fetched.markdown);
         let definition_digest = sha256_hex(&definition.vnext_digest_bytes()?);
         // A workspace-shared definition belongs to the workspace, not merely
@@ -1176,7 +1519,7 @@ impl AgentInstallationService {
         // staging, journaling, or invoking the installation transaction.  The
         // one permitted collision is an exact already-installed copy, which
         // is a no-op even when a caller used a fresh operation key.
-        if prior_journal.is_none()
+        if needs_owned_target_preflight
             && request.scope == AgentInstallationScopeWire::WorkspaceShared
             && owned_file_exists(&target, false)?
         {
@@ -1237,7 +1580,51 @@ impl AgentInstallationService {
             }
             bail!("dirty shared owned agent file collision")
         }
-        if prior_journal.is_none()
+        // Replacement is explicit, never permission to overwrite an edited
+        // daemon-owned copy. `source_digest` is the canonical complete vNext
+        // Markdown digest (including the prompt body), so this catches both
+        // frontmatter and body edits before any stage/journal/DB mutation.
+        if needs_owned_target_preflight
+            && request.replace_acknowledged
+            && owned_file_exists(&target, false)?
+        {
+            let existing = match update_target_id {
+                Some(target_id) => self
+                    .db
+                    .agent_installation(target_id)
+                    .await?
+                    .context("replacement target installation disappeared")?,
+                None => self
+                    .db
+                    .agent_installation_by_source(
+                        db_scope(request.scope),
+                        workspace_id.clone(),
+                        definition
+                            .vnext
+                            .as_ref()
+                            .expect("checked vnext")
+                            .agent_id
+                            .clone(),
+                    )
+                    .await?
+                    .context("replacement target installation disappeared")?,
+            };
+            let current = crate::agents::parse_agent(
+                std::str::from_utf8(&read_owned_file(
+                    &target,
+                    "reading owned agent before replacement",
+                )?)
+                .context("owned agent before replacement is not UTF-8")?,
+                name,
+                target.clone(),
+            )?;
+            let current_digest = sha256_hex(&current.vnext_digest_bytes()?);
+            ensure!(
+                current_digest == existing.source_digest,
+                "dirty shared owned agent file collision"
+            );
+        }
+        if needs_owned_target_preflight
             && owned_file_exists(&target, false)?
             && !request.replace_acknowledged
         {
@@ -1257,6 +1644,16 @@ impl AgentInstallationService {
             prior_file_metadata_json: prior_file_metadata(&target, operation.operation_id)?,
             expected_digest: digest.clone(),
         });
+        if journal.prior_file_metadata_json.is_none() {
+            // This update is intentionally durable before staging: after a
+            // crash, recovery can prove whether a user changed the owned
+            // target rather than treating a file swap as the original copy.
+            journal.prior_file_metadata_json =
+                prior_file_metadata(&target, operation.operation_id)?;
+            self.db
+                .record_installation_journal(journal.clone(), now)
+                .await?;
+        }
         ensure!(
             journal.expected_digest == digest,
             "recovery source digest changed for the original installation request"
@@ -1344,14 +1741,19 @@ impl AgentInstallationService {
                         replacement.replacement_operation_id == operation.operation_id,
                         "stored replacement receipt belongs to another operation"
                     );
-                    self.db
-                        .agent_installation_by_source(
-                            installation_input.scope,
-                            installation_input.canonical_workspace_id.clone(),
-                            installation_input.source_agent_id.clone(),
-                        )
-                        .await?
-                        .filter(|row| replacement_receipt_matches_committed(row, &replacement))
+                    (match update_target_id {
+                        Some(target_id) => self.db.agent_installation(target_id).await?,
+                        None => {
+                            self.db
+                                .agent_installation_by_source(
+                                    installation_input.scope,
+                                    installation_input.canonical_workspace_id.clone(),
+                                    installation_input.source_agent_id.clone(),
+                                )
+                                .await?
+                        }
+                    })
+                    .filter(|row| replacement_receipt_matches_committed(row, &replacement))
                 }
                 None => None,
             }
@@ -1364,15 +1766,19 @@ impl AgentInstallationService {
             // The journal checkpoint is the replay authority: do not issue a
             // second install/replace transaction after a crash between its DB
             // commit and file publication.
-            let row = self
-                .db
-                .agent_installation_by_source(
-                    installation_input.scope,
-                    installation_input.canonical_workspace_id.clone(),
-                    installation_input.source_agent_id.clone(),
-                )
-                .await?
-                .context("DB-committed installation disappeared during recovery")?;
+            let row = (match update_target_id {
+                Some(target_id) => self.db.agent_installation(target_id).await?,
+                None => {
+                    self.db
+                        .agent_installation_by_source(
+                            installation_input.scope,
+                            installation_input.canonical_workspace_id.clone(),
+                            installation_input.source_agent_id.clone(),
+                        )
+                        .await?
+                }
+            })
+            .context("DB-committed installation disappeared during recovery")?;
             ensure!(
                 row.source_identity == installation_input.source_identity
                     && row.source_revision == installation_input.source_revision
@@ -1384,7 +1790,13 @@ impl AgentInstallationService {
         } else if let Some(row) = committed_replacement {
             row
         } else {
-            let outcome = self.db.install_agent(installation_input.clone()).await?;
+            // Update owns a concrete target id. Do not first ask the generic
+            // source-identity insert path to discover a replacement target:
+            // that lookup is appropriate only for an unaddressed Install.
+            let outcome = match update_target_id {
+                Some(_) => InstallAgentOutcome::Conflict,
+                None => self.db.install_agent(installation_input.clone()).await?,
+            };
             match outcome {
                 InstallAgentOutcome::Installed(row)
                 | InstallAgentOutcome::AlreadyInstalled(row) => row,
@@ -1393,15 +1805,22 @@ impl AgentInstallationService {
                         request.replace_acknowledged,
                         "agent installation collides with a different installed definition; explicit replacement acknowledgement is required"
                     );
-                    let existing = self
-                        .db
-                        .agent_installation_by_source(
-                            installation_input.scope,
-                            installation_input.canonical_workspace_id.clone(),
-                            installation_input.source_agent_id.clone(),
-                        )
-                        .await?
-                        .context("replacement target installation disappeared")?;
+                    let existing = match update_target_id {
+                        Some(target_id) => self
+                            .db
+                            .agent_installation(target_id)
+                            .await?
+                            .context("replacement target installation disappeared")?,
+                        None => self
+                            .db
+                            .agent_installation_by_source(
+                                installation_input.scope,
+                                installation_input.canonical_workspace_id.clone(),
+                                installation_input.source_agent_id.clone(),
+                            )
+                            .await?
+                            .context("replacement target installation disappeared")?,
+                    };
                     let replacement = match journal_replacement_receipt(&journal).transpose()? {
                         Some(receipt) => {
                             ensure!(
@@ -1438,11 +1857,19 @@ impl AgentInstallationService {
                     self.db
                         .record_installation_journal(journal.clone(), now)
                         .await?;
-                    match self
-                        .db
-                        .replace_agent(installation_input, operation.created_at_unix_ms)
-                        .await?
-                    {
+                    match if let Some(target_id) = update_target_id {
+                        self.db
+                            .replace_agent_at(
+                                target_id,
+                                installation_input,
+                                operation.created_at_unix_ms,
+                            )
+                            .await?
+                    } else {
+                        self.db
+                            .replace_agent(installation_input, operation.created_at_unix_ms)
+                            .await?
+                    } {
                         InstallAgentOutcome::Installed(row)
                         | InstallAgentOutcome::AlreadyInstalled(row) => row,
                         InstallAgentOutcome::Conflict => {
@@ -1452,6 +1879,12 @@ impl AgentInstallationService {
                 }
             }
         };
+        if let Some(target) = update_target.as_ref() {
+            ensure!(
+                installation.installation_id == target.installation_id,
+                "update source resolves to a different installation"
+            );
+        }
         if checkpoint_rank(journal.checkpoint)
             < checkpoint_rank(InstallationJournalCheckpoint::DbCommitted)
         {
@@ -1579,22 +2012,14 @@ impl AgentInstallationService {
         workspace_root: Option<PathBuf>,
         now: i64,
     ) -> Result<AgentInstallationResultV1> {
-        // The CLI supplies `--path` as an opaque request string. This daemon
-        // owns all interpretation: it derives the requested identity without
-        // opening/stat'ing caller files and only ever writes its owned target.
-        let requested_path = Path::new(&request.source_locator);
-        ensure!(
-            requested_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                == Some("md"),
-            "created agent path must end in .md"
-        );
-        let agent_id = requested_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|stem| !stem.trim().is_empty())
-            .context("created agent path must have a usable file stem")?;
+        // Create accepts a declarative identity, never a client filesystem
+        // path. The daemon owns both the generated Markdown filename and its
+        // destination below the authorized scope root.
+        let agent_id = request
+            .source_locator
+            .strip_prefix("authored/")
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+            .context("created agent identity must be authored/NAME")?;
         ensure!(
             !agent_id.is_empty()
                 && agent_id
@@ -1776,6 +2201,103 @@ impl AgentInstallationService {
             }
         }
     }
+
+    async fn record(
+        &self,
+        row: cockpit_db::db::agent_installations::AgentInstallationRow,
+        workspace_root: Option<&Path>,
+    ) -> Result<AgentInstallationRecordV1> {
+        // Shared definitions are portable by construction. Local provider
+        // handles, effective bindings, and even their derived status belong
+        // to a user's private daemon state and must not appear in a shared
+        // list/inspect DTO (including an empty/unbound status inferred here).
+        let bindings = if row.scope == AgentInstallationScope::WorkspaceShared {
+            Vec::new()
+        } else {
+            let current_bindings = self
+                .db
+                .current_agent_bindings(row.installation_id, row.source_digest.clone())
+                .await?
+                .into_iter()
+                .map(|binding| (binding.slot_id, binding.model_id))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let name = row
+                .source_agent_id
+                .rsplit('/')
+                .next()
+                .context("installed agent id has no filename")?;
+            let path = owned_path(
+                &self.daemon_agents_dir,
+                workspace_root,
+                match row.scope {
+                    AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+                    AgentInstallationScope::WorkspacePrivate => {
+                        AgentInstallationScopeWire::WorkspacePrivate
+                    }
+                    AgentInstallationScope::WorkspaceShared => unreachable!("shared is handled"),
+                },
+                name,
+            )?;
+            let definition = crate::agents::parse_agent(
+                std::str::from_utf8(&read_owned_file(&path, "reading installed agent status")?)?,
+                name,
+                path,
+            )?;
+            let observed_digest = sha256_hex(&definition.vnext_digest_bytes()?);
+            let observation = self.db.agent_observation(row.installation_id).await?;
+            let rebind_required = observation.is_none_or(|observation| {
+                !observation.reviewed || observation.observed_digest != observed_digest
+            });
+            definition
+                .vnext
+                .context("installed agent is not a vNext definition")?
+                .model_slots
+                .iter()
+                .map(|(slot_id, slot)| match current_bindings.get(slot_id) {
+                    Some(model_id) => AgentInstallationSlotStatusV1 {
+                        slot_id: slot_id.clone(),
+                        state: if rebind_required {
+                            AgentInstallationSlotBindingStateV1::RebindRequired
+                        } else {
+                            AgentInstallationSlotBindingStateV1::Bound
+                        },
+                        model_id: model_id.clone(),
+                    },
+                    None => AgentInstallationSlotStatusV1 {
+                        slot_id: slot_id.clone(),
+                        state: if rebind_required {
+                            AgentInstallationSlotBindingStateV1::RebindRequired
+                        } else if slot_id == "primary"
+                            || slot.purpose.eq_ignore_ascii_case("primary")
+                        {
+                            AgentInstallationSlotBindingStateV1::PrimaryUnusable
+                        } else {
+                            AgentInstallationSlotBindingStateV1::OptionalUnbound
+                        },
+                        model_id: String::new(),
+                    },
+                })
+                .collect()
+        };
+        Ok(AgentInstallationRecordV1 {
+            installation_id: row.installation_id.to_string(),
+            scope: match row.scope {
+                AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
+                AgentInstallationScope::WorkspacePrivate => {
+                    AgentInstallationScopeWire::WorkspacePrivate
+                }
+                AgentInstallationScope::WorkspaceShared => {
+                    AgentInstallationScopeWire::WorkspaceShared
+                }
+            },
+            source_agent_id: row.source_agent_id,
+            source_identity: row.source_identity,
+            source_revision: row.source_revision,
+            source_digest: row.source_digest,
+            installation_revision: row.installation_revision,
+            bindings,
+        })
+    }
 }
 
 /// Construct the production daemon coordinator. The state directory is
@@ -1821,12 +2343,13 @@ fn db_scope(value: AgentInstallationScopeWire) -> AgentInstallationScope {
 fn request_fingerprint(request: &AgentInstallationBeginV1, workspace: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!(
-        "v{}:{:?}:{:?}:{}:{}:{}:{}",
+        "v{}:{:?}:{:?}:{}:{}:{}:{}:{}",
         request.dto_version,
         request.operation,
         request.scope,
         workspace.unwrap_or(""),
         request.source_locator,
+        request.target_installation_id.as_deref().unwrap_or(""),
         request.replace_acknowledged,
         request.requested_slot.as_deref().unwrap_or("")
     ));
@@ -2724,10 +3247,10 @@ fn rollback_stage(target: &Path, operation: Uuid) {
 }
 fn prior_file_metadata(path: &Path, operation: Uuid) -> Result<Option<String>> {
     if !owned_file_exists(path, false)? {
-        return Ok(None);
+        return Ok(Some(serde_json::json!({"present": false}).to_string()));
     };
     let bytes = read_owned_file(path, "reading existing owned agent file")?;
-    Ok(Some(serde_json::json!({"digest": sha256_hex(&bytes), "backup_name": prior_backup_path(path, operation)?.file_name().and_then(|name| name.to_str()).unwrap_or_default()}).to_string()))
+    Ok(Some(serde_json::json!({"present": true, "digest": sha256_hex(&bytes), "backup_name": prior_backup_path(path, operation)?.file_name().and_then(|name| name.to_str()).unwrap_or_default()}).to_string()))
 }
 
 fn with_replacement_receipt(
@@ -2789,14 +3312,21 @@ fn prior_file_is_unchanged(path: &Path, metadata: Option<&str>) -> Result<bool> 
     let Some(metadata) = metadata else {
         return Ok(!owned_file_exists(path, false)?);
     };
-    let expected = serde_json::from_str::<serde_json::Value>(metadata)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("digest")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
+    let parsed = serde_json::from_str::<serde_json::Value>(metadata).ok();
+    if parsed
+        .as_ref()
+        .and_then(|value| value.get("present"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return Ok(!owned_file_exists(path, false)?);
+    }
+    let expected = parsed.and_then(|value| {
+        value
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
     Ok(expected.is_some_and(|expected| {
         owned_file_exists(path, false).unwrap_or(false)
             && target_digest(path)
@@ -2809,6 +3339,32 @@ fn target_digest(path: &Path) -> Result<String> {
         path,
         "reading published daemon-owned agent definition",
     )?))
+}
+
+/// Build the redacted immutable journal payload before the DB transaction
+/// creates an operation. The source was already fully fetched and parsed; the
+/// transaction below persists this exact SHA/byte sequence alongside the
+/// operation so a crash cannot make a same-key retry consult a moving ref.
+fn staged_source_journal_metadata(
+    source_locator: &str,
+    fetched: &FetchedAgentSource,
+) -> Result<(String, String)> {
+    let source = CanonicalAgentSource::parse(source_locator)?;
+    let target_name = source
+        .markdown_path
+        .rsplit('/')
+        .next()
+        .and_then(|value| value.strip_suffix(".md"))
+        .filter(|value| !value.is_empty())
+        .context("source Markdown path has no agent filename")?;
+    let digest = sha256_hex(&fetched.markdown);
+    let metadata = serde_json::to_string(&JournalStagedSource {
+        target_name: target_name.to_owned(),
+        digest: digest.clone(),
+        commit_sha: fetched.commit_sha.clone(),
+        markdown_base64: base64::engine::general_purpose::STANDARD.encode(&fetched.markdown),
+    })?;
+    Ok((metadata, digest))
 }
 fn checkpoint_rank(value: InstallationJournalCheckpoint) -> u8 {
     match value {
@@ -3125,25 +3681,6 @@ fn binding_terminal_receipt(
         binding_outcome: Some(binding_outcome),
     }
 }
-fn record(
-    row: cockpit_db::db::agent_installations::AgentInstallationRow,
-) -> AgentInstallationRecordV1 {
-    AgentInstallationRecordV1 {
-        installation_id: row.installation_id.to_string(),
-        scope: match row.scope {
-            AgentInstallationScope::Global => AgentInstallationScopeWire::Global,
-            AgentInstallationScope::WorkspacePrivate => {
-                AgentInstallationScopeWire::WorkspacePrivate
-            }
-            AgentInstallationScope::WorkspaceShared => AgentInstallationScopeWire::WorkspaceShared,
-        },
-        source_agent_id: row.source_agent_id,
-        source_identity: row.source_identity,
-        source_revision: row.source_revision,
-        source_digest: row.source_digest,
-        installation_revision: row.installation_revision,
-    }
-}
 fn replay_operation(receipt_json: Option<&str>) -> Result<AgentInstallationResultV1> {
     let receipt = receipt_json.context("installation operation is still in progress")?;
     serde_json::from_str(receipt).context("stored installation receipt is corrupt")
@@ -3170,7 +3707,7 @@ fn redacted_error(error: anyhow::Error) -> AgentInstallationResultV1 {
         AgentInstallationErrorCodeV1::Collision
     } else if text.contains("fetch") {
         AgentInstallationErrorCodeV1::FetchFailed
-    } else if text.contains("vNext") || text.contains("Markdown") {
+    } else if text.contains("vNext") || text.contains("Markdown") || text.contains("AgentDef") {
         AgentInstallationErrorCodeV1::InvalidDefinition
     } else {
         AgentInstallationErrorCodeV1::InvalidRequest
@@ -3441,6 +3978,10 @@ mod tests {
 
     impl ServiceHarness {
         fn new(reply: FetchReply) -> Self {
+            Self::with_providers(reply, ProvidersConfig::default())
+        }
+
+        fn with_providers(reply: FetchReply, providers: ProvidersConfig) -> Self {
             let root = tempfile::tempdir().expect("temporary daemon root");
             let fetcher = MockFetcher {
                 reply: Arc::new(Mutex::new(reply)),
@@ -3455,7 +3996,7 @@ mod tests {
                     root: root.path().join("workspace"),
                     allowed: true,
                 }),
-                ProvidersConfig::default(),
+                providers,
             );
             Self {
                 _root: root,
@@ -3473,6 +4014,7 @@ mod tests {
                 scope: AgentInstallationScopeWire::Global,
                 workspace_path: None,
                 source_locator: "owner/repo@main:agents/helper.md".into(),
+                target_installation_id: None,
                 replace_acknowledged: false,
                 requested_slot: None,
                 execution_kind: None,
@@ -3493,12 +4035,422 @@ mod tests {
         }
     }
 
+    fn binding_providers() -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        for (profile, provider_id, model_id) in [
+            ("profile-a", "vendor", "exact-a"),
+            ("profile-b", "vendor", "exact-b"),
+            ("profile-local", "local", "compatible"),
+        ] {
+            let mut entry = ProviderEntry::default();
+            entry.template = Some(provider_id.into());
+            entry.models.push(ModelEntry {
+                id: model_id.into(),
+                context_length: Some(128),
+                ..ModelEntry::default()
+            });
+            providers.providers.insert(profile.into(), entry);
+        }
+        providers
+    }
+
+    fn fetched_with_binding_choices(required_capability: &str) -> FetchedAgentSource {
+        FetchedAgentSource {
+            commit_sha: "b".repeat(40),
+            markdown: format!(
+                "---\ndescription: helper\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [{required_capability}]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n      - recommendationId: second\n        upstreamIdentity: upstream/second\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-b\n      - recommendationId: missing\n        upstreamIdentity: upstream/missing\n  optional:\n    purpose: optional\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n    suggestedModels:\n      - recommendationId: first\n        upstreamIdentity: upstream/first\n        providerAliases:\n          - providerId: vendor\n            modelId: exact-a\n---\nbody\n"
+            )
+            .into_bytes(),
+        }
+    }
+
     fn fetched_definition_digest(fetched: &FetchedAgentSource) -> String {
         let markdown = std::str::from_utf8(&fetched.markdown).expect("fixture utf8");
         let definition =
             crate::agents::parse_agent(markdown, "helper", PathBuf::from("fixture.md"))
                 .expect("fixture definition");
         sha256_hex(&definition.vnext_digest_bytes().expect("fixture digest"))
+    }
+
+    #[test]
+    fn agent_installation_daemon_update_target_is_part_of_the_idempotency_fingerprint() {
+        let mut first = ServiceHarness::request("update-target-fingerprint");
+        first.operation = AgentInstallationOperationKind::Update;
+        first.target_installation_id = Some("00000000-0000-0000-0000-000000000001".into());
+        let mut second = first.clone();
+        second.target_installation_id = Some("00000000-0000-0000-0000-000000000002".into());
+        assert_ne!(
+            request_fingerprint(&first, None),
+            request_fingerprint(&second, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_update_without_target_refuses_before_fetch_or_mutation() {
+        let harness = ServiceHarness::new(FetchReply::Failure("must not fetch".into()));
+        let mut request = ServiceHarness::request("update-requires-target");
+        request.operation = AgentInstallationOperationKind::Update;
+        request.replace_acknowledged = true;
+        let AgentInstallationResultV1::Error { error } = harness.service.begin(request, 1).await
+        else {
+            panic!("update without durable target must be refused")
+        };
+        assert_eq!(error.code, AgentInstallationErrorCodeV1::InvalidRequest);
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_invalid_manifest_is_typed_and_creates_no_operation_or_file()
+    {
+        let harness = ServiceHarness::new(FetchReply::Source(FetchedAgentSource {
+            commit_sha: "d".repeat(40),
+            markdown: b"---\ndescription: invalid\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\n---\nmissing slots\n".to_vec(),
+        }));
+        let result = harness
+            .service
+            .begin(ServiceHarness::request("invalid-manifest"), 1)
+            .await;
+        assert!(matches!(
+            result,
+            AgentInstallationResultV1::Error { error }
+                if error.code == AgentInstallationErrorCodeV1::InvalidDefinition
+        ));
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            harness
+                .db
+                .installation_operation("invalid-manifest".into())
+                .await
+                .expect("read invalid manifest operation")
+                .is_none()
+        );
+        assert!(
+            harness
+                .db
+                .list_agent_installations(AgentInstallationScope::Global, None)
+                .await
+                .expect("list invalid manifest installations")
+                .is_empty()
+        );
+        assert!(!harness.target().exists());
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_atomic_begin_replays_pinned_source_after_crash_without_refetch()
+     {
+        let harness = ServiceHarness::new(FetchReply::Source(ServiceHarness::fetched()));
+        let request = ServiceHarness::request("atomic-begin-crash");
+        let fetched = ServiceHarness::fetched();
+        let (staged_file_metadata_json, expected_digest) =
+            staged_source_journal_metadata(&request.source_locator, &fetched)
+                .expect("serialize pinned staged source");
+        let BeginInstallationOperation::Created(operation) = harness
+            .db
+            .begin_installation_operation_with_staged_journal(
+                request.idempotency_key.clone(),
+                request_fingerprint(&request, None),
+                InstallationOperationKind::Install,
+                None,
+                staged_file_metadata_json,
+                expected_digest,
+                1,
+            )
+            .await
+            .expect("atomic operation and journal")
+        else {
+            panic!("fixture must create an operation")
+        };
+        assert!(
+            harness
+                .db
+                .installation_journal(operation.operation_id)
+                .await
+                .expect("read atomic journal")
+                .is_some(),
+            "there is no operation-created/journal-not-separate crash state"
+        );
+        *harness.fetcher.reply.lock().expect("fetcher reply") =
+            FetchReply::Failure("moving ref must not be consulted on recovery".into());
+        let result = harness.service.begin(request, 99).await;
+        assert!(matches!(
+            result,
+            AgentInstallationResultV1::Receipt {
+                status: AgentInstallationReceiptStatusV1::Installed,
+                source_revision: Some(ref revision),
+                ..
+            } if revision == &"a".repeat(40)
+        ));
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_update_rejects_mismatched_target_without_mutation() {
+        let harness = ServiceHarness::new(FetchReply::Failure("must not fetch".into()));
+        let installation_id = Uuid::new_v4();
+        harness
+            .db
+            .install_agent(AgentInstallationInput {
+                installation_id,
+                scope: AgentInstallationScope::Global,
+                canonical_workspace_id: None,
+                source_agent_id: "authored/helper".into(),
+                source_identity: "owner/other:agents/helper.md".into(),
+                source_revision: Some("b".repeat(40)),
+                source_digest: "c".repeat(64),
+                fetched_at_unix_ms: 1,
+            })
+            .await
+            .expect("seed mismatched target");
+        let mut request = ServiceHarness::request("update-target-mismatch");
+        request.operation = AgentInstallationOperationKind::Update;
+        request.target_installation_id = Some(installation_id.to_string());
+        request.replace_acknowledged = true;
+        let AgentInstallationResultV1::Error { error } = harness.service.begin(request, 2).await
+        else {
+            panic!("mismatched update target must be refused")
+        };
+        assert_eq!(error.code, AgentInstallationErrorCodeV1::InvalidRequest);
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            harness
+                .db
+                .installation_operation("update-target-mismatch".into())
+                .await
+                .expect("read operation")
+                .is_none(),
+            "a mismatched target must not create an operation row"
+        );
+        assert_eq!(
+            harness
+                .db
+                .agent_installation(installation_id)
+                .await
+                .expect("read target")
+                .expect("target remains")
+                .source_identity,
+            "owner/other:agents/helper.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_create_uses_authored_identity_and_refuses_collision() {
+        let harness = ServiceHarness::new(FetchReply::Failure("create does not fetch".into()));
+        let mut request = ServiceHarness::request("create-authored");
+        request.operation = AgentInstallationOperationKind::Create;
+        request.source_locator = "authored/new-helper".into();
+        request.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+        request.primary_slot_id = Some("primary".into());
+        let AgentInstallationResultV1::Receipt {
+            status: AgentInstallationReceiptStatusV1::Created,
+            installation_id: Some(installation_id),
+            ..
+        } = harness.service.begin(request, 1).await
+        else {
+            panic!("daemon create must accept authored/NAME")
+        };
+        assert!(Uuid::parse_str(&installation_id).is_ok());
+        assert_eq!(harness.fetcher.calls.load(Ordering::SeqCst), 0);
+
+        let mut collision = ServiceHarness::request("create-authored-collision");
+        collision.operation = AgentInstallationOperationKind::Create;
+        collision.source_locator = "authored/new-helper".into();
+        collision.execution_kind = Some(AgentInstallationExecutionKindV1::Coding);
+        collision.primary_slot_id = Some("primary".into());
+        let AgentInstallationResultV1::Error { error } = harness.service.begin(collision, 2).await
+        else {
+            panic!("same scope authored identity must not overwrite")
+        };
+        assert_eq!(error.code, AgentInstallationErrorCodeV1::Collision);
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_bind_matrix_preserves_suggestions_allows_local_and_handles_defer_and_rebind()
+     {
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Source(fetched_with_binding_choices("text_generation")),
+            binding_providers(),
+        );
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(installation_id),
+            ..
+        } = harness
+            .service
+            .begin(ServiceHarness::request("bind-matrix-install"), 1)
+            .await
+        else {
+            panic!("scripted install must create an installation")
+        };
+
+        let bind = |key: &str, slot: &str| AgentInstallationBeginV1 {
+            idempotency_key: key.into(),
+            operation: AgentInstallationOperationKind::Bind,
+            source_locator: installation_id.clone(),
+            requested_slot: Some(slot.into()),
+            ..ServiceHarness::request(key)
+        };
+        let AgentInstallationResultV1::NeedsChoice {
+            continuation_token,
+            choices,
+            unmatched_recommendations,
+            ..
+        } = harness
+            .service
+            .begin(bind("bind-local", "primary"), 2)
+            .await
+        else {
+            panic!("compatible routes must require a daemon choice")
+        };
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.recommendation_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("first"), Some("second"), None]
+        );
+        assert!(choices[0].exact_alias_match && choices[0].author_suggested);
+        assert!(choices[1].exact_alias_match && choices[1].author_suggested);
+        assert!(!choices[2].author_suggested && !choices[2].exact_alias_match);
+        assert_eq!(
+            unmatched_recommendations[0].canonical_upstream_identity,
+            "upstream/missing"
+        );
+        let local_choice = choices[2].choice_id.clone();
+        assert!(matches!(
+            harness
+                .service
+                .submit_choice(
+                    AgentInstallationSubmitChoiceV1 {
+                        dto_version: AGENT_INSTALLATION_DTO_VERSION,
+                        continuation_token,
+                        choice_id: Some(local_choice),
+                        defer: false,
+                    },
+                    3,
+                )
+                .await,
+            AgentInstallationResultV1::Receipt {
+                status: AgentInstallationReceiptStatusV1::Bound,
+                ..
+            }
+        ));
+
+        let AgentInstallationResultV1::NeedsChoice {
+            continuation_token,
+            choices,
+            ..
+        } = harness
+            .service
+            .begin(bind("bind-rebind", "primary"), 4)
+            .await
+        else {
+            panic!("rebind must create a fresh daemon choice")
+        };
+        assert!(matches!(
+            harness
+                .service
+                .submit_choice(
+                    AgentInstallationSubmitChoiceV1 {
+                        dto_version: AGENT_INSTALLATION_DTO_VERSION,
+                        continuation_token,
+                        choice_id: Some(choices[1].choice_id.clone()),
+                        defer: false,
+                    },
+                    5,
+                )
+                .await,
+            AgentInstallationResultV1::Receipt {
+                status: AgentInstallationReceiptStatusV1::Bound,
+                ..
+            }
+        ));
+
+        for (key, slot, status) in [
+            (
+                "bind-defer-optional",
+                "optional",
+                AgentInstallationReceiptStatusV1::OptionalUnbound,
+            ),
+            (
+                "bind-defer-primary",
+                "primary",
+                AgentInstallationReceiptStatusV1::PrimaryUnusable,
+            ),
+        ] {
+            let AgentInstallationResultV1::NeedsChoice {
+                continuation_token, ..
+            } = harness.service.begin(bind(key, slot), 6).await
+            else {
+                panic!("{slot} must offer a deferrable choice")
+            };
+            assert!(matches!(
+                harness
+                    .service
+                    .submit_choice(
+                        AgentInstallationSubmitChoiceV1 {
+                            dto_version: AGENT_INSTALLATION_DTO_VERSION,
+                            continuation_token,
+                            choice_id: None,
+                            defer: true,
+                        },
+                        7,
+                    )
+                    .await,
+                AgentInstallationResultV1::Receipt { status: actual, .. } if actual == status
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_bind_refuses_unknown_hard_capability_without_mutating_bindings()
+     {
+        let harness = ServiceHarness::with_providers(
+            FetchReply::Source(fetched_with_binding_choices("tool_calling")),
+            binding_providers(),
+        );
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(installation_id),
+            ..
+        } = harness
+            .service
+            .begin(ServiceHarness::request("unknown-capability-install"), 1)
+            .await
+        else {
+            panic!("install must succeed before the bind check")
+        };
+        let result = harness
+            .service
+            .begin(
+                AgentInstallationBeginV1 {
+                    idempotency_key: "unknown-capability-bind".into(),
+                    operation: AgentInstallationOperationKind::Bind,
+                    source_locator: installation_id,
+                    requested_slot: Some("primary".into()),
+                    ..ServiceHarness::request("unknown-capability-bind")
+                },
+                2,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            AgentInstallationResultV1::Receipt {
+                status: AgentInstallationReceiptStatusV1::PrimaryUnusable,
+                ..
+            }
+        ));
+        assert_eq!(
+            harness
+                .db
+                .read(|conn| {
+                    Ok(
+                        conn.query_row("SELECT COUNT(*) FROM agent_model_bindings", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                    )
+                })
+                .await
+                .expect("binding count"),
+            0
+        );
     }
 
     fn slot(
@@ -4477,6 +5429,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_installation_daemon_dirty_update_never_overwrites_the_owned_copy() {
+        let harness = ServiceHarness::new(FetchReply::Source(ServiceHarness::fetched()));
+        let AgentInstallationResultV1::Receipt {
+            installation_id: Some(installation_id),
+            ..
+        } = harness
+            .service
+            .begin(ServiceHarness::request("dirty-update-install"), 1)
+            .await
+        else {
+            panic!("initial install must succeed")
+        };
+        std::fs::write(harness.target(), "locally modified agent").expect("modify owned copy");
+        *harness.fetcher.reply.lock().expect("fetcher reply") = FetchReply::Source(FetchedAgentSource {
+            commit_sha: "c".repeat(40),
+            markdown: b"---\ndescription: refreshed helper\nschemaVersion: 2\nagentId: authored/helper\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: primary\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\nrefreshed\n".to_vec(),
+        });
+        let result = harness
+            .service
+            .begin(
+                AgentInstallationBeginV1 {
+                    idempotency_key: "dirty-update".into(),
+                    operation: AgentInstallationOperationKind::Update,
+                    source_locator: "owner/repo@main:agents/helper.md".into(),
+                    target_installation_id: Some(installation_id.clone()),
+                    replace_acknowledged: true,
+                    ..ServiceHarness::request("dirty-update")
+                },
+                2,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            AgentInstallationResultV1::Error { error }
+                if error.code == AgentInstallationErrorCodeV1::DirtySharedFile
+        ));
+        assert_eq!(
+            std::fs::read_to_string(harness.target()).expect("owned copy remains readable"),
+            "locally modified agent"
+        );
+        assert_eq!(
+            harness
+                .db
+                .agent_installation(Uuid::parse_str(&installation_id).expect("installation id"))
+                .await
+                .expect("read installation")
+                .expect("installation remains")
+                .source_revision,
+            Some("a".repeat(40))
+        );
+    }
+
+    #[tokio::test]
     async fn agent_installation_daemon_shared_exact_ref_path_and_digest_replays_without_collision()
     {
         let harness = ServiceHarness::new(FetchReply::Source(ServiceHarness::fetched()));
@@ -4888,5 +5893,33 @@ mod tests {
         assert!(!wire.contains("profile-secret"));
         let routes = durable_binding_routes(&offerings, &choices).expect("durable route");
         assert_eq!(routes[0].provider_profile_handle, "profile-secret");
+    }
+
+    /// This target is intentionally exercised by `cargo test --release` in
+    /// the release matrix.  The fixture loader and its environment variable
+    /// are both cfg(debug_assertions), so a release daemon has no selectable
+    /// scripted-fetch path at all.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn agent_installation_daemon_release_build_compiles_out_debug_fixture_control() {
+        assert!(!cfg!(debug_assertions));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn agent_installation_daemon_debug_fixture_rejects_credential_or_transport_fields() {
+        let commit_sha = "b".repeat(40);
+        let value = serde_json::json!({
+            "commit_sha": commit_sha,
+            "markdown": "fixture",
+            "workspace_path": ".",
+            "providers": {
+                "profile": {
+                    "template": "vendor",
+                    "headers": [{"name": "Authorization", "value": "not-allowed"}]
+                }
+            }
+        });
+        assert!(serde_json::from_value::<DebugAgentInstallationFixture>(value).is_err());
     }
 }

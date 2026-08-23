@@ -248,6 +248,32 @@ impl SpawnedDaemon {
         Self::start_in(home).await
     }
 
+    /// Start a debug daemon whose agent-installation RPCs use one immutable
+    /// scripted service.  The child receives only a path to non-secret JSON;
+    /// the fixture cannot carry credentials or a transport endpoint.
+    #[cfg(debug_assertions)]
+    pub async fn start_with_agent_installation_fixture(fixture: &serde_json::Value) -> Self {
+        Self::start_with_home_agent_installation_fixture(IsolatedHome::new(), fixture).await
+    }
+
+    #[cfg(debug_assertions)]
+    pub async fn start_with_home_agent_installation_fixture(
+        mut home: IsolatedHome,
+        fixture: &serde_json::Value,
+    ) -> Self {
+        let path = home.home_dir().join("agent-installation-fixture.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(fixture).expect("serialize agent-installation fixture"),
+        )
+        .expect("write non-secret agent-installation fixture");
+        home.set_env(
+            cockpit_cli::daemon::agent_installation::DEBUG_AGENT_INSTALLATION_FIXTURE_ENV,
+            path.display().to_string(),
+        );
+        Self::start_in(home).await
+    }
+
     async fn start_in(home: IsolatedHome) -> Self {
         let output = home
             .cockpit()

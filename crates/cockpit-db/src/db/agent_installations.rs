@@ -660,6 +660,23 @@ impl Db {
         self.transaction(move |conn| replace_agent_conn(conn, &input, now_unix_ms))
             .await
     }
+
+    /// Replace one explicit daemon-owned installation. Unlike
+    /// [`Self::replace_agent`], this never resolves the target from a source
+    /// identity: callers that already selected an installation (notably
+    /// `agent update INSTALLATION_ID`) must not be able to redirect a replace
+    /// merely by fetching an AgentDef with a different identity.
+    pub async fn replace_agent_at(
+        &self,
+        installation_id: Uuid,
+        input: AgentInstallationInput,
+        now_unix_ms: i64,
+    ) -> Result<InstallAgentOutcome> {
+        self.transaction(move |conn| {
+            replace_agent_at_conn(conn, installation_id, &input, now_unix_ms)
+        })
+        .await
+    }
     pub async fn agent_installation(
         &self,
         installation_id: Uuid,
@@ -797,6 +814,19 @@ impl Db {
         .await
     }
 
+    /// Current hard-verified bindings for a definition digest. Returned rows
+    /// remain daemon-local; callers must redact profile handles before wire use.
+    pub async fn current_agent_bindings(
+        &self,
+        installation_id: Uuid,
+        definition_digest: String,
+    ) -> Result<Vec<AgentBindingRow>> {
+        self.read(move |conn| {
+            current_bindings_for_digest(conn, installation_id, &definition_digest)
+        })
+        .await
+    }
+
     /// Look up one installation by its daemon-owned source identity.  The
     /// caller must supply the same canonical workspace identity used during
     /// installation; this layer never inspects a filesystem path.
@@ -808,6 +838,14 @@ impl Db {
     ) -> Result<Option<AgentInstallationRow>> {
         let key = scope_key(scope, canonical_workspace_id.as_deref())?;
         self.read(move |conn| installation_by_identity(conn, scope, &key, &source_agent_id))
+            .await
+    }
+
+    pub async fn agent_observation(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Option<AgentObservationRow>> {
+        self.read(move |conn| observation_by_id(conn, installation_id))
             .await
     }
 
@@ -1057,6 +1095,53 @@ pub fn replace_agent_conn(
         params![existing.installation_id.to_string(), input.source_digest, now_unix_ms],
     )
     .context("refreshing replaced installation observation")?;
+    Ok(InstallAgentOutcome::Installed(
+        installation_by_id(conn, existing.installation_id)?.expect("updated installation"),
+    ))
+}
+
+/// Targeted form of [`replace_agent_conn`]. This is deliberately separate
+/// from the source-identity resolver above: an update has already authorized
+/// a concrete installation id, and changing a fetched AgentDef's id must not
+/// select another record in the same namespace.
+pub fn replace_agent_at_conn(
+    conn: &Connection,
+    installation_id: Uuid,
+    input: &AgentInstallationInput,
+    now_unix_ms: i64,
+) -> Result<InstallAgentOutcome> {
+    validate_installation(input)?;
+    let Some(existing) = installation_by_id(conn, installation_id)? else {
+        return Ok(InstallAgentOutcome::Conflict);
+    };
+    ensure!(
+        existing.scope == input.scope
+            && existing.canonical_workspace_id == input.canonical_workspace_id
+            && existing.source_agent_id == input.source_agent_id,
+        "targeted replacement identity does not match installation"
+    );
+    if existing.source_identity == input.source_identity
+        && existing.source_revision == input.source_revision
+        && existing.source_digest == input.source_digest
+        && existing.deleted_at_unix_ms.is_none()
+    {
+        return Ok(InstallAgentOutcome::AlreadyInstalled(existing));
+    }
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL",
+        params![existing.installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring bindings before targeted agent replacement")?;
+    conn.execute(
+        "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=installation_revision+1,deleted_at_unix_ms=NULL WHERE installation_id=?1",
+        params![existing.installation_id.to_string(), input.source_identity, input.source_revision, input.source_digest, input.fetched_at_unix_ms],
+    )
+    .context("replacing targeted agent installation provenance")?;
+    conn.execute(
+        "UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",
+        params![existing.installation_id.to_string(), input.source_digest, now_unix_ms],
+    )
+    .context("refreshing targeted installation observation")?;
     Ok(InstallAgentOutcome::Installed(
         installation_by_id(conn, existing.installation_id)?.expect("updated installation"),
     ))

@@ -31,8 +31,8 @@ pub use agent_installation::{
     AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
     AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
     AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
-    AgentInstallationScopeWire, AgentInstallationSubmitChoiceV1,
-    AgentInstallationUnmatchedRecommendationV1,
+    AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
+    AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 pub mod host_capabilities;
 pub mod image_control;

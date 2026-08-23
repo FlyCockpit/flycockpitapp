@@ -5243,6 +5243,48 @@ CREATE UNIQUE INDEX agent_model_bindings_current_slot
     ON agent_model_bindings(installation_id, definition_digest, slot_id)
     WHERE retired_at_unix_ms IS NULL;
 
+-- The daemon installation service owns these operation rows.  They are
+-- deliberately separate from `agent_installations`: replay/recovery may
+-- observe or finish a file journal, but it must invoke the installation
+-- transaction above as the sole authority that changes binding/snapshot/
+-- revision state.
+CREATE TABLE installation_operations (
+    operation_id                 TEXT PRIMARY KEY,
+    idempotency_key              TEXT NOT NULL UNIQUE,
+    request_fingerprint          TEXT NOT NULL,
+    operation_kind               TEXT NOT NULL CHECK (operation_kind IN ('install', 'update', 'bind', 'create')),
+    canonical_workspace_id       TEXT,
+    state                        TEXT NOT NULL CHECK (state IN ('pending_choice', 'running', 'terminal')),
+    terminal_receipt_json        TEXT,
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL,
+    CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
+);
+
+CREATE TABLE installation_continuations (
+    continuation_token           TEXT PRIMARY KEY,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    choice_set_json              TEXT NOT NULL,
+    expires_at_unix_ms           INTEGER NOT NULL,
+    submitted_choice_id          TEXT,
+    state                        TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'expired', 'completed')),
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL
+);
+CREATE INDEX installation_continuations_expiry
+ON installation_continuations(state, expires_at_unix_ms);
+
+CREATE TABLE installation_journals (
+    journal_id                   TEXT PRIMARY KEY,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    checkpoint                   TEXT NOT NULL CHECK (checkpoint IN ('staged', 'db_committed', 'file_renamed', 'complete')),
+    staged_file_metadata_json    TEXT,
+    prior_file_metadata_json     TEXT,
+    expected_digest              TEXT NOT NULL,
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL
+);
+
 -- Bind requests get their own receipt because a retry must be distinguished
 -- from a different mutation that happens to choose identical model metadata.
 CREATE TABLE agent_binding_receipts (

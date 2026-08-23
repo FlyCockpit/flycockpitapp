@@ -15724,6 +15724,45 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             package: Some("tokio".into()),
             project_root: None,
         },
+        "agent_installation_begin" => {
+            Request::AgentInstallationBegin(cockpit_proto::AgentInstallationBeginV1 {
+                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                idempotency_key: "agent-installation-matrix".into(),
+                operation: cockpit_proto::AgentInstallationOperationKind::Create,
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                workspace_path: None,
+                source_locator: "authored/helper".into(),
+                replace_acknowledged: false,
+                requested_slot: None,
+                execution_kind: Some(cockpit_proto::AgentInstallationExecutionKindV1::Coding),
+                primary_slot_id: Some("primary".into()),
+                auto_select_first_exact: false,
+            })
+        }
+        "agent_installation_submit_choice" => {
+            Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 {
+                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                continuation_token: Uuid::new_v4().to_string(),
+                choice_id: Some("choice-a".into()),
+                defer: false,
+            })
+        }
+        "agent_installation_list" => {
+            Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 {
+                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                workspace_path: None,
+                installation_id: None,
+            })
+        }
+        "agent_installation_inspect" => {
+            Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 {
+                dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION,
+                scope: cockpit_proto::AgentInstallationScopeWire::Global,
+                workspace_path: None,
+                installation_id: Some(Uuid::new_v4().to_string()),
+            })
+        }
         other => panic!("unhandled authz matrix request kind {other}"),
     }
 }
@@ -22443,6 +22482,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::GetMediaUploadStatus(..) => "GetMediaUploadStatus",
                         Request::FinalizeMediaUpload(..) => "FinalizeMediaUpload",
                         Request::DiscardUnreferencedMediaAttachment(..) => "DiscardUnreferencedMediaAttachment",
+                        Request::AgentInstallationBegin(..) => "AgentInstallationBegin",
+                        Request::AgentInstallationSubmitChoice(..) => "AgentInstallationSubmitChoice",
+                        Request::AgentInstallationList(..) => "AgentInstallationList",
+                        Request::AgentInstallationInspect(..) => "AgentInstallationInspect",
                         $(Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
@@ -22452,6 +22495,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "GetMediaAttachmentStatus", "GetMediaAttachmentPreview", "BeginMediaUpload",
                     "AppendMediaUploadChunk", "CancelMediaUpload", "GetMediaUploadStatus",
                     "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
+                    "AgentInstallationBegin", "AgentInstallationSubmitChoice",
+                    "AgentInstallationList", "AgentInstallationInspect",
                     $(stringify!($variant)),*, "Unknown"
                 ];
             };

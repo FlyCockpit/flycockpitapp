@@ -2053,6 +2053,17 @@ pub enum Request {
         project_root: Option<String>,
     },
 
+    /// Begin a daemon-owned agent installation/update/bind/create operation.
+    /// Its DTO never carries a credential or response-visible filesystem path.
+    AgentInstallationBegin(crate::AgentInstallationBeginV1),
+
+    /// Submit a durable daemon-issued installation choice token.
+    AgentInstallationSubmitChoice(crate::AgentInstallationSubmitChoiceV1),
+
+    AgentInstallationList(crate::AgentInstallationReadV1),
+
+    AgentInstallationInspect(crate::AgentInstallationReadV1),
+
     #[serde(other)]
     Unknown,
 }
@@ -2794,6 +2805,10 @@ macro_rules! request_variants {
             (Request::RepairMediaReservation { .. }, "repair_media_reservation");
             (Request::GetDoctorSnapshot { .. }, "get_doctor_snapshot");
             (Request::DocsAsk { .. }, "docs_ask");
+            (Request::AgentInstallationBegin(..), "agent_installation_begin");
+            (Request::AgentInstallationSubmitChoice(..), "agent_installation_submit_choice");
+            (Request::AgentInstallationList(..), "agent_installation_list");
+            (Request::AgentInstallationInspect(..), "agent_installation_inspect");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -3064,6 +3079,10 @@ macro_rules! command {
             (Request::RepairMediaReservation { scope, id, expected_block_generation, repair_plan_digest, idempotency_key }, "repair_media_reservation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String", [scope: String => param, id: String => param, expected_block_generation: u64 => param, repair_plan_digest: String => param, idempotency_key: String => param]);
             (Request::GetDoctorSnapshot { project_root, no_sandbox, offline }, "get_doctor_snapshot", owner_only, none, false, read_only, none, concurrent, none, "project_root:Option<String>|no_sandbox:bool|offline:bool", [project_root: Option<String> => param, no_sandbox: bool => param, offline: bool => param]);
             (Request::DocsAsk { question, package, project_root }, "docs_ask", owner_only, none, false, read_only, none, serialized, none, "question:String|package:Option<String>|project_root:Option<String>", [question: String => param, package: Option<String> => param, project_root: Option<String> => param]);
+            (Request::AgentInstallationBegin(..), "agent_installation_begin", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AgentInstallationBeginV1", []);
+            (Request::AgentInstallationSubmitChoice(..), "agent_installation_submit_choice", owner_only, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "request:AgentInstallationSubmitChoiceV1", []);
+            (Request::AgentInstallationList(..), "agent_installation_list", owner_only, none, false, read_only, none, concurrent, none, "request:AgentInstallationReadV1", []);
+            (Request::AgentInstallationInspect(..), "agent_installation_inspect", owner_only, none, false, read_only, none, concurrent, none, "request:AgentInstallationReadV1", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };

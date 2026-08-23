@@ -50,6 +50,7 @@ pub mod image_generation_plan;
 pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
+pub mod installation_operations;
 pub mod lang;
 pub mod locks;
 pub mod media_attachments;

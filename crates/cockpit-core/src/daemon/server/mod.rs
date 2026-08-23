@@ -217,6 +217,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // must be neutralized before it crosses the socket, exactly like the
         // sibling rendered-doctor / transcript free-text responses above.
         proto::Response::DocsAnswer { answer } => scrub_string(answer, redact),
+        // This DTO is constructed from canonical identifiers and fixed
+        // redacted diagnostics only; it intentionally excludes workspace
+        // paths, source URLs, provider handles, and credentials.
+        proto::Response::AgentInstallation(_) => {}
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
         | proto::Response::RetainedHttpsMedia(..)

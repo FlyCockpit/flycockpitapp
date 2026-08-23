@@ -51,7 +51,7 @@ pub use profile::{
     AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
     AgentProfileResolutionInput, ProfileQuestionOverride, ProfileVerificationReduction,
     ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
-    resolve_agent_profile,
+    ranked_compatible_offerings, resolve_agent_profile,
 };
 use vnext::DefinitionScope;
 pub use vnext::{

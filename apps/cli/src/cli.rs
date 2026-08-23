@@ -740,15 +740,98 @@ pub struct InvocationCancelArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Install a versioned agent definition through the daemon.
+    Install {
+        #[arg(value_name = "OWNER/REPO[@REV]:PATH")]
+        source: String,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+        /// Reuse this opaque operation key to replay an interrupted request.
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Update an installed agent definition through the daemon.
+    Update {
+        #[arg(value_name = "OWNER/REPO[@REV]:PATH")]
+        source: String,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Bind a daemon-resolved installed agent slot.
+    Bind {
+        #[arg(value_name = "INSTALLATION_ID")]
+        installation_id: String,
+        #[arg(long, default_value = "primary")]
+        slot: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Submit one daemon-issued agent binding choice.
+    SubmitChoice {
+        #[arg(value_name = "CONTINUATION_TOKEN")]
+        continuation_token: String,
+        #[arg(value_name = "CHOICE_ID", required_unless_present = "defer")]
+        choice_id: Option<String>,
+        /// Leave the selected slot unbound without exposing a provider route.
+        #[arg(long, conflicts_with = "choice_id")]
+        defer: bool,
+    },
+    /// Inspect one daemon-owned installed agent record.
+    Inspect {
+        #[arg(value_name = "INSTALLATION_ID")]
+        installation_id: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+    },
     /// Create a new agent file.
     Create {
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
         #[arg(long)]
         description: Option<String>,
+        #[arg(long, value_parser = ["assistant", "coding", "computer"], default_value = "coding")]
+        execution_kind: String,
+        #[arg(long, default_value = "primary")]
+        primary_slot: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
     },
     /// List all available agents (project + global + extended `agent_dirs`).
-    List,
+    List {
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, requires = "workspace")]
+        shared: bool,
+    },
 }
 
 // ---- providers / models ----

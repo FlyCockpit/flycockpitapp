@@ -87,6 +87,45 @@ pub struct AgentObservationRow {
     pub observed_at_unix_ms: i64,
 }
 
+/// Exact pre-replacement state kept by the daemon operation journal.  It is
+/// deliberately limited to mutable installation/observation/binding state:
+/// immutable profile snapshots and their historical receipts are never
+/// modified by replacement compensation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReplacementCompensationReceipt {
+    /// The durable daemon installation-operation that owns this replacement.
+    /// It is distinct from the pre-existing installation id and lets recovery
+    /// reject a receipt copied from a different operation without comparing a
+    /// retry's wall clock to the original mutation time.
+    pub replacement_operation_id: Uuid,
+    pub installation_id: Uuid,
+    pub prior_source_identity: String,
+    pub prior_source_revision: Option<String>,
+    pub prior_source_digest: String,
+    pub prior_fetched_at_unix_ms: i64,
+    pub prior_installation_revision: u64,
+    pub prior_deleted_at_unix_ms: Option<i64>,
+    pub prior_observed_digest: String,
+    pub prior_observation_revision: u64,
+    pub prior_reviewed: bool,
+    pub prior_observed_at_unix_ms: i64,
+    /// Only bindings that were current before this replacement may be
+    /// unretired. This prevents compensation from reviving a later bind.
+    pub prior_current_binding_ids: Vec<Uuid>,
+    pub replacement_source_identity: String,
+    pub replacement_source_revision: Option<String>,
+    pub replacement_source_digest: String,
+    pub replacement_fetched_at_unix_ms: i64,
+    pub replacement_retired_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompensateAgentReplacementOutcome {
+    Restored,
+    AlreadyRestored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserveAgentOutcome {
     Current(AgentObservationRow),
@@ -556,6 +595,79 @@ impl fmt::Display for AgentInstallationScope {
 }
 
 impl Db {
+    /// Capture the exact mutable state that a replacement is allowed to
+    /// compensate. The caller persists this receipt before invoking
+    /// [`Self::replace_agent`], so a crash after the DB transaction retains
+    /// enough information to make recovery idempotent.
+    pub async fn agent_replacement_compensation_receipt(
+        &self,
+        installation_id: Uuid,
+        replacement: AgentInstallationInput,
+        replacement_retired_at_unix_ms: i64,
+    ) -> Result<AgentReplacementCompensationReceipt> {
+        self.read(move |conn| {
+            replacement_compensation_receipt_conn(
+                conn,
+                installation_id,
+                &replacement,
+                replacement_retired_at_unix_ms,
+            )
+        })
+        .await
+    }
+
+    /// Restore a replacement only when the installation still exactly equals
+    /// the replacement captured by its receipt. The check makes retry after a
+    /// crash safe and refuses to overwrite any subsequent mutation.
+    pub async fn compensate_agent_replacement(
+        &self,
+        receipt: AgentReplacementCompensationReceipt,
+    ) -> Result<CompensateAgentReplacementOutcome> {
+        self.transaction(move |conn| compensate_agent_replacement_conn(conn, &receipt))
+            .await
+    }
+
+    /// True only after a prior compensation transaction has restored every
+    /// mutable installation and observation field captured by the receipt.
+    pub async fn agent_replacement_is_compensated(
+        &self,
+        receipt: AgentReplacementCompensationReceipt,
+    ) -> Result<bool> {
+        self.read(move |conn| {
+            let Some(installation) = installation_by_id(conn, receipt.installation_id)? else {
+                return Ok(false);
+            };
+            let Some(observation) = observation_by_id(conn, receipt.installation_id)? else {
+                return Ok(false);
+            };
+            Ok(compensation_is_already_restored(
+                &installation,
+                &observation,
+                &receipt,
+            ))
+        })
+        .await
+    }
+
+    /// Replace the bytes/provenance of an existing installation in the owning
+    /// installation transaction. Existing bindings are retired atomically so
+    /// a new definition can never inherit an unchecked provider route.
+    pub async fn replace_agent(
+        &self,
+        input: AgentInstallationInput,
+        now_unix_ms: i64,
+    ) -> Result<InstallAgentOutcome> {
+        self.transaction(move |conn| replace_agent_conn(conn, &input, now_unix_ms))
+            .await
+    }
+    pub async fn agent_installation(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Option<AgentInstallationRow>> {
+        self.read(move |conn| installation_by_id(conn, installation_id))
+            .await
+    }
+
     pub async fn install_agent(
         &self,
         input: AgentInstallationInput,
@@ -791,6 +903,162 @@ pub fn install_agent_conn(
     ).context("creating agent installation observation")?;
     Ok(InstallAgentOutcome::Installed(
         installation_by_id(conn, input.installation_id)?.expect("inserted installation"),
+    ))
+}
+
+fn replacement_compensation_receipt_conn(
+    conn: &Connection,
+    installation_id: Uuid,
+    replacement: &AgentInstallationInput,
+    replacement_retired_at_unix_ms: i64,
+) -> Result<AgentReplacementCompensationReceipt> {
+    validate_installation(replacement)?;
+    let installation = installation_by_id(conn, installation_id)?
+        .context("replacement target installation is missing")?;
+    ensure!(
+        installation.scope == replacement.scope
+            && installation.canonical_workspace_id == replacement.canonical_workspace_id
+            && installation.source_agent_id == replacement.source_agent_id,
+        "replacement target does not match installation namespace"
+    );
+    let observation = observation_by_id(conn, installation_id)?
+        .context("replacement target installation is missing observation")?;
+    let mut statement = conn
+        .prepare(
+            "SELECT binding_id FROM agent_model_bindings WHERE installation_id=?1 AND retired_at_unix_ms IS NULL ORDER BY binding_id ASC",
+        )
+        .context("preparing replacement binding receipt")?;
+    let prior_current_binding_ids = statement
+        .query_map([installation_id.to_string()], |row| {
+            parse_uuid(row.get::<_, String>(0)?)
+        })
+        .context("reading replacement binding receipt")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("decoding replacement binding receipt")?;
+    Ok(AgentReplacementCompensationReceipt {
+        replacement_operation_id: replacement.installation_id,
+        installation_id,
+        prior_source_identity: installation.source_identity,
+        prior_source_revision: installation.source_revision,
+        prior_source_digest: installation.source_digest,
+        prior_fetched_at_unix_ms: installation.fetched_at_unix_ms,
+        prior_installation_revision: installation.installation_revision,
+        prior_deleted_at_unix_ms: installation.deleted_at_unix_ms,
+        prior_observed_digest: observation.observed_digest,
+        prior_observation_revision: observation.observation_revision,
+        prior_reviewed: observation.reviewed,
+        prior_observed_at_unix_ms: observation.observed_at_unix_ms,
+        prior_current_binding_ids,
+        replacement_source_identity: replacement.source_identity.clone(),
+        replacement_source_revision: replacement.source_revision.clone(),
+        replacement_source_digest: replacement.source_digest.clone(),
+        replacement_fetched_at_unix_ms: replacement.fetched_at_unix_ms,
+        replacement_retired_at_unix_ms,
+    })
+}
+
+fn compensation_is_already_restored(
+    installation: &AgentInstallationRow,
+    observation: &AgentObservationRow,
+    receipt: &AgentReplacementCompensationReceipt,
+) -> bool {
+    installation.installation_id == receipt.installation_id
+        && installation.source_identity == receipt.prior_source_identity
+        && installation.source_revision == receipt.prior_source_revision
+        && installation.source_digest == receipt.prior_source_digest
+        && installation.fetched_at_unix_ms == receipt.prior_fetched_at_unix_ms
+        && installation.installation_revision == receipt.prior_installation_revision
+        && installation.deleted_at_unix_ms == receipt.prior_deleted_at_unix_ms
+        && observation.observed_digest == receipt.prior_observed_digest
+        && observation.observation_revision == receipt.prior_observation_revision
+        && observation.reviewed == receipt.prior_reviewed
+        && observation.observed_at_unix_ms == receipt.prior_observed_at_unix_ms
+}
+
+fn compensation_matches_replacement(
+    installation: &AgentInstallationRow,
+    receipt: &AgentReplacementCompensationReceipt,
+) -> bool {
+    installation.installation_id == receipt.installation_id
+        && installation.source_identity == receipt.replacement_source_identity
+        && installation.source_revision == receipt.replacement_source_revision
+        && installation.source_digest == receipt.replacement_source_digest
+        && installation.fetched_at_unix_ms == receipt.replacement_fetched_at_unix_ms
+        && installation.installation_revision == receipt.prior_installation_revision + 1
+        && installation.deleted_at_unix_ms.is_none()
+}
+
+fn compensate_agent_replacement_conn(
+    conn: &Connection,
+    receipt: &AgentReplacementCompensationReceipt,
+) -> Result<CompensateAgentReplacementOutcome> {
+    let installation = installation_by_id(conn, receipt.installation_id)?
+        .context("replacement compensation installation is missing")?;
+    let observation = observation_by_id(conn, receipt.installation_id)?
+        .context("replacement compensation observation is missing")?;
+    if compensation_is_already_restored(&installation, &observation, receipt) {
+        return Ok(CompensateAgentReplacementOutcome::AlreadyRestored);
+    }
+    ensure!(
+        compensation_matches_replacement(&installation, receipt),
+        "replacement compensation refused because installation changed after replacement"
+    );
+    conn.execute(
+        "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=?6,deleted_at_unix_ms=?7 WHERE installation_id=?1",
+        params![receipt.installation_id.to_string(), receipt.prior_source_identity, receipt.prior_source_revision, receipt.prior_source_digest, receipt.prior_fetched_at_unix_ms, i64::try_from(receipt.prior_installation_revision)?, receipt.prior_deleted_at_unix_ms],
+    )
+    .context("restoring replaced agent installation provenance")?;
+    conn.execute(
+        "UPDATE installation_observations SET observed_digest=?2,observation_revision=?3,review_state=?4,observed_at_unix_ms=?5 WHERE installation_id=?1",
+        params![receipt.installation_id.to_string(), receipt.prior_observed_digest, i64::try_from(receipt.prior_observation_revision)?, if receipt.prior_reviewed { "reviewed" } else { "rebind_required" }, receipt.prior_observed_at_unix_ms],
+    )
+    .context("restoring replaced agent observation")?;
+    for binding_id in &receipt.prior_current_binding_ids {
+        conn.execute(
+            "UPDATE agent_model_bindings SET retired_at_unix_ms=NULL WHERE binding_id=?1 AND installation_id=?2 AND retired_at_unix_ms=?3",
+            params![binding_id.to_string(), receipt.installation_id.to_string(), receipt.replacement_retired_at_unix_ms],
+        )
+        .context("restoring retired agent binding")?;
+    }
+    Ok(CompensateAgentReplacementOutcome::Restored)
+}
+
+pub fn replace_agent_conn(
+    conn: &Connection,
+    input: &AgentInstallationInput,
+    now_unix_ms: i64,
+) -> Result<InstallAgentOutcome> {
+    validate_installation(input)?;
+    let scope_key = scope_key(input.scope, input.canonical_workspace_id.as_deref())?;
+    let Some(existing) =
+        installation_by_identity(conn, input.scope, &scope_key, &input.source_agent_id)?
+    else {
+        return install_agent_conn(conn, input);
+    };
+    if existing.source_identity == input.source_identity
+        && existing.source_revision == input.source_revision
+        && existing.source_digest == input.source_digest
+        && existing.deleted_at_unix_ms.is_none()
+    {
+        return Ok(InstallAgentOutcome::AlreadyInstalled(existing));
+    }
+    conn.execute(
+        "UPDATE agent_model_bindings SET retired_at_unix_ms=?2 WHERE installation_id=?1 AND retired_at_unix_ms IS NULL",
+        params![existing.installation_id.to_string(), now_unix_ms],
+    )
+    .context("retiring bindings before agent replacement")?;
+    conn.execute(
+        "UPDATE agent_installations SET source_identity=?2,source_revision=?3,source_digest=?4,fetched_at_unix_ms=?5,installation_revision=installation_revision+1,deleted_at_unix_ms=NULL WHERE installation_id=?1",
+        params![existing.installation_id.to_string(), input.source_identity, input.source_revision, input.source_digest, input.fetched_at_unix_ms],
+    )
+    .context("replacing agent installation provenance")?;
+    conn.execute(
+        "UPDATE installation_observations SET observed_digest=?2,observation_revision=observation_revision+1,review_state='reviewed',observed_at_unix_ms=?3 WHERE installation_id=?1",
+        params![existing.installation_id.to_string(), input.source_digest, now_unix_ms],
+    )
+    .context("refreshing replaced installation observation")?;
+    Ok(InstallAgentOutcome::Installed(
+        installation_by_id(conn, existing.installation_id)?.expect("updated installation"),
     ))
 }
 
@@ -2434,6 +2702,83 @@ mod tests {
             .unwrap();
         assert!(!section.contains("api_key"));
         assert!(!section.contains("secret_bytes"));
+    }
+
+    #[tokio::test]
+    async fn agent_installation_daemon_replacement_compensation_restores_exact_prior_state_once() {
+        let db = Db::open_in_memory().unwrap();
+        let original = installation(AgentInstallationScope::Global, None);
+        let installation_id = original.installation_id;
+        let original_digest = original.source_digest.clone();
+        assert!(matches!(
+            db.install_agent(original.clone()).await.unwrap(),
+            InstallAgentOutcome::Installed(_)
+        ));
+        let original_binding = match db
+            .bind_agent_model(
+                installation_id,
+                original_digest.clone(),
+                None,
+                "initial-binding".into(),
+                "initial-fingerprint".into(),
+                binding("primary", "model-a"),
+                11,
+            )
+            .await
+            .unwrap()
+        {
+            BindAgentOutcome::Bound(binding) => binding,
+            outcome => panic!("expected initial binding, got {outcome:?}"),
+        };
+        let replacement = AgentInstallationInput {
+            installation_id: Uuid::now_v7(),
+            source_identity: "daemon-local:builder-v2".into(),
+            source_revision: Some("v2".into()),
+            source_digest: digest("definition-v2"),
+            fetched_at_unix_ms: 22,
+            ..original.clone()
+        };
+        let receipt = db
+            .agent_replacement_compensation_receipt(installation_id, replacement.clone(), 22)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.replace_agent(replacement, 22).await.unwrap(),
+            InstallAgentOutcome::Installed(_)
+        ));
+        assert!(
+            db.current_agent_binding(installation_id, original_digest.clone(), "primary".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.compensate_agent_replacement(receipt.clone())
+                .await
+                .unwrap(),
+            CompensateAgentReplacementOutcome::Restored
+        );
+        assert_eq!(
+            db.compensate_agent_replacement(receipt.clone())
+                .await
+                .unwrap(),
+            CompensateAgentReplacementOutcome::AlreadyRestored
+        );
+        assert!(db.agent_replacement_is_compensated(receipt).await.unwrap());
+        let restored = db
+            .agent_installation(installation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.source_identity, original.source_identity);
+        assert_eq!(restored.source_revision, original.source_revision);
+        assert_eq!(restored.source_digest, original_digest);
+        let restored_binding = db
+            .current_agent_binding(installation_id, original.source_digest, "primary".into())
+            .await
+            .unwrap()
+            .expect("prior binding must be restored");
+        assert_eq!(restored_binding.binding_id, original_binding.binding_id);
     }
 
     #[tokio::test]

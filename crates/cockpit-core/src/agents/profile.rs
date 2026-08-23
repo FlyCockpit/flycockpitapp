@@ -757,14 +757,27 @@ fn offering_is_compatible(
     offering: &AgentProfileModelOffering,
     providers: &ProvidersConfig,
 ) -> bool {
+    // Older catalog callers carry a provider-id key only, while daemon-owned
+    // installation choices carry a credential-owning profile handle as well.
+    // Prefer the latter when it is an installed local route; falling back to
+    // the provider id keeps portable profile resolution independent of the
+    // daemon's local handle spelling.
+    let capability_key = if providers
+        .providers
+        .contains_key(&offering.provider_profile_handle)
+    {
+        &offering.provider_profile_handle
+    } else {
+        &offering.provider_id
+    };
     let capabilities = providers.resolve_effective_model_capabilities(
-        &offering.provider_id,
+        capability_key,
         &offering.model_id,
         providers.resolution_generation,
     );
     hard_requirements_satisfied(
         slot,
-        providers.resolve_location(&offering.provider_id, &offering.model_id),
+        providers.resolve_location(capability_key, &offering.model_id),
         &capabilities,
     )
 }
@@ -816,7 +829,10 @@ fn hard_requirements_satisfied(
             })
 }
 
-fn ranked_compatible_offerings(
+/// Return only hard-compatible offerings in the documented stable order:
+/// author recommendation order, exact alias order, then daemon-owned local
+/// offering id.  Upstream identities are advisory and never become aliases.
+pub fn ranked_compatible_offerings(
     slot: &super::ModelSlot,
     offerings: &[AgentProfileModelOffering],
     providers: &ProvidersConfig,

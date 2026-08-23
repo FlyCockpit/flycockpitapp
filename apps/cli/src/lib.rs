@@ -695,7 +695,13 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
             | Some(Command::Completion { .. })
             | Some(Command::BashHints(_))
             | Some(Command::Agent(
-                crate::cli::AgentCommand::Create { .. } | crate::cli::AgentCommand::List
+                crate::cli::AgentCommand::Install { .. }
+                    | crate::cli::AgentCommand::Update { .. }
+                    | crate::cli::AgentCommand::Bind { .. }
+                    | crate::cli::AgentCommand::SubmitChoice { .. }
+                    | crate::cli::AgentCommand::Inspect { .. }
+                    | crate::cli::AgentCommand::Create { .. }
+                    | crate::cli::AgentCommand::List { .. }
             ))
             | Some(Command::Mcp(
                 crate::cli::McpCommand::Add(_) | crate::cli::McpCommand::List
@@ -1118,7 +1124,10 @@ mod tests {
             &Command::BashHints(crate::cli::BashHintsCommand::List)
         )));
         assert!(!command_requires_workspace_trust(Some(&Command::Agent(
-            crate::cli::AgentCommand::List
+            crate::cli::AgentCommand::List {
+                workspace: None,
+                shared: false,
+            }
         ))));
         assert!(!command_requires_workspace_trust(Some(&Command::Mcp(
             crate::cli::McpCommand::List

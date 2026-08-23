@@ -2,99 +2,342 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use crate::agents::{AgentDef, AgentKind};
 use crate::cli::AgentCommand;
-use cockpit_core::agents::{
-    DelegationPolicy, ExecutionKind, ModelCapability, ModelLocality, ModelSlot, VnextAgentDef,
+use crate::daemon::client::ensure_persistent_daemon;
+use crate::daemon::proto::{
+    AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationOperationKind,
+    AgentInstallationReadV1, AgentInstallationResultV1, AgentInstallationScopeWire,
+    AgentInstallationSubmitChoiceV1, Request, Response,
 };
 
 pub async fn run(cmd: AgentCommand) -> Result<()> {
     match cmd {
-        AgentCommand::Create { path, description } => create(path, description),
-        AgentCommand::List => list(),
+        AgentCommand::Install {
+            source,
+            replace,
+            workspace,
+            shared,
+            operation_key,
+            yes,
+        } => {
+            begin(
+                source,
+                AgentInstallationOperationKind::Install,
+                replace,
+                None,
+                workspace,
+                shared,
+                operation_key,
+                yes,
+            )
+            .await
+        }
+        AgentCommand::Update {
+            source,
+            replace,
+            workspace,
+            shared,
+            operation_key,
+            yes,
+        } => {
+            begin(
+                source,
+                AgentInstallationOperationKind::Update,
+                replace,
+                None,
+                workspace,
+                shared,
+                operation_key,
+                yes,
+            )
+            .await
+        }
+        AgentCommand::Bind {
+            installation_id,
+            slot,
+            workspace,
+            shared,
+            operation_key,
+            yes,
+        } => {
+            begin(
+                installation_id,
+                AgentInstallationOperationKind::Bind,
+                false,
+                Some(slot),
+                workspace,
+                shared,
+                operation_key,
+                yes,
+            )
+            .await
+        }
+        AgentCommand::SubmitChoice {
+            continuation_token,
+            choice_id,
+            defer,
+        } => submit_choice(continuation_token, choice_id, defer).await,
+        AgentCommand::Inspect {
+            installation_id,
+            workspace,
+            shared,
+        } => inspect(installation_id, workspace, shared).await,
+        AgentCommand::Create {
+            path,
+            description,
+            execution_kind,
+            primary_slot,
+            workspace,
+            shared,
+            operation_key,
+        } => {
+            create(
+                path,
+                description,
+                execution_kind,
+                primary_slot,
+                workspace,
+                shared,
+                operation_key,
+            )
+            .await
+        }
+        AgentCommand::List { workspace, shared } => list(workspace, shared).await,
     }
 }
 
-fn create(path: Option<PathBuf>, description: Option<String>) -> Result<()> {
+async fn submit_choice(
+    continuation_token: String,
+    choice_id: Option<String>,
+    defer: bool,
+) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for agent choice")?;
+    let response = daemon
+        .client
+        .request(Request::AgentInstallationSubmitChoice(
+            AgentInstallationSubmitChoiceV1 {
+                dto_version: AGENT_INSTALLATION_DTO_VERSION,
+                continuation_token,
+                choice_id,
+                defer,
+            },
+        ))
+        .await
+        .context("sending agent choice to daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected agent choice: {error}"))?;
+    match response {
+        Response::AgentInstallation(AgentInstallationResultV1::Receipt {
+            status,
+            installation_id,
+            ..
+        }) => println!(
+            "agent choice completed: {status:?}{}",
+            installation_id
+                .map(|id| format!(" ({id})"))
+                .unwrap_or_default()
+        ),
+        Response::AgentInstallation(AgentInstallationResultV1::Error { error }) => {
+            bail!("agent choice refused: {:?}", error.code)
+        }
+        _ => bail!("daemon returned unexpected response to agent choice"),
+    }
+    Ok(())
+}
+
+async fn begin(
+    source_locator: String,
+    operation: AgentInstallationOperationKind,
+    replace_acknowledged: bool,
+    requested_slot: Option<String>,
+    workspace: Option<PathBuf>,
+    shared: bool,
+    operation_key: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for agent operation")?;
+    let response = daemon
+        .client
+        .request(Request::AgentInstallationBegin(AgentInstallationBeginV1 {
+            dto_version: AGENT_INSTALLATION_DTO_VERSION,
+            idempotency_key: operation_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            operation,
+            scope: scope_for_workspace(workspace.as_ref(), shared),
+            workspace_path: workspace_path(workspace),
+            source_locator,
+            replace_acknowledged,
+            requested_slot,
+            execution_kind: None,
+            primary_slot_id: None,
+            auto_select_first_exact: yes,
+        }))
+        .await
+        .context("sending agent operation to daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected agent operation: {error}"))?;
+    match response {
+        Response::AgentInstallation(AgentInstallationResultV1::Receipt {
+            status,
+            installation_id,
+            ..
+        }) => println!(
+            "agent operation completed: {status:?}{}",
+            installation_id
+                .map(|id| format!(" ({id})"))
+                .unwrap_or_default()
+        ),
+        Response::AgentInstallation(AgentInstallationResultV1::NeedsChoice {
+            continuation_token,
+            choices,
+            ..
+        }) => {
+            println!("agent binding needs a choice; continuation={continuation_token}");
+            for choice in choices {
+                println!(
+                    "{}\t{}/{}",
+                    choice.choice_id, choice.provider_id, choice.model_id
+                );
+            }
+        }
+        Response::AgentInstallation(AgentInstallationResultV1::Error { error }) => {
+            bail!("agent operation refused: {:?}", error.code)
+        }
+        _ => bail!("daemon returned unexpected response to agent operation"),
+    }
+    Ok(())
+}
+
+async fn inspect(installation_id: String, workspace: Option<PathBuf>, shared: bool) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for agent inspect")?;
+    let response = daemon
+        .client
+        .request(Request::AgentInstallationInspect(AgentInstallationReadV1 {
+            dto_version: AGENT_INSTALLATION_DTO_VERSION,
+            scope: scope_for_workspace(workspace.as_ref(), shared),
+            workspace_path: workspace_path(workspace),
+            installation_id: Some(installation_id),
+        }))
+        .await
+        .context("sending agent inspect to daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected agent inspect: {error}"))?;
+    match response {
+        Response::AgentInstallation(AgentInstallationResultV1::Inspected {
+            installation: Some(record),
+        }) => println!(
+            "{}\t{}\t{}",
+            record.installation_id,
+            record.source_agent_id,
+            record.source_revision.unwrap_or_default()
+        ),
+        Response::AgentInstallation(AgentInstallationResultV1::Inspected {
+            installation: None,
+        }) => bail!("agent installation was not found"),
+        _ => bail!("daemon returned unexpected response to agent inspect"),
+    }
+    Ok(())
+}
+
+async fn create(
+    path: Option<PathBuf>,
+    description: Option<String>,
+    execution_kind: String,
+    primary_slot: String,
+    workspace: Option<PathBuf>,
+    shared: bool,
+    operation_key: Option<String>,
+) -> Result<()> {
     let path =
         path.ok_or_else(|| anyhow::anyhow!("--path is required for `cockpit agent create`"))?;
-    if path.is_dir() {
-        bail!("--path must name the agent markdown file, not a directory");
-    }
-    if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-        bail!("--path must end in .md");
-    }
-    let name = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("--path must have a usable file stem"))?
-        .to_string();
-    let description = description.unwrap_or_else(|| format!("Custom agent `{name}`"));
-    let def = AgentDef {
-        name: name.clone(),
-        description,
-        mode: crate::agents::AgentMode::default(),
-        model: None,
-        temperature: None,
-        tools: None,
-        tool_tiers: std::collections::BTreeMap::new(),
-        tool_descriptions: std::collections::BTreeMap::new(),
-        scan_tool_results: None,
-        goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
-        permission: None,
-        fork_eligible: false,
-        vnext: Some(VnextAgentDef {
-            schema_version: cockpit_core::agents::SCHEMA_VERSION,
-            agent_id: format!("authored/{name}"),
-            execution_kind: ExecutionKind::Coding,
-            model_slots: std::collections::BTreeMap::from([(
-                "primary".to_string(),
-                ModelSlot {
-                    purpose: "Primary model for this workspace agent.".to_string(),
-                    min_context_tokens: 1,
-                    required_capabilities: vec![ModelCapability::TextGeneration],
-                    locality: ModelLocality::Any,
-                    allow_default_fallback: true,
-                    suggested_models: Vec::new(),
-                },
-            )]),
-            delegation: DelegationPolicy::default(),
-            questions: None,
-            verification: None,
-        }),
-        prompt: format!("You are the `{name}` Cockpit agent."),
-        prompt_variants: std::collections::HashMap::new(),
-        source: path.clone(),
+    let requested_path = path.to_string_lossy().into_owned();
+    let _description = description;
+    // `--path` is an opaque request value at the client boundary. The daemon
+    // alone validates/derives its requested identity and chooses the owned
+    // destination; this process never stats, opens, or writes it.
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for agent create")?;
+    let response = daemon
+        .client
+        .request(Request::AgentInstallationBegin(AgentInstallationBeginV1 {
+            dto_version: AGENT_INSTALLATION_DTO_VERSION,
+            idempotency_key: operation_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            operation: AgentInstallationOperationKind::Create,
+            scope: scope_for_workspace(workspace.as_ref(), shared),
+            workspace_path: workspace_path(workspace),
+            source_locator: requested_path,
+            replace_acknowledged: false,
+            requested_slot: None,
+            execution_kind: Some(parse_execution_kind(&execution_kind)?),
+            primary_slot_id: Some(primary_slot),
+            auto_select_first_exact: false,
+        }))
+        .await
+        .context("sending agent create to daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected agent create: {error}"))?;
+    let Response::AgentInstallation(AgentInstallationResultV1::Receipt { status, .. }) = response
+    else {
+        bail!("daemon returned an unexpected response to agent create");
     };
-    crate::agents::validate_invariants(&def)?;
-    let markdown = def.to_markdown()?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating agents dir {}", parent.display()))?;
-    }
-    std::fs::write(&path, markdown).with_context(|| format!("writing agent {}", path.display()))?;
-    let loaded = crate::agents::load_from_file(&path)?;
-    println!("created agent `{}` at {}", loaded.name, path.display());
+    println!("agent creation completed: {status:?}");
     Ok(())
 }
 
-fn list() -> Result<()> {
-    let cwd = std::env::current_dir().context("resolving cwd")?;
-    for listing in crate::agents::list_all(&cwd) {
-        let kind = match listing.kind {
-            AgentKind::Builtin { overridden } if overridden => "builtin override",
-            AgentKind::Builtin { .. } => "builtin",
-            AgentKind::Custom => "custom",
-        };
-        match listing.def {
-            Ok(def) => println!("{}\t{}\t{}", listing.name, kind, def.description),
-            Err(error) => println!("{}\t{}\t<invalid: {}>", listing.name, kind, error),
-        }
+async fn list(workspace: Option<PathBuf>, shared: bool) -> Result<()> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for agent list")?;
+    let response = daemon
+        .client
+        .request(Request::AgentInstallationList(AgentInstallationReadV1 {
+            dto_version: AGENT_INSTALLATION_DTO_VERSION,
+            scope: scope_for_workspace(workspace.as_ref(), shared),
+            workspace_path: workspace_path(workspace),
+            installation_id: None,
+        }))
+        .await
+        .context("sending agent list to daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected agent list: {error}"))?;
+    let Response::AgentInstallation(AgentInstallationResultV1::Listed { installations }) = response
+    else {
+        bail!("daemon returned an unexpected response to agent list");
+    };
+    for installation in installations {
+        println!(
+            "{}\t{}\t{}",
+            installation.installation_id,
+            installation.source_agent_id,
+            installation.source_revision.unwrap_or_default()
+        );
     }
     Ok(())
+}
+
+fn scope_for_workspace(workspace: Option<&PathBuf>, shared: bool) -> AgentInstallationScopeWire {
+    match (workspace.is_some(), shared) {
+        (false, false) => AgentInstallationScopeWire::Global,
+        (true, false) => AgentInstallationScopeWire::WorkspacePrivate,
+        (true, true) => AgentInstallationScopeWire::WorkspaceShared,
+        // Clap rejects this shape, but preserve a fail-closed daemon request
+        // if a programmatic caller ever constructs it.
+        (false, true) => AgentInstallationScopeWire::WorkspaceShared,
+    }
+}
+
+fn workspace_path(workspace: Option<PathBuf>) -> Option<String> {
+    workspace.map(|path| path.to_string_lossy().into_owned())
+}
+
+fn parse_execution_kind(value: &str) -> Result<cockpit_proto::AgentInstallationExecutionKindV1> {
+    match value {
+        "assistant" => Ok(cockpit_proto::AgentInstallationExecutionKindV1::Assistant),
+        "coding" => Ok(cockpit_proto::AgentInstallationExecutionKindV1::Coding),
+        "computer" => Ok(cockpit_proto::AgentInstallationExecutionKindV1::Computer),
+        _ => bail!("unsupported agent execution kind"),
+    }
 }
 
 #[cfg(test)]
@@ -104,40 +347,41 @@ mod tests {
 
     use crate::cli::Cli;
 
-    #[tokio::test]
-    async fn agent_create_then_list() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp
-            .path()
-            .join(".cockpit")
-            .join("agents")
-            .join("helper.md");
-        run(AgentCommand::Create {
-            path: Some(path.clone()),
-            description: Some("Helps with tests".to_string()),
-        })
-        .await
-        .unwrap();
+    #[test]
+    fn agent_installation_daemon_cli_create_uses_daemon_transport_not_direct_filesystem() {
+        let source = include_str!("agent.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production agent command source");
+        assert!(source.contains("ensure_persistent_daemon"));
+        assert!(source.contains("Request::AgentInstallationBegin"));
+        assert!(!source.contains("std::fs::write"));
+        assert!(!source.contains("std::fs::create_dir_all"));
+        assert!(!source.contains("path.is_dir()"));
+        assert!(!source.contains("path.file_stem()"));
+        assert!(!source.contains("path.extension()"));
+    }
 
-        let loaded = crate::agents::load_from_file(&path).unwrap();
-        assert_eq!(loaded.name, "helper");
-        assert_eq!(loaded.description, "Helps with tests");
-        assert!(loaded.vnext.is_some());
-        assert!(loaded.tools.is_none());
-
-        let cwd = temp.path();
-        let policy = cockpit_config::trust::WorkspaceTrustPolicy {
-            root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
-            mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
-        };
-        let listing = cockpit_config::trust::with_workspace_trust_policy(policy, || {
-            crate::agents::list_all(cwd)
-                .into_iter()
-                .find(|entry| entry.name == "helper")
-                .expect("custom agent listed")
-        });
-        assert!(matches!(listing.kind, AgentKind::Custom));
-        assert!(listing.def.is_ok());
+    #[test]
+    fn agent_installation_daemon_cli_routes_all_mutations_over_rpc() {
+        let source = include_str!("agent.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production agent command source");
+        for command in [
+            "AgentCommand::Install",
+            "AgentCommand::Update",
+            "AgentCommand::Bind",
+            "AgentCommand::Inspect",
+            "Request::AgentInstallationBegin",
+            "Request::AgentInstallationInspect",
+            "Request::AgentInstallationList",
+        ] {
+            assert!(
+                source.contains(command),
+                "missing daemon transport: {command}"
+            );
+        }
     }
 
     #[test]
@@ -159,5 +403,44 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn agent_installation_cli_preserves_retry_key_and_noninteractive_choice_intent() {
+        let cli = Cli::try_parse_from([
+            "cockpit",
+            "agent",
+            "bind",
+            "installation",
+            "--operation-key",
+            "retry-key",
+            "--yes",
+        ])
+        .expect("parse bind");
+        let Some(crate::cli::Command::Agent(AgentCommand::Bind {
+            operation_key, yes, ..
+        })) = cli.command
+        else {
+            panic!("expected agent bind")
+        };
+        assert_eq!(operation_key.as_deref(), Some("retry-key"));
+        assert!(yes);
+
+        let cli = Cli::try_parse_from([
+            "cockpit",
+            "agent",
+            "submit-choice",
+            "continuation",
+            "--defer",
+        ])
+        .expect("parse defer");
+        let Some(crate::cli::Command::Agent(AgentCommand::SubmitChoice {
+            choice_id, defer, ..
+        })) = cli.command
+        else {
+            panic!("expected agent defer")
+        };
+        assert!(defer);
+        assert!(choice_id.is_none());
     }
 }

@@ -2223,6 +2223,25 @@ fn reasoning_effort_supports_value(capability: &ReasoningEffortCapability, value
         .any(|candidate| candidate.value == value)
 }
 
+/// Clamp an OpenAI-compatible `reasoning[_.]effort` wire value to what rig's
+/// typed `ReasoningEffort` can express.
+///
+/// rig (0.42) accepts `none|minimal|low|medium|high|xhigh|max` and rejects the
+/// entire `additional_params` payload *before send* for any other value.
+/// Copilot's catalog advertises an `ultra` tier above `max` that rig cannot
+/// encode, so a model selected/dispatched at `ultra` would fail every request.
+/// `ultra` is the "above the ceiling" tier, so it clamps to the wire ceiling
+/// `max` (still a selectable UI tier; now dispatches at maximum effort). This is
+/// the single OpenAI-compatible chokepoint — it also covers the raw fall-through
+/// value used when a catalog/user mapping has no explicit entry.
+fn clamp_openai_reasoning_effort_wire_value(mapped: Value) -> Value {
+    if mapped == Value::String("ultra".to_string()) {
+        Value::String("max".to_string())
+    } else {
+        mapped
+    }
+}
+
 fn json_at_path(path: &[String], value: Value) -> Value {
     debug_assert!(!path.is_empty());
     let mut nested = value;
@@ -2894,6 +2913,7 @@ impl ProvidersConfig {
                     .get(value)
                     .cloned()
                     .unwrap_or_else(|| Value::String(value.to_string()));
+                let mapped = clamp_openai_reasoning_effort_wire_value(mapped);
                 Value::Object(Map::from_iter([(field.clone(), mapped)]))
             }
             ReasoningEffortRequestMapping::JsonPath { path, values } => {
@@ -2901,6 +2921,7 @@ impl ProvidersConfig {
                     .get(value)
                     .cloned()
                     .unwrap_or_else(|| Value::String(value.to_string()));
+                let mapped = clamp_openai_reasoning_effort_wire_value(mapped);
                 json_at_path(path, mapped)
             }
             ReasoningEffortRequestMapping::AnthropicAdaptive { values } => {

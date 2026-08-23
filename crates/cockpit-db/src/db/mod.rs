@@ -96,6 +96,7 @@ pub mod tool_calls;
 pub mod usage_events;
 pub mod verification_ledger;
 pub mod wire;
+pub mod workspace_lease_artifacts;
 pub mod workspace_trust;
 pub mod write_scope_leases;
 

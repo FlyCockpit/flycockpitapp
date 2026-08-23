@@ -3226,6 +3226,302 @@ CREATE INDEX idx_write_scope_permits_held
     ON write_scope_permits (session_id)
     WHERE state = 'held';
 
+-- ---- workspace leases and commitless task artifacts -----------------------
+-- These rows are daemon-owned recovery metadata, never filesystem handles or
+-- file content. Canonical roots identify the host worktree; every mutable
+-- observation is represented by a SHA-256 receipt.
+CREATE TABLE workspace_leases (
+    workspace_lease_id        TEXT PRIMARY KEY,
+    session_id                TEXT NOT NULL,
+    agent_instance_id         TEXT NOT NULL,
+    write_scope_lease_id      TEXT NOT NULL,
+    canonical_repository_id   TEXT NOT NULL,
+    canonical_root            TEXT NOT NULL,
+    kind                      TEXT NOT NULL CHECK (kind IN ('worktree', 'repository')),
+    base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
+    base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    managed_path              TEXT NOT NULL,
+    private_ref_digest        TEXT NOT NULL CHECK (length(private_ref_digest) = 64 AND private_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaned', 'uncertain')),
+    expires_at_unix_ms        INTEGER NOT NULL,
+    revision                  INTEGER NOT NULL CHECK (revision >= 0),
+    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'host_cleanup', 'restart_uncertain')),
+    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'restart_uncertain')),
+    pinned_at_unix_ms         INTEGER,
+    pinned_by_agent_instance_id TEXT,
+    created_at_unix_ms        INTEGER NOT NULL,
+    updated_at_unix_ms        INTEGER NOT NULL,
+    UNIQUE (workspace_lease_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
+    FOREIGN KEY (pinned_by_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
+    CHECK ((state = 'cleaned') = (terminal_reason IS NOT NULL)),
+    CHECK (
+        (state = 'active' AND terminal_reason IS NULL AND uncertain_reason IS NULL)
+        OR (state = 'grace' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
+        OR (state = 'uncertain' AND terminal_reason IS NULL AND uncertain_reason IS NOT NULL)
+        OR (state = 'cleaned' AND terminal_reason IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_workspace_leases_session_owner_state
+    ON workspace_leases (session_id, agent_instance_id, state, expires_at_unix_ms);
+CREATE UNIQUE INDEX uq_workspace_leases_live_root
+    ON workspace_leases (session_id, canonical_repository_id, canonical_root)
+    WHERE state IN ('active', 'grace', 'uncertain');
+
+-- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
+-- an ambiguous worktree or silently skip grace. Every mutation is a CAS
+-- revision advance; pinning and renewal are same-state mutations.
+CREATE TRIGGER workspace_leases_revision_monotonic
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.revision <> OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease revision must advance exactly once');
+END;
+
+CREATE TRIGGER workspace_leases_legal_transition
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+    'active>grace', 'active>uncertain', 'grace>cleaned',
+    'grace>uncertain', 'uncertain>cleaned'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease transition rejected');
+END;
+
+CREATE TRIGGER workspace_leases_cleaned_final
+BEFORE UPDATE ON workspace_leases
+WHEN OLD.state = 'cleaned'
+BEGIN
+    SELECT RAISE(ABORT, 'cleaned workspace lease is final');
+END;
+
+-- A lease's identity and provenance are an immutable recovery receipt. The
+-- only mutable lease data are lifecycle state/revision, expiry, pin retention,
+-- transition reasons, and its update timestamp.
+CREATE TRIGGER workspace_leases_provenance_immutable
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.agent_instance_id <> OLD.agent_instance_id
+  OR NEW.write_scope_lease_id <> OLD.write_scope_lease_id
+  OR NEW.canonical_repository_id <> OLD.canonical_repository_id
+  OR NEW.canonical_root <> OLD.canonical_root
+  OR NEW.kind <> OLD.kind
+  OR NEW.base_sha_digest <> OLD.base_sha_digest
+  OR NEW.base_ref_digest <> OLD.base_ref_digest
+  OR NEW.managed_path <> OLD.managed_path
+  OR NEW.private_ref_digest <> OLD.private_ref_digest
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease provenance is immutable');
+END;
+
+CREATE TRIGGER workspace_leases_terminal_reason_immutable
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.terminal_reason IS NOT OLD.terminal_reason
+ AND NOT (OLD.terminal_reason IS NULL AND NEW.state = 'cleaned')
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease terminal reason is immutable');
+END;
+
+CREATE TRIGGER workspace_leases_uncertain_reason_transition_only
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.uncertain_reason IS NOT OLD.uncertain_reason
+ AND NOT (NEW.state <> OLD.state AND NEW.state IN ('grace', 'uncertain'))
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease uncertainty reason may change only with transition');
+END;
+
+CREATE TRIGGER workspace_leases_scope_owner_matches
+BEFORE INSERT ON workspace_leases
+WHEN NOT EXISTS (
+    SELECT 1 FROM write_scope_leases w
+    WHERE w.lease_id = NEW.write_scope_lease_id
+      AND w.session_id = NEW.session_id
+      AND w.owner_id = NEW.agent_instance_id
+      AND w.state = 'active'
+      AND w.scope_path = NEW.canonical_root
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease requires active owned write scope');
+END;
+
+CREATE TABLE task_artifacts (
+    artifact_id                 TEXT PRIMARY KEY,
+    source_workspace_lease_id   TEXT NOT NULL,
+    session_id                  TEXT NOT NULL,
+    agent_instance_id           TEXT NOT NULL,
+    base_head_digest            TEXT NOT NULL CHECK (length(base_head_digest) = 64 AND base_head_digest NOT GLOB '*[^0-9a-f]*'),
+    base_ref_digest             TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    base_index_digest           TEXT NOT NULL CHECK (length(base_index_digest) = 64 AND base_index_digest NOT GLOB '*[^0-9a-f]*'),
+    touched_manifest_digest     TEXT NOT NULL CHECK (length(touched_manifest_digest) = 64 AND touched_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    untracked_manifest_digest   TEXT NOT NULL CHECK (length(untracked_manifest_digest) = 64 AND untracked_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    ordered_patch_digest        TEXT NOT NULL CHECK (length(ordered_patch_digest) = 64 AND ordered_patch_digest NOT GLOB '*[^0-9a-f]*'),
+    validation_receipt_digest   TEXT NOT NULL CHECK (length(validation_receipt_digest) = 64 AND validation_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    parent_result_json          TEXT NOT NULL,
+    state                       TEXT NOT NULL CHECK (state IN ('produced', 'integrating', 'integrated', 'stale', 'conflict', 'cancelled', 'failed')),
+    revision                    INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms          INTEGER NOT NULL,
+    updated_at_unix_ms          INTEGER NOT NULL,
+    UNIQUE (artifact_id, session_id),
+    FOREIGN KEY (source_workspace_lease_id, session_id)
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_task_artifacts_source_state
+    ON task_artifacts (source_workspace_lease_id, state);
+CREATE INDEX idx_task_artifacts_session_owner
+    ON task_artifacts (session_id, agent_instance_id, created_at_unix_ms);
+
+CREATE TRIGGER task_artifacts_source_owner_matches
+BEFORE INSERT ON task_artifacts
+WHEN NOT EXISTS (
+    SELECT 1 FROM workspace_leases w
+    WHERE w.workspace_lease_id = NEW.source_workspace_lease_id
+      AND w.session_id = NEW.session_id
+      AND w.agent_instance_id = NEW.agent_instance_id
+      AND w.state = 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact requires active owned workspace lease');
+END;
+
+CREATE TABLE task_artifact_integration_receipts (
+    artifact_id                 TEXT PRIMARY KEY,
+    session_id                  TEXT NOT NULL,
+    target_canonical_repository_id TEXT NOT NULL,
+    target_canonical_root       TEXT NOT NULL,
+    target_head_digest          TEXT NOT NULL CHECK (length(target_head_digest) = 64 AND target_head_digest NOT GLOB '*[^0-9a-f]*'),
+    target_ref_digest           TEXT NOT NULL CHECK (length(target_ref_digest) = 64 AND target_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    target_index_digest         TEXT NOT NULL CHECK (length(target_index_digest) = 64 AND target_index_digest NOT GLOB '*[^0-9a-f]*'),
+    changed_path_manifest_digest TEXT NOT NULL CHECK (length(changed_path_manifest_digest) = 64 AND changed_path_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    target_write_scope_lease_id TEXT NOT NULL,
+    expected_target_generation  INTEGER NOT NULL CHECK (expected_target_generation >= 0),
+    expected_target_revision    INTEGER NOT NULL CHECK (expected_target_revision >= 0),
+    result_state                TEXT NOT NULL CHECK (result_state = 'integrated'),
+    created_at_unix_ms          INTEGER NOT NULL,
+    UNIQUE (artifact_id, session_id),
+    FOREIGN KEY (artifact_id, session_id)
+        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_task_artifact_receipts_target
+    ON task_artifact_integration_receipts (target_write_scope_lease_id, session_id);
+
+CREATE TRIGGER task_artifacts_revision_monotonic
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.revision <> OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact revision must advance exactly once');
+END;
+
+CREATE TRIGGER task_artifacts_legal_transition
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+    'produced>integrating', 'produced>cancelled',
+    'integrating>produced', 'integrating>integrated',
+    'integrating>stale', 'integrating>conflict',
+    'integrating>cancelled', 'integrating>failed'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact transition rejected');
+END;
+
+CREATE TRIGGER task_artifacts_terminal_final
+BEFORE UPDATE ON task_artifacts
+WHEN OLD.state IN ('integrated', 'stale', 'conflict', 'cancelled', 'failed')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal task artifact is final');
+END;
+
+CREATE TRIGGER task_artifacts_provenance_immutable
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.artifact_id <> OLD.artifact_id
+  OR NEW.source_workspace_lease_id <> OLD.source_workspace_lease_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.agent_instance_id <> OLD.agent_instance_id
+  OR NEW.base_head_digest <> OLD.base_head_digest
+  OR NEW.base_ref_digest <> OLD.base_ref_digest
+  OR NEW.base_index_digest <> OLD.base_index_digest
+  OR NEW.touched_manifest_digest <> OLD.touched_manifest_digest
+  OR NEW.untracked_manifest_digest <> OLD.untracked_manifest_digest
+  OR NEW.ordered_patch_digest <> OLD.ordered_patch_digest
+  OR NEW.validation_receipt_digest <> OLD.validation_receipt_digest
+  OR NEW.parent_result_json <> OLD.parent_result_json
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact provenance is immutable');
+END;
+
+CREATE TRIGGER task_artifact_integrated_requires_receipt
+BEFORE UPDATE OF state ON task_artifacts
+WHEN NEW.state = 'integrated'
+ AND NOT EXISTS (
+    SELECT 1 FROM task_artifact_integration_receipts r
+    WHERE r.artifact_id = OLD.artifact_id AND r.session_id = OLD.session_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'integrated artifact requires immutable receipt');
+END;
+
+CREATE TRIGGER task_artifact_receipt_requires_integrating
+BEFORE INSERT ON task_artifact_integration_receipts
+WHEN NOT EXISTS (
+    SELECT 1 FROM task_artifacts a
+    WHERE a.artifact_id = NEW.artifact_id
+      AND a.session_id = NEW.session_id
+      AND a.state = 'integrating'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'integration receipt requires integrating artifact');
+END;
+
+CREATE TRIGGER task_artifact_receipt_target_owner_matches
+BEFORE INSERT ON task_artifact_integration_receipts
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM task_artifacts a
+    JOIN workspace_leases source
+      ON source.workspace_lease_id = a.source_workspace_lease_id
+     AND source.session_id = a.session_id
+    JOIN write_scope_leases w ON w.lease_id = NEW.target_write_scope_lease_id
+    WHERE a.artifact_id = NEW.artifact_id
+      AND a.session_id = NEW.session_id
+      AND w.session_id = a.session_id
+      AND w.owner_id = a.agent_instance_id
+      AND w.state = 'active'
+      AND w.scope_path = NEW.target_canonical_root
+      AND source.canonical_repository_id = NEW.target_canonical_repository_id
+      AND w.generation = NEW.expected_target_generation
+      AND w.version = NEW.expected_target_revision
+)
+BEGIN
+    SELECT RAISE(ABORT, 'integration receipt target scope is not owned or current');
+END;
+
+CREATE TRIGGER task_artifact_receipts_immutable
+BEFORE UPDATE ON task_artifact_integration_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact integration receipt is immutable');
+END;
+
+CREATE TRIGGER task_artifact_receipts_not_deletable
+BEFORE DELETE ON task_artifact_integration_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact integration receipt cannot be deleted');
+END;
+
 -- A released permit is final; resurrection would let a drained transfer barrier
 -- be re-entered after the authority already moved.
 CREATE TRIGGER write_scope_permits_released_is_final

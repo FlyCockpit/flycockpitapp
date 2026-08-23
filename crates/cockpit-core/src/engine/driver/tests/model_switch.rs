@@ -1386,8 +1386,11 @@ async fn live_model_switch_keeps_endpoint_specific_reasoning_recovery_params() {
     );
     assert_eq!(
         params.additional_params,
-        Some(serde_json::json!({ "reasoning": { "effort": "ultra" } })),
-        "the switched frame uses the catalog's Responses payload"
+        // The model was selected at the advertised `ultra` tier, but rig's typed
+        // ReasoningEffort cannot express it, so the resolver clamps the wire
+        // value to the ceiling `max` on this recovery/switch dispatch too.
+        Some(serde_json::json!({ "reasoning": { "effort": "max" } })),
+        "the switched frame uses the catalog's Responses payload (ultra clamped to max)"
     );
     assert_eq!(
         params

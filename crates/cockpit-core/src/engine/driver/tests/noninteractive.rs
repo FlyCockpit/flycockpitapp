@@ -5302,3 +5302,587 @@ async fn forked_task_session_inherits_command_secret_cache_via_real_path() {
          prepare_fork_task_context"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Noninteractive subagent lifecycle observe-hook boundary wiring
+// (subagentStart / subagentStop). These drive the REAL driver production
+// boundaries for the NONINTERACTIVE (background delegation) modes:
+//   - START at `register_running` inside
+//     `run_single_noninteractive_task_backgroundable` (and the batch analogue).
+//   - STOP at delegation delivery inside
+//     `finalize_background_noninteractive_completion` (single + batch, inline +
+//     background + runtime-error paths).
+// The hook command is unresolvable so it fails open (executable-not-found)
+// WITHOUT spawning a process; a `hook_run` row is still recorded — the wiring
+// signal (`vec!["failed"]`). On dead-code HEAD (no wiring) no such row exists.
+// ---------------------------------------------------------------------------
+
+/// Swap in a hook registry while PRESERVING the driver's resolved providers /
+/// extended config (unlike `inject_hooks`, which drops providers). The single
+/// delegation preflight resolves the child model from `providers`, so it must
+/// stay intact for the START boundary (`register_running`) to be reached.
+fn inject_hooks_keep_config(
+    driver: &mut Driver,
+    reg: crate::config::extended::hooks::HookRegistry,
+) {
+    let mut snapshot = (*driver.config.snapshot()).clone();
+    snapshot.hooks = reg;
+    driver
+        .set_config_handle(crate::daemon::session_worker::SessionConfigHandle::detached(snapshot));
+}
+
+#[tokio::test]
+async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
+    // Drive the REAL delivery boundary: an inline single-delegation completion
+    // delivered through `finalize_background_noninteractive_completion` fires
+    // exactly one `subagentStop` matched on the child agent type. This is the
+    // pair of the `subagentStart` fired at register-running.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    seed_task_delegation(&driver, "task-nis-stop", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-nis-stop",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-nis-stop".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {}),
+        },
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let delivery = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Single {
+                task_call_id: "task-nis-stop".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: Some("fn-nis-stop".to_string()),
+                result: Box::new(Ok(single_noninteractive_completion(
+                    "task-nis-stop",
+                    "single report",
+                ))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        delivery,
+        NoninteractiveCompletionDelivery::Inline(_)
+    ));
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "delivering a single noninteractive child must fire exactly one subagentStop"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    // A different-agent-type hook must NOT fire on an `explore` child delivery.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    seed_task_delegation(&driver, "task-nis-stop2", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-nis-stop2",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-nis-stop2".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {}),
+        },
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let _ = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Single {
+                task_call_id: "task-nis-stop2".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: Some("fn-nis-stop2".to_string()),
+                result: Box::new(Ok(single_noninteractive_completion(
+                    "task-nis-stop2",
+                    "single report",
+                ))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a builder-only hook must not fire on an explore child delivery"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn noninteractive_started_child_runtime_error_still_fires_one_stop() {
+    // A started child whose background task returned `Err` (a runtime-level
+    // delegation failure) is delivered through the error arm of
+    // `finalize_background_noninteractive_completion`; it must STILL fire exactly
+    // one `subagentStop` so every register-running `subagentStart` is paired.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    driver.noninteractive_delegations.register_running(
+        "task-nis-err",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-nis-err".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {}),
+        },
+    );
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let _ = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Single {
+                task_call_id: "task-nis-err".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: Some("fn-nis-err".to_string()),
+                result: Box::new(Err(anyhow::anyhow!("child crashed"))),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "a runtime-errored started child must still fire exactly one subagentStop"
+    );
+}
+
+#[tokio::test]
+async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
+    // Drive the REAL batch delivery boundary: a three-child batch completion
+    // delivered through `finalize_background_noninteractive_completion` fires
+    // exactly one `subagentStop` PER started child (all matched on the child
+    // agent type), pairing the three per-entry `subagentStart`s.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    seed_batch_task_delegation(&driver, "task-nis-batch", &["first", "second", "third"]).await;
+    for label in ["first", "second", "third"] {
+        driver.noninteractive_delegations.register_running(
+            "task-nis-batch",
+            label,
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+    }
+    driver.noninteractive_jobs.insert(
+        "task-nis-batch".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {}),
+        },
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let _ = driver
+        .finalize_background_noninteractive_completion(
+            Some(BackgroundNoninteractiveCompletion::Batch {
+                task_call_id: "task-nis-batch".to_string(),
+                task_provider_item_id: None,
+                task_function_call_id: Some("fn-nis-batch".to_string()),
+                result: Box::new(Ok(BatchNoninteractiveCompletion {
+                    task_call_id: "task-nis-batch".to_string(),
+                    task_provider_item_id: None,
+                    task_function_call_id: Some("fn-nis-batch".to_string()),
+                    children: vec![
+                        BatchChildCompletion {
+                            idx: 0,
+                            label: "first".to_string(),
+                            child_agent: "explore".to_string(),
+                            report: "first report".to_string(),
+                            failed: false,
+                            partial_progress: DelegationPartialProgress::default(),
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        },
+                        BatchChildCompletion {
+                            idx: 1,
+                            label: "second".to_string(),
+                            child_agent: "explore".to_string(),
+                            report: "second failed".to_string(),
+                            failed: true,
+                            partial_progress: DelegationPartialProgress::default(),
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        },
+                        BatchChildCompletion {
+                            idx: 2,
+                            label: "third".to_string(),
+                            child_agent: "explore".to_string(),
+                            report: "third report".to_string(),
+                            failed: false,
+                            partial_progress: DelegationPartialProgress::default(),
+                            snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        },
+                    ],
+                    repair_notes: Vec::new(),
+                })),
+            }),
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await.len(),
+        3,
+        "delivering a three-child batch must fire exactly one subagentStop per child"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn noninteractive_real_spawn_fires_one_subagent_start() {
+    // Drive the REAL backgroundable entry point through to `register_running`: a
+    // valid single delegation (child model resolves) reaches the register-running
+    // boundary and fires exactly one `subagentStart` matched on the child agent
+    // type. The user queue is pre-closed so the wrapper returns immediately after
+    // the child is spawned (via the input arm) without waiting on the child's
+    // completion.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks_keep_config(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "explore",
+        ),
+    );
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    queue.close().await;
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let task = single_task(&driver, "explore", "task-start-real", None, None);
+    let _ = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Reaching register_running is the START precondition: the child is live.
+    assert!(
+        driver
+            .noninteractive_delegations
+            .is_live("task-start-real", "default"),
+        "a valid delegation must register the running child (START precondition)"
+    );
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStart").await,
+        vec!["failed".to_string()],
+        "a real noninteractive child spawn must fire exactly one subagentStart"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    // A different-agent-type hook must NOT fire on an `explore` child spawn.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks_keep_config(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "builder",
+        ),
+    );
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    queue.close().await;
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let task = single_task(&driver, "explore", "task-start-real2", None, None);
+    let _ = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        observe_hook_events(&driver, "subagentStart")
+            .await
+            .is_empty(),
+        "a builder-only hook must not fire on an explore child spawn"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn noninteractive_prespawn_refusal_fires_neither_start_nor_stop() {
+    // A child refused BEFORE it starts (an unknown child agent fails the
+    // fail-closed preflight, which returns before `register_running`) must fire
+    // NEITHER a subagentStart NOR a subagentStop — no child existed.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks_keep_config(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "no-such-agent",
+        ),
+    );
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let task = single_task(&driver, "no-such-agent", "task-refused", None, None);
+    let message = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // The wrapper returned a content-safe error (not a real child report).
+    assert_eq!(tool_result_id(&message), "task-refused");
+    // No child was ever registered running (register_running not reached).
+    assert!(
+        !driver
+            .noninteractive_delegations
+            .is_live("task-refused", "default"),
+        "a fail-closed preflight registers no running child"
+    );
+    assert!(
+        observe_hook_events(&driver, "subagentStart")
+            .await
+            .is_empty(),
+        "a refused-before-spawn child must fire NO subagentStart"
+    );
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a refused-before-spawn child must fire NO subagentStop"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[test]
+fn noninteractive_end_reason_maps_terminal_status() {
+    // The single-sourced `endReason` vocabulary: each terminal registry status
+    // maps to its own distinct token; a non-terminal status uses the caller's
+    // fallback. Built from independent literals so a wrong mapping is rejected.
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Completed, "fallback"),
+        "completed"
+    );
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Failed, "fallback"),
+        "failed"
+    );
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Cancelled, "fallback"),
+        "cancelled"
+    );
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Lost, "fallback"),
+        "lost"
+    );
+    // Non-terminal (never `complete()`d) → caller fallback, not a fabricated token.
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Running, "failed"),
+        "failed"
+    );
+    assert_eq!(
+        noninteractive_end_reason(NoninteractiveDelegationStatus::Backgrounded, "aborted"),
+        "aborted"
+    );
+}
+
+#[tokio::test]
+async fn noninteractive_whole_job_cancel_fires_one_cancelled_subagent_stop() {
+    // Whole-job cancel aborts the background job so it never reaches the delivery
+    // funnel; the started child must STILL fire exactly one `subagentStop`
+    // (endReason `cancelled`) at the cancel boundary so no start is left unpaired.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    seed_task_delegation(&driver, "task-cancel-hook", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-cancel-hook",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-cancel-hook".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        },
+    );
+
+    let body = driver
+        .dispatch_task_control(
+            TaskControlAction::Cancel,
+            Some("task-cancel-hook".to_string()),
+            None,
+            None,
+        )
+        .await;
+    assert!(body.contains("cancelled"), "{body}");
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "a whole-job cancel of a started child must fire exactly one subagentStop"
+    );
+}
+
+#[tokio::test]
+async fn noninteractive_redelivered_completion_does_not_double_fire_stop() {
+    // The delivered-transition claim makes the paired stop fire exactly once: a
+    // second delivery of the same job (already delivered) is a no-op and fires no
+    // additional stop.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    seed_task_delegation(&driver, "task-redeliver", "default").await;
+    driver.noninteractive_delegations.register_running(
+        "task-redeliver",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    driver.noninteractive_jobs.insert(
+        "task-redeliver".to_string(),
+        BackgroundNoninteractiveJob {
+            delivered: false,
+            handle: tokio::spawn(async {}),
+        },
+    );
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    for _ in 0..2 {
+        let _ = driver
+            .finalize_background_noninteractive_completion(
+                Some(BackgroundNoninteractiveCompletion::Single {
+                    task_call_id: "task-redeliver".to_string(),
+                    task_provider_item_id: None,
+                    task_function_call_id: Some("fn-redeliver".to_string()),
+                    result: Box::new(Ok(single_noninteractive_completion(
+                        "task-redeliver",
+                        "single report",
+                    ))),
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "a re-delivered completion must not fire a second subagentStop"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn noninteractive_batch_real_spawn_fires_one_start_per_entry() {
+    // Drive the REAL batch backgroundable entry point through the per-entry
+    // `register_running` loop: two valid entries fire exactly two `subagentStart`
+    // hooks (one per started child). The user queue is pre-closed so the wrapper
+    // returns right after spawning without waiting on the children.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks_keep_config(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "explore",
+        ),
+    );
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    queue.close().await;
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let task = BatchNoninteractiveTask {
+        entries: vec![
+            batch_entry("first", "explore", None),
+            batch_entry("second", "explore", None),
+        ],
+        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-batch-start".to_string(),
+        task_provider_item_id: None,
+        task_function_call_id: None,
+    };
+    let _ = driver
+        .run_batch_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        driver
+            .noninteractive_delegations
+            .is_live("task-batch-start", "first")
+            && driver
+                .noninteractive_delegations
+                .is_live("task-batch-start", "second"),
+        "a valid batch registers both running children (START precondition)"
+    );
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStart").await.len(),
+        2,
+        "a real batch spawn must fire exactly one subagentStart per started child"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}

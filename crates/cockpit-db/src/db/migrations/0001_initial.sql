@@ -1490,6 +1490,214 @@ CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
 CREATE INDEX idx_sevents_session_trust_seq ON session_events (session_id, model_trust, seq)
   WHERE model_trust IS NOT NULL;
 
+-- ---- verification ledger ----------------------------------------------------
+-- Verification work is daemon-owned audit state.  Rows deliberately contain
+-- only bounded classifications, opaque identifiers, and SHA-256 digests.  The
+-- selected executable artifact, provider receipt, candidate body, and raw
+-- verifier evidence remain volatile host state and are never recoverable from
+-- SQLite.
+CREATE TABLE verification_operations (
+    operation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    requested_candidate_count INTEGER NOT NULL CHECK (requested_candidate_count >= 0 AND requested_candidate_count <= 64),
+    effective_candidate_count INTEGER NOT NULL CHECK (effective_candidate_count >= 0 AND effective_candidate_count <= requested_candidate_count),
+    total_token_ceiling INTEGER NOT NULL CHECK (total_token_ceiling >= 0),
+    estimated_cost_ceiling_microunits INTEGER NOT NULL CHECK (estimated_cost_ceiling_microunits >= 0),
+    cost_unit TEXT NOT NULL CHECK (cost_unit IN ('microusd')),
+    collection_deadline_unix_ms INTEGER NOT NULL,
+    collection_duration_ms INTEGER NOT NULL CHECK (collection_duration_ms >= 0),
+    conservative_token_reservation INTEGER NOT NULL CHECK (conservative_token_reservation >= 0),
+    conservative_cost_reservation_microunits INTEGER NOT NULL CHECK (conservative_cost_reservation_microunits >= 0),
+    estimate_state TEXT NOT NULL CHECK (estimate_state IN ('available', 'estimate_unavailable')),
+    budget_action TEXT CHECK (budget_action IN ('refuse', 'dispatch_original')),
+    original_operation_digest TEXT NOT NULL CHECK (length(original_operation_digest) = 64 AND original_operation_digest NOT GLOB '*[^0-9a-f]*'),
+    pretool_context_capability_digest TEXT NOT NULL CHECK (length(pretool_context_capability_digest) = 64 AND pretool_context_capability_digest NOT GLOB '*[^0-9a-f]*'),
+    state TEXT NOT NULL CHECK (state IN ('created', 'collecting', 'synthesizing', 'dispatching', 'succeeded', 'failed', 'cancelled', 'aborted', 'skipped_budget_refused', 'unknown')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    collection_closed_at_unix_ms INTEGER,
+    collection_revision INTEGER NOT NULL DEFAULT 0 CHECK (collection_revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
+           (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
+    CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
+    CHECK ((budget_action = 'dispatch_original') = (effective_candidate_count = 0))
+);
+
+CREATE INDEX idx_verification_operations_session_state
+    ON verification_operations(session_id, state, updated_at_unix_ms);
+
+CREATE TABLE verification_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
+    canonical_call_digest TEXT NOT NULL CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
+    artifact_union_digest TEXT NOT NULL CHECK (length(artifact_union_digest) = 64 AND artifact_union_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_summary_json TEXT NOT NULL,
+    reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens >= 0),
+    reserved_cost_microunits INTEGER NOT NULL CHECK (reserved_cost_microunits >= 0),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'valid', 'invalid', 'cancelled', 'timed_out', 'malformed')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (candidate_id, operation_id),
+    UNIQUE (candidate_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_verification_candidates_operation_state
+    ON verification_candidates(operation_id, state, created_at_unix_ms);
+
+-- A write candidate's file-level union is digest-only: callers can prove a
+-- synthesis is composed entirely of valid candidates without persisting a raw
+-- path, diff, binary body, or mode string in the ledger.
+CREATE TABLE verification_candidate_artifacts (
+    candidate_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('add', 'delete', 'modify', 'rename', 'mode')),
+    affected_path_digest TEXT NOT NULL CHECK (length(affected_path_digest) = 64 AND affected_path_digest NOT GLOB '*[^0-9a-f]*'),
+    prior_path_digest TEXT CHECK (length(prior_path_digest) = 64 AND prior_path_digest NOT GLOB '*[^0-9a-f]*'),
+    content_digest TEXT CHECK (length(content_digest) = 64 AND content_digest NOT GLOB '*[^0-9a-f]*'),
+    binary_metadata_digest TEXT CHECK (length(binary_metadata_digest) = 64 AND binary_metadata_digest NOT GLOB '*[^0-9a-f]*'),
+    mode_digest TEXT CHECK (length(mode_digest) = 64 AND mode_digest NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (candidate_id, ordinal),
+    FOREIGN KEY (candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_id, session_id)
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+    CHECK ((operation_kind = 'rename') = (prior_path_digest IS NOT NULL)),
+    CHECK ((operation_kind = 'mode') = (mode_digest IS NOT NULL))
+);
+
+CREATE TABLE verification_late_results (
+    late_result_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    result_kind TEXT NOT NULL CHECK (result_kind IN ('valid', 'invalid', 'malformed', 'failed')),
+    result_digest TEXT NOT NULL CHECK (length(result_digest) = 64 AND result_digest NOT GLOB '*[^0-9a-f]*'),
+    received_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (candidate_id, result_digest),
+    FOREIGN KEY (candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_id, session_id)
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_syntheses (
+    synthesis_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'selected', 'synthesized_write', 'refused', 'no_valid_candidate', 'failed')),
+    selected_candidate_id TEXT,
+    artifact_kind TEXT CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
+    canonical_call_digest TEXT CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
+    write_union_receipt_digest TEXT CHECK (length(write_union_receipt_digest) = 64 AND write_union_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_summary_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (selected_candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT,
+    CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
+        OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
+        OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
+);
+
+-- A synthesized write is a digest-only union of exact members owned by valid
+-- write candidates. This proves no output path or operation kind was invented
+-- outside the candidate set without retaining raw path or patch data.
+CREATE TABLE verification_synthesis_artifacts (
+    synthesis_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    source_candidate_id TEXT NOT NULL,
+    source_artifact_ordinal INTEGER NOT NULL CHECK (source_artifact_ordinal >= 0),
+    PRIMARY KEY (synthesis_id, ordinal),
+    UNIQUE (synthesis_id, source_candidate_id, source_artifact_ordinal),
+    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id, source_artifact_ordinal)
+        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT
+);
+
+CREATE TABLE verification_projection_envelopes (
+    envelope_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    prepared_projection_id TEXT NOT NULL UNIQUE,
+    prepared_projection_digest TEXT NOT NULL CHECK (length(prepared_projection_digest) = 64 AND prepared_projection_digest NOT GLOB '*[^0-9a-f]*'),
+    batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
+    surrogate_kind TEXT NOT NULL CHECK (surrogate_kind IN ('selected_call', 'synthesized_write', 'normalized_original')),
+    model_visible_projection_json TEXT NOT NULL,
+    retention_state TEXT NOT NULL CHECK (retention_state IN ('retained', 'cleaned')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_dispatch_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    host_idempotency_key TEXT NOT NULL UNIQUE,
+    dispatch_digest TEXT NOT NULL CHECK (length(dispatch_digest) = 64 AND dispatch_digest NOT GLOB '*[^0-9a-f]*'),
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'executing', 'succeeded', 'failed', 'unknown', 'cancelled_no_submission')),
+    redacted_receipt_json TEXT,
+    receipt_digest TEXT CHECK (length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_projections (
+    projection_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('suppressed', 'committed')),
+    batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_result_json TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (projection_id, session_id),
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_projection_events (
+    projection_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    session_id TEXT NOT NULL,
+    session_event_seq INTEGER NOT NULL,
+    PRIMARY KEY (projection_id, ordinal),
+    UNIQUE (projection_id, session_event_seq),
+    FOREIGN KEY (projection_id, session_id)
+        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_verification_projection_events_session
+    ON verification_projection_events(session_id, session_event_seq);
+
 -- Durable idempotency tombstones for accepted client submissions that never
 -- become user_message events. A removed, cancelled, or preflight-rejected
 -- UUID must remain terminal across worker/daemon restarts; otherwise an

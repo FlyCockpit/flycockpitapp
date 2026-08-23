@@ -94,6 +94,7 @@ pub mod task_todos;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;
+pub mod verification_ledger;
 pub mod wire;
 pub mod workspace_trust;
 pub mod write_scope_leases;

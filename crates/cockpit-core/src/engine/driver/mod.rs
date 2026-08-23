@@ -4480,6 +4480,89 @@ impl Driver {
         .await;
     }
 
+    /// Fire a `subagentStart` / `subagentStop` observe hook for a CHILD
+    /// subagent, against the turn-pinned hook registry. CHILD-ONLY by
+    /// construction: every call site is a genuine child spawn / child stop
+    /// (interactive stack push, inline noninteractive finish, detached Swarm
+    /// report) — never a root boundary. Matcher / `subagentType` is the child
+    /// agent type; `subagentId` identifies the delegating `task` call so the
+    /// downstream attention consumer can pair start/stop. `subagentStop`
+    /// additionally carries `endReason` (why the child stopped). Observe-only /
+    /// fail-open; this is the notification fire ONLY — the child stop-gate
+    /// continuation (`run_stop_hooks`) is deferred to a later increment.
+    async fn fire_subagent_hook(
+        &self,
+        event: crate::config::extended::hooks::HookEvent,
+        subagent_type: &str,
+        subagent_id: Option<&str>,
+        end_reason: Option<&str>,
+    ) {
+        let snapshot = self.config.snapshot();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
+            event,
+            // Matcher = child agent type (the `ChildAgentType` matcher policy).
+            subagent_type,
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
+            None,
+            None,
+            Some(subagent_type),
+            subagent_id,
+            crate::engine::agent::hooks::ObserveFields {
+                end_reason,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    /// Fire a paired `subagentStop` for every interactive child frame still on
+    /// the stack at driver-loop teardown.
+    ///
+    /// The normal child-teardown paths (`pop_child_with_envelope` on success,
+    /// `unwind_stack_to_root` on cancel / gate / interrupt / inference failure)
+    /// already fire `subagentStop` and return with the stack back at the root
+    /// frame. The one remaining escape is a driver-loop exit via a fatal error
+    /// (`Err` propagation) that abandons a still-active child frame WITHOUT
+    /// unwinding. Called once when the driver loop resolves (see
+    /// `run_main_loop`'s caller in `session_worker/run.rs`), this closes that
+    /// gap so no `subagentStart` is left unpaired: each abandoned child emits
+    /// exactly one `subagentStop` with `endReason` = `aborted`. On every clean
+    /// / already-unwound exit the stack is at root, so this fires nothing (no
+    /// double-stop). Deepest child first, mirroring an unwind.
+    pub(crate) async fn drain_orphaned_child_stop_hooks(&self) {
+        // Collect first so no borrow of `self.stack` is held across the await
+        // inside `fire_subagent_hook`.
+        let orphans: Vec<(String, Option<String>)> = self
+            .stack
+            .iter()
+            .skip(1)
+            .rev()
+            .map(|frame| {
+                (
+                    frame.agent.name.clone(),
+                    frame
+                        .answering
+                        .as_ref()
+                        .map(|pending| pending.call_id.clone()),
+                )
+            })
+            .collect();
+        for (subagent_type, subagent_id) in orphans {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &subagent_type,
+                subagent_id.as_deref(),
+                Some("aborted"),
+            )
+            .await;
+        }
+    }
+
     /// Fire `stopFailure` observe hooks on an inference/API error that ends the
     /// attempt without a normal stop gate. Matcher / `errorClass` are the stable
     /// per-variant token from [`error_class_match_value`]. Never fired on a
@@ -6170,6 +6253,19 @@ impl Driver {
             .answering
             .as_ref()
             .and_then(|pending| pending.provider_item_id.as_deref());
+        // `subagentStop` observe hooks: the INTERACTIVE child completed and is
+        // being popped (spawn mode 1 of 3). Fire the notification BEFORE the
+        // parent report is recorded/emitted below. Child-only; matcher /
+        // `subagentType` is the child agent type, `subagentId` is the
+        // delegating `task` call id, `endReason` is `completed` (this is the
+        // normal success pop; the abort/teardown path is a separate site).
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            &child.agent.name,
+            task_call_id,
+            Some("completed"),
+        )
+        .await;
         let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
             &child.agent.model,
             child.fallback_decision.as_ref(),
@@ -6308,6 +6404,22 @@ impl Driver {
                 .answering
                 .as_ref()
                 .and_then(|pending| pending.provider_item_id.as_deref());
+            // `subagentStop` observe hooks: an INTERACTIVE child is being torn
+            // down on a cancelled / draining / terminally-failed parent turn
+            // (the abort counterpart of the success pop). Firing here keeps
+            // every `subagentStart` paired with exactly one `subagentStop` for
+            // the downstream attention consumer — a child that started must
+            // always emit a stop, whether it completed or was aborted.
+            // `endReason` is `aborted` (distinct from the success pop's
+            // `completed`). Child-only; matcher / `subagentType` is the child
+            // agent type, `subagentId` is the delegating `task` call id.
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &child.agent.name,
+                task_call_id,
+                Some("aborted"),
+            )
+            .await;
             let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
@@ -7613,6 +7725,17 @@ impl Driver {
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
                         fallback_decision: None,
                     });
+                    // `subagentStart` observe hooks: the INTERACTIVE child
+                    // session has just been pushed onto the stack (spawn mode 1
+                    // of 3). Child-only; matcher / `subagentType` is the child
+                    // agent type, `subagentId` is the delegating `task` call id.
+                    self.fire_subagent_hook(
+                        crate::config::extended::hooks::HookEvent::SubagentStart,
+                        &child_agent,
+                        Some(&task_call_id),
+                        None,
+                    )
+                    .await;
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
                     let _ = tx

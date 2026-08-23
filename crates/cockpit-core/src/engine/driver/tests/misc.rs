@@ -382,3 +382,190 @@ async fn stop_failure_hook_fires_on_inference_error_class() {
         "a timeout_ttft-only hook must not fire on a network failure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Interactive subagent lifecycle observe-hook boundary wiring
+// (subagentStart / subagentStop). These drive the REAL driver production
+// boundaries: `pop_child_with_envelope` (success child stop) and
+// `unwind_stack_to_root` (abort child stop). The hook command is unresolvable
+// so it fails open (executable-not-found) WITHOUT spawning a process; a
+// `hook_run` row is still recorded — the wiring signal. On dead-code HEAD (no
+// wiring) no such row exists, so each fails there. `push_answering_child`
+// pushes a child whose agent name is `builder`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
+    // Drive the real success-pop boundary: a `subagentStop` hook matched on the
+    // child agent type fires exactly once when the child frame is popped.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    push_answering_child(&mut driver, "task-pop-1", "fn-pop-1");
+    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "popping an interactive child must fire exactly one subagentStop hook"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    // A different-agent-type hook must NOT fire on a builder child pop.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    push_answering_child(&mut driver, "task-pop-2", "fn-pop-2");
+    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "an explore-only hook must not fire on a builder child pop"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
+    // Drive the real abort/teardown boundary: a cancelled parent turn unwinds
+    // the child stack, which must STILL fire `subagentStop` so every started
+    // child is paired with a stop. Without this, an aborted interactive child
+    // would leave a `subagentStart` with no matching `subagentStop`.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let call_id = "task-abort-hook-1";
+    let function_call_id = "fn-abort-hook-1";
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    driver.stack[0].history = vec![task_tool_call(call_id, function_call_id)];
+    push_answering_child(&mut driver, call_id, function_call_id);
+    driver
+        .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
+        .await;
+    assert_eq!(driver.stack.len(), 1, "unwind returns to the root frame");
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "aborting an interactive child must fire exactly one subagentStop hook"
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
+    // The production `fire_subagent_hook` helper (the exact call the interactive
+    // spawn boundary makes) fires a `subagentStart` hook matched on the child
+    // agent type, and does not fire on a different-agent-type lookalike.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "builder",
+        ),
+    );
+    driver
+        .fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "builder",
+            Some("task-start-1"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStart").await,
+        vec!["failed".to_string()],
+        "a builder child spawn must fire exactly one subagentStart hook"
+    );
+
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "explore",
+        ),
+    );
+    driver
+        .fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            "builder",
+            Some("task-start-2"),
+            None,
+        )
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStart")
+            .await
+            .is_empty(),
+        "an explore-only hook must not fire on a builder child spawn"
+    );
+}
+
+#[tokio::test]
+async fn orphaned_child_teardown_fires_paired_subagent_stop() {
+    // The pairing-teardown escape hatch: a driver-loop exit that abandons a
+    // still-active interactive child (only reachable via a fatal error, which
+    // does NOT unwind) must still fire exactly one `subagentStop` per orphaned
+    // child so no `subagentStart` is left unpaired. Drive the real teardown
+    // helper (`drain_orphaned_child_stop_hooks`, called unconditionally when
+    // the driver loop resolves in the session worker) with a child on the
+    // stack.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    push_answering_child(&mut driver, "task-orphan-1", "fn-orphan-1");
+    // Child is still on the stack (not popped / unwound) — simulating a fatal
+    // driver-loop exit that abandoned it.
+    assert_eq!(driver.stack.len(), 2, "child frame is present pre-teardown");
+    driver.drain_orphaned_child_stop_hooks().await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "an orphaned child at driver teardown must fire exactly one subagentStop"
+    );
+
+    // At the root frame (the normal exit state) the teardown fires nothing —
+    // no double-stop for children already popped / unwound.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    assert_eq!(driver.stack.len(), 1, "root-only stack");
+    driver.drain_orphaned_child_stop_hooks().await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "teardown at the root frame must fire no subagentStop"
+    );
+}

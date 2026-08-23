@@ -119,6 +119,13 @@ pub struct HookEnvelope {
     /// | `manual`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_source: Option<String>,
+    /// End-reason discriminator (Decision 8) — a first-class typed field, not
+    /// overloaded onto the generic `reason` key. Carries the `subagentStop`
+    /// child-stop reason (e.g. `completed`, `aborted`) and, for `sessionEnd`,
+    /// the same closed `WorkerStop`-derived token used as the matcher
+    /// (`completed` | `interrupted` | `cancelled` | `shutdown` | `error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
 }
 
 /// Typed, camelCase observe-envelope discriminators (Decision 8 / F1).
@@ -134,6 +141,8 @@ pub(crate) struct ObserveFields<'a> {
     pub permission_kind: Option<&'a str>,
     pub error_class: Option<&'a str>,
     pub compact_source: Option<&'a str>,
+    /// `subagentStop` child-stop reason (envelope `endReason`).
+    pub end_reason: Option<&'a str>,
 }
 
 impl HookEnvelope {
@@ -169,6 +178,7 @@ impl HookEnvelope {
             permission_kind: None,
             error_class: None,
             compact_source: None,
+            end_reason: None,
         }
     }
 
@@ -210,6 +220,7 @@ impl HookEnvelope {
             permission_kind: None,
             error_class: None,
             compact_source: None,
+            end_reason: None,
         }
     }
 
@@ -252,6 +263,7 @@ impl HookEnvelope {
             permission_kind: fields.permission_kind.map(str::to_string),
             error_class: fields.error_class.map(str::to_string),
             compact_source: fields.compact_source.map(str::to_string),
+            end_reason: fields.end_reason.map(str::to_string),
         }
     }
 
@@ -1466,9 +1478,11 @@ pub(crate) async fn run_stop_hooks(
 ///
 /// Observe-only hooks (`sessionStart`, `userPromptSubmit`, `permissionDenied`,
 /// `subagentStart`, `preCompact`, `postCompact`, `stopFailure`, and
-/// `sessionEnd`) never block. All matching hooks run sequentially even if an
-/// earlier observer fails. Each failed run is recorded; a nonmatching handler
-/// produces no row.
+/// `sessionEnd`) never block. `subagentStop`'s observe NOTIFICATION (a child
+/// stopped, with its `endReason`) is also emitted through here; its stop-gate
+/// continuation is a separate concern. All matching hooks run sequentially even
+/// if an earlier observer fails. Each failed run is recorded; a nonmatching
+/// handler produces no row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_observe_hooks(
     runner: &dyn CommandRunner,

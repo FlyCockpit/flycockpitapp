@@ -237,6 +237,42 @@ impl WorkerStop {
             WorkerStop::Shutdown { .. } | WorkerStop::WorkerStopped => "worker stopped",
         }
     }
+
+    /// Closed, deterministic map from a worker-teardown cause onto the
+    /// `sessionEnd` hook matcher (Decision 3). This is the ONLY authority for
+    /// the matcher; callers must not re-derive it from the human-readable
+    /// [`Self::session_ended_reason`] proto text. Exhaustive over every
+    /// `WorkerStop` variant (no `_`) so a future teardown cause is a compile
+    /// error here rather than a silent mis-map. The matcher token is one of the
+    /// closed config set `completed | interrupted | cancelled | shutdown |
+    /// error` (`config/extended/hooks.rs` `HookEvent::SessionEnd` policy):
+    ///
+    /// - a failed driver ⇒ `error`
+    /// - a driver that exited on its own ⇒ `completed`
+    /// - a resumable (`pause_for_resume: true`) daemon drain ⇒ `shutdown`
+    ///   (the session stays resumable rather than ending)
+    /// - a non-resumable shutdown or an explicit worker stop ⇒ `completed`
+    ///
+    /// `interrupted` / `cancelled` are reserved matcher tokens for future
+    /// teardown causes; today no `WorkerStop` variant classifies them, so they
+    /// are intentionally not produced (mapping to them would be a
+    /// plausible-but-wrong value). When such a cause is added, extend
+    /// `WorkerStop` and this match together.
+    pub(super) fn session_end_matcher(&self) -> &'static str {
+        match self {
+            WorkerStop::DriverFailed => "error",
+            WorkerStop::DriverExited => "completed",
+            WorkerStop::Shutdown {
+                pause_for_resume: true,
+                ..
+            } => "shutdown",
+            WorkerStop::Shutdown {
+                pause_for_resume: false,
+                ..
+            }
+            | WorkerStop::WorkerStopped => "completed",
+        }
+    }
 }
 
 pub(super) fn driver_join_outcome(

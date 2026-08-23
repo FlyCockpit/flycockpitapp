@@ -4194,3 +4194,95 @@ async fn queue_item_carries_display_text() {
     assert!(proto.text.starts_with("<file"));
     assert_eq!(proto.display_text.as_deref(), Some("review @src/lib.rs"));
 }
+
+// ---------------------------------------------------------------------------
+// `sessionEnd` hook matcher: closed deterministic WorkerStop -> matcher map.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_end_matcher_maps_worker_stop() {
+    // Expectations are INDEPENDENT literals (Decision 3), not re-derived from
+    // the mapping code. The config-allowed closed matcher set for
+    // `HookEvent::SessionEnd`.
+    let allowed = ["completed", "interrupted", "cancelled", "shutdown", "error"];
+
+    // A failed driver is the ONLY `error`.
+    assert_eq!(WorkerStop::DriverFailed.session_end_matcher(), "error");
+    // A driver that exited on its own is a clean completion.
+    assert_eq!(WorkerStop::DriverExited.session_end_matcher(), "completed");
+    // An explicit worker stop is a clean completion.
+    assert_eq!(WorkerStop::WorkerStopped.session_end_matcher(), "completed");
+    // A resumable daemon drain reports `shutdown` (session stays resumable).
+    assert_eq!(
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active: true,
+            pending_tool_count: 3,
+        }
+        .session_end_matcher(),
+        "shutdown"
+    );
+    assert_eq!(
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active: false,
+            pending_tool_count: 0,
+        }
+        .session_end_matcher(),
+        "shutdown"
+    );
+    // A non-resumable shutdown is a clean completion, NOT `shutdown`.
+    assert_eq!(
+        WorkerStop::Shutdown {
+            pause_for_resume: false,
+            active: false,
+            pending_tool_count: 0,
+        }
+        .session_end_matcher(),
+        "completed"
+    );
+
+    // Every produced matcher is inside the config-allowed closed set.
+    for stop in [
+        WorkerStop::DriverFailed,
+        WorkerStop::DriverExited,
+        WorkerStop::WorkerStopped,
+        WorkerStop::Shutdown {
+            pause_for_resume: true,
+            active: true,
+            pending_tool_count: 1,
+        },
+        WorkerStop::Shutdown {
+            pause_for_resume: false,
+            active: false,
+            pending_tool_count: 0,
+        },
+    ] {
+        assert!(
+            allowed.contains(&stop.session_end_matcher()),
+            "{stop:?} -> {} is outside the closed sessionEnd matcher set",
+            stop.session_end_matcher()
+        );
+    }
+
+    // The matcher must NOT be the human-readable `session_ended_reason` proto
+    // text: `DriverExited` reports proto reason "driver exited" but matcher
+    // "completed"; `DriverFailed` reports "driver failed" but matcher "error".
+    // This proves the closed map, not a string-match on the proto reason.
+    assert_eq!(
+        WorkerStop::DriverExited.session_ended_reason(),
+        "driver exited"
+    );
+    assert_ne!(
+        WorkerStop::DriverExited.session_end_matcher(),
+        WorkerStop::DriverExited.session_ended_reason()
+    );
+    assert_eq!(
+        WorkerStop::DriverFailed.session_ended_reason(),
+        "driver failed"
+    );
+    assert_ne!(
+        WorkerStop::DriverFailed.session_end_matcher(),
+        WorkerStop::DriverFailed.session_ended_reason()
+    );
+}

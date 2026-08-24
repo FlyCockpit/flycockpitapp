@@ -231,26 +231,6 @@ impl ToolsPane {
 
     fn write_agent_def(&mut self, def: &AgentDef) -> Result<()> {
         let markdown = def.to_markdown()?;
-        let mut revision = self.revision.clone();
-        if !self.editable {
-            let response = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::MutateAgent {
-                    project_root: self.cwd.to_string_lossy().into_owned(),
-                    mutation: cockpit_core::daemon::proto::AgentMutation::EjectBuiltin {
-                        name: self.agent_name.clone(),
-                    },
-                    expected_revision: Some(revision),
-                },
-            )
-            .map_err(anyhow::Error::msg)?;
-            let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
-                anyhow::bail!("daemon returned an unexpected eject response");
-            };
-            revision = result
-                .snapshot
-                .ok_or_else(|| anyhow::anyhow!("daemon omitted the ejected snapshot"))?
-                .revision;
-        }
         let response = crate::tui::agent_runner::daemon_request_blocking(
             cockpit_core::daemon::proto::Request::MutateAgent {
                 project_root: self.cwd.to_string_lossy().into_owned(),
@@ -258,7 +238,7 @@ impl ToolsPane {
                     name: self.agent_name.clone(),
                     markdown,
                 },
-                expected_revision: Some(revision),
+                expected_revision: Some(self.revision.clone()),
             },
         )
         .map_err(anyhow::Error::msg)?;

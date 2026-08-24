@@ -180,6 +180,7 @@ async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorP
 }
 
 fn inventory_sync(root: &Path) -> Result<Response, ErrorPayload> {
+    recover_reset_all(root)?;
     let entries = crate::agents::list_all(root)
         .into_iter()
         .map(|entry| {
@@ -309,9 +310,12 @@ fn mutate_sync(
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
-            if current.source_layer != AgentSourceLayer::Workspace {
+            if !matches!(
+                current.source_layer,
+                AgentSourceLayer::Workspace | AgentSourceLayer::Embedded
+            ) {
                 return Err(conflict(
-                    "save refused: select/eject the workspace layer explicitly first",
+                    "save refused: another configuration layer owns this agent",
                 ));
             }
             let parsed =
@@ -321,9 +325,8 @@ fn mutate_sync(
             let target = project_agent_path(root, &name)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
                 .map_err(internal)?;
-            let old =
-                nofollow_read(&target)?.ok_or_else(|| conflict("workspace agent disappeared"))?;
-            if old == markdown.as_bytes() {
+            let old = nofollow_read(&target)?;
+            if old.as_deref() == Some(markdown.as_bytes()) {
                 (false, 0, Some(current))
             } else {
                 cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
@@ -405,25 +408,19 @@ fn mutate_sync(
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            // Only workspace-owned overrides are in scope. Other layers are
-            // never deleted as a side effect of a workspace reset.
-            let mut affected = 0;
-            for name in crate::agents::BUILTIN_AGENT_NAMES {
-                let target = project_agent_path(root, name)?;
-                if target.is_file() {
-                    cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
-                    affected += 1;
-                }
-            }
+            let affected = reset_all_builtins_atomic(root)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
-            if current.source_layer != AgentSourceLayer::Workspace {
+            if !matches!(
+                current.source_layer,
+                AgentSourceLayer::Workspace | AgentSourceLayer::Embedded
+            ) {
                 return Err(conflict(
-                    "goal settings require an explicit workspace-layer override",
+                    "goal settings cannot shadow an agent owned by another configuration layer",
                 ));
             }
             let mut def = crate::agents::parse_agent(
@@ -555,11 +552,110 @@ fn opaque_source_identity(root: &Path, source: &Path, layer: AgentSourceLayer) -
 fn inventory_revision(root: &Path) -> Result<String, ErrorPayload> {
     let mut digest = Sha256::new();
     for name in crate::agents::BUILTIN_AGENT_NAMES {
-        let snapshot = snapshot_sync(root, name)?;
         digest.update(name.as_bytes());
-        digest.update(snapshot.revision.as_bytes());
+        let target = project_agent_path(root, name)?;
+        match nofollow_read(&target)? {
+            Some(bytes) => {
+                digest.update([1]);
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            None => digest.update([0]),
+        }
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResetAllJournal {
+    operation_id: String,
+    entries: Vec<ResetAllEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResetAllEntry {
+    name: String,
+    staged_name: String,
+}
+
+fn reset_journal_path(root: &Path) -> PathBuf {
+    root.join(".cockpit/agent-reset-all.journal.json")
+}
+
+/// Recover an interrupted reset conservatively by restoring every staged
+/// override. A reset is externally committed only after every rename lands
+/// and the journal is removed, so boot/request recovery never exposes a
+/// silently partial reset as success.
+fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
+    let journal_path = reset_journal_path(root);
+    let Some(raw) = nofollow_read(&journal_path)? else {
+        return Ok(());
+    };
+    let journal: ResetAllJournal = serde_json::from_slice(&raw).map_err(bad_config)?;
+    let trash = root
+        .join(".cockpit/.agent-reset-trash")
+        .join(&journal.operation_id);
+    for entry in journal.entries.iter().rev() {
+        validate_name(&entry.name)?;
+        let target = project_agent_path(root, &entry.name)?;
+        let staged = trash.join(&entry.staged_name);
+        if staged.is_file() && !target.exists() {
+            std::fs::rename(&staged, &target).map_err(internal)?;
+        }
+    }
+    cockpit_config::config::remove_config_file_atomic(&journal_path).map_err(internal)?;
+    let _ = std::fs::remove_dir_all(trash);
+    Ok(())
+}
+
+fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
+    recover_reset_all(root)?;
+    let operation_id = Uuid::new_v4().to_string();
+    let trash = root
+        .join(".cockpit/.agent-reset-trash")
+        .join(&operation_id);
+    let mut entries = Vec::new();
+    for name in crate::agents::BUILTIN_AGENT_NAMES {
+        let target = project_agent_path(root, name)?;
+        if nofollow_read(&target)?.is_some() {
+            entries.push(ResetAllEntry {
+                name: (*name).to_string(),
+                staged_name: format!("{name}.md"),
+            });
+        }
+    }
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(&trash).map_err(internal)?;
+    let journal = ResetAllJournal {
+        operation_id,
+        entries,
+    };
+    let encoded = serde_json::to_vec_pretty(&journal).map_err(internal)?;
+    cockpit_config::config::write_config_bytes_atomic(&reset_journal_path(root), &encoded)
+        .map_err(internal)?;
+
+    for entry in &journal.entries {
+        let source = project_agent_path(root, &entry.name)?;
+        let staged = trash.join(&entry.staged_name);
+        if let Err(error) = std::fs::rename(&source, &staged) {
+            // The durable journal makes rollback retryable if this immediate
+            // recovery itself encounters an I/O failure.
+            let _ = recover_reset_all(root);
+            return Err(internal(error));
+        }
+    }
+    // Removing staged files happens only after all authoritative paths have
+    // moved. The journal remains until cleanup is complete; a crash therefore
+    // restores the exact pre-operation inventory.
+    for entry in &journal.entries {
+        std::fs::remove_file(trash.join(&entry.staged_name)).map_err(internal)?;
+    }
+    cockpit_config::config::remove_config_file_atomic(&reset_journal_path(root))
+        .map_err(internal)?;
+    let _ = std::fs::remove_dir_all(trash);
+    Ok(journal.entries.len() as u32)
 }
 
 fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPayload> {

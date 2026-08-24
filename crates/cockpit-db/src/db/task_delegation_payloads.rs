@@ -129,7 +129,9 @@ impl Db {
             .write(move |conn| Self::insert_prepared_task_delegation_payload_conn(conn, prepared))
             .await?;
         let row = committed.confirm_outer_commit();
-        self.reconcile_delegation_sidecar_cleanup_intents().await?;
+        if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, "replaced delegation sidecar cleanup remains durable and pending");
+        }
         Ok(row)
     }
 

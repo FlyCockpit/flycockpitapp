@@ -274,7 +274,9 @@ impl Db {
             .into_iter()
             .map(|payload| payload.confirm_outer_commit())
             .collect();
-        self.reconcile_delegation_sidecar_cleanup_intents().await?;
+        if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, "replaced delegation sidecar cleanup remains durable and pending");
+        }
         Ok(rows)
     }
 

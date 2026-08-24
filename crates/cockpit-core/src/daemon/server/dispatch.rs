@@ -685,6 +685,7 @@ async fn handle_send_user_message(
     // queue ledger: that would create a second accept path after phase one.
     // Media and inline text retain their existing legacy ledger until their
     // own transport representation is migrated.
+    #[cfg(feature = "remote")]
     let remote_queue_operation = if artifact_admission.is_some() {
         None
     } else {
@@ -732,6 +733,7 @@ async fn handle_send_user_message(
                 // worker uses — record a fresh operation, replay an already
                 // committed one, or reject an operation/actor conflict — so no
                 // remote send returns accepted without a ledger operation row.
+                #[cfg(feature = "remote")]
                 if let Some(operation) = &remote_queue_operation {
                     match crate::daemon::session_worker::reserve_remote_send_operation(
                         &ctx.db, operation,
@@ -816,6 +818,7 @@ async fn handle_send_user_message(
     handle
         .send_work(SessionWork::UserMessage {
             submission: Box::new(submission),
+            #[cfg(feature = "remote")]
             remote_operation: remote_queue_operation,
             artifact_admission: artifact_admission.clone().map(Box::new),
             respond_to,
@@ -2621,6 +2624,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::RemoveQueuedUserMessage { queue_item_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 let request = Request::RemoveQueuedUserMessage { queue_item_id };
                 let params = request
@@ -2641,6 +2645,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })
@@ -2656,6 +2661,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveNewestQueuedUserMessage { target_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 if target_id.is_none() {
                     return Err(ErrorPayload {
@@ -2685,6 +2691,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })
@@ -2700,6 +2707,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveEditableQueuedUserMessages { target_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 let request = Request::RemoveEditableQueuedUserMessages {
                     target_id: target_id.clone(),
@@ -2722,6 +2730,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })

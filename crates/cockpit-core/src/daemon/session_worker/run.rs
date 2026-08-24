@@ -399,6 +399,7 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
     }
 }
 
+#[cfg(any(feature = "remote", test))]
 pub(super) fn remote_queue_mutation_response(
     receipt: RemoteQueueMutationReceiptV1,
 ) -> proto::RemoveQueuedUserMessageResult {
@@ -455,6 +456,7 @@ pub(super) fn remote_queue_mutation_response(
 /// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
 /// the ledger row; the marker is unchanged from main; the cross-record atomicity
 /// is the V2 cutover's job.
+#[cfg(any(feature = "remote", test))]
 pub(super) async fn reserve_remote_send_operation_impl(
     db: &crate::db::Db,
     remote: &crate::daemon::session_worker::RemoteQueueOperation,
@@ -871,6 +873,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     Ok(replayed)
 }
 
+#[cfg(any(feature = "remote", test))]
 struct RemoteQueueMutationCommit<'a> {
     session: &'a Session,
     queue: &'a crate::engine::message::UserSubmissionQueue,
@@ -882,6 +885,7 @@ struct RemoteQueueMutationCommit<'a> {
     redaction: &'a SharedRedactionTable,
 }
 
+#[cfg(any(feature = "remote", test))]
 async fn commit_remote_queue_mutation(
     input: RemoteQueueMutationCommit<'_>,
 ) -> std::result::Result<RemoteQueueMutationReceiptV1, proto::ErrorPayload> {
@@ -2104,6 +2108,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::UserMessage {
                     mut submission,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     artifact_admission,
                     respond_to,
@@ -2630,6 +2635,7 @@ pub(super) async fn run_worker(
                             // the transactional ledger (#3) — record a fresh operation,
                             // replay an already-committed one, or reject an
                             // operation/actor conflict — but NEVER enqueue a second copy.
+                            #[cfg(feature = "remote")]
                             if let Some(remote) = remote_operation.as_ref() {
                                 match reserve_remote_send_operation(&session.db, remote).await {
                                     RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
@@ -2702,6 +2708,7 @@ pub(super) async fn run_worker(
                     // the operation WITHOUT a second enqueue (#3); a conflict is
                     // rejected with no ledger row. This runs after the terminal /
                     // durable-receipt / model-fence checks above.
+                    #[cfg(feature = "remote")]
                     if let Some(remote) = remote_operation.as_ref() {
                         let (peek, snapshot) = driver_input_queue
                             .peek_idempotent(
@@ -2861,6 +2868,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -2872,6 +2880,7 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
@@ -3010,6 +3019,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -3028,6 +3038,7 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
                             session: &session,
@@ -3090,6 +3101,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -3110,6 +3122,7 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
                             session: &session,

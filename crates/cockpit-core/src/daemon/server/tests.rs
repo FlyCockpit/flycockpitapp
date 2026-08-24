@@ -2179,6 +2179,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -13309,6 +13310,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -13341,6 +13343,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -13397,6 +13400,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -18335,6 +18339,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_newest_queued_user_message",
                     SessionWork::RemoveNewestQueuedUserMessage {
                         target_id,
+                        #[cfg(feature = "remote")]
                         remote_operation: _,
                         respond_to,
                     },
@@ -18353,6 +18358,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_editable_queued_user_messages",
                     SessionWork::RemoveEditableQueuedUserMessages {
                         target_id,
+                        #[cfg(feature = "remote")]
                         remote_operation: _,
                         respond_to,
                     },
@@ -18633,6 +18639,7 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
         |work| {
             let SessionWork::RemoveQueuedUserMessage {
                 queue_item_id: delivered_id,
+                #[cfg(feature = "remote")]
                 remote_operation: _,
                 respond_to,
             } = work

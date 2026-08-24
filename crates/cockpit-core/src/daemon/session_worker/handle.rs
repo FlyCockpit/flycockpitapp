@@ -1545,7 +1545,8 @@ pub enum SessionWork {
         /// the submission, so a replayed operation is a durable no-op rather
         /// than a second accept. Owner/local sends pass `None` and take the
         /// unchanged in-memory accept path.
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         /// Present only for text-only sources above 64KiB. Unlike the legacy
         /// in-memory acceptance path, this branch has a durable FCM2 receipt
         /// and exact artifact lease before it reaches the driver.
@@ -1569,21 +1570,24 @@ pub enum SessionWork {
     },
     RemoveQueuedUserMessage {
         queue_item_id: Uuid,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveNewestQueuedUserMessage {
         target_id: Option<String>,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveEditableQueuedUserMessages {
         target_id: Option<String>,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
         >,

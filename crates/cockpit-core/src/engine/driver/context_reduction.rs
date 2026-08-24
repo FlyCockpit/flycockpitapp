@@ -145,19 +145,21 @@ pub enum DurableCompactionShadow {
 }
 
 /// Durable progress of a compaction across its two observe boundaries and the
-/// successor timeline commit. Each dispatched phase is a durable outbox
-/// receipt: it is persisted before handing the matching boundary to the hook
-/// runner, and both hook payloads carry `compaction_id`. Recovery therefore
-/// applies one policy consistently at both boundaries and never duplicates a
-/// boundary whose dispatch receipt committed. Hook commands that externalize
-/// effects use the stable id as their idempotency key across process failure.
+/// successor timeline commit. The phase is a recovery cursor, not a claim of
+/// exactly-once external execution. Hook delivery uses the separate durable
+/// pending/leased/completed outbox and is at least once: a crash after a hook
+/// command executes but before its receipt commits may redeliver that edge.
+/// Consumers use `(compaction_id, edge)` as their idempotency key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTransactionPhase {
     Prepared,
-    PreDispatched,
+    PreCompleted,
+    /// `preCompact` completed, but at least one durable successor commit
+    /// attempt failed. Recovery retries the same identity; post remains absent.
+    CommitRetryPending,
     SuccessorCommitted,
-    PostDispatched,
+    PostCompleted,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -372,6 +374,10 @@ impl Driver {
     }
 
     pub(in crate::engine::driver) async fn load_compaction_shadow_from_store(&mut self) {
+        if let Err(error) = self.session.db.release_compaction_hook_leases(self.session.id).await {
+            tracing::warn!(error = %error, "compact hook outbox: releasing crash leases failed");
+            return;
+        }
         let ctx_cfg = self.resolve_context_config();
         let row = match self.session.db.compaction_shadow(self.session.id).await {
             Ok(row) => row,
@@ -1237,10 +1243,11 @@ impl Driver {
 
     /// Compaction lifecycle hooks are transactional with the requested
     /// compaction: preparation or validation failure fires neither hook. Once
-    /// validation succeeds, a recovery-only intent is persisted, `preCompact`
-    /// runs immediately before the atomic durable successor commit, the live
-    /// projection follows that commit, and `postCompact` follows projection.
-    /// A storage failure retains the intent for bootstrap recovery.
+    /// validation succeeds, a recovery intent and pending `preCompact` delivery
+    /// are persisted. Hook delivery is at least once, with `compaction_id` as
+    /// the stable consumer idempotency key. A durable successor failure leaves
+    /// an honest attempted transaction: pre may already have run, the intent
+    /// remains retryable, and post is not enqueued until the successor exists.
     pub(in crate::engine::driver) async fn do_compact_with_source(
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -1328,41 +1335,32 @@ impl Driver {
             phase: CompactionTransactionPhase::Prepared,
             prepared,
         };
-        // Validation and all fallible preparation are complete. `preCompact`
-        // is the last lifecycle action before the atomic durable successor
-        // record; the live projection is installed only after that commit.
-        if !self
-            .advance_compaction_transaction(
-                &mut transaction,
-                CompactionTransactionPhase::PreDispatched,
-            )
-            .await
-        {
+        if !self.deliver_compaction_hook(&transaction.prepared, "pre").await {
             self.recovered_compaction_intent = Some(transaction);
             return;
         }
-        let compaction_id = transaction.prepared.compaction_id.to_string();
-        self.fire_observe_hook(
-            crate::config::extended::hooks::HookEvent::PreCompact,
-            source,
-            None,
-            None,
-            crate::engine::agent::hooks::ObserveFields {
-                compact_source: Some(source),
-                compaction_id: Some(&compaction_id),
-                ..Default::default()
-            },
-        )
-        .await;
+        if !self.advance_compaction_transaction(&mut transaction, CompactionTransactionPhase::PreCompleted).await {
+            self.recovered_compaction_intent = Some(transaction);
+            return;
+        }
         if let Err(error) = self.stage_prepared_compaction(&transaction.prepared).await {
-            tracing::warn!(%error, "compaction durable commit failed; recovery intent retained");
+            tracing::warn!(%error, compaction_id=%transaction.prepared.compaction_id, "compaction commit attempt failed after preCompact; retry intent retained");
             let _ = tx
                 .send(TurnEvent::Notice {
                     text: format!(
-                        "/compact: durable successor commit failed: {error}; recovery will finish the prepared compaction"
+                        "/compact: durable successor commit failed after preCompact ran for attempt {}: {error}; recovery will retry the same compaction identity",
+                        transaction.prepared.compaction_id
                     ),
                 })
                 .await;
+            let _ = self.advance_compaction_transaction(
+                &mut transaction,
+                CompactionTransactionPhase::CommitRetryPending,
+            ).await;
+            self.recovered_compaction_intent = Some(transaction);
+            return;
+        }
+        if self.ensure_compaction_hook_pending(&transaction.prepared, "post").await.is_none() {
             self.recovered_compaction_intent = Some(transaction);
             return;
         }
@@ -1378,28 +1376,14 @@ impl Driver {
         }
         self.commit_prepared_compaction(transaction.prepared.clone(), tx)
             .await;
-        if !self
-            .advance_compaction_transaction(
-                &mut transaction,
-                CompactionTransactionPhase::PostDispatched,
-            )
-            .await
-        {
+        if !self.deliver_compaction_hook(&transaction.prepared, "post").await {
             self.recovered_compaction_intent = Some(transaction);
             return;
         }
-        self.fire_observe_hook(
-            crate::config::extended::hooks::HookEvent::PostCompact,
-            source,
-            None,
-            None,
-            crate::engine::agent::hooks::ObserveFields {
-                compact_source: Some(source),
-                compaction_id: Some(&compaction_id),
-                ..Default::default()
-            },
-        )
-        .await;
+        if !self.advance_compaction_transaction(&mut transaction, CompactionTransactionPhase::PostCompleted).await {
+            self.recovered_compaction_intent = Some(transaction);
+            return;
+        }
         self.delete_durable_shadow_brief().await;
     }
 
@@ -1413,40 +1397,54 @@ impl Driver {
         let Some(mut transaction) = self.recovered_compaction_intent.take() else {
             return;
         };
-        if let Err(error) = self.validate_prepared_compaction(&transaction.prepared) {
-            tracing::warn!(%error, "discarding stale recovered compaction intent");
-            self.delete_durable_shadow_brief().await;
-            return;
-        }
-        let source = transaction.prepared.source.clone();
-        let compaction_id = transaction.prepared.compaction_id.to_string();
-        if transaction.phase == CompactionTransactionPhase::Prepared {
-            if !self
-                .advance_compaction_transaction(
-                    &mut transaction,
-                    CompactionTransactionPhase::PreDispatched,
-                )
-                .await
-            {
+        // The successor is the authoritative commit marker. Detect it before
+        // comparing the now-compacted live projection with predecessor
+        // coverage; otherwise a crash after commit is misclassified as stale
+        // and its pending post edge is lost.
+        let successor_exists = match self.session.db
+            .session_compaction_event_seq(self.session.id, transaction.prepared.compaction_id)
+            .await {
+            Ok(row) => row.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "checking recovered compaction successor failed");
                 self.recovered_compaction_intent = Some(transaction);
                 return;
             }
-            self.fire_observe_hook(
-                crate::config::extended::hooks::HookEvent::PreCompact,
-                &source,
-                None,
-                None,
-                crate::engine::agent::hooks::ObserveFields {
-                    compact_source: Some(&source),
-                    compaction_id: Some(&compaction_id),
-                    ..Default::default()
-                },
-            )
-            .await;
+        };
+        if successor_exists {
+            if transaction.phase != CompactionTransactionPhase::PostCompleted {
+                transaction.phase = CompactionTransactionPhase::SuccessorCommitted;
+                if self.ensure_compaction_hook_pending(&transaction.prepared, "post").await.is_none() {
+                    self.recovered_compaction_intent = Some(transaction);
+                    return;
+                }
+            }
+        } else if let Err(error) = self.validate_prepared_compaction(&transaction.prepared) {
+            tracing::warn!(%error, "discarding stale uncommitted compaction intent");
+            self.delete_durable_shadow_brief().await;
+            return;
         }
-        if transaction.phase == CompactionTransactionPhase::PreDispatched {
+        if transaction.phase == CompactionTransactionPhase::Prepared {
+            if !self.deliver_compaction_hook(&transaction.prepared, "pre").await {
+                self.recovered_compaction_intent = Some(transaction);
+                return;
+            }
+            if !self.advance_compaction_transaction(&mut transaction, CompactionTransactionPhase::PreCompleted).await {
+                self.recovered_compaction_intent = Some(transaction);
+                return;
+            }
+        }
+        if matches!(transaction.phase, CompactionTransactionPhase::PreCompleted | CompactionTransactionPhase::CommitRetryPending) {
             if let Err(error) = self.stage_prepared_compaction(&transaction.prepared).await {
                 tracing::warn!(%error, "recovered compaction durable commit still unavailable");
+                let _ = self.advance_compaction_transaction(
+                    &mut transaction,
+                    CompactionTransactionPhase::CommitRetryPending,
+                ).await;
+                self.recovered_compaction_intent = Some(transaction);
+                return;
+            }
+            if self.ensure_compaction_hook_pending(&transaction.prepared, "post").await.is_none() {
                 self.recovered_compaction_intent = Some(transaction);
                 return;
             }
@@ -1464,30 +1462,67 @@ impl Driver {
         if transaction.phase == CompactionTransactionPhase::SuccessorCommitted {
             self.commit_prepared_compaction(transaction.prepared.clone(), tx)
                 .await;
-            if !self
-                .advance_compaction_transaction(
-                    &mut transaction,
-                    CompactionTransactionPhase::PostDispatched,
-                )
-                .await
-            {
+            if !self.deliver_compaction_hook(&transaction.prepared, "post").await {
                 self.recovered_compaction_intent = Some(transaction);
                 return;
             }
-            self.fire_observe_hook(
-                crate::config::extended::hooks::HookEvent::PostCompact,
-                &source,
-                None,
-                None,
-                crate::engine::agent::hooks::ObserveFields {
-                    compact_source: Some(&source),
-                    compaction_id: Some(&compaction_id),
-                    ..Default::default()
-                },
-            )
-            .await;
+            if !self.advance_compaction_transaction(&mut transaction, CompactionTransactionPhase::PostCompleted).await {
+                self.recovered_compaction_intent = Some(transaction);
+                return;
+            }
         }
         self.delete_durable_shadow_brief().await;
+    }
+
+    async fn ensure_compaction_hook_pending(&self, prepared: &PreparedCompaction, edge: &'static str) -> Option<bool> {
+        let payload = serde_json::json!({
+            "compaction_id": prepared.compaction_id,
+            "edge": edge,
+            "source": &prepared.source,
+        });
+        let payload_json = match serde_json::to_string(&payload) {
+            Ok(value) => value,
+            Err(error) => { tracing::warn!(%error, edge, "serializing compaction hook outbox payload failed"); return None; }
+        };
+        match self.session.db.enqueue_compaction_hook(
+            self.session.id, prepared.compaction_id, edge, &payload_json,
+        ).await {
+            Ok(durable) => Some(durable),
+            Err(error) => { tracing::warn!(%error, edge, "enqueuing compaction hook failed"); None }
+        }
+    }
+
+    async fn deliver_compaction_hook(&mut self, prepared: &PreparedCompaction, edge: &'static str) -> bool {
+        let Some(durable) = self.ensure_compaction_hook_pending(prepared, edge).await else {
+            return false;
+        };
+        let lease = if durable {
+            match self.session.db.lease_compaction_hook(
+                self.session.id, prepared.compaction_id, edge, 60 * 60 * 1_000,
+            ).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => return self.session.db.compaction_hook_completed(prepared.compaction_id, edge).await.unwrap_or(false),
+                Err(error) => { tracing::warn!(%error, edge, "leasing compaction hook failed"); return false; }
+            }
+        } else { None };
+        let event = if edge == "pre" {
+            crate::config::extended::hooks::HookEvent::PreCompact
+        } else {
+            crate::config::extended::hooks::HookEvent::PostCompact
+        };
+        let compaction_id = prepared.compaction_id.to_string();
+        self.fire_observe_hook(event, &prepared.source, None, None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(&prepared.source),
+                compaction_id: Some(&compaction_id),
+                ..Default::default()
+            }).await;
+        let Some(lease) = lease else { return true; };
+        match self.session.db.complete_compaction_hook(prepared.compaction_id, edge, lease.lease_id).await {
+            Ok(true) => true,
+            Ok(false) => { tracing::warn!(edge, "compaction hook lease was lost before completion receipt"); false }
+            Err(error) => { tracing::warn!(%error, edge, "recording compaction hook completion failed"); false }
+        }
     }
 
     async fn advance_compaction_transaction(

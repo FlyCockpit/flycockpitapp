@@ -1856,6 +1856,35 @@ CREATE TABLE compaction_shadows (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- Durable delivery state for the two externally observable compaction hook
+-- edges. Delivery is at least once: a worker first leases a pending row, runs
+-- the hook with `compaction_id` as the consumer idempotency key, then records
+-- completion. A crash after the command exits but before that receipt commits
+-- may execute the command again with the same identity.
+CREATE TABLE compaction_hook_outbox (
+    session_id       TEXT NOT NULL,
+    compaction_id    TEXT NOT NULL,
+    edge             TEXT NOT NULL CHECK (edge IN ('pre', 'post')),
+    state            TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'completed')),
+    payload_json     TEXT NOT NULL,
+    lease_id         TEXT,
+    lease_expires_at INTEGER,
+    attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    completed_at     INTEGER,
+    PRIMARY KEY (compaction_id, edge),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    CHECK (
+        (state = 'leased' AND lease_id IS NOT NULL AND lease_expires_at IS NOT NULL AND completed_at IS NULL)
+        OR (state = 'pending' AND lease_id IS NULL AND lease_expires_at IS NULL AND completed_at IS NULL)
+        OR (state = 'completed' AND lease_id IS NULL AND lease_expires_at IS NULL AND completed_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_compaction_hook_outbox_session_state
+    ON compaction_hook_outbox(session_id, state, created_at);
+
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
 -- Session-scope command/path/MCP-tool approval grants; a present row skips the
 -- approval prompt. Project- and Global-scope grants persist outside the

@@ -2922,7 +2922,7 @@ pub(crate) async fn probe_compact_boundaries() -> Vec<String> {
     // Pin the transactional preCompact/postCompact contract over the
     // real `do_compact_with_source` boundary:
     //   prepare-fail → 0 pre + 0 post (no compaction attempted)
-    //   apply-fail   → 0 pre + 0 post (validation/staging did not commit)
+    //   validation-fail → 0 pre + 0 post (no attempt was admitted)
     //   success      → 1 pre + 1 post, preCompact strictly before postCompact
     // Source is "manual" so the auto-compact-gate failure branch is never taken.
 
@@ -2943,7 +2943,9 @@ pub(crate) async fn probe_compact_boundaries() -> Vec<String> {
         "prepare failure must not fire postCompact"
     );
 
-    // apply-fail → neither fires.
+    // Validation failure → neither fires. A later durable commit failure is
+    // different: pre has honestly observed an admitted attempt and recovery
+    // retries that same compaction identity without post until commit.
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     inject_hooks(&mut driver, compact_manual_registry());
     driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Apply);
@@ -3057,9 +3059,10 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
 
     for (phase, expected_hooks) in [
         (Phase::Prepared, vec!["preCompact", "postCompact"]),
-        (Phase::PreDispatched, vec!["postCompact"]),
+        (Phase::PreCompleted, vec!["postCompact"]),
+        (Phase::CommitRetryPending, vec!["postCompact"]),
         (Phase::SuccessorCommitted, vec!["postCompact"]),
-        (Phase::PostDispatched, vec![]),
+        (Phase::PostCompleted, vec![]),
     ] {
         let (mut driver, _tmp) = prepare_apply_fixture().await;
         inject_hooks(&mut driver, compact_manual_registry());
@@ -3069,7 +3072,7 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
             .await
             .expect("prepare succeeds");
 
-        if matches!(phase, Phase::SuccessorCommitted | Phase::PostDispatched) {
+        if matches!(phase, Phase::SuccessorCommitted | Phase::PostCompleted) {
             driver
                 .stage_prepared_compaction(&prepared)
                 .await
@@ -3148,4 +3151,35 @@ async fn compaction_timeline_commit_is_idempotent_by_compaction_id() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn compaction_recovery_recognizes_committed_successor_before_predecessor_validation() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let prepared = driver.prepare_compaction_with_source(&tx, "manual").await.unwrap();
+
+    driver.stage_prepared_compaction(&prepared).await.unwrap();
+    // Model the live projection restored from the committed successor. It no
+    // longer matches predecessor coverage, which must not suppress post.
+    driver.stack[0].history = prepared.history.clone();
+    let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
+        DurableCompactionTransaction {
+            phase: CompactionTransactionPhase::PreCompleted,
+            prepared,
+        },
+    ));
+    driver.session.db.upsert_compaction_shadow(
+        driver.session.id,
+        &serde_json::to_string(&intent).unwrap(),
+    ).await.unwrap();
+
+    driver.load_compaction_shadow_from_store().await;
+    driver.recover_compaction_intent(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(compact_hook_event_order(&driver).await, vec!["postCompact"]);
+    assert!(driver.session.db.compaction_shadow(driver.session.id).await.unwrap().is_none());
 }

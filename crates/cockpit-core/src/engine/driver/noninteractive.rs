@@ -12,7 +12,7 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
 #[derive(Debug, Clone)]
 pub(in crate::engine::driver) struct ChildHookLifecycle {
     subagent_id: String,
-    start_event_emitted: bool,
+    start_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -20,7 +20,7 @@ impl ChildHookLifecycle {
     fn new(subagent_id: impl Into<String>) -> Self {
         Self {
             subagent_id: subagent_id.into(),
-            start_event_emitted: false,
+            start_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -28,7 +28,7 @@ impl ChildHookLifecycle {
     fn already_started(subagent_id: impl Into<String>) -> Self {
         Self {
             subagent_id: subagent_id.into(),
-            start_event_emitted: true,
+            start_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             lifecycle_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -43,6 +43,14 @@ impl ChildHookLifecycle {
     fn emitted(&self) -> bool {
         self.lifecycle_event_emitted
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn started(&self) -> bool {
+        self.start_event_emitted.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn publish_started(&self) {
+        self.start_event_emitted.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -5396,9 +5404,7 @@ async fn fire_recursive_child_abnormal_stop(
     process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     end_reason: &'static str,
 ) {
-    let Some(lifecycle) = lifecycle.filter(|lifecycle| {
-        !lifecycle.start_event_emitted && !lifecycle.emitted()
-    }) else {
+    let Some(lifecycle) = lifecycle.filter(|lifecycle| lifecycle.started() && !lifecycle.emitted()) else {
         return;
     };
     let snapshot = config.snapshot();
@@ -5459,7 +5465,7 @@ pub(crate) async fn run_noninteractive_resumable(
     use crate::engine::agent::turn_with_backup;
 
     if let Some(lifecycle) = child_lifecycle.as_ref()
-        && !lifecycle.start_event_emitted
+        && !lifecycle.started()
     {
         let snapshot = config.snapshot();
         let hook_runner = process_containment.clone().map_or_else(
@@ -5482,6 +5488,7 @@ pub(crate) async fn run_noninteractive_resumable(
             crate::engine::agent::hooks::ObserveFields::default(),
         )
         .await;
+        lifecycle.publish_started();
     }
 
     let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);

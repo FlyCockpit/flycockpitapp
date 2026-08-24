@@ -370,9 +370,14 @@ for child subagent frames. `sessionEnd` is observe-only and fires once per
 session regardless of how it ended.
 
 `preCompact` and `postCompact` envelopes also include the same opaque
-`compactionId`. Hook handlers should use it as their idempotency key: recovery
-never re-dispatches `preCompact`, while it may repeat `postCompact` after an
-ambiguous process crash so the successful boundary is never lost.
+`compactionId`. Delivery uses a durable pending/leased/completed outbox and is
+at least once for both edges. Hook handlers must use `(compactionId, event)` as
+their idempotency key: a crash after a command performs an external effect but
+before Cockpit records its receipt can repeat either hook. `preCompact` means a
+durable compaction attempt was admitted; it can therefore run even when the
+following timeline commit fails. Cockpit retains and retries that same attempt.
+`postCompact` is enqueued only after the durable successor is known to exist.
+Cockpit does not claim exactly-once external effects.
 
 #### Source ordering, argv, and trust
 

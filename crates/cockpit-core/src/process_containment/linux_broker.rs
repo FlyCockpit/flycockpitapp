@@ -44,9 +44,8 @@ const AUTH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 const MAX_PREAUTH_CONNECTIONS: usize = 16;
 const MAX_AUTHENTICATED_CONNECTIONS: usize = 8;
 const MAX_LIVE_OPERATION_RECORDS: usize = 65_536;
-const REPLAY_TOMBSTONE_BYTES: usize = 8 * 1024 * 1024;
-const REPLAY_TOMBSTONE_HASHES: usize = 7;
-const REPLAY_TOMBSTONE_FILE: &str = ".replay-tombstones.bin";
+const REPLAY_IDENTITY_PREFIX: &str = ".replay-identities-";
+const REPLAY_IDENTITIES_PER_SEGMENT: usize = 16_384;
 const BROKER_DIRECTORY: &str = "/run/flycockpit";
 const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -307,15 +306,36 @@ impl LinuxBrokerClient {
     }
 
     async fn cancel_and_prove(&self, session_id: &str, operation_id: &str) -> Result<(), ContainmentError> {
-        let request = Request::CancelOperation {
-            version: PROTOCOL_VERSION,
-            session_id: session_id.to_owned(),
-            operation_id: operation_id.to_owned(),
-        };
-        let client = self.clone();
-        match tokio::task::spawn_blocking(move || client.transact(&request)).await {
-            Ok(Ok((Response::Cancelled { version: PROTOCOL_VERSION }, fds))) if fds.is_empty() => Ok(()),
-            _ => Err(unavailable()),
+        let deadline = std::time::Instant::now() + REAP_TIMEOUT + FRAME_TIMEOUT;
+        loop {
+            let request = Request::CancelOperation {
+                version: PROTOCOL_VERSION,
+                session_id: session_id.to_owned(),
+                operation_id: operation_id.to_owned(),
+            };
+            let client = self.clone();
+            let result = tokio::task::spawn_blocking(move || client.transact(&request)).await;
+            match result {
+                Ok(Ok((Response::Cancelled { version: PROTOCOL_VERSION }, fds))) if fds.is_empty() => return Ok(()),
+                Ok(Ok((Response::Error { code, .. }, fds)))
+                    if fds.is_empty() && matches!(code.as_str(), "operation_owner_active" | "cleanup_pending") => {}
+                _ => {}
+            }
+            let status = Request::OperationStatus {
+                version: PROTOCOL_VERSION,
+                session_id: session_id.to_owned(),
+                operation_id: operation_id.to_owned(),
+            };
+            let client = self.clone();
+            if let Ok(Ok((Response::Operation { version: PROTOCOL_VERSION, state, .. }, fds))) =
+                tokio::task::spawn_blocking(move || client.transact(&status)).await
+            {
+                if fds.is_empty() && matches!(state, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited) {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline { return Err(unavailable()); }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 }
@@ -483,23 +503,11 @@ impl ManagementBroker for LinuxBrokerClient {
         let committed = match tokio::task::spawn_blocking(move || commit_client.transact(&commit)).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
-                // The commit response may be lost after the broker durably
-                // crossed the release boundary. Reconcile the operation; do
-                // not blindly cancel a child which may already be running.
-                let status_client = self.clone();
-                let status = Request::OperationStatus {
-                    version: PROTOCOL_VERSION,
-                    session_id: session_id.clone(),
-                    operation_id: operation_id.clone(),
-                };
-                match tokio::task::spawn_blocking(move || status_client.transact(&status)).await {
-                    Ok(Ok((Response::Operation { version: PROTOCOL_VERSION, state: OperationStatus::Committed | OperationStatus::Exited, key: Some(status_key) }, fds)))
-                        if status_key == key && fds.is_empty() =>
-                    {
-                        (Response::Committed { version: PROTOCOL_VERSION, key: status_key }, Vec::new())
-                    }
-                    _ => return Err(unavailable()),
-                }
+                // A replacement transport cannot adopt another connection's
+                // commit. Request abort and wait for a terminal/ProvenEmpty
+                // state after the old owner's disconnect has linearized.
+                self.cancel_and_prove(&session_id, &operation_id).await?;
+                return Err(unavailable());
             }
         };
         let commit_valid = matches!(
@@ -609,7 +617,7 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     unsafe { libc::close(config.capability_fd) };
     let recovered_empty = verify_server_installation(&config)?;
     verify_socket_location(&config)?;
-    let mut tombstones = ReplayTombstones::load(&config)?;
+    let mut tombstones = ReplayIdentityStore::load(&config)?;
     let mut operations = recover_operation_records(&config, &recovered_empty)?;
     gc_terminal_operations(&config, &mut operations, &mut tombstones)?;
     let mut durable_empty = recovered_empty;
@@ -628,6 +636,20 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
         exit_statuses: recovered_exit_statuses,
         tombstones,
     }));
+    // Cleanup/reap progress must not depend on request traffic. Each pass is
+    // independently bounded and never owns the listener, so idle cleanup does
+    // not delay accepting a replacement daemon connection.
+    {
+        let cleanup_state = state.clone();
+        let cleanup_config = config.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(mut state) = cleanup_state.lock() {
+                retry_pending_cleanups(&cleanup_config, &mut state);
+                retry_pending_exits(&cleanup_config, &mut state);
+            }
+        });
+    }
     // Publish the socket only after cgroup and durable-state recovery has
     // completed. A visible endpoint is a readiness promise to the daemon.
     remove_owned_socket(&config.socket_path)?;
@@ -776,13 +798,12 @@ fn accept_authenticated_connection(
     }
 }
 
-#[derive(Default)]
 struct BrokerState {
     children: BTreeMap<String, libc::pid_t>,
     operations: BTreeMap<(String, String), BrokerOperation>,
     emptied: BTreeSet<String>,
     exit_statuses: BTreeMap<String, Option<i32>>,
-    tombstones: ReplayTombstones,
+    tombstones: ReplayIdentityStore,
 }
 
 struct BrokerOperation {
@@ -797,105 +818,84 @@ struct BrokerOperation {
     owner_connection: Option<u64>,
 }
 
-struct ReplayTombstones {
-    epoch: String,
-    bits: Vec<u8>,
+fn owned_by_other_connection(owner: Option<u64>, connection_id: u64) -> bool {
+    owner.is_some_and(|owner| owner != connection_id)
 }
 
-impl ReplayTombstones {
-    fn load(config: &LinuxBrokerServerConfig) -> std::io::Result<Self> {
-        let path = config.state_root.join(REPLAY_TOMBSTONE_FILE);
-        let epoch = broker_epoch()?;
-        let bits = match fs::read(&path) {
-            Ok(stored) if stored.len() == 37 + REPLAY_TOMBSTONE_BYTES + 32 => {
-                let metadata = fs::symlink_metadata(&path)?;
-                if !metadata.file_type().is_file()
-                    || metadata.uid() != 0
-                    || metadata.mode() & 0o077 != 0
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "replay tombstone store is not private root-owned storage",
-                    ));
-                }
-                if stored.get(36) != Some(&b'\n') {
-                    return Err(invalid("invalid replay tombstone epoch delimiter"));
-                }
-                let stored_epoch = std::str::from_utf8(&stored[..36]).map_err(invalid)?;
-                uuid::Uuid::parse_str(stored_epoch)
-                    .map_err(|_| invalid("invalid replay tombstone epoch"))?;
-                let payload_end = 37 + REPLAY_TOMBSTONE_BYTES;
-                let mut checksum = Sha256::new();
-                checksum.update(b"flycockpit-replay-tombstone-file-v1\0");
-                checksum.update(&stored[..payload_end]);
-                if checksum.finalize().as_slice() != &stored[payload_end..] {
-                    return Err(invalid("replay tombstone checksum mismatch"));
-                }
-                // Operation identities are protocol idempotency keys, not PID
-                // aliases. Their retirement therefore survives reboot even
-                // though process/cgroup recovery is boot-scoped. The epoch in
-                // the envelope records the last writer; it never resets bits.
-                stored[37..payload_end].to_vec()
-            }
-            Ok(_) => return Err(invalid("invalid replay tombstone store")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                vec![0; REPLAY_TOMBSTONE_BYTES]
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(Self { epoch, bits })
-    }
+#[derive(Serialize, Deserialize)]
+struct ReplayIdentitySegment {
+    version: u32,
+    sequence: u64,
+    identities: Vec<(String, String)>,
+    checksum: String,
+}
 
-    fn indexes(session_id: &str, operation_id: &str) -> [usize; REPLAY_TOMBSTONE_HASHES] {
-        std::array::from_fn(|round| {
-            let mut hash = Sha256::new();
-            hash.update(b"flycockpit-replay-tombstone-v1\0");
-            hash.update([round as u8]);
-            hash.update((session_id.len() as u64).to_be_bytes());
-            hash.update(session_id.as_bytes());
-            hash.update((operation_id.len() as u64).to_be_bytes());
-            hash.update(operation_id.as_bytes());
-            let digest = hash.finalize();
-            let value = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix"));
-            (value as usize) % (REPLAY_TOMBSTONE_BYTES * 8)
-        })
+struct ReplayIdentityStore {
+    identities: BTreeSet<(String, String)>,
+    next_sequence: u64,
+}
+
+impl ReplayIdentityStore {
+    fn load(config: &LinuxBrokerServerConfig) -> std::io::Result<Self> {
+        let mut identities = BTreeSet::new();
+        let mut next_sequence = 0_u64;
+        for entry in fs::read_dir(&config.state_root)? {
+            let entry = entry?;
+            let Some(sequence) = replay_segment_sequence(entry.file_name().as_bytes()) else { continue };
+            let metadata = entry.metadata()?;
+            if !entry.file_type()?.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid replay identity segment"));
+            }
+            let bytes = fs::read(entry.path())?;
+            if bytes.len() > MAX_FRAME * 4 { return Err(invalid("replay identity segment exceeds size limit")); }
+            let segment: ReplayIdentitySegment = serde_json::from_slice(&bytes).map_err(invalid)?;
+            if segment.version != 1 || segment.sequence != sequence || segment.identities.len() > REPLAY_IDENTITIES_PER_SEGMENT {
+                return Err(invalid("invalid replay identity segment envelope"));
+            }
+            if segment.checksum != replay_segment_checksum(sequence, &segment.identities)? {
+                return Err(invalid("replay identity segment checksum mismatch"));
+            }
+            for identity in segment.identities {
+                if uuid::Uuid::parse_str(&identity.0).is_err() || !valid_operation_id(&identity.1) || !identities.insert(identity) {
+                    return Err(invalid("duplicate or invalid retired operation identity"));
+                }
+            }
+            next_sequence = next_sequence.max(sequence.checked_add(1).ok_or_else(|| invalid("replay segment sequence overflow"))?);
+        }
+        Ok(Self { identities, next_sequence })
     }
 
     fn contains(&self, session_id: &str, operation_id: &str) -> bool {
-        Self::indexes(session_id, operation_id).into_iter().all(|index| {
-            self.bits[index / 8] & (1 << (index % 8)) != 0
-        })
+        self.identities.contains(&(session_id.to_owned(), operation_id.to_owned()))
     }
 
-    fn insert(&mut self, session_id: &str, operation_id: &str) {
-        for index in Self::indexes(session_id, operation_id) {
-            self.bits[index / 8] |= 1 << (index % 8);
+    fn append(&mut self, config: &LinuxBrokerServerConfig, retired: &[(String, String)]) -> std::io::Result<()> {
+        for chunk in retired.chunks(REPLAY_IDENTITIES_PER_SEGMENT) {
+            let identities = chunk.to_vec();
+            let sequence = self.next_sequence;
+            let segment = ReplayIdentitySegment { version: 1, sequence, checksum: replay_segment_checksum(sequence, &identities)?, identities: identities.clone() };
+            let bytes = serde_json::to_vec(&segment).map_err(invalid)?;
+            let destination = config.state_root.join(format!("{REPLAY_IDENTITY_PREFIX}{sequence:020}.json"));
+            atomic_replace_named_state(config, &destination, &bytes, ".replay-identities")?;
+            for identity in identities { self.identities.insert(identity); }
+            self.next_sequence = sequence.checked_add(1).ok_or_else(|| invalid("replay segment sequence overflow"))?;
         }
+        Ok(())
     }
+}
 
-    fn can_insert_all<'a>(&self, identities: impl Iterator<Item = &'a (String, String)>) -> bool {
-        let mut projected = self.bits.clone();
-        for (session_id, operation_id) in identities {
-            for index in Self::indexes(session_id, operation_id) {
-                projected[index / 8] |= 1 << (index % 8);
-            }
-        }
-        projected.iter().map(|byte| byte.count_ones() as usize).sum::<usize>()
-            <= REPLAY_TOMBSTONE_BYTES * 8 / 2
-    }
+fn replay_segment_sequence(name: &[u8]) -> Option<u64> {
+    let suffix = name.strip_prefix(REPLAY_IDENTITY_PREFIX.as_bytes())?.strip_suffix(b".json")?;
+    if suffix.len() != 20 { return None; }
+    std::str::from_utf8(suffix).ok()?.parse().ok()
+}
 
-    fn persist(&self, config: &LinuxBrokerServerConfig) -> std::io::Result<()> {
-        let destination = config.state_root.join(REPLAY_TOMBSTONE_FILE);
-        let mut bytes = Vec::with_capacity(37 + self.bits.len() + 32);
-        bytes.extend_from_slice(self.epoch.as_bytes());
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&self.bits);
-        let mut checksum = Sha256::new();
-        checksum.update(b"flycockpit-replay-tombstone-file-v1\0");
-        checksum.update(&bytes);
-        bytes.extend_from_slice(&checksum.finalize());
-        atomic_replace_named_state(config, &destination, &bytes, ".replay-tombstones")
-    }
+fn replay_segment_checksum(sequence: u64, identities: &[(String, String)]) -> std::io::Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(b"flycockpit-replay-identity-segment-v1\0");
+    hash.update(sequence.to_be_bytes());
+    hash.update(serde_json::to_vec(identities).map_err(invalid)?);
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -993,6 +993,9 @@ fn serve_one(
                     || existing.request_digest != request_digest
                 {
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_identity_conflict".into() }, &[]);
+                }
+                if owned_by_other_connection(existing.owner_connection, connection_id) {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
                 }
                 if matches!(existing.status, OperationStatus::Prepared) {
                     existing.owner_connection = Some(connection_id);
@@ -1131,6 +1134,9 @@ fn serve_one(
             let (key, generation, digest) = {
                 let operation = state.operations.get_mut(&identity)
                     .ok_or_else(|| invalid("unknown spawn operation"))?;
+                if owned_by_other_connection(operation.owner_connection, connection_id) {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
+                }
                 if matches!(operation.status, OperationStatus::Committed | OperationStatus::Exited) {
                     return send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key: operation.key.clone() }, &[]);
                 }
@@ -1234,6 +1240,9 @@ fn serve_one(
             let Some(operation) = state.operations.get_mut(&identity) else {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_not_found".into() }, &[]);
             };
+            if owned_by_other_connection(operation.owner_connection, connection_id) {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
+            }
             if matches!(operation.status, OperationStatus::Cancelled) {
                 return send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[]);
             }
@@ -1277,6 +1286,9 @@ fn serve_one(
             if version == PROTOCOL_VERSION => {
             let operation = state.operations.get(&(session_id, operation_id));
             match operation {
+                Some(operation) if owned_by_other_connection(operation.owner_connection, connection_id) => {
+                    send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[])
+                }
                 Some(operation) => send_response(stream, &Response::Operation { version: PROTOCOL_VERSION, state: operation.status, key: Some(operation.key.clone()) }, &[]),
                 None => send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_not_found".into() }, &[]),
             }
@@ -1997,7 +2009,7 @@ fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &mut BrokerSt
             continue;
         }
         let exit_status = if let Some(pid) = state.children.get(&key).copied() {
-            if let Ok(exit_status) = reap_child(pid) {
+            if let Ok(exit_status) = reap_child_bounded(pid, std::time::Duration::ZERO) {
                 exit_status
             } else {
                 continue;
@@ -2657,7 +2669,7 @@ fn recover_operation_records(
     let mut locator_bindings = BTreeMap::<String, (String, String, String)>::new();
     for entry in fs::read_dir(&config.state_root)? {
         let entry = entry?;
-        if entry.file_name().as_bytes() == REPLAY_TOMBSTONE_FILE.as_bytes() {
+        if replay_segment_sequence(entry.file_name().as_bytes()).is_some() {
             continue;
         }
         if is_owned_state_temporary(&entry)? {
@@ -2747,8 +2759,8 @@ fn is_owned_state_temporary(entry: &fs::DirEntry) -> std::io::Result<bool> {
     if !owned_state_temporary_name(name.as_bytes()) {
         return Ok(false);
     }
-    let max_len = if name.as_bytes().starts_with(b".replay-tombstones-") {
-        (37 + REPLAY_TOMBSTONE_BYTES + 32) as u64
+    let max_len = if name.as_bytes().starts_with(b".replay-identities-") {
+        (MAX_FRAME * 4) as u64
     } else {
         MAX_FRAME as u64
     };
@@ -2767,7 +2779,7 @@ fn is_owned_state_temporary(entry: &fs::DirEntry) -> std::io::Result<bool> {
 }
 
 fn owned_state_temporary_name(bytes: &[u8]) -> bool {
-    [b".operation-".as_slice(), b".replay-tombstones-".as_slice()]
+    [b".operation-".as_slice(), b".replay-identities-".as_slice()]
         .into_iter()
         .find_map(|prefix| bytes.strip_prefix(prefix).and_then(|value| value.strip_suffix(b".tmp")))
         .and_then(|uuid_bytes| std::str::from_utf8(uuid_bytes).ok())
@@ -2777,7 +2789,7 @@ fn owned_state_temporary_name(bytes: &[u8]) -> bool {
 fn gc_terminal_operations(
     config: &LinuxBrokerServerConfig,
     operations: &mut BTreeMap<(String, String), BrokerOperation>,
-    tombstones: &mut ReplayTombstones,
+    tombstones: &mut ReplayIdentityStore,
 ) -> std::io::Result<()> {
     if operations.len() < MAX_LIVE_OPERATION_RECORDS {
         return Ok(());
@@ -2792,16 +2804,14 @@ fn gc_terminal_operations(
     if retired.is_empty() {
         return Ok(());
     }
-    if !tombstones.can_insert_all(retired.iter()) {
-        return Ok(());
-    }
-    // Publish the fail-closed probabilistic tombstones before removing exact
-    // rows. False positives only retire a fresh identity; there are no false
-    // negatives, so compacted identities can never regain generation authority.
-    for (session_id, operation_id) in &retired {
-        tombstones.insert(session_id, operation_id);
-    }
-    tombstones.persist(config)?;
+    // Exact identities grow in bounded immutable segments. Segment retirement
+    // requires an explicit durable client-watermark protocol; reboot is never
+    // treated as permission to forget idempotency authority.
+    let newly_retired = retired.iter()
+        .filter(|identity| !tombstones.identities.contains(*identity))
+        .cloned()
+        .collect::<Vec<_>>();
+    tombstones.append(config, &newly_retired)?;
     for identity in retired {
         let path = operation_record_path(config, &identity.0, &identity.1)?;
         fs::remove_file(path)?;
@@ -3314,32 +3324,40 @@ mod tests {
     fn owned_temporary_names_are_exact_and_unambiguous() {
         let id = uuid::Uuid::nil();
         assert!(owned_state_temporary_name(format!(".operation-{id}.tmp").as_bytes()));
-        assert!(owned_state_temporary_name(format!(".replay-tombstones-{id}.tmp").as_bytes()));
+        assert!(owned_state_temporary_name(format!(".replay-identities-{id}.tmp").as_bytes()));
         assert!(!owned_state_temporary_name(format!("operation-{id}.tmp").as_bytes()));
         assert!(!owned_state_temporary_name(b".operation-not-a-uuid.tmp"));
         assert!(!owned_state_temporary_name(format!(".operation-{id}.tmp.extra").as_bytes()));
     }
 
     #[test]
-    fn replay_tombstones_never_forget_a_retired_identity() {
-        let mut tombstones = ReplayTombstones {
-            epoch: uuid::Uuid::nil().to_string(),
-            bits: vec![0; REPLAY_TOMBSTONE_BYTES],
+    fn replay_identity_store_is_exact() {
+        let mut tombstones = ReplayIdentityStore {
+            identities: BTreeSet::new(),
+            next_sequence: 0,
         };
         assert!(!tombstones.contains("session", "operation"));
-        tombstones.insert("session", "operation");
+        tombstones.identities.insert(("session".into(), "operation".into()));
         assert!(tombstones.contains("session", "operation"));
         assert!(!tombstones.contains("session", "different-operation"));
     }
 
     #[test]
-    fn replay_tombstones_stop_compacting_before_saturation() {
-        let tombstones = ReplayTombstones {
-            epoch: uuid::Uuid::nil().to_string(),
-            bits: vec![u8::MAX; REPLAY_TOMBSTONE_BYTES],
-        };
-        let identities = [("session".to_owned(), "operation".to_owned())];
-        assert!(!tombstones.can_insert_all(identities.iter()));
+    fn replay_identity_segment_checksum_binds_sequence_and_contents() {
+        let identities = [(uuid::Uuid::nil().to_string(), "operation".to_owned())];
+        assert_ne!(
+            replay_segment_checksum(1, &identities).unwrap(),
+            replay_segment_checksum(2, &identities).unwrap()
+        );
+        assert_eq!(replay_segment_sequence(b".replay-identities-00000000000000000042.json"), Some(42));
+        assert_eq!(replay_segment_sequence(b".replay-identities-42.json"), None);
+    }
+
+    #[test]
+    fn operation_ownership_must_quiesce_before_reconnect_adoption() {
+        assert!(owned_by_other_connection(Some(7), 8));
+        assert!(!owned_by_other_connection(Some(7), 7));
+        assert!(!owned_by_other_connection(None, 8));
     }
 
     #[test]

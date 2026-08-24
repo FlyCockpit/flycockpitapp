@@ -101,15 +101,32 @@ daemon_was_active=0
 broker_enablement=$(systemctl is-enabled "$broker_unit" 2>/dev/null || true)
 daemon_enablement=$(systemctl is-enabled "$daemon_unit" 2>/dev/null || true)
 detached_was_active=0
+detached_control_executable=
+detached_executable_source=
+detached_control_socket=
 if systemctl is-active --quiet "$broker_unit"; then broker_was_active=1; fi
 if systemctl is-active --quiet "$daemon_unit"; then daemon_was_active=1; fi
-if [ "$daemon_was_active" -eq 0 ] \
-  && runuser -u "$daemon_user" -- "$status_cli" daemon status --json >/dev/null 2>&1
-then
-  detached_was_active=1
+if [ "$daemon_was_active" -eq 0 ]; then
+  detached_status=$(runuser -u "$daemon_user" -- "$status_cli" daemon status --json 2>/dev/null || true)
+  detached_pid=$(printf '%s\n' "$detached_status" | sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  detached_control_socket=$(printf '%s\n' "$detached_status" | sed -n 's/.*"socket_path":[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$detached_pid" ] && [ -n "$detached_control_socket" ]; then
+    detached_executable_source="/proc/$detached_pid/exe"
+    detached_control_executable=$(readlink "$detached_executable_source" 2>/dev/null || true)
+    if [ -z "$detached_control_executable" ] || [ ! -x "$detached_executable_source" ]; then
+      echo "could not snapshot the detached daemon control executable" >&2
+      exit 1
+    fi
+    detached_was_active=1
+  fi
 fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
 committed=0
+if [ "$detached_was_active" -eq 1 ]; then
+  cp --preserve=all "$detached_executable_source" "$transaction/detached-control-executable"
+  printf '%s\n' "$detached_control_socket" >"$transaction/detached-control-socket"
+  status_cli="$transaction/detached-control-executable"
+fi
 
 # Record directory ownership before any service or tmpfiles action. Rollback
 # removes only paths proven absent at transaction start; pre-existing shared
@@ -261,8 +278,13 @@ rollback() {
     fi
     if [ "$daemon_was_active" -eq 1 ]; then
       systemctl start "$daemon_unit" 2>/dev/null || true
-    elif [ "$detached_was_active" -eq 1 ] && [ -x /usr/bin/cockpit ]; then
-      runuser -u "$daemon_user" -- /usr/bin/cockpit daemon start 2>/dev/null || true
+    elif [ "$detached_was_active" -eq 1 ] && [ -x "$transaction/detached-control-executable" ]; then
+      runuser -u "$daemon_user" -- "$transaction/detached-control-executable" daemon start 2>/dev/null || true
+      restored_status=$(runuser -u "$daemon_user" -- "$transaction/detached-control-executable" daemon status --json 2>/dev/null || true)
+      restored_socket=$(printf '%s\n' "$restored_status" | sed -n 's/.*"socket_path":[[:space:]]*"\([^"]*\)".*/\1/p')
+      if [ "$restored_socket" != "$(sed -n '1p' "$transaction/detached-control-socket")" ]; then
+        echo "warning: detached daemon control route was not restored exactly" >&2
+      fi
     fi
   fi
   rm -rf "$transaction"

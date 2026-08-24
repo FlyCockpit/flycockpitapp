@@ -48,26 +48,30 @@ fn ownership() -> BTreeMap<String, Ownership> {
 }
 
 #[test]
-fn local_profile_executes_and_removes_every_remote_schema_object() {
+fn local_base_and_remote_extension_have_exact_physical_ownership() {
+    let local = Connection::open_in_memory().unwrap();
+    local.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .expect("0001_initial.sql must execute as SQLite");
+    let local_inventory = schema_inventory(&local);
+    let local_tables = local_inventory.get("table").cloned().unwrap_or_default();
     let full = Connection::open_in_memory().unwrap();
     full.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
-        .expect("0001_initial.sql must execute as SQLite");
+        .expect("local base must execute before the remote extension");
+    full.execute_batch(include_str!("../src/db/migrations/0001_remote_profile.sql"))
+        .expect("remote profile extension must execute after the local base");
     let full_inventory = schema_inventory(&full);
     let full_tables = full_inventory.get("table").cloned().unwrap_or_default();
     let ownership = ownership();
     assert_eq!(ownership.keys().cloned().collect::<BTreeSet<_>>(), full_tables,
         "ownership manifest must classify every executed table exactly once");
 
-    let local = Connection::open_in_memory().unwrap();
-    local.execute_batch(include_str!("../src/db/migrations/0001_initial.sql")).unwrap();
-    local.execute_batch(include_str!("../src/db/migrations/0001_local_profile.sql"))
-        .expect("local profile SQL must execute against the full schema");
-    let local_inventory = schema_inventory(&local);
-    let local_tables = local_inventory.get("table").cloned().unwrap_or_default();
     let remote_tables = ownership.iter()
         .filter_map(|(name, owner)| (owner.status == "remove-from-v0.1").then_some(name.clone()))
         .collect::<BTreeSet<_>>();
     assert_eq!(full_tables.difference(&local_tables).cloned().collect::<BTreeSet<_>>(), remote_tables);
+
+    assert!(remote_tables.is_disjoint(&local_tables),
+        "local base migration must not contain a remote-owned table");
 
     let mut stmt = local.prepare(
         "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",

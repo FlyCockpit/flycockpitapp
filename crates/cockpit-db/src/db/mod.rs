@@ -829,7 +829,7 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
-    profile_sql: &'static str,
+    extension_sql: &'static str,
 }
 
 #[cfg(feature = "remote")]
@@ -843,9 +843,9 @@ const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
     #[cfg(not(feature = "remote"))]
-    profile_sql: include_str!("migrations/0001_local_profile.sql"),
+    extension_sql: "",
     #[cfg(feature = "remote")]
-    profile_sql: "",
+    extension_sql: include_str!("migrations/0001_remote_profile.sql"),
 }];
 
 /// Latest schema version understood by this build.
@@ -1044,9 +1044,10 @@ fn migration_definition_hash(migration: &Migration) -> String {
     // Omitting the extension made two materially different schemas share a
     // migration checksum and allowed an edited profile extension to pass the
     // ledger check.
-    let mut definition = String::with_capacity(migration.sql.len() + migration.profile_sql.len());
+    let mut definition =
+        String::with_capacity(migration.sql.len() + migration.extension_sql.len());
     definition.push_str(migration.sql);
-    definition.push_str(migration.profile_sql);
+    definition.push_str(migration.extension_sql);
     migration_hash(&definition)
 }
 
@@ -1054,7 +1055,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
     let expected = Connection::open_in_memory().context("opening expected-schema database")?;
     for migration in migrations {
         expected.execute_batch(migration.sql)?;
-        expected.execute_batch(migration.profile_sql)?;
+        expected.execute_batch(migration.extension_sql)?;
     }
     expected.execute_batch(
         "CREATE TABLE schema_version (\
@@ -1249,8 +1250,8 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
-            if !migration.profile_sql.is_empty() {
-                conn.execute_batch(migration.profile_sql)
+            if !migration.extension_sql.is_empty() {
+                conn.execute_batch(migration.extension_sql)
                     .with_context(|| format!("applying migration {version} build profile"))?;
             }
             let fingerprint = exact_ddl_fingerprint(conn)?;
@@ -1449,7 +1450,7 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
-                profile_sql: "",
+                extension_sql: "",
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)

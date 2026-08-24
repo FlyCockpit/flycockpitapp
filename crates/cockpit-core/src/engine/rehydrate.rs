@@ -329,6 +329,13 @@ pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
         redaction,
     )?;
 
+    // Scrub all tool result text bodies through the redaction table.  The
+    // projection function above already redacts tool results that have a
+    // durable text-artifact projection; this pass covers tool results
+    // without a projection (e.g. forced-skill preludes) so the rehydrated
+    // history matches the live dispatch's egress boundary.
+    scrub_tool_result_bodies(&mut history, redaction);
+
     Ok(Some(Rehydrated {
         history,
         watermark,
@@ -505,6 +512,31 @@ fn apply_text_artifact_tool_projections(
         ));
     }
     Ok(())
+}
+
+/// Scrub all tool result text bodies through the redaction table.  Tool
+/// results that already received a redacted frame from
+/// `apply_text_artifact_tool_projections` are unaffected (the scrub is
+/// idempotent for already-redacted text); tool results without a durable
+/// projection (e.g. forced-skill preludes) get the same egress boundary
+/// the live dispatch applies.
+fn scrub_tool_result_bodies(
+    history: &mut [Message],
+    redaction: &crate::redact::RedactionTable,
+) {
+    for message in history.iter_mut() {
+        if let Message::User { content, .. } = message {
+            for part in content.iter_mut() {
+                if let UserContent::ToolResult(result) = part {
+                    for item in result.content.iter_mut() {
+                        if let ToolResultContent::Text(text_part) = item {
+                            text_part.text = redaction.scrub(&text_part.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_rehydrated_tool_artifact_frame<'a>(
@@ -3444,6 +3476,7 @@ mod tests {
         let cfg = crate::config::extended::RedactConfig {
             enabled: true,
             denylist: vec![secret.to_owned()],
+            placeholder: "***REDACT***".to_owned(),
             ..crate::config::extended::RedactConfig::default()
         };
         let redaction = Arc::new(
@@ -4053,7 +4086,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let calls = assistant_calls(&r.history[1]);
+        // Skill-slash rebuilds the seed pair before the retained user
+        // envelope, so the assistant is at index 0 and the result at 1.
+        let calls = assistant_calls(&r.history[0]);
         assert_eq!(calls[0].id, call_id);
         assert_eq!(
             calls[0]
@@ -4062,7 +4097,7 @@ mod tests {
                 .map(|provider| provider.call_id.as_str()),
             Some(call_id)
         );
-        let results = tool_results(&r.history[2]);
+        let results = tool_results(&r.history[1]);
         assert_eq!(results[0].call, call_id);
         assert_eq!(
             results[0]
@@ -4251,7 +4286,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let calls = assistant_calls(&r.history[1]);
+            // Skill-slash events rebuild the seed pair (assistant call +
+            // result) before the retained user envelope, so the assistant
+            // is at index 0 and the result at index 1. Non-skill events
+            // keep the user message first, so the assistant is at index 1
+            // and the result at index 2.
+            let (assistant_idx, results_idx) = if is_skill { (0, 1) } else { (1, 2) };
+            let calls = assistant_calls(&r.history[assistant_idx]);
             assert_eq!(calls[0].id, call_id);
             assert_eq!(
                 calls[0]
@@ -4260,7 +4301,7 @@ mod tests {
                     .map(|provider| provider.call_id.as_str()),
                 Some(call_id)
             );
-            let results = tool_results(&r.history[2]);
+            let results = tool_results(&r.history[results_idx]);
             assert_eq!(results[0].call, call_id);
             assert_eq!(
                 results[0]

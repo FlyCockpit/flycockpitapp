@@ -4409,8 +4409,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             no_sandbox,
             offline,
         } => {
-            get_doctor_snapshot_response(Some(ctx.db.clone()), project_root, no_sandbox, offline)
-                .await
+            get_doctor_snapshot_response(
+                Some(ctx.db.clone()),
+                ctx.secret_vault.clone(),
+                project_root,
+                no_sandbox,
+                offline,
+            )
+            .await
         }
         // Owner-remoted, read-only, serialized: the docs pipeline creates a
         // `"docs"` session and runs a full turn, so it is not a snapshot-correct
@@ -9650,8 +9656,14 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             no_sandbox,
             offline,
         } => {
-            get_doctor_snapshot_response(Some(ctx.db.clone()), project_root, no_sandbox, offline)
-                .await
+            get_doctor_snapshot_response(
+                Some(ctx.db.clone()),
+                ctx.secret_vault.clone(),
+                project_root,
+                no_sandbox,
+                offline,
+            )
+            .await
         }
         _ => Err(ErrorPayload {
             code: ErrorCode::Internal,
@@ -13716,6 +13728,7 @@ async fn diagnose_media_reservation_response(
 
 async fn get_doctor_snapshot_response(
     db: Option<crate::db::Db>,
+    vault: Arc<crate::secure_key::SecretVault>,
     project_root: Option<String>,
     no_sandbox: bool,
     offline: bool,
@@ -13726,19 +13739,25 @@ async fn get_doctor_snapshot_response(
     // dispatch task's `Send` boundary. Only the rendered `String` and the
     // failure flag (both `Send`) leave the closure. The daemon injects its own
     // already-open `Db` (a cheap Arc-backed shared handle) so the snapshot never
-    // opens a second DB.
+    // opens a second DB. The vault-backed secret lookup lets the credential
+    // check resolve `$secret:<name>` references after the literal-header
+    // migration has rewritten provider config files.
     let (rendered, has_failures) = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
         let path = project_root.map(PathBuf::from);
+        let store = crate::credentials::CredentialStore::from_vault(vault)
+            .map_err(|error| error.to_string())?;
+        let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
         let snapshot = runtime
             .block_on(crate::diagnostics::cli_snapshot(
                 path.as_deref(),
                 no_sandbox,
                 offline,
                 db.as_ref(),
+                Some(&secret_lookup),
             ))
             .map_err(|error| error.to_string())?;
         Ok::<(String, bool), String>((crate::diagnostics::render(&snapshot), snapshot.has_failures))

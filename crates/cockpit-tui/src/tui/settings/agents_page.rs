@@ -2450,9 +2450,15 @@ pub(super) mod tests {
         }
         let mut dialog = agents_dialog(&tmp);
         focus(&mut dialog, "pointer-agent");
-        dialog.handle_key(press(KeyCode::Enter));
-        dialog.handle_key(press(KeyCode::Char('e')));
-        assert!(page(&dialog).editing.is_some(), "detail opens raw editor");
+        // The pointer Edit action opens the in-TUI raw editor directly
+        // (edit_selected_in_tui), bypassing the v2 detail-page guard.
+        let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Edit(
+                super::super::pointer_actions::AgentId("pointer-agent".into()),
+            ),
+        );
+        click_agent_action(&mut dialog, &edit_action);
+        assert!(page(&dialog).editing.is_some(), "pointer Edit opens raw editor");
 
         let original = fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap();
         let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
@@ -2884,8 +2890,14 @@ pub(super) mod tests {
             .unwrap();
             let mut dialog = agents_dialog(&tmp);
             focus(&mut dialog, "pointer-agent");
-            dialog.handle_key(press(KeyCode::Enter));
-            dialog.handle_key(press(KeyCode::Char('e')));
+            // The pointer Edit action opens the in-TUI raw editor directly
+            // (edit_selected_in_tui), bypassing the v2 detail-page guard.
+            let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(
+                    super::super::pointer_actions::AgentId("pointer-agent".into()),
+                ),
+            );
+            click_agent_action(&mut dialog, &edit_action);
             page_mut(&mut dialog)
                 .editing
                 .as_mut()
@@ -3022,12 +3034,19 @@ pub(super) mod tests {
                 super::super::pointer_actions::AgentsAction::Open(agent.clone()),
             );
             click_agent_action(&mut dialog, &action);
+            // All agents are schemaVersion 2; the structured tool editor is
+            // intentionally unavailable. Open still reaches the reducer and
+            // sets the status message instead of opening the detail.
+            assert!(
+                page(&dialog).detail.is_none(),
+                "v2 Open does not open the structured editor for {agent:?}"
+            );
             assert!(
                 page(&dialog)
-                    .detail
+                    .status
                     .as_ref()
-                    .is_some_and(|detail| detail.name == agent.0),
-                "Open reaches the real detail reducer for {agent:?}"
+                    .is_some_and(|s| s.contains("unavailable")),
+                "v2 Open sets the unavailable status for {agent:?}"
             );
         }
 
@@ -3117,107 +3136,11 @@ pub(super) mod tests {
             "the matching second Reset removes exactly the stable override"
         );
 
-        for descriptor in cockpit_core::agents::tool_surface_catalog() {
-            let tool = descriptor.name;
-            for cycle_tier in [false, true] {
-                let tmp = TempDir::new().unwrap();
-                let mut dialog = populated_pointer_agents_dialog(&tmp);
-                focus(&mut dialog, "pointer-agent");
-                dialog.handle_key(press(KeyCode::Enter));
-                focus_tool(&mut dialog, tool);
-                let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
-                let row = super::super::pointer_actions::AgentToolId(tool.into());
-                let (action, granted_before, tier_before) = {
-                    let detail = page(&dialog).detail.as_ref().expect("agent detail");
-                    let action = if cycle_tier {
-                        super::super::pointer_actions::AgentsAction::CycleTier(agent, row)
-                    } else {
-                        super::super::pointer_actions::AgentsAction::ToggleTool(agent, row)
-                    };
-                    (
-                        super::super::pointer_actions::SettingsPointerAction::Agents(action),
-                        detail.draft.granted(tool),
-                        detail.draft.tier(tool),
-                    )
-                };
-                let target = {
-                    let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);
-                    dialog
-                        .pointer_surface
-                        .targets
-                        .borrow()
-                        .iter()
-                        .find(|target| {
-                            target.enabled
-                                && target.action
-                                    == super::super::shell::SettingsPointerAction::Page(
-                                        action.clone(),
-                                    )
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| panic!("{action:?} rerenders from selected tool {tool}"))
-                };
-                dialog.handle_pointer(super::super::tests::settings_mouse(
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    target.rect.x,
-                    target.rect.y,
-                ));
-                assert!(
-                    page(&dialog).detail.is_some(),
-                    "detail remains after Down for {action:?}"
-                );
-                dialog.handle_pointer(super::super::tests::settings_mouse(
-                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-                    target.rect.x,
-                    target.rect.y,
-                ));
-                let detail = page(&dialog)
-                    .detail
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("detail remains after Up for {action:?}"));
-                if cycle_tier {
-                    let tier_after = detail.draft.tier(tool);
-                    if cockpit_core::agents::legal_tool_tiers(tool).len() > 1 {
-                        assert_ne!(tier_after, tier_before, "tier cycles for {tool}");
-                    } else {
-                        assert_eq!(
-                            tier_after, tier_before,
-                            "fixed tier remains stable for {tool}"
-                        );
-                    }
-                } else {
-                    assert_ne!(
-                        detail.draft.granted(tool),
-                        granted_before,
-                        "grant toggles for {tool}"
-                    );
-                }
-            }
-        }
-
-        for raw_editor in [false, true] {
-            let tmp = TempDir::new().unwrap();
-            let mut dialog = populated_pointer_agents_dialog(&tmp);
-            focus(&mut dialog, "pointer-agent");
-            dialog.handle_key(press(KeyCode::Enter));
-            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
-            let action =
-                super::super::pointer_actions::SettingsPointerAction::Agents(if raw_editor {
-                    super::super::pointer_actions::AgentsAction::OpenRawEditor(agent)
-                } else {
-                    super::super::pointer_actions::AgentsAction::Save(agent)
-                });
-            click_agent_action(&mut dialog, &action);
-            if raw_editor {
-                assert!(page(&dialog).editing.is_some());
-            } else {
-                assert!(page(&dialog).detail.is_some());
-                let persisted =
-                    fs::read_to_string(tmp.path().join(".cockpit/agents/pointer-agent.md"))
-                        .unwrap();
-                assert!(persisted.contains("tools:"));
-            }
-        }
+        // The structured tool surface editor (ToggleTool / CycleTier /
+        // Save / OpenRawEditor) is intentionally unavailable for
+        // schemaVersion 2 agents: tool authority is host-owned.  These
+        // pointer interactions were exercised when the detail page opened
+        // for v1 agents; v2 agents redirect to the raw editor instead.
     }
 
     #[cfg(unix)]

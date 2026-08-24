@@ -147,7 +147,7 @@ impl HookEvent {
             }
             Self::PreCompact => HookEventPolicy::new(
                 G::Observe,
-                A::PreparedApplyAttempt,
+                A::SuccessfulCompactionPreProjection,
                 M::Closed(&["manual", "auto"]),
                 5,
             ),
@@ -190,7 +190,7 @@ pub enum HookApplicability {
     NormalRootDoneOnly,
     InferenceErrorOnly,
     ChildOnly,
-    PreparedApplyAttempt,
+    SuccessfulCompactionPreProjection,
     SuccessfulCompactionOnly,
     EverySession,
 }

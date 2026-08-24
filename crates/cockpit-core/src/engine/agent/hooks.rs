@@ -910,7 +910,7 @@ impl CommandRunner for TokioCommandRunner {
                     AllocationBoundary::TimedOut => (true, None),
                     AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
                 };
-                let cancellation_recorded = allocation_cancel.cancel().is_ok();
+                let cancellation_recorded = allocation_cancel.cancel().await.is_ok();
                 // The actor reply is the explicit cleanup-completion ticket.
                 // It resolves only after a losing broker prepare is cancelled
                 // or a winning commit reaches same-generation ProvenEmpty.

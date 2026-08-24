@@ -104,12 +104,16 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         "detached_was_active",
         "detached_control_executable",
         "detached-control-socket",
+        "detached-runtime-dir",
         "/proc/$detached_pid/exe",
+        "/proc/$detached_pid/stat",
+        "daemon-endpoint.json",
+        "ambiguous detached daemon authority",
+        "kill -TERM \"$detached_pid\"",
         "payload_root=",
         "trap 'exit 129' HUP",
         "trap 'exit 130' INT",
         "trap 'exit 143' TERM",
-        "daemon status --json",
         "containment broker did not publish the authenticated socket contract",
         "--doctor --allowed-uid",
         "systemd-run --quiet --wait --collect",
@@ -125,6 +129,10 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
     ] {
         assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
     }
+    assert!(!CONTAINMENT_INSTALLER.contains("$status_cli\" daemon status"));
+    let discovery = CONTAINMENT_INSTALLER.find("daemon-endpoint.json").unwrap();
+    let payload_install = CONTAINMENT_INSTALLER.find("stage_install \"$payload_cli\"").unwrap();
+    assert!(discovery < payload_install);
     assert!(DAEMON_UNIT.contains("Wants=cockpit-containment-broker@%i.service"));
     assert!(!DAEMON_UNIT.contains("BindsTo=cockpit-containment-broker@%i.service"));
     assert!(DAEMON_UNIT.contains("ExecStartPost=/usr/libexec/flycockpit/cockpit-containment-broker --doctor"));

@@ -57,7 +57,18 @@ impl AllocationCancellation {
         })
     }
 
-    pub(crate) fn cancel(&self) -> std::io::Result<()> {
+    /// Durably wins (or observes loss of) the allocation decision without
+    /// blocking a Tokio worker on `flock(2)` or `fsync(2)`.
+    pub(crate) async fn cancel(&self) -> std::io::Result<()> {
+        let cancellation = self.clone();
+        tokio::task::spawn_blocking(move || cancellation.cancel_blocking())
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    // Kept crate-visible for the Linux transaction unit tests, which exercise
+    // the cross-process decision protocol without constructing a runtime.
+    pub(crate) fn cancel_blocking(&self) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;

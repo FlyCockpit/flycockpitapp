@@ -336,7 +336,7 @@ Cockpit recognizes exactly these event keys (in canonical order):
 | `stopFailure` | observe | inferenceErrorOnly | errorClass | 5s | no |
 | `subagentStart` | observe | childOnly | childAgentType | 5s | no |
 | `subagentStop` | stop | childOnly | childAgentType | 60s | yes |
-| `preCompact` | observe | preparedApplyAttempt | closed: `manual`, `auto` | 5s | no |
+| `preCompact` | observe | successfulCompactionPreProjection | closed: `manual`, `auto` | 5s | no |
 | `postCompact` | observe | successfulCompactionOnly | closed: `manual`, `auto` | 5s | no |
 | `sessionEnd` | observe | everySession | closed: `completed`, `interrupted`, `cancelled`, `shutdown`, `error` | 5s | no |
 
@@ -369,15 +369,21 @@ A normal root-turn `stop` and a child-only `subagentStop` are distinct events:
 for child subagent frames. `sessionEnd` is observe-only and fires once per
 session regardless of how it ended.
 
-`preCompact` and `postCompact` envelopes also include the same opaque
-`compactionId`. Delivery uses a durable pending/leased/completed outbox and is
-at least once for both edges. Hook handlers must use `(compactionId, event)` as
-their idempotency key: a crash after a command performs an external effect but
-before Cockpit records its receipt can repeat either hook. `preCompact` means a
-durable compaction attempt was admitted; it can therefore run even when the
-following timeline commit fails. Cockpit retains and retries that same attempt.
-`postCompact` is enqueued only after the durable successor is known to exist.
-Cockpit does not claim exactly-once external effects.
+`preCompact` and `postCompact` envelopes also include the same opaque,
+restart-stable `compactionId`. Delivery uses a durable
+pending/leased/completed outbox and is at least once for both edges. Hook
+handlers must use `(compactionId, event)` as their idempotency key: a crash
+after a command performs an external effect but before Cockpit records its
+receipt can repeat either hook. A prepared compaction commits its durable
+successor before either lifecycle edge becomes deliverable; commit failure
+therefore fires neither hook. Cockpit then durably enqueues and delivers
+`preCompact` immediately before projecting that committed successor into live
+history, and delivers `postCompact` after projection. Recovery blocks new work
+and retries with backoff until pending intents, outbox receipts, and projection
+converge. Both edges remain bound to the immutable handler-plan identity and
+configuration generation captured when the compaction was admitted; config
+drift cannot substitute a different handler. Cockpit does not claim
+exactly-once external effects.
 
 #### Source ordering, argv, and trust
 

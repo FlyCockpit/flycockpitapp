@@ -144,7 +144,7 @@ fn hooks_config_event_table_and_defaults() {
         (
             HookEvent::PreCompact,
             HookGate::Observe,
-            HookApplicability::PreparedApplyAttempt,
+            HookApplicability::SuccessfulCompactionPreProjection,
             HookMatcherPolicy::Closed(&["manual", "auto"]),
             5,
         ),

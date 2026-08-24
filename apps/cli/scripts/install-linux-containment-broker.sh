@@ -14,10 +14,13 @@ daemon_user=$1
 payload_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 payload_cli="$payload_root/cockpit"
 payload_broker="$payload_root/cockpit-containment-broker"
-status_cli=$payload_cli
-if [ -x /usr/bin/cockpit ]; then status_cli=/usr/bin/cockpit; fi
 daemon_uid=$(id -u "$daemon_user")
 daemon_gid=$(id -g "$daemon_user")
+daemon_home=$(getent passwd "$daemon_user" | awk -F: 'NR == 1 { print $6 }')
+if [ -z "$daemon_home" ] || [ ! -d "$daemon_home" ]; then
+  echo "daemon account home directory is unavailable" >&2
+  exit 1
+fi
 capability=/etc/flycockpit/containment-capability-$daemon_uid
 case "$daemon_uid:$daemon_gid" in
   *[!0-9:]*|:*) echo "daemon account did not resolve to numeric uid/gid" >&2; exit 1 ;;
@@ -104,13 +107,74 @@ detached_was_active=0
 detached_control_executable=
 detached_executable_source=
 detached_control_socket=
+detached_pid=
+detached_starttime=
+detached_runtime_dir=
 if systemctl is-active --quiet "$broker_unit"; then broker_was_active=1; fi
 if systemctl is-active --quiet "$daemon_unit"; then daemon_was_active=1; fi
 if [ "$daemon_was_active" -eq 0 ]; then
-  detached_status=$(runuser -u "$daemon_user" -- "$status_cli" daemon status --json 2>/dev/null || true)
-  detached_pid=$(printf '%s\n' "$detached_status" | sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-  detached_control_socket=$(printf '%s\n' "$detached_status" | sed -n 's/.*"socket_path":[[:space:]]*"\([^"]*\)".*/\1/p')
-  if [ -n "$detached_pid" ] && [ -n "$detached_control_socket" ]; then
+  # Discover the old authority from its stable endpoint record and kernel
+  # identity. Never ask the new payload (or an arbitrary PATH binary) to speak
+  # an old daemon protocol: upgrades must remain possible across incompatible
+  # prerelease wire versions.
+  daemon_state="$daemon_home/.local/state/cockpit"
+  endpoint_record="$daemon_state/daemon-endpoint.json"
+  pid_record="$daemon_state/daemon.pid"
+  endpoint_pid=
+  endpoint_socket=
+  file_pid=
+  if [ -f "$endpoint_record" ]; then
+    endpoint_pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$endpoint_record")
+    endpoint_socket=$(sed -n 's/.*"socket"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$endpoint_record")
+  fi
+  if [ -f "$pid_record" ]; then file_pid=$(sed -n '1s/^\([0-9][0-9]*\)$/\1/p' "$pid_record"); fi
+  if [ -n "$endpoint_pid" ] && [ -n "$file_pid" ] && [ "$endpoint_pid" != "$file_pid" ]; then
+    echo "ambiguous detached daemon authority: endpoint and pid records disagree" >&2
+    exit 1
+  fi
+  if [ -z "$endpoint_socket" ]; then
+    runtime_socket="/run/user/$daemon_uid/cockpit/cockpit.sock"
+    state_socket="$daemon_state/daemon.sock"
+    socket_candidates=0
+    if [ -S "$runtime_socket" ]; then endpoint_socket=$runtime_socket; socket_candidates=$((socket_candidates + 1)); fi
+    if [ -S "$state_socket" ]; then endpoint_socket=$state_socket; socket_candidates=$((socket_candidates + 1)); fi
+    if [ "$socket_candidates" -gt 1 ]; then
+      echo "ambiguous detached daemon authority: multiple canonical sockets exist" >&2
+      exit 1
+    fi
+  fi
+  detached_pid=${endpoint_pid:-$file_pid}
+  daemon_process_candidates=0
+  for process_status in /proc/[0-9]*/status; do
+    candidate_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$process_status" 2>/dev/null || true)
+    [ "$candidate_uid" = "$daemon_uid" ] || continue
+    candidate_pid=${process_status#/proc/}; candidate_pid=${candidate_pid%/status}
+    candidate_argv=$(tr '\000' ' ' <"/proc/$candidate_pid/cmdline" 2>/dev/null || true)
+    case " $candidate_argv " in *" daemon start --foreground "*) daemon_process_candidates=$((daemon_process_candidates + 1)) ;; esac
+  done
+  if [ "$daemon_process_candidates" -gt 0 ] && [ -z "$detached_pid" ]; then
+    echo "active daemon-like process has no unambiguous recorded authority" >&2
+    exit 1
+  fi
+  if [ -n "$detached_pid" ] && kill -0 "$detached_pid" 2>/dev/null; then
+    if [ -z "$endpoint_socket" ] || [ ! -S "$endpoint_socket" ]; then
+      echo "active detached daemon has no unambiguous recorded control endpoint" >&2
+      exit 1
+    fi
+    process_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$detached_pid/status" 2>/dev/null || true)
+    process_argv=$(tr '\000' ' ' <"/proc/$detached_pid/cmdline" 2>/dev/null || true)
+    socket_uid=$(stat -c '%u' "$endpoint_socket" 2>/dev/null || true)
+    if [ "$process_uid" != "$daemon_uid" ] || [ "$socket_uid" != "$daemon_uid" ] \
+      || ! printf '%s' " $process_argv " | grep -F " daemon start --foreground " >/dev/null; then
+      echo "detached daemon process or endpoint is not owned by the daemon account" >&2
+      exit 1
+    fi
+    detached_starttime=$(sed -n 's/^[^)]*) //' "/proc/$detached_pid/stat" | cut -d' ' -f20)
+    if [ -z "$detached_starttime" ]; then
+      echo "could not attest detached daemon process generation" >&2
+      exit 1
+    fi
+    detached_control_socket=$endpoint_socket
     detached_executable_source="/proc/$detached_pid/exe"
     detached_control_executable=$(readlink "$detached_executable_source" 2>/dev/null || true)
     if [ -z "$detached_control_executable" ] || [ ! -x "$detached_executable_source" ]; then
@@ -118,6 +182,14 @@ if [ "$daemon_was_active" -eq 0 ]; then
       exit 1
     fi
     detached_was_active=1
+    case "$detached_control_socket" in
+      "$daemon_state/daemon.sock") detached_runtime_dir= ;;
+      */cockpit/cockpit.sock) detached_runtime_dir=$(dirname "$(dirname "$detached_control_socket")") ;;
+      *) echo "recorded detached daemon endpoint is not a canonical route" >&2; exit 1 ;;
+    esac
+  elif [ -n "$endpoint_socket" ] && [ -S "$endpoint_socket" ]; then
+    echo "recorded detached daemon endpoint exists without its recorded process" >&2
+    exit 1
   fi
 fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
@@ -125,7 +197,7 @@ committed=0
 if [ "$detached_was_active" -eq 1 ]; then
   cp --preserve=all "$detached_executable_source" "$transaction/detached-control-executable"
   printf '%s\n' "$detached_control_socket" >"$transaction/detached-control-socket"
-  status_cli="$transaction/detached-control-executable"
+  printf '%s\n' "$detached_runtime_dir" >"$transaction/detached-runtime-dir"
 fi
 
 # Record directory ownership before any service or tmpfiles action. Rollback
@@ -279,11 +351,19 @@ rollback() {
     if [ "$daemon_was_active" -eq 1 ]; then
       systemctl start "$daemon_unit" 2>/dev/null || true
     elif [ "$detached_was_active" -eq 1 ] && [ -x "$transaction/detached-control-executable" ]; then
-      runuser -u "$daemon_user" -- "$transaction/detached-control-executable" daemon start 2>/dev/null || true
-      restored_status=$(runuser -u "$daemon_user" -- "$transaction/detached-control-executable" daemon status --json 2>/dev/null || true)
-      restored_socket=$(printf '%s\n' "$restored_status" | sed -n 's/.*"socket_path":[[:space:]]*"\([^"]*\)".*/\1/p')
-      if [ "$restored_socket" != "$(sed -n '1p' "$transaction/detached-control-socket")" ]; then
-        echo "warning: detached daemon control route was not restored exactly" >&2
+      restored_runtime=$(sed -n '1p' "$transaction/detached-runtime-dir")
+      if [ -n "$restored_runtime" ]; then
+        runuser -u "$daemon_user" -- env XDG_RUNTIME_DIR="$restored_runtime" \
+          "$transaction/detached-control-executable" daemon start --detach 2>/dev/null || true
+      else
+        runuser -u "$daemon_user" -- env -u XDG_RUNTIME_DIR \
+          "$transaction/detached-control-executable" daemon start --detach 2>/dev/null || true
+      fi
+      restored_socket=$(sed -n 's/.*"socket"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$daemon_home/.local/state/cockpit/daemon-endpoint.json" 2>/dev/null || true)
+      if [ "$restored_socket" != "$(sed -n '1p' "$transaction/detached-control-socket")" ] \
+        || [ ! -S "$restored_socket" ]; then
+        echo "error: detached daemon control route was not restored exactly" >&2
       fi
     fi
   fi
@@ -298,15 +378,26 @@ trap 'exit 143' TERM
 if [ "$daemon_was_active" -eq 1 ]; then systemctl stop "$daemon_unit"; fi
 if [ "$broker_was_active" -eq 1 ]; then systemctl stop "$broker_unit"; fi
 if [ "$detached_was_active" -eq 1 ]; then
-  # Address the daemon through its canonical runtime endpoint. This also finds
-  # installs whose launching executable lived outside Cargo home or /usr/bin.
-  runuser -u "$daemon_user" -- "$status_cli" daemon stop --grace 30
+  # Signal the kernel-attested old process directly. This takeover path does
+  # not depend on either the old or new CLI protocol.
+  kill -TERM "$detached_pid"
+  attempts=30
+  while kill -0 "$detached_pid" 2>/dev/null \
+    && [ "$(sed -n 's/^[^)]*) //' "/proc/$detached_pid/stat" 2>/dev/null | cut -d' ' -f20)" = "$detached_starttime" ]; do
+    attempts=$((attempts - 1))
+    if [ "$attempts" -le 0 ]; then
+      echo "detached daemon did not stop within the takeover deadline" >&2
+      exit 1
+    fi
+    sleep 1
+  done
 fi
 if systemctl is-active --quiet "$daemon_unit" || systemctl is-active --quiet "$broker_unit"; then
   echo "refusing to install while an old managed service remains active" >&2
   exit 1
 fi
-if runuser -u "$daemon_user" -- "$status_cli" daemon status --json >/dev/null 2>&1; then
+if [ -n "$detached_pid" ] && kill -0 "$detached_pid" 2>/dev/null \
+  && [ "$(sed -n 's/^[^)]*) //' "/proc/$detached_pid/stat" 2>/dev/null | cut -d' ' -f20)" = "$detached_starttime" ]; then
   echo "refusing to install while a detached daemon remains active" >&2
   exit 1
 fi

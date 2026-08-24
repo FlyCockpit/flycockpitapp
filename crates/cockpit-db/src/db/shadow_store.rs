@@ -138,6 +138,18 @@ impl Db {
         }).await
     }
 
+    pub async fn has_unfinished_compaction_hooks(&self, session_id: Uuid) -> Result<bool> {
+        self.read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM compaction_hook_outbox
+                  WHERE session_id=?1 AND state!='completed')",
+                params![session_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .await
+    }
+
     /// Bootstrap recovery owns the session exclusively, so leases left by the
     /// prior process can be reclaimed immediately instead of waiting on a wall
     /// clock timeout.
@@ -380,7 +392,9 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_hook_outbox_covers_crash_cuts_and_large_payloads() {
-        let db = Db::open_in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("compaction-recovery.db");
+        let db = Db::open(&path).unwrap();
         let session_id = session(&db, "hook-outbox").await;
         let compaction_id = Uuid::now_v7();
         let payload = serde_json::json!({
@@ -392,12 +406,18 @@ mod tests {
         // Crash before execution: pending remains claimable with the exact
         // payload, including payloads much larger than hook stdin normally is.
         assert!(db.enqueue_compaction_hook(session_id, compaction_id, "pre", &payload).await.unwrap());
+        drop(db);
+
+        // A real database reopen is the crash boundary after enqueue.
+        let db = Db::open(&path).unwrap();
         let first = db.lease_compaction_hook(session_id, compaction_id, "pre", 60_000).await.unwrap().unwrap();
         assert_eq!(first.payload_json, payload);
         assert_eq!(first.attempt_count, 1);
+        drop(db);
 
         // Crash after external execution but before its receipt: bootstrap
         // releases the stale lease and redelivers the same stable identity.
+        let db = Db::open(&path).unwrap();
         db.release_compaction_hook_leases(session_id).await.unwrap();
         let second = db.lease_compaction_hook(session_id, compaction_id, "pre", 60_000).await.unwrap().unwrap();
         assert_eq!(second.compaction_id, first.compaction_id);
@@ -406,6 +426,8 @@ mod tests {
 
         // Crash after receipt: completed rows are terminal and cannot lease.
         assert!(db.complete_compaction_hook(compaction_id, "pre", second.lease_id).await.unwrap());
+        drop(db);
+        let db = Db::open(&path).unwrap();
         assert!(db.compaction_hook_completed(compaction_id, "pre").await.unwrap());
         assert!(db.lease_compaction_hook(session_id, compaction_id, "pre", 1).await.unwrap().is_none());
     }

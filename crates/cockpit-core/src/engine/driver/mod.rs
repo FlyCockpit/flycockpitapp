@@ -769,9 +769,12 @@ pub struct Driver {
     shadow_brief: Option<ShadowBriefState>,
     /// A validated compaction transaction recovered from the durable intent
     /// slot. It is completed at driver-loop bootstrap before accepting new
-    /// work, so a crash after `preCompact` cannot expose the predecessor as if
-    /// no compaction had been requested.
+    /// work, so a crash after the successor commit cannot admit work before
+    /// lifecycle receipts and live projection converge.
     recovered_compaction_intent: Option<context_reduction::DurableCompactionTransaction>,
+    /// Fail-closed admission latch while durable compaction recovery cannot be
+    /// loaded or reconciled.
+    compaction_recovery_blocked: bool,
     shadow_brief_generation: u64,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
@@ -1079,6 +1082,7 @@ struct TestCompactBriefCall {
 pub(in crate::engine::driver) enum CompactForceFailure {
     Prepare,
     Apply,
+    Commit,
 }
 
 #[cfg(test)]
@@ -1506,6 +1510,7 @@ impl Driver {
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
             recovered_compaction_intent: None,
+            compaction_recovery_blocked: false,
             shadow_brief_generation: 0,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
@@ -1833,6 +1838,7 @@ impl Driver {
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
             recovered_compaction_intent: None,
+            compaction_recovery_blocked: false,
             shadow_brief_generation: 0,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
@@ -2403,7 +2409,7 @@ impl Driver {
                 cached_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             });
-        self.load_compaction_shadow_from_store().await;
+        let _ = self.load_compaction_shadow_from_store().await;
         Ok(Some(rehydrated))
     }
 
@@ -3409,7 +3415,12 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
-        self.recover_compaction_intent(tx).await;
+        // Durable compaction recovery is an admission gate, not a best-effort
+        // startup task. No user/control/job work is observed until a committed
+        // successor, both lifecycle receipts, and live projection converge.
+        // Retrying also re-pins configuration so an operator can restore the
+        // exact admitted hook plan without restarting the daemon again.
+        self.reconcile_compaction_before_admission(tx).await;
         self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
@@ -4825,11 +4836,31 @@ impl Driver {
         fields: crate::engine::agent::hooks::ObserveFields<'_>,
     ) {
         let snapshot = self.config.snapshot();
+        self.fire_observe_hook_with_registry(
+            snapshot.hooks(),
+            event,
+            match_value,
+            tool_name,
+            tool_call_id,
+            fields,
+        )
+        .await;
+    }
+
+    async fn fire_observe_hook_with_registry(
+        &self,
+        registry: &crate::config::extended::hooks::HookRegistry,
+        event: crate::config::extended::hooks::HookEvent,
+        match_value: &str,
+        tool_name: Option<&str>,
+        tool_call_id: Option<&str>,
+        fields: crate::engine::agent::hooks::ObserveFields<'_>,
+    ) {
         let runner = self.hook_runner();
         crate::engine::agent::hooks::run_observe_hooks(
             &runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
-            snapshot.hooks(),
+            registry,
             event,
             match_value,
             self.session.id,

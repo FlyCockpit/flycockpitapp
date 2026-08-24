@@ -2863,7 +2863,9 @@ impl HookDocumentationContract {
                     HookApplicability::NormalRootDoneOnly => "normalRootDoneOnly",
                     HookApplicability::InferenceErrorOnly => "inferenceErrorOnly",
                     HookApplicability::ChildOnly => "childOnly",
-                    HookApplicability::PreparedApplyAttempt => "preparedApplyAttempt",
+                    HookApplicability::SuccessfulCompactionPreProjection => {
+                        "successfulCompactionPreProjection"
+                    }
                     HookApplicability::SuccessfulCompactionOnly => "successfulCompactionOnly",
                     HookApplicability::EverySession => "everySession",
                 };

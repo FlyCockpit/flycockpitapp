@@ -184,6 +184,10 @@ enum Response {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OperationStatus {
+    /// In-memory reservation while the kernel spawn transaction is running.
+    /// This phase is never persisted and prevents cleanup from racing a
+    /// prepare before the child ownership descriptors have been published.
+    Preparing,
     Prepared,
     /// The commit decision is durable, but release of the child gate has not
     /// yet been durably acknowledged. Recovery must conservatively abort this
@@ -629,13 +633,15 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     let recovered_exit_statuses = operations.values()
         .filter_map(|operation| operation.exit_code.map(|code| (operation.key.clone(), Some(code))))
         .collect();
-    let state = Arc::new(Mutex::new(BrokerState {
-        children: BTreeMap::new(),
-        operations,
-        emptied: durable_empty,
-        exit_statuses: recovered_exit_statuses,
-        tombstones,
-    }));
+    let state = Arc::new(BrokerState {
+        children: Mutex::new(BTreeMap::new()),
+        operations: Mutex::new(operations.into_iter().map(|(identity, operation)| {
+            (identity, Arc::new(Mutex::new(operation)))
+        }).collect()),
+        emptied: Mutex::new(durable_empty),
+        exit_statuses: Mutex::new(recovered_exit_statuses),
+        tombstones: Mutex::new(tombstones),
+    });
     // Cleanup/reap progress must not depend on request traffic. Each pass is
     // independently bounded and never owns the listener, so idle cleanup does
     // not delay accepting a replacement daemon connection.
@@ -644,10 +650,8 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
         let cleanup_config = config.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            if let Ok(mut state) = cleanup_state.lock() {
-                retry_pending_cleanups(&cleanup_config, &mut state);
-                retry_pending_exits(&cleanup_config, &mut state);
-            }
+            retry_pending_cleanups(&cleanup_config, &cleanup_state);
+            retry_pending_exits(&cleanup_config, &cleanup_state);
         });
     }
     // Publish the socket only after cgroup and durable-state recovery has
@@ -662,12 +666,17 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     // peer-credential and capability authenticated before it can issue a
     // request.
     let next_connection_id = AtomicU64::new(1);
+    // Broker-lifetime accounting. A per-accept-loop counter would reset after
+    // every successful authentication and allow an attacker to accumulate an
+    // unbounded number of slow pre-authentication threads over time.
+    let preauthenticated_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let authenticated_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let mut stream = accept_authenticated_connection(
             &listener,
             config.allowed_uid,
             &broker_capability,
+            &preauthenticated_connections,
         )?;
         if authenticated_connections.fetch_add(1, Ordering::AcqRel)
             >= MAX_AUTHENTICATED_CONNECTIONS
@@ -692,26 +701,15 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
                 // connections therefore cannot block acceptance or progress
                 // on another authenticated connection.
                 if let Err(error) = wait_for_frame_start(stream.as_raw_fd()) {
-                    if let Ok(mut state) = connection_state.lock() {
-                        cleanup_connection_children(&connection_config, &mut state, connection_id);
-                    }
+                    cleanup_connection_children(&connection_config, &connection_state, connection_id);
                     if !matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) {
                         eprintln!("containment broker connection closed: {error}");
                     }
                     break;
                 }
-                let result = match connection_state.lock() {
-                    Ok(mut state) => {
-                        retry_pending_cleanups(&connection_config, &mut state);
-                        retry_pending_exits(&connection_config, &mut state);
-                        serve_one(&mut stream, &connection_config, &mut state, connection_id)
-                    }
-                    Err(_) => Err(std::io::Error::other("broker state lock poisoned")),
-                };
+                let result = serve_one(&mut stream, &connection_config, &connection_state, connection_id);
                 if let Err(error) = result {
-                    if let Ok(mut state) = connection_state.lock() {
-                        cleanup_connection_children(&connection_config, &mut state, connection_id);
-                    }
+                    cleanup_connection_children(&connection_config, &connection_state, connection_id);
                     if !matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut) {
                         eprintln!("containment broker connection closed: {error}");
                     }
@@ -757,9 +755,9 @@ fn accept_authenticated_connection(
     listener: &UnixListener,
     allowed_uid: u32,
     capability: &OwnedFd,
+    active: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<UnixStream> {
     let (authenticated_tx, authenticated_rx) = std::sync::mpsc::sync_channel(1);
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     listener.set_nonblocking(true)?;
     loop {
         if let Ok(stream) = authenticated_rx.try_recv() {
@@ -768,15 +766,16 @@ fn accept_authenticated_connection(
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if active.load(Ordering::Acquire) >= MAX_PREAUTH_CONNECTIONS {
+                if !try_reserve_connection(active, MAX_PREAUTH_CONNECTIONS) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
-                active.fetch_add(1, Ordering::AcqRel);
                 let active = active.clone();
+                let connection_count = ConnectionCountGuard(active);
                 let sender = authenticated_tx.clone();
                 let expected = duplicate_valid_capability(capability.as_raw_fd())?;
                 std::thread::spawn(move || {
+                    let _connection_count = connection_count;
                     let accepted = stream.set_read_timeout(Some(AUTH_FRAME_TIMEOUT)).is_ok()
                         && stream.set_write_timeout(Some(AUTH_FRAME_TIMEOUT)).is_ok()
                         && verify_peer_uid(&stream, allowed_uid).is_ok()
@@ -784,7 +783,6 @@ fn accept_authenticated_connection(
                     if accepted {
                         let _ = sender.try_send(stream);
                     }
-                    active.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -798,12 +796,21 @@ fn accept_authenticated_connection(
     }
 }
 
+fn try_reserve_connection(
+    active: &std::sync::atomic::AtomicUsize,
+    limit: usize,
+) -> bool {
+    active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        (count < limit).then_some(count + 1)
+    }).is_ok()
+}
+
 struct BrokerState {
-    children: BTreeMap<String, libc::pid_t>,
-    operations: BTreeMap<(String, String), BrokerOperation>,
-    emptied: BTreeSet<String>,
-    exit_statuses: BTreeMap<String, Option<i32>>,
-    tombstones: ReplayIdentityStore,
+    children: Mutex<BTreeMap<String, libc::pid_t>>,
+    operations: Mutex<BTreeMap<(String, String), Arc<Mutex<BrokerOperation>>>>,
+    emptied: Mutex<BTreeSet<String>>,
+    exit_statuses: Mutex<BTreeMap<String, Option<i32>>>,
+    tombstones: Mutex<ReplayIdentityStore>,
 }
 
 struct BrokerOperation {
@@ -816,6 +823,9 @@ struct BrokerOperation {
     /// Runtime connection that owns disconnect cleanup. Durable recovery has
     /// no live owner; a matching retry adopts the operation explicitly.
     owner_connection: Option<u64>,
+    /// Claims background cleanup/recovery without serializing unrelated
+    /// operation records behind a global broker lock.
+    cleanup_in_progress: bool,
 }
 
 fn owned_by_other_connection(owner: Option<u64>, connection_id: u64) -> bool {
@@ -915,13 +925,26 @@ struct DurableOperation {
 }
 
 impl BrokerState {
-    fn remember_empty(&mut self, key: String) {
+    fn operation(&self, identity: &(String, String)) -> Option<Arc<Mutex<BrokerOperation>>> {
+        self.operations.lock().expect("operation-map lock poisoned").get(identity).cloned()
+    }
+
+    fn operation_for_key(&self, key: &str) -> Option<((String, String), Arc<Mutex<BrokerOperation>>)> {
+        let operations = self.operations.lock().expect("operation-map lock poisoned")
+            .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
+        operations.into_iter().find(|(_, operation)| {
+            operation.lock().expect("operation lock poisoned").key == key
+        })
+    }
+
+    fn remember_empty(&self, key: String) {
         const MAX_TOMBSTONES: usize = 4096;
-        self.emptied.insert(key);
-        while self.emptied.len() > MAX_TOMBSTONES {
-            if let Some(oldest) = self.emptied.iter().next().cloned() {
-                self.emptied.remove(&oldest);
-                self.exit_statuses.remove(&oldest);
+        let mut emptied = self.emptied.lock().expect("empty-state lock poisoned");
+        emptied.insert(key);
+        while emptied.len() > MAX_TOMBSTONES {
+            if let Some(oldest) = emptied.iter().next().cloned() {
+                emptied.remove(&oldest);
+                self.exit_statuses.lock().expect("exit-state lock poisoned").remove(&oldest);
             }
         }
     }
@@ -930,7 +953,7 @@ impl BrokerState {
 fn serve_one(
     stream: &mut UnixStream,
     config: &LinuxBrokerServerConfig,
-    state: &mut BrokerState,
+    state: &BrokerState,
     connection_id: u64,
 ) -> std::io::Result<()> {
     // Idle authenticated connections are allowed indefinitely. Once the first
@@ -987,14 +1010,17 @@ fn serve_one(
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "request_digest_mismatch".into() }, &[]);
             }
             let requested_key = containment_key(&containment_id, generation)?;
-            if let Some(existing) = state.operations.get_mut(&operation_key) {
+            if let Some(existing) = state.operation(&operation_key) {
+                let mut existing = existing.lock().expect("operation lock poisoned");
                 if existing.key != requested_key
                     || existing.generation != generation
                     || existing.request_digest != request_digest
                 {
+                    drop(existing);
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_identity_conflict".into() }, &[]);
                 }
                 if owned_by_other_connection(existing.owner_connection, connection_id) {
+                    drop(existing);
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
                 }
                 if matches!(existing.status, OperationStatus::Prepared) {
@@ -1002,28 +1028,40 @@ fn serve_one(
                 }
                 return match (&existing.status, &existing.prepared) {
                     (OperationStatus::Prepared, Some(spawned)) => {
-                        let descriptors = prepared_response_fds(spawned, capture_io);
+                        let descriptors = duplicate_prepared_response_fds(spawned, capture_io)?;
+                        let descriptor_numbers = descriptors.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+                        let key = existing.key.clone();
+                        let guard = spawned.guard.clone();
+                        drop(existing);
                         send_response(
                             stream,
-                            &Response::Prepared { version: PROTOCOL_VERSION, key: existing.key.clone(), guard: spawned.guard.clone() },
-                            &descriptors,
+                            &Response::Prepared { version: PROTOCOL_VERSION, key, guard },
+                            &descriptor_numbers,
                         )
                     }
-                    _ => send_response(stream, &Response::Operation { version: PROTOCOL_VERSION, state: existing.status, key: Some(existing.key.clone()) }, &[]),
+                    _ => {
+                        let response = Response::Operation { version: PROTOCOL_VERSION, state: existing.status, key: Some(existing.key.clone()) };
+                        drop(existing);
+                        send_response(stream, &response, &[])
+                    }
                 };
             }
             // Exact durable state is authoritative. GC deliberately publishes
             // the Bloom filter before unlinking exact rows, so a crash may
             // leave both representations behind.
-            if state.tombstones.contains(&session_id, &operation_id) {
+            if state.tombstones.lock().expect("replay-state lock poisoned").contains(&session_id, &operation_id) {
                 return send_response(stream, &Response::Error {
                     version: PROTOCOL_VERSION,
                     code: "operation_identity_retired".into(),
                 }, &[]);
             }
-            if state.operations.iter().any(|(identity, operation)| {
-                operation.key == requested_key && identity != &operation_key
-            }) {
+            let operation_snapshot = state.operations.lock().expect("operation-map lock poisoned")
+                .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
+            let locator_bound = operation_snapshot.iter().any(|(identity, operation)| {
+                    operation.lock().expect("operation lock poisoned").key == requested_key
+                        && identity != &operation_key
+                });
+            if locator_bound {
                 return send_response(
                     stream,
                     &Response::Error {
@@ -1033,9 +1071,9 @@ fn serve_one(
                     &[],
                 );
             }
-            if state.operations.len() >= MAX_LIVE_OPERATION_RECORDS {
-                gc_terminal_operations(config, &mut state.operations, &mut state.tombstones)?;
-                if state.operations.len() >= MAX_LIVE_OPERATION_RECORDS {
+            if state.operations.lock().expect("operation-map lock poisoned").len() >= MAX_LIVE_OPERATION_RECORDS {
+                gc_runtime_terminal_operations(config, state)?;
+                if state.operations.lock().expect("operation-map lock poisoned").len() >= MAX_LIVE_OPERATION_RECORDS {
                     return send_response(stream, &Response::Error {
                         version: PROTOCOL_VERSION,
                         code: "broker_active_operation_limit_reached".into(),
@@ -1050,6 +1088,26 @@ fn serve_one(
             let cancellation_fd = request_fds.last()
                 .expect("validated cancellation descriptor");
             verify_allocation_decision_fd(cancellation_fd.as_fd())?;
+            // Reserve the identity before the blocking kernel transaction.
+            // The per-operation lock, not the global map lock, linearizes a
+            // duplicate prepare against this in-progress allocation.
+            let operation = Arc::new(Mutex::new(BrokerOperation {
+                status: OperationStatus::Preparing,
+                key: requested_key.clone(),
+                generation,
+                request_digest: request_digest.clone(),
+                prepared: None,
+                exit_code: None,
+                owner_connection: Some(connection_id),
+                cleanup_in_progress: false,
+            }));
+            {
+                let mut operations = state.operations.lock().expect("operation-map lock poisoned");
+                if operations.contains_key(&operation_key) {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
+                }
+                operations.insert(operation_key.clone(), operation.clone());
+            }
             let spawned = spawn_atomic(
                 config,
                 &containment_id,
@@ -1067,15 +1125,12 @@ fn serve_one(
                     // Publish ownership before any fallible durable write or
                     // response. From this point every failure path is visible
                     // to retry_pending_cleanups and cannot orphan a child.
-                    state.operations.insert(operation_key.clone(), BrokerOperation {
-                        status: OperationStatus::CleanupRequired,
-                        key: key.clone(),
-                        generation,
-                        request_digest: request_digest.clone(),
-                        prepared: Some(spawned),
-                        exit_code: None,
-                        owner_connection: Some(connection_id),
-                    });
+                    {
+                        let mut operation = operation.lock().expect("operation lock poisoned");
+                        operation.prepared = Some(spawned);
+                        operation.status = OperationStatus::CleanupRequired;
+                        operation.cleanup_in_progress = true;
+                    }
                     if let Err(error) = persist_operation(
                         config,
                         &session_id,
@@ -1087,12 +1142,14 @@ fn serve_one(
                     ) {
                         return Err(error);
                     }
-                    let operation = state.operations.get_mut(&operation_key)
-                        .expect("newly owned operation");
-                    operation.status = OperationStatus::Prepared;
-                    let spawned = operation.prepared.as_ref().expect("prepared child retained");
-                    let descriptors = prepared_response_fds(spawned, capture_io);
+                    let mut operation_state = operation.lock().expect("operation lock poisoned");
+                    operation_state.status = OperationStatus::Prepared;
+                    operation_state.cleanup_in_progress = false;
+                    let spawned = operation_state.prepared.as_ref().expect("prepared child retained");
+                    let descriptors = duplicate_prepared_response_fds(spawned, capture_io)?;
+                    let descriptor_numbers = descriptors.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
                     let guard = spawned.guard.clone();
+                    drop(operation_state);
                     if let Err(error) = send_response(
                         &stream,
                         &Response::Prepared {
@@ -1100,11 +1157,11 @@ fn serve_one(
                             key,
                             guard,
                         },
-                        &descriptors,
+                        &descriptor_numbers,
                     ) {
-                        let operation = state.operations.get_mut(&operation_key)
-                            .expect("owned operation survives response failure");
+                        let mut operation = operation.lock().expect("operation lock poisoned");
                         operation.status = OperationStatus::CleanupRequired;
+                        operation.cleanup_in_progress = true;
                         let _ = persist_operation(
                             config,
                             &session_id,
@@ -1118,54 +1175,63 @@ fn serve_one(
                     }
                     Ok(())
                 }
-                Err(error) => send_response(
-                    &stream,
-                    &Response::Error {
+                Err(error) => {
+                    let mut operations = state.operations.lock().expect("operation-map lock poisoned");
+                    if operations.get(&operation_key).is_some_and(|found| Arc::ptr_eq(found, &operation)) {
+                        operations.remove(&operation_key);
+                    }
+                    drop(operations);
+                    send_response(&stream, &Response::Error {
                         version: PROTOCOL_VERSION,
                         code: broker_error_code(&error).into(),
-                    },
-                    &[],
-                ),
+                    }, &[])
+                }
             }
         }
         Request::CommitSpawn { version, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
             let identity = (session_id.clone(), operation_id.clone());
-            let (key, generation, digest) = {
-                let operation = state.operations.get_mut(&identity)
+            let operation = state.operation(&identity)
                     .ok_or_else(|| invalid("unknown spawn operation"))?;
+            let (key, generation, digest, decision, mut spawned) = {
+                let mut operation = operation.lock().expect("operation lock poisoned");
                 if owned_by_other_connection(operation.owner_connection, connection_id) {
+                    drop(operation);
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
                 }
                 if matches!(operation.status, OperationStatus::Committed | OperationStatus::Exited) {
-                    return send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key: operation.key.clone() }, &[]);
+                    let key = operation.key.clone();
+                    drop(operation);
+                    return send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key }, &[]);
                 }
                 if !matches!(operation.status, OperationStatus::Prepared) {
+                    drop(operation);
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_cancelled".into() }, &[]);
                 }
+                if operation.cleanup_in_progress {
+                    drop(operation);
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_cleanup_in_progress".into() }, &[]);
+                }
                 operation.owner_connection = Some(connection_id);
+                let spawned = operation.prepared.take()
+                    .ok_or_else(|| invalid("prepared operation has no child"))?;
+                let decision = match reopen_fd(spawned.cancellation.as_fd()) {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        operation.prepared = Some(spawned);
+                        return Err(error);
+                    }
+                };
                 operation.status = OperationStatus::CommitDecided;
+                operation.cleanup_in_progress = true;
                 (
                     operation.key.clone(),
                     operation.generation,
                     operation.request_digest.clone(),
+                    decision,
+                    spawned,
                 )
             };
-            let decision = {
-                let operation = state.operations.get(&identity).expect("operation exists");
-                let spawned = operation.prepared.as_ref()
-                    .ok_or_else(|| invalid("prepared operation has no child"))?;
-                match reopen_fd(spawned.cancellation.as_fd()) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Prepared;
-                        return Err(error);
-                    }
-                }
-            };
-            let mut spawned = state.operations.get_mut(&identity)
-                .expect("operation exists").prepared.take()
-                .expect("prepared child checked above");
             match durably_choose_commit(decision.as_fd(), || {
                 persist_operation(
                     config,
@@ -1179,9 +1245,11 @@ fn serve_one(
             }, || release_child(&mut spawned)) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let operation = state.operations.get_mut(&identity).expect("operation exists");
+                    let mut operation = operation.lock().expect("operation lock poisoned");
                     operation.status = OperationStatus::Prepared;
                     operation.prepared = Some(spawned);
+                    operation.cleanup_in_progress = false;
+                    drop(operation);
                     return send_response(
                         stream,
                         &Response::Error {
@@ -1192,12 +1260,13 @@ fn serve_one(
                     );
                 }
                 Err(error) => {
-                    let operation = state.operations.get_mut(&identity).expect("operation exists");
+                    let mut operation = operation.lock().expect("operation lock poisoned");
                     // Once this transaction was attempted, an I/O error does
                     // not prove whether the durable decision or release write
                     // crossed its boundary. Abort conservatively; never
                     // publish cancellation for a child that may have run.
                     operation.status = OperationStatus::DisconnectCleanupRequired;
+                    operation.cleanup_in_progress = false;
                     let _ = persist_operation(
                         config,
                         &session_id,
@@ -1208,7 +1277,7 @@ fn serve_one(
                         &digest,
                     );
                     if rollback_generation(&config.cgroup_root.join(&key), spawned.pid).is_err() {
-                        state.children.insert(key.clone(), spawned.pid);
+                        state.children.lock().expect("child-state lock poisoned").insert(key.clone(), spawned.pid);
                     }
                     return Err(error);
                 }
@@ -1217,84 +1286,112 @@ fn serve_one(
             // A failed durable Committed write then closes the connection and
             // cleanup_connection_children still kills and proves this child
             // empty instead of orphaning an untracked running generation.
-            state.children.insert(key.clone(), spawned.pid);
+            state.children.lock().expect("child-state lock poisoned").insert(key.clone(), spawned.pid);
             if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::Released, &key, generation, &digest) {
-                let operation = state.operations.get_mut(&identity).expect("operation exists");
+                let mut operation = operation.lock().expect("operation lock poisoned");
                 operation.status = OperationStatus::DisconnectCleanupRequired;
+                operation.cleanup_in_progress = false;
                 let _ = persist_operation(config, &session_id, &operation_id, OperationStatus::DisconnectCleanupRequired, &key, generation, &digest);
                 return Err(error);
             }
-            state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Released;
+            operation.lock().expect("operation lock poisoned").status = OperationStatus::Released;
             if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &key, generation, &digest) {
-                let operation = state.operations.get_mut(&identity).expect("operation exists");
+                let mut operation = operation.lock().expect("operation lock poisoned");
                 operation.status = OperationStatus::DisconnectCleanupRequired;
+                operation.cleanup_in_progress = false;
                 let _ = persist_operation(config, &session_id, &operation_id, OperationStatus::DisconnectCleanupRequired, &key, generation, &digest);
                 return Err(error);
             }
-            state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Committed;
+            {
+                let mut operation = operation.lock().expect("operation lock poisoned");
+                operation.status = OperationStatus::Committed;
+                operation.cleanup_in_progress = false;
+            }
             send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key }, &[])
         }
         Request::CancelOperation { version, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
             let identity = (session_id.clone(), operation_id.clone());
-            let Some(operation) = state.operations.get_mut(&identity) else {
+            let Some(operation) = state.operation(&identity) else {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_not_found".into() }, &[]);
             };
-            if owned_by_other_connection(operation.owner_connection, connection_id) {
-                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
-            }
-            if matches!(operation.status, OperationStatus::Cancelled) {
-                return send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[]);
-            }
-            if matches!(operation.status, OperationStatus::DisconnectAborted | OperationStatus::Exited) {
-                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_already_terminal".into() }, &[]);
-            }
-            let key = operation.key.clone();
-            let generation = operation.generation;
-            let digest = operation.request_digest.clone();
-            operation.status = OperationStatus::CleanupRequired;
+            let (key, generation, digest, mut prepared) = {
+                let mut operation = operation.lock().expect("operation lock poisoned");
+                if matches!(operation.status, OperationStatus::Cancelled) {
+                    drop(operation);
+                    return send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[]);
+                }
+                if matches!(operation.status, OperationStatus::DisconnectAborted | OperationStatus::Exited) {
+                    drop(operation);
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_already_terminal".into() }, &[]);
+                }
+                if operation.cleanup_in_progress {
+                    let response = Response::Operation { version: PROTOCOL_VERSION, state: operation.status, key: Some(operation.key.clone()) };
+                    drop(operation);
+                    return send_response(stream, &response, &[]);
+                }
+                let values = (
+                    operation.key.clone(),
+                    operation.generation,
+                    operation.request_digest.clone(),
+                    operation.prepared.take(),
+                );
+                // Cancellation authority follows the durable operation ID,
+                // not the lifetime of the peer that prepared it. The
+                // per-operation lock linearizes replacement cancel vs commit.
+                operation.status = OperationStatus::CleanupRequired;
+                operation.owner_connection = Some(connection_id);
+                operation.cleanup_in_progress = true;
+                values
+            };
             if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &key, generation, &digest) {
                 // Ownership is deliberately retained. The old durable state
                 // remains authoritative and a retry can make progress.
+                operation.lock().expect("operation lock poisoned").prepared = prepared.take();
+                operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
                 return Err(error);
             }
-            let prepared = state.operations.get_mut(&identity)
-                .expect("operation exists")
-                .prepared.take();
-
             let pid = prepared.as_ref().map(|spawned| spawned.pid)
-                .or_else(|| state.children.get(&key).copied());
+                .or_else(|| state.children.lock().expect("child-state lock poisoned").get(&key).copied());
             if let Some(pid) = pid {
-                state.children.insert(key.clone(), pid);
+                state.children.lock().expect("child-state lock poisoned").insert(key.clone(), pid);
             }
             let cleanup_exit = match cleanup_generation(config, &key, generation, pid, REAP_TIMEOUT) {
                 Ok(status) => status,
                 Err(error) => {
                     // CleanupRequired plus children ownership remains retryable;
                     // never acknowledge cancellation without ProvenEmpty.
+                    operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
                     return Err(error);
                 }
             };
-            persist_pending_exit_for_key(config, state, &key, OperationStatus::CleanupRequired, cleanup_exit)?;
-            persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled)?;
-            state.children.remove(&key);
-            state.exit_statuses.insert(key.clone(), cleanup_exit);
+            if let Err(error) = persist_pending_exit_for_key(config, state, &key, OperationStatus::CleanupRequired, cleanup_exit)
+                .and_then(|()| persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled))
+            {
+                operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
+                return Err(error);
+            }
+            state.children.lock().expect("child-state lock poisoned").remove(&key);
+            state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), cleanup_exit);
             state.remember_empty(key.clone());
+            operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
             send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
         }
         Request::OperationStatus { version, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
-            let operation = state.operations.get(&(session_id, operation_id));
+            let operation = state.operation(&(session_id, operation_id));
             match operation {
-                Some(operation) if owned_by_other_connection(operation.owner_connection, connection_id) => {
-                    send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[])
+                Some(operation) => {
+                    let operation = operation.lock().expect("operation lock poisoned");
+                    let response = Response::Operation { version: PROTOCOL_VERSION, state: operation.status, key: Some(operation.key.clone()) };
+                    drop(operation);
+                    send_response(stream, &response, &[])
                 }
-                Some(operation) => send_response(stream, &Response::Operation { version: PROTOCOL_VERSION, state: operation.status, key: Some(operation.key.clone()) }, &[]),
                 None => send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_not_found".into() }, &[]),
             }
         }
         Request::Kill { version, key, generation } if version == PROTOCOL_VERSION => {
-            if state.emptied.contains(&key) {
+            if state.emptied.lock().expect("empty-state lock poisoned").contains(&key) {
                 return send_response(&stream, &Response::Killed { version: PROTOCOL_VERSION }, &[]);
             }
             let Some(path) = resolve_key_if_present(config, &key, generation)? else {
@@ -1305,7 +1402,7 @@ fn serve_one(
             send_response(&stream, &Response::Killed { version: PROTOCOL_VERSION }, &[])
         }
         Request::Populated { version, key, generation } if version == PROTOCOL_VERSION => {
-            if state.emptied.contains(&key) {
+            if state.emptied.lock().expect("empty-state lock poisoned").contains(&key) {
                 return send_response(
                     &stream,
                     &Response::Population { version: PROTOCOL_VERSION, populated: false },
@@ -1327,14 +1424,14 @@ fn serve_one(
             let events = fs::read_to_string(path.join("cgroup.events"))?;
             let populated = parse_populated(&events)?;
             if !populated {
-                let exit_status = match state.children.get(&key).copied() {
+                let exit_status = match state.children.lock().expect("child-state lock poisoned").get(&key).copied() {
                     Some(pid) => reap_child(pid)?,
-                    None => state.exit_statuses.get(&key).copied().flatten(),
+                    None => state.exit_statuses.lock().expect("exit-state lock poisoned").get(&key).copied().flatten(),
                 };
                 // Cache the observation for an in-process persistence retry,
                 // but retain child ownership and do not report terminal state
                 // until both durable writes below succeed.
-                state.exit_statuses.insert(key.clone(), exit_status);
+                state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), exit_status);
                 persist_pending_exit_for_key(
                     config,
                     state,
@@ -1344,8 +1441,8 @@ fn serve_one(
                 )?;
                 fs::remove_dir(&path)?;
                 persist_terminal_for_key(config, state, &key, OperationStatus::Exited)?;
-                state.children.remove(&key);
-                state.exit_statuses.insert(key.clone(), exit_status);
+                state.children.lock().expect("child-state lock poisoned").remove(&key);
+                state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), exit_status);
                 state.remember_empty(key.clone());
             }
             send_response(&stream, &Response::Population { version: PROTOCOL_VERSION, populated }, &[])
@@ -1354,16 +1451,18 @@ fn serve_one(
             if !valid_key(&key, generation) {
                 return Err(invalid("invalid containment key"));
             }
-            let exit_code = if let Some(exit_code) = state.exit_statuses.get(&key) {
-                *exit_code
+            let cached_exit = state.exit_statuses.lock().expect("exit-state lock poisoned").get(&key).copied();
+            let exit_code = if let Some(exit_code) = cached_exit {
+                exit_code
             } else {
-                let pid = state.children.get(&key).copied().ok_or_else(|| invalid("unknown child"))?;
+                let pid = state.children.lock().expect("child-state lock poisoned").get(&key).copied().ok_or_else(|| invalid("unknown child"))?;
                 let exit_code = reap_child(pid)?;
-                state.exit_statuses.insert(key.clone(), exit_code);
+                state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), exit_code);
                 exit_code
             };
-            let status = state.operations.values().find(|operation| operation.key == key)
-                .map(|operation| operation.status)
+            let operation = state.operation_for_key(&key).map(|(_, operation)| operation);
+            let status = operation
+                .map(|operation| operation.lock().expect("operation lock poisoned").status)
                 .ok_or_else(|| invalid("exit status has no durable operation identity"))?;
             let terminal = if matches!(status, OperationStatus::Committed | OperationStatus::Exited) {
                 OperationStatus::Exited
@@ -1377,8 +1476,8 @@ fn serve_one(
             };
             persist_pending_exit_for_key(config, state, &key, pending_terminal, exit_code)?;
             persist_terminal_for_key(config, state, &key, terminal)?;
-            state.children.remove(&key);
-            state.exit_statuses.insert(key.clone(), exit_code);
+            state.children.lock().expect("child-state lock poisoned").remove(&key);
+            state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), exit_code);
             send_response(&stream, &Response::Exited { version: PROTOCOL_VERSION, status: terminal, exit_code }, &[])
         }
         _ => send_response(
@@ -1412,6 +1511,20 @@ fn prepared_response_fds(spawned: &Spawned, capture_io: bool) -> Vec<RawFd> {
     } else {
         vec![spawned.pidfd.as_raw_fd()]
     }
+}
+
+fn duplicate_prepared_response_fds(
+    spawned: &Spawned,
+    capture_io: bool,
+) -> std::io::Result<Vec<OwnedFd>> {
+    prepared_response_fds(spawned, capture_io).into_iter().map(|fd| {
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+        }
+    }).collect()
 }
 
 fn reopen_fd(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
@@ -1945,21 +2058,18 @@ fn wait_cgroup_empty(group: &Path, timeout: std::time::Duration) -> std::io::Res
 
 fn cleanup_connection_children(
     config: &LinuxBrokerServerConfig,
-    state: &mut BrokerState,
+    state: &Arc<BrokerState>,
     connection_id: u64,
 ) {
-    let identities = state.operations.keys().cloned().collect::<Vec<_>>();
-    for (session_id, operation_id) in identities {
-        let identity = (session_id.clone(), operation_id.clone());
-        let Some(operation) = state.operations.get_mut(&identity) else { continue };
+    let operations = state.operations.lock().expect("operation-map lock poisoned")
+        .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
+    for ((session_id, operation_id), operation) in operations {
+        let (key, generation, digest, pending, terminal, prepared) = {
+            let mut operation = operation.lock().expect("operation lock poisoned");
         if operation.owner_connection != Some(connection_id) {
             continue;
         }
         operation.owner_connection = None;
-        let prepared = operation.prepared.take();
-        let key = operation.key.clone();
-        let generation = operation.generation;
-        let digest = operation.request_digest.clone();
         let (pending, terminal) = match operation.status {
             OperationStatus::Prepared | OperationStatus::CleanupRequired => {
                 (OperationStatus::CleanupRequired, OperationStatus::Cancelled)
@@ -1970,112 +2080,134 @@ fn cleanup_connection_children(
             _ => continue,
         };
         operation.status = pending;
-        let _ = persist_operation(config, &session_id, &operation_id, pending, &key, generation, &digest);
-        let pid = prepared.as_ref().map(|spawned| spawned.pid)
-            .or_else(|| state.children.get(&key).copied());
-        let cleanup_exit = match cleanup_generation(config, &key, generation, pid, std::time::Duration::ZERO) {
-            Ok(status) => status,
-            Err(_) => {
-                if let Some(pid) = pid {
-                    state.children.insert(key, pid);
-                }
-                continue;
-            }
+        operation.cleanup_in_progress = true;
+            (operation.key.clone(), operation.generation, operation.request_digest.clone(), pending, terminal, operation.prepared.take())
         };
-        if persist_pending_exit_for_key(config, state, &key, pending, cleanup_exit).is_err() {
-            if let Some(pid) = pid { state.children.insert(key, pid); }
-            continue;
-        }
-        if persist_terminal_for_key(config, state, &key, terminal).is_err() {
-            continue;
-        }
-        state.children.remove(&key);
-        state.exit_statuses.insert(key.clone(), cleanup_exit);
-        state.remember_empty(key.clone());
+        let config = config.clone();
+        let state = state.clone();
+        let operation = operation.clone();
+        std::thread::spawn(move || {
+            let _ = persist_operation(&config, &session_id, &operation_id, pending, &key, generation, &digest);
+            cleanup_claimed_operation(&config, &state, &operation, &key, generation, pending, terminal, prepared);
+        });
     }
 }
 
-fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
-    let pending = state.operations.values().filter_map(|operation| {
-        let terminal = match operation.status {
-            OperationStatus::CleanupRequired => OperationStatus::Cancelled,
-            OperationStatus::DisconnectCleanupRequired => OperationStatus::DisconnectAborted,
-            _ => return None,
+fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &Arc<BrokerState>) {
+    let operations = state.operations.lock().expect("operation-map lock poisoned")
+        .values().cloned().collect::<Vec<_>>();
+    for operation in operations {
+        let claim = {
+            let mut operation = operation.lock().expect("operation lock poisoned");
+            if operation.cleanup_in_progress { None } else {
+                let terminal = match operation.status {
+                    OperationStatus::CleanupRequired => Some(OperationStatus::Cancelled),
+                    OperationStatus::DisconnectCleanupRequired => Some(OperationStatus::DisconnectAborted),
+                    _ => None,
+                };
+                terminal.map(|terminal| {
+                    operation.cleanup_in_progress = true;
+                    (operation.key.clone(), operation.generation, operation.status, terminal, operation.prepared.take())
+                })
+            }
         };
-        Some((operation.key.clone(), operation.generation, terminal))
-    }).collect::<Vec<_>>();
-    for (key, generation, terminal) in pending {
-        if cleanup_generation(config, &key, generation, None, std::time::Duration::ZERO).is_err() {
-            continue;
-        }
-        let exit_status = if let Some(pid) = state.children.get(&key).copied() {
-            if let Ok(exit_status) = reap_child_bounded(pid, std::time::Duration::ZERO) {
-                exit_status
+        let Some((key, generation, pending, terminal, prepared)) = claim else { continue };
+        let config = config.clone();
+        let state = state.clone();
+        let operation = operation.clone();
+        std::thread::spawn(move || {
+            cleanup_claimed_operation(&config, &state, &operation, &key, generation, pending, terminal, prepared);
+        });
+    }
+}
+
+fn cleanup_claimed_operation(
+    config: &LinuxBrokerServerConfig,
+    state: &BrokerState,
+    operation: &Arc<Mutex<BrokerOperation>>,
+    key: &str,
+    generation: u64,
+    pending: OperationStatus,
+    terminal: OperationStatus,
+    prepared: Option<Spawned>,
+) {
+    let pid = prepared.as_ref().map(|spawned| spawned.pid)
+        .or_else(|| state.children.lock().expect("child-state lock poisoned").get(key).copied());
+    if let Some(pid) = pid {
+        state.children.lock().expect("child-state lock poisoned").insert(key.to_owned(), pid);
+    }
+    let result = cleanup_generation(config, key, generation, pid, std::time::Duration::ZERO)
+        .and_then(|exit| {
+            persist_pending_exit_for_key(config, state, key, pending, exit)?;
+            persist_terminal_for_key(config, state, key, terminal)?;
+            Ok(exit)
+        });
+    let mut operation = operation.lock().expect("operation lock poisoned");
+    operation.cleanup_in_progress = false;
+    if let Ok(exit) = result {
+        state.children.lock().expect("child-state lock poisoned").remove(key);
+        state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.to_owned(), exit);
+        state.remember_empty(key.to_owned());
+    } else if operation.prepared.is_none() {
+        operation.prepared = prepared;
+    }
+}
+
+fn retry_pending_exits(config: &LinuxBrokerServerConfig, state: &Arc<BrokerState>) {
+    let operations = state.operations.lock().expect("operation-map lock poisoned")
+        .values().cloned().collect::<Vec<_>>();
+    for operation in operations {
+        let pending = {
+            let mut operation = operation.lock().expect("operation lock poisoned");
+            if !matches!(operation.status, OperationStatus::ExitPersistenceRequired) || operation.cleanup_in_progress {
+                None
             } else {
-                continue;
+                operation.cleanup_in_progress = true;
+                Some((operation.key.clone(), operation.generation, operation.exit_code))
             }
-        } else {
-            state.exit_statuses.get(&key).copied().flatten()
         };
-        let pending_status = match terminal {
-            OperationStatus::Cancelled => OperationStatus::CleanupRequired,
-            OperationStatus::DisconnectAborted => OperationStatus::DisconnectCleanupRequired,
-            _ => continue,
-        };
-        if persist_pending_exit_for_key(config, state, &key, pending_status, exit_status).is_err() {
-            continue;
-        }
-        if persist_terminal_for_key(config, state, &key, terminal).is_err() {
-            continue;
-        }
-        state.children.remove(&key);
-        state.exit_statuses.insert(key.clone(), exit_status);
-        state.remember_empty(key.clone());
-    }
-}
-
-fn retry_pending_exits(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
-    let pending = state.operations.values()
-        .filter(|operation| matches!(operation.status, OperationStatus::ExitPersistenceRequired))
-        .map(|operation| (operation.key.clone(), operation.generation, operation.exit_code))
-        .collect::<Vec<_>>();
-    for (key, generation, exit_code) in pending {
-        let path = match resolve_key_if_present(config, &key, generation) {
+        let Some((key, generation, exit_code)) = pending else { continue };
+        let config = config.clone();
+        let state = state.clone();
+        let operation = operation.clone();
+        std::thread::spawn(move || {
+        let path = match resolve_key_if_present(&config, &key, generation) {
             Ok(path) => path,
-            Err(_) => continue,
+            Err(_) => { operation.lock().expect("operation lock poisoned").cleanup_in_progress = false; return; },
         };
         if let Some(path) = path {
             let events = match fs::read_to_string(path.join("cgroup.events")) {
                 Ok(events) => events,
-                Err(_) => continue,
+                Err(_) => { operation.lock().expect("operation lock poisoned").cleanup_in_progress = false; return; },
             };
             if !matches!(parse_populated(&events), Ok(false)) || fs::remove_dir(path).is_err() {
-                continue;
+                operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
+                return;
             }
         }
-        if persist_terminal_for_key(config, state, &key, OperationStatus::Exited).is_err() {
-            continue;
+        if persist_terminal_for_key(&config, &state, &key, OperationStatus::Exited).is_err() {
+            operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
+            return;
         }
-        state.children.remove(&key);
-        state.exit_statuses.insert(key.clone(), exit_code);
+        state.children.lock().expect("child-state lock poisoned").remove(&key);
+        state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), exit_code);
         state.remember_empty(key);
+        operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
+        });
     }
 }
 
 fn persist_terminal_for_key(
     config: &LinuxBrokerServerConfig,
-    state: &mut BrokerState,
+    state: &BrokerState,
     key: &str,
     status: OperationStatus,
 ) -> std::io::Result<()> {
-    let identity = state.operations.iter()
-        .find(|(_, operation)| operation.key == key)
-        .map(|(identity, _)| identity.clone());
-    let (session_id, operation_id) = identity
+    let found = state.operation_for_key(key);
+    let ((session_id, operation_id), operation) = found
         .ok_or_else(|| invalid("terminal status has no durable operation identity"))?;
-    let operation = state.operations.get_mut(&(session_id.clone(), operation_id.clone()))
-        .expect("operation identity came from map");
-    let exit_code = state.exit_statuses.get(key).copied().flatten().or(operation.exit_code);
+    let mut operation = operation.lock().expect("operation lock poisoned");
+    let exit_code = state.exit_statuses.lock().expect("exit-state lock poisoned").get(key).copied().flatten().or(operation.exit_code);
     let destination = operation_record_path(config, &session_id, &operation_id)?;
     let record = DurableOperation {
         broker_epoch: broker_epoch()?, session_id, operation_id, status,
@@ -2087,22 +2219,22 @@ fn persist_terminal_for_key(
     atomic_replace_operation_record(config, &destination, &bytes)?;
     operation.status = status;
     operation.exit_code = record.exit_code;
-    gc_terminal_operations(config, &mut state.operations, &mut state.tombstones)?;
+    drop(operation);
+    gc_runtime_terminal_operations(config, state)?;
     Ok(())
 }
 
 fn persist_pending_exit_for_key(
     config: &LinuxBrokerServerConfig,
-    state: &mut BrokerState,
+    state: &BrokerState,
     key: &str,
     status: OperationStatus,
     exit_code: Option<i32>,
 ) -> std::io::Result<()> {
-    let identity = state.operations.iter()
-        .find(|(_, operation)| operation.key == key)
-        .map(|(identity, _)| identity.clone())
+    let found = state.operation_for_key(key)
         .ok_or_else(|| invalid("pending exit has no durable operation identity"))?;
-    let operation = state.operations.get(&identity).expect("operation identity came from map");
+    let (identity, operation) = found;
+    let operation = operation.lock().expect("operation lock poisoned");
     persist_operation_with_exit(
         config,
         &identity.0,
@@ -2113,7 +2245,9 @@ fn persist_pending_exit_for_key(
         &operation.request_digest,
         exit_code,
     )?;
-    let operation = state.operations.get_mut(&identity).expect("operation identity came from map");
+    drop(operation);
+    let operation = state.operation(&identity).expect("operation identity came from map");
+    let mut operation = operation.lock().expect("operation lock poisoned");
     operation.status = status;
     operation.exit_code = exit_code;
     Ok(())
@@ -2712,6 +2846,9 @@ fn recover_operation_records(
         }
         let proven_empty = recovered_empty.contains(&record.key)
             || !config.cgroup_root.join(&record.key).exists();
+        if matches!(record.status, OperationStatus::Preparing) {
+            return Err(invalid("transient preparing state cannot be durable"));
+        }
         let recovered_status = match record.status {
             OperationStatus::Prepared | OperationStatus::CleanupRequired => {
                 if proven_empty { OperationStatus::Cancelled } else { OperationStatus::CleanupRequired }
@@ -2746,6 +2883,7 @@ fn recover_operation_records(
             prepared: None,
             exit_code: record.exit_code,
             owner_connection: None,
+            cleanup_in_progress: false,
         }).is_some() {
             return Err(invalid("duplicate durable operation identity"));
         }
@@ -2818,6 +2956,44 @@ fn gc_terminal_operations(
         operations.remove(&identity);
     }
     File::open(&config.state_root)?.sync_all()?;
+    Ok(())
+}
+
+fn gc_runtime_terminal_operations(
+    config: &LinuxBrokerServerConfig,
+    state: &BrokerState,
+) -> std::io::Result<()> {
+    let retired = {
+        let operations = state.operations.lock().expect("operation-map lock poisoned");
+        if operations.len() < MAX_LIVE_OPERATION_RECORDS {
+            return Ok(());
+        }
+        let target = MAX_LIVE_OPERATION_RECORDS * 3 / 4;
+        operations.iter().filter_map(|(identity, operation)| {
+            let operation = operation.try_lock().ok()?;
+            matches!(operation.status,
+                OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited)
+                .then(|| identity.clone())
+        }).take(operations.len().saturating_sub(target)).collect::<Vec<_>>()
+    };
+    if retired.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut tombstones = state.tombstones.lock().expect("replay-state lock poisoned");
+        let newly_retired = retired.iter()
+            .filter(|identity| !tombstones.identities.contains(*identity))
+            .cloned().collect::<Vec<_>>();
+        tombstones.append(config, &newly_retired)?;
+    }
+    for identity in &retired {
+        fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?)?;
+    }
+    File::open(&config.state_root)?.sync_all()?;
+    let mut operations = state.operations.lock().expect("operation-map lock poisoned");
+    for identity in retired {
+        operations.remove(&identity);
+    }
     Ok(())
 }
 
@@ -3394,7 +3570,7 @@ mod tests {
     #[test]
     fn allocation_decision_is_linearized_under_one_cross_process_lock() {
         let cancelled = super::super::adapter::AllocationCancellation::new().unwrap();
-        cancelled.cancel().unwrap();
+        cancelled.cancel_blocking().unwrap();
         assert!(!durably_choose_commit(cancelled.decision_fd(), || {
             panic!("cancel-first decision must not persist commit")
         }, || panic!("cancel-first decision must not release")).unwrap());
@@ -3405,13 +3581,25 @@ mod tests {
             persisted.store(true, Ordering::Release);
             Ok(())
         }, || Ok(())).unwrap());
-        committed.cancel().unwrap();
+        committed.cancel_blocking().unwrap();
         assert!(persisted.load(Ordering::Acquire));
         let mut state = [0_u8];
         assert_eq!(unsafe {
             libc::pread(committed.decision_fd().as_raw_fd(), state.as_mut_ptr().cast(), 1, 0)
         }, 1);
         assert_eq!(state[0], 2, "commit winner cannot be rewritten as pre-release cancellation");
+    }
+
+    #[tokio::test]
+    async fn allocation_cancellation_async_api_completes_the_durable_ticket() {
+        let cancellation = super::super::adapter::AllocationCancellation::new().unwrap();
+        cancellation.cancel().await.unwrap();
+        assert!(cancellation.is_cancelled());
+        let mut state = [0_u8];
+        assert_eq!(unsafe {
+            libc::pread(cancellation.decision_fd().as_raw_fd(), state.as_mut_ptr().cast(), 1, 0)
+        }, 1);
+        assert_eq!(state, [1]);
     }
 
     #[test]
@@ -3433,7 +3621,7 @@ mod tests {
         let cancelling = cancellation.clone();
         let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(0);
         let cancel = std::thread::spawn(move || {
-            cancelling.cancel().unwrap();
+            cancelling.cancel_blocking().unwrap();
             cancelled_tx.send(()).unwrap();
         });
         assert!(matches!(
@@ -3501,6 +3689,22 @@ mod tests {
         let mut redirected = config;
         redirected.cgroup_root = PathBuf::from("/sys/fs/cgroup/operator-owned");
         assert!(verify_canonical_cgroup_root(&redirected).is_err());
+    }
+
+    #[test]
+    fn preauthentication_admission_is_bounded_and_released_by_guard() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(try_reserve_connection(&active, 2));
+        let first = ConnectionCountGuard(active.clone());
+        assert!(try_reserve_connection(&active, 2));
+        let second = ConnectionCountGuard(active.clone());
+        assert!(!try_reserve_connection(&active, 2));
+        drop(first);
+        assert!(try_reserve_connection(&active, 2));
+        let replacement = ConnectionCountGuard(active.clone());
+        drop(second);
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]

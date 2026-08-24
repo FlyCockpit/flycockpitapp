@@ -521,7 +521,7 @@ async fn ready_brief_survives_driver_drop() {
     drop(driver);
 
     let mut restored = Driver::new(session.clone(), locks, redact, cwd, root);
-    restored.load_compaction_shadow_from_store().await;
+    let _ = restored.load_compaction_shadow_from_store().await;
     append_complete_test_turns(&mut restored, 3);
     install_test_providers(
         &mut restored,
@@ -609,7 +609,7 @@ async fn load_without_row_clears_memory_view() {
         input_coverage: crate::engine::compact_draft::CompactInputCoverage::Full,
     }));
 
-    driver.load_compaction_shadow_from_store().await;
+    let _ = driver.load_compaction_shadow_from_store().await;
 
     assert!(
         driver.shadow_brief.is_none(),
@@ -643,7 +643,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         driver.cwd.clone(),
         driver.stack[0].agent.clone(),
     );
-    restored.load_compaction_shadow_from_store().await;
+    let _ = restored.load_compaction_shadow_from_store().await;
 
     assert_eq!(restored.shadow_brief_generation, 7);
     assert!(matches!(
@@ -667,7 +667,7 @@ async fn loaded_brief_generation_is_persisted_and_compared() {
         .await
         .unwrap();
     restored.shadow_brief_generation = 8;
-    restored.load_compaction_shadow_from_store().await;
+    let _ = restored.load_compaction_shadow_from_store().await;
 
     assert!(restored.shadow_brief.is_none());
     assert!(
@@ -700,7 +700,7 @@ async fn durable_shadow_missing_fit_metadata_is_discarded() {
         .await
         .unwrap();
 
-    driver.load_compaction_shadow_from_store().await;
+    let _ = driver.load_compaction_shadow_from_store().await;
 
     assert!(driver.shadow_brief.is_none());
     assert!(
@@ -735,7 +735,7 @@ async fn stale_loaded_brief_is_discarded() {
         .unwrap();
     append_complete_test_turns(&mut driver, 9);
 
-    driver.load_compaction_shadow_from_store().await;
+    let _ = driver.load_compaction_shadow_from_store().await;
 
     assert!(driver.shadow_brief.is_none());
     assert!(
@@ -2943,9 +2943,9 @@ pub(crate) async fn probe_compact_boundaries() -> Vec<String> {
         "prepare failure must not fire postCompact"
     );
 
-    // Validation failure → neither fires. A later durable commit failure is
-    // different: pre has honestly observed an admitted attempt and recovery
-    // retries that same compaction identity without post until commit.
+    // Validation and durable-successor commit failures both fire neither;
+    // recovery retries the stable compaction identity before any hook becomes
+    // deliverable.
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     inject_hooks(&mut driver, compact_manual_registry());
     driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Apply);
@@ -3030,9 +3030,9 @@ async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
         .await
         .unwrap();
 
-    driver.load_compaction_shadow_from_store().await;
+    let _ = driver.load_compaction_shadow_from_store().await;
     assert!(driver.recovered_compaction_intent.is_some());
-    driver.recover_compaction_intent(&tx).await;
+    assert!(driver.recover_compaction_intent(&tx).await);
     drop(tx);
     while rx.recv().await.is_some() {}
 
@@ -3054,14 +3054,93 @@ async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
 }
 
 #[tokio::test]
+async fn compact_successor_commit_failure_fires_neither_and_blocks_admission() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
+        DurableCompactionTransaction {
+            phase: CompactionTransactionPhase::Prepared,
+            prepared,
+        },
+    ));
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(
+            driver.session.id,
+            &serde_json::to_string(&intent).unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = driver.load_compaction_shadow_from_store().await;
+    driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Commit);
+
+    assert!(
+        !driver.recover_compaction_intent(&tx).await,
+        "a missing durable successor must keep admission closed"
+    );
+    assert!(driver.recovered_compaction_intent.is_some());
+    assert!(compact_hook_event_order(&driver).await.is_empty());
+
+    driver.test_compact_force_failure = None;
+    assert!(driver.recover_compaction_intent(&tx).await);
+    assert_eq!(
+        compact_hook_event_order(&driver).await,
+        vec!["preCompact".to_string(), "postCompact".to_string()]
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn compact_recovery_rejects_handler_plan_drift_until_exact_plan_returns() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    let admitted = compact_manual_registry();
+    inject_hooks(&mut driver, admitted.clone());
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let prepared = driver.prepare_compaction_with_source(&tx, "manual").await.unwrap();
+    driver.stage_prepared_compaction(&prepared).await.unwrap();
+    let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
+        DurableCompactionTransaction {
+            phase: CompactionTransactionPhase::SuccessorCommitted,
+            prepared,
+        },
+    ));
+    driver.session.db.upsert_compaction_shadow(
+        driver.session.id,
+        &serde_json::to_string(&intent).unwrap(),
+    ).await.unwrap();
+
+    let mut drifted = admitted.clone();
+    drifted.hooks[0].command.push("changed-after-admission".to_string());
+    inject_hooks(&mut driver, drifted);
+    let _ = driver.load_compaction_shadow_from_store().await;
+    assert!(!driver.recover_compaction_intent(&tx).await);
+    assert!(compact_hook_event_order(&driver).await.is_empty());
+
+    inject_hooks(&mut driver, admitted);
+    assert!(driver.recover_compaction_intent(&tx).await);
+    assert_eq!(
+        compact_hook_event_order(&driver).await,
+        vec!["preCompact".to_string(), "postCompact".to_string()]
+    );
+    drop(tx);
+    while rx.recv().await.is_some() {}
+}
+
+#[tokio::test]
 async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_boundaries() {
     use CompactionTransactionPhase as Phase;
 
     for (phase, expected_hooks) in [
         (Phase::Prepared, vec!["preCompact", "postCompact"]),
-        (Phase::PreCompleted, vec!["postCompact"]),
-        (Phase::CommitRetryPending, vec!["postCompact"]),
-        (Phase::SuccessorCommitted, vec!["postCompact"]),
+        (Phase::SuccessorCommitted, vec!["preCompact", "postCompact"]),
+        (Phase::Projected, vec!["postCompact"]),
         (Phase::PostCompleted, vec![]),
     ] {
         let (mut driver, _tmp) = prepare_apply_fixture().await;
@@ -3071,12 +3150,16 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
             .prepare_compaction_with_source(&tx, "manual")
             .await
             .expect("prepare succeeds");
+        let expected_history = prepared.history.clone();
 
-        if matches!(phase, Phase::SuccessorCommitted | Phase::PostCompleted) {
+        if phase != Phase::Prepared {
             driver
                 .stage_prepared_compaction(&prepared)
                 .await
                 .expect("pre-crash successor commit succeeds");
+        }
+        if matches!(phase, Phase::Projected | Phase::PostCompleted) {
+            driver.stack[0].history = expected_history.clone();
         }
         let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
             DurableCompactionTransaction { phase, prepared },
@@ -3090,8 +3173,8 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
             )
             .await
             .unwrap();
-        driver.load_compaction_shadow_from_store().await;
-        driver.recover_compaction_intent(&tx).await;
+        let _ = driver.load_compaction_shadow_from_store().await;
+        assert!(driver.recover_compaction_intent(&tx).await);
 
         let hooks = compact_hook_event_order(&driver).await;
         assert_eq!(
@@ -3112,6 +3195,10 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
             .filter(|row| row.kind == "session_compacted")
             .count();
         assert_eq!(compacted, 1, "phase {phase:?} must commit one successor");
+        assert_eq!(
+            driver.stack[0].history, expected_history,
+            "phase {phase:?} must finish with the successor projected"
+        );
         assert!(
             driver
                 .session
@@ -3166,7 +3253,7 @@ async fn compaction_recovery_recognizes_committed_successor_before_predecessor_v
     driver.stack[0].history = prepared.history.clone();
     let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
         DurableCompactionTransaction {
-            phase: CompactionTransactionPhase::PreCompleted,
+            phase: CompactionTransactionPhase::Projected,
             prepared,
         },
     ));
@@ -3175,8 +3262,8 @@ async fn compaction_recovery_recognizes_committed_successor_before_predecessor_v
         &serde_json::to_string(&intent).unwrap(),
     ).await.unwrap();
 
-    driver.load_compaction_shadow_from_store().await;
-    driver.recover_compaction_intent(&tx).await;
+    let _ = driver.load_compaction_shadow_from_store().await;
+    assert!(driver.recover_compaction_intent(&tx).await);
     drop(tx);
     while rx.recv().await.is_some() {}
 

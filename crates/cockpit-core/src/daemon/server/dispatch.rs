@@ -9921,7 +9921,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id must not be empty")
             } else if provider_id.contains('\0') {
                 Some("provider id contains NUL")
-            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+            } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")
@@ -9936,7 +9936,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id must not be empty")
             } else if provider_id.contains('\0') {
                 Some("provider id contains NUL")
-            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+            } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")

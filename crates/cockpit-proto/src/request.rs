@@ -4481,6 +4481,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn agent_installation_rpcs_are_local_owner_only() {
         // Installation commands operate on the daemon's local workspace and
@@ -4911,10 +4912,13 @@ mod tests {
         );
         assert_ne!("get_session_compactions", "read_history_page");
         // ReadHistoryPage is unchanged (still a read).
-        assert_eq!(
-            remote_operation_class_for_tag("read_history_page"),
-            Some(RemoteOperationClass::ReadOnly)
-        );
+        #[cfg(feature = "remote")]
+        {
+            assert_eq!(
+                remote_operation_class_for_tag("read_history_page"),
+                Some(RemoteOperationClass::ReadOnly)
+            );
+        }
     }
 
     #[test]
@@ -4925,8 +4929,11 @@ mod tests {
         assert!(!command_tags.contains(&"list_sealed_values"));
         assert!(!command_tags.contains(&"delete_sealed_value"));
         // No `Request` variant serializes to the retired tags either.
-        assert_eq!(remote_operation_class_for_tag("list_sealed_values"), None);
-        assert_eq!(remote_operation_class_for_tag("delete_sealed_value"), None);
+        #[cfg(feature = "remote")]
+        {
+            assert_eq!(remote_operation_class_for_tag("list_sealed_values"), None);
+            assert_eq!(remote_operation_class_for_tag("delete_sealed_value"), None);
+        }
     }
 
     #[test]

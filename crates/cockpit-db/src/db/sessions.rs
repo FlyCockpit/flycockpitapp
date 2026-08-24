@@ -1840,7 +1840,7 @@ impl Db {
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<()> {
-        ensure!(
+        anyhow::ensure!(
             now_unix_ms >= 0,
             "cleanup intent timestamp must be nonnegative"
         );

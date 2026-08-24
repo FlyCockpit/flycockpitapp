@@ -13052,8 +13052,8 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     // upgrade the fixture's AgentReadonly scope to Agent for this session's
     // project root. The actor binding still carries the authenticated device
     // identity that the FCM2 admission must stamp.
-    remote_identity.authorization = principal::RemoteAuthorization::LegacyRelayScopes(vec![
-        principal::PrincipalGrant {
+    remote_identity.authorization =
+        principal::RemoteAuthorization::LegacyRelayScopes(vec![principal::PrincipalGrant {
             scope: principal::PrincipalScope::Agent,
             project_root: Some(
                 project
@@ -13063,8 +13063,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                     .to_string_lossy()
                     .into_owned(),
             ),
-        },
-    ]);
+        }]);
     remote_identity.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,

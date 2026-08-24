@@ -161,9 +161,12 @@ fn extended_config_layer_snapshot(
             .map_err(|error| error.to_string())?
         {
             Ok(Response::ExtendedConfigSnapshot { layers, .. }) => {
-                let layer = layers.into_iter()
+                let layer = layers
+                    .into_iter()
                     .find(|layer| layer.display_path == requested_path)
-                    .ok_or_else(|| "settings target is not a daemon-discovered layer".to_string())?;
+                    .ok_or_else(|| {
+                        "settings target is not a daemon-discovered layer".to_string()
+                    })?;
                 let mut config = *layer.config;
                 let denylist = layer.denylist;
                 let revision = layer.revision;
@@ -179,8 +182,13 @@ fn extended_config_layer_snapshot(
                         "__cockpit_denylist_entries".into(),
                         serde_json::to_value(denylist).map_err(|error| error.to_string())?,
                     );
-                value.as_object_mut().expect("ExtendedConfig serializes as object").insert(
-                    "__cockpit_settings_layer_id".into(), serde_json::Value::String(layer.layer_id));
+                value
+                    .as_object_mut()
+                    .expect("ExtendedConfig serializes as object")
+                    .insert(
+                        "__cockpit_settings_layer_id".into(),
+                        serde_json::Value::String(layer.layer_id),
+                    );
                 Ok((config, value, revision))
             }
             Ok(other) => Err(format!("unexpected settings snapshot response: {other:?}")),
@@ -206,8 +214,11 @@ fn apply_settings_patch_via_daemon(
         denylist,
     };
     let project_root = config_layer_request(path, project_root)?;
-    let layer_id = base.get("__cockpit_settings_layer_id").and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?.to_owned();
+    let layer_id = base
+        .get("__cockpit_settings_layer_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+        .to_owned();
     let expected_revision = revision.to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
@@ -250,9 +261,11 @@ pub(super) fn apply_typed_settings_document_edit(
         denylist,
     };
     let project_root = config_layer_request(path, project_root)?;
-    let layer_id = authority_base.get("__cockpit_settings_layer_id")
+    let layer_id = authority_base
+        .get("__cockpit_settings_layer_id")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?.to_owned();
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+        .to_owned();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await

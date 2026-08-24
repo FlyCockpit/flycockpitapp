@@ -8,11 +8,11 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::agents::{AgentDef, GoalSettingsOverride};
-use crate::assistants::{
-    CreateAssistantSpec, default_home_dir, spec_from_wizard,
-};
 #[cfg(test)]
-use crate::assistants::{AssistantConfig, assistant_definition_path, identity, markdown_content_hash};
+use crate::assistants::{
+    AssistantConfig, assistant_definition_path, identity, markdown_content_hash,
+};
+use crate::assistants::{CreateAssistantSpec, default_home_dir, spec_from_wizard};
 use crate::cli::{
     AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
     MediaAccountingCommand,
@@ -316,12 +316,9 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
         .client
         .request(delete_assistant_request(
             &args.name,
-            assistant
-                .definition_revision
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "assistant definition cannot be safely read; refusing delete"
-                ))?,
+            assistant.definition_revision.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("assistant definition cannot be safely read; refusing delete")
+            })?,
         ))
         .await
         .context("requesting assistant delete from daemon")?
@@ -500,8 +497,11 @@ mod tests {
             panic!("show/delete must resolve through GetAssistant");
         };
         assert_eq!(name, "helper-bot");
-        let Request::DeleteAssistant { name, expected_revision } =
-            delete_assistant_request("helper-bot", "rev-1") else {
+        let Request::DeleteAssistant {
+            name,
+            expected_revision,
+        } = delete_assistant_request("helper-bot", "rev-1")
+        else {
             panic!("delete must remove through DeleteAssistant");
         };
         assert_eq!(name, "helper-bot");

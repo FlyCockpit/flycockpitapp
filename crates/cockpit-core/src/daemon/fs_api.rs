@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -296,11 +296,12 @@ pub async fn get_extended_config_snapshot(
             let mut layers = Vec::new();
             let now = Instant::now();
             settings_capabilities()
-                .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
+                .lock()
+                .map_err(|_| internal("settings capability registry lock poisoned"))?
                 .retain(|_, cap| cap.expires_at > now);
             for (kind, target) in discovered_settings_layers(&root)? {
-                let guard = cockpit_config::config::hold_config_mutation_lock(&target)
-                    .map_err(internal)?;
+                let guard =
+                    cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
                 let (raw, identity) = read_optional_config(&target)?;
                 let revision = content_hash(&raw);
                 let mut config: cockpit_config::config::extended::ExtendedConfig =
@@ -323,21 +324,35 @@ pub async fn get_extended_config_snapshot(
                 let id = Uuid::new_v4();
                 drop(guard);
                 settings_capabilities()
-                    .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
-                    .insert(id, SettingsCapability {
-                    owner: owner.clone(), root: root.clone(), target: target.clone(),
-                    revision: revision.clone(), identity, denylist_ids, issued_at: now,
-                    expires_at: now + SETTINGS_CAPABILITY_TTL,
-                });
+                    .lock()
+                    .map_err(|_| internal("settings capability registry lock poisoned"))?
+                    .insert(
+                        id,
+                        SettingsCapability {
+                            owner: owner.clone(),
+                            root: root.clone(),
+                            target: target.clone(),
+                            revision: revision.clone(),
+                            identity,
+                            denylist_ids,
+                            issued_at: now,
+                            expires_at: now + SETTINGS_CAPABILITY_TTL,
+                        },
+                    );
                 enforce_settings_capability_caps(&owner)?;
                 layers.push(cockpit_proto::ExtendedConfigLayerSnapshot {
-                    layer_id: id.to_string(), kind,
-                    display_path: target.display().to_string(), config: Box::new(config),
-                    denylist, revision,
+                    layer_id: id.to_string(),
+                    kind,
+                    display_path: target.display().to_string(),
+                    config: Box::new(config),
+                    denylist,
+                    revision,
                 });
             }
-            Ok(Response::ExtendedConfigSnapshot { layers,
-                config_generation: crate::daemon::server::inventory::current_config_generation() })
+            Ok(Response::ExtendedConfigSnapshot {
+                layers,
+                config_generation: crate::daemon::server::inventory::current_config_generation(),
+            })
         }),
     )
     .await
@@ -492,28 +507,46 @@ async fn trusted_settings_root(
     Ok(root)
 }
 
-fn discovered_settings_layers(root: &Path) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
-    use cockpit_config::config::dirs::{ConfigDirKind as K, CONFIG_FILE};
+fn discovered_settings_layers(
+    root: &Path,
+) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
+    use cockpit_config::config::dirs::{CONFIG_FILE, ConfigDirKind as K};
     let mut layer_dirs = cockpit_config::config::dirs::discover_config_dirs(root);
     if let Some(home) = dirs::home_dir() {
-        layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::HomeXdg, path: home.join(".config/cockpit") });
-        layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::HomeDot, path: home.join(".cockpit") });
+        layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
+            kind: K::HomeXdg,
+            path: home.join(".config/cockpit"),
+        });
+        layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
+            kind: K::HomeDot,
+            path: home.join(".cockpit"),
+        });
     }
     layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
         kind: K::MachineLocal,
         path: cockpit_config::config::dirs::local_config_dir_for(root).map_err(internal)?,
     });
-    layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::Project, path: root.join(".cockpit") });
+    layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
+        kind: K::Project,
+        path: root.join(".cockpit"),
+    });
     let mut seen = std::collections::HashSet::new();
-    Ok(layer_dirs.into_iter().filter_map(|dir| {
-        let target = dir.path.join(CONFIG_FILE);
-        if !seen.insert(target.clone()) { return None; }
-        let kind = match dir.kind { K::HomeXdg => cockpit_proto::CockpitConfigLayer::HomeXdg,
-            K::HomeDot => cockpit_proto::CockpitConfigLayer::HomeDot,
-            K::MachineLocal => cockpit_proto::CockpitConfigLayer::MachineLocal,
-            K::Project => cockpit_proto::CockpitConfigLayer::Project };
-        Some((kind, target))
-    }).collect())
+    Ok(layer_dirs
+        .into_iter()
+        .filter_map(|dir| {
+            let target = dir.path.join(CONFIG_FILE);
+            if !seen.insert(target.clone()) {
+                return None;
+            }
+            let kind = match dir.kind {
+                K::HomeXdg => cockpit_proto::CockpitConfigLayer::HomeXdg,
+                K::HomeDot => cockpit_proto::CockpitConfigLayer::HomeDot,
+                K::MachineLocal => cockpit_proto::CockpitConfigLayer::MachineLocal,
+                K::Project => cockpit_proto::CockpitConfigLayer::Project,
+            };
+            Some((kind, target))
+        })
+        .collect())
 }
 
 fn read_optional_config(
@@ -525,31 +558,42 @@ fn read_optional_config(
     ),
     ErrorPayload,
 > {
-    Ok(match cockpit_config::config::read_config_file_nofollow_with_identity(target)
-        .map_err(internal)?
-    {
-        Some((bytes, identity)) => (bytes, Some(identity)),
-        None => (b"{}\n".to_vec(), None),
-    })
+    Ok(
+        match cockpit_config::config::read_config_file_nofollow_with_identity(target)
+            .map_err(internal)?
+        {
+            Some((bytes, identity)) => (bytes, Some(identity)),
+            None => (b"{}\n".to_vec(), None),
+        },
+    )
 }
 
 fn enforce_settings_capability_caps(owner: &str) -> Result<(), ErrorPayload> {
     let mut caps = settings_capabilities()
         .lock()
         .map_err(|_| internal("settings capability registry lock poisoned"))?;
-    while caps.values().filter(|cap| cap.owner == owner).count()
-        > SETTINGS_CAPABILITY_OWNER_CAP
-    {
+    while caps.values().filter(|cap| cap.owner == owner).count() > SETTINGS_CAPABILITY_OWNER_CAP {
         let oldest = caps
             .iter()
             .filter(|(_, cap)| cap.owner == owner)
             .min_by_key(|(_, cap)| cap.issued_at)
             .map(|(id, _)| *id);
-        if let Some(id) = oldest { caps.remove(&id); } else { break; }
+        if let Some(id) = oldest {
+            caps.remove(&id);
+        } else {
+            break;
+        }
     }
     while caps.len() > SETTINGS_CAPABILITY_GLOBAL_CAP {
-        let oldest = caps.iter().min_by_key(|(_, cap)| cap.issued_at).map(|(id, _)| *id);
-        if let Some(id) = oldest { caps.remove(&id); } else { break; }
+        let oldest = caps
+            .iter()
+            .min_by_key(|(_, cap)| cap.issued_at)
+            .map(|(id, _)| *id);
+        if let Some(id) = oldest {
+            caps.remove(&id);
+        } else {
+            break;
+        }
     }
     Ok(())
 }
@@ -571,11 +615,18 @@ fn merge_changed_known_value(
         return;
     }
     match (target, current, candidate) {
-        (serde_json::Value::Object(target), serde_json::Value::Object(current), serde_json::Value::Object(candidate)) => {
+        (
+            serde_json::Value::Object(target),
+            serde_json::Value::Object(current),
+            serde_json::Value::Object(candidate),
+        ) => {
             for (key, value) in candidate {
                 if let Some(current) = current.get(&key) {
                     merge_changed_known_value(
-                        target.entry(key).or_insert(serde_json::Value::Null), current, value);
+                        target.entry(key).or_insert(serde_json::Value::Null),
+                        current,
+                        value,
+                    );
                 }
             }
         }

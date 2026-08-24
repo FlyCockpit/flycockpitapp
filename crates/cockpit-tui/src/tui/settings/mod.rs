@@ -2603,13 +2603,10 @@ impl SettingsDialog {
         {
             s.cx.mcp_config = snapshot;
         }
-        #[cfg(not(test))]
-        if let Some(extended) =
-            daemon_extended_snapshot(s.active_project_root.as_deref().expect("picker root"))
-        {
-            s.cx.extended = extended;
-            s.cx.extended_warnings.clear();
-        }
+        // `open_with_config` already loaded the exact selected layer together
+        // with its opaque revision. Do not replace it with the layered
+        // effective projection here: doing so would materialize inherited
+        // values into this layer and detach `extended_base` from the revision.
         s
     }
 
@@ -4199,12 +4196,6 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
-}
-
-fn daemon_extended_snapshot(cwd: &std::path::Path) -> Option<ExtendedConfig> {
-    daemon_provider_view_snapshot(cwd, None)
-        .and_then(|config| config.extended_config_json)
-        .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
 fn daemon_mcp_snapshot(

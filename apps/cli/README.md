@@ -522,6 +522,11 @@ the daemon authenticates each connection by passing that descriptor, and the
 broker compares its root-owned inode before accepting any request. A manually
 or detach-launched daemon intentionally has no capability descriptor and
 rejects hooks before spawn with `descendant_containment_unsupported`.
+The broker keeps its root-owned listener for its full service lifetime and
+re-authenticates replacement daemon connections; the daemon refreshes broker
+readiness lazily after a broker restart. A lost authenticated connection kills
+and proves empty every generation owned by that connection before another
+daemon is accepted.
 
 The broker creates each cgroup and uses `clone3(CLONE_INTO_CGROUP)`. The child
 completes its private mount/cgroup namespace, read-only cgroup view,
@@ -531,12 +536,22 @@ set does it commit the operation and release `execve`. Disconnects and
 cancelled prepared operations are killed and proven empty. Operation status
 and terminal tombstones live in root-private broker state so restart recovery
 does not turn an ambiguous prepare or commit into a second launch.
+For the older containment API that does not request captured pipes, the daemon
+passes its exact stdin/stdout/stderr descriptors and inherited environment to
+the broker instead of silently substituting broker-service pipes or an empty
+environment. Terminal-record collection may use absence of a valid generation
+directory below the exclusively root-owned cgroup root as a persistent empty
+proof; a missing arbitrary or malformed path is never accepted as proof.
 
 Install the managed Linux deployment from an extracted release directory with
 `sudo apps/cli/scripts/install-linux-containment-broker.sh DAEMON_USER`. The
 installer creates the capability, installs the broker and daemon units, and
 enables `cockpit-daemon@UID.service`. Re-running it preserves the existing
 capability. Removing or replacing that file requires stopping both units first.
+Installation requires systemd 253 or newer for `OpenFile=`, validates units
+before mutation, stages replacements with atomic renames, stops legacy detached
+daemons, verifies both managed services are ready, and restores the prior files
+and service activity if the transaction fails.
 macOS and Windows still reject this combined primitive before spawn. The fake
 adapter exercises the lifecycle contract in tests; it is not a production
 fallback. Cockpit never spawns a hook first and attaches containment afterward.

@@ -406,7 +406,8 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
                 program: req.program,
                 args: req.args,
                 cwd: req.cwd,
-                env: Default::default(),
+                env: std::env::vars().collect(),
+                capture_io: false,
                 require_proven: req.require_proven,
             })
             .await?;

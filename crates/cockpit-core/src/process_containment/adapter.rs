@@ -46,6 +46,10 @@ pub struct NativeIoSpawnRequest {
     pub(crate) args: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) env: BTreeMap<String, String>,
+    /// Capture returns private pipes to the caller. The non-I/O containment
+    /// API sets this false to preserve the native command contract: inherited
+    /// environment and the daemon's exact stdio descriptors.
+    pub(crate) capture_io: bool,
     pub(crate) require_proven: bool,
 }
 
@@ -58,6 +62,7 @@ impl std::fmt::Debug for NativeIoSpawnRequest {
             .field("generation", &self.generation)
             .field("argv_count", &self.args.len().saturating_add(1))
             .field("environment_key_count", &self.env.len())
+            .field("capture_io", &self.capture_io)
             .field("require_proven", &self.require_proven)
             .finish_non_exhaustive()
     }

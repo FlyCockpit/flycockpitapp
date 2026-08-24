@@ -2,7 +2,7 @@
 Description=FlyCockpit privileged descendant containment broker for UID %i
 Documentation=https://docs.flycockpit.com/
 After=local-fs.target
-Before=cockpit-daemon.service
+Before=cockpit-daemon@%i.service
 ConditionPathIsMountPoint=/sys/fs/cgroup
 
 [Service]
@@ -36,7 +36,7 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX
 RestrictRealtime=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN
 AmbientCapabilities=
 Restart=always
 RestartSec=1s

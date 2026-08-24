@@ -1596,6 +1596,7 @@ async fn prepare_native_with_io(
             args,
             cwd,
             env,
+            capture_io: true,
             require_proven,
         },
         cancellation,

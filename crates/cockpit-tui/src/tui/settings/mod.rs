@@ -134,11 +134,10 @@ fn run_settings_daemon<T>(
     Err("settings daemon RPC requires the application runtime".to_string())
 }
 
-fn write_settings_text_via_daemon(
+fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
-    content: String,
-) -> Result<(), String> {
+) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
     let (root, relative) = project_root
         .filter(|root| path.starts_with(root))
         .and_then(|root| {
@@ -152,34 +151,158 @@ fn write_settings_text_via_daemon(
                     .map(|name| (root, std::path::Path::new(name)))
             })
         })
-        .ok_or_else(|| "settings write target has no parent".to_string())?;
+        .ok_or_else(|| "settings snapshot target has no parent".to_string())?;
     let project_root = root.display().to_string();
-    let relative = relative.display().to_string();
-    // The daemon owns the target and performs the freshness check. The TUI
-    // must not read config.json merely to compute a hash: legacy layers can
-    // contain literal secrets before daemon redaction.
-    let base_hash = None;
+    let path = relative.display().to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
             .map_err(|error| error.to_string())?;
         match client
-            .request(Request::SaveExtendedConfig {
+            .request(Request::GetExtendedConfigSnapshot { project_root, path })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Ok(Response::ExtendedConfigSnapshot {
+                config_json,
+                revision,
+                ..
+            }) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&config_json).map_err(|error| error.to_string())?;
+                let config =
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                Ok((config, value, revision))
+            }
+            Ok(other) => Err(format!("unexpected settings snapshot response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
+fn apply_settings_patch_via_daemon(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    base: &serde_json::Value,
+    desired: &ExtendedConfig,
+    revision: &str,
+) -> Result<(), String> {
+    let desired = serde_json::to_value(desired).map_err(|error| error.to_string())?;
+    let patch = json_merge_diff(base, &desired).unwrap_or_else(|| serde_json::json!({}));
+    let patch_json = serde_json::to_string(&patch).map_err(|error| error.to_string())?;
+    let (root, relative) = project_root
+        .filter(|root| path.starts_with(root))
+        .and_then(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| (root, relative))
+        })
+        .or_else(|| {
+            path.parent().and_then(|root| {
+                path.file_name()
+                    .map(|name| (root, std::path::Path::new(name)))
+            })
+        })
+        .ok_or_else(|| "settings patch target has no parent".to_string())?;
+    let project_root = root.display().to_string();
+    let path = relative.display().to_string();
+    let expected_revision = revision.to_string();
+    run_settings_daemon(async move {
+        let client = settings_daemon_client()
+            .await
+            .map_err(|error| error.to_string())?;
+        match client
+            .request(Request::ApplyExtendedConfigPatch {
                 project_root,
-                path: relative,
-                content,
-                base_hash,
+                path,
+                patch_json,
+                expected_revision,
             })
             .await
             .map_err(|error| error.to_string())?
         {
             Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
-            Ok(other) => Err(format!(
-                "unexpected settings file-write response: {other:?}"
-            )),
+            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
             Err(error) => Err(error.to_string()),
         }
     })
+}
+
+pub(super) fn apply_raw_settings_patch_via_daemon(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    patch: serde_json::Value,
+) -> Result<(), String> {
+    let (_, _, revision) = extended_config_layer_snapshot(path, project_root)?;
+    let (root, relative) = project_root
+        .filter(|root| path.starts_with(root))
+        .and_then(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| (root, relative))
+        })
+        .or_else(|| {
+            path.parent().and_then(|root| {
+                path.file_name()
+                    .map(|name| (root, std::path::Path::new(name)))
+            })
+        })
+        .ok_or_else(|| "settings patch target has no parent".to_string())?;
+    let project_root = root.display().to_string();
+    let path = relative.display().to_string();
+    let patch_json = serde_json::to_string(&patch).map_err(|error| error.to_string())?;
+    run_settings_daemon(async move {
+        let client = settings_daemon_client()
+            .await
+            .map_err(|error| error.to_string())?;
+        match client
+            .request(Request::ApplyExtendedConfigPatch {
+                project_root,
+                path,
+                patch_json,
+                expected_revision: revision,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
+            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
+fn json_merge_diff(
+    base: &serde_json::Value,
+    desired: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if base == desired {
+        return None;
+    }
+    match (base, desired) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(desired)) => {
+            let mut patch = serde_json::Map::new();
+            for key in base.keys() {
+                if !desired.contains_key(key) {
+                    patch.insert(key.clone(), serde_json::Value::Null);
+                }
+            }
+            for (key, desired_value) in desired {
+                match base.get(key) {
+                    Some(base_value) => {
+                        if let Some(value) = json_merge_diff(base_value, desired_value) {
+                            patch.insert(key.clone(), value);
+                        }
+                    }
+                    None => {
+                        patch.insert(key.clone(), desired_value.clone());
+                    }
+                }
+            }
+            (!patch.is_empty()).then_some(serde_json::Value::Object(patch))
+        }
+        _ => Some(desired.clone()),
+    }
 }
 
 /// Search the complete metadata-only secret inventory.  Inventory pages are
@@ -722,6 +845,11 @@ pub struct SettingsCx {
     /// Cached cockpit-only `config.json` state. Read by the UI page and the
     /// Tools page; written back on each edit.
     pub(super) extended: ExtendedConfig,
+    /// Safe daemon snapshot used to calculate a minimal typed merge patch.
+    extended_base: serde_json::Value,
+    /// Opaque revision of the raw authoritative layer corresponding to
+    /// `extended_base`.
+    extended_revision: Option<String>,
     /// Malformed known extended-config fields skipped during the most
     /// recent load. Unknown raw keys are preserved separately by
     /// [`ExtendedConfigDoc`].
@@ -2377,10 +2505,18 @@ impl SettingsDialog {
             .map(|d| d.config_with_warnings())
             .unwrap_or_default();
         #[cfg(not(test))]
-        let (extended, extended_warnings) = config_cwd(&extended_path)
-            .and_then(|cwd| daemon_extended_snapshot(&cwd))
-            .map(|config| (config, Vec::new()))
-            .unwrap_or_default();
+        let (extended, extended_base, extended_revision, extended_warnings) =
+            extended_config_layer_snapshot(&extended_path, None)
+                .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
+                .unwrap_or_else(|_| {
+                    let config = ExtendedConfig::default();
+                    let value = serde_json::to_value(&config).unwrap_or_default();
+                    (config, value, None, Vec::new())
+                });
+        #[cfg(test)]
+        let extended_base = serde_json::to_value(&extended).unwrap_or_default();
+        #[cfg(test)]
+        let extended_revision = None;
         // Fresh install (no config at this location yet): seed the
         // skills scan-dir list with the defaults so they show as ordinary
         // editable rows. Materialization-only — an existing config whose
@@ -2404,6 +2540,8 @@ impl SettingsDialog {
                 original_config: config.clone(),
                 config,
                 extended,
+                extended_base,
+                extended_revision,
                 extended_warnings,
                 mcp_config,
                 picker_cwd: None,
@@ -2485,10 +2623,15 @@ impl SettingsDialog {
             self.extended_warnings = warnings;
         }
         #[cfg(not(test))]
-        if let Some(extended) =
-            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
-        {
+        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+        ) {
             self.extended = extended;
+            self.extended_base = base;
+            self.extended_revision = Some(revision);
             self.extended_warnings.clear();
         }
     }
@@ -2503,13 +2646,21 @@ impl SettingsDialog {
             doc.write(&self.extended).map_err(|e| e.to_string())?;
         }
         #[cfg(not(test))]
-        write_settings_text_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
-        )?;
+        {
+            let revision = self.extended_revision.as_deref().ok_or_else(|| {
+                "settings snapshot has no revision; reload before saving".to_string()
+            })?;
+            apply_settings_patch_via_daemon(
+                &self.extended_path,
+                self.active_project_root
+                    .as_deref()
+                    .or(self.picker_cwd.as_deref()),
+                &self.extended_base,
+                &self.extended,
+                revision,
+            )?;
+            self.reload_extended();
+        }
         Ok(())
     }
 
@@ -3661,10 +3812,15 @@ impl SettingsCx {
             self.extended_warnings = warnings;
         }
         #[cfg(not(test))]
-        if let Some(extended) =
-            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
-        {
+        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+        ) {
             self.extended = extended;
+            self.extended_base = base;
+            self.extended_revision = Some(revision);
             self.extended_warnings.clear();
         }
     }
@@ -3678,13 +3834,21 @@ impl SettingsCx {
             doc.write(&self.extended).map_err(|e| e.to_string())?;
         }
         #[cfg(not(test))]
-        write_settings_text_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
-        )?;
+        {
+            let revision = self.extended_revision.as_deref().ok_or_else(|| {
+                "settings snapshot has no revision; reload before saving".to_string()
+            })?;
+            apply_settings_patch_via_daemon(
+                &self.extended_path,
+                self.active_project_root
+                    .as_deref()
+                    .or(self.picker_cwd.as_deref()),
+                &self.extended_base,
+                &self.extended,
+                revision,
+            )?;
+            self.reload_extended();
+        }
         Ok(())
     }
 
@@ -4929,10 +5093,10 @@ fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
     #[cfg(not(test))]
     {
         let config_path = dir.join(CONFIG_FILE);
-        write_settings_text_via_daemon(
+        apply_raw_settings_patch_via_daemon(
             &config_path,
             None,
-            "{\n  \"agents\": {},\n  \"tools\": {}\n}\n".to_string(),
+            serde_json::json!({ "agents": {}, "tools": {} }),
         )?;
         Ok(config_path)
     }

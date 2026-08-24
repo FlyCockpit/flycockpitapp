@@ -10,16 +10,18 @@ use std::collections::BTreeMap;
 #[test]
 fn settings_config_mutations_stay_daemon_owned() {
     let source = include_str!("mod.rs");
-    // Every settings config mutation funnels through the daemon's owned
-    // save RPC via `write_settings_text_via_daemon`.
+    // Every settings config mutation funnels through the daemon's revisioned
+    // typed merge-patch RPC.
     assert!(
-        source.contains("Request::SaveExtendedConfig"),
-        "settings must issue the daemon-owned config-save RPC"
+        source.contains("Request::ApplyExtendedConfigPatch"),
+        "settings must issue the daemon-owned config-patch RPC"
     );
     assert!(
-        source.contains("write_settings_text_via_daemon"),
-        "settings writes must route through the daemon helper"
+        source.contains("apply_settings_patch_via_daemon"),
+        "settings writes must route through the revisioned patch helper"
     );
+    assert!(!source.contains("Request::SaveExtendedConfig"));
+    assert!(!source.contains("base_hash = None"));
     // The retired local-save helper must be gone entirely.
     assert!(!source.contains("remove_raw_path_and_save"));
     // Direct local config writes / directory scaffolding survive only as

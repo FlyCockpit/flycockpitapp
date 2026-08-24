@@ -3493,6 +3493,7 @@ fn remove_project_shadow_path(
     project_config: &std::path::Path,
     path: &[&str],
 ) -> Result<bool, String> {
+    #[cfg(test)]
     let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(project_config)
         .map_err(|e| e.to_string())?;
     #[cfg(test)]
@@ -3502,13 +3503,15 @@ fn remove_project_shadow_path(
     }
     #[cfg(not(test))]
     {
-        let (removed, rendered) = doc
-            .remove_raw_path_rendered(path)
-            .map_err(|e| e.to_string())?;
-        if removed {
-            super::write_settings_text_via_daemon(project_config, None, rendered)?;
+        let Some((last, parents)) = path.split_last() else {
+            return Ok(false);
+        };
+        let mut patch = serde_json::json!({ (last): null });
+        for parent in parents.iter().rev() {
+            patch = serde_json::json!({ (parent): patch });
         }
-        Ok(removed)
+        super::apply_raw_settings_patch_via_daemon(project_config, None, patch)?;
+        Ok(true)
     }
 }
 

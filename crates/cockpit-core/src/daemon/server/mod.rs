@@ -4998,6 +4998,7 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
             id,
             after_event_seq,
@@ -5079,6 +5080,7 @@ async fn handle_envelope(
             };
             let _ = send_writer_envelope(writer_tx, envelope).await;
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
             id,
             delivery_id,
@@ -5138,6 +5140,7 @@ async fn handle_envelope(
             )
             .await;
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
         | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
             tracing::warn!(%id, "client sent a replay response; ignoring");
@@ -5313,9 +5316,13 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(_) => "replay_request",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayResponse(_) => "replay_response",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAck(_) => "replay_ack",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAckResponse(_) => "replay_ack_response",
         Body::Unknown => "unknown",
     }

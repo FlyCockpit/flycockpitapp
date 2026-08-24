@@ -149,7 +149,7 @@ fn decode_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteAuditUploadSt
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
 

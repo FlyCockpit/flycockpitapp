@@ -410,6 +410,7 @@ async fn run_io(
                             Body::Request { id, request, .. } => {
                                 tracing::warn!(id = %id, ?request, "daemon sent a request to a client; ignoring");
                             }
+                            #[cfg(feature = "remote")]
                             Body::RemoteReplayRequest(_)
                             | Body::RemoteReplayResponse(_)
                             | Body::RemoteReplayAck(_)

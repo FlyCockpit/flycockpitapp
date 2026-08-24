@@ -806,10 +806,8 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
             .context("setting SQLite durability policy")?;
         // `pragma_update` doesn't accept the kind of literal that
         // `journal_mode = WAL` needs; the query-row form does. The
-        // return value is the resolved mode — we don't use it but a
-        // non-`wal` result on a file DB would mean WAL is unavailable
-        // (older SQLite, exotic FS), which is fine to silently fall
-        // back to.
+        // return value is the resolved mode. A non-WAL result fails closed:
+        // the read-pool and durability contracts rely on WAL semantics.
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))
             .context("enabling WAL")?;

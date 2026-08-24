@@ -530,7 +530,7 @@ fn response_hint(body: &str) -> String {
     format!("JSON object with keys: {}", keys.join(", "))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     #![allow(deprecated)]
 

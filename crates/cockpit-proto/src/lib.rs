@@ -1287,18 +1287,23 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_req")]
     RemoteReplayRequest(RemoteReplayRequestV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_res")]
     RemoteReplayResponse(RemoteReplayResponseV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack")]
     RemoteReplayAck(RemoteReplayAckV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack_res")]
     RemoteReplayAckResponse(RemoteReplayAckResponseV2),
     #[serde(other)]
     Unknown,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayRequestV2 {
@@ -1308,6 +1313,7 @@ pub struct RemoteReplayRequestV2 {
     pub limit: RemoteReplayLimit,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayResponseV2 {
@@ -1316,6 +1322,7 @@ pub struct RemoteReplayResponseV2 {
     pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckV2 {
@@ -1324,6 +1331,7 @@ pub struct RemoteReplayAckV2 {
     pub lease_token: CanonicalRfcUuidV1,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckResponseV2 {
@@ -1331,6 +1339,7 @@ pub struct RemoteReplayAckResponseV2 {
     pub acked: bool,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOutboxDeliveryV1 {
@@ -1342,9 +1351,11 @@ pub struct RemoteOutboxDeliveryV1 {
     pub lease_expires_at_ms: i64,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalRfcUuidV1(Uuid);
 
+#[cfg(feature = "remote")]
 impl CanonicalRfcUuidV1 {
     pub fn new(value: Uuid) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -1358,6 +1369,7 @@ impl CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl Serialize for CanonicalRfcUuidV1 {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -1367,6 +1379,7 @@ impl Serialize for CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -1382,9 +1395,11 @@ impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RemoteReplayLimit(u16);
 
+#[cfg(feature = "remote")]
 impl RemoteReplayLimit {
     pub fn new(value: u16) -> anyhow::Result<Self> {
         anyhow::ensure!((1..=256).contains(&value), "replay limit must be 1..=256");
@@ -1395,6 +1410,7 @@ impl RemoteReplayLimit {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for RemoteReplayLimit {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -2998,12 +3014,13 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
             (version, tag)
         }
         Body::Event { event } => (9, event.wire_tag()),
-        Body::Error { .. }
-        | Body::RemoteReplayRequest(_)
+        Body::Error { .. } => (9, "unknown"),
+        #[cfg(feature = "remote")]
+        Body::RemoteReplayRequest(_)
         | Body::RemoteReplayResponse(_)
         | Body::RemoteReplayAck(_)
-        | Body::RemoteReplayAckResponse(_)
-        | Body::Unknown => (9, "unknown"),
+        | Body::RemoteReplayAckResponse(_) => (9, "unknown"),
+        Body::Unknown => (9, "unknown"),
     }
 }
 
@@ -3266,6 +3283,7 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(_)
         | Body::RemoteReplayResponse(_)
         | Body::RemoteReplayAck(_)

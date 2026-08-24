@@ -1565,7 +1565,7 @@ fn reservation(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
 

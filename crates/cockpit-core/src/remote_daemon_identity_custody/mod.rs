@@ -863,5 +863,5 @@ impl<A: DaemonCustodyAdapter> RemoteIdentityCustodyProvider for DaemonIdentityCu
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests;

@@ -308,7 +308,7 @@ fn decode_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrgSyncState> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
     use serde_json::json;

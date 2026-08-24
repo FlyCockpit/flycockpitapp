@@ -18,7 +18,7 @@ use base64::Engine;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef;
+use cockpit_core::daemon::proto::bulk_transfer::BulkTransferRef;
 use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response, SessionSummary};
 
 use crate::cli::ExportArgs;
@@ -193,7 +193,7 @@ fn resolve_from_summaries(
 /// SHA-256 so a truncated or corrupted download never lands on disk.
 async fn download_export(
     client: &DaemonClient,
-    transfer: &RemoteBulkTransferRef,
+    transfer: &BulkTransferRef,
     raw: bool,
 ) -> Result<Vec<u8>> {
     let expected_len = transfer.total_length_value();

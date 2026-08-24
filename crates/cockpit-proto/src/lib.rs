@@ -37,6 +37,7 @@ pub use agent_installation::{
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 pub mod host_capabilities;
+pub mod bulk_transfer;
 pub mod image_control;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,

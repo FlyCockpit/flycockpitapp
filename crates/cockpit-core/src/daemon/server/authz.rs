@@ -464,6 +464,7 @@ pub(super) async fn require_remote_target_session_writer(
     }
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_session_id_value {
     ($state:expr, none) => {
         None
@@ -479,6 +480,7 @@ macro_rules! command_session_id_value {
     };
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_request_session_id_match {
     (($request:ident, $state:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
@@ -487,11 +489,13 @@ macro_rules! command_request_session_id_match {
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn request_session_id(request: &Request, state: &MutableClientState) -> Option<Uuid> {
     proto::command!(command_request_session_id_match, request, state)
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_audit_path_value {
     (none) => {
         None
@@ -504,6 +508,7 @@ macro_rules! command_audit_path_value {
     };
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_request_audit_path_match {
     (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
@@ -512,11 +517,13 @@ macro_rules! command_request_audit_path_match {
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn request_audit_path(request: &Request) -> Option<String> {
     proto::command!(command_request_audit_path_match, request)
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_is_remote_mutating_match {
     (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
@@ -525,6 +532,7 @@ macro_rules! command_is_remote_mutating_match {
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn is_remote_mutating_request(request: &Request) -> bool {
     proto::command!(command_is_remote_mutating_match, request)

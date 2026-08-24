@@ -2328,10 +2328,15 @@ async fn handle_serialized_request_impl(
             .await
             .map_err(internal)?;
     }
+    #[cfg(feature = "remote")]
     let request_kind = principal::request_kind(&request);
+    #[cfg(feature = "remote")]
     let audit_session_id = request_session_id(&request, state);
+    #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
+    #[cfg(feature = "remote")]
     let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
+    #[cfg(feature = "remote")]
     let authorized_request = match authorize_request_context(&request, state, ctx).await {
         Ok(authorized) => authorized,
         Err(error) => {
@@ -2367,6 +2372,11 @@ async fn handle_serialized_request_impl(
             return Err(error);
         }
     };
+    #[cfg(not(feature = "remote"))]
+    if let Err(error) = authorize_request_context(&request, state, ctx).await {
+        return Err(error);
+    }
+    #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
             ctx,
@@ -2633,6 +2643,10 @@ async fn handle_serialized_request_impl(
                 }
                 Ok(Response::RunInvocationCancelResult { result })
             } else {
+                run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
+            }
+            #[cfg(not(feature = "remote"))]
+            {
                 run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
             }
         }
@@ -9101,10 +9115,14 @@ async fn handle_concurrent_request_impl(
         );
     }
     validate_request_semantics(&request)?;
+    #[cfg(feature = "remote")]
     let request_kind = principal::request_kind(&request);
+    #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
+    #[cfg(feature = "remote")]
     let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
     if let Err(error) = authorize_request_shared(&request, &shared, &ctx).await {
+        #[cfg(feature = "remote")]
         if audit_remote {
             audit_remote_request(
                 &ctx,
@@ -9118,6 +9136,7 @@ async fn handle_concurrent_request_impl(
         }
         return Err(error);
     }
+    #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
             &ctx,

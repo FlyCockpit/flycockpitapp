@@ -163,13 +163,13 @@ pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
     Ok(
-        files::read_file_nofollow_with_identity(path, true, true)?.map(|(file, bytes, identity)| {
-            VerifiedTerminalIngressFile {
+        files::read_file_nofollow_with_identity(path, true, true)?.map(
+            |(file, bytes, identity)| VerifiedTerminalIngressFile {
                 file,
                 bytes,
                 identity,
-            }
-        }),
+            },
+        ),
     )
 }
 
@@ -177,6 +177,17 @@ pub fn hold_terminal_ingress_file_verified(
 /// retained-parent platform primitive.
 pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
     files::remove_file_nofollow(path)
+}
+
+/// Move an authority-bearing regular file between two retained, no-follow
+/// parent directory handles. Both parent identities are fixed before the
+/// source name is resolved, so a concurrent pathname-component replacement
+/// cannot redirect the move.
+pub fn rename_config_file_nofollow(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    files::rename_file_nofollow(source, destination)
 }
 
 #[cfg(all(test, unix))]

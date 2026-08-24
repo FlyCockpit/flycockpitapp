@@ -20,7 +20,6 @@ struct EditorLeaseState {
     root: PathBuf,
     name: String,
     revision: String,
-    created_at: Instant,
     expires_at: Instant,
 }
 
@@ -103,13 +102,13 @@ pub async fn begin_editor_lease(
     let mut leases = editor_leases().lock().map_err(lock_poison)?;
     let now = Instant::now();
     leases.retain(|_, lease| lease.expires_at > now);
-    if leases.len() >= MAX_EDITOR_LEASES
-        && let Some(oldest) = leases
-            .iter()
-            .min_by_key(|(_, lease)| lease.created_at)
-            .map(|(id, _)| *id)
-    {
-        leases.remove(&oldest);
+    if leases.len() >= MAX_EDITOR_LEASES {
+        return Err(ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message:
+                "agent editor lease capacity is exhausted; complete or cancel an existing lease"
+                    .into(),
+        });
     }
     leases.insert(
         lease_id,
@@ -118,7 +117,6 @@ pub async fn begin_editor_lease(
             root,
             name,
             revision: expected_revision,
-            created_at: now,
             expires_at: now + EDITOR_LEASE_TTL,
         },
     );
@@ -158,7 +156,7 @@ pub async fn complete_editor_lease(
     if lease.principal_digest != principal_digest {
         reinsert_editor_lease(id, lease)?;
         return Err(ErrorPayload {
-            code: ErrorCode::PermissionDenied,
+            code: ErrorCode::Authorization,
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
@@ -215,12 +213,12 @@ async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorP
     let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
         .await
         .map_err(|error| ErrorPayload {
-            code: ErrorCode::PermissionDenied,
+            code: ErrorCode::WorkspaceTrust,
             message: format!("workspace trust is required for agent management: {error:#}"),
         })?;
     if policy.mode != crate::db::workspace_trust::WorkspaceTrustMode::Trust {
         return Err(ErrorPayload {
-            code: ErrorCode::PermissionDenied,
+            code: ErrorCode::WorkspaceTrust,
             message: "agent management requires a trusted workspace".into(),
         });
     }
@@ -653,12 +651,17 @@ fn reset_journal_path(root: &Path) -> PathBuf {
     root.join(".cockpit/agent-reset-all.journal.json")
 }
 
-fn validated_reset_journal(root: &Path, raw: &[u8]) -> Result<(ResetAllJournal, PathBuf), ErrorPayload> {
+fn validated_reset_journal(
+    root: &Path,
+    raw: &[u8],
+) -> Result<(ResetAllJournal, PathBuf), ErrorPayload> {
     let journal: ResetAllJournal = serde_json::from_slice(raw).map_err(bad_config)?;
     let operation_id = Uuid::parse_str(&journal.operation_id)
         .map_err(|_| bad_request("agent reset journal has an invalid operation ID"))?;
     if operation_id.to_string() != journal.operation_id {
-        return Err(bad_request("agent reset journal operation ID is not canonical"));
+        return Err(bad_request(
+            "agent reset journal operation ID is not canonical",
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     for name in &journal.entries {
@@ -710,20 +713,31 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                 let staged_exists = nofollow_read(&staged)?.is_some();
                 let target_exists = nofollow_read(&target)?.is_some();
                 match (staged_exists, target_exists) {
-                    (true, false) => std::fs::rename(&staged, &target).map_err(internal)?,
+                    (true, false) => {
+                        cockpit_config::config::rename_config_file_nofollow(&staged, &target)
+                            .map_err(internal)?
+                    }
                     // This entry was not staged yet, or an earlier recovery
                     // pass already restored it.
                     (false, true) => {}
-                    (true, true) => return Err(conflict(
-                        "agent reset rollback found both staged and authoritative files",
-                    )),
-                    (false, false) => return Err(conflict(
-                        "agent reset rollback found neither staged nor authoritative file",
-                    )),
+                    (true, true) => {
+                        return Err(conflict(
+                            "agent reset rollback found both staged and authoritative files",
+                        ));
+                    }
+                    (false, false) => {
+                        return Err(conflict(
+                            "agent reset rollback found neither staged nor authoritative file",
+                        ));
+                    }
                 }
             }
-            if agents_dir.is_dir() { sync_dir(&agents_dir)?; }
-            if trash.is_dir() { sync_dir(&trash)?; }
+            if agents_dir.is_dir() {
+                sync_dir(&agents_dir)?;
+            }
+            if trash.is_dir() {
+                sync_dir(&trash)?;
+            }
         }
         ResetAllPhase::Committed => {
             for name in &journal.entries {
@@ -738,12 +752,16 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                     (false, false) => {}
                     // Once committed, an authoritative target is unexpected;
                     // never bless or delete it because it may be newer data.
-                    (_, true) => return Err(conflict(
-                        "committed agent reset found an unexpected authoritative file",
-                    )),
+                    (_, true) => {
+                        return Err(conflict(
+                            "committed agent reset found an unexpected authoritative file",
+                        ));
+                    }
                 }
             }
-            if trash.is_dir() { sync_dir(&trash)?; }
+            if trash.is_dir() {
+                sync_dir(&trash)?;
+            }
         }
     }
     cockpit_config::config::remove_config_file_atomic(&journal_path).map_err(internal)?;
@@ -780,7 +798,7 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
             .map_err(internal)?;
         if policy.mode != crate::db::workspace_trust::WorkspaceTrustMode::Trust {
             return Err(ErrorPayload {
-                code: ErrorCode::PermissionDenied,
+                code: ErrorCode::WorkspaceTrust,
                 message: format!(
                     "refusing agent reset recovery for untrusted historical root {}",
                     root.display()
@@ -805,7 +823,9 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
 fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     recover_reset_all(root)?;
     let operation_id = Uuid::new_v4();
-    let trash = root.join(".cockpit/.agent-reset-trash").join(operation_id.to_string());
+    let trash = root
+        .join(".cockpit/.agent-reset-trash")
+        .join(operation_id.to_string());
     let mut entries = Vec::new();
     for name in crate::agents::BUILTIN_AGENT_NAMES {
         let target = project_agent_path(root, name)?;
@@ -822,6 +842,12 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
         return Err(bad_request("agent reset trash root is a symlink"));
     }
     std::fs::create_dir_all(&trash).map_err(internal)?;
+    // The prepared journal may refer to this staging directory immediately
+    // after publication, so persist both the directory itself and its parent
+    // first. Recovery must never observe a durable journal naming a directory
+    // that existed only in volatile metadata.
+    sync_dir(&trash)?;
+    sync_dir(trash.parent().expect("trash operation has parent"))?;
     let journal = ResetAllJournal {
         operation_id: operation_id.to_string(),
         phase: ResetAllPhase::Prepared,
@@ -835,7 +861,7 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     for name in &journal.entries {
         let source = project_agent_path(root, name)?;
         let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = std::fs::rename(&source, &staged) {
+        if let Err(error) = cockpit_config::config::rename_config_file_nofollow(&source, &staged) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
             let _ = recover_reset_all(root);
@@ -846,7 +872,10 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     sync_dir(&trash)?;
     // The committed marker is the linearization point. Recovery before it
     // restores staged files; recovery after it finishes deletion.
-    let committed = ResetAllJournal { phase: ResetAllPhase::Committed, ..journal };
+    let committed = ResetAllJournal {
+        phase: ResetAllPhase::Committed,
+        ..journal
+    };
     let encoded = serde_json::to_vec_pretty(&committed).map_err(internal)?;
     cockpit_config::config::write_config_bytes_atomic(&reset_journal_path(root), &encoded)
         .map_err(internal)?;

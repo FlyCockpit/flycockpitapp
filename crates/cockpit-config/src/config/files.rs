@@ -1659,6 +1659,79 @@ pub(crate) fn remove_file_nofollow(path: &Path) -> Result<()> {
     prepare_file_removal(path)?.commit()
 }
 
+pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let (source_parent, source_name) = open_parent_directory_nofollow(source)?;
+        let (destination_parent, destination_name) = open_parent_directory_nofollow(destination)?;
+        let source_name_c = path_component_cstring(&source_name)?;
+        let destination_name_c = path_component_cstring(&destination_name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained parent descriptor and component string remain
+        // live; AT_SYMLINK_NOFOLLOW makes this an entry-kind proof.
+        let stated = unsafe {
+            libc::fstatat(
+                source_parent.as_raw_fd(),
+                source_name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stated != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("stating rename source {}", source.display()));
+        }
+        // SAFETY: fstatat initialized the record on success.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!(
+                "refusing to rename non-regular config file {}",
+                source.display()
+            );
+        }
+        // SAFETY: both retained directory descriptors and both component
+        // strings remain live for the call.
+        let renamed = unsafe {
+            libc::renameat(
+                source_parent.as_raw_fd(),
+                source_name_c.as_ptr(),
+                destination_parent.as_raw_fd(),
+                destination_name_c.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("renaming {} to {}", source.display(), destination.display())
+            });
+        }
+        source_parent.sync_all()?;
+        destination_parent.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let (source_parent, source_name) = open_windows_parent_directory_nofollow(source, false)?;
+        let source_file = open_windows_child_nofollow(&source_parent, &source_name, false, true)
+            .with_context(|| format!("opening rename source {}", source.display()))?;
+        reject_windows_reparse_handle(&source_file, source)?;
+        let (destination_parent, destination_name) =
+            open_windows_parent_directory_for_rename_nofollow(destination, false)?;
+        rename_open_file_on_windows(&source_file, &destination_parent, &destination_name, false)
+            .with_context(|| {
+                format!("renaming {} to {}", source.display(), destination.display())
+            })?;
+        source_parent.sync_all()?;
+        destination_parent.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (source, destination);
+        anyhow::bail!("identity-bound config rename is unsupported on this platform")
+    }
+}
+
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     prepare_atomic_write(path, contents)?.commit()
 }

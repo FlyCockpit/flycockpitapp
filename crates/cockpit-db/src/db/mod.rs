@@ -674,6 +674,41 @@ impl Db {
         }
     }
 
+    /// Run a writer job to completion from an already-blocking authority
+    /// coordinator.
+    ///
+    /// This is intentionally synchronous: callers use it while holding
+    /// thread-affine filesystem locks whose guards must never cross an
+    /// `.await`. Normal async application paths should use [`Self::write`].
+    pub fn write_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit writes");
+        }
+        if let Some(writer) = &self.writer {
+            let rx = writer.submit(f)?;
+            let boxed = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("db writer reply dropped"))??;
+            boxed
+                .downcast::<T>()
+                .map(|value| *value)
+                .map_err(|_| anyhow::anyhow!("db writer returned unexpected result type"))
+        } else {
+            let inner = self
+                .memory
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("db has no in-memory connection"))?;
+            let guard = inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            f(&guard)
+        }
+    }
+
     /// Execute an atomic write transaction on the writer connection.
     ///
     /// Use this instead of composing multiple async accessors when the

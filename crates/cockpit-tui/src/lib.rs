@@ -17,6 +17,15 @@
 //! the lower crates do not depend on `cockpit-tui` or `cockpit-cli`. A
 //! discovered inversion is fixed by moving the symbol to its correct crate,
 //! never by a shim or a circular dev-dependency.
+//!
+//! Durable authority belongs to the daemon. The TUI may keep drafts and may
+//! write only explicitly inventoried host-presentation artifacts: clipboard
+//! recovery files, user-selected export destinations, and isolated external-
+//! editor staging files. Agent/config discovery, validation, revisions and
+//! commits cross typed daemon RPCs; a staging pathname is never an authority
+//! capability. `tui_db_boundary` audits every production filesystem mutation
+//! as an exact source-line exception so adding authority cannot hide behind a
+//! whole-file allowlist.
 
 pub mod banner;
 pub mod clipboard;

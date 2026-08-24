@@ -189,7 +189,10 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "tokio::fs::write(",
         "tokio::fs::remove_file(",
     ];
-    const ALLOWED: &[(&str, &str)] = &[
+    // Every exception is a single reviewed source line, not a whole-file
+    // exemption. Adding a second mutation in an allowed host-integration file
+    // must therefore update this inventory explicitly.
+    const ALLOWED_LINES: &[(&str, &str)] = &[
         (
             "crates/cockpit-tui/src/tui/settings/agents_page.rs",
             "std::fs::write(&staging.path, text)",
@@ -198,10 +201,30 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             "crates/cockpit-tui/src/tui/app/panes.rs",
             "std::fs::write(&path, effect.text_before_launch)",
         ),
-        ("crates/cockpit-tui/src/tui/async_action.rs", ""),
-        ("crates/cockpit-tui/src/tui/app/export_actions.rs", ""),
-        ("crates/cockpit-tui/src/clipboard/recovery/unix.rs", ""),
-        ("crates/cockpit-tui/src/clipboard/recovery/windows.rs", ""),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            "std::fs::create_dir_all(&dir)?",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            "let mut file = std::fs::OpenOptions::new()",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            "match tokio::fs::remove_file(&path).await",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/export_actions.rs",
+            "let _ = tokio::fs::remove_file(entry.path()).await",
+        ),
+        (
+            "crates/cockpit-tui/src/clipboard/recovery/unix.rs",
+            "std::fs::create_dir_all(parent).map_err",
+        ),
+        (
+            "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
+            "std::fs::create_dir_all(parent)?",
+        ),
     ];
     fn visit(path: &Path, findings: &mut Vec<String>) {
         for entry in fs::read_dir(path).unwrap() {
@@ -212,35 +235,46 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
                 || path.components().any(|part| part.as_os_str() == "tests")
-                || path.file_name().and_then(|value| value.to_str())
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
                     .is_some_and(|name| name.ends_with("_tests.rs"))
             {
                 continue;
             }
             let source = fs::read_to_string(&path).unwrap();
-            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap_or(&source);
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
-            for mutation in MUTATIONS {
-                if !production.contains(mutation) {
-                    continue;
-                }
-                let allowed = ALLOWED.iter().any(|(file, required)| {
-                    relative == *file && (required.is_empty() || production.contains(required))
-                });
-                if !allowed {
-                    findings.push(format!("{relative}: {mutation}"));
+            for (line_number, line) in production.lines().enumerate() {
+                for mutation in MUTATIONS {
+                    if !line.contains(mutation) {
+                        continue;
+                    }
+                    let allowed = ALLOWED_LINES
+                        .iter()
+                        .any(|(file, exact)| relative == *file && line.contains(exact));
+                    if !allowed {
+                        findings.push(format!("{relative}:{}: {mutation}", line_number + 1));
+                    }
                 }
             }
-            if production.contains("use std::fs as ")
-                || production.contains("use tokio::fs as ")
-            {
-                findings.push(format!("{relative}: filesystem alias obscures authority audit"));
+            if production.contains("use std::fs as ") || production.contains("use tokio::fs as ") {
+                findings.push(format!(
+                    "{relative}: filesystem alias obscures authority audit"
+                ));
             }
         }
     }
     let mut findings = Vec::new();
     visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
-    assert!(findings.is_empty(), "unowned TUI filesystem mutations:\n{}", findings.join("\n"));
+    assert!(
+        findings.is_empty(),
+        "unowned TUI filesystem mutations:\n{}",
+        findings.join("\n")
+    );
 }
 
 #[test]

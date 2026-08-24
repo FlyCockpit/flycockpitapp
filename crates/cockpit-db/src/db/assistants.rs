@@ -119,6 +119,41 @@ impl Db {
         .await
     }
 
+    /// Update only the identity-file digests when every authority-bearing row
+    /// field still matches the snapshot used to read those files.
+    pub async fn update_assistant_identity_hashes_cas(
+        &self,
+        expected: AssistantRow,
+        config_json: &str,
+    ) -> Result<AssistantRow> {
+        let config_json = config_json.to_string();
+        serde_json::from_str::<serde_json::Value>(&config_json)
+            .context("assistant config must be valid JSON")?;
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE assistants SET config_json = ?6
+                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+                       AND config_json = ?4 AND content_hash = ?5",
+                    params![
+                        expected.name,
+                        expected.created_at,
+                        expected.home_dir,
+                        expected.config_json,
+                        expected.content_hash,
+                        config_json,
+                    ],
+                )
+                .context("compare-and-swap assistant identity hashes")?;
+            if changed != 1 {
+                anyhow::bail!("assistant registry changed while identity files were read");
+            }
+            Db::get_assistant_conn(conn, &expected.name)?
+                .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+        })
+        .await
+    }
+
     pub async fn update_assistant_content_hash_cas(
         &self,
         name: &str,

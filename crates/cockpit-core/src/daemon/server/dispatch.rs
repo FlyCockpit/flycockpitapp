@@ -4250,8 +4250,8 @@ async fn handle_serialized_request_impl(
                     home_dir,
                 },
             )
-                .await
-                .map_err(|error| bad_request(error.to_string()))?;
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
             let response = Response::AssistantUpserted {
                 assistant: assistant_to_proto(row),
             };
@@ -4286,7 +4286,7 @@ async fn handle_serialized_request_impl(
                         message: format!("assistant definition save rejected: {error:#}"),
                     })?;
             Ok(Response::AssistantDefinitionSaved {
-                assistant: assistant_to_proto_with_definition(updated),
+                assistant: assistant_to_proto_with_definition(updated).map_err(internal)?,
             })
         }
 
@@ -4548,26 +4548,12 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let row = ctx
-                .db
-                .get_assistant(&name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| conflict("assistant changed or no longer exists"))?;
-            let path = crate::assistants::assistant_definition_path(Path::new(&row.home_dir));
-            let _guard = cockpit_config::config::hold_config_mutation_lock(&path)
-                .map_err(internal)?;
-            let snapshot = assistant_to_proto_with_definition(row.clone());
-            if snapshot.definition_revision.as_deref() != Some(expected_revision.as_str()) {
-                return Err(conflict("assistant changed since delete confirmation"));
-            }
-            let deleted = ctx
-                .db
-                .delete_assistant_if_unchanged(row)
-                .await
-                .map_err(internal)?;
+            let deleted =
+                crate::assistants::delete_registration(&ctx.db, &name, &expected_revision)
+                    .await
+                    .map_err(|error| conflict(format!("assistant deletion rejected: {error:#}")))?;
             if !deleted {
-                return Err(conflict("assistant registry changed during delete"));
+                return Err(conflict("assistant changed or no longer exists"));
             }
             let response = Response::AssistantDeleted { deleted };
             finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
@@ -13778,35 +13764,25 @@ pub(super) fn assistant_to_proto(
 
 fn assistant_to_proto_with_definition(
     row: crate::db::assistants::AssistantRow,
-) -> proto::AssistantSummary {
+) -> anyhow::Result<proto::AssistantSummary> {
+    let home = crate::assistants::validate_row_home(&row)?;
+    let path = crate::assistants::assistant_definition_path(&home);
+    let bytes = cockpit_config::config::read_config_file_nofollow(&path)?
+        .context("assistant definition is missing")?;
+    let actual_hash = crate::assistants::sha256_hex(&bytes);
+    anyhow::ensure!(
+        actual_hash == row.content_hash,
+        "assistant definition bytes do not match the registry content hash"
+    );
+    let markdown = String::from_utf8(bytes).context("assistant definition is not valid UTF-8")?;
+    let definition = crate::agents::parse_daemon_local_markdown(&markdown, &row.name)
+        .context("assistant definition is invalid")?;
+    crate::assistants::validate_definition_identity(&row, &definition)?;
+    let revision = crate::assistants::definition_revision(&row, &markdown);
     let mut summary = assistant_to_proto(row);
-    let path = crate::assistants::assistant_definition_path(Path::new(&summary.home_dir));
-    match cockpit_config::config::read_config_file_nofollow(&path) {
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(markdown) => {
-                match crate::agents::parse_daemon_local_markdown(&markdown, &summary.name) {
-                    Ok(_) => {
-                        summary.definition_revision = Some(crate::assistants::definition_revision(
-                            &crate::db::assistants::AssistantRow {
-                                name: summary.name.clone(),
-                                created_at: summary.created_at,
-                                home_dir: summary.home_dir.clone(),
-                                config_json: summary.config_json.clone(),
-                                content_hash: summary.content_hash.clone(),
-                            },
-                            &markdown,
-                        ));
-                        summary.definition_markdown = Some(markdown);
-                    }
-                    Err(error) => summary.definition_diagnostic = Some(error.to_string()),
-                }
-            }
-            Err(_) => summary.definition_diagnostic = Some("definition is not valid UTF-8".into()),
-        },
-        Ok(None) => summary.definition_diagnostic = Some("definition is missing".into()),
-        Err(error) => summary.definition_diagnostic = Some(error.to_string()),
-    }
-    summary
+    summary.definition_revision = Some(revision);
+    summary.definition_markdown = Some(markdown);
+    Ok(summary)
 }
 
 /// Non-secret JSON projection of a registered package row for the

@@ -475,6 +475,55 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             truncated: _,
             kind: _,
         } => scrub_option_string(content, redact),
+        proto::Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation: _,
+        } => {
+            for layer in layers {
+                scrub_string(&mut layer.layer_id, redact);
+                scrub_string(&mut layer.display_path, redact);
+                // ExtendedConfig is deliberately typed, but contains nested
+                // free-text fields (prompts, paths, model names and command
+                // configuration). Round-trip its JSON representation so the
+                // redaction backstop reaches every string without maintaining
+                // a second field inventory here.
+                if let Ok(mut value) = serde_json::to_value(&layer.config) {
+                    scrub_json_strings(&mut value, redact);
+                    if let Ok(config) = serde_json::from_value(value) {
+                        layer.config = config;
+                    }
+                }
+                scrub_string(&mut layer.revision, redact);
+                for entry in &mut layer.denylist {
+                    scrub_string(&mut entry.entry_id, redact);
+                    scrub_string(&mut entry.fingerprint, redact);
+                    scrub_string(&mut entry.display_mask, redact);
+                }
+            }
+        }
+        proto::Response::AgentInventory {
+            entries,
+            inventory_revision,
+            config_generation: _,
+        } => {
+            for entry in entries {
+                scrub_agent_inventory_entry(entry, redact);
+            }
+            scrub_string(inventory_revision, redact);
+        }
+        proto::Response::AgentEditSnapshot(snapshot) => {
+            scrub_agent_edit_snapshot(snapshot, redact);
+        }
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            if let Some(snapshot) = &mut result.snapshot {
+                scrub_agent_edit_snapshot(snapshot, redact);
+            }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => {
+            scrub_string(&mut lease.lease_id, redact);
+            scrub_agent_edit_snapshot(&mut lease.snapshot, redact);
+        }
         proto::Response::GitStatus { entries } => {
             for entry in entries {
                 scrub_string(&mut entry.raw, redact);
@@ -1526,6 +1575,22 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
     scrub_option_string(definition_markdown, redact);
     scrub_option_string(definition_revision, redact);
     scrub_option_string(definition_diagnostic, redact);
+}
+
+fn scrub_agent_inventory_entry(entry: &mut proto::AgentInventoryEntry, redact: &RedactionTable) {
+    scrub_string(&mut entry.name, redact);
+    scrub_option_string(&mut entry.description, redact);
+    scrub_option_string(&mut entry.model, redact);
+    scrub_option_string(&mut entry.diagnostic, redact);
+}
+
+fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &RedactionTable) {
+    scrub_string(&mut snapshot.name, redact);
+    scrub_string(&mut snapshot.markdown, redact);
+    scrub_string(&mut snapshot.canonical_preview, redact);
+    scrub_string(&mut snapshot.source_identity, redact);
+    scrub_string(&mut snapshot.revision, redact);
+    scrub_option_string(&mut snapshot.goal_supervision_json, redact);
 }
 
 fn scrub_assistant_session_created(

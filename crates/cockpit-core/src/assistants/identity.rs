@@ -91,18 +91,22 @@ fn seed_file(path: &Path, body: &str) -> Result<()> {
 }
 
 pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
-    Ok(crate::private_fs::read_private_file(path, "assistant identity")?
-        .map(|bytes| crate::assistants::sha256_hex(&bytes)))
+    Ok(
+        crate::private_fs::read_private_file(path, "assistant identity")?
+            .map(|bytes| crate::assistants::sha256_hex(&bytes)),
+    )
 }
 
 pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
-    let home_dir = Path::new(&row.home_dir);
-    let mut config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    let home_dir = crate::assistants::validate_row_home(row)?;
+    let original_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&row.config_json)
+            .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+    let mut config = original_config.clone();
     let max_tokens = config.identity_max_tokens.max(1);
 
-    let soul = load_piece(&soul_path(home_dir), "SOUL.md", max_tokens)?;
-    let user = load_piece(&user_path(home_dir), "USER.md", max_tokens)?;
+    let soul = load_piece(&soul_path(&home_dir), "SOUL.md", max_tokens)?;
+    let user = load_piece(&user_path(&home_dir), "USER.md", max_tokens)?;
 
     let mut notices = Vec::new();
     if config.soul_hash.as_ref() != soul.hash.as_ref() {
@@ -133,18 +137,11 @@ pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoa
         }
     }
 
-    if !notices.is_empty()
-        || config.soul_hash
-            != serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json)
-                .unwrap_or_default()
-                .soul_hash
-        || config.user_hash
-            != serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json)
-                .unwrap_or_default()
-                .user_hash
+    if config.soul_hash != original_config.soul_hash
+        || config.user_hash != original_config.user_hash
     {
         let config_json = serde_json::to_string(&config)?;
-        db.update_assistant_config(&row.name, &config_json)
+        db.update_assistant_identity_hashes_cas(row.clone(), &config_json)
             .await
             .with_context(|| format!("updating identity hashes for assistant `{}`", row.name))?;
     }
@@ -182,8 +179,8 @@ struct IdentityPiece {
 }
 
 fn load_piece(path: &Path, label: &'static str, max_tokens: usize) -> Result<IdentityPiece> {
-    let bytes = crate::private_fs::read_private_file(path, "assistant identity")?
-        .unwrap_or_default();
+    let bytes =
+        crate::private_fs::read_private_file(path, "assistant identity")?.unwrap_or_default();
     let hash = if bytes.is_empty() {
         None
     } else {
@@ -333,8 +330,9 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     let Some((row, identity_file)) = identity_target(ctx, path).await? else {
         return Ok(());
     };
-    let mut config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    crate::assistants::validate_row_home(&row)?;
+    let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
     match identity_file {
         SOUL_FILE => config.soul_hash = hash_optional_file(path)?,
         USER_FILE => config.user_hash = hash_optional_file(path)?,
@@ -343,7 +341,7 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     let config_json = serde_json::to_string(&config)?;
     ctx.session
         .db
-        .update_assistant_config(&row.name, &config_json)
+        .update_assistant_identity_hashes_cas(row, &config_json)
         .await?;
     Ok(())
 }
@@ -358,9 +356,9 @@ async fn identity_target(
     let Some(row) = ctx.session.db.get_assistant(name).await? else {
         return Ok(None);
     };
-    let home = Path::new(&row.home_dir);
-    let soul = soul_path(home);
-    let user = user_path(home);
+    let home = crate::assistants::validate_row_home(&row)?;
+    let soul = soul_path(&home);
+    let user = user_path(&home);
     if same_path(path, &soul) {
         Ok(Some((row, SOUL_FILE)))
     } else if same_path(path, &user) {

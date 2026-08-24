@@ -124,6 +124,7 @@ pub fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
 }
 
 pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
+    validate_row_home(row)?;
     let config: AssistantConfig = serde_json::from_str(&row.config_json)
         .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
     if config.installation_id.is_nil() {
@@ -149,6 +150,20 @@ pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
     Ok(definition)
 }
 
+/// Prove that a persisted assistant is bound to the only daemon-owned home
+/// allowed for its name before any authority-bearing filesystem access.
+pub fn validate_row_home(row: &AssistantRow) -> Result<PathBuf> {
+    validate_assistant_name(&row.name)?;
+    let expected = default_home_dir(&row.name)?;
+    if Path::new(&row.home_dir) != expected {
+        bail!(
+            "assistant `{}` registry home is not its daemon-owned canonical home",
+            row.name
+        );
+    }
+    Ok(expected)
+}
+
 pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<AssistantRow> {
     create_assistant_with_installation_id(db, spec, Uuid::new_v4()).await
 }
@@ -159,6 +174,19 @@ pub async fn create_assistant(db: &Db, spec: CreateAssistantSpec) -> Result<Assi
 /// mints a fresh UUID. This explicit form is for flows that must write the
 /// definition and registry configuration from one preallocated identity.
 pub async fn create_assistant_with_installation_id(
+    db: &Db,
+    spec: CreateAssistantSpec,
+    installation_id: Uuid,
+) -> Result<AssistantRow> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        create_assistant_with_installation_id_sync(&db, spec, installation_id)
+    })
+    .await
+    .context("assistant creation coordinator joined")?
+}
+
+fn create_assistant_with_installation_id_sync(
     db: &Db,
     spec: CreateAssistantSpec,
     installation_id: Uuid,
@@ -178,8 +206,8 @@ pub async fn create_assistant_with_installation_id(
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
-    recover_creation_journal(db, &spec.home_dir).await?;
-    if db.get_assistant(&spec.name).await?.is_some() {
+    recover_creation_journal_locked(db, &spec.home_dir)?;
+    if get_assistant_blocking(db, &spec.name)?.is_some() {
         bail!("assistant `{}` already exists", spec.name);
     }
     if cockpit_config::config::read_config_file_nofollow(&path)?.is_some() {
@@ -236,13 +264,13 @@ pub async fn create_assistant_with_installation_id(
     )?;
     cockpit_config::config::write_config_bytes_atomic(&path, markdown.as_bytes())
         .with_context(|| format!("writing assistant definition {}", path.display()))?;
-    let row = db.upsert_assistant(
-        &spec.name,
-        &spec.home_dir.to_string_lossy(),
-        &config_json,
-        &content_hash,
-    )
-    .await?;
+    let name = spec.name.clone();
+    let home_dir = spec.home_dir.to_string_lossy().into_owned();
+    let config_for_db = config_json.clone();
+    let hash_for_db = content_hash.clone();
+    let row = db.write_blocking(move |conn| {
+        crate::db::Db::upsert_assistant_conn(conn, &name, &home_dir, &config_for_db, &hash_for_db)
+    })?;
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
     Ok(row)
 }
@@ -462,7 +490,7 @@ fn creation_journal_path(home: &Path) -> PathBuf {
     home.join(".assistant-creation.journal.json")
 }
 
-async fn recover_creation_journal(db: &Db, home: &Path) -> Result<()> {
+fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
     let journal_path = creation_journal_path(home);
     let Some(raw) = cockpit_config::config::read_config_file_nofollow(&journal_path)? else {
         return Ok(());
@@ -491,7 +519,8 @@ async fn recover_creation_journal(db: &Db, home: &Path) -> Result<()> {
     let parsed = crate::agents::parse_daemon_local_markdown(&journal.markdown, &journal.name)?;
     validate_definition_identity(&row_for_validation, &parsed)?;
     identity::seed_identity_files(home)?;
-    if let Some(existing) = db.get_assistant(&journal.name).await? {
+    if let Some(existing) = get_assistant_blocking(db, &journal.name)? {
+        validate_row_home(&existing)?;
         if existing.home_dir != journal.home_dir
             || existing.config_json != journal.config_json
             || existing.content_hash != journal.content_hash
@@ -508,13 +537,19 @@ async fn recover_creation_journal(db: &Db, home: &Path) -> Result<()> {
         }
     } else {
         cockpit_config::config::write_config_bytes_atomic(&target, journal.markdown.as_bytes())?;
-        db.upsert_assistant(
-            &journal.name,
-            &journal.home_dir,
-            &journal.config_json,
-            &journal.content_hash,
-        )
-        .await?;
+        let name = journal.name.clone();
+        let home_dir = journal.home_dir.clone();
+        let config_json = journal.config_json.clone();
+        let content_hash = journal.content_hash.clone();
+        db.write_blocking(move |conn| {
+            crate::db::Db::upsert_assistant_conn(
+                conn,
+                &name,
+                &home_dir,
+                &config_json,
+                &content_hash,
+            )
+        })?;
     }
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition disappeared during creation recovery")?;
@@ -525,8 +560,9 @@ async fn recover_creation_journal(db: &Db, home: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Result<()> {
-    let home = Path::new(&row.home_dir);
+fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Result<()> {
+    let home = validate_row_home(row)?;
+    let home = home.as_path();
     let journal_path = definition_journal_path(home);
     let Some(raw) = cockpit_config::config::read_config_file_nofollow(&journal_path)? else {
         return Ok(());
@@ -572,14 +608,21 @@ async fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Resul
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
     // Re-read through the writer queue before returning so recovery never
     // reports a row different from the one it reconciled.
-    let _ = db.get_assistant(&row.name).await?;
+    let _ = get_assistant_blocking(db, &row.name)?;
     Ok(())
 }
 
 async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
-    let target = assistant_definition_path(Path::new(&row.home_dir));
-    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-    recover_definition_journal_locked(db, row).await
+    let db = db.clone();
+    let row = row.clone();
+    tokio::task::spawn_blocking(move || {
+        let home = validate_row_home(&row)?;
+        let target = assistant_definition_path(&home);
+        let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+        recover_definition_journal_locked(&db, &row)
+    })
+    .await
+    .context("assistant definition recovery coordinator joined")?
 }
 
 pub async fn recover_definition_journals(db: &Db) -> Result<()> {
@@ -592,9 +635,14 @@ pub async fn recover_definition_journals(db: &Db) -> Result<()> {
                     continue;
                 }
                 let home = entry.path();
-                let target = assistant_definition_path(&home);
-                let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-                recover_creation_journal(db, &home).await?;
+                let db = db.clone();
+                tokio::task::spawn_blocking(move || {
+                    let target = assistant_definition_path(&home);
+                    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+                    recover_creation_journal_locked(&db, &home)
+                })
+                .await
+                .context("assistant creation recovery coordinator joined")??;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -612,9 +660,25 @@ pub async fn save_definition_cas(
     markdown: String,
     expected_revision: &str,
 ) -> Result<AssistantRow> {
-    let target = assistant_definition_path(Path::new(&row.home_dir));
+    let db = db.clone();
+    let expected_revision = expected_revision.to_string();
+    tokio::task::spawn_blocking(move || {
+        save_definition_cas_sync(&db, row, markdown, &expected_revision)
+    })
+    .await
+    .context("assistant definition save coordinator joined")?
+}
+
+fn save_definition_cas_sync(
+    db: &Db,
+    row: AssistantRow,
+    markdown: String,
+    expected_revision: &str,
+) -> Result<AssistantRow> {
+    let home = validate_row_home(&row)?;
+    let target = assistant_definition_path(&home);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-    recover_definition_journal_locked(db, &row).await?;
+    recover_definition_journal_locked(db, &row)?;
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition is missing")?;
     let current = String::from_utf8(current).context("assistant definition is not valid UTF-8")?;
@@ -639,19 +703,22 @@ pub async fn save_definition_cas(
         next_markdown: markdown.clone(),
     };
     let encoded = serde_json::to_vec_pretty(&journal)?;
-    let journal_path = definition_journal_path(Path::new(&row.home_dir));
+    let journal_path = definition_journal_path(&home);
     cockpit_config::config::write_config_bytes_atomic(&journal_path, &encoded)?;
     cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())?;
-    let updated = match db
-        .update_assistant_content_hash_cas(
-            &row.name,
-            &row.home_dir,
-            &row.config_json,
-            &row.content_hash,
-            &next_hash,
-        )
-        .await
-    {
+    let expected = row.clone();
+    let next_hash_for_db = next_hash.clone();
+    let updated = match db.write_blocking(move |conn| {
+        let changed = conn.execute(
+            "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
+            rusqlite::params![expected.name, expected.home_dir, expected.config_json, expected.content_hash, next_hash_for_db],
+        )?;
+        if changed != 1 {
+            bail!("assistant registry changed before definition commit");
+        }
+        crate::db::Db::get_assistant_conn(conn, &expected.name)?
+            .context("assistant disappeared after definition update")
+    }) {
         Ok(updated) => updated,
         Err(error) => {
             cockpit_config::config::write_config_bytes_atomic(
@@ -669,18 +736,48 @@ pub async fn save_definition_cas(
 /// Remove only the registry binding while retaining the user's assistant home.
 /// The same definition lock and journal recovery used by saves ensures delete
 /// cannot race an in-flight file/row commit.
-pub async fn delete_registration(db: &Db, name: &str) -> Result<bool> {
+pub async fn delete_registration(db: &Db, name: &str, expected_revision: &str) -> Result<bool> {
+    let db = db.clone();
+    let name = name.to_string();
+    let expected_revision = expected_revision.to_string();
+    tokio::task::spawn_blocking(move || delete_registration_sync(&db, &name, &expected_revision))
+        .await
+        .context("assistant deletion coordinator joined")?
+}
+
+fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Result<bool> {
     validate_assistant_name(name)?;
-    let Some(row) = db.get_assistant(name).await? else {
+    let Some(row) = get_assistant_blocking(db, name)? else {
         return Ok(false);
     };
-    let target = assistant_definition_path(Path::new(&row.home_dir));
+    let home = validate_row_home(&row)?;
+    let target = assistant_definition_path(&home);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-    recover_creation_journal(db, Path::new(&row.home_dir)).await?;
-    let row = db.get_assistant(name).await?
+    recover_creation_journal_locked(db, &home)?;
+    let row = get_assistant_blocking(db, name)?
         .context("assistant disappeared during delete recovery")?;
-    recover_definition_journal_locked(db, &row).await?;
-    db.delete_assistant(name).await
+    validate_row_home(&row)?;
+    recover_definition_journal_locked(db, &row)?;
+    let markdown = cockpit_config::config::read_config_file_nofollow(&target)?
+        .context("assistant definition is missing during delete")?;
+    let markdown = String::from_utf8(markdown).context("assistant definition is not UTF-8")?;
+    if definition_revision(&row, &markdown) != expected_revision
+        || markdown_content_hash(&markdown) != row.content_hash
+    {
+        bail!("assistant changed since delete confirmation");
+    }
+    db.write_blocking(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
+            rusqlite::params![row.name, row.created_at, row.home_dir, row.config_json, row.content_hash],
+        )?;
+        Ok(changed == 1)
+    })
+}
+
+fn get_assistant_blocking(db: &Db, name: &str) -> Result<Option<AssistantRow>> {
+    let name = name.to_string();
+    db.write_blocking(move |conn| crate::db::Db::get_assistant_conn(conn, &name))
 }
 
 #[cfg(test)]

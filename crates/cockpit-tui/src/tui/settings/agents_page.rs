@@ -767,6 +767,13 @@ impl SettingsCx {
         let Some(editor) = p.editing.as_ref() else {
             return;
         };
+        if editor.is_assistant_definition() {
+            p.status = Some(
+                "external editing is unavailable for assistant definitions; use the in-TUI editor"
+                    .into(),
+            );
+            return;
+        }
         if editor.name != expected.0 || p.pending_external_edit.is_some() {
             return;
         }
@@ -842,16 +849,15 @@ impl SettingsCx {
                 let name = detail.name.clone();
                 let text = detail.original_text.clone();
                 let revision = detail.revision.clone();
-                let assistant_definition = matches!(detail.source, AgentRowSource::Assistant { .. });
+                let assistant_definition =
+                    matches!(detail.source, AgentRowSource::Assistant { .. });
                 p.detail = None;
                 let vim = self.extended.tui.vim_mode.vim_enabled();
                 p.editing = match (assistant_definition, revision) {
-                    (true, Some(revision)) => Some(AgentEditor::new_assistant(
-                        name, path, &text, vim, revision,
-                    )),
-                    (false, revision) => Some(AgentEditor::new(
-                        name, path, &text, vim, revision,
-                    )),
+                    (true, Some(revision)) => {
+                        Some(AgentEditor::new_assistant(name, path, &text, vim, revision))
+                    }
+                    (false, revision) => Some(AgentEditor::new(name, path, &text, vim, revision)),
                     (true, None) => {
                         p.status = Some("raw edit failed: missing assistant revision".into());
                         None

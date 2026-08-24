@@ -57,13 +57,14 @@ fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempD
 /// vNext/legacy delegation boundary check.  The test "Build" agent is created
 /// directly (not via `agent_from_def`), so `vnext_reachable_subagents` is not
 /// called and the broad list cannot cause a resolution bail.
-fn test_vnext_build_grant(
-    root: &std::path::Path,
-) -> crate::agents::EffectiveVnextGrant {
+fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
     use crate::agents::{
         AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
         ModelLocality, ModelSlot, VnextAgentDef,
     };
+    let host = crate::agents::VnextHostPolicy::for_session_config(
+        &crate::config::extended::load_for_cwd(root),
+    );
     let children = [
         "cockpit/builder",
         "cockpit/explore",
@@ -101,15 +102,16 @@ fn test_vnext_build_grant(
                 })
                 .collect(),
             max_descendant_depth: Some(4),
-            max_concurrent_children: Some(8),
+            // Author exactly the host's concurrency ceiling so `resolve_grant`
+            // always admits this test grant (it REJECTS, never clamps, an
+            // authored value above the host ceiling — see vnext.rs). The batch
+            // delivery tests fan out at most three children, well under this.
+            max_concurrent_children: Some(host.max_concurrent_children),
             targets: vec![DelegationTarget::SameRoot],
         },
         questions: None,
         verification: None,
     };
-    let host = crate::agents::VnextHostPolicy::for_session_config(
-        &crate::config::extended::load_for_cwd(root),
-    );
     definition
         .resolve_grant(&host)
         .expect("test vNext Build grant must resolve")

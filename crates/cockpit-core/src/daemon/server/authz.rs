@@ -1,6 +1,7 @@
 use super::sessions::*;
 use super::*;
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AuthorizedFcorResource {
     pub(super) kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
@@ -9,9 +10,11 @@ pub(super) struct AuthorizedFcorResource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthorizedRequestContext {
+    #[cfg(feature = "remote")]
     pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
 }
 
+#[cfg(feature = "remote")]
 impl AuthorizedRequestContext {
     /// Build the canonical operation bytes from resources resolved at the
     /// authorization boundary. Callers must supply the request-specific
@@ -44,6 +47,7 @@ impl AuthorizedRequestContext {
     }
 }
 
+#[cfg(feature = "remote")]
 fn canonical_project_root_bytes(
     path: &std::path::Path,
 ) -> std::result::Result<Vec<u8>, ErrorPayload> {
@@ -54,6 +58,7 @@ fn canonical_project_root_bytes(
     Ok(text.as_bytes().to_vec())
 }
 
+#[cfg(feature = "remote")]
 fn push_fcor_resource(
     resources: &mut Vec<AuthorizedFcorResource>,
     kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
@@ -62,9 +67,11 @@ fn push_fcor_resource(
     resources.push(AuthorizedFcorResource { kind, value });
 }
 
+#[cfg(feature = "remote")]
 trait SessionFcorResource {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>);
 }
+#[cfg(feature = "remote")]
 impl SessionFcorResource for Uuid {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
         push_fcor_resource(
@@ -74,6 +81,7 @@ impl SessionFcorResource for Uuid {
         );
     }
 }
+#[cfg(feature = "remote")]
 impl SessionFcorResource for Option<Uuid> {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
         if let Some(value) = self {
@@ -82,20 +90,24 @@ impl SessionFcorResource for Option<Uuid> {
     }
 }
 
+#[cfg(feature = "remote")]
 trait OptionalFcorText {
     fn optional_text(&self) -> Option<&str>;
 }
+#[cfg(feature = "remote")]
 impl OptionalFcorText for String {
     fn optional_text(&self) -> Option<&str> {
         Some(self)
     }
 }
+#[cfg(feature = "remote")]
 impl OptionalFcorText for Option<String> {
     fn optional_text(&self) -> Option<&str> {
         self.as_deref()
     }
 }
 
+#[cfg(feature = "remote")]
 macro_rules! resolve_fcor_role {
     ($resources:ident, $cwd:ident, $name:ident => param) => {
         let _ = $name;
@@ -240,6 +252,7 @@ macro_rules! resolve_fcor_role {
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_resolve_fcor_resources {
     (($request:ident, $cwd:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request { $($(#[$row_attr])* $pattern => {
@@ -254,6 +267,7 @@ macro_rules! command_resolve_fcor_resources {
 
 /// Resolve path-bearing FCOR resources only after request authorization.
 /// Raw client path text never leaves this boundary.
+#[cfg(feature = "remote")]
 fn resolve_authorized_fcor_resources(
     request: &Request,
     daemon_cwd: &std::path::Path,
@@ -267,10 +281,11 @@ pub(super) async fn authorize_request_context(
     ctx: &DaemonContext,
 ) -> std::result::Result<AuthorizedRequestContext, ErrorPayload> {
     authorize_request(request, state, ctx).await?;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote"))]
     ctx.fcor_resolver_calls
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(AuthorizedRequestContext {
+        #[cfg(feature = "remote")]
         fcor_resources: resolve_authorized_fcor_resources(request, &ctx.canonical_cwd)?,
     })
 }

@@ -129,6 +129,14 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     Ok(AgentExternalEditStaging { path })
 }
 
+fn seed_agent_external_edit_staging(
+    staging: &AgentExternalEditStaging,
+    text: &str,
+) -> Result<(), String> {
+    std::fs::write(&staging.path, text)
+        .map_err(|error| format!("failed to seed external-edit recovery draft: {error}"))
+}
+
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
 /// fields the page needs so the page state doesn't borrow the (non-`Clone`,
 /// error-carrying) listing.
@@ -608,7 +616,6 @@ impl SettingsCx {
                     // Ensure a single trailing newline like a real editor.
                     let text = format!("{}\n", text.trim_end_matches('\n'));
                     let name = editor.name.clone();
-                    p.editing = None;
                     let cwd = self.agents_cwd();
                     let saved = match revision {
                         Some(revision) => mutate_agent(
@@ -627,6 +634,7 @@ impl SettingsCx {
                     };
                     match saved {
                         Ok(()) => {
+                            p.editing = None;
                             p.refresh_after_edit(&cwd, Some(&name));
                         }
                         Err(e) => {
@@ -755,6 +763,11 @@ impl SettingsCx {
                 return;
             }
         };
+        let text = format!("{}\n", editor.text().trim_end_matches('\n'));
+        if let Err(error) = seed_agent_external_edit_staging(&staging, &text) {
+            p.status = Some(error);
+            return;
+        }
         let lease = match begin_agent_editor_lease(&cwd, &editor.name, revision) {
             Ok(lease) => lease,
             Err(error) => {
@@ -762,7 +775,6 @@ impl SettingsCx {
                 return;
             }
         };
-        let text = format!("{}\n", editor.text().trim_end_matches('\n'));
         let draft = p.editing.take();
         let id = p.external_edit_ops.begin();
         p.pending_external_edit = Some(AgentExternalEdit {
@@ -1008,16 +1020,31 @@ impl SettingsCx {
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
             let text = snapshot.markdown.clone();
+            let vim = self.extended.tui.vim_mode.vim_enabled();
+            let draft = AgentEditor::new(
+                name.clone(),
+                path.clone(),
+                &text,
+                vim,
+                Some(snapshot.revision.clone()),
+            );
             let staging = match agent_external_edit_staging() {
                 Ok(staging) => staging,
                 Err(error) => {
+                    p.editing = Some(draft);
                     p.status = Some(error);
                     return;
                 }
             };
+            if let Err(error) = seed_agent_external_edit_staging(&staging, &text) {
+                p.editing = Some(draft);
+                p.status = Some(error);
+                return;
+            }
             let lease = match begin_agent_editor_lease(&cwd, &name, snapshot.revision.clone()) {
                 Ok(lease) => lease,
                 Err(error) => {
+                    p.editing = Some(draft);
                     p.status = Some(format!("external edit lease failed: {error}"));
                     return;
                 }
@@ -1029,7 +1056,7 @@ impl SettingsCx {
                 staging: staging.path,
                 lease_id: lease.lease_id,
                 text_before_launch: text,
-                draft: None,
+                draft: Some(draft),
                 servicing: false,
             });
             p.status = Some("opening $EDITOR…".into());

@@ -105,7 +105,6 @@ fn tui_agent_authority_is_daemon_owned() {
         "cockpit_core::agents::load_daemon_local_named_from_file(",
         "Request::FsWrite",
         "Request::UpsertAssistant",
-        "std::fs::write(",
         "std::fs::remove_file(",
     ] {
         assert!(
@@ -123,6 +122,12 @@ fn tui_agent_authority_is_daemon_owned() {
     ] {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }
+    assert_eq!(
+        production.matches("std::fs::write(").count(),
+        1,
+        "agent UI may write only its isolated external-editor staging file"
+    );
+    assert!(production.contains("std::fs::write(&staging.path, text)"));
 }
 
 #[test]

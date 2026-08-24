@@ -95,7 +95,9 @@ pub(crate) const PRODUCTION_HOOK_BOUNDARIES: &[(HookEvent, &str)] = &[
     (HookEvent::SessionEnd, "session_worker.teardown"),
 ];
 
-/// Reserved environment keys overwritten after configured env.
+/// Reserved environment keys overwritten after configured env. Consumed by
+/// [`build_child_env`] (the single source for these key names) and cited by the
+/// documentation contract.
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "COCKPIT_HOOK_EVENT",
     "COCKPIT_HOOK_NAME",
@@ -627,15 +629,15 @@ pub(crate) fn build_child_env(
 
     #[cfg(windows)]
     {
-        let system_root = process_env.system_root().ok_or_else(|| {
-            "missing SystemRoot: cannot construct clean Windows environment".to_string()
-        })?;
-        env.insert("SystemRoot".to_string(), system_root.clone());
-        env.insert("WINDIR".to_string(), system_root);
         // Deliberately do NOT add ComSpec, PATHEXT, or any other host variable.
+        for (key, value) in windows_clean_env_additions(process_env.system_root())? {
+            env.insert(key.to_string(), value);
+        }
     }
 
-    // Overwrite reserved keys after configured env.
+    // Overwrite reserved keys after configured env. The key names are the
+    // single-sourced `RESERVED_ENV_KEYS` (Decision #6) so the runner, the
+    // documentation contract, and tests cannot drift.
     env.insert(RESERVED_ENV_KEYS[0].to_string(), event.key().to_string());
     env.insert(
         RESERVED_ENV_KEYS[1].to_string(),
@@ -654,6 +656,28 @@ pub(crate) fn build_child_env(
     }
 
     Ok(env)
+}
+
+/// Windows-only clean-environment additions (`SystemRoot` + `WINDIR`), both
+/// derived from the parent `SystemRoot` value obtained through the
+/// [`ProcessEnv`] seam. Returns the missing-`SystemRoot` fail-open error when
+/// the parent process has no `SystemRoot`, so a hook is never launched into an
+/// unbootable Windows environment. `ComSpec`, `PATHEXT`, and every other host
+/// variable are deliberately excluded.
+///
+/// This is a cross-platform pure function — compiled on all hosts, consumed
+/// only under `#[cfg(windows)]` in [`build_child_env`] — so the construction
+/// and its fail-open branch are unit-testable without a Windows host. On
+/// non-Windows builds it is genuinely unused by production; the allow mirrors
+/// the cross-platform [`ProcessEnv::system_root`] seam.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_clean_env_additions(
+    system_root: Option<String>,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let root = system_root.ok_or_else(|| {
+        "missing SystemRoot: cannot construct clean Windows environment".to_string()
+    })?;
+    Ok(vec![("SystemRoot", root.clone()), ("WINDIR", root)])
 }
 
 /// Resolve the hook command's executable to an absolute path.

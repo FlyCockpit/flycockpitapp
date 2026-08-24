@@ -41,12 +41,33 @@ fn test_provider_base_url() -> String {
 }
 
 /// Build a driver rooted on a keyless local fixture provider.
+///
+/// The root "Build" primary carries NO vNext delegation grant (legacy path),
+/// which is what the vast majority of driver tests exercise. Tests that need
+/// the root to delegate to authored/cockpit vNext children must use the
+/// `*_vnext` variants below, which attach a resolved [`test_vnext_build_grant`].
 fn test_driver(max_schedules: usize) -> (Driver, tempfile::TempDir) {
     test_driver_with_url(max_schedules, test_provider_base_url())
 }
 
 fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempDir) {
     test_driver_with_url(max_schedules, "http://127.0.0.1:1/v1".to_string())
+}
+
+/// vNext variant of [`test_driver`]: the root "Build" primary carries a
+/// resolved vNext delegation grant so tests that delegate to authored/cockpit
+/// vNext children clear the vNext delegation boundary check (the legacy `None`
+/// path refuses such children).
+fn test_driver_vnext(max_schedules: usize) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url_and_grant(max_schedules, test_provider_base_url(), true)
+}
+
+/// vNext variant of [`test_driver_with_url`] (see [`test_driver_vnext`]).
+fn test_driver_with_url_vnext(
+    max_schedules: usize,
+    provider_url: String,
+) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url_and_grant(max_schedules, provider_url, true)
 }
 
 /// Construct a vNext `EffectiveVnextGrant` for the test "Build" primary.
@@ -57,13 +78,14 @@ fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempD
 /// vNext/legacy delegation boundary check.  The test "Build" agent is created
 /// directly (not via `agent_from_def`), so `vnext_reachable_subagents` is not
 /// called and the broad list cannot cause a resolution bail.
-fn test_vnext_build_grant(
-    root: &std::path::Path,
-) -> crate::agents::EffectiveVnextGrant {
+fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
     use crate::agents::{
         AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
         ModelLocality, ModelSlot, VnextAgentDef,
     };
+    let host = crate::agents::VnextHostPolicy::for_session_config(
+        &crate::config::extended::load_for_cwd(root),
+    );
     let children = [
         "cockpit/builder",
         "cockpit/explore",
@@ -101,21 +123,30 @@ fn test_vnext_build_grant(
                 })
                 .collect(),
             max_descendant_depth: Some(4),
-            max_concurrent_children: Some(8),
+            // Author exactly the host's concurrency ceiling so `resolve_grant`
+            // always admits this test grant (it REJECTS, never clamps, an
+            // authored value above the host ceiling — see vnext.rs). The batch
+            // delivery tests fan out at most three children, well under this.
+            max_concurrent_children: Some(host.max_concurrent_children),
             targets: vec![DelegationTarget::SameRoot],
         },
         questions: None,
         verification: None,
     };
-    let host = crate::agents::VnextHostPolicy::for_session_config(
-        &crate::config::extended::load_for_cwd(root),
-    );
     definition
         .resolve_grant(&host)
         .expect("test vNext Build grant must resolve")
 }
 
 fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, tempfile::TempDir) {
+    test_driver_with_url_and_grant(max_schedules, provider_url, false)
+}
+
+fn test_driver_with_url_and_grant(
+    max_schedules: usize,
+    provider_url: String,
+    with_vnext_grant: bool,
+) -> (Driver, tempfile::TempDir) {
     use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
 
@@ -177,7 +208,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
-        vnext_grant: Some(test_vnext_build_grant(&root)),
+        vnext_grant: with_vnext_grant.then(|| test_vnext_build_grant(&root)),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         assistant_identity_prefix: None,
     });

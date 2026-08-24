@@ -577,7 +577,7 @@ fn scoped_child_subtree_is_pre_granted_read_write() {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let (mut driver, _tmp) = test_driver_with_url_vnext(8, url.clone());
                     let config_dir = driver.cwd.join(".cockpit");
                     let providers_dir = config_dir.join("providers");
                     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -863,7 +863,7 @@ fn noninteractive_single_spawn_amends_with_child_routing() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let (mut driver, _tmp) = test_driver(8);
+                    let (mut driver, _tmp) = test_driver_vnext(8);
                     write_delegated_model_config(&mut driver, &["local", "child-single"]);
                     seed_task_delegation(&driver, "task-single-routing", "default").await;
                     seed_task_payload(&driver, "task-single-routing", "default", "explore").await;
@@ -932,7 +932,7 @@ async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let (mut driver, _tmp) = test_driver(8);
+                    let (mut driver, _tmp) = test_driver_vnext(8);
                     let primary_provider = failing_provider();
                     // Keep the provider alive for the delegation run; dropping it closes the listener.
                     let primary_url = primary_provider.base_url();
@@ -1035,7 +1035,7 @@ async fn delegated_child_succeeds_via_fallback_chain_and_export_records_it() {
 
 #[tokio::test]
 async fn noninteractive_batch_spawn_amends_each_child_routing() {
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_vnext(8);
     write_delegated_model_config(&mut driver, &["local", "child-first", "child-second"]);
     seed_batch_task_delegation(&driver, "task-batch-routing", &["first", "second"]).await;
     seed_task_payload(&driver, "task-batch-routing", "first", "explore").await;
@@ -1674,7 +1674,7 @@ async fn noninteractive_report_stamps_child_model() {
 
 #[tokio::test]
 async fn noninteractive_batch_report_stamps_child_model() {
-    let (mut driver, _tmp) = test_driver(8);
+    let (mut driver, _tmp) = test_driver_vnext(8);
     write_delegated_model_config(&mut driver, &["local", "batch-child-report"]);
     seed_batch_task_delegation(&driver, "task-batch-child-report", &["first"]).await;
     seed_task_payload(&driver, "task-batch-child-report", "first", "explore").await;
@@ -2146,7 +2146,7 @@ fn single_delegation_runs_under_pinned_generation_across_refresh() {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let (mut driver, _tmp) = test_driver_with_url_vnext(8, url.clone());
                     let config_dir = driver.cwd.join(".cockpit");
                     let providers_dir = config_dir.join("providers");
                     std::fs::create_dir_all(&providers_dir).unwrap();
@@ -3805,7 +3805,7 @@ fn delegated_failover_dispatches_backup_posture() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let (mut driver, _tmp) = test_driver(8);
+                    let (mut driver, _tmp) = test_driver_vnext(8);
                     let cwd = driver.cwd.clone();
                     // The current-thread runtime runs the whole delegation on this
                     // thread, so a thread-local trust guard makes the custom `probe`

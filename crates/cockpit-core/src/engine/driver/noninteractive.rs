@@ -12,13 +12,27 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
 #[derive(Debug, Clone)]
 pub(in crate::engine::driver) struct ChildHookLifecycle {
     subagent_id: String,
+    lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChildHookLifecycle {
     fn new(subagent_id: impl Into<String>) -> Self {
         Self {
             subagent_id: subagent_id.into(),
+            lifecycle_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn publish(&self, emitted: bool) {
+        if emitted {
+            self.lifecycle_event_emitted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn emitted(&self) -> bool {
+        self.lifecycle_event_emitted
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -235,12 +249,18 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationEntry {
     pub(in crate::engine::driver) snapshot: NoninteractiveDelegationSnapshot,
     pub(in crate::engine::driver) steer_queue: std::collections::VecDeque<NoninteractiveSteer>,
     pub(in crate::engine::driver) completion: Option<NoninteractiveCompletionPayload>,
+    /// Shared with the background execution driver's copy of this entry. The
+    /// foreground driver owns completion/cancellation reconciliation, so it
+    /// must observe a controlling stop gate emitted by the child before it
+    /// decides whether an abnormal-path observe notification is still owed.
+    pub(in crate::engine::driver) lifecycle: ChildHookLifecycle,
 }
 
 impl NoninteractiveDelegationEntry {
     pub(in crate::engine::driver) fn running(
         child_agent: String,
         snapshot: NoninteractiveDelegationSnapshot,
+        lifecycle: ChildHookLifecycle,
     ) -> Self {
         Self {
             child_agent,
@@ -249,11 +269,12 @@ impl NoninteractiveDelegationEntry {
             snapshot,
             steer_queue: std::collections::VecDeque::new(),
             completion: None,
+            lifecycle,
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::engine::driver) struct NoninteractiveDelegationRegistry {
     pub(in crate::engine::driver) entries:
         std::collections::HashMap<NoninteractiveDelegationKey, NoninteractiveDelegationEntry>,
@@ -347,9 +368,18 @@ impl NoninteractiveDelegationRegistry {
         snapshot: NoninteractiveDelegationSnapshot,
     ) {
         let key = NoninteractiveDelegationKey::new(task_call_id, label);
+        // The foreground registers before spawning its background driver. That
+        // driver re-registers after preflight; retain the shared lifecycle latch
+        // so stop-gate ownership crosses the clone boundary instead of becoming
+        // private to whichever driver copy happened to run the child.
+        let lifecycle = self
+            .entries
+            .get(&key)
+            .map(|entry| entry.lifecycle.clone())
+            .unwrap_or_else(|| ChildHookLifecycle::new(task_call_id));
         self.entries.insert(
             key,
-            NoninteractiveDelegationEntry::running(child_agent, snapshot),
+            NoninteractiveDelegationEntry::running(child_agent, snapshot, lifecycle),
         );
     }
 
@@ -363,6 +393,15 @@ impl NoninteractiveDelegationRegistry {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.snapshot = snapshot;
         }
+    }
+
+    pub(in crate::engine::driver) fn child_hook_lifecycle(
+        &self,
+        task_call_id: &str,
+        label: &str,
+    ) -> Option<ChildHookLifecycle> {
+        let key = NoninteractiveDelegationKey::new(task_call_id, label);
+        self.entries.get(&key).map(|entry| entry.lifecycle.clone())
     }
 
     pub(in crate::engine::driver) fn push_steer(
@@ -738,12 +777,13 @@ impl NoninteractiveCompletionDelivery {
 pub(in crate::engine::driver) struct BackgroundNoninteractiveJob {
     pub(in crate::engine::driver) delivered: bool,
     pub(in crate::engine::driver) handle: tokio::task::JoinHandle<()>,
+    pub(in crate::engine::driver) cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Drop for BackgroundNoninteractiveJob {
     fn drop(&mut self) {
         if !self.handle.is_finished() {
-            self.handle.abort();
+            self.cancel.cancel();
         }
     }
 }
@@ -1219,6 +1259,7 @@ impl Driver {
         let completion_task_call_id = task_call_id.clone();
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
+        let job_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
             // Keep the reservation alive for the full background child
             // lifetime, including time spent after the foreground has moved on.
@@ -1240,6 +1281,7 @@ impl Driver {
             BackgroundNoninteractiveJob {
                 delivered: false,
                 handle,
+                cancel: job_cancel,
             },
         );
         tokio::select! {
@@ -1872,7 +1914,11 @@ impl Driver {
                             &composed_brief,
                         )
                     };
-                    match run_noninteractive_resumable(
+                    let child_hook_lifecycle = self
+                        .noninteractive_delegations
+                        .child_hook_lifecycle(&task_call_id, "default")
+                        .expect("single child lifecycle registered before execution");
+                    let child_result = run_noninteractive_resumable(
                         child,
                         dispatch_brief,
                         prior_history,
@@ -1882,7 +1928,7 @@ impl Driver {
                         child_cwd.resolved.clone(),
                         self.config.clone(),
                         self.process_containment.clone(),
-                        Some(ChildHookLifecycle::new(task_call_id.clone())),
+                        Some(child_hook_lifecycle.clone()),
                         self.interrupts.clone(),
                         cancel,
                         self.approver.clone(),
@@ -1897,8 +1943,8 @@ impl Driver {
                             "default",
                         )),
                     )
-                    .await
-                    {
+                    .await;
+                    match child_result {
                         Err(e) => {
                             let (message, history, fallback_decision, failure_envelope) =
                                 e.into_parts();
@@ -2346,6 +2392,7 @@ impl Driver {
             // gate before producing this report. Only abnormal terminal paths
             // need the observe-only pairing here.
             .filter(|(_, entry)| entry.status != NoninteractiveDelegationStatus::Completed)
+            .filter(|(_, entry)| !entry.lifecycle.emitted())
             .map(|(key, entry)| {
                 (
                     key.label.clone(),
@@ -2850,34 +2897,13 @@ impl Driver {
                 let cancel_whole_job = target_task_call_id.is_some() && label.is_none();
                 if cancel_whole_job
                     && let Some(task_call_id) = selected.first().map(|row| row.task_call_id.clone())
-                    && let Some(job) = self.noninteractive_jobs.remove(&task_call_id)
+                    && let Some(job) = self.noninteractive_jobs.get(&task_call_id)
                 {
-                    job.handle.abort();
-                    self.release_noninteractive_child_locks(&selected).await;
-                    // `subagentStop` for each STARTED child of the aborted job. The
-                    // job was removed+aborted, so its completion never reaches
-                    // `finalize_background_noninteractive_completion` to fire the
-                    // paired stop — fire it here with `endReason: cancelled`. Only
-                    // live (still-running) entries are started-and-unpaired; an
-                    // already-delivered child has a terminal status and fired its
-                    // stop at delivery. This whole-job-abort path is the ONLY cancel
-                    // site that fires: a per-label cancel does NOT abort the job, so
-                    // that child's completion still flows through the delivery
-                    // funnel and is paired there (no double stop).
-                    for row in &selected {
-                        if self
-                            .noninteractive_delegations
-                            .is_live(&row.task_call_id, &row.label)
-                        {
-                            self.fire_subagent_hook(
-                                crate::config::extended::hooks::HookEvent::SubagentStop,
-                                &row.child_agent,
-                                Some(&row.task_call_id),
-                                Some("cancelled"),
-                            )
-                            .await;
-                        }
-                    }
+                    // Cancellation is cooperative. The child owns any in-flight
+                    // stop gate and publishes its terminal completion only after
+                    // hook containment cleanup has settled; delivery remains the
+                    // sole place that pairs abnormal lifecycle notifications.
+                    job.cancel.cancel();
                 }
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
@@ -3317,6 +3343,7 @@ impl Driver {
         let completion_task_call_id = task_call_id.clone();
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
+        let job_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
             let result = runner
                 .execute_batch_noninteractive_task_with_admissions(
@@ -3340,6 +3367,7 @@ impl Driver {
             BackgroundNoninteractiveJob {
                 delivered: false,
                 handle,
+                cancel: job_cancel,
             },
         );
         tokio::select! {
@@ -4135,7 +4163,11 @@ impl Driver {
                             &brief,
                         )
                     };
-                    match run_noninteractive_resumable(
+                    let child_hook_lifecycle = driver
+                        .noninteractive_delegations
+                        .child_hook_lifecycle(&entry_task_call_id, &entry.label)
+                        .expect("batch child lifecycle registered before execution");
+                    let child_result = run_noninteractive_resumable(
                         child,
                         brief,
                         prior_history,
@@ -4145,7 +4177,7 @@ impl Driver {
                         child_cwd.resolved.clone(),
                         pinned.clone(),
                         driver.process_containment.clone(),
-                        Some(ChildHookLifecycle::new(entry_task_call_id.clone())),
+                        Some(child_hook_lifecycle.clone()),
                         driver.interrupts.clone(),
                         child_cancel.clone(),
                         driver.approver.clone(),
@@ -4160,8 +4192,8 @@ impl Driver {
                             entry.label.clone(),
                         )),
                     )
-                    .await
-                    {
+                    .await;
+                    match child_result {
                         Ok(outcome) => {
                             snapshot = NoninteractiveDelegationSnapshot::from_history(
                                 outcome.history.clone(),
@@ -5422,10 +5454,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         crate::engine::agent::hooks::TokioCommandRunner::new,
                         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
                     );
-                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
-                        reason,
-                        additional_context,
-                    } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
+                    let stop_outcome = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,
                         snapshot.hooks(),
@@ -5438,7 +5467,12 @@ pub(crate) async fn run_noninteractive_resumable(
                         &mut stop_gate,
                         &cancel,
                     )
-                    .await
+                    .await;
+                    lifecycle.publish(stop_gate.lifecycle_event_emitted);
+                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                        reason,
+                        additional_context,
+                    } = stop_outcome
                         && !cancel.is_cancelled()
                     {
                         next_prompt = Driver::stop_continuation_prompt(reason, additional_context);
@@ -5474,10 +5508,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         crate::engine::agent::hooks::TokioCommandRunner::new,
                         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
                     );
-                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
-                        reason,
-                        additional_context,
-                    } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
+                    let stop_outcome = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,
                         snapshot.hooks(),
@@ -5490,7 +5521,12 @@ pub(crate) async fn run_noninteractive_resumable(
                         &mut stop_gate,
                         &cancel,
                     )
-                    .await
+                    .await;
+                    lifecycle.publish(stop_gate.lifecycle_event_emitted);
+                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                        reason,
+                        additional_context,
+                    } = stop_outcome
                         && !cancel.is_cancelled()
                     {
                         next_prompt = Driver::stop_continuation_prompt(reason, additional_context);

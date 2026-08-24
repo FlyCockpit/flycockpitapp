@@ -601,7 +601,7 @@ async fn swarm_subagent_start_and_stop_pair_for_child_agent_type_matcher() {
     );
     inject_hooks(&mut driver, reg);
 
-    driver.fire_swarm_subagent_start("sched-bee-1", "bee").await;
+    driver.fire_swarm_subagent_start("sched-bee-1", "bee", Default::default()).await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStart").await,
         vec!["failed".to_string()],
@@ -632,7 +632,7 @@ async fn swarm_subagent_start_and_stop_pair_for_child_agent_type_matcher() {
         .hooks,
     );
     inject_hooks(&mut driver, reg);
-    driver.fire_swarm_subagent_start("sched-bee-2", "bee").await;
+    driver.fire_swarm_subagent_start("sched-bee-2", "bee", Default::default()).await;
     driver
         .fire_swarm_subagent_stop_if_tracked("sched-bee-2", false)
         .await;
@@ -679,7 +679,7 @@ async fn swarm_subagent_stop_only_fires_for_a_tracked_started_child() {
     // Start then stop fires exactly once; a SECOND stop for the same job fires
     // nothing (the map removal makes the pairing exactly-once — no double-fire
     // on a duplicate/late completion).
-    driver.fire_swarm_subagent_start("sched-bee-3", "bee").await;
+    driver.fire_swarm_subagent_start("sched-bee-3", "bee", Default::default()).await;
     driver
         .fire_swarm_subagent_stop_if_tracked("sched-bee-3", false)
         .await;
@@ -707,7 +707,7 @@ async fn orphaned_swarm_child_teardown_fires_paired_subagent_stop() {
             "bee",
         ),
     );
-    driver.fire_swarm_subagent_start("sched-bee-4", "bee").await;
+    driver.fire_swarm_subagent_start("sched-bee-4", "bee", Default::default()).await;
     // `fire_swarm_subagent_start` also fires a subagentStart; clear the ledger
     // expectation by only inspecting subagentStop below.
     driver.drain_orphaned_swarm_stop_hooks().await;
@@ -727,7 +727,7 @@ async fn orphaned_swarm_child_teardown_fires_paired_subagent_stop() {
             "bee",
         ),
     );
-    driver.fire_swarm_subagent_start("sched-bee-5", "bee").await;
+    driver.fire_swarm_subagent_start("sched-bee-5", "bee", Default::default()).await;
     driver
         .fire_swarm_subagent_stop_if_tracked("sched-bee-5", false)
         .await;

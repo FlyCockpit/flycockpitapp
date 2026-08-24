@@ -1173,6 +1173,7 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
         BackgroundNoninteractiveJob {
             delivered: true,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     tokio::task::yield_now().await;
@@ -1183,7 +1184,7 @@ async fn delivered_finished_noninteractive_job_is_reaped() {
 }
 
 #[tokio::test]
-async fn whole_job_cancel_releases_aborted_child_locks() {
+async fn whole_job_cancel_is_cooperative_and_retains_job_ownership_until_completion() {
     let (mut driver, tmp) = test_driver(8);
     let path = tmp.path().join("held.rs");
     std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -1199,6 +1200,7 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
         .acquire(&path, "explore", driver.session.id)
         .await
         .unwrap();
+    let job_cancel = tokio_util::sync::CancellationToken::new();
     driver.noninteractive_jobs.insert(
         "task-lock".to_string(),
         BackgroundNoninteractiveJob {
@@ -1206,6 +1208,7 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
             handle: tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
+            cancel: job_cancel.clone(),
         },
     );
 
@@ -1219,8 +1222,9 @@ async fn whole_job_cancel_releases_aborted_child_locks() {
         .await;
 
     assert!(body.contains("cancelled"), "{body}");
-    assert!(driver.locks.holder(&path).is_none());
-    assert!(!driver.noninteractive_jobs.contains_key("task-lock"));
+    assert!(job_cancel.is_cancelled());
+    assert!(driver.locks.holder(&path).is_some());
+    assert!(driver.noninteractive_jobs.contains_key("task-lock"));
 }
 
 #[tokio::test]
@@ -1276,6 +1280,7 @@ async fn backgrounded_completion_error_becomes_async_failed_result_once() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
@@ -5435,6 +5440,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -5486,6 +5492,7 @@ async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -5539,6 +5546,7 @@ async fn noninteractive_started_child_runtime_error_still_fires_one_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
@@ -5558,6 +5566,108 @@ async fn noninteractive_started_child_runtime_error_still_fires_one_stop() {
         observe_hook_events(&driver, "subagentStop").await,
         vec!["failed".to_string()],
         "a runtime-errored started child must still fire exactly one subagentStop"
+    );
+}
+
+#[tokio::test]
+async fn background_driver_stop_gate_latch_suppresses_foreground_fallback_stop() {
+    // The foreground driver owns terminal delivery, while the cloned driver
+    // runs the child and its controlling stop gate. Re-registration during
+    // execution must retain one shared lifecycle latch across that ownership
+    // boundary; otherwise foreground error/cancel reconciliation emits a
+    // duplicate observe-only `subagentStop`.
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    driver.noninteractive_delegations.register_running(
+        "task-shared-stop",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let mut background = driver.clone_for_background_noninteractive(&tx);
+    // Both single and batch executors re-register after their own preflight.
+    background.noninteractive_delegations.register_running(
+        "task-shared-stop",
+        "default",
+        "explore".to_string(),
+        NoninteractiveDelegationSnapshot::empty(),
+    );
+    background
+        .noninteractive_delegations
+        .child_hook_lifecycle("task-shared-stop", "default")
+        .expect("background lifecycle")
+        .publish(true);
+
+    assert!(
+        driver
+            .noninteractive_delegations
+            .entries
+            .get(&NoninteractiveDelegationKey::new(
+                "task-shared-stop",
+                "default"
+            ))
+            .is_some_and(|entry| entry.lifecycle.emitted()),
+        "the foreground completion owner must observe the background stop gate"
+    );
+    driver
+        .fire_noninteractive_subagent_stops("task-shared-stop", "failed")
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop").await.is_empty(),
+        "foreground fallback reconciliation must not duplicate the controlling stop gate"
+    );
+}
+
+#[tokio::test]
+async fn background_batch_stop_gate_latches_are_isolated_per_child() {
+    let (mut driver, _tmp) = test_driver(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "explore",
+        ),
+    );
+    for label in ["gated", "failed-before-gate"] {
+        driver.noninteractive_delegations.register_running(
+            "task-shared-batch-stop",
+            label,
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+    }
+
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    let mut background = driver.clone_for_background_noninteractive(&tx);
+    for label in ["gated", "failed-before-gate"] {
+        background.noninteractive_delegations.register_running(
+            "task-shared-batch-stop",
+            label,
+            "explore".to_string(),
+            NoninteractiveDelegationSnapshot::empty(),
+        );
+    }
+    background
+        .noninteractive_delegations
+        .child_hook_lifecycle("task-shared-batch-stop", "gated")
+        .expect("gated child lifecycle")
+        .publish(true);
+
+    driver
+        .fire_noninteractive_subagent_stops("task-shared-batch-stop", "failed")
+        .await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "only the batch child that failed before reaching its controlling gate needs fallback pairing"
     );
 }
 
@@ -5589,6 +5699,7 @@ async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -5835,6 +5946,7 @@ async fn noninteractive_whole_job_cancel_fires_one_cancelled_subagent_stop() {
             handle: tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
 
@@ -5879,6 +5991,7 @@ async fn noninteractive_redelivered_completion_does_not_double_fire_stop() {
         BackgroundNoninteractiveJob {
             delivered: false,
             handle: tokio::spawn(async {}),
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);

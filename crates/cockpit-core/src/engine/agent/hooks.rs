@@ -853,8 +853,7 @@ impl CommandRunner for TokioCommandRunner {
             };
         };
         let operation_id = format!("hook-{}", Uuid::new_v4());
-        let (lease, mut io) = match containment
-            .create_and_spawn_with_io(
+        let allocation = containment.create_and_spawn_with_io(
                 session_id,
                 operation_id,
                 executable,
@@ -862,9 +861,28 @@ impl CommandRunner for TokioCommandRunner {
                 env.clone(),
                 cwd,
                 true,
-            )
-            .await
-        {
+            );
+        let cancellation = self
+            .cancellation
+            .clone()
+            .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+        let cancellation_enabled = self.cancellation.is_some();
+        let allocation_result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if cancellation_enabled => {
+                return HookRawOutput {
+                    stdout: String::new(),
+                    exit_code: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    spawn_failed: false,
+                    timeout: false,
+                    failure_reason: Some(REASON_HOOK_CANCELLED),
+                    output_truncated: false,
+                };
+            }
+            result = allocation => result,
+        };
+        let (lease, mut io) = match allocation_result {
             Ok(created) => created,
             Err(crate::process_containment::ContainmentError::DescendantContainmentUnavailable {
                 ..
@@ -982,11 +1000,6 @@ impl CommandRunner for TokioCommandRunner {
                 tokio::join!(stdin_fut, stdout_fut, stderr_fut, io.wait.as_mut());
             (stdin_result, stdout_result, stderr_result, wait_result)
         };
-        let cancellation = self
-            .cancellation
-            .clone()
-            .unwrap_or_else(tokio_util::sync::CancellationToken::new);
-        let cancellation_enabled = self.cancellation.is_some();
         let (stdin_failed, stdout_result, stdout_pipe_failed, stderr_truncated, stderr_pipe_failed, exit_code, timed_out, overflowed, cancelled) =
             tokio::select! {
                 biased;

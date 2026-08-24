@@ -479,6 +479,7 @@ pub struct AgentSession {
 struct SwarmSubagentHookState {
     subagent_type: String,
     stop_gate_completed: bool,
+    lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1472,7 +1473,11 @@ impl Driver {
             allow_unbounded_schedule_loops: self.allow_unbounded_schedule_loops,
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
             schedule,
-            noninteractive_delegations: NoninteractiveDelegationRegistry::default(),
+            // Entries are value-cloned for execution-local status/snapshots,
+            // while each child's lifecycle latch remains shared. Completion is
+            // reconciled by the foreground driver, which must know whether the
+            // background clone already emitted the controlling stop boundary.
+            noninteractive_delegations: self.noninteractive_delegations.clone(),
             vnext_child_admissions: self.vnext_child_admissions.clone(),
             vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
             job_event_rx,
@@ -3694,7 +3699,7 @@ impl Driver {
                     }
                 };
                 let replay_memo = payload.root_stop_gate.unwrap_or_default();
-                let result = match Box::pin(crate::engine::interrupt::with_root_stop_gate_memo(
+                let replay_result = Box::pin(crate::engine::interrupt::with_root_stop_gate_memo(
                     replay_memo,
                     self.replay_parked_interrupt_call(
                     interrupt_id,
@@ -3705,20 +3710,16 @@ impl Driver {
                     cancel.clone(),
                     ),
                 ))
-                .await
-                {
+                .await;
+                let resumed_result = match replay_result {
                     Ok(()) => {
-                        async {
-                            self.continue_after_parked_interrupt_replay(
-                                input_queue,
-                                tx,
-                                cancel,
-                            )
-                                .await?;
-                            Ok(ParkedReplayOutcome::Completed)
-                        }
-                        .await
+                        self.continue_after_parked_interrupt_replay(input_queue, tx, cancel)
+                            .await
                     }
+                    Err(error) => Err(error),
+                };
+                let result = match resumed_result {
+                    Ok(()) => Ok(ParkedReplayOutcome::Completed),
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         Ok(ParkedReplayOutcome::ParkedAgain)
                     }
@@ -4914,7 +4915,12 @@ impl Driver {
     /// L22), so this only ever runs for real subagents. Child-only; matcher /
     /// `subagentType` is the child agent type, `subagentId` is the schedule
     /// `job_id` (the correlation the paired stop reuses).
-    async fn fire_swarm_subagent_start(&mut self, job_id: &str, subagent_type: &str) {
+    async fn fire_swarm_subagent_start(
+        &mut self,
+        job_id: &str,
+        subagent_type: &str,
+        lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         // Record before firing so a completion racing on the same turn boundary
         // (it cannot: SwarmChildStarted is always drained first) still pairs.
         self.swarm_subagents
@@ -4923,6 +4929,7 @@ impl Driver {
                 SwarmSubagentHookState {
                     subagent_type: subagent_type.to_string(),
                     stop_gate_completed: false,
+                    lifecycle_event_emitted,
                 },
             );
         self.fire_subagent_hook(
@@ -4957,7 +4964,11 @@ impl Driver {
         // A successful child ran its controlling gate inside `run_swarm_loop`
         // before publishing the completion. Only failures bypass that gate and
         // need an observe-only terminal notification here.
-        if !failed && state.stop_gate_completed {
+        if state.stop_gate_completed
+            || state
+                .lifecycle_event_emitted
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let end_reason = if failed { "failed" } else { "aborted" };
@@ -4986,6 +4997,12 @@ impl Driver {
         let orphans: Vec<(String, SwarmSubagentHookState)> =
             self.swarm_subagents.drain().collect();
         for (job_id, state) in orphans {
+            if state
+                .lifecycle_event_emitted
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                continue;
+            }
             self.fire_subagent_hook(
                 crate::config::extended::hooks::HookEvent::SubagentStop,
                 &state.subagent_type,

@@ -34,6 +34,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
@@ -110,6 +111,11 @@ pub enum ScheduleEvent {
         /// The child's built-in agent type ([`SpawnWorkerKind::agent_name`]);
         /// the `subagentStart`/`subagentStop` matcher + `subagentType` field.
         subagent_type: String,
+        /// Shared terminal-boundary ownership. The child sets this before it
+        /// can publish completion, including cancellation/error unwinds, so a
+        /// driver teardown that has not drained the ordered marker still
+        /// cannot emit a duplicate observe-only stop.
+        lifecycle_event_emitted: Arc<AtomicBool>,
     },
     /// The detached child completed its controlling `subagentStop` boundary
     /// before publishing its terminal result. This ordered marker lets the

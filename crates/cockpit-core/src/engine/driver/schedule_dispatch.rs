@@ -23,13 +23,18 @@ impl Driver {
             ScheduleEvent::SwarmChildStarted {
                 job_id,
                 subagent_type,
+                lifecycle_event_emitted,
             } => {
                 // A genuine detached-`Swarm` child (`bee` / `scout`) started
                 // (spawn mode 3 of 3). Fire `subagentStart` and track it so the
                 // paired `subagentStop` fires when its `Completed` is drained.
                 // The authority never emits this for goal-supervision workers
                 // (guidance L22), so this boundary is child-only by construction.
-                self.fire_swarm_subagent_start(&job_id, &subagent_type)
+                self.fire_swarm_subagent_start(
+                    &job_id,
+                    &subagent_type,
+                    lifecycle_event_emitted,
+                )
                     .await;
             }
             ScheduleEvent::SwarmChildStopGateCompleted { job_id } => {

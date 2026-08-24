@@ -179,11 +179,13 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     // share this runner but are never user-facing subagents (guidance L22), so
     // the `is_goal_control` check is the single closed exclusion predicate and
     // they emit neither lifecycle event.
+    let lifecycle_event_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if !spec.worker.is_goal_control() {
         let _ = event_tx
             .send(ScheduleEvent::SwarmChildStarted {
                 job_id: job_id.clone(),
                 subagent_type: spec.worker.agent_name().to_string(),
+                lifecycle_event_emitted: lifecycle_event_emitted.clone(),
             })
             .await;
     }
@@ -225,8 +227,19 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         &turn_tx,
         &cmd_tx,
         cancel.clone(),
+        lifecycle_event_emitted.clone(),
     )
     .await;
+
+    if !spec.worker.is_goal_control()
+        && lifecycle_event_emitted.load(std::sync::atomic::Ordering::Acquire)
+    {
+        let _ = event_tx
+            .send(ScheduleEvent::SwarmChildStopGateCompleted {
+                job_id: job_id.clone(),
+            })
+            .await;
+    }
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -244,13 +257,6 @@ pub async fn run_swarm(run: SwarmRunCtx) {
 
     let result = match loop_outcome {
         Ok(text) => {
-            if !spec.worker.is_goal_control() {
-                let _ = event_tx
-                    .send(ScheduleEvent::SwarmChildStopGateCompleted {
-                        job_id: job_id.clone(),
-                    })
-                    .await;
-            }
             text
         }
         Err(e) => {
@@ -302,6 +308,7 @@ async fn run_swarm_loop(
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
     cancel: tokio_util::sync::CancellationToken,
+    lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<String> {
     let SwarmChild {
         agent,
@@ -443,10 +450,7 @@ async fn run_swarm_loop(
                     crate::engine::agent::hooks::TokioCommandRunner::new,
                     crate::engine::agent::hooks::TokioCommandRunner::with_containment,
                 );
-                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
-                    reason,
-                    additional_context,
-                } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
+                let stop_outcome = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                     &hook_runner,
                     &crate::engine::agent::hooks::DefaultProcessEnv,
                     hook_snapshot.hooks(),
@@ -459,7 +463,15 @@ async fn run_swarm_loop(
                     &mut stop_gate,
                     &cancel,
                 )
-                .await
+                .await;
+                lifecycle_event_emitted.store(
+                    stop_gate.lifecycle_event_emitted,
+                    std::sync::atomic::Ordering::Release,
+                );
+                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                    reason,
+                    additional_context,
+                } = stop_outcome
                     && !cancel.is_cancelled()
                 {
                     next_prompt = crate::engine::driver::Driver::stop_continuation_prompt(
@@ -526,10 +538,7 @@ async fn run_swarm_loop(
                     crate::engine::agent::hooks::TokioCommandRunner::new,
                     crate::engine::agent::hooks::TokioCommandRunner::with_containment,
                 );
-                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
-                    reason,
-                    additional_context,
-                } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
+                let stop_outcome = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                     &hook_runner,
                     &crate::engine::agent::hooks::DefaultProcessEnv,
                     hook_snapshot.hooks(),
@@ -542,7 +551,15 @@ async fn run_swarm_loop(
                     &mut stop_gate,
                     &cancel,
                 )
-                .await
+                .await;
+                lifecycle_event_emitted.store(
+                    stop_gate.lifecycle_event_emitted,
+                    std::sync::atomic::Ordering::Release,
+                );
+                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                    reason,
+                    additional_context,
+                } = stop_outcome
                     && !cancel.is_cancelled()
                 {
                     next_prompt = crate::engine::driver::Driver::stop_continuation_prompt(
@@ -1186,6 +1203,7 @@ mod tests {
                 &turn_tx,
                 &cmd_tx,
                 tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ),
         )
         .await

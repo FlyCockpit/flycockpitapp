@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::error::TrySendError;
@@ -393,10 +393,33 @@ impl Drop for ProcessContainmentActor {
 
 fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
     let (reply, rx) = oneshot::channel();
-    if tx.blocking_send(Op::Shutdown { reply }).is_ok() {
-        let _ = rx.blocking_recv();
+    let deadline = Instant::now() + ACTOR_SHUTDOWN_DEADLINE;
+    let mut op = Op::Shutdown { reply };
+    loop {
+        match tx.try_send(op) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                op = returned;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => return,
+        }
     }
-    let _ = join.join();
+    let mut rx = rx;
+    loop {
+        match rx.try_recv() {
+            Ok(()) => {
+                let _ = join.join();
+                return;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                if Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn wall_ms() -> i64 {
@@ -417,8 +440,18 @@ struct ActorState {
     /// Leases whose allocation reply was dropped after the actor had already
     /// published ownership. Reconciliation stays in the actor state machine;
     /// it is neither an untracked Tokio task nor a blocking retry loop.
-    pending_reconciliation: Vec<ContainmentLease>,
+    pending_reconciliation: Vec<PendingReconciliation>,
 }
+
+struct PendingReconciliation {
+    lease: ContainmentLease,
+    next_attempt: tokio::time::Instant,
+    backoff: Duration,
+}
+
+const RECONCILIATION_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const ACTOR_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 async fn actor_loop(
     db: Db,
@@ -455,11 +488,13 @@ async fn actor_loop(
                     }
                     continue;
                 }
-                // `yield_now` is immediately eligible and `select!` is
-                // unbiased, so a continuously-ready ordinary command queue
-                // cannot perpetually reset a reconciliation timer and starve
-                // actor-owned cleanup.
-                _ = tokio::task::yield_now() => {
+                _ = tokio::time::sleep_until(
+                    state.pending_reconciliation
+                        .iter()
+                        .map(|pending| pending.next_attempt)
+                        .min()
+                        .expect("non-empty reconciliation queue has a deadline")
+                ) => {
                     reconcile_one_pending(&mut state).await;
                     continue;
                 }
@@ -473,7 +508,7 @@ async fn actor_loop(
                 // survive for the next startup recovery pass; we never rewrite
                 // uncertainty into a false Empty result merely to exit.
                 if tokio::time::timeout(
-                    Duration::from_secs(5),
+                    ACTOR_SHUTDOWN_DEADLINE,
                     drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx),
                 )
                 .await
@@ -582,7 +617,9 @@ async fn actor_loop(
                     require_proven,
                 )
                 .await;
-                let _ = reply.send(result);
+                if let Err(Ok(lease)) = reply.send(result) {
+                    enqueue_pending_reconciliation(&mut state, lease);
+                }
             }
             Op::Terminate { lease, reply } => {
                 let result = terminate_one(&mut state, lease).await;
@@ -631,10 +668,15 @@ async fn actor_loop(
 
 fn enqueue_pending_reconciliation(state: &mut ActorState, lease: ContainmentLease) {
     let duplicate = state.pending_reconciliation.iter().any(|pending| {
-        pending.containment_id == lease.containment_id && pending.generation == lease.generation
+        pending.lease.containment_id == lease.containment_id
+            && pending.lease.generation == lease.generation
     });
     if !duplicate {
-        state.pending_reconciliation.push(lease);
+        state.pending_reconciliation.push(PendingReconciliation {
+            lease,
+            next_attempt: tokio::time::Instant::now(),
+            backoff: RECONCILIATION_INITIAL_BACKOFF,
+        });
     }
 }
 
@@ -670,16 +712,35 @@ async fn drain_shutdown_reconciliation(
 }
 
 async fn reconcile_one_pending(state: &mut ActorState) {
-    let Some(lease) = state.pending_reconciliation.pop() else {
+    let Some(index) = state
+        .pending_reconciliation
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, pending)| pending.next_attempt)
+        .map(|(index, _)| index)
+    else {
         return;
     };
+    let mut pending = state.pending_reconciliation.swap_remove(index);
+    if pending.next_attempt > tokio::time::Instant::now() {
+        state.pending_reconciliation.push(pending);
+        return;
+    }
+    let lease = pending.lease.clone();
     let _ = terminate_one(state, lease.clone()).await;
     match await_empty_one(state, lease.clone()).await {
         Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation => {}
         // The actor remains the sole owner and retries later. Other actor
         // commands get priority at the select above, so a slow/uncertain
         // cleanup cannot become a queue-saturation spin or starve shutdown.
-        _ => state.pending_reconciliation.insert(0, lease),
+        _ => {
+            pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
+            pending.backoff = pending
+                .backoff
+                .saturating_mul(2)
+                .min(RECONCILIATION_MAX_BACKOFF);
+            state.pending_reconciliation.push(pending);
+        }
     }
 }
 
@@ -846,6 +907,7 @@ async fn reclaim_unpublished_allocation(
     // Allocation succeeded but durable/live ownership did not. The adapter
     // handle is still available locally, so reclaim it directly and do not
     // return until its same-generation oracle proves emptiness.
+    let mut backoff = RECONCILIATION_INITIAL_BACKOFF;
     loop {
         let _ = state.adapter.terminate(handle, generation).await;
         if matches!(
@@ -854,7 +916,8 @@ async fn reclaim_unpublished_allocation(
         ) {
             return;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
     }
 }
 
@@ -1043,7 +1106,7 @@ async fn create_container(
     let generation = 1u64;
     let now = wall_ms();
     let platform_kind = state.adapter.platform_kind();
-    let guarantee = ContainmentGuarantee::Proven;
+    let guarantee = state.adapter.guarantee();
 
     let mut record = match reduce(
         None,
@@ -1061,6 +1124,27 @@ async fn create_container(
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
     persist_insert(state, &record).await?;
+
+    if require_proven && guarantee == ContainmentGuarantee::Unsupported {
+        let reason = state
+            .adapter
+            .safe_metadata()
+            .capability_reason
+            .unwrap_or_else(|| "unsupported".into());
+        let unsupported = match reduce(
+            Some(record.clone()),
+            ContainmentEvent::MarkUnsupported {
+                generation,
+                reason: reason.clone(),
+                now_wall_ms: wall_ms(),
+            },
+        ) {
+            ReduceResult::Applied(record) => *record,
+            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        };
+        persist_cas(state, &record, &unsupported).await?;
+        return Err(ContainmentError::DescendantContainmentUnavailable { reason });
+    }
 
     let allocated = match state
         .adapter
@@ -1096,6 +1180,24 @@ async fn create_container(
         }
     };
 
+    if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
+        reclaim_unpublished_allocation(state, &allocated.handle, generation).await;
+        let failed = match reduce(
+            Some(record.clone()),
+            ContainmentEvent::CreateFailed {
+                generation,
+                now_wall_ms: wall_ms(),
+            },
+        ) {
+            ReduceResult::Applied(record) => *record,
+            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        };
+        persist_cas(state, &record, &failed).await?;
+        return Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: "adapter returned a non-proven container allocation".into(),
+        });
+    }
+
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -1107,7 +1209,10 @@ async fn create_container(
         ReduceResult::Applied(r) => *r,
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
-    persist_cas_from_creating(state, &record).await?;
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        reclaim_unpublished_allocation(state, &allocated.handle, generation).await;
+        return Err(error);
+    }
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(

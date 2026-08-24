@@ -4266,41 +4266,19 @@ async fn handle_serialized_request_impl(
             if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request("assistant markdown exceeds maximum length"));
             }
-            crate::agents::parse_daemon_local_markdown(&markdown, &name)
-                .map_err(|error| bad_request(error.to_string()))?;
             let row = ctx
                 .db
                 .get_assistant(&name)
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
-            let target = crate::assistants::assistant_definition_path(Path::new(&row.home_dir));
-            let _guard =
-                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-            let current = cockpit_config::config::read_config_file_nofollow(&target)
-                .map_err(internal)?
-                .ok_or_else(|| bad_request("assistant definition is missing"))?;
-            let current_revision = crate::assistants::markdown_content_hash(
-                std::str::from_utf8(&current)
-                    .map_err(|_| bad_request("assistant definition is not valid UTF-8"))?,
-            );
-            if current_revision != expected_revision || row.content_hash != current_revision {
-                return Err(ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "assistant definition or registry changed; reload before saving"
-                        .into(),
-                });
-            }
-            if current != markdown.as_bytes() {
-                cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
-                    .map_err(internal)?;
-            }
-            let content_hash = crate::assistants::markdown_content_hash(&markdown);
-            let updated = ctx
-                .db
-                .upsert_assistant(&row.name, &row.home_dir, &row.config_json, &content_hash)
-                .await
-                .map_err(internal)?;
+            let updated =
+                crate::assistants::save_definition_cas(&ctx.db, row, markdown, &expected_revision)
+                    .await
+                    .map_err(|error| ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("assistant definition save rejected: {error:#}"),
+                    })?;
             Ok(Response::AssistantDefinitionSaved {
                 assistant: assistant_to_proto_with_definition(updated),
             })
@@ -5048,7 +5026,7 @@ async fn handle_serialized_request_impl(
                 project_root,
                 name,
                 expected_revision,
-                principal_digest(&state.principal),
+                agent_editor_lease_owner(state),
             )
             .await
         }
@@ -5063,7 +5041,7 @@ async fn handle_serialized_request_impl(
                 project_root,
                 lease_id,
                 markdown,
-                principal_digest(&state.principal),
+                agent_editor_lease_owner(state),
             )
             .await
         }
@@ -8995,6 +8973,20 @@ async fn handle_serialized_request_impl(
             None,
         )),
     }
+}
+
+fn agent_editor_lease_owner(state: &MutableClientState) -> String {
+    let session = state
+        .attached
+        .as_ref()
+        .map(|attached| attached.handle.session_id.to_string())
+        .unwrap_or_else(|| "detached".into());
+    format!(
+        "{}:{}:{}:{session}",
+        principal_digest(&state.principal),
+        state.terminal_context.client_instance_id,
+        state.terminal_context.connection_epoch,
+    )
 }
 
 #[cfg(feature = "remote")]
@@ -13744,8 +13736,16 @@ fn assistant_to_proto_with_definition(
             Ok(markdown) => {
                 match crate::agents::parse_daemon_local_markdown(&markdown, &summary.name) {
                     Ok(_) => {
-                        summary.definition_revision =
-                            Some(crate::assistants::markdown_content_hash(&markdown));
+                        summary.definition_revision = Some(crate::assistants::definition_revision(
+                            &crate::db::assistants::AssistantRow {
+                                name: summary.name.clone(),
+                                created_at: summary.created_at,
+                                home_dir: summary.home_dir.clone(),
+                                config_json: summary.config_json.clone(),
+                                content_hash: summary.content_hash.clone(),
+                            },
+                            &markdown,
+                        ));
                         summary.definition_markdown = Some(markdown);
                     }
                     Err(error) => summary.definition_diagnostic = Some(error.to_string()),

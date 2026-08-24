@@ -748,6 +748,13 @@ impl SettingsCx {
             return;
         };
         let cwd = self.agents_cwd();
+        let staging = match agent_external_edit_staging() {
+            Ok(staging) => staging,
+            Err(error) => {
+                p.status = Some(error);
+                return;
+            }
+        };
         let lease = match begin_agent_editor_lease(&cwd, &editor.name, revision) {
             Ok(lease) => lease,
             Err(error) => {
@@ -756,13 +763,6 @@ impl SettingsCx {
             }
         };
         let text = format!("{}\n", editor.text().trim_end_matches('\n'));
-        let staging = match agent_external_edit_staging() {
-            Ok(staging) => staging,
-            Err(error) => {
-                p.status = Some(error);
-                return;
-            }
-        };
         let draft = p.editing.take();
         let id = p.external_edit_ops.begin();
         p.pending_external_edit = Some(AgentExternalEdit {
@@ -1008,17 +1008,17 @@ impl SettingsCx {
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
             let text = snapshot.markdown.clone();
-            let lease = match begin_agent_editor_lease(&cwd, &name, snapshot.revision.clone()) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    p.status = Some(format!("external edit lease failed: {error}"));
-                    return;
-                }
-            };
             let staging = match agent_external_edit_staging() {
                 Ok(staging) => staging,
                 Err(error) => {
                     p.status = Some(error);
+                    return;
+                }
+            };
+            let lease = match begin_agent_editor_lease(&cwd, &name, snapshot.revision.clone()) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    p.status = Some(format!("external edit lease failed: {error}"));
                     return;
                 }
             };

@@ -47,6 +47,12 @@ const EVENT_QUEUE: usize = 1024;
 /// generous ceiling so a hung daemon causes a loud error rather than
 /// a stalled TUI.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum wait for a freshly spawned daemon child to bind its socket and
+/// answer a status request.  A debug build paginating in a ~700MB binary
+/// under CI or test parallelism can take well past the previous 5s ceiling;
+/// 30s matches the restart-handshake budget and stays well below the
+/// interactive `DAEMON_RESTART_HANDSHAKE_TIMEOUT` (90s).
+const SPAWN_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const MAX_BIASED_INBOUND_FRAMES: usize = 32;
 
@@ -855,10 +861,10 @@ fn set_own_ephemeral_paths_for_test(paths: crate::daemon::DaemonPaths) {
 }
 
 /// Poll for the daemon socket and an actual DaemonStatus response.
-/// 2ms initial backoff, doubling up to a 50ms ceiling; total cap 5s.
+/// 2ms initial backoff, doubling up to a 50ms ceiling; total cap 30s.
 async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
     let mut timer = crate::startup::PhaseTimer::start("wait_for_daemon");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + SPAWN_DAEMON_TIMEOUT;
     // Tight initial backoff: a freshly-spawned daemon child binds and starts
     // accepting in ~15ms (exec + tokio init + a ~4ms boot on a multi-GB DB),
     // so the first retry must land near that mark, not 50ms later. Ramp gently

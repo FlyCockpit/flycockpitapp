@@ -228,7 +228,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             // itself opens no session DB (its ratchet ALLOWED stays empty); the
             // single permitted default-path opener lives in cockpit-core.
             let snapshot =
-                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline, None)
+                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline, None, None)
                     .await?;
             println!(
                 "{}",

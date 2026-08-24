@@ -1,9 +1,17 @@
-//! Opaque 16-byte remote protocol identifiers and CanonicalU64DecimalStringV1.
+//! Opaque 16-byte remote protocol identifiers.
 //! Paired with packages/cockpit-protocol/src/remote-protocol-id.ts.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::marker::PhantomData;
+
+// Compatibility exports for the remote protocol package. New local code uses
+// `wire_scalar` directly so its source-level dependency inventory stays free
+// of remote-service modules.
+pub use crate::wire_scalar::{
+    CanonicalU64DecimalStringV1, decode_u64_be, encode_u64_be,
+    format_canonical_u64_decimal_string, parse_canonical_u64_decimal_string,
+};
 
 pub const REMOTE_PROTOCOL_ID_BYTES: usize = 16;
 pub const REMOTE_PROTOCOL_ID_B64URL_LEN: usize = 22;
@@ -222,97 +230,6 @@ pub type RemoteTransferId = RemoteProtocolId<kind::Transfer>;
 /// the protocol-foundation random 16-byte typed alias encoded as canonical
 /// 22-character unpadded base64url.
 pub type RemotePublicPolicyId = RemoteProtocolId<kind::PublicPolicy>;
-
-/// Nominal CanonicalU64DecimalStringV1 wire type (never a JSON number).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CanonicalU64DecimalStringV1(String);
-
-impl CanonicalU64DecimalStringV1 {
-    pub fn parse(input: &str) -> Result<Self, RemoteProtocolIdError> {
-        let v = parse_canonical_u64_decimal_string(input)?;
-        Ok(Self(format_canonical_u64_decimal_string(v)))
-    }
-
-    pub fn from_u64(value: u64) -> Self {
-        Self(format_canonical_u64_decimal_string(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn value(&self) -> u64 {
-        parse_canonical_u64_decimal_string(&self.0).expect("canonical u64 invariant")
-    }
-}
-
-impl serde::Serialize for CanonicalU64DecimalStringV1 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for CanonicalU64DecimalStringV1 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::parse(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// CanonicalU64DecimalStringV1 parser.
-pub fn parse_canonical_u64_decimal_string(input: &str) -> Result<u64, RemoteProtocolIdError> {
-    if input.is_empty() {
-        return Err(RemoteProtocolIdError::Invalid(
-            "u64 decimal spelling invalid".into(),
-        ));
-    }
-    if input == "0" {
-        return Ok(0);
-    }
-    if !input
-        .as_bytes()
-        .first()
-        .is_some_and(|b| (b'1'..=b'9').contains(b))
-    {
-        return Err(RemoteProtocolIdError::Invalid(
-            "u64 decimal spelling invalid".into(),
-        ));
-    }
-    if input.len() > 20 || !input.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(RemoteProtocolIdError::Invalid(
-            "u64 decimal spelling invalid".into(),
-        ));
-    }
-    let v: u64 = input
-        .parse()
-        .map_err(|_| RemoteProtocolIdError::Invalid("u64 decimal overflow".into()))?;
-    if v.to_string() != input {
-        return Err(RemoteProtocolIdError::Invalid(
-            "u64 decimal noncanonical".into(),
-        ));
-    }
-    Ok(v)
-}
-
-pub fn format_canonical_u64_decimal_string(value: u64) -> String {
-    value.to_string()
-}
-
-/// Network-byte-order u64 for binary protocols.
-pub fn encode_u64_be(value: u64) -> [u8; 8] {
-    value.to_be_bytes()
-}
-
-pub fn decode_u64_be(bytes: &[u8]) -> Result<u64, RemoteProtocolIdError> {
-    if bytes.len() != 8 {
-        return Err(RemoteProtocolIdError::Invalid(
-            "u64be requires 8 bytes".into(),
-        ));
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(arr))
-}
 
 #[cfg(test)]
 mod tests {

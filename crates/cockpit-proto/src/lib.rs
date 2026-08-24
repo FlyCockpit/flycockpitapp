@@ -74,6 +74,7 @@ pub mod remote_version;
 pub mod remote_wire_magic_registry;
 pub mod send_user_message_v2;
 pub mod terminal;
+pub mod wire_scalar;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

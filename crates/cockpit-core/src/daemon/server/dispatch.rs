@@ -5048,6 +5048,7 @@ async fn handle_serialized_request_impl(
                 project_root,
                 name,
                 expected_revision,
+                principal_digest(&state.principal),
             )
             .await
         }
@@ -5062,6 +5063,7 @@ async fn handle_serialized_request_impl(
                 project_root,
                 lease_id,
                 markdown,
+                principal_digest(&state.principal),
             )
             .await
         }

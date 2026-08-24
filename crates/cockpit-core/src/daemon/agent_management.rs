@@ -16,6 +16,7 @@ use crate::daemon::server::DaemonContext;
 
 #[derive(Clone)]
 struct EditorLeaseState {
+    principal_digest: String,
     root: PathBuf,
     name: String,
     revision: String,
@@ -70,6 +71,7 @@ pub async fn begin_editor_lease(
     project_root: String,
     name: String,
     expected_revision: String,
+    principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     let snapshot = tokio::task::spawn_blocking({
@@ -90,6 +92,7 @@ pub async fn begin_editor_lease(
     leases.insert(
         lease_id,
         EditorLeaseState {
+            principal_digest,
             root,
             name,
             revision: expected_revision,
@@ -108,6 +111,7 @@ pub async fn complete_editor_lease(
     project_root: String,
     lease_id: String,
     markdown: Option<String>,
+    principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     let id = Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
@@ -122,6 +126,12 @@ pub async fn complete_editor_lease(
     };
     if lease.root != root {
         return Err(bad_request("editor lease belongs to another workspace"));
+    }
+    if lease.principal_digest != principal_digest {
+        return Err(ErrorPayload {
+            code: ErrorCode::PermissionDenied,
+            message: "agent editor lease belongs to another client principal".into(),
+        });
     }
     let result = match markdown {
         Some(markdown) => tokio::task::spawn_blocking(move || {

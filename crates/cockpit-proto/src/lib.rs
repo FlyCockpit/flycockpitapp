@@ -6823,6 +6823,27 @@ mod tests {
     }
 
     #[test]
+    fn assistant_registration_revision_is_present_in_current_response_fixtures() {
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+        for response_name in ["assistant_upserted", "assistant_definition_saved"] {
+            let revision = fixture[response_name]["data"]["assistant"]["registration_revision"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !revision.is_empty(),
+                "current v13 {response_name} must carry a registry CAS token"
+            );
+        }
+        let revision = fixture["assistants"]["data"]["assistants"][0]["registration_revision"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !revision.is_empty(),
+            "current v13 assistant inventory must carry registry CAS tokens"
+        );
+    }
+
+    #[test]
     fn archived_v12_fixture_is_retained_but_not_in_the_live_compatibility_window() {
         assert!(!is_protocol_compatible(12));
         let archived = proto_fixture_tests::read_fixture_for(12, "response.json");

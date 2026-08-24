@@ -663,6 +663,83 @@ pub(crate) fn read_file_nofollow_with_identity(
     Ok(Some((file, bytes, identity)))
 }
 
+pub(crate) fn open_directory_handle_nofollow(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        return open_directory_nofollow(path, false, false);
+    }
+    #[cfg(windows)]
+    {
+        return open_windows_directory_nofollow(path, false);
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("refusing non-directory or symlink {}", path.display());
+        }
+        return std::fs::File::open(path).map_err(Into::into);
+    }
+}
+
+pub(crate) fn read_leaf_from_directory_handle(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if Path::new(leaf).components().count() != 1
+        || matches!(
+            Path::new(leaf).components().next(),
+            None | Some(std::path::Component::CurDir)
+                | Some(std::path::Component::ParentDir)
+                | Some(std::path::Component::RootDir)
+                | Some(std::path::Component::Prefix(_))
+        )
+    {
+        anyhow::bail!("retained-directory read requires one normal leaf component");
+    }
+    #[cfg(unix)]
+    let file = open_file_at_nofollow(
+        directory,
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    #[cfg(windows)]
+    let file = {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+        open_windows_relative_nofollow(
+            directory,
+            leaf,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        )?
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (directory, leaf, max_bytes);
+        anyhow::bail!("retained-directory reads are unsupported on this platform");
+    }
+    #[cfg(any(unix, windows))]
+    {
+        use std::io::Read as _;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+            anyhow::bail!("retained-directory leaf is not a bounded regular file");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            anyhow::bail!("retained-directory leaf exceeds the byte limit");
+        }
+        Ok(bytes)
+    }
+}
+
 #[cfg(windows)]
 fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;

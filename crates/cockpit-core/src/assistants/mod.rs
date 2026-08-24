@@ -123,20 +123,6 @@ pub fn assistant_definition_path(home_dir: &Path) -> PathBuf {
     home_dir.join("assistant.md")
 }
 
-#[cfg(test)]
-fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
-    validate_assistant_name(name)?;
-    let path = assistant_definition_path(home_dir);
-    let agent = crate::agents::load_daemon_local_named_from_file(&path, name)
-        .with_context(|| format!("loading assistant definition {}", path.display()))?;
-    Ok(AssistantDef {
-        name: name.to_string(),
-        description: agent.description.clone(),
-        home_dir: home_dir.to_path_buf(),
-        agent,
-    })
-}
-
 /// Load an authority-bearing assistant definition through the one daemon
 /// coordinator.  Callers must never combine a registry row obtained at one
 /// instant with an uncoordinated pathname read at another.
@@ -943,27 +929,42 @@ fn get_assistant_blocking(db: &Db, name: &str) -> Result<Option<AssistantRow>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn assistant_def_parses_via_agent_parser() {
+    #[tokio::test]
+    async fn assistant_definition_is_returned_by_daemon_coordinator_snapshot() {
+        let env = crate::test_env::lock_async().await;
         let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("my-helper");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            assistant_definition_path(&home),
-            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Helps with tests\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nStay focused.\n",
+        env.set_var("XDG_DATA_HOME", temp.path());
+        let db = Db::open_in_memory().unwrap();
+        let home = default_home_dir("my-helper").unwrap();
+        create_assistant_with_installation_id(
+            &db,
+            CreateAssistantSpec {
+                name: "my-helper".into(),
+                description: "Helps with tests".into(),
+                prompt: "Stay focused.".into(),
+                home_dir: home.clone(),
+            },
+            Uuid::from_u128(1),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = snapshot(&db, "my-helper").await.unwrap().unwrap();
+        let def = crate::agents::parse_daemon_local_markdown(
+            snapshot.definition_markdown.as_deref().unwrap(),
+            "my-helper",
         )
         .unwrap();
 
-        let def = load_from_home("my-helper", &home).unwrap();
-
         assert_eq!(def.name, "my-helper");
         assert_eq!(def.description, "Helps with tests");
-        assert_eq!(def.agent.name, "my-helper");
-        assert_eq!(def.agent.prompt, "Stay focused.");
+        assert_eq!(def.prompt, "Stay focused.");
         assert_eq!(
-            def.agent.vnext.as_ref().map(|v| v.execution_kind),
+            def.vnext.as_ref().map(|v| v.execution_kind),
             Some(ExecutionKind::Assistant)
         );
-        assert!(def.agent.tools.is_none());
+        assert!(def.tools.is_none());
+        assert!(snapshot.definition_revision.is_some());
+        assert!(snapshot.definition_diagnostic.is_none());
     }
 }

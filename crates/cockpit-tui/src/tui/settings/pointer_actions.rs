@@ -24,7 +24,7 @@ pub(super) enum GenerationNodeId {
     Jobs,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct AgentId(pub String);
+pub(super) struct AgentId(String);
 impl AgentId {
     pub(super) fn workspace(name: &str) -> Self {
         Self(format!("workspace:{name}"))
@@ -32,6 +32,10 @@ impl AgentId {
 
     pub(super) fn assistant(name: &str) -> Self {
         Self(format!("assistant:{name}"))
+    }
+
+    pub(super) fn reset_all() -> Self {
+        Self("action:reset-all".into())
     }
 
     pub(super) fn name(&self) -> &str {

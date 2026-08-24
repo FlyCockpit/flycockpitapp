@@ -852,18 +852,20 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     if entries.is_empty() {
         return Ok(0);
     }
-    if std::fs::symlink_metadata(trash.parent().expect("trash has parent"))
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(bad_request("agent reset trash root is a symlink"));
-    }
-    std::fs::create_dir_all(&trash).map_err(internal)?;
+    let trash_root = trash.parent().expect("trash has parent");
+    crate::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
+    #[cfg(unix)]
+    let _trash_root_handle =
+        crate::private_fs::open_private_dir_handle(trash_root).map_err(internal)?;
+    crate::private_fs::ensure_private_dir(&trash).map_err(internal)?;
+    #[cfg(unix)]
+    let _trash_handle = crate::private_fs::open_private_dir_handle(&trash).map_err(internal)?;
     // The prepared journal may refer to this staging directory immediately
     // after publication, so persist both the directory itself and its parent
     // first. Recovery must never observe a durable journal naming a directory
     // that existed only in volatile metadata.
     sync_dir(&trash)?;
-    sync_dir(trash.parent().expect("trash operation has parent"))?;
+    sync_dir(trash_root)?;
     let journal = ResetAllJournal {
         operation_id: operation_id.to_string(),
         phase: ResetAllPhase::Prepared,

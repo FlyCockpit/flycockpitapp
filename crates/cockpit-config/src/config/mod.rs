@@ -159,6 +159,21 @@ pub fn read_config_file_nofollow_with_identity(
         .map(|(_, bytes, identity)| (bytes, identity)))
 }
 
+/// Retain an existing directory without following any path component.
+pub fn open_config_directory_nofollow(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    files::open_directory_handle_nofollow(path)
+}
+
+/// Read one bounded regular-file leaf relative to a retained directory.
+/// Path replacement after the directory was opened cannot redirect this read.
+pub fn read_config_leaf_from_retained_directory(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
+}
+
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {

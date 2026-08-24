@@ -13,8 +13,10 @@
 //!     agent.
 //!   - `e` — **raw edit** a daemon-returned definition snapshot. Workspace
 //!     agents may use `$EDITOR` through a daemon editor lease and host-owned
-//!     staging file; assistant definitions use the in-TUI editor and their
-//!     typed revisioned RPC. The TUI never writes either authoritative file.
+//!     private staging file seeded once before launch; completion reads that
+//!     leaf through its retained directory handle and sends only the edited
+//!     bytes to the daemon. Assistant definitions use the in-TUI editor and
+//!     their typed revisioned RPC. The TUI never writes either authoritative file.
 //!   - `d` — **delete** a custom agent (arm→confirm via [`ResetButton`]).
 //!     Built-ins can never be deleted.
 //!   - `r` — **reset** the highlighted *overridden* built-in to its
@@ -94,10 +96,7 @@ pub(super) struct AgentExternalEdit {
     /// daemon; completion returns the edited bytes under this lease.
     staging_dir: tempfile::TempDir,
     staging_path: PathBuf,
-    #[cfg(unix)]
     staging_dir_handle: std::fs::File,
-    #[cfg(unix)]
-    staging_dir_identity: (u64, u64),
     lease_id: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
     /// failed/cancelled operation restores this exact editor for retry.
@@ -116,10 +115,7 @@ pub(crate) struct AgentExternalEditEffect {
 struct AgentExternalEditStaging {
     directory: tempfile::TempDir,
     path: PathBuf,
-    #[cfg(unix)]
     directory_handle: std::fs::File,
-    #[cfg(unix)]
-    directory_identity: (u64, u64),
 }
 
 fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
@@ -130,23 +126,12 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     cockpit_core::private_fs::ensure_private_dir(directory.path())
         .map_err(|error| format!("failed to secure external-edit directory: {error:#}"))?;
     let path = directory.path().join("assistant.md");
-    #[cfg(unix)]
-    let (directory_handle, directory_identity) = {
-        use std::os::unix::fs::MetadataExt as _;
-        let handle = std::fs::File::open(directory.path())
-            .map_err(|error| format!("failed to retain external-edit directory: {error}"))?;
-        let metadata = handle
-            .metadata()
-            .map_err(|error| format!("failed to identify external-edit directory: {error}"))?;
-        (handle, (metadata.dev(), metadata.ino()))
-    };
+    let directory_handle = cockpit_config::config::open_config_directory_nofollow(directory.path())
+        .map_err(|error| format!("failed to retain external-edit directory: {error:#}"))?;
     Ok(AgentExternalEditStaging {
         directory,
         path,
-        #[cfg(unix)]
         directory_handle,
-        #[cfg(unix)]
-        directory_identity,
     })
 }
 
@@ -162,29 +147,16 @@ fn read_agent_external_edit_staging(pending: &AgentExternalEdit) -> Result<Strin
     if pending.staging_path.parent() != Some(pending.staging_dir.path()) {
         return Err("external-edit staging path escaped its private directory".into());
     }
-    let metadata = std::fs::symlink_metadata(pending.staging_dir.path())
-        .map_err(|error| format!("external-edit directory disappeared: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("external-edit staging directory identity is invalid".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let held = pending
-            .staging_dir_handle
-            .metadata()
-            .map_err(|error| format!("failed to revalidate held staging directory: {error}"))?;
-        if (held.dev(), held.ino()) != pending.staging_dir_identity
-            || (metadata.dev(), metadata.ino()) != pending.staging_dir_identity
-        {
-            return Err(
-                "external-edit staging directory was replaced during editor handoff".into(),
-            );
-        }
-    }
-    let bytes = cockpit_config::config::read_config_file_nofollow(&pending.staging_path)
-        .map_err(|error| format!("failed to validate editor staging file: {error:#}"))?
-        .ok_or_else(|| "external editor removed its staging file".to_string())?;
+    let leaf = pending
+        .staging_path
+        .file_name()
+        .ok_or_else(|| "external-edit staging file has no leaf name".to_string())?;
+    let bytes = cockpit_config::config::read_config_leaf_from_retained_directory(
+        &pending.staging_dir_handle,
+        leaf,
+        cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES,
+    )
+    .map_err(|error| format!("failed to read retained editor staging file: {error:#}"))?;
     String::from_utf8(bytes).map_err(|_| "external editor produced non-UTF-8 content".into())
 }
 
@@ -285,6 +257,15 @@ impl AgentsPage {
                 ..
             }) => {
                 "↑/↓  enter: tools  e: edit definition  d: unregister (×2)  R: reset all  esc/h: back  q: close"
+            }
+            Some(AgentRow {
+                source:
+                    AgentRowSource::AssistantUnavailable {
+                        registration_revision,
+                    },
+                ..
+            }) if !registration_revision.is_empty() => {
+                "↑/↓  enter: diagnostic  d: unregister (×2)  R: reset all  esc/h: back  q: close"
             }
             Some(AgentRow {
                 source: AgentRowSource::AssistantUnavailable { .. },
@@ -391,9 +372,15 @@ impl AgentsPage {
                             markdown: Some(markdown.clone()),
                         },
                     )? {
-                        cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(_) => {
-                            Ok(())
-                        }
+                        cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(
+                            result,
+                        ) => validate_agent_mutation_result(
+                            &result,
+                            Some(agent.name()),
+                            Some(markdown),
+                            true,
+                            false,
+                        ),
                         other => Err(format!("unexpected editor completion response: {other:?}")),
                     }
                 })();
@@ -464,7 +451,10 @@ fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
         },
     );
     let (mut rows, inventory_status) = match response {
-        Ok(cockpit_core::daemon::proto::Response::AgentInventory { entries, .. }) => (
+        Ok(cockpit_core::daemon::proto::Response::AgentInventory {
+            entries,
+            inventory_revision,
+        }) if valid_agent_inventory(&entries, &inventory_revision) => (
             entries
                 .into_iter()
                 .map(|entry| AgentRow {
@@ -511,6 +501,17 @@ fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
     }
 }
 
+fn valid_agent_inventory(
+    entries: &[cockpit_core::daemon::proto::AgentInventoryEntry],
+    revision: &str,
+) -> bool {
+    let mut names = std::collections::HashSet::new();
+    !revision.is_empty()
+        && entries
+            .iter()
+            .all(|entry| !entry.name.is_empty() && names.insert(entry.name.as_str()))
+}
+
 fn agent_snapshot(
     cwd: &std::path::Path,
     name: &str,
@@ -521,7 +522,10 @@ fn agent_snapshot(
             name: name.to_string(),
         },
     )? {
-        cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) => Ok(snapshot),
+        cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) => {
+            validate_agent_snapshot(&snapshot, name, None)?;
+            Ok(snapshot)
+        }
         other => Err(format!("unexpected agent snapshot response: {other:?}")),
     }
 }
@@ -534,7 +538,7 @@ fn agent_inventory_revision(cwd: &std::path::Path) -> Result<String, String> {
     )? {
         cockpit_core::daemon::proto::Response::AgentInventory {
             inventory_revision, ..
-        } => Ok(inventory_revision),
+        } if !inventory_revision.is_empty() => Ok(inventory_revision),
         other => Err(format!("unexpected agent inventory response: {other:?}")),
     }
 }
@@ -544,6 +548,36 @@ fn mutate_agent(
     mutation: cockpit_core::daemon::proto::AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<cockpit_core::daemon::proto::AgentMutationResult, String> {
+    let expected_name = match &mutation {
+        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin { name }
+        | cockpit_core::daemon::proto::AgentMutation::SaveDefinition { name, .. }
+        | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { name, .. }
+        | cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name }
+        | cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name }
+        | cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision { name, .. } => {
+            Some(name.clone())
+        }
+        cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins => None,
+    };
+    let expected_markdown = match &mutation {
+        cockpit_core::daemon::proto::AgentMutation::SaveDefinition { markdown, .. }
+        | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { markdown, .. } => {
+            Some(markdown.clone())
+        }
+        _ => None,
+    };
+    let requires_snapshot = matches!(
+        &mutation,
+        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin { .. }
+            | cockpit_core::daemon::proto::AgentMutation::SaveDefinition { .. }
+            | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { .. }
+            | cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { .. }
+            | cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision { .. }
+    );
+    let is_delete = matches!(
+        &mutation,
+        cockpit_core::daemon::proto::AgentMutation::DeleteCustom { .. }
+    );
     match crate::tui::agent_runner::daemon_request_blocking(
         cockpit_core::daemon::proto::Request::MutateAgent {
             project_root: cwd.to_string_lossy().into_owned(),
@@ -551,7 +585,16 @@ fn mutate_agent(
             expected_revision,
         },
     )? {
-        cockpit_core::daemon::proto::Response::AgentMutated(result) => Ok(result),
+        cockpit_core::daemon::proto::Response::AgentMutated(result) => {
+            validate_agent_mutation_result(
+                &result,
+                expected_name.as_deref(),
+                expected_markdown.as_deref(),
+                requires_snapshot,
+                is_delete,
+            )?;
+            Ok(result)
+        }
         other => Err(format!("unexpected agent mutation response: {other:?}")),
     }
 }
@@ -588,10 +631,25 @@ fn begin_agent_editor_lease(
         cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
             project_root: cwd.to_string_lossy().into_owned(),
             name: name.to_string(),
-            expected_revision,
+            expected_revision: expected_revision.clone(),
         },
     )? {
-        cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => Ok(lease),
+        cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => {
+            if lease.lease_id.is_empty() {
+                return Err("daemon returned an empty editor lease ID".into());
+            }
+            validate_agent_snapshot(&lease.snapshot, name, None)?;
+            if lease.snapshot.revision != expected_revision {
+                return Err("daemon editor lease was minted for a different revision".into());
+            }
+            if !lease.snapshot.editable
+                || lease.snapshot.source_layer
+                    != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
+            {
+                return Err("daemon editor lease was minted for a non-workspace source".into());
+            }
+            Ok(lease)
+        }
         other => Err(format!("unexpected editor lease response: {other:?}")),
     }
 }
@@ -606,6 +664,17 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
     Ok(assistants
         .into_iter()
         .map(|row| {
+            if row.name.is_empty() {
+                return AgentRow {
+                    name: "<invalid-assistant>".into(),
+                    kind: AgentKind::Custom,
+                    detail: Err("daemon returned an assistant without a name".into()),
+                    model: None,
+                    source: AgentRowSource::AssistantUnavailable {
+                        registration_revision: String::new(),
+                    },
+                };
+            }
             let source = match (row.definition_markdown, row.definition_revision) {
                 (Some(markdown), Some(revision))
                     if !revision.is_empty()
@@ -659,15 +728,72 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
 
 fn coherent_assistant_save_revision(
     assistant: &cockpit_core::daemon::proto::AssistantSummary,
+    expected_name: &str,
+    expected_markdown: &str,
 ) -> Result<String, String> {
+    if assistant.name != expected_name
+        || assistant.registration_revision.is_empty()
+        || assistant.content_hash
+            != cockpit_core::assistants::markdown_content_hash(expected_markdown)
+    {
+        return Err("daemon returned a misrouted assistant save snapshot".into());
+    }
     match (
         assistant.definition_markdown.as_ref(),
         assistant.definition_revision.as_ref(),
         assistant.definition_diagnostic.as_ref(),
     ) {
-        (Some(_), Some(revision), None) if !revision.is_empty() => Ok(revision.clone()),
+        (Some(markdown), Some(revision), None)
+            if markdown == expected_markdown && !revision.is_empty() =>
+        {
+            Ok(revision.clone())
+        }
         _ => Err("daemon returned an incoherent assistant save snapshot".into()),
     }
+}
+
+fn validate_agent_snapshot(
+    snapshot: &cockpit_core::daemon::proto::AgentEditSnapshot,
+    expected_name: &str,
+    expected_markdown: Option<&str>,
+) -> Result<(), String> {
+    if snapshot.name != expected_name || snapshot.revision.is_empty() {
+        return Err("daemon returned a misrouted or revisionless agent snapshot".into());
+    }
+    if expected_markdown.is_some_and(|markdown| snapshot.markdown != markdown) {
+        return Err("daemon returned an agent snapshot with unexpected content".into());
+    }
+    if snapshot.source_identity.is_empty() {
+        return Err("daemon returned an agent snapshot without source identity".into());
+    }
+    Ok(())
+}
+
+fn validate_agent_mutation_result(
+    result: &cockpit_core::daemon::proto::AgentMutationResult,
+    expected_name: Option<&str>,
+    expected_markdown: Option<&str>,
+    requires_snapshot: bool,
+    is_delete: bool,
+) -> Result<(), String> {
+    if let Some(snapshot) = &result.snapshot {
+        let expected_name = expected_name
+            .ok_or_else(|| "daemon returned a snapshot for a global mutation".to_string())?;
+        validate_agent_snapshot(snapshot, expected_name, expected_markdown)?;
+        if expected_markdown.is_some()
+            && (!snapshot.editable
+                || snapshot.source_layer
+                    != cockpit_core::daemon::proto::AgentSourceLayer::Workspace)
+        {
+            return Err("daemon returned saved content from a non-workspace source".into());
+        }
+    } else if requires_snapshot {
+        return Err("daemon omitted the mutation's target snapshot".into());
+    }
+    if is_delete && (!result.changed || result.affected != 1 || result.snapshot.is_some()) {
+        return Err("daemon returned an incoherent custom-agent deletion result".into());
+    }
+    Ok(())
 }
 
 /// Present the effective-model display value in canonical `provider/model`
@@ -752,12 +878,12 @@ impl SettingsCx {
                             match crate::tui::agent_runner::daemon_request_blocking(
                                 cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
                                     name: name.clone(),
-                                    markdown: text,
+                                    markdown: text.clone(),
                                     expected_revision: revision,
                                 },
                             ) {
                                 Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { assistant }) => {
-                                    coherent_assistant_save_revision(&assistant).map(|_| ())
+                                    coherent_assistant_save_revision(&assistant, &name, &text).map(|_| ())
                                 }
                                 Ok(other) => Err(format!("unexpected assistant save response: {other:?}")),
                                 Err(error) => Err(error),
@@ -938,10 +1064,7 @@ impl SettingsCx {
             agent: expected,
             staging_path: staging.path,
             staging_dir: staging.directory,
-            #[cfg(unix)]
             staging_dir_handle: staging.directory_handle,
-            #[cfg(unix)]
-            staging_dir_identity: staging.directory_identity,
             lease_id: lease.lease_id,
             draft,
             servicing: false,
@@ -1010,10 +1133,18 @@ impl SettingsCx {
         if let Err(error) = &row.detail {
             p.status = Some(
                 if matches!(&row.source, AgentRowSource::AssistantUnavailable { .. }) {
-                    format!(
-                        "assistant `{}` is unavailable and cannot be edited or deleted: {error}",
-                        row.name
-                    )
+                    match &row.source {
+                        AgentRowSource::AssistantUnavailable {
+                            registration_revision,
+                        } if !registration_revision.is_empty() => format!(
+                            "assistant `{}` is unavailable and cannot be edited; it can still be unregistered with d: {error}",
+                            row.name
+                        ),
+                        _ => format!(
+                            "assistant `{}` is unavailable and cannot be edited or unregistered because its registry revision is missing: {error}",
+                            row.name
+                        ),
+                    }
                 } else {
                     format!(
                         "`{}` has a parse error; use the raw editor to repair it: {error}",
@@ -1075,7 +1206,12 @@ impl SettingsCx {
             return;
         }
         p.rows = rows_for(&cwd).0;
-        if let Some(idx) = p.rows.iter().position(|r| r.name == name) {
+        let selected_id = row_agent_id(&name, &source);
+        if let Some(idx) = p
+            .rows
+            .iter()
+            .position(|row| row_agent_id(&row.name, &row.source) == selected_id)
+        {
             p.cursor = idx;
         }
         let draft = ToolSurfaceDraft::from_def(&def);
@@ -1130,7 +1266,7 @@ impl SettingsCx {
             match response {
                 Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
                     assistant,
-                }) => match coherent_assistant_save_revision(&assistant) {
+                }) => match coherent_assistant_save_revision(&assistant, &detail.name, &markdown) {
                     Ok(revision) => detail.revision = Some(revision),
                     Err(error) => {
                         detail.status = Some(error);
@@ -1277,10 +1413,7 @@ impl SettingsCx {
                 agent: super::pointer_actions::AgentId::workspace(&name),
                 staging_path: staging.path,
                 staging_dir: staging.directory,
-                #[cfg(unix)]
                 staging_dir_handle: staging.directory_handle,
-                #[cfg(unix)]
-                staging_dir_identity: staging.directory_identity,
                 lease_id: lease.lease_id,
                 draft: Some(draft),
                 servicing: false,
@@ -1375,6 +1508,15 @@ impl SettingsCx {
         }
         let cwd = self.agents_cwd();
         let result = match &row.source {
+            AgentRowSource::Assistant {
+                registration_revision,
+                ..
+            }
+            | AgentRowSource::AssistantUnavailable {
+                registration_revision,
+            } if registration_revision.is_empty() => Err(
+                "assistant cannot be unregistered because its registry revision is missing".into(),
+            ),
             AgentRowSource::Assistant {
                 registration_revision,
                 ..
@@ -1608,7 +1750,7 @@ impl SettingsCx {
             &mut lines,
             area.width,
             "Enter opens a structured tool editor; e edits a daemon snapshot. \
-             Workspace agents can use $EDITOR through a leased staging file; assistants use the in-TUI editor. Editing a built-in ejects its default first. The model is \
+             Workspace agents can use $EDITOR through a private, securely seeded leased staging file; its edited bytes are committed by the daemon. Assistants use the in-TUI editor. Editing a built-in ejects its default first. The model is \
              the `model:` frontmatter field (provider/model). Delete uses the source-specific daemon authority; reset reverts an overridden built-in.",
             muted,
         );
@@ -1697,10 +1839,16 @@ impl SettingsCx {
                         "[Unregister]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
                     )),
-                    (AgentRowSource::AssistantUnavailable { .. }, _) => Some((
+                    (
+                        AgentRowSource::AssistantUnavailable {
+                            registration_revision,
+                        },
+                        _,
+                    ) if !registration_revision.is_empty() => Some((
                         "[Unregister]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
                     )),
+                    (AgentRowSource::AssistantUnavailable { .. }, _) => None,
                     (AgentRowSource::Agent, AgentKind::Custom) => Some((
                         "[Delete]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
@@ -1751,9 +1899,9 @@ impl SettingsCx {
             lines.push(Line::from("[Cancel]"));
             controls.push(Some((
                 super::pointer_actions::SettingsPointerAction::Agents(
-                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
-                        "reset-all".into(),
-                    )),
+                    super::pointer_actions::AgentsAction::Cancel(
+                        super::pointer_actions::AgentId::reset_all(),
+                    ),
                 ),
                 true,
                 None,
@@ -2821,7 +2969,7 @@ pub(super) mod tests {
         // (edit_selected_in_tui), bypassing the v2 detail-page guard.
         let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Edit(
-                super::super::pointer_actions::AgentId("pointer-agent".into()),
+                super::super::pointer_actions::AgentId::workspace("pointer-agent"),
             ),
         );
         click_agent_action(&mut dialog, &edit_action);
@@ -2874,7 +3022,7 @@ pub(super) mod tests {
             "click row is relative to retained editor-body origin"
         );
 
-        let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+        let agent = super::super::pointer_actions::AgentId::workspace("pointer-agent");
         let action = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
         );
@@ -2983,7 +3131,7 @@ pub(super) mod tests {
             &cwd,
             operation,
             super::super::pointer_actions::AgentsAction::ExternalEditResult(
-                super::super::pointer_actions::AgentId("replacement-agent".into()),
+                super::super::pointer_actions::AgentId::workspace("replacement-agent"),
                 super::super::pointer_actions::ExternalEditOutcome::Saved,
             ),
             None,
@@ -3263,7 +3411,7 @@ pub(super) mod tests {
             // (edit_selected_in_tui), bypassing the v2 detail-page guard.
             let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Edit(
-                    super::super::pointer_actions::AgentId("pointer-agent".into()),
+                    super::super::pointer_actions::AgentId::workspace("pointer-agent"),
                 ),
             );
             click_agent_action(&mut dialog, &edit_action);
@@ -3272,7 +3420,7 @@ pub(super) mod tests {
                 .as_mut()
                 .expect("raw editor opens")
                 .paste("changed-by-pointer\n");
-            let agent = super::super::pointer_actions::AgentId("pointer-agent".into());
+            let agent = super::super::pointer_actions::AgentId::workspace("pointer-agent");
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 if terminal == "save" {
                     super::super::pointer_actions::AgentsAction::Save(agent)
@@ -3391,14 +3539,14 @@ pub(super) mod tests {
         let identities = page(&source)
             .rows
             .iter()
-            .map(|row| super::super::pointer_actions::AgentId(row.name.clone()))
+            .map(|row| row_agent_id(&row.name, &row.source))
             .collect::<Vec<_>>();
         assert!(!identities.is_empty(), "populated Agents source has rows");
 
         for agent in &identities {
             let tmp = TempDir::new().unwrap();
             let mut dialog = populated_pointer_agents_dialog(&tmp);
-            focus(&mut dialog, &agent.0);
+            focus(&mut dialog, agent.name());
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Open(agent.clone()),
             );
@@ -3431,7 +3579,7 @@ pub(super) mod tests {
                 page(&dialog)
                     .editing
                     .as_ref()
-                    .is_some_and(|editor| editor.name == agent.0),
+                    .is_some_and(|editor| editor.name == agent.name()),
                 "Edit reaches the real raw-editor transition for {agent:?}"
             );
         }
@@ -3439,7 +3587,7 @@ pub(super) mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dialog = populated_pointer_agents_dialog(&tmp);
         focus(&mut dialog, "pointer-agent");
-        let custom = super::super::pointer_actions::AgentId("pointer-agent".into());
+        let custom = super::super::pointer_actions::AgentId::workspace("pointer-agent");
         let delete = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Delete(custom.clone()),
         );
@@ -3465,7 +3613,7 @@ pub(super) mod tests {
         assert!(page(&dialog).confirm_reset);
         let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Cancel(
-                super::super::pointer_actions::AgentId("reset-all".into()),
+                super::super::pointer_actions::AgentId::reset_all(),
             ),
         );
         click_agent_action(&mut dialog, &cancel);
@@ -3475,7 +3623,7 @@ pub(super) mod tests {
             "cancelling ResetAll preserves configured agents"
         );
 
-        let builtin = super::super::pointer_actions::AgentId("Build".into());
+        let builtin = super::super::pointer_actions::AgentId::workspace("Build");
         let reset = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Reset(builtin.clone()),
         );

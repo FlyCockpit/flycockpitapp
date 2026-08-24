@@ -222,6 +222,10 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
             "crates/cockpit-tui/src/tui/app/events.rs",
             "let mut command = std::process::Command::new(\"git\");",
         ),
+        (
+            "crates/cockpit-tui/src/clipboard/executable.rs",
+            "let mut cmd = Command::new(path);",
+        ),
     ];
 
     fn visit(
@@ -266,6 +270,35 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
                             line_number + 1
                         ));
                     }
+                }
+                let imported_command_call = line.contains("Command::new(")
+                    && !line.contains("std::process::Command::new(")
+                    && !line.contains("tokio::process::Command::new(");
+                if imported_command_call {
+                    if let Some(allowed) = ALLOWED
+                        .iter()
+                        .find(|(file, exact)| relative == *file && line.trim() == *exact)
+                    {
+                        *hits.entry(*allowed).or_default() += 1;
+                    } else {
+                        findings.push(format!(
+                            "{relative}:{}: imported process Command authority",
+                            line_number + 1
+                        ));
+                    }
+                }
+                let trimmed = line.trim();
+                if (trimmed.starts_with("use std::process")
+                    || trimmed.starts_with("use tokio::process")
+                    || trimmed.starts_with("use std as ")
+                    || trimmed.starts_with("use tokio as "))
+                    && trimmed != "use std::process::{Command, Stdio};"
+                    && trimmed != "use std::process::ExitStatus;"
+                {
+                    findings.push(format!(
+                        "{relative}:{}: process import/alias obscures authority audit",
+                        line_number + 1
+                    ));
                 }
             }
         }
@@ -333,10 +366,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         (
             "crates/cockpit-tui/src/tui/settings/agents_page.rs",
             "cockpit_config::config::write_config_bytes_atomic(&staging.path, text.as_bytes())",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/panes.rs",
-            "if let Err(error) = std::fs::write(&path, effect.text_before_launch) {",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -457,7 +486,15 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                     }
                 }
             }
-            if production.contains("use std::fs as ") || production.contains("use tokio::fs as ") {
+            if production.contains("use std::fs as ")
+                || production.contains("use tokio::fs as ")
+                || production.contains("use std::fs::{self")
+                || production.contains("use tokio::fs::{self")
+                || production.lines().any(|line| line.trim() == "use std::fs;")
+                || production
+                    .lines()
+                    .any(|line| line.trim() == "use tokio::fs;")
+            {
                 findings.push(format!(
                     "{relative}: filesystem alias obscures authority audit"
                 ));

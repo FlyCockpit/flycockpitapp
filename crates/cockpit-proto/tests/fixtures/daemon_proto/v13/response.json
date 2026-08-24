@@ -202,6 +202,7 @@
         "created_at": 1700000000,
         "home_dir": "/tmp/assistants/helper-bot",
         "name": "helper-bot",
+        "registration_revision": "registration-revision-fixture",
         "definition_markdown": null,
         "definition_revision": null,
         "definition_diagnostic": null
@@ -218,6 +219,7 @@
           "created_at": 1700000000,
           "home_dir": "/tmp/assistants/helper-bot",
           "name": "helper-bot",
+          "registration_revision": "registration-revision-fixture",
           "definition_markdown": null,
           "definition_revision": null,
           "definition_diagnostic": null
@@ -2124,6 +2126,7 @@
         "created_at": 1700000000,
         "home_dir": "/tmp/assistants/helper-bot",
         "name": "helper-bot",
+        "registration_revision": "registration-revision-fixture",
         "definition_markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n",
         "definition_revision": "revision",
         "definition_diagnostic": null

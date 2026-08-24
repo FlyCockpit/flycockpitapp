@@ -515,6 +515,7 @@ pub(super) fn is_remote_mutating_request(request: &Request) -> bool {
     proto::command!(command_is_remote_mutating_match, request)
 }
 
+#[cfg(feature = "remote")]
 pub(super) async fn audit_remote_request(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,

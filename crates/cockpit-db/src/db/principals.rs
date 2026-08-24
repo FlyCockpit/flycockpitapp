@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::db::Db;
 
 #[allow(dead_code)]
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAuditRow {
     pub audit_id: i64,
@@ -32,6 +33,7 @@ impl Db {
         .await
     }
 
+    #[cfg(feature = "remote")]
     pub async fn insert_remote_audit(
         &self,
         principal: &str,
@@ -43,6 +45,7 @@ impl Db {
             .await
     }
 
+    #[cfg(feature = "remote")]
     pub async fn insert_remote_audit_with_path(
         &self,
         principal: &str,
@@ -77,6 +80,7 @@ impl Db {
     }
 
     #[allow(dead_code)]
+    #[cfg(feature = "remote")]
     pub async fn list_remote_audit(&self) -> Result<Vec<RemoteAuditRow>> {
         self.read(|conn| {
             let mut stmt = conn
@@ -119,6 +123,7 @@ impl Db {
         .await
     }
 
+    #[cfg(feature = "remote")]
     pub async fn list_remote_audit_after(
         &self,
         cursor_audit_id: i64,
@@ -214,25 +219,9 @@ mod tests {
             Some(true)
         );
 
-        db.insert_remote_audit_with_path(
-            "flycockpit:user-1",
-            "approval_decision",
-            Some(session.session_id),
-            "denied",
-            Some("src/main.rs"),
-        )
-        .await
-        .unwrap();
-
-        let rows = db.list_remote_audit().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].principal, "flycockpit:user-1");
-        assert_eq!(rows[0].request_kind, "approval_decision");
-        assert_eq!(rows[0].session_id, Some(session.session_id));
-        assert_eq!(rows[0].verdict, "denied");
-        assert_eq!(rows[0].path.as_deref(), Some("src/main.rs"));
     }
 
+    #[cfg(feature = "remote")]
     #[tokio::test]
     async fn sharing_flag_and_remote_audit_round_trip() {
         let db = Db::open_in_memory().unwrap();

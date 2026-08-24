@@ -84,15 +84,27 @@ fn tui_db_surface_behavior_matrix() {
 
 #[test]
 fn tui_agent_authority_is_daemon_owned() {
-    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
-    let goals = read("crates/cockpit-tui/src/tui/goal_settings_pane.rs");
-    let production = format!("{agents}\n{goals}");
+    fn production_part(source: String) -> String {
+        source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(&source)
+            .to_string()
+    }
+    let agents = production_part(read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
+    let goals = production_part(read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));
+    let tools = production_part(read("crates/cockpit-tui/src/tui/tools_pane.rs"));
+    let production = format!("{agents}\n{goals}\n{tools}");
     for forbidden in [
         "cockpit_core::agents::resolve(",
         "cockpit_core::agents::list_all(",
         "cockpit_core::agents::eject_builtin(",
         "cockpit_core::agents::find_override(",
         "cockpit_core::agents::reset_all_builtins(",
+        "cockpit_core::assistants::load_from_home(",
+        "cockpit_core::agents::load_daemon_local_named_from_file(",
+        "Request::FsWrite",
+        "Request::UpsertAssistant",
         "std::fs::write(",
         "std::fs::remove_file(",
     ] {
@@ -107,6 +119,7 @@ fn tui_agent_authority_is_daemon_owned() {
         "MutateAgent",
         "BeginAgentEditorLease",
         "CompleteAgentEditorLease",
+        "SaveAssistantDefinition",
     ] {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }

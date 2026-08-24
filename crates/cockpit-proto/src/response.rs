@@ -423,6 +423,10 @@ pub enum Response {
         assistant: AssistantSummary,
     },
 
+    AssistantDefinitionSaved {
+        assistant: AssistantSummary,
+    },
+
     AssistantSessionCreated {
         session: AssistantSessionCreated,
     },
@@ -1157,6 +1161,7 @@ macro_rules! response_variants {
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");
+            (Response::AssistantDefinitionSaved { .. }, "assistant_definition_saved");
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");
             (Response::AutoTitle { .. }, "auto_title");
             (Response::ExportSessionData { .. }, "export_session_data");

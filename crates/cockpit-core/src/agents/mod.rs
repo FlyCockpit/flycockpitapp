@@ -1163,6 +1163,19 @@ pub fn load_daemon_local_named_from_file(path: &Path, name: &str) -> Result<Agen
     Ok(def)
 }
 
+/// Validate exact markdown bytes for a daemon-owned assistant definition
+/// without requiring a client-visible or temporary authoritative path.
+pub fn parse_daemon_local_markdown(text: &str, name: &str) -> Result<AgentDef> {
+    let def = parse_agent_with_scope(
+        text,
+        name,
+        PathBuf::from("<daemon-assistant-definition>"),
+        DefinitionScope::DaemonLocal,
+    )?;
+    validate_invariants(&def)?;
+    Ok(def)
+}
+
 /// Load exactly the daemon-owned path recorded for one selected installation
 /// into the profile catalog.  This deliberately takes the installation UUID
 /// and observation receipt from the installation service: display names are

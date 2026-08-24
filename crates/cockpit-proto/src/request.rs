@@ -717,6 +717,14 @@ pub enum Request {
         content_hash: String,
     },
 
+    /// Validate, CAS-write, and update the assistant registry as one daemon
+    /// operation. Clients never combine generic FsWrite with registry upsert.
+    SaveAssistantDefinition {
+        name: String,
+        markdown: String,
+        expected_revision: String,
+    },
+
     /// Create a new assistant session through the daemon registry. The
     /// session is deferred and is not persisted until its first user message.
     CreateAssistantSession {
@@ -2923,6 +2931,7 @@ macro_rules! request_variants {
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
+            (Request::SaveAssistantDefinition { .. }, "save_assistant_definition");
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
             (Request::AutoTitle { .. }, "auto_title");
             (Request::ExportSessionData { .. }, "export_session_data");
@@ -3200,6 +3209,7 @@ macro_rules! command {
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
+            (Request::SaveAssistantDefinition { name, markdown, expected_revision }, "save_assistant_definition", owner_only, none, true, local_only, none, serialized, none, "name:String|markdown:String|expected_revision:String", [name: String => param, markdown: String => param, expected_revision: String => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);

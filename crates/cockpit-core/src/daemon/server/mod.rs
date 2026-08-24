@@ -624,7 +624,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
-        proto::Response::AssistantUpserted { assistant } => {
+        proto::Response::AssistantUpserted { assistant }
+        | proto::Response::AssistantDefinitionSaved { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }
         proto::Response::ImportSessionArchive { .. } => {}
@@ -1514,11 +1515,17 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         home_dir,
         config_json,
         content_hash,
+        definition_markdown,
+        definition_revision,
+        definition_diagnostic,
     } = assistant;
     scrub_string(name, redact);
     scrub_string(home_dir, redact);
     scrub_string(config_json, redact);
     scrub_string(content_hash, redact);
+    scrub_option_string(definition_markdown, redact);
+    scrub_option_string(definition_revision, redact);
+    scrub_option_string(definition_diagnostic, redact);
 }
 
 fn scrub_assistant_session_created(

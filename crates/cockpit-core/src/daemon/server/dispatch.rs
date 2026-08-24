@@ -4211,7 +4211,7 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(internal)?
                 .into_iter()
-                .map(assistant_to_proto)
+                .map(assistant_to_proto_with_definition)
                 .collect();
             Ok(Response::Assistants { assistants })
         }
@@ -4250,6 +4250,60 @@ async fn handle_serialized_request_impl(
                 assistant: assistant_to_proto(row),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "upsert_assistant", response)
+        }
+        Request::SaveAssistantDefinition {
+            name,
+            markdown,
+            expected_revision,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent assistant writes",
+                ));
+            }
+            crate::assistants::validate_assistant_name(&name)
+                .map_err(|error| bad_request(error.to_string()))?;
+            if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
+                return Err(bad_request("assistant markdown exceeds maximum length"));
+            }
+            crate::agents::parse_daemon_local_markdown(&markdown, &name)
+                .map_err(|error| bad_request(error.to_string()))?;
+            let row = ctx
+                .db
+                .get_assistant(&name)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
+            let target = crate::assistants::assistant_definition_path(Path::new(&row.home_dir));
+            let _guard =
+                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+            let current = cockpit_config::config::read_config_file_nofollow(&target)
+                .map_err(internal)?
+                .ok_or_else(|| bad_request("assistant definition is missing"))?;
+            let current_revision = crate::assistants::markdown_content_hash(
+                std::str::from_utf8(&current)
+                    .map_err(|_| bad_request("assistant definition is not valid UTF-8"))?,
+            );
+            if current_revision != expected_revision || row.content_hash != current_revision {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "assistant definition or registry changed; reload before saving"
+                        .into(),
+                });
+            }
+            if current != markdown.as_bytes() {
+                cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
+                    .map_err(internal)?;
+            }
+            let content_hash = crate::assistants::markdown_content_hash(&markdown);
+            let updated = ctx
+                .db
+                .upsert_assistant(&row.name, &row.home_dir, &row.config_json, &content_hash)
+                .await
+                .map_err(internal)?;
+            Ok(Response::AssistantDefinitionSaved {
+                assistant: assistant_to_proto_with_definition(updated),
+            })
         }
 
         Request::AddPackage {
@@ -4980,13 +5034,8 @@ async fn handle_serialized_request_impl(
             mutation,
             expected_revision,
         } => {
-            crate::daemon::agent_management::mutate(
-                ctx,
-                project_root,
-                mutation,
-                expected_revision,
-            )
-            .await
+            crate::daemon::agent_management::mutate(ctx, project_root, mutation, expected_revision)
+                .await
         }
 
         Request::BeginAgentEditorLease {
@@ -9302,7 +9351,7 @@ async fn handle_concurrent_request_impl(
                 .await
                 .map_err(internal)?
                 .into_iter()
-                .map(assistant_to_proto)
+                .map(assistant_to_proto_with_definition)
                 .collect();
             Ok(Response::Assistants { assistants })
         }
@@ -13674,7 +13723,35 @@ pub(super) fn assistant_to_proto(
         home_dir: row.home_dir,
         config_json: row.config_json,
         content_hash: row.content_hash,
+        definition_markdown: None,
+        definition_revision: None,
+        definition_diagnostic: None,
     }
+}
+
+fn assistant_to_proto_with_definition(
+    row: crate::db::assistants::AssistantRow,
+) -> proto::AssistantSummary {
+    let mut summary = assistant_to_proto(row);
+    let path = crate::assistants::assistant_definition_path(Path::new(&summary.home_dir));
+    match cockpit_config::config::read_config_file_nofollow(&path) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(markdown) => {
+                match crate::agents::parse_daemon_local_markdown(&markdown, &summary.name) {
+                    Ok(_) => {
+                        summary.definition_revision =
+                            Some(crate::assistants::markdown_content_hash(&markdown));
+                        summary.definition_markdown = Some(markdown);
+                    }
+                    Err(error) => summary.definition_diagnostic = Some(error.to_string()),
+                }
+            }
+            Err(_) => summary.definition_diagnostic = Some("definition is not valid UTF-8".into()),
+        },
+        Ok(None) => summary.definition_diagnostic = Some("definition is missing".into()),
+        Err(error) => summary.definition_diagnostic = Some(error.to_string()),
+    }
+    summary
 }
 
 /// Non-secret JSON projection of a registered package row for the

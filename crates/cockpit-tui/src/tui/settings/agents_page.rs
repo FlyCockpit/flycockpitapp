@@ -148,10 +148,7 @@ pub(super) struct AgentRow {
 #[derive(Clone)]
 enum AgentRowSource {
     Agent,
-    Assistant {
-        home_dir: PathBuf,
-        config_json: String,
-    },
+    Assistant { markdown: String, revision: String },
 }
 
 pub(super) struct AgentDetail {
@@ -506,21 +503,30 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
     Ok(assistants
         .into_iter()
         .map(|row| {
-            let home_dir = PathBuf::from(&row.home_dir);
-            let definition = cockpit_core::assistants::load_from_home(&row.name, &home_dir);
+            let definition = row
+                .definition_markdown
+                .as_deref()
+                .ok_or_else(|| {
+                    row.definition_diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "assistant definition unavailable".into())
+                })
+                .and_then(|markdown| {
+                    cockpit_core::agents::parse_daemon_local_markdown(markdown, &row.name)
+                        .map_err(|error| error.to_string())
+                });
             let (detail, model) = match definition {
-                Ok(def) => (Ok(def.description), normalize_model(def.agent.model)),
-                Err(error) => (Err(error.to_string()), None),
+                Ok(def) => (Ok(def.description), normalize_model(def.model)),
+                Err(error) => (Err(error), None),
             };
+            let markdown = row.definition_markdown.unwrap_or_default();
+            let revision = row.definition_revision.unwrap_or_default();
             AgentRow {
                 name: row.name,
                 kind: AgentKind::Custom,
                 detail,
                 model,
-                source: AgentRowSource::Assistant {
-                    home_dir,
-                    config_json: row.config_json,
-                },
+                source: AgentRowSource::Assistant { markdown, revision },
             }
         })
         .collect())
@@ -839,18 +845,11 @@ impl SettingsCx {
                     return;
                 }
             },
-            AgentRowSource::Assistant { home_dir, .. } => {
-                let path = cockpit_core::assistants::assistant_definition_path(home_dir);
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        p.status =
-                            Some(format!("edit failed: reading {}: {error}", path.display()));
-                        return;
-                    }
-                };
-                (path, text, None)
-            }
+            AgentRowSource::Assistant { markdown, revision } => (
+                PathBuf::from("<daemon-assistant-definition>"),
+                markdown.clone(),
+                Some(revision.clone()),
+            ),
         };
         let load_result = match &source {
             AgentRowSource::Agent => cockpit_core::agents::parse_agent(
@@ -859,7 +858,7 @@ impl SettingsCx {
                 PathBuf::from("<daemon-agent-snapshot>"),
             ),
             AgentRowSource::Assistant { .. } => {
-                cockpit_core::agents::load_daemon_local_named_from_file(&path, &name)
+                cockpit_core::agents::parse_daemon_local_markdown(&original_text, &name)
             }
         };
         let def = match load_result {
@@ -929,7 +928,32 @@ impl SettingsCx {
                 return;
             }
         };
-        if let Some(revision) = detail.revision.clone() {
+        if let AgentRowSource::Assistant { .. } = &detail.source {
+            let Some(expected_revision) = detail.revision.clone() else {
+                detail.status = Some("save failed: missing assistant revision".into());
+                return;
+            };
+            let response = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                    name: detail.name.clone(),
+                    markdown: markdown.clone(),
+                    expected_revision,
+                },
+            );
+            match response {
+                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
+                    assistant,
+                }) => detail.revision = assistant.definition_revision,
+                Ok(other) => {
+                    detail.status = Some(format!("unexpected assistant save response: {other:?}"));
+                    return;
+                }
+                Err(error) => {
+                    detail.status = Some(format!("save Unavailable — {error}; Retry"));
+                    return;
+                }
+            }
+        } else if let Some(revision) = detail.revision.clone() {
             match mutate_agent(
                 &self.agents_cwd(),
                 cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
@@ -947,41 +971,8 @@ impl SettingsCx {
                 }
             }
         } else {
-            let AgentRowSource::Assistant { home_dir, .. } = &detail.source else {
-                detail.status = Some("save failed: missing daemon agent revision".into());
-                return;
-            };
-            let Some(file_name) = detail.path.file_name().and_then(|name| name.to_str()) else {
-                detail.status = Some("save failed: assistant definition has no filename".into());
-                return;
-            };
-            let base_hash = cockpit_core::assistants::markdown_content_hash(&detail.original_text);
-            let request = cockpit_core::daemon::proto::Request::FsWrite {
-                project_root: home_dir.to_string_lossy().into_owned(),
-                path: file_name.to_string(),
-                content: markdown.clone(),
-                base_hash: Some(base_hash),
-            };
-            if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
-                detail.status = Some(format!("save Unavailable — {error}; Retry"));
-                return;
-            }
-        }
-        if let AgentRowSource::Assistant {
-            home_dir,
-            config_json,
-        } = &detail.source
-        {
-            let request = cockpit_core::daemon::proto::Request::UpsertAssistant {
-                name: detail.name.clone(),
-                home_dir: home_dir.to_string_lossy().into_owned(),
-                config_json: config_json.clone(),
-                content_hash: cockpit_core::assistants::markdown_content_hash(&markdown),
-            };
-            if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
-                detail.status = Some(format!("save Unavailable — {error}; Retry"));
-                return;
-            }
+            detail.status = Some("save failed: missing daemon agent revision".into());
+            return;
         }
         detail.original_text = markdown;
         detail.status = Some(match cleanup_notice {

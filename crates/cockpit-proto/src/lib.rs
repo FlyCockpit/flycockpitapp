@@ -2188,6 +2188,11 @@ pub struct AssistantSummary {
     pub home_dir: String,
     pub config_json: String,
     pub content_hash: String,
+    /// Daemon-read exact authored definition; absent when the registered file
+    /// cannot be safely opened or parsed.
+    pub definition_markdown: Option<String>,
+    pub definition_revision: Option<String>,
+    pub definition_diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

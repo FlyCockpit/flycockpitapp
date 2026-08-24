@@ -575,7 +575,14 @@ impl ScheduleAuthority {
     /// Drop a job that reported terminal completion from its own spawned
     /// task. In-context loops remove themselves before emitting completion;
     /// this is primarily for background, forked-loop, and swarm tasks.
-    pub fn mark_completed(&mut self, job_id: &str) {
+    ///
+    /// Returns `true` iff this call actually removed a live registry row, i.e.
+    /// this is the FIRST terminal event drained for `job_id`. A swarm job can
+    /// have two terminal producers (its runner and a racing `cancel()`), so the
+    /// caller uses this to free the concurrency slot exactly once (#108): the
+    /// slot is tied to the single row removal, not to the number of `Completed`
+    /// events drained.
+    pub fn mark_completed(&mut self, job_id: &str) -> bool {
         if let Some(mut entry) = self.registry.remove(job_id) {
             if let Some(ic) = &mut entry.in_context
                 && let Some(t) = ic.timer_abort.take()
@@ -583,6 +590,9 @@ impl ScheduleAuthority {
                 t.abort();
             }
             entry.abort.take();
+            true
+        } else {
+            false
         }
     }
 
@@ -728,6 +738,7 @@ impl ScheduleAuthority {
         // synthesize the terminal completion here since the task won't get
         // to send its own.
         else {
+            let was_swarm = entry.kind == ScheduleKind::Swarm;
             self.send_terminal_event(ScheduleEvent::Completed {
                 job_id: entry.job_id.clone(),
                 label: entry.label.clone(),
@@ -736,6 +747,18 @@ impl ScheduleAuthority {
                 failed: false,
                 requests: Vec::new(),
             });
+            // A swarm runner may ALSO publish its own terminal `Completed`
+            // (`abort()` is not synchronous). Free the concurrency slot HERE,
+            // synchronously — tied to this one-time registry-row removal, not to
+            // event delivery. The runner's racing `Completed`, if any, finds no
+            // row when the driver drains it (`mark_completed` returns `false`),
+            // so it does not double-free the slot; and if the runner's terminal
+            // is aborted or dropped under channel backpressure, the slot is
+            // still freed here rather than leaking (#108). Non-swarm ephemeral
+            // jobs free their slot through the normal `Completed` drain.
+            if was_swarm {
+                self.swarm_completed();
+            }
         }
         true
     }
@@ -1368,6 +1391,55 @@ mod tests {
         // Two more completions empty the running set.
         auth.swarm_completed();
         auth.swarm_completed();
+        assert_eq!(auth.running_swarm(), 0);
+    }
+
+    /// #108: a swarm job has two possible terminal producers — its runner's own
+    /// `Completed` and a racing `cancel()` — but the concurrency slot must be
+    /// freed exactly ONCE. The slot is tied to the single registry-row removal,
+    /// not to the number of `Completed` events drained.
+    #[tokio::test(start_paused = true)]
+    async fn swarm_cancel_frees_slot_once_despite_racing_runner_terminal() {
+        let (mut auth, _events, _ui, _tmp) = test_authority(8);
+        auth.set_swarm_max_concurrency(2);
+
+        let mut spec = swarm_spec(1);
+        spec.job_id = Some("swarm-cancelled".to_string());
+        assert!(auth.spawn_swarm(spec).contains("scheduled"));
+        assert_eq!(auth.running_swarm(), 1);
+
+        // Cancel frees the slot synchronously (tied to the row removal), even if
+        // the runner's own terminal is aborted or lost under backpressure.
+        assert!(auth.cancel("swarm-cancelled"));
+        assert_eq!(auth.running_swarm(), 0, "cancel frees the slot exactly once");
+
+        // The runner's racing terminal now arrives as a duplicate: `mark_completed`
+        // finds no row and returns `false`, so the driver skips `swarm_completed`
+        // and the slot is NOT double-freed.
+        assert!(
+            !auth.mark_completed("swarm-cancelled"),
+            "a duplicate terminal for an already-reconciled swarm finds no row"
+        );
+        assert_eq!(auth.running_swarm(), 0);
+
+        // A different swarm that completes naturally: the FIRST terminal drain
+        // removes its row (`mark_completed` → true), which is exactly how the
+        // driver knows to free that slot; a second (duplicate) drain returns
+        // `false` and must not free it again.
+        let mut natural = swarm_spec(1);
+        natural.job_id = Some("swarm-natural".to_string());
+        assert!(auth.spawn_swarm(natural).contains("scheduled"));
+        assert_eq!(auth.running_swarm(), 1);
+        assert!(
+            auth.mark_completed("swarm-natural"),
+            "the first terminal removes the live row"
+        );
+        auth.swarm_completed(); // what the driver does when row_removed == true
+        assert_eq!(auth.running_swarm(), 0);
+        assert!(
+            !auth.mark_completed("swarm-natural"),
+            "a second terminal finds no row"
+        );
         assert_eq!(auth.running_swarm(), 0);
     }
 

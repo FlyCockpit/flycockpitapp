@@ -493,7 +493,7 @@ pub(super) fn oversized_text_artifact_admission(
             .map_err(internal)?;
             (
                 operation.operation_id,
-                crate::db::db::message_attachments::MessageActor::RemoteDevice {
+                crate::db::db::message_attachments::MessageActor::ExternalPrincipal {
                     id: *operation.authenticated_device_id.as_bytes(),
                     generation: operation.authenticated_device_generation,
                 },
@@ -898,7 +898,7 @@ pub(super) fn bulk_user_message_replay_actor(
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
     match remote_operation {
-        Some(operation) => Ok(crate::db::message_attachments::MessageActor::RemoteDevice {
+        Some(operation) => Ok(crate::db::message_attachments::MessageActor::ExternalPrincipal {
             id: *operation.authenticated_device_id.as_bytes(),
             generation: operation.authenticated_device_generation,
         }),

@@ -788,7 +788,7 @@ impl Db {
                 )
                 .optional()
                 .context("loading local-owner canonical FCM2 replay bytes"),
-            crate::db::message_attachments::MessageActor::RemoteDevice { id, generation } => conn
+            crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation } => conn
                 .query_row(
                     "SELECT q.canonical_message
                        FROM message_queue_items q
@@ -798,7 +798,7 @@ impl Db {
                        JOIN message_operation_receipts o
                          ON o.session_id=s.session_id AND o.operation_id=s.operation_id
                       WHERE q.session_id=?1 AND q.client_submission_id=?2
-                        AND o.actor_kind='remote_device' AND o.actor_id=?3
+                        AND o.actor_kind='external_principal' AND o.actor_id=?3
                         AND o.actor_generation=?4",
                     params![
                         session_id.to_string(),

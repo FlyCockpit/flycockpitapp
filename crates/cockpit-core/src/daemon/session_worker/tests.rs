@@ -1268,7 +1268,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         let admission = OversizedTextArtifactAdmission {
             canonical_message,
             operation_id: *operation_id.as_bytes(),
-            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+            actor: crate::db::message_attachments::MessageActor::ExternalPrincipal {
                 id: *device_id.as_bytes(),
                 generation: conflict_operation.authenticated_device_generation,
             },
@@ -1467,7 +1467,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         let admission = OversizedTextArtifactAdmission {
             canonical_message,
             operation_id: *operation_id.as_bytes(),
-            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+            actor: crate::db::message_attachments::MessageActor::ExternalPrincipal {
                 id: *device_id.as_bytes(),
                 generation: operation.authenticated_device_generation,
             },

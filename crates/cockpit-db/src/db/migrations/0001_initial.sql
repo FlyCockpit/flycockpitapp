@@ -1777,7 +1777,7 @@ CREATE TABLE client_submission_terminal_receipts (
 CREATE TABLE message_operation_receipts (
     session_id             TEXT NOT NULL,
     operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
-    actor_kind             TEXT NOT NULL CHECK (actor_kind IN ('local_owner', 'remote_device')),
+    actor_kind             TEXT NOT NULL CHECK (actor_kind IN ('local_owner', 'external_principal')),
     actor_id               BLOB,
     -- Canonical unsigned big-endian u64: zeroblob(8) for local owner and a
     -- nonzero value for a remote-device generation.
@@ -1801,7 +1801,7 @@ CREATE TABLE message_operation_receipts (
     UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
     CHECK (
       (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = zeroblob(8)) OR
-      (actor_kind = 'remote_device' AND typeof(actor_id) = 'blob' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation <> zeroblob(8))
+      (actor_kind = 'external_principal' AND typeof(actor_id) = 'blob' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation <> zeroblob(8))
     ),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     CHECK ((artifact_model_fence_generation IS NULL) = (artifact_model_fence_json IS NULL)),

@@ -12954,7 +12954,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     assert_eq!(admission.operation_id, expected_operation_id);
     assert!(matches!(
         admission.actor,
-        crate::db::message_attachments::MessageActor::RemoteDevice { id, generation }
+        crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation }
             if id == expected_device_id && generation == expected_device_generation
     ));
     let item = proto::QueueItem {

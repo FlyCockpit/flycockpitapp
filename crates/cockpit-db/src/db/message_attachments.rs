@@ -20,7 +20,7 @@ pub const MAX_QUEUED_CANONICAL_MESSAGE_BYTES: usize = 17_439_564;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageActor {
     LocalOwner,
-    RemoteDevice { id: [u8; 16], generation: u64 },
+    ExternalPrincipal { id: [u8; 16], generation: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,7 +270,7 @@ pub(crate) fn accept_conn(
         "operation and submission identities must differ"
     );
     ensure!(input.outbox_sequence >= 0, "negative outbox sequence");
-    if let MessageActor::RemoteDevice { id, generation } = input.actor {
+    if let MessageActor::ExternalPrincipal { id, generation } = input.actor {
         ensure!(
             id != [0; 16] && generation > 0,
             "invalid remote actor binding"
@@ -356,8 +356,8 @@ pub(crate) fn accept_conn(
 fn actor_parts(actor: MessageActor) -> (&'static str, Option<Vec<u8>>, Vec<u8>) {
     match actor {
         MessageActor::LocalOwner => ("local_owner", None, 0u64.to_be_bytes().to_vec()),
-        MessageActor::RemoteDevice { id, generation } => (
-            "remote_device",
+        MessageActor::ExternalPrincipal { id, generation } => (
+            "external_principal",
             Some(id.to_vec()),
             generation.to_be_bytes().to_vec(),
         ),
@@ -454,7 +454,7 @@ mod tests {
             AcceptMessageResult::Conflict
         );
         let mut changed_actor = original.clone();
-        changed_actor.actor = MessageActor::RemoteDevice {
+        changed_actor.actor = MessageActor::ExternalPrincipal {
             id: [10; 16],
             generation: 1,
         };
@@ -639,7 +639,7 @@ mod tests {
             .await
             .unwrap();
         let mut original = input(session.session_id);
-        original.actor = MessageActor::RemoteDevice {
+        original.actor = MessageActor::ExternalPrincipal {
             id: [11; 16],
             generation: 2,
         };
@@ -650,7 +650,7 @@ mod tests {
             AcceptMessageResult::Accepted
         );
         let mut changed_id = original.clone();
-        changed_id.actor = MessageActor::RemoteDevice {
+        changed_id.actor = MessageActor::ExternalPrincipal {
             id: [12; 16],
             generation: 2,
         };
@@ -661,7 +661,7 @@ mod tests {
             AcceptMessageResult::Conflict
         );
         let mut changed_generation = original;
-        changed_generation.actor = MessageActor::RemoteDevice {
+        changed_generation.actor = MessageActor::ExternalPrincipal {
             id: [11; 16],
             generation: 3,
         };

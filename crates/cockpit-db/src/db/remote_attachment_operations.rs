@@ -125,6 +125,7 @@ pub enum TransactionalRemoteOperationOutcome<T> {
     OperationConflict,
     OperationActorConflict,
     AttachmentLedgerCapacity,
+    AttachmentOutboxCapacity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -945,10 +946,10 @@ impl Db {
                         Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
                     }
                     CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        bail!("transactional remote operation ledger capacity")
+                        Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
                     }
                     CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        bail!("transactional remote operation outbox capacity")
+                        Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
                     }
                 }
             }

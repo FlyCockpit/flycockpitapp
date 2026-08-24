@@ -505,7 +505,11 @@ pub(super) async fn reserve_remote_send_operation_impl(
             })
         }
         Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
-        | Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
+        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => RemoteSendDecision::Rejected(proto::ErrorPayload {
+            code: proto::ErrorCode::Conflict,
+            message: "remote operation capacity reached".into(),
+        }),
+        Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
             code: proto::ErrorCode::Internal,
             message: "remote send could not be committed to the operation ledger".into(),
         }),
@@ -977,7 +981,11 @@ async fn commit_remote_queue_mutation(
             if let Some(staged) = staged.as_ref() { queue.abort_staged_removal(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })
         }
-        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => {
+            if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
+            Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })
+        }
+        Err(_) => {
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })
         }
@@ -2974,7 +2982,11 @@ pub(super) async fn run_worker(
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.abort_staged_removal(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })); continue;
                             }
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => {
+                                if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
+                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })); continue;
+                            }
+                            Err(_) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
                             }

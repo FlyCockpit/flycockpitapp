@@ -138,7 +138,8 @@ where
             code: ErrorCode::Conflict,
             message: "remote operation conflict".into(),
         }),
-        TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload {
+        TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+        | TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "remote operation capacity reached".into(),
         }),

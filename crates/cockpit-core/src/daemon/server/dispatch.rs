@@ -13612,6 +13612,7 @@ fn package_row_json(row: &crate::db::packages::PackageRow) -> serde_json::Value 
 }
 
 /// Non-secret JSON projection of the FlyCockpit connector state.
+#[cfg(feature = "remote")]
 fn connector_state_json(state: &crate::db::connector::ConnectorState) -> serde_json::Value {
     serde_json::json!({
         "server_url": state.server_url,
@@ -13627,6 +13628,7 @@ fn connector_state_json(state: &crate::db::connector::ConnectorState) -> serde_j
 }
 
 /// Non-secret JSON projection of one org-policy sync state row.
+#[cfg(feature = "remote")]
 fn org_sync_state_json(state: &crate::db::org_sync::OrgSyncState) -> serde_json::Value {
     serde_json::json!({
         "server_url": state.server_url,
@@ -13641,6 +13643,7 @@ fn org_sync_state_json(state: &crate::db::org_sync::OrgSyncState) -> serde_json:
 }
 
 /// Non-secret JSON projection of one remote-audit upload cursor row.
+#[cfg(feature = "remote")]
 fn audit_upload_state_json(
     state: &crate::db::remote_audit_upload::RemoteAuditUploadState,
 ) -> serde_json::Value {
@@ -13733,6 +13736,7 @@ async fn list_packages_response(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn get_connector_state_response(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -13753,6 +13757,7 @@ async fn get_connector_state_response(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn get_org_sync_status_response(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {

@@ -2112,6 +2112,24 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
+    /// Single exhaustive classifier for FlyCockpit-service operations retained
+    /// in the prerelease wire enum for profile-to-profile database lineage.
+    /// Local builds reject this class before dispatch; no second deny list may
+    /// be maintained in a frontend or daemon worker.
+    pub const fn requires_remote_feature(&self) -> bool {
+        matches!(
+            self,
+            Self::StoreFlycockpitCredential { .. }
+                | Self::ClearFlycockpitCredential
+                | Self::SetFlycockpitConnectorEnabled { .. }
+                | Self::SyncFlycockpitOrgPolicy
+                | Self::EnrollFlycockpitOrgSync { .. }
+                | Self::GetFlycockpitAccount
+                | Self::GetConnectorState
+                | Self::GetOrgSyncStatus
+        )
+    }
+
     /// Validate semantic invariants independently of Serde.
     ///
     /// Requests carried over an in-process transport are already typed and do

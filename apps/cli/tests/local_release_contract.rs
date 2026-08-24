@@ -92,6 +92,16 @@ fn local_release_cfg_gates_commands_modules_workers_and_protocol() {
         let marker = format!("#[cfg(feature = \"remote\")]\npub mod {module};");
         assert!(protocol.contains(&marker), "protocol module {module} is reachable locally");
     }
+    let requests = source("crates/cockpit-proto/src/request.rs");
+    assert!(requests.contains("pub const fn requires_remote_feature(&self) -> bool"));
+    let dispatch = source("crates/cockpit-core/src/daemon/server/dispatch.rs");
+    assert_eq!(
+        dispatch.matches("request.requires_remote_feature()").count(),
+        2,
+        "both dispatch lanes must consume the one protocol-owned classifier"
+    );
+    assert!(!dispatch.contains("Request::StoreFlycockpitCredential { .. }"),
+        "dispatch must not grow a second remote deny list");
 }
 
 #[test]

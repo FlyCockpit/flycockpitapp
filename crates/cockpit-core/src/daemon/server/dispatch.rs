@@ -2169,17 +2169,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     #[cfg(not(feature = "remote"))]
-    if matches!(
-        &request,
-        Request::StoreFlycockpitCredential { .. }
-            | Request::ClearFlycockpitCredential
-            | Request::SetFlycockpitConnectorEnabled { .. }
-            | Request::SyncFlycockpitOrgPolicy
-            | Request::EnrollFlycockpitOrgSync { .. }
-            | Request::GetFlycockpitAccount
-            | Request::GetConnectorState
-            | Request::GetOrgSyncStatus
-    ) {
+    if request.requires_remote_feature() {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"
@@ -9053,10 +9043,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     #[cfg(not(feature = "remote"))]
-    if matches!(
-        &request,
-        Request::GetFlycockpitAccount | Request::GetConnectorState | Request::GetOrgSyncStatus
-    ) {
+    if request.requires_remote_feature() {
         return Err(ErrorPayload {
             code: ErrorCode::BadRequest,
             message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"

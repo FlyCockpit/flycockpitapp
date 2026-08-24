@@ -1,13 +1,15 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
-use std::sync::{Mutex as StdMutex, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine as _;
 use ignore::Match;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
 use crate::daemon::proto::{
@@ -19,6 +21,22 @@ const FS_LIST_ENTRY_CAP: usize = 1_000;
 const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
+const SETTINGS_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone)]
+struct SettingsCapability {
+    root: PathBuf,
+    target: PathBuf,
+    revision: String,
+    denylist_ids: Vec<String>,
+    expires_at: Instant,
+}
+
+fn settings_capabilities() -> &'static Mutex<std::collections::HashMap<Uuid, SettingsCapability>> {
+    static CAPS: OnceLock<Mutex<std::collections::HashMap<Uuid, SettingsCapability>>> =
+        OnceLock::new();
+    CAPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 pub async fn fs_list(
     ctx: Arc<DaemonContext>,
@@ -258,42 +276,60 @@ pub async fn save_extended_config(
     .await
 }
 
-/// Return the safe client projection of one settings layer and an opaque
-/// revision of the authoritative raw bytes.
+/// Return every daemon-discovered settings layer. Each snapshot carries an
+/// ephemeral capability bound to this canonical trusted root, exact target,
+/// raw revision, and individual denylist occurrences.
 pub async fn get_extended_config_snapshot(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
-    layer: cockpit_proto::CockpitConfigLayer,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
-            let target = settings_layer_target(&root, layer)?;
-            let _guard =
-                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-            let raw = match std::fs::read(&target) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}\n".to_vec(),
-                Err(error) => return Err(internal(error)),
-            };
-            let mut config: cockpit_config::config::extended::ExtendedConfig =
-                serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            let denylist = config
-                .redact
-                .denylist
-                .iter()
-                .enumerate()
-                .map(|(index, value)| redacted_denylist_entry(index, value))
-                .collect();
-            config.redact.denylist.clear();
-            config.image_generation = config.image_generation.redacted_for_snapshot();
-            Ok(Response::ExtendedConfigSnapshot {
-                config: Box::new(config),
-                denylist,
-                revision: content_hash(&raw),
-                config_generation: crate::daemon::server::inventory::current_config_generation(),
-            })
+            let mut layers = Vec::new();
+            let now = Instant::now();
+            settings_capabilities()
+                .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
+                .retain(|_, cap| cap.expires_at > now);
+            for (kind, target) in discovered_settings_layers(&root)? {
+                let guard = cockpit_config::config::hold_config_mutation_lock(&target)
+                    .map_err(internal)?;
+                let raw = read_optional_config(&target)?;
+                let revision = content_hash(&raw);
+                let mut config: cockpit_config::config::extended::ExtendedConfig =
+                    serde_json::from_slice(&raw).map_err(bad_request_config)?;
+                let denylist_ids: Vec<String> = config
+                    .redact
+                    .denylist
+                    .iter()
+                    .map(|_| Uuid::new_v4().to_string())
+                    .collect();
+                let denylist = config
+                    .redact
+                    .denylist
+                    .iter()
+                    .zip(&denylist_ids)
+                    .map(|(value, id)| redacted_denylist_entry(id, value))
+                    .collect();
+                config.redact.denylist.clear();
+                config.image_generation = config.image_generation.redacted_for_snapshot();
+                let id = Uuid::new_v4();
+                drop(guard);
+                settings_capabilities()
+                    .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
+                    .insert(id, SettingsCapability {
+                    root: root.clone(), target: target.clone(), revision: revision.clone(),
+                    denylist_ids, expires_at: now + SETTINGS_CAPABILITY_TTL,
+                });
+                layers.push(cockpit_proto::ExtendedConfigLayerSnapshot {
+                    layer_id: id.to_string(), kind,
+                    display_path: target.display().to_string(), config: Box::new(config),
+                    denylist, revision,
+                });
+            }
+            Ok(Response::ExtendedConfigSnapshot { layers,
+                config_generation: crate::daemon::server::inventory::current_config_generation() })
         }),
     )
     .await
@@ -306,7 +342,7 @@ pub async fn get_extended_config_snapshot(
 pub async fn apply_extended_config_patch(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
-    layer: cockpit_proto::CockpitConfigLayer,
+    layer_id: String,
     patch: cockpit_proto::ExtendedConfigPatch,
     expected_revision: String,
 ) -> Result<Response, ErrorPayload> {
@@ -314,7 +350,19 @@ pub async fn apply_extended_config_patch(
     join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
-            let target = settings_layer_target(&root, layer)?;
+            let id = Uuid::parse_str(&layer_id)
+                .map_err(|_| conflict("settings snapshot is absent, expired, or stale"))?;
+            let capability = {
+                let mut caps = settings_capabilities().lock().map_err(|_| internal("settings capability registry lock poisoned"))?;
+                let now = Instant::now();
+                caps.retain(|_, cap| cap.expires_at > now);
+                caps.get(&id).cloned()
+                    .ok_or_else(|| conflict("settings snapshot is absent, expired, or stale"))?
+            };
+            if capability.root != root || capability.revision != expected_revision {
+                return Err(conflict("settings snapshot is absent, expired, or stale"));
+            }
+            let target = capability.target;
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
             let (raw, existed) = match std::fs::read(&target) {
@@ -336,11 +384,16 @@ pub async fn apply_extended_config_patch(
             }
             let mut document: serde_json::Value =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
+            let current_typed: cockpit_config::config::extended::ExtendedConfig =
+                serde_json::from_slice(&raw).map_err(bad_request_config)?;
+            let current_typed = serde_json::to_value(current_typed).map_err(internal)?;
             let candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;
             let candidate = candidate.as_object().expect("ExtendedConfig serializes as object");
+            let current_typed = current_typed.as_object()
+                .expect("ExtendedConfig serializes as object");
             for field in patch.fields {
                 if field == cockpit_proto::ExtendedConfigField::ImageGeneration {
                     return Err(bad_request(
@@ -351,6 +404,9 @@ pub async fn apply_extended_config_patch(
                 let value = candidate.get(key).cloned().ok_or_else(|| {
                     bad_request(format!("typed settings candidate omitted `{key}`"))
                 })?;
+                let current = current_typed.get(key).ok_or_else(|| {
+                    bad_request(format!("typed settings schema omitted `{key}`"))
+                })?;
                 if field == cockpit_proto::ExtendedConfigField::Redact {
                     let existing = object
                         .get("redact")
@@ -360,13 +416,18 @@ pub async fn apply_extended_config_patch(
                         .unwrap_or_else(|| serde_json::json!([]));
                     let mut value = value;
                     value.as_object_mut().expect("RedactConfig serializes as object")
-                        .insert("denylist".into(), existing);
-                    object.insert(key.into(), value);
+                        .insert("denylist".into(), existing.clone());
+                    let mut current = current.clone();
+                    current.as_object_mut().expect("RedactConfig serializes as object")
+                        .insert("denylist".into(), existing.clone());
+                    merge_changed_known_value(
+                        object.entry(key).or_insert(serde_json::Value::Null), &current, value);
                 } else {
-                    object.insert(key.into(), value);
+                    merge_changed_known_value(
+                        object.entry(key).or_insert(serde_json::Value::Null), current, value);
                 }
             }
-            apply_denylist_mutations(object, patch.denylist)?;
+            apply_denylist_mutations(object, patch.denylist, &capability.denylist_ids)?;
             let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;
             let merged = cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
                 &patched,
@@ -381,6 +442,9 @@ pub async fn apply_extended_config_patch(
             } else {
                 crate::daemon::server::inventory::current_config_generation()
             };
+            settings_capabilities()
+                .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
+                .remove(&id);
             Ok(Response::ExtendedConfigSaved { hash: desired_hash, config_generation })
         }),
     )
@@ -407,52 +471,71 @@ async fn trusted_settings_root(
     Ok(root)
 }
 
-fn settings_layer_target(
-    root: &Path,
-    layer: cockpit_proto::CockpitConfigLayer,
-) -> Result<PathBuf, ErrorPayload> {
-    let directory = match layer {
-        cockpit_proto::CockpitConfigLayer::HomeXdg => dirs::home_dir()
-            .ok_or_else(|| bad_request("home directory is unavailable"))?
-            .join(".config/cockpit"),
-        cockpit_proto::CockpitConfigLayer::HomeDot => dirs::home_dir()
-            .ok_or_else(|| bad_request("home directory is unavailable"))?
-            .join(".cockpit"),
-        cockpit_proto::CockpitConfigLayer::MachineLocal => {
-            cockpit_config::config::dirs::local_config_dir_for(root).map_err(internal)?
-        }
-        cockpit_proto::CockpitConfigLayer::Project { ancestor_depth } => {
-            let mut owner = root;
-            for _ in 0..ancestor_depth {
-                owner = owner.parent().ok_or_else(|| {
-                    bad_request("project config layer escapes the trusted workspace ancestry")
-                })?;
-            }
-            owner.join(".cockpit")
-        }
-    };
-    Ok(directory.join(cockpit_config::config::dirs::CONFIG_FILE))
+fn discovered_settings_layers(root: &Path) -> Result<Vec<(cockpit_proto::CockpitConfigLayer, PathBuf)>, ErrorPayload> {
+    use cockpit_config::config::dirs::{ConfigDirKind as K, CONFIG_FILE};
+    let mut layer_dirs = cockpit_config::config::dirs::discover_config_dirs(root);
+    if let Some(home) = dirs::home_dir() {
+        layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::HomeXdg, path: home.join(".config/cockpit") });
+        layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::HomeDot, path: home.join(".cockpit") });
+    }
+    layer_dirs.push(cockpit_config::config::dirs::ConfigDir {
+        kind: K::MachineLocal,
+        path: cockpit_config::config::dirs::local_config_dir_for(root).map_err(internal)?,
+    });
+    layer_dirs.push(cockpit_config::config::dirs::ConfigDir { kind: K::Project, path: root.join(".cockpit") });
+    let mut seen = std::collections::HashSet::new();
+    Ok(layer_dirs.into_iter().filter_map(|dir| {
+        let target = dir.path.join(CONFIG_FILE);
+        if !seen.insert(target.clone()) { return None; }
+        let kind = match dir.kind { K::HomeXdg => cockpit_proto::CockpitConfigLayer::HomeXdg,
+            K::HomeDot => cockpit_proto::CockpitConfigLayer::HomeDot,
+            K::MachineLocal => cockpit_proto::CockpitConfigLayer::MachineLocal,
+            K::Project => cockpit_proto::CockpitConfigLayer::Project };
+        Some((kind, target))
+    }).collect())
 }
 
-fn denylist_id(value: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-redact-denylist-entry-v1\0");
-    digest.update(value.as_bytes());
-    format!("{:x}", digest.finalize())
+fn read_optional_config(target: &Path) -> Result<Vec<u8>, ErrorPayload> {
+    match std::fs::read(target) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(b"{}\n".to_vec()),
+        Err(error) => Err(internal(error)),
+    }
 }
 
-fn redacted_denylist_entry(_index: usize, value: &str) -> cockpit_proto::RedactedDenylistEntry {
-    let id = denylist_id(value);
+fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {
     cockpit_proto::RedactedDenylistEntry {
-        entry_id: id.clone(),
-        fingerprint: id[..16].to_string(),
+        entry_id: id.to_owned(),
+        fingerprint: id.chars().take(8).collect(),
         display_mask: format!("•••• ({} bytes)", value.len()),
+    }
+}
+
+fn merge_changed_known_value(
+    target: &mut serde_json::Value,
+    current: &serde_json::Value,
+    candidate: serde_json::Value,
+) {
+    if current == &candidate {
+        return;
+    }
+    match (target, current, candidate) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(current), serde_json::Value::Object(candidate)) => {
+            for (key, value) in candidate {
+                if let Some(current) = current.get(&key) {
+                    merge_changed_known_value(
+                        target.entry(key).or_insert(serde_json::Value::Null), current, value);
+                }
+            }
+        }
+        (target, _, candidate) => *target = candidate,
     }
 }
 
 fn apply_denylist_mutations(
     document: &mut serde_json::Map<String, serde_json::Value>,
     mutations: Vec<cockpit_proto::DenylistMutation>,
+    occurrence_ids: &[String],
 ) -> Result<(), ErrorPayload> {
     let redact = document
         .entry("redact")
@@ -466,10 +549,11 @@ fn apply_denylist_mutations(
         .ok_or_else(|| bad_request("redact.denylist must be an array"))?;
     let mut values: Vec<(String, String)> = values
         .iter()
-        .map(|value| {
+        .zip(occurrence_ids)
+        .map(|(value, id)| {
             value
                 .as_str()
-                .map(|value| (denylist_id(value), value.to_owned()))
+                .map(|value| (id.clone(), value.to_owned()))
                 .ok_or_else(|| bad_request("redact.denylist entries must be strings"))
         })
         .collect::<Result<_, _>>()?;
@@ -488,7 +572,7 @@ fn apply_denylist_mutations(
                     }
                     None => 0,
                 };
-                values.insert(index, (denylist_id(&value), value));
+                values.insert(index, (Uuid::new_v4().to_string(), value));
             }
             cockpit_proto::DenylistMutation::Update { entry_id, value } => {
                 validate_new_denylist_literal(&value)?;

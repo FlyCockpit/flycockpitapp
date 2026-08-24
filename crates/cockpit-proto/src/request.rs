@@ -815,7 +815,7 @@ pub enum Request {
 
     FsList {
         project_root: String,
-        layer: crate::CockpitConfigLayer,
+        path: String,
         #[serde(default)]
         show_hidden: bool,
     },
@@ -1677,14 +1677,13 @@ pub enum Request {
     GetExtendedConfigSnapshot {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        path: String,
     },
 
     /// Apply a typed field patch to the authoritative daemon-selected layer.
     ApplyExtendedConfigPatch {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        layer: crate::CockpitConfigLayer,
+        layer_id: String,
         patch: crate::ExtendedConfigPatch,
         expected_revision: String,
     },
@@ -2741,18 +2740,12 @@ impl Request {
             }
             Self::ApplyExtendedConfigPatch {
                 project_root,
-                layer,
+                layer_id,
                 patch,
                 expected_revision,
             } => {
                 validate_owner_project_root(project_root)?;
-                if matches!(
-                    layer,
-                    crate::CockpitConfigLayer::Project { ancestor_depth }
-                        if *ancestor_depth > 256
-                ) {
-                    return Err("project settings layer ancestry is too deep".to_string());
-                }
+                validate_owner_identifier("settings layer capability", layer_id, 128)?;
                 let encoded = serde_json::to_vec(patch)
                     .map_err(|error| format!("extended config patch is invalid: {error}"))?;
                 if encoded.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
@@ -3334,8 +3327,8 @@ macro_rules! command {
             (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
             (Request::BeginAgentEditorLease { project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|name:String|expected_revision:String", [project_root: String => project_root, name: String => param, expected_revision: String => param]);
             (Request::CompleteAgentEditorLease { project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|lease_id:String|markdown:Option<String>", [project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
-            (Request::GetExtendedConfigSnapshot { project_root, layer }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|layer:crate::CockpitConfigLayer", [project_root: String => project_root, layer: crate::CockpitConfigLayer => param]);
-            (Request::ApplyExtendedConfigPatch { project_root, layer, patch, expected_revision }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|layer:crate::CockpitConfigLayer|patch:crate::ExtendedConfigPatch|expected_revision:String", [project_root: String => project_root, layer: crate::CockpitConfigLayer => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param]);
+            (Request::GetExtendedConfigSnapshot { project_root }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::ApplyExtendedConfigPatch { project_root, layer_id, patch, expected_revision }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String", [project_root: String => project_root, layer_id: String => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);

@@ -565,9 +565,7 @@ pub enum Response {
     },
 
     ExtendedConfigSnapshot {
-        config: Box<cockpit_config::config::extended::ExtendedConfig>,
-        denylist: Vec<crate::RedactedDenylistEntry>,
-        revision: String,
+        layers: Vec<crate::ExtendedConfigLayerSnapshot>,
         config_generation: u64,
     },
 

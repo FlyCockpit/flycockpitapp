@@ -43,8 +43,8 @@ pub use agent_management::{
     AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES,
 };
 pub use config_management::{
-    CockpitConfigLayer, DenylistMutation, ExtendedConfigField, ExtendedConfigPatch,
-    RedactedDenylistEntry,
+    CockpitConfigLayer, DenylistMutation, ExtendedConfigField, ExtendedConfigLayerSnapshot,
+    ExtendedConfigPatch, RedactedDenylistEntry,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;

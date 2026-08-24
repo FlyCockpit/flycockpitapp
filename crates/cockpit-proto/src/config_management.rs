@@ -8,7 +8,21 @@ pub enum CockpitConfigLayer {
     HomeXdg,
     HomeDot,
     MachineLocal,
-    Project { ancestor_depth: u16 },
+    Project,
+}
+
+/// A daemon-discovered settings layer. `layer_id` is an ephemeral,
+/// occurrence-bound capability; clients never nominate a path or ancestry
+/// depth for a mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendedConfigLayerSnapshot {
+    pub layer_id: String,
+    pub kind: CockpitConfigLayer,
+    /// Presentation only. This path is never accepted back as authority.
+    pub display_path: String,
+    pub config: Box<cockpit_config::config::extended::ExtendedConfig>,
+    pub denylist: Vec<RedactedDenylistEntry>,
+    pub revision: String,
 }
 
 /// The complete typed candidate plus an explicit allowlist of fields to copy

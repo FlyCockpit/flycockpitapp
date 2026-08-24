@@ -135,90 +135,38 @@ fn run_settings_daemon<T>(
 }
 
 fn config_layer_request(
-    path: &std::path::Path,
+    _path: &std::path::Path,
     project_root: Option<&std::path::Path>,
-) -> Result<(String, cockpit_core::daemon::proto::CockpitConfigLayer), String> {
-    let home = dirs::home_dir();
+) -> Result<String, String> {
     let cwd = std::env::current_dir().ok();
     let request_root = project_root.or(cwd.as_deref());
-    if home
-        .as_ref()
-        .is_some_and(|home| path == home.join(".config/cockpit/config.json"))
-    {
-        let root =
-            request_root.ok_or_else(|| "settings request has no workspace root".to_string())?;
-        return Ok((
-            root.display().to_string(),
-            cockpit_core::daemon::proto::CockpitConfigLayer::HomeXdg,
-        ));
-    }
-    if home
-        .as_ref()
-        .is_some_and(|home| path == home.join(".cockpit/config.json"))
-    {
-        let root =
-            request_root.ok_or_else(|| "settings request has no workspace root".to_string())?;
-        return Ok((
-            root.display().to_string(),
-            cockpit_core::daemon::proto::CockpitConfigLayer::HomeDot,
-        ));
-    }
-    if let Some(root) = request_root
-        && cockpit_config::dirs::local_config_dir_for(root)
-            .ok()
-            .as_deref()
-            == path.parent()
-    {
-        return Ok((
-            root.display().to_string(),
-            cockpit_core::daemon::proto::CockpitConfigLayer::MachineLocal,
-        ));
-    }
-    let owner = path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| "project settings target has no owner".to_string())?;
-    let root = request_root
-        .filter(|root| path.starts_with(root))
-        .unwrap_or(owner);
-    let depth = root
-        .ancestors()
-        .position(|ancestor| ancestor == owner)
-        .ok_or_else(|| "project settings target is outside the workspace ancestry".to_string())?;
-    let depth =
-        u16::try_from(depth).map_err(|_| "project settings ancestry is too deep".to_string())?;
-    Ok((
-        root.display().to_string(),
-        cockpit_core::daemon::proto::CockpitConfigLayer::Project {
-            ancestor_depth: depth,
-        },
-    ))
+    request_root
+        .map(|root| root.display().to_string())
+        .ok_or_else(|| "settings request has no workspace root".to_string())
 }
 
 fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
-    let (project_root, layer) = config_layer_request(path, project_root)?;
+    let project_root = config_layer_request(path, project_root)?;
+    let requested_path = path.display().to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
             .map_err(|error| error.to_string())?;
         match client
-            .request(Request::GetExtendedConfigSnapshot {
-                project_root,
-                layer,
-            })
+            .request(Request::GetExtendedConfigSnapshot { project_root })
             .await
             .map_err(|error| error.to_string())?
         {
-            Ok(Response::ExtendedConfigSnapshot {
-                config,
-                denylist,
-                revision,
-                ..
-            }) => {
-                let mut config = *config;
+            Ok(Response::ExtendedConfigSnapshot { layers, .. }) => {
+                let layer = layers.into_iter()
+                    .find(|layer| layer.display_path == requested_path)
+                    .ok_or_else(|| "settings target is not a daemon-discovered layer".to_string())?;
+                let mut config = *layer.config;
+                let denylist = layer.denylist;
+                let revision = layer.revision;
                 config.redact.denylist = denylist
                     .iter()
                     .map(|entry| entry.display_mask.clone())
@@ -231,6 +179,8 @@ fn extended_config_layer_snapshot(
                         "__cockpit_denylist_entries".into(),
                         serde_json::to_value(denylist).map_err(|error| error.to_string())?,
                     );
+                value.as_object_mut().expect("ExtendedConfig serializes as object").insert(
+                    "__cockpit_settings_layer_id".into(), serde_json::Value::String(layer.layer_id));
                 Ok((config, value, revision))
             }
             Ok(other) => Err(format!("unexpected settings snapshot response: {other:?}")),
@@ -255,7 +205,9 @@ fn apply_settings_patch_via_daemon(
         materialize: false,
         denylist,
     };
-    let (project_root, layer) = config_layer_request(path, project_root)?;
+    let project_root = config_layer_request(path, project_root)?;
+    let layer_id = base.get("__cockpit_settings_layer_id").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?.to_owned();
     let expected_revision = revision.to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
@@ -264,7 +216,7 @@ fn apply_settings_patch_via_daemon(
         match client
             .request(Request::ApplyExtendedConfigPatch {
                 project_root,
-                layer,
+                layer_id,
                 patch,
                 expected_revision,
             })
@@ -297,7 +249,10 @@ pub(super) fn apply_typed_settings_document_edit(
         materialize: true,
         denylist,
     };
-    let (project_root, layer) = config_layer_request(path, project_root)?;
+    let project_root = config_layer_request(path, project_root)?;
+    let layer_id = authority_base.get("__cockpit_settings_layer_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?.to_owned();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
@@ -305,7 +260,7 @@ pub(super) fn apply_typed_settings_document_edit(
         match client
             .request(Request::ApplyExtendedConfigPatch {
                 project_root,
-                layer,
+                layer_id,
                 patch,
                 expected_revision: revision,
             })

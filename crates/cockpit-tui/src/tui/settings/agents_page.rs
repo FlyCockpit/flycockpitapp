@@ -99,8 +99,6 @@ pub(super) struct AgentExternalEdit {
     #[cfg(unix)]
     staging_dir_identity: (u64, u64),
     lease_id: String,
-    /// Buffer write owned by the injected host effect.
-    pub(super) text_before_launch: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
     /// failed/cancelled operation restores this exact editor for retry.
     draft: Option<AgentEditor>,
@@ -113,7 +111,6 @@ pub(super) struct AgentExternalEdit {
 pub(crate) struct AgentExternalEditEffect {
     pub(crate) operation_id: PointerOperationId,
     pub(crate) path: PathBuf,
-    pub(crate) text_before_launch: String,
 }
 
 struct AgentExternalEditStaging {
@@ -325,7 +322,6 @@ impl AgentsPage {
         Some(AgentExternalEditEffect {
             operation_id: pending.id,
             path: pending.staging_path.clone(),
-            text_before_launch: pending.text_before_launch.clone(),
         })
     }
 
@@ -947,7 +943,6 @@ impl SettingsCx {
             #[cfg(unix)]
             staging_dir_identity: staging.directory_identity,
             lease_id: lease.lease_id,
-            text_before_launch: text,
             draft,
             servicing: false,
         });
@@ -1287,7 +1282,6 @@ impl SettingsCx {
                 #[cfg(unix)]
                 staging_dir_identity: staging.directory_identity,
                 lease_id: lease.lease_id,
-                text_before_launch: text,
                 draft: Some(draft),
                 servicing: false,
             });
@@ -2784,7 +2778,7 @@ pub(super) mod tests {
         // A matching completion is accepted once; a duplicate is inert.
         let effect = drained.unwrap();
         let operation_id = effect.operation_id;
-        fs::write(&effect.path, &effect.text_before_launch).unwrap();
+        assert!(!fs::read_to_string(&effect.path).unwrap().is_empty());
         outer.finish_agent_edit(
             operation_id,
             super::super::pointer_actions::ExternalEditOutcome::Saved,
@@ -2980,7 +2974,7 @@ pub(super) mod tests {
             .expect("effect request drains once");
         assert_eq!(request.operation_id, operation);
         assert_eq!(
-            request.text_before_launch,
+            fs::read_to_string(&request.path).unwrap(),
             vnext_workspace_agent("pointer-agent", "pointer fixture", "Xbody")
         );
         assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
@@ -3007,7 +3001,6 @@ pub(super) mod tests {
             page(&dialog).pending_external_edit.is_some(),
             "stale completion is inert"
         );
-        fs::write(&request.path, &request.text_before_launch).unwrap();
         let saved_result = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::ExternalEditResult(
                 agent.clone(),

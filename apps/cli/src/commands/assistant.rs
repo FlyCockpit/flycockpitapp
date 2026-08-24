@@ -1,5 +1,4 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -246,15 +245,9 @@ async fn list() -> Result<()> {
         return Ok(());
     }
     for assistant in assistants {
-        // The proto AssistantSummary carries name/home_dir but not the
-        // description (which lives in the assistant definition file).
-        // Load it from disk to preserve the CLI output format.
-        let description = crate::assistants::load_from_home(
-            &assistant.name,
-            std::path::Path::new(&assistant.home_dir),
-        )
-        .map(|def| def.description)
-        .unwrap_or_else(|_| "<invalid>".to_string());
+        let description = verified_assistant_definition(&assistant)
+            .map(|def| def.description)
+            .unwrap_or_else(|error| format!("<invalid: {error:#}>"));
         println!(
             "{}\t{}\t{}",
             assistant.name, description, assistant.home_dir
@@ -270,9 +263,7 @@ async fn show(name: &str) -> Result<()> {
     let assistant = fetch_assistant(&daemon, name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-    // The registry row carries name/home_dir/content_hash; the description,
-    // description lives in the on-disk schemaVersion 2 definition file.
-    let def = crate::assistants::load_from_home(&assistant.name, Path::new(&assistant.home_dir))?;
+    let def = verified_assistant_definition(&assistant)?;
     println!("name: {}", def.name);
     println!("description: {}", def.description);
     println!("home_dir: {}", def.home_dir.display());
@@ -290,6 +281,40 @@ async fn show(name: &str) -> Result<()> {
     };
     println!("execution_kind: {execution_kind}");
     Ok(())
+}
+
+/// Consume only the daemon-coordinated registry/definition snapshot. The CLI
+/// must never reopen the private assistant pathname after the daemon has
+/// validated it: doing so would split authority and reintroduce a TOCTOU read.
+fn verified_assistant_definition(
+    assistant: &crate::daemon::proto::AssistantSummary,
+) -> Result<cockpit_core::agents::AgentDef> {
+    if assistant.registration_revision.is_empty() {
+        bail!("assistant `{}` has no registry revision", assistant.name);
+    }
+    let markdown = assistant.definition_markdown.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "assistant `{}` definition is unavailable: {}",
+            assistant.name,
+            assistant
+                .definition_diagnostic
+                .as_deref()
+                .unwrap_or("daemon returned an incoherent definition snapshot")
+        )
+    })?;
+    if assistant.definition_diagnostic.is_some()
+        || assistant
+            .definition_revision
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        bail!(
+            "assistant `{}` definition snapshot is incoherent",
+            assistant.name
+        );
+    }
+    cockpit_core::agents::parse_daemon_local_markdown(markdown, &assistant.name)
+        .with_context(|| format!("parsing daemon snapshot for assistant `{}`", assistant.name))
 }
 
 async fn delete(args: AssistantDeleteArgs) -> Result<()> {

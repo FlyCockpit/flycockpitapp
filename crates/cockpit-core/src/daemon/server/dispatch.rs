@@ -4159,18 +4159,34 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
-            crate::assistants::load_verified(&ctx.db, &assistant_id)
+            let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| bad_request(format!("assistant `{assistant_id}` not found")))?;
+            let verified_revision = crate::assistants::registration_revision(&verified.row);
+            if verified.definition_markdown.is_none()
+                || verified
+                    .definition_revision
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || verified.definition_diagnostic.is_some()
+            {
+                return Err(bad_request(format!(
+                    "assistant `{assistant_id}` definition snapshot is incoherent"
+                )));
+            }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
-                    crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?.ok_or_else(
-                        || anyhow::anyhow!("assistant `{assistant_for_db}` not found"),
-                    )?;
+                    let current = crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?
+                        .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_for_db}` not found"))?;
+                    if crate::assistants::registration_revision(&current) != verified_revision {
+                        anyhow::bail!(
+                            "assistant `{assistant_for_db}` registration changed during session resolution"
+                        );
+                    }
                     let (row, created) =
                         match crate::db::Db::most_recent_session_for_assistant_conn(
                             conn,

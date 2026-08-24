@@ -162,15 +162,6 @@ impl App {
             return Ok(true);
         };
 
-        if let Err(error) = std::fs::write(&path, effect.text_before_launch) {
-            self.dialog.finish_agent_edit(
-                operation_id,
-                crate::tui::settings::pointer_actions::ExternalEditOutcome::Failed,
-                Some(format!("write failed before launching $EDITOR: {error}")),
-            );
-            return Ok(true);
-        }
-
         let (outcome, live_mouse) = Self::run_external_editor_command(
             terminal,
             terminal_input,

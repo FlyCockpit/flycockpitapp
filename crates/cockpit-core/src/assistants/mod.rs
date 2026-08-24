@@ -593,7 +593,16 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
             )?,
         }
     } else {
-        cockpit_config::config::write_config_bytes_atomic(&target, journal.markdown.as_bytes())?;
+        match cockpit_config::config::read_config_file_nofollow(&target)? {
+            Some(bytes) if bytes == journal.markdown.as_bytes() => {}
+            Some(_) => bail!(
+                "assistant creation target exists without a registry row and conflicts with journal bytes"
+            ),
+            None => cockpit_config::config::write_config_bytes_atomic(
+                &target,
+                journal.markdown.as_bytes(),
+            )?,
+        }
         let name = journal.name.clone();
         let home_dir = journal.home_dir.clone();
         let config_json = journal.config_json.clone();

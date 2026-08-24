@@ -33,6 +33,9 @@ struct SettingsCapability {
     revision: String,
     identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
     denylist_ids: Vec<String>,
+    /// Exact values replaced by opaque per-occurrence placeholders in the
+    /// typed owner projection. These bytes never cross the daemon boundary.
+    redacted_occurrences: std::collections::HashMap<String, String>,
     issued_at: Instant,
     expires_at: Instant,
 }
@@ -321,7 +324,9 @@ pub async fn get_extended_config_snapshot(
                     .collect();
                 config.redact.denylist.clear();
                 config.image_generation = config.image_generation.redacted_for_snapshot();
-                config = redact_extended_config_projection(config, &redaction)?;
+                let (redacted_config, redacted_occurrences) =
+                    redact_extended_config_projection(config, &redaction)?;
+                config = redacted_config;
                 let id = Uuid::new_v4();
                 drop(guard);
                 settings_capabilities()
@@ -336,6 +341,7 @@ pub async fn get_extended_config_snapshot(
                             revision: revision.clone(),
                             identity,
                             denylist_ids,
+                            redacted_occurrences,
                             issued_at: now,
                             expires_at: now + SETTINGS_CAPABILITY_TTL,
                         },
@@ -362,18 +368,35 @@ pub async fn get_extended_config_snapshot(
 fn redact_extended_config_projection(
     config: cockpit_config::config::extended::ExtendedConfig,
     redaction: &crate::redact::RedactionTable,
-) -> Result<cockpit_config::config::extended::ExtendedConfig, ErrorPayload> {
-    fn scrub_value(value: &mut serde_json::Value, redaction: &crate::redact::RedactionTable) {
+) -> Result<
+    (
+        cockpit_config::config::extended::ExtendedConfig,
+        std::collections::HashMap<String, String>,
+    ),
+    ErrorPayload,
+> {
+    fn scrub_value(
+        value: &mut serde_json::Value,
+        redaction: &crate::redact::RedactionTable,
+        occurrences: &mut std::collections::HashMap<String, String>,
+    ) {
         match value {
-            serde_json::Value::String(text) => *text = redaction.scrub(text),
+            serde_json::Value::String(text) => {
+                if redaction.scrub(text) != *text {
+                    let placeholder =
+                        format!("{SETTINGS_REDACTED_OCCURRENCE_PREFIX}{}__", Uuid::new_v4());
+                    occurrences.insert(placeholder.clone(), std::mem::take(text));
+                    *text = placeholder;
+                }
+            }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    scrub_value(value, redaction);
+                    scrub_value(value, redaction, occurrences);
                 }
             }
             serde_json::Value::Object(values) => {
                 for value in values.values_mut() {
-                    scrub_value(value, redaction);
+                    scrub_value(value, redaction, occurrences);
                 }
             }
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
@@ -382,15 +405,48 @@ fn redact_extended_config_projection(
     }
 
     let mut value = serde_json::to_value(config).map_err(internal)?;
-    scrub_value(&mut value, redaction);
+    let mut occurrences = std::collections::HashMap::new();
+    scrub_value(&mut value, redaction, &mut occurrences);
     // Type-preserving deserialization is the fail-closed boundary: if a
     // secret literal occupied an enum/discriminator or otherwise made the
     // projection invalid, do not emit a subtly altered authority document.
-    serde_json::from_value(value).map_err(|error| {
+    let config = serde_json::from_value(value).map_err(|error| {
         internal(format!(
             "redacted settings projection no longer satisfies its typed schema: {error}"
         ))
-    })
+    })?;
+    Ok((config, occurrences))
+}
+
+const SETTINGS_REDACTED_OCCURRENCE_PREFIX: &str = "__cockpit_redacted_setting_v1_";
+
+fn restore_redacted_occurrences(
+    value: &mut serde_json::Value,
+    occurrences: &std::collections::HashMap<String, String>,
+) -> Result<(), ErrorPayload> {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(original) = occurrences.get(text) {
+                *text = original.clone();
+            } else if text.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX) {
+                return Err(bad_request(
+                    "redacted settings placeholders may be preserved exactly or replaced, but not edited",
+                ));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                restore_redacted_occurrences(value, occurrences)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                restore_redacted_occurrences(value, occurrences)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
 }
 
 /// Apply a client-generated JSON merge patch under the daemon's config lock.
@@ -447,7 +503,8 @@ pub async fn apply_extended_config_patch(
             let current_typed: cockpit_config::config::extended::ExtendedConfig =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
             let current_typed = serde_json::to_value(current_typed).map_err(internal)?;
-            let candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
+            let mut candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
+            restore_redacted_occurrences(&mut candidate, &capability.redacted_occurrences)?;
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;

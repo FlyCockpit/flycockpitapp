@@ -1000,7 +1000,13 @@ pub(crate) async fn inject_knowledge_for_turn(
     redact: Arc<RedactionTable>,
 ) {
     let extended = config.extended();
-    let bundles = attached_bundles(session, cwd, &extended).await;
+    let bundles = match attached_bundles(session, cwd, &extended).await {
+        Ok(bundles) => bundles,
+        Err(error) => {
+            tracing::warn!(%error, "refusing knowledge injection because assistant authority validation failed");
+            return;
+        }
+    };
     if bundles.is_empty() {
         return;
     }
@@ -1081,24 +1087,35 @@ pub(crate) async fn attached_bundles_available(
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> bool {
     let extended = config.extended();
-    !attached_bundles(session, cwd, &extended).await.is_empty()
+    match attached_bundles(session, cwd, &extended).await {
+        Ok(bundles) => !bundles.is_empty(),
+        Err(error) => {
+            tracing::warn!(%error, "assistant knowledge availability check failed closed");
+            false
+        }
+    }
 }
 
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
     extended: &ExtendedConfig,
-) -> Vec<AttachedBundle> {
+) -> Result<Vec<AttachedBundle>> {
     let mut bundles = Vec::new();
-    if let Some(name) = &session.assistant_name
-        && let Ok(Some(row)) = session.db.get_assistant(name).await
-    {
-        let root = Path::new(&row.home_dir).join("knowledge");
-        if root.exists() {
-            bundles.push(AttachedBundle {
-                scope: BundleScope::Assistant,
-                root,
-            });
+    if let Some(name) = &session.assistant_name {
+        let snapshot = crate::assistants::snapshot(&session.db, name)
+            .await
+            .with_context(|| format!("validating assistant `{name}` knowledge root"))?;
+        if let Some(snapshot) = snapshot {
+            // `snapshot` validates the persisted row's canonical home and
+            // definition identity through the unified assistant coordinator.
+            let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
+            if root.exists() {
+                bundles.push(AttachedBundle {
+                    scope: BundleScope::Assistant,
+                    root,
+                });
+            }
         }
     }
 
@@ -1109,7 +1126,7 @@ pub(crate) async fn attached_bundles(
             root: project_root,
         });
     }
-    bundles
+    Ok(bundles)
 }
 
 fn project_bundle_trusted() -> bool {
@@ -1174,7 +1191,7 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
-        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await;
+        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await?;
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
@@ -1557,6 +1574,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(
@@ -1566,12 +1584,14 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
         assert_eq!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .len(),
             1
         );

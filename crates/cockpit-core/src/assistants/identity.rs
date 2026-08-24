@@ -322,8 +322,13 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
             preauthorized: false,
         });
     };
-    let config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing identity write",
+                row.name
+            )
+        })?;
     match config.soul_edit_mode {
         SoulEditMode::HumanOnly => Ok(IdentityWriteGate::Refuse(format!(
             "Refused: `{}` is an assistant identity file ({identity_file}); soul_edit_mode=human_only requires the human to edit SOUL.md/USER.md outside model tools.",

@@ -16,7 +16,7 @@ use cockpit_db::external_journal::{
     EXTERNAL_JOURNAL_UNRESOLVED_CRITICAL_MS, ExternalJournalState,
 };
 #[cfg(unix)]
-use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
+use cockpit_db::filesystem_identity::FilesystemIdentityV1;
 
 #[cfg(unix)]
 use super::RemoteRenameArtifactV1;
@@ -140,7 +140,7 @@ fn remote_operation_artifact_authority_is_private_held_and_nofollow() {
 fn remote_rename_artifact_is_generation_bound_canonical_and_reopenable() {
     let env = Env::new();
     let journal = env.journal();
-    let identity = |object_id, kind| RemoteFilesystemIdentityV1 {
+    let identity = |object_id, kind| FilesystemIdentityV1 {
         filesystem_id: 7,
         object_id,
         kind,

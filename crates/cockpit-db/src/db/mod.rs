@@ -45,6 +45,7 @@ pub mod assistants;
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
+pub mod filesystem_identity;
 mod files;
 pub mod guidance;
 pub mod image_generation;

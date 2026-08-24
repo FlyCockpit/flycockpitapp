@@ -41,6 +41,7 @@ pub mod agent_tree_decisions;
 pub mod app_flags;
 pub mod archive_import;
 pub mod assistants;
+#[cfg(feature = "remote")]
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
@@ -57,6 +58,7 @@ pub mod locks;
 pub mod media_attachments;
 pub mod message_attachments;
 pub mod needs_attention;
+#[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod packages;
 pub mod paused_work;
@@ -66,7 +68,9 @@ pub mod project_notes;
 pub mod protected_leak_records;
 pub mod protected_redaction_history;
 pub mod prune_ledger;
+#[cfg(feature = "remote")]
 pub mod remote_attachment_operations;
+#[cfg(feature = "remote")]
 pub mod remote_audit_upload;
 pub mod retention;
 pub mod run_invocations;
@@ -170,6 +174,11 @@ impl Writer {
                         .and_then(|result| result);
                     let _ = request.reply.send(result);
                 }
+                // The last database owner performs an explicit truncating
+                // checkpoint before SQLite closes the writer. This bounds
+                // WAL growth and makes the durable shutdown boundary
+                // independent of SQLite's build-time autocheckpoint defaults.
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             })
             .context("spawning db writer thread")?;
         match ready_rx.recv().context("waiting for db writer startup")? {
@@ -339,18 +348,34 @@ impl Db {
             .parent()
             .context("canonical cockpit DB path has no parent")?;
         files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
-        Self::open(&path)
+        Self::open_daemon_owned(&path)
     }
 
-    /// Open a database at an arbitrary path.
+    /// Open a database at an arbitrary path without claiming daemon ownership.
+    ///
+    /// This is the general/test multi-handle API. Production daemon startup
+    /// must use [`Self::open_default`] (or [`Self::open_daemon_owned`]) so its
+    /// migration and writer lifetime remain protected by the singleton lock.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_impl(path, false)
+    }
+
+    /// Open an arbitrary database as its exclusive daemon owner.
+    pub fn open_daemon_owned(path: &Path) -> Result<Self> {
+        Self::open_impl(path, true)
+    }
+
+    fn open_impl(path: &Path, daemon_owned: bool) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
         // Acquire exclusive process ownership before opening SQLite. The guard
         // is stored in `Db`, so backup/migration, writer startup, and the full
         // daemon lifetime are one ownership interval.
-        let owner_lock = Arc::new(files::DatabaseOwnerLock::acquire(path)?);
+        let owner_lock = daemon_owned
+            .then(|| files::DatabaseOwnerLock::acquire(path))
+            .transpose()?
+            .map(Arc::new);
         let existed_before_open = path.exists();
         if existed_before_open {
             let incoming = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -380,7 +405,7 @@ impl Db {
             writer: Some(writer),
             read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
-            _owner_lock: Some(owner_lock),
+            _owner_lock: owner_lock,
             _diagnostic_lock: None,
             read_only: false,
         };
@@ -773,7 +798,11 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
         // Durable daemon acknowledgements mean the WAL commit has crossed the
         // operating-system durability boundary. Do not inherit SQLite build or
         // environment defaults for this contract.
-        conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 1000;")
+        conn.execute_batch(
+            "PRAGMA synchronous = FULL;
+             PRAGMA wal_autocheckpoint = 1000;
+             PRAGMA journal_size_limit = 67108864;",
+        )
             .context("setting SQLite durability policy")?;
         // `pragma_update` doesn't accept the kind of literal that
         // `journal_mode = WAL` needs; the query-row form does. The
@@ -781,9 +810,13 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
         // non-`wal` result on a file DB would mean WAL is unavailable
         // (older SQLite, exotic FS), which is fine to silently fall
         // back to.
-        let _: String = conn
+        let journal_mode: String = conn
             .query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))
             .context("enabling WAL")?;
+        anyhow::ensure!(
+            journal_mode.eq_ignore_ascii_case("wal"),
+            "file-backed SQLite database requires WAL journal mode; SQLite selected {journal_mode:?}"
+        );
     }
     Ok(())
 }

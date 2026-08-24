@@ -140,16 +140,41 @@ struct WriteRequest {
 
 #[derive(Clone)]
 struct Writer {
-    tx: mpsc::SyncSender<WriteRequest>,
+    inner: Arc<WriterInner>,
+}
+
+/// Shared writer lifetime. `Db` declares its `writer` field before its owner
+/// lock, so the final clone joins this thread (including its final checkpoint)
+/// before releasing exclusive database ownership.
+struct WriterInner {
+    tx: Mutex<Option<mpsc::SyncSender<WriteRequest>>>,
+    join: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+}
+
+impl Drop for WriterInner {
+    fn drop(&mut self) {
+        // Closing the channel is the writer's orderly shutdown signal.
+        if let Ok(slot) = self.tx.get_mut() {
+            slot.take();
+        }
+        let join = self.join.get_mut().ok().and_then(Option::take);
+        if let Some(join) = join {
+            match join.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(%error, "database writer shutdown failed"),
+                Err(_) => tracing::error!("database writer thread panicked during shutdown"),
+            }
+        }
+    }
 }
 
 impl Writer {
     fn start(path: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("cockpit-db-writer".into())
-            .spawn(move || {
+            .spawn(move || -> Result<()> {
                 let conn = match Connection::open(&path)
                     .with_context(|| format!("opening sqlite writer at {}", path.display()))
                     .and_then(|conn| {
@@ -164,7 +189,7 @@ impl Writer {
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.to_string()));
-                        return;
+                        return Err(e);
                     }
                 };
 
@@ -178,12 +203,22 @@ impl Writer {
                 // checkpoint before SQLite closes the writer. This bounds
                 // WAL growth and makes the durable shutdown boundary
                 // independent of SQLite's build-time autocheckpoint defaults.
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .context("checkpointing SQLite WAL during writer shutdown")?;
+                Ok(())
             })
             .context("spawning db writer thread")?;
         match ready_rx.recv().context("waiting for db writer startup")? {
-            Ok(()) => Ok(Self { tx }),
-            Err(e) => anyhow::bail!(e),
+            Ok(()) => Ok(Self {
+                inner: Arc::new(WriterInner {
+                    tx: Mutex::new(Some(tx)),
+                    join: Mutex::new(Some(join)),
+                }),
+            }),
+            Err(e) => {
+                let _ = join.join();
+                anyhow::bail!(e)
+            }
         }
     }
 
@@ -197,7 +232,12 @@ impl Writer {
             let value = f(conn)?;
             Ok(Box::new(value) as Box<dyn Any + Send>)
         });
-        self.tx
+        self.inner
+            .tx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db writer mutex poisoned"))?
+            .as_ref()
+            .context("db writer is shut down")?
             .send(WriteRequest { job, reply })
             .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
         Ok(rx)

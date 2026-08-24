@@ -376,7 +376,38 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     let Some((row, identity_file)) = identity_target(ctx, path).await? else {
         return Ok(());
     };
+    let db = ctx.session.db.clone();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || record_identity_write_sync(&db, row, identity_file, &path))
+        .await
+        .context("assistant identity write coordinator joined")?
+}
+
+fn record_identity_write_sync(
+    db: &Db,
+    requested: AssistantRow,
+    identity_file: &'static str,
+    path: &Path,
+) -> Result<()> {
+    let home = crate::assistants::validate_row_home(&requested)?;
+    let definition = crate::assistants::assistant_definition_path(&home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, &home)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .context("assistant disappeared while recording identity write")?;
     crate::assistants::validate_row_home(&row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during identity recovery")?;
+    crate::assistants::validate_row_home(&row)?;
+    let expected_path = match identity_file {
+        SOUL_FILE => soul_path(&home),
+        USER_FILE => user_path(&home),
+        _ => anyhow::bail!("unsupported assistant identity file"),
+    };
+    if !same_path(path, &expected_path) {
+        anyhow::bail!("identity path changed before hash publication");
+    }
     let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
         .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
     match identity_file {
@@ -385,10 +416,7 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
         _ => {}
     }
     let config_json = serde_json::to_string(&config)?;
-    ctx.session
-        .db
-        .update_assistant_identity_hashes_cas(row, &config_json)
-        .await?;
+    update_identity_hashes_cas_blocking(db, row, config_json)?;
     Ok(())
 }
 

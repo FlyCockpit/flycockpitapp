@@ -46,7 +46,8 @@ use tokio::sync::oneshot;
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
     MediaReservationHandle, ObservationId, ProviderMediaVariant, SanitizedComputerFrame,
-    ScreenshotMediaType, TransientProviderRequest,
+    ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
+    openai_transient_computer_output,
 };
 use super::target::{
     BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetUnavailableReason,
@@ -3314,31 +3315,50 @@ impl NativeResponseExtractor {
     pub fn build_continuation(
         call: &NativeComputerCall,
         outcome: &CoordinatedOutcome,
+        live_frame: Option<&LiveComputerFrame>,
     ) -> NativeComputerContinuation {
         match call {
             NativeComputerCall::OpenAi { call_id, .. } => {
                 match outcome {
-                    CoordinatedOutcome::Completed { screenshot, .. } => {
-                        // Build a transient wire payload from the sanitized
-                        // projection. In a real system the live frame would be
-                        // borrowed; here we build a text-only continuation
-                        // because the live frame was dropped after capture.
-                        // The sanitized projection is the only durable record.
-                        let _ = screenshot;
-                        NativeComputerContinuation::TextOnly {
-                            call_id: call_id.clone(),
-                            text: "computer action completed".to_string(),
-                            provider: NativeProvider::OpenAi,
+                    CoordinatedOutcome::Completed { completed, .. } => {
+                        // With the transient live frame retained, build a real
+                        // `computer_call_output` carrying the screenshot; the
+                        // durable projection is recorded, pixels stay transient.
+                        // Without it (capture missed / not retained by the
+                        // caller) fall back to a text-only continuation.
+                        match live_frame {
+                            Some(frame) => NativeComputerContinuation::OpenAi {
+                                call_id: call_id.clone(),
+                                transient: Some(openai_transient_computer_output(
+                                    frame,
+                                    call_id,
+                                    completed.len(),
+                                    None,
+                                )),
+                            },
+                            None => NativeComputerContinuation::TextOnly {
+                                call_id: call_id.clone(),
+                                text: "computer action completed".to_string(),
+                                provider: NativeProvider::OpenAi,
+                            },
                         }
                     }
-                    CoordinatedOutcome::BackendCompleted { screenshot, .. } => {
-                        let _ = screenshot;
-                        NativeComputerContinuation::TextOnly {
+                    CoordinatedOutcome::BackendCompleted { completed, .. } => match live_frame {
+                        Some(frame) => NativeComputerContinuation::OpenAi {
+                            call_id: call_id.clone(),
+                            transient: Some(openai_transient_computer_output(
+                                frame,
+                                call_id,
+                                completed.len(),
+                                None,
+                            )),
+                        },
+                        None => NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
                             text: "computer action backend completed".to_string(),
                             provider: NativeProvider::OpenAi,
-                        }
-                    }
+                        },
+                    },
                     CoordinatedOutcome::Failed { failure, .. } => {
                         NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
@@ -3410,6 +3430,7 @@ impl NativeResponseExtractor {
                     outcome,
                     NativeProvider::Anthropic20251124,
                     ProviderMediaVariant::Anthropic20251124ImageBlock,
+                    live_frame,
                 )
             }
             NativeComputerCall::Anthropic20250124 { tool_use_id, .. } => {
@@ -3418,6 +3439,7 @@ impl NativeResponseExtractor {
                     outcome,
                     NativeProvider::Anthropic20250124,
                     ProviderMediaVariant::Anthropic20250124ImageBlock,
+                    live_frame,
                 )
             }
             NativeComputerCall::UnsupportedVariant { provider, detail } => {
@@ -3449,17 +3471,17 @@ impl NativeResponseExtractor {
         outcome: &CoordinatedOutcome,
         provider: NativeProvider,
         variant: ProviderMediaVariant,
+        live_frame: Option<&LiveComputerFrame>,
     ) -> NativeComputerContinuation {
         match outcome {
-            CoordinatedOutcome::Completed { .. } => NativeComputerContinuation::Anthropic {
+            CoordinatedOutcome::Completed { .. }
+            | CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
                 tool_use_id: tool_use_id.to_string(),
                 variant,
-                transient: None, // text-only; live frame was dropped
-            },
-            CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
-                tool_use_id: tool_use_id.to_string(),
-                variant,
-                transient: None,
+                // Attach the transient image block when the live frame was
+                // retained; otherwise text-only (no screenshot to send).
+                transient: live_frame
+                    .map(|frame| anthropic_transient_image_block(frame, tool_use_id, variant)),
             },
             CoordinatedOutcome::Failed { failure, .. } => NativeComputerContinuation::TextOnly {
                 call_id: tool_use_id.to_string(),
@@ -3677,7 +3699,7 @@ mod tests {
         let outcome = coordinator.execute_openai_call(call_id, actions).await;
 
         // Build the continuation through the native seam.
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::TextOnly {
@@ -3700,6 +3722,75 @@ mod tests {
                 assert!(!proj_json.contains("data:image"));
             }
             other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_continuation_attaches_transient_when_live_frame_retained() {
+        // With the transient live frame retained, a successful continuation
+        // carries a real provider transient (the screenshot); without it, the
+        // continuation is text-only. The pixels never leave the transient path.
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reservation: Box<dyn MediaReservationHandle> =
+            Box::new(InMemoryReservationHandle::new(released));
+        let frame = LiveComputerFrame::try_new(
+            vec![1, 2, 3, 4],
+            ScreenshotMediaType::Png,
+            FrameDimensions {
+                width: 2,
+                height: 2,
+                region: None,
+                native_zoom: None,
+            },
+            ObservationId("call-frame".to_string()),
+            ActionId("call-frame".to_string()),
+            CaptureEpoch(1),
+            reservation,
+            None,
+        )
+        .expect("live frame construction");
+
+        let completed = CoordinatedOutcome::Completed {
+            completed: Vec::new(),
+            screenshot: Some(frame.sanitized()),
+        };
+
+        // OpenAI: a retained frame yields an `OpenAi` continuation with a
+        // transient; no frame yields text-only.
+        let openai_call = NativeComputerCall::OpenAi {
+            call_id: "call-frame".to_string(),
+            actions: Vec::new(),
+        };
+        match NativeResponseExtractor::build_continuation(&openai_call, &completed, Some(&frame)) {
+            NativeComputerContinuation::OpenAi { call_id, transient } => {
+                assert_eq!(call_id, "call-frame");
+                assert!(transient.is_some(), "a retained live frame builds a transient");
+            }
+            other => panic!("expected OpenAi continuation with transient, got {other:?}"),
+        }
+        assert!(matches!(
+            NativeResponseExtractor::build_continuation(&openai_call, &completed, None),
+            NativeComputerContinuation::TextOnly {
+                provider: NativeProvider::OpenAi,
+                ..
+            }
+        ));
+
+        // Anthropic: a retained frame yields an image-block transient.
+        let anthropic_call = NativeComputerCall::Anthropic20251124 {
+            tool_use_id: "tool-frame".to_string(),
+            action: Anthropic20251124ComputerAction::Screenshot,
+        };
+        match NativeResponseExtractor::build_continuation(&anthropic_call, &completed, Some(&frame)) {
+            NativeComputerContinuation::Anthropic {
+                tool_use_id,
+                transient,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "tool-frame");
+                assert!(transient.is_some(), "a retained live frame builds a transient");
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
         }
     }
 
@@ -3743,7 +3834,7 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20251124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::Anthropic { .. }
@@ -3789,7 +3880,7 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20250124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::Anthropic { .. }
@@ -4708,7 +4799,7 @@ mod tests {
         let outcome = CoordinatedOutcome::UnsupportedProviderVariant {
             detail: "unknown action type `foo`".to_string(),
         };
-        let continuation = NativeResponseExtractor::build_continuation(&call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(&call, &outcome, None);
         match continuation {
             NativeComputerContinuation::Unsupported {
                 provider,
@@ -4787,7 +4878,7 @@ mod tests {
             })
             .await;
 
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         // The continuation does not carry pixel data in a serializable form.
         // (The TransientProviderRequest, if present, is not Serialize.)
         let _ = continuation;

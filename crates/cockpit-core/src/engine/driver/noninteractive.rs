@@ -5180,7 +5180,17 @@ pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (Some(event_tx), Some(target)) = (event_tx, target) else {
-            while rx.recv().await.is_some() {}
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    event = rx.recv() => {
+                        if event.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
             return;
         };
 

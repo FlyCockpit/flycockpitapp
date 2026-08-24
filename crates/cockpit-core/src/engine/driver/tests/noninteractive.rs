@@ -707,7 +707,12 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
     let (child_tx, child_rx) = mpsc::channel(8);
     let (parent_tx, mut parent_rx) = mpsc::channel(8);
     let target = NoninteractiveSteerTarget::new("task-1", "default");
-    let forwarder = spawn_noninteractive_event_forwarder(child_rx, Some(parent_tx), Some(target));
+    let forwarder = spawn_noninteractive_event_forwarder(
+        child_rx,
+        Some(parent_tx),
+        Some(target),
+        tokio_util::sync::CancellationToken::new(),
+    );
 
     child_tx
         .send(TurnEvent::AssistantTextDelta {
@@ -765,13 +770,35 @@ async fn noninteractive_event_forwarder_wraps_child_events() {
 }
 
 #[tokio::test]
+async fn noninteractive_event_forwarder_without_route_honours_cancellation() {
+    let (child_tx, child_rx) = mpsc::channel(1);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let forwarder = spawn_noninteractive_event_forwarder(
+        child_rx,
+        None,
+        None,
+        cancel.clone(),
+    );
+
+    // Keep the producer alive: channel closure cannot be the forwarder's exit.
+    cancel.cancel();
+    forwarder.await.unwrap();
+    drop(child_tx);
+}
+
+#[tokio::test]
 async fn noninteractive_display_delta_coalesces_typed_text() {
     use crate::engine::response_performance::AssistantAttemptId;
 
     let (child_tx, child_rx) = mpsc::channel(8);
     let (parent_tx, mut parent_rx) = mpsc::channel(8);
     let target = NoninteractiveSteerTarget::new("task-disp", "default");
-    let forwarder = spawn_noninteractive_event_forwarder(child_rx, Some(parent_tx), Some(target));
+    let forwarder = spawn_noninteractive_event_forwarder(
+        child_rx,
+        Some(parent_tx),
+        Some(target),
+        tokio_util::sync::CancellationToken::new(),
+    );
 
     let attempt = AssistantAttemptId::new(42);
     child_tx

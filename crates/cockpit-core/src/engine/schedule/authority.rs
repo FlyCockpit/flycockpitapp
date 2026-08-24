@@ -69,6 +69,10 @@ pub enum ScheduleCommand {
     Spawn {
         spec: SpawnSpec,
         result_tx: Option<oneshot::Sender<String>>,
+        /// Parent-owned lifetime. Once the requesting child is cancelled, an
+        /// accepted command may still be dequeued but must never begin a
+        /// grandchild turn.
+        parent_cancel: Option<tokio_util::sync::CancellationToken>,
     },
 }
 
@@ -156,6 +160,10 @@ struct ScheduleEntry {
     /// Cooperative cancellation for work that must settle lifecycle/process
     /// ownership before returning. Present for Swarm jobs.
     cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Distinguishes an ordinary cooperative cancel (whose terminal event
+    /// must backpressure until delivered) from driver teardown (which joins
+    /// tasks and reconciles registry/lifecycle state directly).
+    teardown: Option<Arc<AtomicBool>>,
     /// For in-context loops: the scheduler state needed to re-arm.
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
@@ -373,7 +381,10 @@ pub struct ScheduleAuthority {
     running_swarm: usize,
     /// Recursive `Swarm` spawns that arrived while at the concurrency cap
     /// (GOALS §24). Drained FIFO as running jobs complete and slots free.
-    swarm_queue: std::collections::VecDeque<SpawnSpec>,
+    swarm_queue: std::collections::VecDeque<(
+        SpawnSpec,
+        Option<tokio_util::sync::CancellationToken>,
+    )>,
 }
 
 impl ScheduleAuthority {
@@ -469,6 +480,17 @@ impl ScheduleAuthority {
     /// the caller (the driver / the child runner) — this method only enforces
     /// the concurrency cap and FIFO queueing.
     pub fn spawn_swarm(&mut self, spec: SpawnSpec) -> String {
+        self.spawn_swarm_owned(spec, None)
+    }
+
+    fn spawn_swarm_owned(
+        &mut self,
+        spec: SpawnSpec,
+        parent_cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> String {
+        if parent_cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+            return "refused: the requesting swarm parent was cancelled".to_string();
+        }
         if spec.prompt.len() > MAX_SWARM_PROMPT_BYTES {
             return format!(
                 "refused: spawn prompt is {} bytes; maximum is {} bytes",
@@ -492,27 +514,35 @@ impl ScheduleAuthority {
                     MAX_SWARM_QUEUE_LEN
                 );
             }
-            self.swarm_queue.push_back(spec);
+            self.swarm_queue.push_back((spec, parent_cancel));
             return format!(
                 "queued swarm subagent `{job_id}` (swarm concurrency cap {} reached; {} waiting) — starts when a slot frees",
                 self.swarm_max_concurrency,
                 self.swarm_queue.len()
             );
         }
-        let job_id = self.start_swarm_now(spec);
+        let job_id = self.start_swarm_now(spec, parent_cancel);
         format!("scheduled swarm subagent `{job_id}` (running in the background)")
     }
 
     /// Start a recursive `Swarm` subagent task immediately (slot already
     /// reserved by the caller's cap check). Registers the job, bumps the
     /// running count, and spawns the runner. Returns the job id.
-    fn start_swarm_now(&mut self, spec: SpawnSpec) -> String {
+    fn start_swarm_now(
+        &mut self,
+        spec: SpawnSpec,
+        parent_cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> String {
         let job_id = spec.job_id.clone().unwrap_or_else(new_job_id);
         let label = swarm_label(&spec);
         self.running_swarm += 1;
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
 
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = parent_cancel.map_or_else(
+            tokio_util::sync::CancellationToken::new,
+            |parent| parent.child_token(),
+        );
+        let teardown = Arc::new(AtomicBool::new(false));
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -522,6 +552,7 @@ impl ScheduleAuthority {
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
             cancel: cancel.clone(),
+            teardown: teardown.clone(),
         };
         let handle = tokio::spawn(swarm::run_swarm(run_ctx));
         let entry = ScheduleEntry {
@@ -532,6 +563,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(handle.abort_handle()),
             cancel: Some(cancel),
+            teardown: Some(teardown),
             in_context: None,
             background: None,
         };
@@ -547,10 +579,13 @@ impl ScheduleAuthority {
     pub fn swarm_completed(&mut self) {
         self.running_swarm = self.running_swarm.saturating_sub(1);
         while !self.swarm_at_capacity() {
-            let Some(spec) = self.swarm_queue.pop_front() else {
+            let Some((spec, parent_cancel)) = self.swarm_queue.pop_front() else {
                 break;
             };
-            self.start_swarm_now(spec);
+            if parent_cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+                continue;
+            }
+            self.start_swarm_now(spec, parent_cancel);
         }
     }
 
@@ -620,9 +655,13 @@ impl ScheduleAuthority {
         self.swarm_queue.clear();
         for entry in self.registry.values_mut() {
             if entry.kind == ScheduleKind::Swarm
-                && let Some(cancel) = entry.cancel.take()
             {
-                cancel.cancel();
+                if let Some(teardown) = entry.teardown.take() {
+                    teardown.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(cancel) = entry.cancel.take() {
+                    cancel.cancel();
+                }
             }
         }
         let tasks = std::mem::take(&mut self.swarm_tasks);
@@ -654,6 +693,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: None,
             cancel: None,
+            teardown: None,
             in_context: Some(InContextLoop {
                 next_delay_secs: args.interval_secs,
                 args,
@@ -694,6 +734,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(handle.abort_handle()),
             cancel: None,
+            teardown: None,
             in_context: None,
             background: None,
         };
@@ -731,6 +772,7 @@ impl ScheduleAuthority {
             iteration: 0,
             abort: Some(abort),
             cancel: None,
+            teardown: None,
             in_context: None,
             background: Some(Arc::new(handle)),
         };
@@ -771,6 +813,12 @@ impl ScheduleAuthority {
         // a synthetic success here would race that honest aborted result and
         // double-complete the registry slot.
         if cooperative {
+            // Keep the registry entry (and especially its teardown latch)
+            // authority-owned until the real terminal event is drained. If
+            // driver teardown wins while that event is backpressured, the
+            // latch is how `settle_swarm_for_teardown` makes the producer's
+            // final send nonblocking before joining it.
+            self.registry.insert(job_id.to_string(), entry);
             return true;
         }
         // In-context loops: the iterations already reached main; emit a
@@ -859,8 +907,12 @@ impl ScheduleAuthority {
             // global cap. The pointer return is dropped here — the child
             // already received its synchronous "scheduled/queued" tool result
             // from its own runner; this path only does the actual scheduling.
-            ScheduleCommand::Spawn { spec, result_tx } => {
-                let result = self.spawn_swarm(spec);
+            ScheduleCommand::Spawn {
+                spec,
+                result_tx,
+                parent_cancel,
+            } => {
+                let result = self.spawn_swarm_owned(spec, parent_cancel);
                 if let Some(result_tx) = result_tx {
                     let _ = result_tx.send(result);
                 }

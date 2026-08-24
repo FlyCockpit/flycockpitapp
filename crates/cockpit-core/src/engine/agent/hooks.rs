@@ -845,7 +845,8 @@ impl CommandRunner for TokioCommandRunner {
             };
         };
         let operation_id = format!("hook-{}", Uuid::new_v4());
-        let allocation = containment.create_and_spawn_with_io(
+        let allocation_cancel = tokio_util::sync::CancellationToken::new();
+        let allocation = containment.create_and_spawn_with_io_cancellable(
                 session_id,
                 operation_id,
                 executable,
@@ -853,18 +854,18 @@ impl CommandRunner for TokioCommandRunner {
                 env.clone(),
                 cwd,
                 true,
+                allocation_cancel.clone(),
             );
         let cancellation = self
             .cancellation
             .clone()
             .unwrap_or_else(tokio_util::sync::CancellationToken::new);
         let cancellation_enabled = self.cancellation.is_some();
-        // Allocation is part of the hook deadline. Enqueuing the operation is
-        // the cleanup-ticket handoff: the actor owns the request and, if this
-        // reply receiver is dropped after a spawn, `reply.send` failure moves
-        // the unpublished lease directly into actor reconciliation. Therefore
-        // timeout/cancellation may stop awaiting without detaching either the
-        // allocation future or an opaque platform handle.
+        // Allocation is part of the hook deadline. Once the bounded actor
+        // accepts this request, `allocation_cancel` is its cleanup ticket:
+        // timeout/cancellation requests cancellation and then waits for the
+        // actor's acknowledgement, which is sent only after a crossed spawn
+        // boundary has reached same-generation ProvenEmpty.
         let mut allocation = Box::pin(allocation);
         let allocation_deadline = tokio::time::sleep(timeout);
         tokio::pin!(allocation_deadline);
@@ -889,7 +890,8 @@ impl CommandRunner for TokioCommandRunner {
                     AllocationBoundary::TimedOut => (true, None),
                     AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
                 };
-                drop(allocation);
+                allocation_cancel.cancel();
+                let _ = allocation.await;
                 return HookRawOutput {
                     stdout: String::new(),
                     exit_code: None,

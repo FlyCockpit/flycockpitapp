@@ -3508,6 +3508,12 @@ impl Driver {
                         self.schedule.handle_command(cmd);
                         continue;
                     } else {
+                        // Losing the actor command ingress is a teardown
+                        // boundary, not permission to drop the authority's
+                        // task registry. Cooperatively cancel and join every
+                        // recursive child before leaving the driver loop.
+                        self.schedule.settle_swarm_for_teardown().await;
+                        self.drain_orphaned_swarm_stop_hooks().await;
                         break;
                     }
                 }

@@ -51,6 +51,7 @@ enum Op {
         env: std::collections::BTreeMap<String, String>,
         cwd: PathBuf,
         require_proven: bool,
+        cancellation: tokio_util::sync::CancellationToken,
         reply: Reply<Result<(ContainmentLease, NativeChildIo), ContainmentError>>,
     },
     CreateContainerAndExec {
@@ -98,9 +99,6 @@ enum Op {
         kind: LateCallbackKind,
         reply: Reply<()>,
     },
-    Shutdown {
-        reply: Reply<()>,
-    },
 }
 
 struct LiveEntry {
@@ -119,6 +117,7 @@ struct ReconciliationRequest {
 pub struct ProcessContainmentHandle {
     tx: mpsc::Sender<Op>,
     reconciliation_tx: mpsc::UnboundedSender<ReconciliationRequest>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl ProcessContainmentHandle {
@@ -180,6 +179,35 @@ impl ProcessContainmentHandle {
         cwd: impl Into<PathBuf>,
         require_proven: bool,
     ) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
+        self.create_and_spawn_with_io_cancellable(
+            session_id,
+            operation_id,
+            program,
+            args,
+            env,
+            cwd,
+            require_proven,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Submit an allocation with an explicit accepted-request cancellation
+    /// ticket. Once enqueued, cancellation does not drop ownership: the actor
+    /// acknowledges it only after any allocation that crossed the spawn
+    /// boundary has reached same-generation ProvenEmpty.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_and_spawn_with_io_cancellable(
+        &self,
+        session_id: Uuid,
+        operation_id: impl Into<String>,
+        program: impl Into<PathBuf>,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        cwd: impl Into<PathBuf>,
+        require_proven: bool,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::CreateAndSpawnWithIo {
             session_id,
@@ -189,9 +217,19 @@ impl ProcessContainmentHandle {
             env,
             cwd: cwd.into(),
             require_proven,
+            cancellation: cancellation.clone(),
             reply,
         })?;
-        Self::await_reply(rx).await?
+        let result = Self::await_reply(rx).await?;
+        if cancellation.is_cancelled()
+            && let Ok((lease, _)) = result.as_ref()
+        {
+            self.reconcile_and_await_empty(lease.clone()).await?;
+            return Err(ContainmentError::Internal(
+                "allocation request cancelled after cleanup".into(),
+            ));
+        }
+        result
     }
 
     /// Fresh container per generation for container/zerobox strict work.
@@ -348,9 +386,11 @@ impl ProcessContainmentActor {
     pub fn start(db: Db, adapter: SharedAdapter) -> Self {
         let (tx, rx) = mpsc::channel(CONTAINMENT_QUEUE_CAPACITY);
         let (reconciliation_tx, reconciliation_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = ProcessContainmentHandle {
             tx: tx.clone(),
             reconciliation_tx,
+            shutdown_tx,
         };
         let join = thread::Builder::new()
             .name("process-containment".into())
@@ -364,7 +404,7 @@ impl ProcessContainmentActor {
                     .enable_all()
                     .build()
                     .expect("containment runtime");
-                rt.block_on(actor_loop(db, adapter, rx, reconciliation_rx));
+                rt.block_on(actor_loop(db, adapter, rx, reconciliation_rx, shutdown_rx));
                 // Drop runtime without blocking forever on stray tasks.
                 rt.shutdown_background();
             })
@@ -379,16 +419,14 @@ impl ProcessContainmentActor {
         let Some(join) = self.join.take() else {
             return;
         };
-        let tx = self.handle.tx.clone();
-        let shutdown = move || shutdown_actor_thread(tx, join);
         if tokio::runtime::Handle::try_current().is_ok() {
             // `blocking_send` panics from an async runtime. Keep the complete
             // synchronous shutdown protocol on an ordinary helper thread;
             // joining that helper preserves this method's explicit-shutdown
             // guarantee without entering Tokio's blocking APIs here.
-            let _ = std::thread::spawn(shutdown).join();
+            dispatch_actor_shutdown(self.handle.shutdown_tx.clone(), join, true);
         } else {
-            shutdown();
+            shutdown_actor_thread(self.handle.shutdown_tx.clone(), join);
         }
     }
 }
@@ -403,50 +441,67 @@ impl Drop for ProcessContainmentActor {
         let Some(join) = self.join.take() else {
             return;
         };
-        let tx = self.handle.tx.clone();
-        let shutdown = move || shutdown_actor_thread(tx, join);
         if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(shutdown);
+            dispatch_actor_shutdown(self.handle.shutdown_tx.clone(), join, false);
         } else {
-            shutdown();
+            shutdown_actor_thread(self.handle.shutdown_tx.clone(), join);
         }
     }
 }
 
-fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
-    let (reply, rx) = oneshot::channel();
-    let deadline = Instant::now() + ACTOR_SHUTDOWN_DEADLINE;
-    let mut op = Op::Shutdown { reply };
-    loop {
-        match tx.try_send(op) {
-            Ok(()) => break,
-            Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
-                op = returned;
-                thread::sleep(Duration::from_millis(10));
+fn dispatch_actor_shutdown(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: thread::JoinHandle<()>,
+    wait_for_helper: bool,
+) {
+    let retained = Arc::new(std::sync::Mutex::new(Some((shutdown_tx, join))));
+    let for_helper = retained.clone();
+    let helper = thread::Builder::new()
+        .name("process-containment-shutdown".into())
+        .spawn(move || {
+            let owned = for_helper
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((shutdown_tx, join)) = owned {
+                shutdown_actor_thread(shutdown_tx, join);
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                retain_actor_join(join);
-                return;
+        });
+    match helper {
+        Ok(helper) if wait_for_helper => {
+            let _ = helper.join();
+        }
+        Ok(_) => {}
+        Err(_) => {
+            // Do not drop the actor JoinHandle on helper-thread exhaustion.
+            // This fallback can block, but preserves the ownership invariant.
+            let owned = retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((shutdown_tx, join)) = owned {
+                shutdown_actor_thread(shutdown_tx, join);
             }
         }
     }
-    let mut rx = rx;
-    loop {
-        match rx.try_recv() {
-            Ok(()) => {
-                let _ = join.join();
-                return;
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                if Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                retain_actor_join(join);
-                return;
-            }
-        }
+}
+
+fn shutdown_actor_thread(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: thread::JoinHandle<()>,
+) {
+    // `send_replace` cannot be rejected by bounded operation-queue pressure.
+    // The actor owns a receiver for its entire lifetime, and channel closure
+    // also resolves the selected control branch.
+    shutdown_tx.send_replace(true);
+    let deadline = Instant::now() + ACTOR_SHUTDOWN_DEADLINE;
+    while !join.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if join.is_finished() {
+        let _ = join.join();
+    } else {
+        retain_actor_join(join);
     }
 }
 
@@ -455,11 +510,35 @@ fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
 /// of dropping (detaching) it. The actor continues owning every live adapter
 /// handle and durable reconciliation item until its loop actually finishes.
 fn retain_actor_join(join: thread::JoinHandle<()>) {
-    let _ = thread::Builder::new()
+    // Keep a second owner outside the closure. `Builder::spawn` consumes and
+    // drops its closure on failure; moving the only JoinHandle directly into
+    // that closure would silently detach precisely on the resource-exhaustion
+    // path where thread creation fails.
+    let retained = Arc::new(std::sync::Mutex::new(Some(join)));
+    let for_reaper = retained.clone();
+    let spawned = thread::Builder::new()
         .name("process-containment-reaper".into())
         .spawn(move || {
-            let _ = join.join();
+            let join = for_reaper
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(join) = join {
+                let _ = join.join();
+            }
         });
+    if spawned.is_err() {
+        // Failure is exceptional and there is no nonblocking OS primitive
+        // which can both retain and join a Rust thread. Preserve ownership and
+        // correctness by joining on this already-off-runtime shutdown helper.
+        let join = retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(join) = join {
+            let _ = join.join();
+        }
+    }
 }
 
 fn wall_ms() -> i64 {
@@ -515,6 +594,7 @@ async fn actor_loop(
     adapter: SharedAdapter,
     mut rx: mpsc::Receiver<Op>,
     mut reconciliation_rx: mpsc::UnboundedReceiver<ReconciliationRequest>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut state = ActorState {
         db,
@@ -530,6 +610,10 @@ async fn actor_loop(
         let op = if state.pending_reconciliation.is_empty() && state.pending_unpublished.is_empty() {
             tokio::select! {
                 op = rx.recv() => op,
+                _ = shutdown_rx.changed() => {
+                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                    break;
+                }
                 request = reconciliation_rx.recv() => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
@@ -540,6 +624,10 @@ async fn actor_loop(
         } else {
             tokio::select! {
                 op = rx.recv() => op,
+                _ = shutdown_rx.changed() => {
+                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                    break;
+                }
                 request = reconciliation_rx.recv() => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
@@ -559,18 +647,14 @@ async fn actor_loop(
                 }
             }
         };
-        let Some(op) = op else { break };
+        let Some(op) = op else {
+            // Every sender disappeared without the explicit owner signal.
+            // This is still a shutdown boundary: retain and reconcile all
+            // live ownership before the actor thread exits.
+            drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+            break;
+        };
         match op {
-            Op::Shutdown { reply } => {
-                // The synchronous caller has a deadline, but the ownership
-                // task does not: cancelling this drain would drop opaque live
-                // handles. If the caller times out it transfers the JoinHandle
-                // to a reaper, while this actor continues until every accepted
-                // cleanup has reached proven empty.
-                drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
-                let _ = reply.send(());
-                break;
-            }
             Op::SafeMetadata { reply } => {
                 let _ = reply.send(state.adapter.safe_metadata());
             }
@@ -624,9 +708,13 @@ async fn actor_loop(
                 env,
                 cwd,
                 require_proven,
+                cancellation,
                 reply,
             } => {
-                let result = create_native_with_io(
+                let mut result = if cancellation.is_cancelled() {
+                    Err(ContainmentError::Internal("allocation request cancelled".into()))
+                } else {
+                    create_native_with_io(
                     &mut state,
                     session_id,
                     operation_id,
@@ -636,7 +724,28 @@ async fn actor_loop(
                     cwd,
                     require_proven,
                 )
-                .await;
+                .await
+                };
+                if cancellation.is_cancelled()
+                    && let Ok((lease, _)) = result.as_ref()
+                {
+                    let lease = lease.clone();
+                    reconcile_lease_to_proven_empty(&mut state, lease).await;
+                    result = Err(ContainmentError::Internal(
+                        "allocation request cancelled after cleanup".into(),
+                    ));
+                } else if cancellation.is_cancelled() {
+                    // A post-spawn durable-publication failure is represented
+                    // by `pending_unpublished`, not by a lease in `result`.
+                    // Do not acknowledge this accepted request until those
+                    // actor-owned native handles have also proved empty.
+                    while !state.pending_unpublished.is_empty() {
+                        reconcile_one_pending(&mut state).await;
+                        if !state.pending_unpublished.is_empty() {
+                            tokio::time::sleep(RECONCILIATION_INITIAL_BACKOFF).await;
+                        }
+                    }
+                }
                 if let Err(Ok((lease, _io))) = reply.send(result) {
                     // The requester was cancelled after allocation. Ownership
                     // stays with the actor, so reclaim the unpublished lease
@@ -711,6 +820,21 @@ async fn actor_loop(
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+async fn reconcile_lease_to_proven_empty(state: &mut ActorState, lease: ContainmentLease) {
+    let mut backoff = RECONCILIATION_INITIAL_BACKOFF;
+    loop {
+        let _ = terminate_one(state, lease.clone()).await;
+        if matches!(
+            await_empty_one(state, lease.clone()).await,
+            Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation
+        ) {
+            return;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
     }
 }
 

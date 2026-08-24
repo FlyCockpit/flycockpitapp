@@ -57,6 +57,10 @@ pub struct SwarmRunCtx {
     /// in-flight stop hook settle its containment and publish one honest
     /// aborted terminal event.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Set before teardown cancellation. Ordinary cancellation must deliver
+    /// its completion even through backpressure; teardown reconciles directly
+    /// and therefore must never block its task join on the event queue.
+    pub teardown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -167,9 +171,32 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         event_tx,
         cmd_tx,
         cancel,
+        teardown,
     } = run;
 
     let lifecycle_event_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // A recursive spawn request can be accepted just before its parent is
+    // cancelled. The child token is derived from that parent, so close this
+    // race before write-authority transfer, lifecycle publication, or a first
+    // model turn.
+    if cancel.is_cancelled() {
+        send_swarm_terminal(
+            &event_tx,
+            &cancel,
+            &teardown,
+            ScheduleEvent::Completed {
+                job_id,
+                label,
+                kind: ScheduleKind::Swarm,
+                result: "swarm subagent cancelled".to_string(),
+                failed: false,
+                requests: Vec::new(),
+            },
+        )
+        .await;
+        return;
+    }
 
     // AC7: capability + execution-wide permit + containment are acquired here,
     // immediately BEFORE the child's first turn — i.e. before any native spawn
@@ -184,7 +211,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         match begin_write_scope_transfer(&spec, &ctx).await {
             Ok(handle) => handle,
             Err(refusal) => {
-                send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
+                send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
                         job_id,
                         label,
                         kind: ScheduleKind::Swarm,
@@ -214,7 +241,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     if !spec.worker.is_goal_control()
         && lifecycle_event_emitted.load(std::sync::atomic::Ordering::Acquire)
     {
-        send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::SwarmChildStopGateCompleted {
+        send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::SwarmChildStopGateCompleted {
                 job_id: job_id.clone(),
             }).await;
     }
@@ -239,7 +266,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }
         Err(e) => {
             let cancelled = cancel.is_cancelled();
-            send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
+            send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
                     job_id,
                     label,
                     kind: ScheduleKind::Swarm,
@@ -263,7 +290,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     } else {
         budget_result(&label, &spec, &result)
     };
-    send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
+    send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
             job_id,
             label,
             kind: ScheduleKind::Swarm,
@@ -276,19 +303,27 @@ pub async fn run_swarm(run: SwarmRunCtx) {
 async fn send_swarm_terminal(
     event_tx: &mpsc::Sender<ScheduleEvent>,
     cancel: &tokio_util::sync::CancellationToken,
+    teardown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     event: ScheduleEvent,
 ) {
-    if cancel.is_cancelled() {
+    if teardown.load(std::sync::atomic::Ordering::Acquire) {
         let _ = event_tx.try_send(event);
         return;
     }
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            // Teardown owns abnormal lifecycle reconciliation and is waiting
-            // to join this task. Never deadlock that join on a full event
-            // channel which the driver has intentionally stopped draining.
-            let _ = event_tx.try_send(event);
+            if teardown.load(std::sync::atomic::Ordering::Acquire) {
+                // Teardown owns abnormal lifecycle reconciliation and is
+                // waiting to join this task. Never deadlock that join on a
+                // full channel the driver has stopped draining.
+                let _ = event_tx.try_send(event);
+            } else {
+                // Human/parent cancellation is an ordinary terminal outcome.
+                // The driver is alive and must receive this authority signal,
+                // so preserve backpressure instead of dropping completion.
+                let _ = event_tx.send(event).await;
+            }
         }
         result = event_tx.send(event) => {
             let _ = result;
@@ -679,6 +714,7 @@ async fn route_child_spawn(
     let command = ScheduleCommand::Spawn {
             spec: child,
             result_tx: Some(result_tx),
+            parent_cancel: Some(cancel.clone()),
         };
     let sent = tokio::select! {
         biased;
@@ -1298,7 +1334,7 @@ mod tests {
             let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
             let handle = tokio::spawn(async move {
                 match cmd_rx.recv().await {
-                    Some(ScheduleCommand::Spawn { spec, result_tx }) => {
+                    Some(ScheduleCommand::Spawn { spec, result_tx, .. }) => {
                         if let Some(result_tx) = result_tx {
                             let _ = result_tx.send("scheduled".to_string());
                         }
@@ -1421,7 +1457,7 @@ mod tests {
         tokio::pin!(routed);
         let result_tx = tokio::select! {
             maybe = cmd_rx.recv() => match maybe {
-                Some(ScheduleCommand::Spawn { spec, result_tx }) => {
+                Some(ScheduleCommand::Spawn { spec, result_tx, .. }) => {
                     assert_eq!(spec.depth, 2, "depth advances by one per edge");
                     assert_eq!(spec.write_scope, "slice");
                     assert_eq!(spec.max_depth, 3);
@@ -1472,14 +1508,20 @@ mod tests {
             &cancel,
         );
         tokio::pin!(waiting);
-        let held_reply = tokio::select! {
+        let (held_reply, accepted_parent_cancel) = tokio::select! {
             command = cmd_rx.recv() => match command {
-                Some(ScheduleCommand::Spawn { result_tx, .. }) => result_tx,
+                Some(ScheduleCommand::Spawn { result_tx, parent_cancel, .. }) => {
+                    (result_tx, parent_cancel.expect("recursive spawn carries parent ownership"))
+                }
                 other => panic!("expected nested spawn, got {other:?}"),
             },
             result = &mut waiting => panic!("returned before scheduler reply: {result}"),
         };
         cancel.cancel();
+        assert!(
+            accepted_parent_cancel.is_cancelled(),
+            "an already-accepted recursive command stays parent-owned"
+        );
         let result = waiting.await;
         assert!(result.contains("parent was cancelled"));
         assert!(held_reply.expect("reply sender").send("late".into()).is_err());
@@ -1506,7 +1548,7 @@ mod tests {
         tokio::pin!(routed);
         let result_tx = tokio::select! {
             maybe = cmd_rx.recv() => match maybe {
-                Some(ScheduleCommand::Spawn { spec, result_tx }) => {
+                Some(ScheduleCommand::Spawn { spec, result_tx, .. }) => {
                     assert_eq!(spec.worker, SpawnWorkerKind::Scout);
                     assert_eq!(spec.model.as_deref(), Some("openrouter/reviewer"));
                     assert_eq!(spec.depth, 2);

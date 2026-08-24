@@ -845,7 +845,20 @@ impl CommandRunner for TokioCommandRunner {
             };
         };
         let operation_id = format!("hook-{}", Uuid::new_v4());
-        let allocation_cancel = tokio_util::sync::CancellationToken::new();
+        let allocation_cancel = match crate::process_containment::AllocationCancellation::new() {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                return HookRawOutput {
+                    stdout: String::new(),
+                    exit_code: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    spawn_failed: true,
+                    timeout: false,
+                    failure_reason: Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+                    output_truncated: false,
+                };
+            }
+        };
         let allocation = containment.create_and_spawn_with_io_cancellable(
                 session_id,
                 operation_id,
@@ -864,9 +877,8 @@ impl CommandRunner for TokioCommandRunner {
         // Allocation is part of the hook deadline. Once the bounded actor
         // accepts this request, `allocation_cancel` is its cleanup ticket:
         // timeout/cancellation transfers the request-specific cleanup ticket
-        // to the actor. Allocation is actor-owned after queue acceptance, so
-        // this hook future need not remain pinned behind a stuck platform
-        // allocation; the actor will publish-or-reconcile that exact request.
+        // to the actor. The hook then awaits that ticket: completion means the
+        // exact generation either never crossed release or reached ProvenEmpty.
         let mut allocation = Box::pin(allocation);
         let allocation_deadline = tokio::time::sleep(timeout);
         tokio::pin!(allocation_deadline);
@@ -891,7 +903,16 @@ impl CommandRunner for TokioCommandRunner {
                     AllocationBoundary::TimedOut => (true, None),
                     AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
                 };
-                allocation_cancel.cancel();
+                let cancellation_recorded = allocation_cancel.cancel().is_ok();
+                // The actor reply is the explicit cleanup-completion ticket.
+                // It resolves only after a losing broker prepare is cancelled
+                // or a winning commit reaches same-generation ProvenEmpty.
+                let completion = allocation.await;
+                if !cancellation_recorded
+                    && let Ok((lease, _)) = completion
+                {
+                    let _ = containment.reconcile_and_await_empty(lease).await;
+                }
                 return HookRawOutput {
                     stdout: String::new(),
                     exit_code: None,

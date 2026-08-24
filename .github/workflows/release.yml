@@ -225,13 +225,29 @@ jobs:
 
       - name: Build artifacts
         run: |
+          for target in ${{ join(matrix.targets, ' ') }}; do
+            case "$target" in
+              *linux*)
+                cargo build --locked --release --target "$target" -p cockpit-cli \
+                  --bin cockpit-containment-broker --features linux-containment-broker-bin
+                mkdir -p "target/distrib/linux-brokers/$target"
+                cp "target/$target/release/cockpit-containment-broker" \
+                  "target/distrib/linux-brokers/$target/cockpit-containment-broker"
+                ;;
+            esac
+          done
           dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > target/distrib/dist-manifest.json
           echo "dist ran successfully"
 
-      - name: Verify Linux containment archive topology
-        if: ${{ contains(join(matrix.targets, ','), 'linux') }}
+      - name: Assemble target-specific containment archives
         shell: bash
-        run: python3 apps/cli/scripts/verify-linux-containment-archive.py target/distrib
+        run: |
+          for target in ${{ join(matrix.targets, ' ') }}; do
+            python3 apps/cli/scripts/assemble-linux-containment-archive.py target/distrib "$target"
+          done
+          case "${{ join(matrix.targets, ' ') }}" in
+            *linux*) python3 apps/cli/scripts/verify-linux-containment-archive.py target/distrib ;;
+          esac
 
       - id: cargo-dist
         name: Post-build

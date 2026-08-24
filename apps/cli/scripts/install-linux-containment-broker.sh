@@ -155,6 +155,12 @@ if [ "$(stat -c '%F:%u:%g:%a' "$socket")" != "socket:0:$daemon_gid:660" ]; then
   echo "containment broker did not publish the authenticated socket contract" >&2
   exit 1
 fi
+# Authenticate the actual protocol and require the broker's Proven readiness
+# attestation. FD 9 is opened by this root installer and never exposed by path
+# to the daemon user.
+/usr/libexec/flycockpit/cockpit-containment-broker \
+  --doctor --allowed-uid "$daemon_uid" --socket "$socket" \
+  --capability-fd 9 9<"/etc/flycockpit/containment-capability-$daemon_uid"
 systemctl start "$daemon_unit"
 systemctl is-active --quiet "$daemon_unit"
 runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null

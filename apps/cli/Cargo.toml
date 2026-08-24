@@ -27,6 +27,12 @@ path = "src/main.rs"
 [[bin]]
 name = "cockpit-containment-broker"
 path = "src/containment_broker_main.rs"
+required-features = ["linux-containment-broker-bin"]
+
+[features]
+# Enabled only by Linux CI/release jobs. cargo-dist therefore cannot publish a
+# non-Linux broker stub or infer a cross-platform co-bundle from package bins.
+linux-containment-broker-bin = []
 
 # Single merged e2e/integration test binary: one full-dependency-graph link
 # instead of one per test file. Modules live in tests/e2e/.

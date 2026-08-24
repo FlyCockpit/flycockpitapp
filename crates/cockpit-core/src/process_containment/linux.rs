@@ -13,8 +13,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::adapter::{
-    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest,
-    ContainmentAdapter, NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, AllocationCancellation,
+    ContainerExecRequest, ContainmentAdapter, NativeIoSpawnRequest, NativeSpawnRequest,
+    SharedAdapter,
 };
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
@@ -417,7 +418,8 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
                 ),
                 capture_io: false,
                 require_proven: req.require_proven,
-                cancellation: tokio_util::sync::CancellationToken::new(),
+                cancellation: AllocationCancellation::new()
+                    .map_err(|error| ContainmentError::Internal(error.to_string()))?,
             })
             .await?;
         Ok(spawned.allocation)

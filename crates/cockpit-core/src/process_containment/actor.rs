@@ -19,8 +19,8 @@ use crate::db::Db;
 use crate::db::execution_containments::{CasExecutionContainment, ExecutionContainmentRow};
 
 use super::adapter::{
-    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest, NativeChildIo,
-    NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, AllocationCancellation,
+    ContainerExecRequest, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
 };
 use super::state_machine::reduce;
 use super::types::{
@@ -51,7 +51,7 @@ enum Op {
         env: std::collections::BTreeMap<String, String>,
         cwd: PathBuf,
         require_proven: bool,
-        cancellation: tokio_util::sync::CancellationToken,
+        cancellation: AllocationCancellation,
         reply: Reply<Result<(ContainmentLease, NativeChildIo), ContainmentError>>,
     },
     CreateContainerAndExec {
@@ -187,7 +187,8 @@ impl ProcessContainmentHandle {
             env,
             cwd,
             require_proven,
-            tokio_util::sync::CancellationToken::new(),
+            AllocationCancellation::new()
+                .map_err(|error| ContainmentError::Internal(error.to_string()))?,
         )
         .await
     }
@@ -206,7 +207,7 @@ impl ProcessContainmentHandle {
         env: std::collections::BTreeMap<String, String>,
         cwd: impl Into<PathBuf>,
         require_proven: bool,
-        cancellation: tokio_util::sync::CancellationToken,
+        cancellation: AllocationCancellation,
     ) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(Op::CreateAndSpawnWithIo {
@@ -620,7 +621,7 @@ struct PendingUnpublished {
 struct PreparedIoAllocation {
     record: ContainmentRecord,
     request: NativeIoSpawnRequest,
-    cancellation: tokio_util::sync::CancellationToken,
+    cancellation: AllocationCancellation,
     reply: IoCreateReply,
 }
 
@@ -1512,7 +1513,7 @@ async fn prepare_native_with_io(
     env: std::collections::BTreeMap<String, String>,
     cwd: PathBuf,
     require_proven: bool,
-    cancellation: tokio_util::sync::CancellationToken,
+    cancellation: AllocationCancellation,
     reply: IoCreateReply,
 ) -> Result<PreparedIoAllocation, (IoCreateReply, ContainmentError)> {
     if state.intake_closed {

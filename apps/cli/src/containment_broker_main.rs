@@ -19,6 +19,7 @@ fn main() -> std::io::Result<()> {
     let mut gid = None;
     let mut socket = None;
     let mut capability_fd = None;
+    let mut doctor = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -26,10 +27,19 @@ fn main() -> std::io::Result<()> {
             Some("--allowed-gid") => gid = Some(parse_id(args.next(), "--allowed-gid")?),
             Some("--socket") => socket = args.next().map(PathBuf::from),
             Some("--capability-fd") => capability_fd = Some(parse_id(args.next(), "--capability-fd")? as i32),
+            Some("--doctor") => doctor = true,
             _ => return Err(invalid("unknown or non-UTF-8 argument")),
         }
     }
     let uid = uid.ok_or_else(|| invalid("--allowed-uid is required"))?;
+    if doctor {
+        let config = cockpit_core::process_containment::LinuxBrokerConfig {
+            socket_path: socket.ok_or_else(|| invalid("--socket is required for --doctor"))?,
+            expected_broker_uid: 0,
+            capability_fd,
+        };
+        return cockpit_core::process_containment::doctor_linux_containment_broker(config);
+    }
     let gid = match gid {
         Some(gid) => gid,
         None => primary_gid(uid)?,

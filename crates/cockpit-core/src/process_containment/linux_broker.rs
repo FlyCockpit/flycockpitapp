@@ -40,15 +40,19 @@ const MAX_ARGUMENTS: usize = 4096;
 const MAX_STRING_BYTES: usize = 128 * 1024;
 const SPAWN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const AUTH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_PREAUTH_CONNECTIONS: usize = 16;
+const MAX_OPERATION_RECORDS_PER_EPOCH: usize = 65_536;
 const BROKER_DIRECTORY: &str = "/run/flycockpit";
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct LinuxBrokerConfig {
     pub socket_path: PathBuf,
     pub expected_broker_uid: u32,
-    /// Root-opened, non-inheritable capability descriptor delivered to the
-    /// daemon by its service manager. The number is public; possession of the
-    /// underlying open file description is the capability.
+    /// Root-opened capability descriptor delivered to the daemon by its
+    /// service manager. The descriptor number is public; possession of an fd
+    /// for the attested root-owned, mode-0400 inode is the bearer capability.
     pub capability_fd: Option<RawFd>,
 }
 
@@ -85,6 +89,18 @@ pub fn inherited_named_fd(expected_name: &str) -> Option<RawFd> {
         }
     }
     found
+}
+
+/// Performs the same peer, capability, framing, and kernel-contract handshake
+/// used by the daemon. Installers use this instead of treating service-manager
+/// liveness or socket metadata as proof of usable containment.
+pub fn doctor_linux_containment_broker(config: LinuxBrokerConfig) -> std::io::Result<()> {
+    let capability_raw = config.capability_fd.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "containment capability fd unavailable")
+    })?;
+    let capability = duplicate_valid_capability(capability_raw)?;
+    let stream = connect_authenticated_stream(&config, capability.as_fd())?;
+    stream.shutdown(std::net::Shutdown::Both)
 }
 
 #[derive(Debug, Clone)]
@@ -335,11 +351,17 @@ impl ManagementBroker for LinuxBrokerClient {
         let operation_id = request.operation_id.clone();
         let program = request.program.as_os_str().as_bytes().to_vec();
         let cwd = request.cwd.as_os_str().as_bytes().to_vec();
-        let environment = request.inherited_env.unwrap_or_else(|| {
+        let mut environment = request.inherited_env.unwrap_or_else(|| {
             request.env.iter().map(|(key, value)| {
                 (key.as_bytes().to_vec(), value.as_bytes().to_vec())
             }).collect()
         });
+        // Environment order is not semantic. Canonical byte ordering makes
+        // request digests stable across libc/hash-map enumeration order and
+        // makes duplicate byte keys unambiguously invalid.
+        environment.sort_by(|left, right| left.0.cmp(&right.0));
+        validate_environment(&environment)
+            .map_err(|error| ContainmentError::Internal(error.to_string()))?;
         let request_digest = canonical_spawn_digest(
             &containment_id.to_string(),
             &session_id,
@@ -366,13 +388,19 @@ impl ManagementBroker for LinuxBrokerClient {
         };
         let capture_io = request.capture_io;
         let cancellation = request.cancellation.clone();
+        let cancellation_fd = cancellation.decision_fd().as_raw_fd();
         let (response, mut fds) = tokio::task::spawn_blocking(move || {
             if capture_io {
-                client.transact(&wire)
+                client.transact_with_fds(&wire, &[cancellation_fd])
             } else {
                 client.transact_with_fds(
                     &wire,
-                    &[libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO],
+                    &[
+                        libc::STDIN_FILENO,
+                        libc::STDOUT_FILENO,
+                        libc::STDERR_FILENO,
+                        cancellation_fd,
+                    ],
                 )
             }
         })
@@ -569,11 +597,14 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
             .filter(|operation| matches!(operation.status, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited))
             .map(|operation| operation.key.clone()),
     );
+    let recovered_exit_statuses = operations.values()
+        .filter_map(|operation| operation.exit_code.map(|code| (operation.key.clone(), Some(code))))
+        .collect();
     let mut state = BrokerState {
         children: BTreeMap::new(),
         operations,
         emptied: durable_empty,
-        exit_statuses: BTreeMap::new(),
+        exit_statuses: recovered_exit_statuses,
     };
     // Keep the root-owned listener alive for the service lifetime. A daemon
     // restart or a broken request connection must not require restarting the
@@ -581,13 +612,11 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     // peer-credential and capability authenticated before it can issue a
     // request.
     loop {
-        let (mut stream, _) = listener.accept()?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
-        if verify_peer_uid(&stream, config.allowed_uid).is_err()
-            || authenticate_connection(&mut stream, &broker_capability).is_err()
-        {
-            continue;
-        }
+        let mut stream = accept_authenticated_connection(
+            &listener,
+            config.allowed_uid,
+            &broker_capability,
+        )?;
         // An authenticated daemon may legitimately have no containment work
         // for an arbitrary period. A frame timeout here would turn ordinary
         // idleness into a disconnect and kill every active generation.
@@ -622,6 +651,51 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     }
 }
 
+fn accept_authenticated_connection(
+    listener: &UnixListener,
+    allowed_uid: u32,
+    capability: &OwnedFd,
+) -> std::io::Result<UnixStream> {
+    let (authenticated_tx, authenticated_rx) = std::sync::mpsc::sync_channel(1);
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    listener.set_nonblocking(true)?;
+    loop {
+        if let Ok(stream) = authenticated_rx.try_recv() {
+            listener.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if active.load(Ordering::Acquire) >= MAX_PREAUTH_CONNECTIONS {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                active.fetch_add(1, Ordering::AcqRel);
+                let active = active.clone();
+                let sender = authenticated_tx.clone();
+                let expected = duplicate_valid_capability(capability.as_raw_fd())?;
+                std::thread::spawn(move || {
+                    let accepted = stream.set_read_timeout(Some(AUTH_FRAME_TIMEOUT)).is_ok()
+                        && stream.set_write_timeout(Some(AUTH_FRAME_TIMEOUT)).is_ok()
+                        && verify_peer_uid(&stream, allowed_uid).is_ok()
+                        && authenticate_connection(&mut stream, &expected).is_ok();
+                    if accepted {
+                        let _ = sender.try_send(stream);
+                    }
+                    active.fetch_sub(1, Ordering::AcqRel);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => {
+                listener.set_nonblocking(false)?;
+                return Err(error);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct BrokerState {
     children: BTreeMap<String, libc::pid_t>,
@@ -636,16 +710,23 @@ struct BrokerOperation {
     generation: u64,
     request_digest: String,
     prepared: Option<Spawned>,
+    exit_code: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct DurableOperation {
+    /// Linux boot ID. Identities are immutable for this entire epoch; records
+    /// from retired boots can be compacted because their processes and pidfds
+    /// can no longer exist.
+    broker_epoch: String,
     session_id: String,
     operation_id: String,
     status: OperationStatus,
     key: String,
     generation: u64,
     request_digest: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
 }
 
 impl BrokerState {
@@ -671,7 +752,7 @@ fn serve_one(
     // within FRAME_TIMEOUT so a partial writer cannot monopolize the broker.
     wait_for_frame_start(stream.as_raw_fd())?;
     stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
-    let received = recv_with_fds(stream.as_raw_fd(), 3);
+    let received = recv_with_fds(stream.as_raw_fd(), 4);
     let restore = stream.set_read_timeout(None);
     let (body, request_fds) = received?;
     restore?;
@@ -690,8 +771,8 @@ fn serve_one(
             capture_io,
             request_digest,
         } if version == PROTOCOL_VERSION => {
-            if (capture_io && !request_fds.is_empty())
-                || (!capture_io && request_fds.len() != 3)
+            if (capture_io && request_fds.len() != 1)
+                || (!capture_io && request_fds.len() != 4)
             {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "invalid_stdio_descriptors".into() }, &[]);
             }
@@ -720,8 +801,8 @@ fn serve_one(
             if request_digest != expected_digest {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "request_digest_mismatch".into() }, &[]);
             }
+            let requested_key = containment_key(&containment_id, generation)?;
             if let Some(existing) = state.operations.get(&operation_key) {
-                let requested_key = containment_key(&containment_id, generation)?;
                 if existing.key != requested_key
                     || existing.generation != generation
                     || existing.request_digest != request_digest
@@ -740,38 +821,102 @@ fn serve_one(
                     _ => send_response(stream, &Response::Operation { version: PROTOCOL_VERSION, state: existing.status, key: Some(existing.key.clone()) }, &[]),
                 };
             }
+            if state.operations.iter().any(|(identity, operation)| {
+                operation.key == requested_key && identity != &operation_key
+            }) {
+                return send_response(
+                    stream,
+                    &Response::Error {
+                        version: PROTOCOL_VERSION,
+                        code: "containment_locator_already_bound".into(),
+                    },
+                    &[],
+                );
+            }
+            if state.operations.len() >= MAX_OPERATION_RECORDS_PER_EPOCH {
+                return send_response(
+                    stream,
+                    &Response::Error {
+                        version: PROTOCOL_VERSION,
+                        code: "broker_epoch_operation_limit_reached".into(),
+                    },
+                    &[],
+                );
+            }
             let inherited_stdio = (!capture_io).then(|| [
                 request_fds[0].as_raw_fd(),
                 request_fds[1].as_raw_fd(),
                 request_fds[2].as_raw_fd(),
             ]);
-            let spawned = spawn_atomic(config, &containment_id, generation, &program, &args, &cwd, &env, inherited_stdio);
+            let cancellation_fd = request_fds.last()
+                .expect("validated cancellation descriptor");
+            verify_allocation_decision_fd(cancellation_fd.as_fd())?;
+            let spawned = spawn_atomic(
+                config,
+                &containment_id,
+                generation,
+                &program,
+                &args,
+                &cwd,
+                &env,
+                inherited_stdio,
+                reopen_fd(cancellation_fd.as_fd())?,
+            );
             match spawned {
                 Ok(spawned) => {
                     let key = spawned.key.clone();
-                    persist_operation(config, &session_id, &operation_id, OperationStatus::Prepared, &key, generation, &request_digest)?;
-                    let descriptors = prepared_response_fds(&spawned, capture_io);
-                    let result = send_response(
+                    // Publish ownership before any fallible durable write or
+                    // response. From this point every failure path is visible
+                    // to retry_pending_cleanups and cannot orphan a child.
+                    state.operations.insert(operation_key.clone(), BrokerOperation {
+                        status: OperationStatus::CleanupRequired,
+                        key: key.clone(),
+                        generation,
+                        request_digest: request_digest.clone(),
+                        prepared: Some(spawned),
+                        exit_code: None,
+                    });
+                    if let Err(error) = persist_operation(
+                        config,
+                        &session_id,
+                        &operation_id,
+                        OperationStatus::Prepared,
+                        &key,
+                        generation,
+                        &request_digest,
+                    ) {
+                        return Err(error);
+                    }
+                    let operation = state.operations.get_mut(&operation_key)
+                        .expect("newly owned operation");
+                    operation.status = OperationStatus::Prepared;
+                    let spawned = operation.prepared.as_ref().expect("prepared child retained");
+                    let descriptors = prepared_response_fds(spawned, capture_io);
+                    let guard = spawned.guard.clone();
+                    if let Err(error) = send_response(
                         &stream,
                         &Response::Prepared {
                             version: PROTOCOL_VERSION,
-                            key: key.clone(),
-                            guard: spawned.guard.clone(),
+                            key,
+                            guard,
                         },
                         &descriptors,
-                    );
-                    if result.is_ok() {
-                        state.operations.insert(operation_key, BrokerOperation {
-                            status: OperationStatus::Prepared,
-                            key,
+                    ) {
+                        let operation = state.operations.get_mut(&operation_key)
+                            .expect("owned operation survives response failure");
+                        operation.status = OperationStatus::CleanupRequired;
+                        let _ = persist_operation(
+                            config,
+                            &session_id,
+                            &operation_id,
+                            OperationStatus::CleanupRequired,
+                            &operation.key,
                             generation,
-                            request_digest,
-                            prepared: Some(spawned),
-                        });
-                    } else {
-                        let _ = rollback_generation(&config.cgroup_root.join(&key), spawned.pid);
+                            &request_digest,
+                        );
+                        return Err(error);
                     }
-                    result
+                    Ok(())
                 }
                 Err(error) => send_response(
                     &stream,
@@ -786,7 +931,7 @@ fn serve_one(
         Request::CommitSpawn { version, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
             let identity = (session_id.clone(), operation_id.clone());
-            let (key, generation, digest, mut spawned) = {
+            let (key, generation, digest) = {
                 let operation = state.operations.get_mut(&identity)
                     .ok_or_else(|| invalid("unknown spawn operation"))?;
                 if matches!(operation.status, OperationStatus::Committed | OperationStatus::Exited) {
@@ -800,10 +945,53 @@ fn serve_one(
                     operation.key.clone(),
                     operation.generation,
                     operation.request_digest.clone(),
-                    operation.prepared.take().ok_or_else(|| invalid("prepared operation has no child"))?,
                 )
             };
-            persist_operation(config, &session_id, &operation_id, OperationStatus::Committing, &key, generation, &digest)?;
+            let decision = state.operations.get(&identity)
+                .and_then(|operation| operation.prepared.as_ref())
+                .ok_or_else(|| invalid("prepared operation has no child"))?
+                .cancellation.as_fd();
+            match durably_choose_commit(decision, || {
+                persist_operation(
+                    config,
+                    &session_id,
+                    &operation_id,
+                    OperationStatus::Committing,
+                    &key,
+                    generation,
+                    &digest,
+                )
+            }) {
+                Ok(true) => {}
+                Ok(false) => {
+                    state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Prepared;
+                    return send_response(
+                        stream,
+                        &Response::Error {
+                            version: PROTOCOL_VERSION,
+                            code: "operation_cancelled_before_release".into(),
+                        },
+                        &[],
+                    );
+                }
+                Err(error) => {
+                    state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::CleanupRequired;
+                    let _ = persist_operation(
+                        config,
+                        &session_id,
+                        &operation_id,
+                        OperationStatus::CleanupRequired,
+                        &key,
+                        generation,
+                        &digest,
+                    );
+                    return Err(error);
+                }
+            }
+            let mut spawned = state.operations.get_mut(&identity)
+                .expect("operation exists")
+                .prepared.take()
+                .ok_or_else(|| invalid("prepared operation has no child"))?;
             if let Err(error) = release_child(&mut spawned) {
                 let operation = state.operations.get_mut(&identity).expect("operation exists");
                 operation.status = OperationStatus::CleanupRequired;
@@ -840,13 +1028,26 @@ fn serve_one(
             let key = operation.key.clone();
             let generation = operation.generation;
             let digest = operation.request_digest.clone();
-            let prepared = operation.prepared.take();
             operation.status = OperationStatus::CleanupRequired;
-            persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &key, generation, &digest)?;
+            if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &key, generation, &digest) {
+                // Ownership is deliberately retained. The old durable state
+                // remains authoritative and a retry can make progress.
+                return Err(error);
+            }
+            let prepared = state.operations.get_mut(&identity)
+                .expect("operation exists")
+                .prepared.take();
 
             let pid = prepared.as_ref().map(|spawned| spawned.pid)
                 .or_else(|| state.children.get(&key).copied());
-            cleanup_generation(config, &key, generation, pid, std::time::Duration::from_secs(5))?;
+            if let Some(pid) = pid {
+                state.children.insert(key.clone(), pid);
+            }
+            if let Err(error) = cleanup_generation(config, &key, generation, pid, REAP_TIMEOUT) {
+                // CleanupRequired plus children ownership remains retryable;
+                // never acknowledge cancellation without ProvenEmpty.
+                return Err(error);
+            }
             if let Some(pid) = state.children.remove(&key) {
                 let status = reap_child(pid)?;
                 state.exit_statuses.insert(key.clone(), status);
@@ -907,6 +1108,7 @@ fn serve_one(
                 fs::remove_dir(&path)?;
                 state.remember_empty(key.clone());
                 mark_operation_terminal(config, state, &key, OperationStatus::Exited)?;
+                persist_exit_status_for_key(config, state, &key)?;
             }
             send_response(&stream, &Response::Population { version: PROTOCOL_VERSION, populated }, &[])
         }
@@ -924,6 +1126,7 @@ fn serve_one(
                 exit_code
             };
             mark_operation_terminal(config, state, &key, OperationStatus::Exited)?;
+            persist_exit_status_for_key(config, state, &key)?;
             send_response(&stream, &Response::Exited { version: PROTOCOL_VERSION, exit_code }, &[])
         }
         _ => send_response(
@@ -942,6 +1145,7 @@ struct Spawned {
     stderr: OwnedFd,
     pidfd: OwnedFd,
     release: OwnedFd,
+    cancellation: OwnedFd,
     guard: GuardAttestation,
 }
 
@@ -958,6 +1162,70 @@ fn prepared_response_fds(spawned: &Spawned, capture_io: bool) -> Vec<RawFd> {
     }
 }
 
+fn reopen_fd(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    let reopened: OwnedFd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)?
+        .into();
+    if !same_capability_inode(fd, reopened.as_fd())? {
+        return Err(invalid("reopened allocation decision identity changed"));
+    }
+    Ok(reopened)
+}
+
+fn verify_allocation_decision_fd(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let metadata = fd_stat(fd)?;
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_size != 1 {
+        return Err(invalid("invalid allocation decision descriptor"));
+    }
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    let required = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if seals < 0 || seals & required != required {
+        return Err(invalid("allocation decision descriptor is not size-sealed"));
+    }
+    let mut state = [0_u8];
+    if unsafe { libc::pread(fd.as_raw_fd(), state.as_mut_ptr().cast(), 1, 0) } != 1
+        || state[0] > 1
+    {
+        return Err(invalid("invalid allocation decision state"));
+    }
+    Ok(())
+}
+
+fn durably_choose_commit(
+    fd: BorrowedFd<'_>,
+    persist: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut state = [0_u8];
+        if unsafe { libc::pread(fd.as_raw_fd(), state.as_mut_ptr().cast(), 1, 0) } != 1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if state[0] == 1 { return Ok(false); }
+        if state[0] != 0 { return Err(invalid("allocation decision was already finalized")); }
+        // Hold the cross-process decision lock through durable persistence.
+        // A cancellation which linearized first wrote 1; otherwise this write
+        // records the winning commit before any user byte is released.
+        persist()?;
+        let committed = [2_u8];
+        if unsafe { libc::pwrite(fd.as_raw_fd(), committed.as_ptr().cast(), 1, 0) } != 1
+            || unsafe { libc::fsync(fd.as_raw_fd()) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(true)
+    })();
+    let unlock = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
+    if unlock != 0 && result.is_ok() { return Err(std::io::Error::last_os_error()); }
+    result
+}
+
 fn spawn_atomic(
     config: &LinuxBrokerServerConfig,
     containment_id: &str,
@@ -967,6 +1235,7 @@ fn spawn_atomic(
     cwd: &[u8],
     env: &[(Vec<u8>, Vec<u8>)],
     inherited_stdio: Option<[RawFd; 3]>,
+    cancellation: OwnedFd,
 ) -> std::io::Result<Spawned> {
     let key = containment_key(containment_id, generation)?;
     if args.len() > MAX_ARGUMENTS || env.len() > MAX_ENVIRONMENT_ENTRIES {
@@ -1091,6 +1360,7 @@ fn spawn_atomic(
         stderr: stderr_read,
         pidfd,
         release: release_write,
+        cancellation,
         guard: GuardAttestation {
             pid,
             clone_into_cgroup: true,
@@ -1132,7 +1402,7 @@ unsafe fn child_exec(
         || unsafe { libc::dup2(stderr, libc::STDERR_FILENO) } < 0
         || unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP) } != 0
         || unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) } != 0
-        || unsafe { libc::mount(std::ptr::null(), c"/sys/fs/cgroup".as_ptr(), std::ptr::null(), libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, std::ptr::null()) } != 0
+        || unsafe { make_cgroup_mounts_read_only() }.is_err()
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
     {
         unsafe { child_fail(status, std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM)) };
@@ -1162,6 +1432,77 @@ unsafe fn child_exec(
     }
     unsafe { libc::execve(program.as_ptr(), argv.as_ptr(), env.as_ptr()) };
     unsafe { child_fail(status, std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOEXEC)) }
+}
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+unsafe fn make_cgroup_mounts_read_only() -> std::io::Result<()> {
+    const AT_RECURSIVE: u32 = 0x8000;
+    const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+    let attributes = MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let mut found_primary = false;
+    for line in mountinfo.lines() {
+        let mut halves = line.split(" - ");
+        let Some(left) = halves.next() else { return Err(invalid("invalid mountinfo")); };
+        let Some(right) = halves.next() else { return Err(invalid("invalid mountinfo")); };
+        if !right.starts_with("cgroup2 ") { continue; }
+        let encoded = left.split_whitespace().nth(4)
+            .ok_or_else(|| invalid("cgroup2 mount has no mountpoint"))?;
+        let mountpoint = decode_mountinfo_path(encoded)?;
+        found_primary |= mountpoint == b"/sys/fs/cgroup";
+        let mountpoint = CString::new(mountpoint)
+            .map_err(|_| invalid("cgroup2 mountpoint contains NUL"))?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                libc::AT_FDCWD,
+                mountpoint.as_ptr(),
+                AT_RECURSIVE,
+                &attributes,
+                std::mem::size_of::<MountAttr>(),
+            )
+        };
+        if result != 0 { return Err(std::io::Error::last_os_error()); }
+    }
+    if found_primary { Ok(()) } else { Err(invalid("primary cgroup2 mount is not visible")) }
+}
+
+fn decode_mountinfo_path(encoded: &str) -> std::io::Result<Vec<u8>> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 3 >= bytes.len()
+                || !bytes[index + 1..=index + 3]
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'7'))
+            {
+                return Err(invalid("invalid mountinfo path escape"));
+            }
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(decoded)
 }
 
 fn release_child(spawned: &mut Spawned) -> std::io::Result<()> {
@@ -1210,24 +1551,72 @@ fn cleanup_generation(
 ) -> std::io::Result<()> {
     let Some(group) = resolve_key_if_present(config, key, generation)? else {
         if let Some(pid) = pid {
-            let _ = reap_child(pid)?;
+            let _ = reap_child_bounded(pid, timeout)?;
         }
         return Ok(());
     };
     fs::write(group.join("cgroup.kill"), b"1")?;
     if let Some(pid) = pid {
-        let _ = reap_child(pid)?;
+        let _ = reap_child_bounded(pid, timeout)?;
     }
     wait_cgroup_empty(&group, timeout)?;
     fs::remove_dir(group)
 }
 
 fn reap_child(pid: libc::pid_t) -> std::io::Result<Option<i32>> {
+    reap_child_bounded(pid, REAP_TIMEOUT)
+}
+
+fn reap_child_bounded(
+    pid: libc::pid_t,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<i32>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+    if pidfd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    } else {
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let mut descriptor = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let milliseconds = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+            if ready > 0 {
+                break;
+            }
+            if ready == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "pidfd did not become reapable",
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
     loop {
         let mut status = 0;
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        // Never use a blocking waitpid in the single broker authority. pidfd
+        // readiness above is the bounded kernel completion oracle.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if waited == pid {
             return Ok(decode_wait_status(status));
+        }
+        if waited == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "pidfd readiness raced child reap",
+            ));
         }
         if waited < 0 {
             let error = std::io::Error::last_os_error();
@@ -1545,6 +1934,7 @@ fn valid_key(key: &str, generation: u64) -> bool {
 }
 
 fn validate_environment(env: &[(Vec<u8>, Vec<u8>)]) -> std::io::Result<()> {
+    let mut previous: Option<&[u8]> = None;
     for (key, value) in env {
         if key.is_empty()
             || key.len() > MAX_STRING_BYTES
@@ -1555,6 +1945,10 @@ fn validate_environment(env: &[(Vec<u8>, Vec<u8>)]) -> std::io::Result<()> {
         {
             return Err(invalid("invalid environment entry"));
         }
+        if previous.is_some_and(|previous| previous >= key.as_slice()) {
+            return Err(invalid("environment keys must be unique and byte-sorted"));
+        }
+        previous = Some(key);
     }
     Ok(())
 }
@@ -1643,15 +2037,19 @@ fn verify_client_guard(guard: &GuardAttestation, key: &str, pidfd: BorrowedFd<'_
     let cgroup_mount_read_only = fs::read_to_string(proc_root.join("mountinfo"))
         .ok()
         .is_some_and(|mountinfo| {
-            mountinfo.lines().any(|line| {
+            let cgroup_mounts = mountinfo.lines().filter_map(|line| {
                 let mut halves = line.split(" - ");
-                let Some(left) = halves.next() else { return false };
-                let Some(right) = halves.next() else { return false };
+                let left = halves.next()?;
+                let right = halves.next()?;
+                if !right.starts_with("cgroup2 ") { return None; }
                 let fields = left.split_whitespace().collect::<Vec<_>>();
-                fields.get(4) == Some(&"/sys/fs/cgroup")
-                    && fields.get(5).is_some_and(|options| options.split(',').any(|option| option == "ro"))
-                    && right.starts_with("cgroup2 ")
-            })
+                Some((fields.get(4).copied(), fields.get(5).copied()))
+            }).collect::<Vec<_>>();
+            !cgroup_mounts.is_empty()
+                && cgroup_mounts.iter().any(|(mount, _)| *mount == Some("/sys/fs/cgroup"))
+                && cgroup_mounts.iter().all(|(_, options)| {
+                    options.is_some_and(|options| options.split(',').any(|option| option == "ro"))
+                })
         });
     let pidfd_matches = fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
         .ok()
@@ -1796,12 +2194,14 @@ fn persist_operation(
 ) -> std::io::Result<()> {
     let destination = operation_record_path(config, session_id, operation_id)?;
     let record = DurableOperation {
+        broker_epoch: broker_epoch()?,
         session_id: session_id.to_owned(),
         operation_id: operation_id.to_owned(),
         status,
         key: key.to_owned(),
         generation,
         request_digest: request_digest.to_owned(),
+        exit_code: None,
     };
     let bytes = serde_json::to_vec(&record).map_err(invalid)?;
     let temporary = config.state_root.join(format!(".operation-{}.tmp", uuid::Uuid::new_v4()));
@@ -1814,23 +2214,80 @@ fn persist_operation(
     File::open(&config.state_root)?.sync_all()
 }
 
+fn persist_exit_status_for_key(
+    config: &LinuxBrokerServerConfig,
+    state: &BrokerState,
+    key: &str,
+) -> std::io::Result<()> {
+    let Some(((session_id, operation_id), _)) = state.operations.iter()
+        .find(|(_, operation)| operation.key == key)
+    else {
+        return Err(invalid("exit status has no durable operation identity"));
+    };
+    let destination = operation_record_path(config, session_id, operation_id)?;
+    let mut record: DurableOperation = serde_json::from_slice(&fs::read(&destination)?)
+        .map_err(invalid)?;
+    record.exit_code = state.exit_statuses.get(key).copied().flatten();
+    let bytes = serde_json::to_vec(&record).map_err(invalid)?;
+    let temporary = config.state_root.join(format!(".operation-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, destination)?;
+    File::open(&config.state_root)?.sync_all()
+}
+
+fn broker_epoch() -> std::io::Result<String> {
+    let epoch = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let epoch = epoch.trim();
+    uuid::Uuid::parse_str(epoch).map_err(|_| invalid("invalid kernel boot epoch"))?;
+    Ok(epoch.to_owned())
+}
+
 fn recover_operation_records(
     config: &LinuxBrokerServerConfig,
     recovered_empty: &BTreeSet<String>,
 ) -> std::io::Result<BTreeMap<(String, String), BrokerOperation>> {
     let mut operations = BTreeMap::new();
+    let current_epoch = broker_epoch()?;
+    let mut locator_bindings = BTreeMap::<String, (String, String, String)>::new();
     for entry in fs::read_dir(&config.state_root)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() || entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+            return Err(invalid("unexpected entry in broker state root"));
         }
         let metadata = entry.metadata()?;
         if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 || metadata.len() > MAX_FRAME as u64 {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid broker operation record"));
         }
         let record: DurableOperation = serde_json::from_slice(&fs::read(entry.path())?).map_err(invalid)?;
+        let expected_name = format!("{}--{}.json", record.session_id, record.operation_id);
+        if entry.file_name().as_bytes() != expected_name.as_bytes()
+            || uuid::Uuid::parse_str(&record.session_id).is_err()
+            || !valid_operation_id(&record.operation_id)
+            || record.request_digest.len() != 64
+            || !record.request_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid("durable operation filename or identity mismatch"));
+        }
         if !valid_key(&record.key, record.generation) {
             return Err(invalid("invalid durable containment locator"));
+        }
+        let identity = (record.session_id.clone(), record.operation_id.clone());
+        if let Some(previous) = locator_bindings.insert(
+            record.key.clone(),
+            (identity.0.clone(), identity.1.clone(), record.request_digest.clone()),
+        ) {
+            if previous != (identity.0.clone(), identity.1.clone(), record.request_digest.clone()) {
+                return Err(invalid("durable containment locator has multiple operation identities"));
+            }
+        }
+        if record.broker_epoch != current_epoch {
+            fs::remove_file(entry.path())?;
+            continue;
         }
         let proven_empty = recovered_empty.contains(&record.key)
             || !config.cgroup_root.join(&record.key).exists();
@@ -1846,14 +2303,21 @@ fn recover_operation_records(
         if !matches!(record.status, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited) {
             persist_operation(config, &record.session_id, &record.operation_id, recovered_status, &record.key, record.generation, &record.request_digest)?;
         }
-        operations.insert((record.session_id, record.operation_id), BrokerOperation {
+        if operations.insert(identity, BrokerOperation {
             status: recovered_status,
             key: record.key,
             generation: record.generation,
             request_digest: record.request_digest,
             prepared: None,
-        });
+            exit_code: record.exit_code,
+        }).is_some() {
+            return Err(invalid("duplicate durable operation identity"));
+        }
+        if operations.len() > MAX_OPERATION_RECORDS_PER_EPOCH {
+            return Err(invalid("durable operation epoch exceeds bounded replay horizon"));
+        }
     }
+    File::open(&config.state_root)?.sync_all()?;
     Ok(operations)
 }
 
@@ -1938,6 +2402,7 @@ fn verify_kernel_spawn_contract(config: &LinuxBrokerServerConfig) -> std::io::Re
         b"/",
         &[],
         None,
+        new_allocation_decision_fd()?,
     )?;
     if !spawned.guard.proven() {
         let _ = rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid);
@@ -1958,6 +2423,25 @@ fn verify_kernel_spawn_contract(config: &LinuxBrokerServerConfig) -> std::io::Re
     }
     wait_cgroup_empty(&group, std::time::Duration::from_secs(5))?;
     fs::remove_dir(group)
+}
+
+fn new_allocation_decision_fd() -> std::io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::memfd_create(
+            c"flycockpit-broker-self-test-decision".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 { return Err(std::io::Error::last_os_error()); }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), 1) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 fn verify_root_owned_migration_file(path: &Path) -> std::io::Result<()> {
@@ -2006,7 +2490,7 @@ fn duplicate_valid_capability(fd: RawFd) -> std::io::Result<OwnedFd> {
     Ok(duplicate)
 }
 
-fn same_file_description(left: BorrowedFd<'_>, right: BorrowedFd<'_>) -> std::io::Result<bool> {
+fn same_capability_inode(left: BorrowedFd<'_>, right: BorrowedFd<'_>) -> std::io::Result<bool> {
     let left = fd_stat(left)?;
     let right = fd_stat(right)?;
     Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
@@ -2022,14 +2506,20 @@ fn fd_stat(fd: BorrowedFd<'_>) -> std::io::Result<libc::stat> {
 }
 
 fn authenticate_connection(stream: &mut UnixStream, expected: &OwnedFd) -> std::io::Result<()> {
-    let (body, mut fds) = recv_with_fds(stream.as_raw_fd(), 1)?;
+    let deadline = std::time::Instant::now() + AUTH_FRAME_TIMEOUT;
+    wait_for_frame_start_until(stream.as_raw_fd(), Some(deadline))?;
+    let (body, mut fds) = recv_with_fds_until(
+        stream.as_raw_fd(),
+        1,
+        deadline,
+    )?;
     let request: Request = serde_json::from_slice(&body).map_err(invalid)?;
     let Some(capability) = fds.pop() else {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing containment capability"));
     };
     if !fds.is_empty()
         || !matches!(request, Request::Authenticate { version: PROTOCOL_VERSION })
-        || !same_file_description(capability.as_fd(), expected.as_fd())?
+        || !same_capability_inode(capability.as_fd(), expected.as_fd())?
     {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid containment capability"));
     }
@@ -2117,6 +2607,18 @@ fn send_with_fds(socket: RawFd, body: &[u8], fds: &[RawFd]) -> std::io::Result<(
 }
 
 fn recv_with_fds(socket: RawFd, max_fds: usize) -> std::io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    recv_with_fds_until(
+        socket,
+        max_fds,
+        std::time::Instant::now() + FRAME_TIMEOUT,
+    )
+}
+
+fn recv_with_fds_until(
+    socket: RawFd,
+    max_fds: usize,
+    frame_deadline: std::time::Instant,
+) -> std::io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut frame = vec![0_u8; MAX_FRAME + 4];
     let mut iov = libc::iovec { iov_base: frame.as_mut_ptr().cast(), iov_len: frame.len() };
     let mut control = vec![0_u8; unsafe { libc::CMSG_SPACE((max_fds * std::mem::size_of::<RawFd>()) as u32) as usize }];
@@ -2141,7 +2643,7 @@ fn recv_with_fds(socket: RawFd, max_fds: usize) -> std::io::Result<(Vec<u8>, Vec
     }
     let mut received = received as usize;
     while received < 4 {
-        let count = recv_retry(socket, &mut frame[received..4])?;
+        let count = recv_retry_until(socket, &mut frame[received..4], frame_deadline)?;
         if count <= 0 { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short broker frame")); }
         received += count as usize;
     }
@@ -2149,7 +2651,7 @@ fn recv_with_fds(socket: RawFd, max_fds: usize) -> std::io::Result<(Vec<u8>, Vec
     if body_len > MAX_FRAME { return Err(invalid("frame too large")); }
     let total = body_len + 4;
     while received < total {
-        let count = recv_retry(socket, &mut frame[received..total])?;
+        let count = recv_retry_until(socket, &mut frame[received..total], frame_deadline)?;
         if count <= 0 { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short broker frame")); }
         received += count as usize;
     }
@@ -2157,18 +2659,32 @@ fn recv_with_fds(socket: RawFd, max_fds: usize) -> std::io::Result<(Vec<u8>, Vec
 }
 
 fn wait_for_frame_start(socket: RawFd) -> std::io::Result<()> {
+    wait_for_frame_start_until(socket, None)
+}
+
+fn wait_for_frame_start_until(
+    socket: RawFd,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<()> {
     let mut descriptor = libc::pollfd {
         fd: socket,
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
     loop {
-        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        let timeout = deadline.map_or(-1, |deadline| {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1)
+        });
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
         if result > 0 {
             return Ok(());
         }
         if result == 0 {
-            continue;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "broker frame did not start before deadline",
+            ));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
@@ -2177,10 +2693,44 @@ fn wait_for_frame_start(socket: RawFd) -> std::io::Result<()> {
     }
 }
 
-fn recv_retry(socket: RawFd, buffer: &mut [u8]) -> std::io::Result<isize> {
+fn recv_retry_until(
+    socket: RawFd,
+    buffer: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<isize> {
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "absolute broker frame deadline exceeded",
+            ));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: socket,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1);
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "absolute broker frame deadline exceeded",
+            ));
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(error);
+        }
         let received = unsafe {
-            libc::recv(socket, buffer.as_mut_ptr().cast(), buffer.len(), libc::MSG_CMSG_CLOEXEC)
+            libc::recv(
+                socket,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT,
+            )
         };
         if received >= 0 {
             return Ok(received);
@@ -2273,6 +2823,44 @@ mod tests {
         assert!(validate_environment(&env).is_ok());
         assert!(validate_environment(&[(b"A=B".to_vec(), b"x".to_vec())]).is_err());
         assert!(validate_environment(&[(b"A".to_vec(), vec![0])]).is_err());
+        assert!(validate_environment(&[
+            (b"B".to_vec(), b"1".to_vec()),
+            (b"A".to_vec(), b"2".to_vec()),
+        ]).is_err());
+        assert!(validate_environment(&[
+            (b"A".to_vec(), b"1".to_vec()),
+            (b"A".to_vec(), b"2".to_vec()),
+        ]).is_err());
+    }
+
+    #[test]
+    fn mountinfo_paths_are_decoded_before_recursive_sanitization() {
+        assert_eq!(decode_mountinfo_path(r#"/sys/fs/cgroup"#).unwrap(), b"/sys/fs/cgroup");
+        assert_eq!(decode_mountinfo_path(r#"/cgroup\040view"#).unwrap(), b"/cgroup view");
+        assert!(decode_mountinfo_path(r#"/bad\0"#).is_err());
+    }
+
+    #[test]
+    fn allocation_decision_is_linearized_under_one_cross_process_lock() {
+        let cancelled = super::super::adapter::AllocationCancellation::new().unwrap();
+        cancelled.cancel().unwrap();
+        assert!(!durably_choose_commit(cancelled.decision_fd(), || {
+            panic!("cancel-first decision must not persist commit")
+        }).unwrap());
+
+        let committed = super::super::adapter::AllocationCancellation::new().unwrap();
+        let persisted = std::sync::atomic::AtomicBool::new(false);
+        assert!(durably_choose_commit(committed.decision_fd(), || {
+            persisted.store(true, Ordering::Release);
+            Ok(())
+        }).unwrap());
+        committed.cancel().unwrap();
+        assert!(persisted.load(Ordering::Acquire));
+        let mut state = [0_u8];
+        assert_eq!(unsafe {
+            libc::pread(committed.decision_fd().as_raw_fd(), state.as_mut_ptr().cast(), 1, 0)
+        }, 1);
+        assert_eq!(state[0], 2, "commit winner cannot be rewritten as pre-release cancellation");
     }
 
     #[test]

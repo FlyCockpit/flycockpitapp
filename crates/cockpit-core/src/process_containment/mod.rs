@@ -30,13 +30,17 @@ pub use adapter::{
     AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest,
     ContainmentAdapter, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
 };
+pub(crate) use adapter::AllocationCancellation;
 pub use container::{ContainerRuntimeAdapter, RuntimeKind};
 pub use fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};
 pub use linux::{
     CgroupNamespaceGuard, LinuxCgroupAdapter, MANAGEMENT_BOUNDARY_UNAVAILABLE, TestBroker,
 };
 #[cfg(target_os = "linux")]
-pub use linux_broker::{LinuxBrokerConfig, LinuxBrokerServerConfig, run_linux_containment_broker};
+pub use linux_broker::{
+    LinuxBrokerConfig, LinuxBrokerServerConfig, doctor_linux_containment_broker,
+    run_linux_containment_broker,
+};
 #[cfg(target_os = "linux")]
 pub fn inherited_linux_broker_capability_fd() -> Option<std::os::fd::RawFd> {
     linux_broker::inherited_named_fd("flycockpit-containment-capability")

@@ -8,6 +8,8 @@ const CATALOG: &str = include_str!("../../../crates/cockpit-core/src/external_ru
 const GENERATOR: &str = include_str!("../scripts/generate-release-assets.sh");
 const CONTAINMENT_INSTALLER: &str = include_str!("../scripts/install-linux-containment-broker.sh");
 const CONTAINMENT_ARCHIVE_CHECK: &str = include_str!("../scripts/verify-linux-containment-archive.py");
+const CONTAINMENT_ARCHIVE_ASSEMBLER: &str =
+    include_str!("../scripts/assemble-linux-containment-archive.py");
 const BROKER_UNIT: &str = include_str!("../../../infra/systemd/cockpit-containment-broker@.service");
 const DAEMON_UNIT: &str = include_str!("../../../infra/systemd/cockpit-daemon@.service");
 const SHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.sh");
@@ -101,16 +103,69 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         "detached_was_active",
         "daemon status --json",
         "containment broker did not publish the authenticated socket contract",
+        "--doctor --allowed-uid",
     ] {
         assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
     }
     assert!(DAEMON_UNIT.contains("Wants=cockpit-containment-broker@%i.service"));
     assert!(!DAEMON_UNIT.contains("BindsTo=cockpit-containment-broker@%i.service"));
     assert!(!BROKER_UNIT.contains("ProcSubset=pid"));
-    assert!(WORKFLOW.contains("Verify Linux containment archive topology"));
+    assert!(WORKFLOW.contains("Assemble target-specific containment archives"));
+    assert!(WORKFLOW.contains("assemble-linux-containment-archive.py"));
+    assert!(WORKFLOW.contains("--features linux-containment-broker-bin"));
+    assert!(CONTAINMENT_ARCHIVE_ASSEMBLER.contains("privileged Linux payload leaked into non-Linux target"));
+    assert!(CONTAINMENT_ARCHIVE_ASSEMBLER.contains("rebuild(cli, assembled)"));
     for payload in ["cockpit", "cockpit-containment-broker", "install-linux-containment-broker.sh"] {
         assert!(CONTAINMENT_ARCHIVE_CHECK.contains(payload));
     }
+}
+
+#[test]
+fn linux_containment_post_assembly_merges_split_archive_fixture() {
+    use std::{path::PathBuf, process::Command};
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/distrib")
+        .join(format!("containment-assembly-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let assembler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/assemble-linux-containment-archive.py");
+    let fixture = r#"
+import pathlib, subprocess, sys, tarfile
+root, assembler = pathlib.Path(sys.argv[1]), sys.argv[2]
+target = 'x86_64-unknown-linux-gnu'
+cli = root / 'cli'
+(cli / 'payload').mkdir(parents=True)
+for name in ['cockpit', 'install-linux-containment-broker.sh',
+             'cockpit-containment-broker@.service', 'cockpit-daemon@.service',
+             'flycockpit-containment.conf']:
+    (cli / 'payload' / name).write_text(name)
+cli_archive = root / f'cockpit-{target}.tar.gz'
+with tarfile.open(cli_archive, 'w:gz') as archive: archive.add(cli / 'payload', arcname='payload')
+raw_broker = root / 'linux-brokers' / target / 'cockpit-containment-broker'
+raw_broker.parent.mkdir(parents=True); raw_broker.write_text('broker')
+subprocess.check_call([sys.executable, assembler, str(root), target])
+with tarfile.open(cli_archive) as archive:
+    names = {pathlib.Path(item.name).name for item in archive.getmembers() if item.isfile()}
+assert 'cockpit' in names and 'cockpit-containment-broker' in names
+windows = root / 'windows'; (windows / 'payload').mkdir(parents=True)
+for name in ['cockpit', 'cockpit-containment-broker', 'install-linux-containment-broker.sh']:
+    (windows / 'payload' / name).write_text(name)
+windows_archive = root / 'cockpit-x86_64-pc-windows-msvc.tar.gz'
+with tarfile.open(windows_archive, 'w:gz') as archive: archive.add(windows / 'payload', arcname='payload')
+subprocess.check_call([sys.executable, assembler, str(root), 'x86_64-pc-windows-msvc'])
+with tarfile.open(windows_archive) as archive:
+    names = {pathlib.Path(item.name).name for item in archive.getmembers() if item.isfile()}
+assert 'cockpit' in names and 'cockpit-containment-broker' not in names
+"#;
+    let output = Command::new("python3")
+        .args(["-c", fixture])
+        .arg(&root)
+        .arg(&assembler)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

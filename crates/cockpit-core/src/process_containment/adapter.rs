@@ -18,6 +18,87 @@ use super::types::{
     SafeLocator,
 };
 
+/// Cancellation ticket shared with privileged native spawners. On Linux its
+/// memfd decision byte is locked across the broker's durable commit write, so
+/// cancellation and release have one cross-process linearization point.
+#[derive(Clone)]
+pub(crate) struct AllocationCancellation {
+    token: tokio_util::sync::CancellationToken,
+    #[cfg(target_os = "linux")]
+    decision: Arc<std::os::fd::OwnedFd>,
+}
+
+impl AllocationCancellation {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let decision = {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            let fd = unsafe {
+                libc::memfd_create(
+                    c"flycockpit-allocation-decision".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            if fd < 0 { return Err(std::io::Error::last_os_error()); }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            if unsafe { libc::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&fd), 1) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+            if unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_ADD_SEALS, seals) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Arc::new(fd)
+        };
+        Ok(Self {
+            token: tokio_util::sync::CancellationToken::new(),
+            #[cfg(target_os = "linux")]
+            decision,
+        })
+    }
+
+    pub(crate) fn cancel(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = self.decision.as_raw_fd();
+            loop {
+                if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 { break; }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted { return Err(error); }
+            }
+            let mut state = [0_u8];
+            if unsafe { libc::pread(fd, state.as_mut_ptr().cast(), 1, 0) } != 1 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+                return Err(error);
+            }
+            if state[0] == 0 {
+                let cancelled = [1_u8];
+                if unsafe { libc::pwrite(fd, cancelled.as_ptr().cast(), 1, 0) } != 1
+                    || unsafe { libc::fsync(fd) } != 0
+                {
+                    let error = std::io::Error::last_os_error();
+                    unsafe { libc::flock(fd, libc::LOCK_UN) };
+                    return Err(error);
+                }
+            }
+            if unsafe { libc::flock(fd, libc::LOCK_UN) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        self.token.cancel();
+        Ok(())
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool { self.token.is_cancelled() }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn decision_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&*self.decision)
+    }
+}
+
 /// Request to place the initial process inside kernel/runtime containment
 /// before any user-controlled instruction runs.
 #[derive(Debug, Clone)]
@@ -57,7 +138,7 @@ pub struct NativeIoSpawnRequest {
     pub(crate) require_proven: bool,
     /// Cancellation remains attached through the privileged prepare/commit
     /// transaction; it is not merely checked after allocation returns.
-    pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    pub(crate) cancellation: AllocationCancellation,
 }
 
 impl std::fmt::Debug for NativeIoSpawnRequest {

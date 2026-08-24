@@ -98,6 +98,10 @@ jobs:
         if: contains(matrix.os, 'windows') == false
         run: cargo build --locked --workspace
 
+      - name: Build privileged Linux containment broker
+        if: contains(matrix.os, 'ubuntu')
+        run: cargo build --locked -p cockpit-cli --bin cockpit-containment-broker --features linux-containment-broker-bin
+
       - name: Check generated runtime documentation
         run: python3 apps/cli/scripts/generate-runtime-docs.py --check
 
@@ -142,6 +146,10 @@ jobs:
       - name: Clippy
         if: contains(matrix.os, 'windows') == false
         run: cargo clippy --locked --workspace --tests -- -D warnings
+
+      - name: Clippy privileged Linux containment broker
+        if: contains(matrix.os, 'ubuntu')
+        run: cargo clippy --locked -p cockpit-cli --bin cockpit-containment-broker --features linux-containment-broker-bin -- -D warnings
 
       - name: Clippy Windows target
         if: contains(matrix.os, 'windows')

@@ -1788,7 +1788,8 @@
   },
   "delete_assistant": {
     "params": {
-      "name": "helper-bot"
+      "name": "helper-bot",
+      "expected_revision": "revision"
     },
     "request": "delete_assistant"
   },

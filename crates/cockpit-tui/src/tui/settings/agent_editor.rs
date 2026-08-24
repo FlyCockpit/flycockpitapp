@@ -18,8 +18,9 @@ pub(super) struct AgentEditor {
     pub(super) name: String,
     /// The on-disk file the buffer will be written back to.
     pub(super) path: std::path::PathBuf,
-    /// Opaque daemon revision captured with the editable snapshot. `None` is
-    /// reserved for daemon-local assistant definitions on their separate RPC.
+    /// Opaque daemon revision captured with the editable snapshot. Both agent
+    /// files and daemon-local assistant definitions require one to save; the
+    /// `assistant_definition` bit selects their distinct typed mutation RPCs.
     pub(super) revision: Option<String>,
     assistant_definition: bool,
     vim_enabled: bool,

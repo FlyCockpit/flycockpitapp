@@ -6,13 +6,17 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct RemoteOperationContext {
     pub(super) request_id: Uuid,
     pub(super) logical_attachment_id: Uuid,
     pub(super) operation_id: Uuid,
     pub(super) authenticated_device_id: Uuid,
     pub(super) authenticated_device_generation: u64,
+    // Held from ingress until the response has been committed or rejected.
+    // The key deliberately excludes request class/hash so cross-class reuse
+    // cannot race an irreversible effect.
+    _identity_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 fn denied() -> ErrorPayload {
@@ -23,7 +27,8 @@ fn denied() -> ErrorPayload {
     }
 }
 
-pub(super) fn admit(
+pub(super) async fn admit(
+    ctx: &DaemonContext,
     principal: &ClientPrincipal,
     request_id: Uuid,
     operation: Option<proto::RemoteOperationIdentityV1>,
@@ -63,11 +68,25 @@ pub(super) fn admit(
     {
         return Err(denied());
     }
+    let key = (operation.logical_attachment_id, operation.operation_id);
+    let lock = {
+        let mut locks = ctx.remote_operation_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let identity_guard = lock.lock_owned().await;
     Ok(Some(RemoteOperationContext {
         request_id,
         logical_attachment_id: operation.logical_attachment_id,
         operation_id: operation.operation_id,
         authenticated_device_id: actor.device_id,
         authenticated_device_generation: actor.device_generation,
+        _identity_guard: identity_guard,
     }))
 }

@@ -50,33 +50,6 @@ impl RemoteSessionLedger {
         }
     }
 
-    /// Acquire the daemon-wide reservation for this operation identity.
-    ///
-    /// This is deliberately an in-memory serialization guard, not the durable
-    /// ledger reservation. The durable reservation and domain mutation remain
-    /// one SQLite transaction; this guard closes the earlier window in which
-    /// two same-identity requests could both perform irreversible side effects
-    /// before one discovered the other's hash conflict.
-    async fn reserve(&self, ctx: &DaemonContext) -> tokio::sync::OwnedMutexGuard<()> {
-        let key = (
-            Uuid::parse_str(&self.logical_attachment_id)
-                .expect("admitted logical attachment id is a UUID"),
-            Uuid::parse_str(&self.operation_id).expect("admitted operation id is a UUID"),
-        );
-        let lock = {
-            let mut locks = ctx.remote_operation_locks.lock().await;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-                lock
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(key, Arc::downgrade(&lock));
-                lock
-            }
-        };
-        lock.lock_owned().await
-    }
-
     async fn committed_replay(
         &self,
         ctx: &DaemonContext,
@@ -106,7 +79,13 @@ impl RemoteSessionLedger {
                 code: ErrorCode::Conflict,
                 message: "remote operation conflict".into(),
             }),
-            RemoteTransactionalReplayLookup::NotCommitted => Ok(None),
+            RemoteTransactionalReplayLookup::Absent => Ok(None),
+            RemoteTransactionalReplayLookup::ExistingIndeterminate => Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message:
+                    "remote operation has an indeterminate persisted outcome; it will not be retried"
+                        .into(),
+            }),
         }
     }
 }
@@ -188,7 +167,6 @@ pub(super) async fn fork_session(
     ephemeral: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -226,7 +204,6 @@ pub(super) async fn create_btw_fork(
     tangent: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -259,7 +236,6 @@ pub(super) async fn end_btw_fork(
     parent_session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -287,7 +263,6 @@ pub(super) async fn discard_session(
     session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -318,7 +293,6 @@ pub(super) async fn archive_session(
     cascade: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -344,7 +318,6 @@ pub(super) async fn unarchive_session(
     session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -363,7 +336,6 @@ pub(super) async fn rename_session(
     title: String,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -382,7 +354,6 @@ pub(super) async fn record_session_note(
     text: String,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -411,7 +382,6 @@ pub(super) async fn delete_session(
     negotiated_protocol_version: u32,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
-    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }

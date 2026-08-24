@@ -4865,7 +4865,7 @@ async fn handle_envelope(
         } => {
             #[cfg(feature = "remote")]
             let remote_operation =
-                match remote_dispatch::admit(&state.principal, id, operation, &request) {
+                match remote_dispatch::admit(ctx, &state.principal, id, operation, &request).await {
                     Ok(context) => context,
                     Err(error) => {
                         let envelope = Envelope::error(Some(id), error);

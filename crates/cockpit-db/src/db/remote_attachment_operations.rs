@@ -74,6 +74,8 @@ pub enum ReserveRemoteOperationOutcome {
 /// fresh operation still falls through to the resolve-then-reserve path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTransactionalReplayLookup {
+    /// No durable reservation exists for this identity.
+    Absent,
     /// The operation identity is already committed with a matching actor/hash;
     /// carries the cached safe response.
     CommittedReplay(Vec<u8>),
@@ -81,9 +83,10 @@ pub enum RemoteTransactionalReplayLookup {
     OperationConflict,
     /// Same operation id, different authenticated actor — a conflict.
     OperationActorConflict,
-    /// No committed match: no row, or a still-in-flight (non-committed) row.
-    /// The caller must resolve target state and reserve as a fresh operation.
-    NotCommitted,
+    /// An exact reservation exists but did not reach a committed terminal
+    /// outcome. It must never be treated as a fresh operation: after a crash
+    /// the daemon cannot prove whether a pre-commit external effect occurred.
+    ExistingIndeterminate,
 }
 
 #[derive(Debug, Clone)]
@@ -975,9 +978,9 @@ impl Db {
     /// Read-only lookup of a transactional operation identity (no reserve, no
     /// commit). Returns `CommittedReplay` only for an exact match (same actor,
     /// same request hash, `transactional_mutation` class) that has already
-    /// committed; a mismatched actor/hash is a conflict; anything else is
-    /// `NotCommitted`. Used to short-circuit an exact replay of a destructive
-    /// request without re-resolving (now-absent) target state.
+    /// committed; a mismatched actor/hash is a conflict. An absent row is
+    /// distinct from an existing nonterminal row so restart recovery can fail
+    /// closed instead of redispatching an effect with an unknown outcome.
     pub async fn lookup_committed_transactional_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
@@ -1022,7 +1025,7 @@ impl Db {
                 .optional()
                 .context("looking up committed remote operation")?;
             let Some((device_id, generation, hash, class, state, response)) = existing else {
-                return Ok(RemoteTransactionalReplayLookup::NotCommitted);
+                return Ok(RemoteTransactionalReplayLookup::Absent);
             };
             if device_id != authenticated_device_id || generation != actor_generation {
                 return Ok(RemoteTransactionalReplayLookup::OperationActorConflict);
@@ -1034,7 +1037,7 @@ impl Db {
                 let bytes = response.context("committed operation missing safe response")?;
                 Ok(RemoteTransactionalReplayLookup::CommittedReplay(bytes))
             } else {
-                Ok(RemoteTransactionalReplayLookup::NotCommitted)
+                Ok(RemoteTransactionalReplayLookup::ExistingIndeterminate)
             }
         })
         .await

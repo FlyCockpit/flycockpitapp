@@ -56,6 +56,7 @@ pub mod remote_identity_protocol;
 pub mod remote_ip_consent;
 #[cfg(feature = "remote")]
 pub mod remote_operation_fcor;
+#[cfg(feature = "remote")]
 pub mod remote_protocol_id;
 #[cfg(feature = "remote")]
 pub mod remote_public_service_policy;
@@ -65,6 +66,7 @@ pub mod remote_session_continuity;
 pub mod remote_signaling_attempt_store;
 #[cfg(feature = "remote")]
 pub mod remote_tenant_authority_protocol;
+#[cfg(feature = "remote")]
 pub mod remote_transport;
 #[cfg(feature = "remote")]
 pub mod remote_transport_selection;

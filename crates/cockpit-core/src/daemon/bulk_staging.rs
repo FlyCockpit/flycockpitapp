@@ -722,9 +722,7 @@ mod tests {
     }
 
     fn opaque_reference(payload: &[u8], seed: u8) -> RemoteBulkTransferRef {
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(seed))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(seed))
         .expect("nonzero transfer id");
         RemoteBulkTransferRef::new(
             transfer_id,
@@ -963,9 +961,7 @@ mod tests {
     #[test]
     fn bulk_staging_does_not_allocate_from_a_declared_length() {
         let declared = 256 * 1024 * 1024u64;
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(60))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(60))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -998,9 +994,7 @@ mod tests {
     #[test]
     fn bulk_staging_expires_abandoned_transfers() {
         let payload = vec![9u8; 4096];
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(70))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(70))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1044,9 +1038,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bulk_staging_reaper_reclaims_on_an_idle_daemon() {
         let payload = vec![3u8; 2048];
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(90))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(90))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1086,9 +1078,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bulk_staging_reaper_does_not_drop_a_live_transfer() {
         let chunk = vec![5u8; 1024];
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(95))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(95))
         .unwrap();
         let total = chunk.len() as u64 * 3;
         let mut whole = Vec::new();
@@ -1134,9 +1124,7 @@ mod tests {
         for _ in 0..2 {
             whole.extend_from_slice(&chunk);
         }
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(120))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(120))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1195,9 +1183,7 @@ mod tests {
             let mut raw = [0u8; 16];
             raw[0] = 0xC0;
             raw[1..9].copy_from_slice(&(nth as u64).to_be_bytes());
-            let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-                cockpit_proto::remote_protocol_id::kind::Transfer,
-            >(raw)
+            let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(raw)
             .unwrap();
             let reference = RemoteBulkTransferRef::new(
                 transfer_id,
@@ -1238,9 +1224,7 @@ mod tests {
         let payload: Vec<u8> = (0..(STAGED_CHUNK_BYTES + 5))
             .map(|i| (i % 97) as u8)
             .collect();
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(2))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(2))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1276,9 +1260,7 @@ mod tests {
         let second = b"terminal bulk source".to_vec();
         let mut payload = first.clone();
         payload.extend_from_slice(&second);
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(31))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(31))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1318,9 +1300,7 @@ mod tests {
     #[test]
     fn bulk_staging_reassembles_an_exact_8mib_opaque_user_source() {
         let payload = vec![b'x'; 8 * 1024 * 1024];
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(32))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(32))
         .unwrap();
         let reference = RemoteBulkTransferRef::new(
             transfer_id,
@@ -1347,9 +1327,7 @@ mod tests {
     #[test]
     fn bulk_staging_rejects_corrupted_payloads() {
         let payload = vec![7u8; 128];
-        let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_proto::remote_protocol_id::kind::Transfer,
-        >(id(3))
+        let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(id(3))
         .unwrap();
         // Reference claims a digest the bytes will not match.
         let reference = RemoteBulkTransferRef::new(

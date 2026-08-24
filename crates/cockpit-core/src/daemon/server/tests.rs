@@ -6480,7 +6480,7 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
     let raw_id = [0x71u8; 16];
     let transfer = crate::daemon::bulk_staging::stage(
         b"raw archive with s3cr3t",
-        proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        proto::bulk_transfer::BulkMimeClass::Export,
         raw_id,
     )
     .expect("stage raw export");
@@ -6532,7 +6532,7 @@ async fn redacted_export_reader_rejects_non_export_transfer() {
     let archive_id = [0x72u8; 16];
     let transfer = crate::daemon::bulk_staging::stage(
         b"PK\x03\x04 import archive",
-        proto::remote_transport::bulk::RemoteBulkMimeClass::Archive,
+        proto::bulk_transfer::BulkMimeClass::Archive,
         archive_id,
     )
     .expect("stage archive");
@@ -7797,7 +7797,7 @@ fn provider_responses_over_interactive_limit_fail_without_partial_payload() {
             display_name: "Provider".into(),
             fetched_at: chrono::Utc::now(),
             availability: crate::daemon::proto::ProviderUsageAvailabilityView::Error {
-                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+                message: "x".repeat(proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES),
             },
         }],
     };
@@ -7815,7 +7815,7 @@ fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
         results: vec![crate::daemon::proto::ProviderModelFetchResult {
             provider_id: "provider".into(),
             outcome: crate::daemon::proto::ProviderModelFetchOutcome::Error {
-                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+                message: "x".repeat(proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES),
             },
         }],
         config: crate::daemon::proto::ProviderConfigView::default(),
@@ -12618,9 +12618,8 @@ async fn attached_state_with_worker_receiver(
     )
 }
 
-fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
-    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
-    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
+    use proto::bulk_transfer::{BulkMimeClass, BulkTransferRef, transfer_id_from_bytes};
     use rand::RngExt as _;
     use sha2::{Digest as _, Sha256};
 
@@ -12631,11 +12630,11 @@ fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::Remo
     if id.iter().all(|byte| *byte == 0) {
         id[0] = 1;
     }
-    RemoteBulkTransferRef::new(
-        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+    BulkTransferRef::new(
+        transfer_id_from_bytes(id).expect("nonzero transfer id"),
         bytes.len() as u64,
         digest,
-        RemoteBulkMimeClass::Opaque,
+        BulkMimeClass::Opaque,
     )
     .expect("opaque user transfer reference")
 }
@@ -12643,7 +12642,7 @@ fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::Remo
 fn stage_opaque_user_transfer(
     bytes: &[u8],
     owner: &crate::daemon::bulk_staging::BulkTransferOwner,
-) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+) -> proto::bulk_transfer::BulkTransferRef {
     let reference = opaque_user_transfer_ref(bytes);
     for (index, chunk) in bytes
         .chunks(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES)
@@ -20406,7 +20405,7 @@ fn minimal_import_archive_base64() -> (Uuid, String) {
 
 /// Build a bulk transfer reference for `bytes` and stage them, as a peer would
 /// via `WriteBulkTransferChunk` before sending `ImportSessionArchive`.
-fn stage_archive_transfer(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+fn stage_archive_transfer(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
     let reference = archive_transfer_ref(bytes);
     let chunk_size = crate::daemon::bulk_staging::STAGED_CHUNK_BYTES;
     if bytes.is_empty() {
@@ -20421,9 +20420,8 @@ fn stage_archive_transfer(bytes: &[u8]) -> proto::remote_transport::bulk::Remote
 }
 
 /// A reference whose bytes were never staged: the daemon must reject it.
-fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
-    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
-    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+fn archive_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
+    use proto::bulk_transfer::{BulkMimeClass, BulkTransferRef, transfer_id_from_bytes};
     use rand::RngExt as _;
     use sha2::{Digest as _, Sha256};
 
@@ -20436,11 +20434,11 @@ fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBu
     if id.iter().all(|b| *b == 0) {
         id[0] = 1;
     }
-    RemoteBulkTransferRef::new(
-        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+    BulkTransferRef::new(
+        transfer_id_from_bytes(id).expect("nonzero transfer id"),
         bytes.len() as u64,
         digest,
-        RemoteBulkMimeClass::Archive,
+        BulkMimeClass::Archive,
     )
     .expect("archive transfer reference")
 }

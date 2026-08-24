@@ -22,13 +22,18 @@ const FS_TEXT_READ_BYTE_CAP: usize = crate::tools::common::OUTPUT_BYTE_CAP;
 const FS_BINARY_READ_BYTE_CAP: usize = 256 * 1024;
 const REMOTE_FILE_AGENT: &str = "remote-project-files";
 const SETTINGS_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
+const SETTINGS_CAPABILITY_GLOBAL_CAP: usize = 256;
+const SETTINGS_CAPABILITY_OWNER_CAP: usize = 32;
 
 #[derive(Clone)]
 struct SettingsCapability {
+    owner: String,
     root: PathBuf,
     target: PathBuf,
     revision: String,
+    identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
     denylist_ids: Vec<String>,
+    issued_at: Instant,
     expires_at: Instant,
 }
 
@@ -282,6 +287,7 @@ pub async fn save_extended_config(
 pub async fn get_extended_config_snapshot(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
+    owner: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
     join_fs_handler(
@@ -295,7 +301,7 @@ pub async fn get_extended_config_snapshot(
             for (kind, target) in discovered_settings_layers(&root)? {
                 let guard = cockpit_config::config::hold_config_mutation_lock(&target)
                     .map_err(internal)?;
-                let raw = read_optional_config(&target)?;
+                let (raw, identity) = read_optional_config(&target)?;
                 let revision = content_hash(&raw);
                 let mut config: cockpit_config::config::extended::ExtendedConfig =
                     serde_json::from_slice(&raw).map_err(bad_request_config)?;
@@ -319,9 +325,11 @@ pub async fn get_extended_config_snapshot(
                 settings_capabilities()
                     .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
                     .insert(id, SettingsCapability {
-                    root: root.clone(), target: target.clone(), revision: revision.clone(),
-                    denylist_ids, expires_at: now + SETTINGS_CAPABILITY_TTL,
+                    owner: owner.clone(), root: root.clone(), target: target.clone(),
+                    revision: revision.clone(), identity, denylist_ids, issued_at: now,
+                    expires_at: now + SETTINGS_CAPABILITY_TTL,
                 });
+                enforce_settings_capability_caps(&owner)?;
                 layers.push(cockpit_proto::ExtendedConfigLayerSnapshot {
                     layer_id: id.to_string(), kind,
                     display_path: target.display().to_string(), config: Box::new(config),
@@ -345,6 +353,7 @@ pub async fn apply_extended_config_patch(
     layer_id: String,
     patch: cockpit_proto::ExtendedConfigPatch,
     expected_revision: String,
+    owner: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
     join_fs_handler(
@@ -359,19 +368,20 @@ pub async fn apply_extended_config_patch(
                 caps.get(&id).cloned()
                     .ok_or_else(|| conflict("settings snapshot is absent, expired, or stale"))?
             };
-            if capability.root != root || capability.revision != expected_revision {
+            if capability.owner != owner
+                || capability.root != root
+                || capability.revision != expected_revision
+            {
                 return Err(conflict("settings snapshot is absent, expired, or stale"));
             }
             let target = capability.target;
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-            let (raw, existed) = match std::fs::read(&target) {
-                Ok(bytes) => (bytes, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (b"{}\n".to_vec(), false)
-                }
-                Err(error) => return Err(internal(error)),
-            };
+            let (raw, identity) = read_optional_config(&target)?;
+            let existed = identity.is_some();
+            if identity != capability.identity {
+                return Err(conflict("configuration file identity changed since snapshot"));
+            }
             let materialize = patch.materialize;
             let current_hash = content_hash(&raw);
             if current_hash != expected_revision {
@@ -436,6 +446,17 @@ pub async fn apply_extended_config_patch(
             .map_err(bad_request_config)?;
             let desired_hash = content_hash(&merged);
             let config_generation = if desired_hash != current_hash || (materialize && !existed) {
+                // Re-open immediately before publication while the real
+                // per-target cross-process lock is held. Both identity and
+                // bytes must still describe the exact capability snapshot.
+                let (precommit, precommit_identity) = read_optional_config(&target)?;
+                if precommit_identity != capability.identity
+                    || content_hash(&precommit) != expected_revision
+                {
+                    return Err(conflict(
+                        "configuration target changed immediately before commit",
+                    ));
+                }
                 cockpit_config::config::write_config_bytes_atomic(&target, &merged)
                     .map_err(internal)?;
                 crate::daemon::server::inventory::publish_committed_config_generation()
@@ -495,12 +516,42 @@ fn discovered_settings_layers(root: &Path) -> Result<Vec<(cockpit_proto::Cockpit
     }).collect())
 }
 
-fn read_optional_config(target: &Path) -> Result<Vec<u8>, ErrorPayload> {
-    match std::fs::read(target) {
-        Ok(bytes) => Ok(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(b"{}\n".to_vec()),
-        Err(error) => Err(internal(error)),
+fn read_optional_config(
+    target: &Path,
+) -> Result<
+    (
+        Vec<u8>,
+        Option<cockpit_config::config::TerminalIngressFileIdentity>,
+    ),
+    ErrorPayload,
+> {
+    Ok(match cockpit_config::config::read_config_file_nofollow_with_identity(target)
+        .map_err(internal)?
+    {
+        Some((bytes, identity)) => (bytes, Some(identity)),
+        None => (b"{}\n".to_vec(), None),
+    })
+}
+
+fn enforce_settings_capability_caps(owner: &str) -> Result<(), ErrorPayload> {
+    let mut caps = settings_capabilities()
+        .lock()
+        .map_err(|_| internal("settings capability registry lock poisoned"))?;
+    while caps.values().filter(|cap| cap.owner == owner).count()
+        > SETTINGS_CAPABILITY_OWNER_CAP
+    {
+        let oldest = caps
+            .iter()
+            .filter(|(_, cap)| cap.owner == owner)
+            .min_by_key(|(_, cap)| cap.issued_at)
+            .map(|(id, _)| *id);
+        if let Some(id) = oldest { caps.remove(&id); } else { break; }
     }
+    while caps.len() > SETTINGS_CAPABILITY_GLOBAL_CAP {
+        let oldest = caps.iter().min_by_key(|(_, cap)| cap.issued_at).map(|(id, _)| *id);
+        if let Some(id) = oldest { caps.remove(&id); } else { break; }
+    }
+    Ok(())
 }
 
 fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {

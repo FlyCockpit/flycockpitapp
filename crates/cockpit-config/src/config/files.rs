@@ -559,6 +559,7 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
 pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
     writable: bool,
+    enforce_private: bool,
 ) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
     #[cfg(unix)]
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
@@ -615,9 +616,10 @@ pub(crate) fn read_file_nofollow_with_identity(
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt as _;
-        if before.uid() != unsafe { libc::geteuid() }
-            || before.mode() & 0o777 != 0o600
-            || before.nlink() != 1
+        if enforce_private
+            && (before.uid() != unsafe { libc::geteuid() }
+                || before.mode() & 0o777 != 0o600
+                || before.nlink() != 1)
         {
             anyhow::bail!("terminal ingress file ownership, mode, or link count changed");
         }
@@ -637,7 +639,9 @@ pub(crate) fn read_file_nofollow_with_identity(
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        verify_windows_protected_dacl(&file)?;
+        if enforce_private {
+            verify_windows_protected_dacl(&file)?;
+        }
         super::TerminalIngressFileIdentity {
             volume: u64::from(info.dwVolumeSerialNumber),
             file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -645,7 +649,7 @@ pub(crate) fn read_file_nofollow_with_identity(
         }
     };
     #[cfg(windows)]
-    if identity.links != 1 {
+    if enforce_private && identity.links != 1 {
         anyhow::bail!("terminal ingress file link count changed");
     }
     #[cfg(all(not(unix), not(windows)))]

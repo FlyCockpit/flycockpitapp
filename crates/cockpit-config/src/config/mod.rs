@@ -90,7 +90,7 @@ pub fn write_terminal_ingress_private_file(
     bytes: &[u8],
 ) -> anyhow::Result<TerminalIngressFileIdentity> {
     files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
-    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false)?
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false, true)?
         .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
     Ok(identity)
 }
@@ -138,7 +138,7 @@ impl Drop for VerifiedTerminalIngressFile {
 pub fn read_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    Ok(files::read_file_nofollow_with_identity(path, false)?
+    Ok(files::read_file_nofollow_with_identity(path, false, true)?
         .map(|(_, bytes, identity)| (bytes, identity)))
 }
 
@@ -148,11 +148,22 @@ pub fn read_config_file_nofollow(path: &std::path::Path) -> anyhow::Result<Optio
     files::read_file_nofollow(path)
 }
 
+/// Read a configuration target through the audited retained-parent,
+/// component-relative no-follow primitive and return its stable filesystem
+/// identity. Daemon capabilities use this to reject same-content pathname
+/// substitution between snapshot and commit.
+pub fn read_config_file_nofollow_with_identity(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
+    Ok(files::read_file_nofollow_with_identity(path, false, false)?
+        .map(|(_, bytes, identity)| (bytes, identity)))
+}
+
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
     Ok(
-        files::read_file_nofollow_with_identity(path, true)?.map(|(file, bytes, identity)| {
+        files::read_file_nofollow_with_identity(path, true, true)?.map(|(file, bytes, identity)| {
             VerifiedTerminalIngressFile {
                 file,
                 bytes,

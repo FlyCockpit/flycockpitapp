@@ -5055,7 +5055,12 @@ async fn handle_serialized_request_impl(
         }
 
         Request::GetExtendedConfigSnapshot { project_root } => {
-            crate::daemon::fs_api::get_extended_config_snapshot(ctx, project_root).await
+            crate::daemon::fs_api::get_extended_config_snapshot(
+                ctx,
+                project_root,
+                settings_capability_owner(state),
+            )
+            .await
         }
 
         Request::ApplyExtendedConfigPatch {
@@ -5070,6 +5075,7 @@ async fn handle_serialized_request_impl(
                 layer_id,
                 patch,
                 expected_revision,
+                settings_capability_owner(state),
             )
             .await?;
             if let Err(error) = ctx.refresh_redaction_table() {
@@ -8996,6 +9002,15 @@ fn agent_editor_lease_owner(state: &MutableClientState) -> String {
     )
 }
 
+fn settings_capability_owner(state: &MutableClientState) -> String {
+    format!(
+        "{}:{}:{}",
+        principal_digest(&state.principal),
+        state.terminal_context.client_instance_id,
+        state.terminal_context.connection_epoch,
+    )
+}
+
 #[cfg(feature = "remote")]
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
@@ -9823,7 +9838,12 @@ async fn handle_concurrent_request_impl(
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
         Request::GetExtendedConfigSnapshot { project_root } => {
-            crate::daemon::fs_api::get_extended_config_snapshot(&ctx, project_root).await
+            crate::daemon::fs_api::get_extended_config_snapshot(
+                &ctx,
+                project_root,
+                shared.capability_owner.clone(),
+            )
+            .await
         }
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx

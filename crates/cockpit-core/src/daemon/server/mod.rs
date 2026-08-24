@@ -3783,6 +3783,7 @@ struct MutableClientState {
 #[derive(Clone)]
 pub(super) struct SharedClientState {
     principal: ClientPrincipal,
+    capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     #[allow(dead_code)]
@@ -3903,6 +3904,12 @@ impl MutableClientState {
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
+            capability_owner: format!(
+                "{}:{}:{}",
+                run_invocation::principal_digest(&self.principal),
+                self.terminal_context.client_instance_id,
+                self.terminal_context.connection_epoch,
+            ),
             upload_accounting: self.upload_accounting.clone(),
             terminal_host: self.terminal_host.clone(),
             terminal_views: self.terminal_views.clone(),

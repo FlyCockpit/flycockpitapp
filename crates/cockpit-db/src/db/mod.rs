@@ -308,6 +308,11 @@ pub struct Db {
     read_pool: Option<Arc<ReadPool>>,
     /// `None` for in-memory databases (tests).
     path: Option<PathBuf>,
+    /// Kernel-backed exclusive ownership retained by every clone until the
+    /// final file-backed daemon handle is dropped.
+    _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
+    _diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
+    read_only: bool,
 }
 
 impl std::fmt::Debug for Db {
@@ -342,20 +347,28 @@ impl Db {
         let mut timer = files::PhaseTimer::start("Db::open");
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
-        // Both the normal daemon and the diagnostic SQLite owner enter through
-        // Db::open, so this kernel-backed RAII lock covers the complete
-        // create/open/backup/migrate interval for either owner.
-        let _boot_lock = files::DatabaseBootLock::acquire(path)?;
+        // Acquire exclusive process ownership before opening SQLite. The guard
+        // is stored in `Db`, so backup/migration, writer startup, and the full
+        // daemon lifetime are one ownership interval.
+        let owner_lock = Arc::new(files::DatabaseOwnerLock::acquire(path)?);
         let existed_before_open = path.exists();
+        if existed_before_open {
+            let incoming = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("opening existing SQLite read-only at {}", path.display()))?;
+            // Preserve a recovery copy for every rejected/unproven prerelease
+            // database, then prove ledger checksum, exact DDL fingerprint,
+            // profile, and user_version before any source-database mutation.
+            backup_before_pending_migration(&incoming, path, MIGRATIONS.len())?;
+            if table_exists(&incoming, "schema_version")? {
+                verify_existing_database(&incoming, MIGRATIONS)?;
+            }
+        }
         files::create_private_file_if_missing(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
         apply_connection_pragmas(&conn, true)
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
-        if existed_before_open {
-            backup_before_pending_migration(&conn, path, MIGRATIONS.len())?;
-        }
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         timer.phase("migrate");
@@ -367,6 +380,9 @@ impl Db {
             writer: Some(writer),
             read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
+            _owner_lock: Some(owner_lock),
+            _diagnostic_lock: None,
+            read_only: false,
         };
         timer.done();
         Ok(db)
@@ -384,8 +400,45 @@ impl Db {
             writer: None,
             read_pool: None,
             path: None,
+            _owner_lock: None,
+            _diagnostic_lock: None,
+            read_only: false,
         };
         Ok(db)
+    }
+
+    /// Open the canonical database for the hidden offline diagnostic worker.
+    /// This never creates files, applies pragmas, backs up, migrates, repairs,
+    /// or starts a writer. The shared non-blocking ownership lock also ensures
+    /// a live daemon must be queried over RPC rather than inspected beside it.
+    pub fn open_default_read_only_diagnostic() -> Result<Self> {
+        let path = Self::default_path()?;
+        if !path.is_file() {
+            anyhow::bail!("database does not exist at {}", path.display());
+        }
+        let diagnostic_lock = Arc::new(files::DatabaseDiagnosticLock::try_acquire(&path)?);
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening SQLite read-only at {}", path.display()))?;
+        verify_existing_database(&conn, MIGRATIONS)?;
+        foreign_key_check(&conn).context("validating diagnostic foreign keys")?;
+        let quick_check: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .context("running diagnostic SQLite quick_check")?;
+        if quick_check != "ok" {
+            anyhow::bail!("SQLite quick_check failed: {quick_check}");
+        }
+        Ok(Self {
+            memory: Some(Arc::new(Mutex::new(conn))),
+            writer: None,
+            read_pool: None,
+            path: Some(path),
+            _owner_lock: None,
+            _diagnostic_lock: Some(diagnostic_lock),
+            read_only: true,
+        })
     }
 
     /// In-memory database constructor for `#[tokio::test]` and other async
@@ -454,6 +507,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit writes");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
             let boxed = tokio::task::spawn_blocking(move || {
@@ -492,6 +548,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit transactions");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(move |conn| run_transaction(conn, f))?;
             let boxed = tokio::task::spawn_blocking(move || {
@@ -620,6 +679,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit writes");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
             let boxed = rx
@@ -741,23 +803,6 @@ struct Migration {
 const SCHEMA_PROFILE: &str = "remote-v0.1";
 #[cfg(not(feature = "remote"))]
 const SCHEMA_PROFILE: &str = "local-v0.1";
-const LOCAL_SCHEMA_PROFILE: &str = "local-v0.1";
-const REMOTE_SCHEMA_PROFILE: &str = "remote-v0.1";
-const REMOTE_TABLES: &[&str] = &[
-    "connector_state",
-    "sync_state",
-    "remote_audit_upload_state",
-    "remote_principal_audit",
-    "remote_attachment_operations",
-    "remote_attachment_lifecycle",
-    "remote_rename_journal",
-    "remote_rename_artifact_cleanup_intents",
-    "remote_attachment_outbox",
-    "remote_attachment_outbox_deliveries",
-    "remote_attachment_outbox_snapshots",
-    "remote_daemon_custody_generation_seq",
-    "remote_daemon_custody_records",
-];
 
 /// All schema migrations in version order. Pre-release: fold schema changes
 /// into `0001_initial.sql`. Do not append `0002_*`.
@@ -835,7 +880,7 @@ fn prerelease_backup_reason(
     migration_count: usize,
 ) -> Result<Option<(i64, &'static str)>> {
     if !table_exists(conn, "schema_version")? {
-        return Ok(None);
+        return Ok(Some((0, "rejecting an unledgered prerelease database")));
     }
     let columns = table_columns(conn, "schema_version")?;
     if !columns.iter().any(|column| column == "schema_fingerprint") {
@@ -857,7 +902,7 @@ fn prerelease_backup_reason(
         )
         .context("reading prerelease schema profile")?;
     if profile != SCHEMA_PROFILE {
-        return Ok(Some((version, "migrating the database schema profile")));
+        return Ok(Some((version, "rejecting a different database schema profile")));
     }
     if version == 1 {
         let recorded: String = conn
@@ -868,6 +913,19 @@ fn prerelease_backup_reason(
         if recorded != migration_definition_hash(&MIGRATIONS[0]) {
             return Ok(Some((version, "rejecting an amended prerelease v1")));
         }
+    }
+    let recorded_fingerprint: String = conn
+        .query_row(
+            "SELECT schema_fingerprint FROM schema_version WHERE version = ?1",
+            [version],
+            |row| row.get(0),
+        )
+        .context("reading prerelease schema fingerprint")?;
+    if recorded_fingerprint != exact_ddl_fingerprint(conn)? {
+        return Ok(Some((version, "rejecting schema fingerprint drift")));
+    }
+    if sqlite_schema_version(conn)? != version {
+        return Ok(Some((version, "rejecting SQLite user_version drift")));
     }
     Ok(None)
 }
@@ -912,18 +970,26 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
     );
     let mut backups = std::fs::read_dir(parent)?
         .flatten()
-        .map(|entry| entry.path())
-        .filter(|candidate| {
+        .filter_map(|entry| {
+            let candidate = entry.path();
+            let owned =
             candidate
                 .file_name()
                 .is_some_and(|name| {
                     let name = name.to_string_lossy();
                     name.starts_with(&prefix) && name.contains(".backup-") && name.ends_with(".sqlite")
-                })
+                });
+            owned.then(|| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (modified, candidate)
+            })
         })
         .collect::<Vec<_>>();
-    backups.sort();
-    for stale in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
+    backups.sort_by_key(|(modified, _)| *modified);
+    for (_, stale) in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
         std::fs::remove_file(stale)?;
     }
     Ok(())
@@ -1047,72 +1113,14 @@ fn verify_user_version(conn: &Connection, ledger_version: i64) -> Result<()> {
     Ok(())
 }
 
-fn recorded_schema_profile(conn: &Connection) -> Result<Option<String>> {
-    if current_schema_version(conn)? == 0 {
-        return Ok(None);
+fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Result<()> {
+    verify_supported_ledger_shape(conn)?;
+    verify_ledger(conn, migrations)?;
+    let current = current_schema_version(conn)?;
+    if current == 0 {
+        anyhow::bail!("database migration ledger is empty");
     }
-    conn.query_row(
-        "SELECT schema_profile FROM schema_version ORDER BY version DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    )
-    .map(Some)
-    .context("reading database schema profile")
-}
-
-/// Move an existing prerelease v1 database along the explicit local/remote
-/// profile lineage. This runs inside the migration transaction and updates the
-/// profile and fingerprint atomically. The common migration checksum remains
-/// unchanged because both profiles descend from the same squashed v1.
-fn migrate_schema_profile(conn: &Connection) -> Result<()> {
-    let Some(current) = recorded_schema_profile(conn)? else {
-        return Ok(());
-    };
-    if current == SCHEMA_PROFILE {
-        return Ok(());
-    }
-    match (current.as_str(), SCHEMA_PROFILE) {
-        (REMOTE_SCHEMA_PROFILE, LOCAL_SCHEMA_PROFILE) => conn
-            .execute_batch(include_str!("migrations/0001_local_profile.sql"))
-            .context("migrating remote-v0.1 schema profile to local-v0.1")?,
-        (LOCAL_SCHEMA_PROFILE, REMOTE_SCHEMA_PROFILE) => {
-            // Reconstruct only the remote-owned objects from the authoritative
-            // squashed migration. sqlite_schema row order preserves table
-            // creation order; secondary indexes and triggers follow tables.
-            let seed = Connection::open_in_memory().context("opening remote profile seed")?;
-            seed.execute_batch(MIGRATIONS[0].sql)
-                .context("materializing authoritative remote profile schema")?;
-            for kind in ["table", "index", "trigger", "view"] {
-                let mut stmt = seed.prepare(
-                    "SELECT tbl_name, sql FROM sqlite_schema \
-                     WHERE type = ?1 AND sql IS NOT NULL ORDER BY rowid",
-                )?;
-                let statements = stmt
-                    .query_map([kind], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for (table, sql) in statements {
-                    let owned = REMOTE_TABLES.contains(&table.as_str());
-                    if owned {
-                        conn.execute_batch(&sql).with_context(|| {
-                            format!("restoring {kind} for remote-v0.1 schema profile")
-                        })?;
-                    }
-                }
-            }
-        }
-        _ => anyhow::bail!(
-            "unsupported database schema profile transition: {current} -> {SCHEMA_PROFILE}"
-        ),
-    }
-    let fingerprint = exact_ddl_fingerprint(conn)?;
-    conn.execute(
-        "UPDATE schema_version SET schema_profile = ?1, schema_fingerprint = ?2 \
-         WHERE version = (SELECT MAX(version) FROM schema_version)",
-        rusqlite::params![SCHEMA_PROFILE, fingerprint],
-    )?;
-    Ok(())
+    verify_user_version(conn, current)
 }
 
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
@@ -1151,7 +1159,6 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         )
         .context("creating schema_version table")?;
 
-        migrate_schema_profile(conn)?;
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
         if current > 0 {

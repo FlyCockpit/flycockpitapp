@@ -10,11 +10,11 @@ use anyhow::{Context, Result};
 /// The lock file is persistent, but ownership is held by the kernel on this
 /// open file description. A crashed process therefore cannot leave stale
 /// ownership behind (unlike a create-new or PID-file protocol).
-pub(crate) struct DatabaseBootLock {
+pub(crate) struct DatabaseOwnerLock {
     _file: std::fs::File,
 }
 
-impl DatabaseBootLock {
+impl DatabaseOwnerLock {
     pub(crate) fn acquire(database: &Path) -> Result<Self> {
         let lock_path = database.with_extension("boot.lock");
         ensure_parent_dir_private(&lock_path)?;
@@ -27,6 +27,29 @@ impl DatabaseBootLock {
         repair_private_file(&lock_path, "database boot lock")?;
         file.lock()
             .with_context(|| format!("locking database boot at {}", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Non-mutating diagnostic ownership. It can coexist with other diagnostic
+/// readers, but never with the daemon's exclusive lifetime owner.
+pub(crate) struct DatabaseDiagnosticLock {
+    _file: std::fs::File,
+}
+
+impl DatabaseDiagnosticLock {
+    pub(crate) fn try_acquire(database: &Path) -> Result<Self> {
+        let lock_path = database.with_extension("boot.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening database ownership lock {}", lock_path.display()))?;
+        file.try_lock_shared().with_context(|| {
+            format!(
+                "database is owned by a live daemon; diagnostics must use its RPC: {}",
+                database.display()
+            )
+        })?;
         Ok(Self { _file: file })
     }
 }

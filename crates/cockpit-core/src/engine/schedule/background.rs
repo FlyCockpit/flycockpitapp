@@ -312,7 +312,9 @@ where
     })
 }
 
-fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+/// Extract a human-readable message from a caught panic payload. Shared with
+/// the swarm runner's panic supervisor ([`super::authority`]).
+pub(super) fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

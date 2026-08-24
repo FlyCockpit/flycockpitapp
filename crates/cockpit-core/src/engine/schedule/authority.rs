@@ -32,9 +32,11 @@
 //!   to main.
 
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -504,7 +506,36 @@ impl ScheduleAuthority {
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
         };
-        let handle = tokio::spawn(swarm::run_swarm(run_ctx));
+        // Panic supervisor: a panic in `run_swarm` sends no terminal `Completed`,
+        // which would strand the registry row and its concurrency slot forever.
+        // Race the runner under a catch_unwind and, on panic, publish a failed
+        // terminal so the driver reconciles the slot exactly once. The
+        // row-removal gate (#108) dedups this against any partial runner
+        // terminal, so a late runner send after a caught panic cannot
+        // double-free the slot.
+        let panic_event_tx = self.event_tx.clone();
+        let panic_job_id = job_id.clone();
+        let panic_label = label.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(payload) = AssertUnwindSafe(swarm::run_swarm(run_ctx))
+                .catch_unwind()
+                .await
+            {
+                let _ = panic_event_tx
+                    .send(ScheduleEvent::Completed {
+                        job_id: panic_job_id,
+                        label: panic_label,
+                        kind: ScheduleKind::Swarm,
+                        result: format!(
+                            "swarm subagent task panicked: {}",
+                            background::panic_payload(payload.as_ref())
+                        ),
+                        failed: true,
+                        requests: Vec::new(),
+                    })
+                    .await;
+            }
+        });
         let entry = ScheduleEntry {
             job_id: job_id.clone(),
             label,

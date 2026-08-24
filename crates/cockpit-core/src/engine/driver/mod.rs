@@ -8700,6 +8700,13 @@ impl Driver {
                                 }
                                 input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
+                                // The folded external submission is a new
+                                // originating user turn even though this method
+                                // keeps the provider loop hot. Its root stop
+                                // budget must not inherit continuations granted
+                                // to the submission that just completed.
+                                root_stop_gate =
+                                    crate::engine::agent::hooks::StopGateState::default();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         expected_model_state_generation: None,
@@ -8734,11 +8741,20 @@ impl Driver {
                     // and inject the structured envelope as the parent's tool
                     // result. `Return` is only ever emitted by a delegated
                     // child, so the stack always has a parent below it.
+                    let gate_outcome = self.consult_active_child_stop_gate().await;
+                    if cancel.is_cancelled() {
+                        self.unwind_stack_to_root_and_discard_pending_input(
+                            StackUnwindReason::Cancelled,
+                            input_rx,
+                            tx,
+                        )
+                        .await;
+                        return Ok(());
+                    }
                     if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                         reason,
                         additional_context,
-                    } = self.consult_active_child_stop_gate().await
-                        && !cancel.is_cancelled()
+                    } = gate_outcome
                     {
                         next_prompt = Self::stop_continuation_prompt(reason, additional_context);
                         continue;
@@ -8751,11 +8767,20 @@ impl Driver {
                 }
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
+                        let gate_outcome = self.consult_active_child_stop_gate().await;
+                        if cancel.is_cancelled() {
+                            self.unwind_stack_to_root_and_discard_pending_input(
+                                StackUnwindReason::Cancelled,
+                                input_rx,
+                                tx,
+                            )
+                            .await;
+                            return Ok(());
+                        }
                         if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                             reason,
                             additional_context,
-                        } = self.consult_active_child_stop_gate().await
-                            && !cancel.is_cancelled()
+                        } = gate_outcome
                         {
                             next_prompt =
                                 Self::stop_continuation_prompt(reason, additional_context);
@@ -8804,6 +8829,8 @@ impl Driver {
                                 }
                                 input_rx.finish(&queue_item_ids).await;
                                 self.reset_delegation_retry_budget();
+                                root_stop_gate =
+                                    crate::engine::agent::hooks::StopGateState::default();
                                 next_prompt =
                                     crate::engine::message::build_user_message(UserSubmission {
                                         expected_model_state_generation: None,
@@ -8875,7 +8902,7 @@ impl Driver {
                         // root turn ends normally below.
                         crate::engine::agent::hooks::StopHookOutcome::Continue { .. }
                         | crate::engine::agent::hooks::StopHookOutcome::End
-                        | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd => {}
+                        | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd(_) => {}
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq).await {

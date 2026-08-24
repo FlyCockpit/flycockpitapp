@@ -2191,7 +2191,7 @@ async fn stop_hook_continuation_state_machine() {
             &mut state,
         )
         .await;
-        assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+        assert_eq!(outcome, StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested));
     }
 
     // At the continuation cap → ForcedEnd WITHOUT reconsulting the hooks and
@@ -2217,7 +2217,7 @@ async fn stop_hook_continuation_state_machine() {
             &mut state,
         )
         .await;
-        assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+        assert_eq!(outcome, StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap));
         assert_eq!(
             runner.invocations().len(),
             0,
@@ -2382,7 +2382,7 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         &mut state,
     )
     .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap));
     assert_eq!(
         runner.invocations().len(),
         expected_grants,
@@ -2780,6 +2780,7 @@ impl HookDocumentationContract {
                 REASON_NONZERO_EXIT_PREFIX,
                 REASON_NO_EXIT_STATUS,
                 REASON_EMPTY_NOT_PROVEN,
+                REASON_PIPE_IO_FAILED,
             ],
             unsupported_formats: vec![
                 "toml",

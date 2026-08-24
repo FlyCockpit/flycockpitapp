@@ -870,7 +870,7 @@ async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
     let outcome = driver
         .consult_root_stop_gate(&PanicRunner, &env, &mut turn_a)
         .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap));
 
     // A DIFFERENT user turn owns a SEPARATE latch: turn B starts fresh and is
     // granted a continuation even though turn A is capped (independence — the
@@ -896,7 +896,7 @@ async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
     let outcome = driver
         .consult_root_stop_gate(&stop, &env, &mut turn_c)
         .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested));
     assert_eq!(
         turn_c.continuation_count, 0,
         "continue:false ends the turn without counting a continuation"

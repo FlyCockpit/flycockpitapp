@@ -491,6 +491,15 @@ tool. Every other failure mode is **fail-open**: the run is recorded as
 - `hook exited with non-zero status` (followed by the numeric exit status)
 - `hook exited without status` (the process crashed or its wait handle failed)
 - `descendant emptiness not proven` (the same-generation empty oracle was uncertain)
+- `hook pipe I/O failed` (stdin delivery or stdout/stderr capture failed)
+
+Native hook execution additionally requires the host containment adapter to
+support atomic process placement with retained stdin/stdout/stderr endpoints.
+The current production Linux, macOS, and Windows adapters do not yet implement
+that combined primitive, so they reject before spawn and audit
+`descendant_containment_unsupported`. The fake adapter exercises the lifecycle
+contract in tests; it is not a production fallback. Cockpit never weakens this
+requirement by spawning a hook first and attaching containment afterward.
 
 Exit status alone never denies. Post and observe-only hooks never block; they
 run sequentially even if an earlier observer fails.
@@ -500,10 +509,11 @@ run sequentially even if an earlier observer fails.
 Each interactive, inline, detached, and nested child frame/job has its own
 stop-continuation counter. A `stop`/`subagentStop` `block` requests another
 model round and increments the counter for the affected frame/job. After **8**
-continuations per `(session, frame-or-job)`, Cockpit forces the turn to end
+continuations per `(session, frame-or-job, originating user turn)`, Cockpit forces the turn to end
 without reconsulting stop hooks. Feedback from a stop hook stays in the
 affected frame/job; a child force-stop returns only its ordinary parent
-envelope/report.
+envelope/report. Forced ends are also recorded as bounded notice events with
+`forcedEndCause` set to `continuation_cap` or `hook_requested`.
 
 #### Audit and privacy
 

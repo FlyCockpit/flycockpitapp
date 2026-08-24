@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -112,7 +112,7 @@ struct LiveEntry {
 /// Async handle to the ProcessContainment actor.
 #[derive(Clone)]
 pub struct ProcessContainmentHandle {
-    tx: SyncSender<Op>,
+    tx: mpsc::Sender<Op>,
 }
 
 impl ProcessContainmentHandle {
@@ -120,7 +120,7 @@ impl ProcessContainmentHandle {
         match self.tx.try_send(op) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(ContainmentError::QueueSaturated),
-            Err(TrySendError::Disconnected(_)) => Err(ContainmentError::ActorStopped),
+            Err(TrySendError::Closed(_)) => Err(ContainmentError::ActorStopped),
         }
     }
 
@@ -298,8 +298,9 @@ impl ProcessContainmentActor {
 
     /// Start with an injected adapter (tests / composition).
     pub fn start(db: Db, adapter: SharedAdapter) -> Self {
-        let (tx, rx) = mpsc::sync_channel(CONTAINMENT_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel(CONTAINMENT_QUEUE_CAPACITY);
         let handle = ProcessContainmentHandle { tx: tx.clone() };
+        let actor_handle = handle.clone();
         let join = thread::Builder::new()
             .name("process-containment".into())
             .spawn(move || {
@@ -312,7 +313,7 @@ impl ProcessContainmentActor {
                     .enable_all()
                     .build()
                     .expect("containment runtime");
-                rt.block_on(actor_loop(db, adapter, rx));
+                rt.block_on(actor_loop(db, adapter, rx, actor_handle));
                 // Drop runtime without blocking forever on stray tasks.
                 rt.shutdown_background();
             })
@@ -325,7 +326,7 @@ impl ProcessContainmentActor {
 
     pub fn shutdown(mut self) {
         let (reply, rx) = oneshot::channel();
-        let _ = self.handle.tx.send(Op::Shutdown { reply });
+        let _ = self.handle.tx.blocking_send(Op::Shutdown { reply });
         let _ = rx.blocking_recv();
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -370,7 +371,12 @@ struct ActorState {
     in_flight: HashSet<String>,
 }
 
-async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
+async fn actor_loop(
+    db: Db,
+    adapter: SharedAdapter,
+    mut rx: mpsc::Receiver<Op>,
+    actor_handle: ProcessContainmentHandle,
+) {
     let mut state = ActorState {
         db,
         adapter,
@@ -379,7 +385,7 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
         intake_closed: false,
         in_flight: HashSet::new(),
     };
-    while let Ok(op) = rx.recv() {
+    while let Some(op) = rx.recv().await {
         match op {
             Op::Shutdown { reply } => {
                 let _ = reply.send(());
@@ -427,7 +433,7 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
                 )
                 .await;
                 if let Err(Ok(lease)) = reply.send(result) {
-                    reclaim_live_lease(&mut state, lease).await;
+                    spawn_lease_reconciliation(actor_handle.clone(), lease);
                 }
             }
             Op::CreateAndSpawnWithIo {
@@ -455,7 +461,7 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
                     // The requester was cancelled after allocation. Ownership
                     // stays with the actor, so reclaim the unpublished lease
                     // instead of leaving a live group with no external owner.
-                    reclaim_live_lease(&mut state, lease).await;
+                    spawn_lease_reconciliation(actor_handle.clone(), lease);
                 }
             }
             Op::CreateContainerAndExec {
@@ -624,13 +630,24 @@ async fn create_native(
                 ReduceResult::Applied(r) => *r,
                 o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            let _ = persist_cas(state, &record, &rec).await;
+            persist_cas(state, &record, &rec).await?;
             return Err(e);
         }
     };
 
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
         reclaim_unpublished_allocation(state, &allocated.handle, generation).await;
+        let failed = match reduce(
+            Some(record.clone()),
+            ContainmentEvent::CreateFailed {
+                generation,
+                now_wall_ms: wall_ms(),
+            },
+        ) {
+            ReduceResult::Applied(record) => *record,
+            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        };
+        persist_cas(state, &record, &failed).await?;
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven native allocation".into(),
         });
@@ -690,17 +707,24 @@ async fn reclaim_unpublished_allocation(
     }
 }
 
-async fn reclaim_live_lease(state: &mut ActorState, lease: ContainmentLease) {
-    loop {
-        let _ = terminate_one(state, lease.clone()).await;
-        if matches!(
-            await_empty_one(state, lease.clone()).await,
-            Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation
-        ) {
-            return;
+fn spawn_lease_reconciliation(handle: ProcessContainmentHandle, lease: ContainmentLease) {
+    // A cancelled allocation requester must not make the actor itself wait on
+    // a potentially slow platform oracle. Reconciliation remains actor-owned:
+    // this task feeds terminate/await operations back through the same bounded
+    // queue, preserving serialization and durable CAS authority while allowing
+    // unrelated containments and shutdown commands to make progress.
+    tokio::spawn(async move {
+        loop {
+            let _ = handle.terminate(lease.clone()).await;
+            if matches!(
+                handle.await_empty(lease.clone()).await,
+                Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -808,6 +832,17 @@ async fn create_native_with_io(
 
     if require_proven && allocated.allocation.guarantee != ContainmentGuarantee::Proven {
         reclaim_unpublished_allocation(state, &allocated.allocation.handle, generation).await;
+        let failed = match reduce(
+            Some(record.clone()),
+            ContainmentEvent::CreateFailed {
+                generation,
+                now_wall_ms: wall_ms(),
+            },
+        ) {
+            ReduceResult::Applied(record) => *record,
+            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        };
+        persist_cas(state, &record, &failed).await?;
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven IO allocation".into(),
         });
@@ -925,7 +960,7 @@ async fn create_container(
                 ReduceResult::Applied(r) => *r,
                 o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            let _ = persist_cas(state, &record, &rec).await;
+            persist_cas(state, &record, &rec).await?;
             return Err(e);
         }
     };
@@ -1000,7 +1035,10 @@ async fn terminate_one(
             return Err(ContainmentError::Internal(format!("{o:?}")));
         }
     };
-    let _ = persist_cas(state, &from_record, &rec).await;
+    if let Err(error) = persist_cas(state, &from_record, &rec).await {
+        state.in_flight.remove(&cmd_key);
+        return Err(error);
+    }
     if let Some(entry) = state.live.get_mut(&lease.containment_id) {
         entry.record = rec;
     }
@@ -1053,7 +1091,7 @@ async fn await_empty_one(
                 ReduceResult::GenerationMismatch { .. } => return Ok(outcome),
                 o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            let _ = persist_cas(state, &from_record, &rec).await;
+            persist_cas(state, &from_record, &rec).await?;
             if let Some(entry) = state.live.get_mut(&lease.containment_id) {
                 entry.record = rec;
                 entry.lease_token.invalidate();
@@ -1072,7 +1110,7 @@ async fn await_empty_one(
                 ReduceResult::Illegal { .. } => return Ok(outcome),
                 o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            let _ = persist_cas(state, &from_record, &rec).await;
+            persist_cas(state, &from_record, &rec).await?;
             if let Some(entry) = state.live.get_mut(&lease.containment_id) {
                 entry.record = rec;
             }

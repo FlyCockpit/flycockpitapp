@@ -33,6 +33,37 @@ fn hook_runner(env: &DispatchEnv<'_>) -> super::hooks::TokioCommandRunner {
         super::hooks::TokioCommandRunner::with_containment,
     )
 }
+
+async fn fire_monty_permission_denied_hook(
+    ctx: &crate::engine::tool::ToolCtx,
+    tool_name: &str,
+    permission_kind: &'static str,
+) {
+    let snapshot = ctx.config.snapshot();
+    let runner = ctx.config.process_containment().map_or_else(
+        super::hooks::TokioCommandRunner::new,
+        super::hooks::TokioCommandRunner::with_containment,
+    );
+    super::hooks::run_observe_hooks(
+        &runner,
+        &super::hooks::DefaultProcessEnv,
+        snapshot.hooks(),
+        crate::config::extended::hooks::HookEvent::PermissionDenied,
+        tool_name,
+        ctx.session.id,
+        &ctx.cwd,
+        &ctx.session.db,
+        Some(tool_name),
+        ctx.current_tool_call_id.as_deref(),
+        None,
+        None,
+        super::hooks::ObserveFields {
+            permission_kind: Some(permission_kind),
+            ..Default::default()
+        },
+    )
+    .await;
+}
 /// The authorization portion of ordinary dispatch, reused by Monty's builtin
 /// adapter. Monty is a transport, not a second tool-execution authority: a
 /// host invocation must consume the same safety gate, standing rejects,
@@ -55,6 +86,7 @@ pub(crate) async fn authorize_monty_native_call(
         GateOutcome::Run { .. } => {}
         GateOutcome::Parked => return Err(crate::engine::interrupt::InterruptParked.into()),
         GateOutcome::Block(block) => {
+            fire_monty_permission_denied_hook(ctx, tool.name(), "authorization_blocked").await;
             return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
                 "denied": true,
                 "kind": "authorization_blocked",
@@ -67,6 +99,7 @@ pub(crate) async fn authorize_monty_native_call(
     if let Some(cage) = ctx.review_cage.as_ref()
         && let Err(error) = cage.allow_dispatch(tool.name())
     {
+        fire_monty_permission_denied_hook(ctx, tool.name(), "review_cage_denied").await;
         return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
             "denied": true,
             "kind": "review_cage_denied",
@@ -87,6 +120,7 @@ pub(crate) async fn authorize_monty_native_call(
                 .is_accept()
             {
                 let available: Vec<&str> = ctx.available_tools.iter().map(String::as_str).collect();
+                fire_monty_permission_denied_hook(ctx, tool.name(), "loop_guard_denied").await;
                 return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
                     "denied": true,
                     "kind": "loop_guard_denied",
@@ -115,7 +149,7 @@ pub(crate) async fn authorize_monty_native_call(
             ("approval_denied", "native tool call denied".to_string())
         }
         crate::approval::Decision::StandingReject { scope } => (
-            "approval_denied",
+            "blocked_standing_reject",
             crate::approval::standing_reject_refusal(tool.name(), scope),
         ),
         crate::approval::Decision::NoninteractiveDeny => (
@@ -123,6 +157,7 @@ pub(crate) async fn authorize_monty_native_call(
             crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
         ),
     };
+    fire_monty_permission_denied_hook(ctx, tool.name(), denied.0).await;
     Ok(MontyNativeAuthorization::Denied(serde_json::json!({
         "denied": true,
         "kind": denied.0,

@@ -5416,6 +5416,16 @@ pub(crate) async fn run_noninteractive_resumable(
                         continue;
                     }
                 }
+                if cancel.is_cancelled() {
+                    drop(child_tx);
+                    let _ = forwarder.await;
+                    return Err(NoninteractiveRunError::new(
+                        anyhow::anyhow!("subagent cancelled while consulting stop hooks"),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 // No `return` tool call: fall back to wrapping the final text
@@ -5456,6 +5466,16 @@ pub(crate) async fn run_noninteractive_resumable(
                         next_prompt = Driver::stop_continuation_prompt(reason, additional_context);
                         continue;
                     }
+                }
+                if cancel.is_cancelled() {
+                    drop(child_tx);
+                    let _ = forwarder.await;
+                    return Err(NoninteractiveRunError::new(
+                        anyhow::anyhow!("subagent cancelled while consulting stop hooks"),
+                        history,
+                        fallback_decision,
+                        fallback_tried,
+                    ));
                 }
                 drop(child_tx);
                 let _ = forwarder.await;

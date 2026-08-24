@@ -62,6 +62,7 @@ pub(crate) const REASON_OUTPUT_LIMIT_EXCEEDED: &str = "hook output exceeded limi
 pub(crate) const REASON_NONZERO_EXIT_PREFIX: &str = "hook exited with non-zero status";
 pub(crate) const REASON_NO_EXIT_STATUS: &str = "hook exited without status";
 pub(crate) const REASON_EMPTY_NOT_PROVEN: &str = "descendant emptiness not proven";
+pub(crate) const REASON_PIPE_IO_FAILED: &str = "hook pipe I/O failed";
 pub(crate) const REASON_OUTPUT_NOT_JSON_OBJECT: &str = "output is not a JSON object";
 pub(crate) const REASON_MALFORMED_HOOK_OUTPUT: &str = "malformed hook output";
 pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
@@ -885,17 +886,17 @@ impl CommandRunner for TokioCommandRunner {
                     let n = match out.read(&mut temp).await {
                         Ok(0) => break,
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(_) => return (Some((total, false)), true),
                     };
                     total.extend_from_slice(&temp[..n]);
                     if total.len() > OUTPUT_CAP_BYTES {
                         total.truncate(OUTPUT_CAP_BYTES);
-                        return Some((total, true));
+                        return (Some((total, true)), false);
                     }
                 }
-                Some((total, false))
+                (Some((total, false)), false)
             } else {
-                None
+                (None, false)
             }
         };
 
@@ -905,17 +906,18 @@ impl CommandRunner for TokioCommandRunner {
                 let mut total = 0_usize;
                 loop {
                     match err.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        Err(_) => return (false, true),
                         Ok(read) => {
                             total = total.saturating_add(read);
                             if total > OUTPUT_CAP_BYTES {
-                                return true;
+                                return (true, false);
                             }
                         }
                     }
                 }
             }
-            false
+            (false, false)
         };
 
         // The deadline covers stdin delivery, both pipe drains, and process
@@ -923,20 +925,22 @@ impl CommandRunner for TokioCommandRunner {
         // a descendant inherits a pipe, and writing stdin outside the deadline
         // can block before timeout enforcement even begins.
         let operation = async {
-            let (stdin_result, stdout_result, stderr_truncated, wait_result) =
+            let (stdin_result, stdout_result, stderr_result, wait_result) =
                 tokio::join!(stdin_fut, stdout_fut, stderr_fut, io.wait.as_mut());
-            (stdin_result, stdout_result, stderr_truncated, wait_result)
+            (stdin_result, stdout_result, stderr_result, wait_result)
         };
-        let (stdin_failed, stdout_result, stderr_truncated, exit_code, timed_out) =
+        let (stdin_failed, stdout_result, stdout_pipe_failed, stderr_truncated, stderr_pipe_failed, exit_code, timed_out) =
             match tokio::time::timeout(timeout, operation).await {
-                Ok((stdin_result, stdout_result, stderr_truncated, wait_result)) => (
+                Ok((stdin_result, (stdout_result, stdout_pipe_failed), (stderr_truncated, stderr_pipe_failed), wait_result)) => (
                     stdin_result.is_err(),
                     stdout_result,
+                    stdout_pipe_failed,
                     stderr_truncated,
+                    stderr_pipe_failed,
                     wait_result.unwrap_or(None),
                     false,
                 ),
-                Err(_) => (false, None, false, None, true),
+                Err(_) => (false, None, false, false, false, None, true),
             };
 
         terminate_and_prove_empty(containment, &lease).await;
@@ -955,7 +959,9 @@ impl CommandRunner for TokioCommandRunner {
             failure_reason: if timed_out {
                 Some(REASON_HOOK_TIMED_OUT)
             } else if stdin_failed {
-                Some(REASON_SPAWN_FAILED)
+                Some(REASON_PIPE_IO_FAILED)
+            } else if stdout_pipe_failed || stderr_pipe_failed {
+                Some(REASON_PIPE_IO_FAILED)
             } else if stdout_truncated || stderr_truncated {
                 Some(REASON_OUTPUT_LIMIT_EXCEEDED)
             } else if exit_code.is_none() && !timed_out {
@@ -1491,7 +1497,13 @@ pub enum StopHookOutcome {
     },
     /// A stop hook produced `{"continue":false,"stopReason":"..."}` which wins
     /// and ends the turn, or the continuation cap was reached (forced end).
-    ForcedEnd,
+    ForcedEnd(ForcedEndCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedEndCause {
+    ContinuationCap,
+    HookRequested,
 }
 
 /// Run all matching stop hooks and aggregate their feedback.
@@ -1533,6 +1545,7 @@ pub(crate) async fn run_stop_hooks(
                     "severity": "warning",
                     "source": STOP_HOOK_FORCED_END_SOURCE,
                     "hookEvent": event.key(),
+                    "forcedEndCause": "continuation_cap",
                     "continuationsGranted": state.continuation_count,
                     "subagentId": subagent_id,
                 }),
@@ -1541,7 +1554,7 @@ pub(crate) async fn run_stop_hooks(
         {
             tracing::warn!(%error, event = event.key(), "failed to record stop-hook forced end");
         }
-        return StopHookOutcome::ForcedEnd;
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap);
     }
 
     let hooks = matching_hooks(registry, event, match_value);
@@ -1691,7 +1704,27 @@ pub(crate) async fn run_stop_hooks(
     }
 
     if feedback.forced_end {
-        return StopHookOutcome::ForcedEnd;
+        if let Err(error) = db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::Notice,
+                None,
+                None,
+                &serde_json::json!({
+                    "text": "A stop hook explicitly ended the turn.",
+                    "severity": "info",
+                    "source": STOP_HOOK_FORCED_END_SOURCE,
+                    "hookEvent": event.key(),
+                    "forcedEndCause": "hook_requested",
+                    "continuationsGranted": state.continuation_count,
+                    "subagentId": subagent_id,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, event = event.key(), "failed to record hook-requested forced end");
+        }
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested);
     }
 
     if feedback.should_continue_round() {

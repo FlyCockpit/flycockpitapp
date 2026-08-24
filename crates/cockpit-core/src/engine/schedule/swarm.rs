@@ -231,11 +231,13 @@ pub async fn run_swarm(run: SwarmRunCtx) {
 
     let result = match loop_outcome {
         Ok(text) => {
-            let _ = event_tx
-                .send(ScheduleEvent::SwarmChildStopGateCompleted {
-                    job_id: job_id.clone(),
-                })
-                .await;
+            if !spec.worker.is_goal_control() {
+                let _ = event_tx
+                    .send(ScheduleEvent::SwarmChildStopGateCompleted {
+                        job_id: job_id.clone(),
+                    })
+                    .await;
+            }
             text
         }
         Err(e) => {
@@ -372,6 +374,9 @@ async fn run_swarm_loop(
                     .expect("Continue with empty history is unreachable");
             }
             TurnOutcome::Done => {
+                if spec.worker.is_goal_control() {
+                    return Ok(collect_final_text(&history));
+                }
                 let hook_snapshot = pinned.snapshot();
                 let hook_runner = ctx.process_containment.clone().map_or_else(
                     crate::engine::agent::hooks::TokioCommandRunner::new,
@@ -448,6 +453,9 @@ async fn run_swarm_loop(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
+                if spec.worker.is_goal_control() {
+                    return Ok(collect_final_text(&history));
+                }
                 let hook_snapshot = pinned.snapshot();
                 let hook_runner = ctx.process_containment.clone().map_or_else(
                     crate::engine::agent::hooks::TokioCommandRunner::new,

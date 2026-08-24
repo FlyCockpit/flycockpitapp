@@ -119,6 +119,10 @@ fn render_capped_payload_range(
     tool_name: &str,
     hash: &str,
 ) -> ToolOutput {
+    // Reserve space for the continuation marker so the final output
+    // (marker included) never exceeds the cap.  This mirrors the approach
+    // in `artifact_read::render_capped_artifact_lines`.
+    const CONTINUATION_RESERVE_BYTES: usize = 192;
     let mut output = String::new();
     let mut next = None;
     for (index, line) in content.lines().enumerate() {
@@ -127,22 +131,31 @@ fn render_capped_payload_range(
             continue;
         }
         let remaining = cap.saturating_sub(output.len());
-        if remaining == 0 {
+        if remaining <= CONTINUATION_RESERVE_BYTES {
             next = Some(number);
             break;
         }
-        let line = crate::tools::artifact_read::utf8_prefix(line, remaining.saturating_sub(1));
+        let budget = remaining
+            .saturating_sub(CONTINUATION_RESERVE_BYTES)
+            .saturating_sub(1);
+        // Only include the line if it fits entirely; otherwise defer to
+        // the continuation so the next page starts cleanly at this line.
+        if line.len() > budget {
+            next = Some(number);
+            break;
+        }
         output.push_str(line);
         output.push('\n');
-        if line.len() < content.lines().nth(index).unwrap_or_default().len() {
-            next = Some(number);
-            break;
-        }
     }
     if let Some(next) = next {
-        output.push_str(&format!(
-            "... [{tool_name} continuation hash={hash} start_line={next}]\n"
-        ));
+        let marker = format!(
+            "... [{tool_name} continuation start_line={next} hash={hash}]\n"
+        );
+        debug_assert!(marker.len() <= CONTINUATION_RESERVE_BYTES);
+        while output.len().saturating_add(marker.len()) > cap {
+            output.pop();
+        }
+        output.push_str(&marker);
         ToolOutput::truncated_text(output)
     } else {
         ToolOutput::text(output)

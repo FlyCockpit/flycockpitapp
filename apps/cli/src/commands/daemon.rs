@@ -237,6 +237,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
                 no_sandbox,
                 offline,
                 snapshot_db.as_ref(),
+                None,
             )
             .await?;
             println!(

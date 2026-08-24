@@ -3175,7 +3175,7 @@ impl Driver {
                             additional_context,
                         } = self
                             .consult_active_child_stop_gate(
-                                &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                                &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(self.session.process_containment()),
                                 &crate::engine::agent::hooks::DefaultProcessEnv,
                             )
                             .await
@@ -3200,7 +3200,7 @@ impl Driver {
                         additional_context,
                     } = self
                         .consult_active_child_stop_gate(
-                            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(self.session.process_containment()),
                             &crate::engine::agent::hooks::DefaultProcessEnv,
                         )
                         .await
@@ -4705,7 +4705,9 @@ impl Driver {
     ) {
         let snapshot = self.config.snapshot();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                self.session.process_containment(),
+            ),
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
             event,
@@ -4745,7 +4747,9 @@ impl Driver {
     ) {
         let snapshot = self.config.snapshot();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                self.session.process_containment(),
+            ),
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
             event,
@@ -4989,7 +4993,9 @@ impl Driver {
         let snapshot = self.config.snapshot();
         let mut discarded = crate::engine::agent::hooks::StopGateState::default();
         let _ = crate::engine::agent::hooks::run_stop_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                self.session.process_containment(),
+            ),
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
             crate::config::extended::hooks::HookEvent::SubagentStop,
@@ -8807,7 +8813,7 @@ impl Driver {
                         additional_context,
                     } = self
                         .consult_active_child_stop_gate(
-                            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(self.session.process_containment()),
                             &crate::engine::agent::hooks::DefaultProcessEnv,
                         )
                         .await
@@ -8836,7 +8842,7 @@ impl Driver {
                             additional_context,
                         } = self
                             .consult_active_child_stop_gate(
-                                &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                                &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(self.session.process_containment()),
                                 &crate::engine::agent::hooks::DefaultProcessEnv,
                             )
                             .await
@@ -8923,7 +8929,7 @@ impl Driver {
                     // like every other hook site.
                     match self
                         .consult_root_stop_gate(
-                            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(self.session.process_containment()),
                             &crate::engine::agent::hooks::DefaultProcessEnv,
                             &mut root_stop_gate,
                         )

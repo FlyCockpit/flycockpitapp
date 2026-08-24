@@ -25,8 +25,9 @@
 //! `PATH`. Reserved keys are overwritten after configured env.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +35,10 @@ use uuid::Uuid;
 
 use crate::config::extended::hooks::{HookEvent, HookRegistry, ResolvedHook};
 use crate::db::session_log::{HookRunAudit, HookRunStatus};
+use crate::process_containment::{
+    ContainmentError, ContainmentGuarantee, ContainmentLease, EmptyOutcome,
+    ProcessContainmentHandle,
+};
 
 /// Maximum size for serialized `toolInput` / `toolResult` envelope values
 /// (128 KiB). Excess is replaced with a UTF-8-safe prefix and the
@@ -48,6 +53,33 @@ pub(crate) const REASON_MAX_CHARS: usize = 1_024;
 
 /// Default reason when a deny has a missing/blank reason.
 pub(crate) const DEFAULT_DENY_REASON: &str = "blocked by preToolUse hook";
+
+/// Single-sourced, closed failure-reason constants for the process-containment
+/// path of hook execution (Decision #6). These exact strings are written to
+/// `hook_run.reason` and asserted by containment tests; do not spell them
+/// inline elsewhere.
+///
+/// Emitted when the platform cannot prove descendant containment *before* the
+/// hook child would run (`ContainmentError::DescendantContainmentUnavailable`
+/// or a non-Proven lease). The handler body never runs; the hook fails open.
+pub(crate) const REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED: &str =
+    "descendant_containment_unsupported";
+/// Emitted when, after the child ran, the same-generation empty oracle could
+/// not prove the descendant group empty (`EmptyOutcome::Uncertain` /
+/// `Unsupported`, or a bounded barrier deadline). The hook fails open, the
+/// durable containment recovery row is retained, and we do NOT claim the child
+/// is gone.
+pub(crate) const REASON_DESCENDANT_CONTAINMENT_UNCERTAIN: &str = "descendant_containment_uncertain";
+/// Emitted when the containment actor itself errored while terminating or
+/// awaiting empty (actor stopped, terminate error). The hook fails open.
+pub(crate) const REASON_DESCENDANT_CONTAINMENT_FAILED: &str = "descendant_containment_failed";
+
+/// Bounded deadline for the post-run empty barrier. A single `terminate` +
+/// single `await_empty` actor round-trip already bounds the common case; this
+/// deadline guarantees that even a stuck platform oracle can never hang the
+/// turn — on elapse the outcome is treated as uncertain (recovery row kept),
+/// never as proven-empty settlement.
+pub(crate) const CONTAINMENT_EMPTY_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reserved environment keys overwritten after configured env.
 #[allow(dead_code)]
@@ -630,6 +662,12 @@ pub(crate) fn resolve_hook_executable(
 // ---------------------------------------------------------------------------
 
 /// The raw result of running one hook command (before decision parsing).
+///
+/// Secret-safety: this type intentionally carries only the hook's own stdout
+/// (bounded, later clipped), coarse status flags, and a CLOSED `&'static str`
+/// failure reason. It never carries argv, env, stdin, or a raw platform error
+/// string, so nothing sensitive can reach the durable ledger or a log through
+/// it.
 #[derive(Debug, Clone)]
 pub struct HookRawOutput {
     pub stdout: String,
@@ -637,6 +675,37 @@ pub struct HookRawOutput {
     pub duration_ms: u64,
     pub spawn_failed: bool,
     pub timeout: bool,
+    /// Closed containment failure reason that overrides decision parsing. When
+    /// `Some`, the hook fails open with exactly this reason (one of the
+    /// `REASON_DESCENDANT_CONTAINMENT_*` constants). When `None`, the ordinary
+    /// `spawn_failed` / `timeout` / stdout-parse decision applies.
+    pub failure_reason: Option<&'static str>,
+}
+
+impl HookRawOutput {
+    /// Fail-open output carrying a closed containment reason. Used before the
+    /// hook body runs (unsupported) or after a non-proven-empty barrier.
+    fn containment_failure(reason: &'static str, start: Instant) -> Self {
+        Self {
+            stdout: String::new(),
+            exit_code: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            spawn_failed: false,
+            timeout: false,
+            failure_reason: Some(reason),
+        }
+    }
+}
+
+/// Outcome of running the actual hook child, independent of containment
+/// bookkeeping. Produced by the injected spawner inside
+/// [`run_hook_child_contained`] so the containment orchestration can be tested
+/// with a fake adapter and without a real external executable.
+struct ChildRunOutcome {
+    stdout: String,
+    exit_code: Option<i32>,
+    spawn_failed: bool,
+    timed_out: bool,
 }
 
 /// A command runner trait for deterministic tests.
@@ -646,8 +715,9 @@ pub struct HookRawOutput {
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run a hook command with the given executable, args, env, cwd, stdin
-    /// envelope, and timeout. Returns the raw output (stdout, exit code,
-    /// duration, failure flags).
+    /// envelope, and timeout. `session_id` is threaded so the production runner
+    /// can acquire a per-session containment lease. Returns the raw output
+    /// (stdout, exit code, duration, failure flags).
     async fn run(
         &self,
         executable: &Path,
@@ -656,20 +726,315 @@ pub trait CommandRunner: Send + Sync {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        session_id: Uuid,
     ) -> HookRawOutput;
 }
 
-/// Production command runner using tokio::process.
+/// Terminate the lease and await the same-generation empty oracle, bounded so a
+/// stuck platform oracle can never hang the turn. Only `ProvenEmpty` is
+/// accepted as settlement (same contract as `process_containment/adapter.rs`).
+enum EmptyBarrier {
+    /// Same-generation oracle proved the group empty. Safe to settle.
+    ProvenEmpty,
+    /// Ambiguous (`Uncertain` / `Unsupported` after spawn, or barrier deadline).
+    /// Keep the durable recovery row; do not claim the child is gone.
+    Uncertain,
+    /// The containment actor itself errored on terminate or await.
+    ActorError,
+}
+
+async fn terminate_and_await_empty(
+    handle: &ProcessContainmentHandle,
+    lease: ContainmentLease,
+) -> EmptyBarrier {
+    // A single terminate + single await_empty actor round-trip — NOT a busy
+    // loop. The WHOLE sequence (both `terminate` and `await_empty`) is under one
+    // deadline so a stuck actor/platform on EITHER call can never hang the turn.
+    let sequence = async {
+        handle.terminate(lease.clone()).await?;
+        handle.await_empty(lease).await
+    };
+    match tokio::time::timeout(CONTAINMENT_EMPTY_BARRIER_TIMEOUT, sequence).await {
+        Ok(Ok(EmptyOutcome::ProvenEmpty { .. })) => EmptyBarrier::ProvenEmpty,
+        Ok(Ok(EmptyOutcome::Uncertain { .. })) | Ok(Ok(EmptyOutcome::Unsupported { .. })) => {
+            EmptyBarrier::Uncertain
+        }
+        // A terminate or await_empty actor error.
+        Ok(Err(_)) => EmptyBarrier::ActorError,
+        // Deadline on either call: we could not prove empty in time. Keep the
+        // recovery row and fail open as uncertain; never proven-empty settlement.
+        Err(_elapsed) => EmptyBarrier::Uncertain,
+    }
+}
+
+/// Drop-safety for the hook lease while the child is running: if the run future
+/// is dropped during `spawn_child`, the lease is still terminated + awaited via
+/// a detached task, so a running hook child is never orphaned. The orchestrator
+/// disarms the guard the instant the child exits (before the inline barrier), so
+/// cleanup runs exactly once — either this detached terminate or the inline
+/// barrier, never both.
+struct HookLeaseGuard {
+    handle: ProcessContainmentHandle,
+    lease: Option<ContainmentLease>,
+}
+
+impl HookLeaseGuard {
+    fn new(handle: ProcessContainmentHandle, lease: ContainmentLease) -> Self {
+        Self {
+            handle,
+            lease: Some(lease),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.lease = None;
+    }
+}
+
+impl Drop for HookLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        // A dropped future cannot await; hand the SAME bounded terminate +
+        // await_empty to a detached task if a runtime is available. This is a
+        // single terminate + single await — never a busy loop.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let handle = self.handle.clone();
+            rt.spawn(async move {
+                let _ = terminate_and_await_empty(&handle, lease).await;
+            });
+        }
+    }
+}
+
+/// Run one hook child under a proven containment lease (write-scope posture).
+///
+/// 1. Acquire a `ContainmentLease` via `create_and_spawn` with
+///    `require_proven: true`. On `DescendantContainmentUnavailable` /
+///    Unsupported-before-spawn, fail open with
+///    [`REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED`] WITHOUT running the child.
+/// 2. Run the real child (`spawn_child`) under the lease, guarded so a dropped
+///    future still terminates it.
+/// 3. Bounded `terminate` + `await_empty`. Only `EmptyOutcome::ProvenEmpty`
+///    settles the real outcome; `Uncertain`/`Unsupported`-after-spawn yields
+///    [`REASON_DESCENDANT_CONTAINMENT_UNCERTAIN`] (recovery row kept) and an
+///    actor error yields [`REASON_DESCENDANT_CONTAINMENT_FAILED`].
+///
+/// The child spawn is injected so this orchestration is exercised by tests with
+/// a `FakeProvenAdapter` / `FakeUnsupportedAdapter` and no real executable,
+/// while production passes the real `tokio::process` spawner.
+async fn run_hook_child_contained<F, Fut>(
+    handle: &ProcessContainmentHandle,
+    session_id: Uuid,
+    program: PathBuf,
+    args: Vec<String>,
+    cwd: PathBuf,
+    start: Instant,
+    spawn_child: F,
+) -> HookRawOutput
+where
+    F: FnOnce(ContainmentLease) -> Fut,
+    Fut: Future<Output = ChildRunOutcome>,
+{
+    // Transient program/args/cwd for the lease. They are NOT persisted: the
+    // actor records only `operation_id` + content-free `SafeLocator`; env and
+    // stdin never reach the lease at all.
+    let operation_id = format!("hook-{}", Uuid::new_v4());
+    let lease = match handle
+        .create_and_spawn(session_id, operation_id, program, args, cwd, true)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(ContainmentError::DescendantContainmentUnavailable { .. }) => {
+            return HookRawOutput::containment_failure(
+                REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+                start,
+            );
+        }
+        // Any other actor error before spawn (actor stopped, queue saturated,
+        // session deleting): fail open. No lease exists, so no child ran.
+        Err(_) => {
+            return HookRawOutput::containment_failure(REASON_DESCENDANT_CONTAINMENT_FAILED, start);
+        }
+    };
+
+    // `require_proven: true` means the actor already rejected Unsupported, but
+    // never run a hook child under a non-proven lease.
+    if lease.guarantee() != ContainmentGuarantee::Proven {
+        let _ = terminate_and_await_empty(handle, lease).await;
+        return HookRawOutput::containment_failure(
+            REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+            start,
+        );
+    }
+
+    // The guard covers the window where the hook CHILD is running: if the run
+    // future is dropped during `spawn_child`, the guard terminates the lease so
+    // the child is never orphaned. Once the child has exited we DISARM before
+    // the barrier, so cleanup runs exactly once: either the guard's detached
+    // terminate (dropped while the child ran) or this inline barrier (child
+    // already exited). A drop during the barrier itself leaves a non-proven
+    // outcome on the actor's existing containment recovery path — no orphaned
+    // child, since the child has already exited.
+    let mut guard = HookLeaseGuard::new(handle.clone(), lease.clone());
+    let outcome = spawn_child(lease.clone()).await;
+    guard.disarm();
+    let barrier = terminate_and_await_empty(handle, lease).await;
+
+    match barrier {
+        EmptyBarrier::ProvenEmpty => HookRawOutput {
+            stdout: outcome.stdout,
+            exit_code: outcome.exit_code,
+            duration_ms: start.elapsed().as_millis() as u64,
+            spawn_failed: outcome.spawn_failed,
+            timeout: outcome.timed_out,
+            failure_reason: None,
+        },
+        EmptyBarrier::Uncertain => {
+            HookRawOutput::containment_failure(REASON_DESCENDANT_CONTAINMENT_UNCERTAIN, start)
+        }
+        EmptyBarrier::ActorError => {
+            HookRawOutput::containment_failure(REASON_DESCENDANT_CONTAINMENT_FAILED, start)
+        }
+    }
+}
+
+/// Spawn the real hook child via `tokio::process` and capture bounded output.
+///
+/// This is the production execution seam — a plain cross-platform
+/// `tokio::process::Command` with `env_clear`, piped stdio, an independent
+/// stdout cap, and `kill_on_drop(true)` (in addition to the lease terminate +
+/// empty barrier that owns cancellation). It is invoked from inside
+/// [`run_hook_child_contained`] only after a proven lease exists.
+async fn spawn_real_hook_child(
+    executable: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    stdin: &str,
+    timeout: Duration,
+) -> ChildRunOutcome {
+    let mut cmd = tokio::process::Command::new(executable);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // Drop-safety for the local child handle, IN ADDITION TO the lease
+    // terminate + empty barrier (never the sole authority).
+    cmd.kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+    };
+
+    // Write stdin.
+    if let Some(mut child_stdin) = child.stdin.take() {
+        if child_stdin.write_all(stdin.as_bytes()).await.is_err() {
+            let _ = child.kill().await;
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+        drop(child_stdin);
+    }
+
+    // Take stdout before spawning the wait future (avoids double mutable
+    // borrow of `child`).
+    let mut child_stdout = child.stdout.take();
+
+    // Read stdout with independent cap.
+    let stdout_fut = async {
+        if let Some(mut out) = child_stdout.take() {
+            let mut temp = vec![0u8; OUTPUT_CAP_BYTES + 1];
+            let mut total = Vec::new();
+            loop {
+                let n = match out.read(&mut temp).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                total.extend_from_slice(&temp[..n]);
+                if total.len() >= OUTPUT_CAP_BYTES {
+                    total.truncate(OUTPUT_CAP_BYTES);
+                    break;
+                }
+            }
+            Some(total)
+        } else {
+            None
+        }
+    };
+
+    let wait_fut = async {
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(_)) => {
+                let _ = child.kill().await;
+                None
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                None
+            }
+        }
+    };
+
+    let (stdout_result, exit_code) = tokio::join!(stdout_fut, wait_fut);
+
+    let stdout_bytes = stdout_result.unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let timed_out = exit_code.is_none();
+    ChildRunOutcome {
+        stdout,
+        exit_code,
+        spawn_failed: false,
+        timed_out,
+    }
+}
+
+/// Production command runner using tokio::process under a containment lease.
 #[derive(Clone)]
 pub struct TokioCommandRunner {
-    #[allow(dead_code)]
-    process_env: std::sync::Arc<dyn ProcessEnv>,
+    /// The daemon's process-containment handle. Production always attaches it;
+    /// when absent (some unit tests) every spawn fails open as
+    /// [`REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED`].
+    containment: Option<ProcessContainmentHandle>,
 }
 
 impl TokioCommandRunner {
+    /// Construct a runner with no containment handle. Every hook spawn fails
+    /// open as unsupported; only for unit tests that do not exercise the spawn
+    /// path. Production must use [`TokioCommandRunner::with_optional_containment`].
     pub fn new() -> Self {
+        Self { containment: None }
+    }
+
+    /// Construct a runner from a session's optional containment handle. When the
+    /// handle is present (production daemon) hooks run under a proven lease; when
+    /// absent (isolated/non-daemon sessions) hooks fail open as unsupported. This
+    /// is the single constructor every production hook-spawn site uses so none
+    /// can accidentally spawn without going through the containment path.
+    pub fn with_optional_containment(handle: Option<ProcessContainmentHandle>) -> Self {
         Self {
-            process_env: std::sync::Arc::new(DefaultProcessEnv),
+            containment: handle,
         }
     }
 }
@@ -690,103 +1055,44 @@ impl CommandRunner for TokioCommandRunner {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        session_id: Uuid,
     ) -> HookRawOutput {
-        let start = std::time::Instant::now();
-        let mut cmd = tokio::process::Command::new(executable);
-        cmd.args(args);
-        cmd.current_dir(cwd);
-        cmd.env_clear();
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                return HookRawOutput {
-                    stdout: String::new(),
-                    exit_code: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    spawn_failed: true,
-                    timeout: false,
-                };
-            }
+        let start = Instant::now();
+        // Production never spawns a hook without a containment handle. A missing
+        // handle is fail-open unsupported, not a raw spawn.
+        let Some(handle) = self.containment.clone() else {
+            return HookRawOutput::containment_failure(
+                REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+                start,
+            );
         };
-
-        // Write stdin.
-        if let Some(mut child_stdin) = child.stdin.take() {
-            if child_stdin.write_all(stdin.as_bytes()).await.is_err() {
-                let _ = child.kill().await;
-                return HookRawOutput {
-                    stdout: String::new(),
-                    exit_code: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    spawn_failed: true,
-                    timeout: false,
-                };
-            }
-            drop(child_stdin);
-        }
-
-        // Take stdout before spawning the wait future (avoids double
-        // mutable borrow of `child`).
-        let mut child_stdout = child.stdout.take();
-
-        // Read stdout with independent cap.
-        let stdout_fut = async {
-            if let Some(mut out) = child_stdout.take() {
-                let mut temp = vec![0u8; OUTPUT_CAP_BYTES + 1];
-                let mut total = Vec::new();
-                loop {
-                    let n = match out.read(&mut temp).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    total.extend_from_slice(&temp[..n]);
-                    if total.len() >= OUTPUT_CAP_BYTES {
-                        total.truncate(OUTPUT_CAP_BYTES);
-                        break;
-                    }
-                }
-                Some(total)
-            } else {
-                None
-            }
-        };
-
-        let wait_fut = async {
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(status)) => status.code(),
-                Ok(Err(_)) => {
-                    let _ = child.kill().await;
-                    None
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    None
-                }
-            }
-        };
-
-        let (stdout_result, exit_code) = tokio::join!(stdout_fut, wait_fut);
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let stdout_bytes = stdout_result.unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-
-        let timed_out = exit_code.is_none();
-        HookRawOutput {
-            stdout,
-            exit_code,
-            duration_ms,
-            spawn_failed: false,
-            timeout: timed_out,
-        }
+        // Clones for the injected spawner (the child spawn borrows nothing from
+        // the orchestration's owned copies).
+        let program = executable.to_path_buf();
+        let args_owned = args.to_vec();
+        let cwd_owned = cwd.to_path_buf();
+        let env_owned = env.clone();
+        let stdin_owned = stdin.to_string();
+        run_hook_child_contained(
+            &handle,
+            session_id,
+            program.clone(),
+            args_owned.clone(),
+            cwd_owned.clone(),
+            start,
+            move |_lease| async move {
+                spawn_real_hook_child(
+                    &program,
+                    &args_owned,
+                    &env_owned,
+                    &cwd_owned,
+                    &stdin_owned,
+                    timeout,
+                )
+                .await
+            },
+        )
+        .await
     }
 }
 
@@ -1024,10 +1330,15 @@ pub(crate) async fn run_pre_tool_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
+            HookDecision::Failed {
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
             HookDecision::Failed {
                 reason: "spawn failed".to_string(),
             }
@@ -1169,10 +1480,15 @@ pub(crate) async fn run_post_tool_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
+            HookDecision::Failed {
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
             HookDecision::Failed {
                 reason: "spawn failed".to_string(),
             }
@@ -1452,10 +1768,15 @@ pub(crate) async fn run_stop_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
+            HookDecision::Failed {
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
             HookDecision::Failed {
                 reason: "spawn failed".to_string(),
             }
@@ -1628,10 +1949,15 @@ pub(crate) async fn run_observe_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
+            HookDecision::Failed {
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
             HookDecision::Failed {
                 reason: "spawn failed".to_string(),
             }

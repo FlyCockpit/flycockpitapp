@@ -60,6 +60,20 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             | crate::daemon::DaemonStatus::LivePidSocketUnreachable
             | crate::daemon::DaemonStatus::UnverifiedPid
     );
+    // In offline mode with no running daemon, use the in-process diagnostic
+    // worker directly. Starting an ephemeral daemon would trigger the
+    // literal-header→`$secret:` migration during boot, rewriting provider
+    // config files before the credential check can report the original state.
+    if args.offline && ephemeral_boot_attempted {
+        let worker = diagnostic_snapshot_worker(&args, no_sandbox)
+            .await
+            .map_err(|error| {
+                DoctorCouldNotRun(anyhow::anyhow!(
+                    "diagnostic snapshot worker failed: {error:#}"
+                ))
+            })?;
+        return finish_snapshot(worker.rendered, worker.has_failures);
+    }
     let daemon = match probe_or_spawn(LifecycleMode::AttachOrEphemeral).await {
         Ok(daemon) => daemon,
         Err(daemon_error) if ephemeral_boot_attempted => {

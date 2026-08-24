@@ -77,6 +77,10 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
             // Inherit the parent's command-secret cache so the scheduled loop
             // fork's store funnel injects resolved command outputs.
             s.set_command_secret_cache(ctx.session.command_secret_cache());
+            // Inherit the parent's descendant containment handle so the scheduled
+            // loop fork's lifecycle hooks run under a proven lease instead of
+            // failing open as unsupported.
+            s.set_process_containment(ctx.session.process_containment());
             Arc::new(s)
         }
         Err(e) => {

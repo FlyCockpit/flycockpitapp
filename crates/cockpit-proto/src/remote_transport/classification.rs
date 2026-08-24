@@ -2522,6 +2522,7 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
 pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Request, "attach"),
     (RemoteMessageKind::Request, "send_user_message"),
+    (RemoteMessageKind::Request, "send_user_message_bulk"),
     (RemoteMessageKind::Request, "steer_delegation"),
     (RemoteMessageKind::Request, "upload_attachment_chunk"),
     (RemoteMessageKind::Request, "set_project_note_content"),
@@ -2744,7 +2745,7 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 220);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 221);
         assert_eq!(RESPONSE_CLASSIFICATION.len(), 145);
         assert_eq!(EVENT_CLASSIFICATION.len(), 83);
     }
@@ -2801,7 +2802,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 74);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 75);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

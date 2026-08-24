@@ -80,11 +80,17 @@ impl<'a> DiagnosticDb<'a> {
     }
 }
 
+/// Optional closure that resolves a `$secret:<name>` reference to its plaintext
+/// value. The daemon supplies a vault-backed lookup; offline/in-process paths
+/// pass `None`.
+pub type SecretLookup<'a> = Option<&'a dyn Fn(&str) -> Option<String>>;
+
 pub async fn cli_snapshot(
     path: Option<&Path>,
     no_sandbox: bool,
     offline: bool,
     db: Option<&crate::db::Db>,
+    secret_lookup: SecretLookup<'_>,
 ) -> Result<DiagnosticsSnapshot> {
     #[cfg(feature = "test-support")]
     if std::env::var_os("COCKPIT_TEST_DOCTOR_FORCE_FAILURE").is_some() {
@@ -123,6 +129,7 @@ pub async fn cli_snapshot(
             sandbox_enabled: Some(!no_sandbox),
         },
         db_source.handle(),
+        secret_lookup,
     )?;
     snapshot.dependencies = tokio::task::spawn_blocking(move || {
         dependency_projection_with_deadline_for_run(
@@ -154,7 +161,7 @@ pub fn tui_snapshot(input: DiagnosticsInput) -> Result<DiagnosticsSnapshot> {
     let cwd = input.cwd.clone();
     let sandbox_enabled = input.sandbox_enabled.unwrap_or(true);
     // The TUI is a daemon client and never opens the DB itself.
-    let mut snapshot = build_snapshot(input, None)?;
+    let mut snapshot = build_snapshot(input, None, None)?;
     snapshot.dependencies =
         dependency_projection_with_deadline_for_run(cwd, Duration::from_secs(2), sandbox_enabled)?;
     snapshot.has_failures |= snapshot.dependencies.has_required_failures();
@@ -211,6 +218,7 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
 fn build_snapshot(
     input: DiagnosticsInput,
     db: Option<&crate::db::Db>,
+    secret_lookup: SecretLookup<'_>,
 ) -> Result<DiagnosticsSnapshot> {
     let trust_root = crate::config::trust::resolve_trust_root(&input.cwd).ok();
     let providers = crate::config::providers::ConfigDoc::load_effective(&input.cwd);
@@ -225,7 +233,8 @@ fn build_snapshot(
         .unwrap_or("none");
 
     let delegation_enabled = delegation_enabled_for_coverage(&providers, &extended, &input);
-    let (providers, provider_failures) = provider_lines(&providers, &extended, delegation_enabled);
+    let (providers, provider_failures) =
+        provider_lines(&providers, &extended, delegation_enabled, secret_lookup);
     let (external_journal, external_journal_failed) = external_journal_lines(db);
 
     let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
@@ -668,6 +677,7 @@ fn provider_lines(
     cfg: &crate::config::providers::ProvidersConfig,
     extended: &crate::config::extended::ExtendedConfig,
     delegation_enabled: bool,
+    secret_lookup: SecretLookup<'_>,
 ) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut failed = false;
@@ -782,7 +792,7 @@ fn provider_lines(
             "{id}: {model_count} model(s), fetch {fetch}, {}",
             notes.join(", ")
         ));
-        let (credential, credential_failed) = credential_line(id, provider);
+        let (credential, credential_failed) = credential_line(id, provider, secret_lookup);
         failed |= credential_failed;
         out.push(credential);
     }
@@ -826,12 +836,13 @@ fn delegation_enabled_for_coverage(
 fn credential_line(
     provider_id: &str,
     provider: &crate::config::providers::ProviderEntry,
+    secret_lookup: SecretLookup<'_>,
 ) -> (String, bool) {
     credential_line_with_sources(
         provider_id,
         provider,
         |name| std::env::var(name).ok(),
-        |_| None,
+        |name| secret_lookup.and_then(|lookup| lookup(name)),
         |_| false,
     )
 }
@@ -1554,7 +1565,7 @@ mod tests {
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
         crate::config::trust::with_workspace_trust_policy(policy, || {
-            build_snapshot(input, None).unwrap()
+            build_snapshot(input, None, None).unwrap()
         })
     }
 
@@ -1607,7 +1618,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = build_snapshot(base_input(tmp.path()), None).unwrap();
+        let snapshot = build_snapshot(base_input(tmp.path()), None, None).unwrap();
 
         assert!(snapshot.workspace_trust.contains("unresolved"));
         assert!(
@@ -1774,6 +1785,7 @@ mod tests {
             &cfg,
             &crate::config::extended::ExtendedConfig::default(),
             true,
+            None,
         );
         let rendered = lines.join("\n");
         assert!(failed, "{rendered}");
@@ -1794,6 +1806,7 @@ mod tests {
             &cfg,
             &crate::config::extended::ExtendedConfig::default(),
             false,
+            None,
         );
         let rendered = lines.join("\n");
         assert!(!failed, "{rendered}");
@@ -1815,6 +1828,7 @@ mod tests {
             &cfg,
             &crate::config::extended::ExtendedConfig::default(),
             true,
+            None,
         );
         let rendered = lines.join("\n");
         assert!(!failed, "{rendered}");
@@ -1845,6 +1859,7 @@ mod tests {
             &cfg,
             &crate::config::extended::ExtendedConfig::default(),
             true,
+            None,
         );
         let rendered = lines.join("\n");
         assert!(
@@ -2155,6 +2170,7 @@ mod tests {
             &cfg,
             &crate::config::extended::ExtendedConfig::default(),
             false,
+            None,
         );
         assert!(!failed);
     }

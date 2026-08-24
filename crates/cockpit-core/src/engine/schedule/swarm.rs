@@ -511,7 +511,9 @@ async fn swarm_child_stop_continuation(
     }
     let snapshot = pinned.snapshot();
     let outcome = crate::engine::agent::hooks::run_stop_hooks(
-        &crate::engine::agent::hooks::TokioCommandRunner::new(),
+        &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+            ctx.session.process_containment(),
+        ),
         &crate::engine::agent::hooks::DefaultProcessEnv,
         snapshot.hooks(),
         crate::config::extended::hooks::HookEvent::SubagentStop,

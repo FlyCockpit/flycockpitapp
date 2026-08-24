@@ -52,7 +52,7 @@
   ],
   "counts": {
     "event": 83,
-    "request": 220,
+    "request": 221,
     "response": 145
   },
   "messages": {
@@ -574,6 +574,12 @@
         "inlinePayloadBound": "truncated_by_cap",
         "lane": "interactive",
         "tag": "send_user_message"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bulk_reference",
+        "lane": "interactive",
+        "tag": "send_user_message_bulk"
       },
       {
         "class": "bounded_request_response",
@@ -2759,6 +2765,10 @@
     {
       "kind": "request",
       "tag": "send_user_message"
+    },
+    {
+      "kind": "request",
+      "tag": "send_user_message_bulk"
     },
     {
       "kind": "request",

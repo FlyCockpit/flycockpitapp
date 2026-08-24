@@ -194,13 +194,21 @@ fn config_layer_request(
         .ok_or_else(|| "settings request has no workspace root".to_string())
 }
 
+fn settings_snapshot_session_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
     let project_root = config_layer_request(path, project_root)?;
     let requested_path = path.display().to_string();
-    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    })? {
         Response::ExtendedConfigSnapshot {
             layers,
             config_generation,
@@ -269,6 +277,7 @@ fn apply_settings_patch_via_daemon(
     let desired_value = serde_json::to_value(desired).map_err(|error| error.to_string())?;
     let operations = changed_extended_paths(base, &desired_value)?;
     let denylist = denylist_mutations(base, &desired.redact.denylist)?;
+    let denylist_receipt_plan = denylist.clone();
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: false,
@@ -298,8 +307,9 @@ fn apply_settings_patch_via_daemon(
         layer_id: layer_id.clone(),
         patch,
         expected_revision: expected_revision.clone(),
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
     });
-    let (result_revision, result_generation) = match response {
+    let (result_revision, result_generation, committed_denylist) = match response {
         Ok(Response::ExtendedConfigSaved {
             hash,
             config_generation,
@@ -309,22 +319,27 @@ fn apply_settings_patch_via_daemon(
             result_revision,
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
+            denylist: committed_denylist,
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == expected_revision
             && hash == result_revision
+            && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
             && (config_generation == expected_generation
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             if publication == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded {
                 return Err("settings committed but redaction publication is degraded; restart the daemon before continuing".into());
             }
-            (result_revision, config_generation)
+            (result_revision, config_generation, committed_denylist)
         }
         Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
         Err(error) => Err(error.to_string()),
     }?;
-    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    })? {
         Response::ExtendedConfigSnapshot {
             layers,
             config_generation,
@@ -333,6 +348,7 @@ fn apply_settings_patch_via_daemon(
                 layer.display_path == requested_path
                     && layer.kind == expected_layer
                     && layer.revision == result_revision
+                    && same_denylist_fingerprints(&layer.denylist, &committed_denylist)
                     && validate_settings_operations(
                         &operations,
                         &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
@@ -354,12 +370,16 @@ pub(super) fn apply_typed_settings_document_edit(
 ) -> Result<(), String> {
     let (_, mut document, revision) = extended_config_layer_snapshot(path, project_root)?;
     let authority_base = document.clone();
-    let operations = operations_from_merge_patch(&patch)?;
     apply_json_merge_patch_local(&mut document, patch);
     let desired: ExtendedConfig = serde_json::from_value(document)
         .map_err(|error| format!("invalid typed settings edit: {error}"))?;
-    let _desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+    let desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+    // Derive authority operations from the actual RFC 7396 result. In
+    // particular an empty object is a no-op when the authored value is
+    // already an object; it is never serialized as a destructive Set({}).
+    let operations = changed_extended_paths(&authority_base, &desired_value)?;
     let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
+    let denylist_receipt_plan = denylist.clone();
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: true,
@@ -389,8 +409,9 @@ pub(super) fn apply_typed_settings_document_edit(
         layer_id: layer_id.clone(),
         patch,
         expected_revision: revision.clone(),
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
     });
-    let (result_revision, result_generation) = match response {
+    let (result_revision, result_generation, committed_denylist) = match response {
         Ok(Response::ExtendedConfigSaved {
             hash,
             config_generation,
@@ -400,22 +421,27 @@ pub(super) fn apply_typed_settings_document_edit(
             result_revision,
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
+            denylist: committed_denylist,
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == revision
             && hash == result_revision
+            && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
             && (config_generation == expected_generation
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             if publication == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded {
                 return Err("settings committed but redaction publication is degraded; restart the daemon before continuing".into());
             }
-            (result_revision, config_generation)
+            (result_revision, config_generation, committed_denylist)
         }
         Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
         Err(error) => Err(error.to_string()),
     }?;
-    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    })? {
         Response::ExtendedConfigSnapshot {
             layers,
             config_generation,
@@ -424,6 +450,7 @@ pub(super) fn apply_typed_settings_document_edit(
                 layer.display_path == requested_path
                     && layer.kind == expected_layer
                     && layer.revision == result_revision
+                    && same_denylist_fingerprints(&layer.denylist, &committed_denylist)
                     && validate_settings_operations(
                         &operations,
                         &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
@@ -523,43 +550,6 @@ fn changed_extended_paths(
     Ok(operations)
 }
 
-fn operations_from_merge_patch(
-    patch: &serde_json::Value,
-) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
-    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
-    fn visit(value: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<M>) {
-        match value {
-            serde_json::Value::Null => out.push(M::Unset { path: path.clone() }),
-            serde_json::Value::Object(object) if !object.is_empty() => {
-                for (key, value) in object {
-                    path.push(key.clone());
-                    visit(value, path, out);
-                    path.pop();
-                }
-            }
-            value => out.push(M::Set {
-                path: path.clone(),
-                value: value.clone(),
-            }),
-        }
-    }
-    let object = patch
-        .as_object()
-        .ok_or_else(|| "typed settings patch root must be an object".to_string())?;
-    let mut operations = Vec::new();
-    for (key, value) in object {
-        let Some(field) = ExtendedConfigField::from_json_key(key) else {
-            return Err(format!("settings patch path `{key}` is not typed"));
-        };
-        if field == ExtendedConfigField::ImageGeneration {
-            return Err("image generation settings require their dedicated API".into());
-        }
-        let mut path = vec![key.clone()];
-        visit(value, &mut path, &mut operations);
-    }
-    Ok(operations)
-}
-
 fn validate_settings_operations(
     operations: &[cockpit_core::daemon::proto::ExtendedConfigPathMutation],
     snapshot: &serde_json::Value,
@@ -617,8 +607,8 @@ fn validate_settings_operations(
 fn denylist_mutations(
     base: &serde_json::Value,
     desired: &[String],
-) -> Result<Vec<cockpit_core::daemon::proto::DenylistMutation>, String> {
-    use cockpit_core::daemon::proto::{DenylistMutation as M, RedactedDenylistEntry};
+) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
+    use cockpit_core::daemon::proto::{DesiredDenylistEntry as D, RedactedDenylistEntry};
     let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
         base.get("__cockpit_denylist_entries")
             .cloned()
@@ -626,58 +616,63 @@ fn denylist_mutations(
     )
     .map_err(|error| error.to_string())?;
     let mut used = std::collections::HashSet::new();
-    let mut target: Vec<(String, Option<String>)> = Vec::new();
-    for (index, value) in desired.iter().enumerate() {
+    let mut target = Vec::new();
+    for value in desired {
         if let Some(entry) = entries
             .iter()
             .find(|entry| entry.display_mask == *value && !used.contains(&entry.entry_id))
         {
             used.insert(entry.entry_id.clone());
-            target.push((entry.entry_id.clone(), None));
-        } else if let Some(entry) = entries
-            .get(index)
-            .filter(|entry| !used.contains(&entry.entry_id))
-        {
-            used.insert(entry.entry_id.clone());
-            target.push((entry.entry_id.clone(), Some(value.clone())));
-        } else {
-            target.push((format!("new:{index}"), Some(value.clone())));
-        }
-    }
-    let mut operations = Vec::new();
-    let mut after_id: Option<String> = None;
-    for (id, replacement) in &target {
-        if id.starts_with("new:") {
-            let value = replacement.clone().expect("new entry has value");
-            operations.push(M::Add {
-                value: value.clone(),
-                after_id: after_id.clone(),
-            });
-            // The server's opaque ID is intentionally not reproducible by the
-            // client, so later additions remain head inserts in reverse order.
-            after_id = None;
-        } else {
-            operations.push(M::Move {
-                entry_id: id.clone(),
-                after_id: after_id.clone(),
-            });
-            if let Some(value) = replacement {
-                operations.push(M::Update {
-                    entry_id: id.clone(),
-                    value: value.clone(),
-                });
-            }
-            after_id = Some(id.clone());
-        }
-    }
-    for entry in &entries {
-        if !used.contains(&entry.entry_id) {
-            operations.push(M::Remove {
+            target.push(D::Existing {
                 entry_id: entry.entry_id.clone(),
             });
+        } else {
+            target.push(D::New {
+                value: value.clone(),
+            });
         }
     }
-    Ok(operations)
+    Ok(target)
+}
+
+fn validate_committed_denylist(
+    planned: &[cockpit_core::daemon::proto::DesiredDenylistEntry],
+    committed: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
+) -> Result<(), String> {
+    use sha2::{Digest as _, Sha256};
+    if planned.len() != committed.len() {
+        return Err("denylist receipt has the wrong length".into());
+    }
+    for (planned, committed) in planned.iter().zip(committed) {
+        match planned {
+            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+                if entry_id == &committed.entry_id => {}
+            cockpit_core::daemon::proto::DesiredDenylistEntry::New { value } => {
+                let mut digest = Sha256::new();
+                digest.update(b"cockpit-redacted-denylist-entry-v1\0");
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+                if committed.fingerprint != format!("{:x}", digest.finalize()) {
+                    return Err("denylist receipt fingerprint differs from intended literal".into());
+                }
+            }
+            _ => {
+                return Err("denylist receipt reordered or replaced an existing occurrence".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_denylist_fingerprints(
+    authoritative: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
+    receipt: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
+) -> bool {
+    authoritative.len() == receipt.len()
+        && authoritative
+            .iter()
+            .zip(receipt)
+            .all(|(left, right)| left.fingerprint == right.fingerprint)
 }
 
 /// Search the complete metadata-only secret inventory.  Inventory pages are

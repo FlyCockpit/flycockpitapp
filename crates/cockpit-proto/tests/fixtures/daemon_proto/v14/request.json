@@ -1832,7 +1832,8 @@
   },
   "get_extended_config_snapshot": {
     "params": {
-      "project_root": "/tmp/project"
+      "project_root": "/tmp/project",
+      "snapshot_session_id": "22222222-2222-4222-8222-222222222222"
     },
     "request": "get_extended_config_snapshot"
   },
@@ -1849,9 +1850,11 @@
           }
         ],
         "materialize": false,
-        "denylist": []
+        "denylist": [],
+        "redacted_mutations": []
       },
-      "expected_revision": "revision"
+      "expected_revision": "revision",
+      "snapshot_session_id": "22222222-2222-4222-8222-222222222222"
     },
     "request": "apply_extended_config_patch"
   },

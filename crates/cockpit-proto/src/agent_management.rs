@@ -8,6 +8,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 pub const MAX_AGENT_NAME_BYTES: usize = 128;
 pub const MAX_AGENT_MARKDOWN_BYTES: usize = 256 * 1024;
 
@@ -53,6 +61,9 @@ pub struct AgentInventoryEntry {
     /// Exact revision of the effective source and workspace target state.
     pub revision: String,
     pub editable: bool,
+    /// Digest of the exact redacted presentation fields in this response.
+    /// `revision` remains an opaque authority CAS token.
+    pub projection_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +86,8 @@ pub struct AgentEditSnapshot {
     pub goal_supervision_json: Option<String>,
     pub editable: bool,
     pub supports_goal_supervision: bool,
+    /// Digest of the exact redacted presentation fields in this response.
+    pub projection_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,17 +132,19 @@ pub struct GoalSupervisionPatch {
 pub struct AgentMutationResult {
     pub changed: bool,
     pub affected: u32,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub snapshot: Option<AgentEditSnapshot>,
     pub config_generation: u64,
     /// Present for inventory-wide mutations such as reset-all and bound to the
     /// post-commit inventory returned by a subsequent refresh.
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub inventory_revision: Option<String>,
     /// Exact document or inventory revision consumed by the daemon. Creation
     /// is the only mutation that legitimately has no prior revision.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub consumed_revision: Option<String>,
     /// Present only on the completion response for this exact editor lease.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub completed_lease_id: Option<String>,
 }
 
@@ -260,16 +275,10 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
     {
         return Err("agent snapshot identity is missing");
     }
-    let content_hash = format!("{:x}", Sha256::digest(snapshot.markdown.as_bytes()));
-    let expected = agent_definition_revision(
-        &snapshot.name,
-        snapshot.source_layer,
-        &snapshot.source_identity,
-        &content_hash,
-        snapshot.source_layer == AgentSourceLayer::Workspace,
-    );
-    if snapshot.revision != expected {
-        return Err("agent snapshot revision is invalid");
+    if snapshot.revision.is_empty()
+        || snapshot.projection_digest != agent_edit_projection_digest(snapshot)
+    {
+        return Err("agent snapshot projection digest is invalid");
     }
     if snapshot.overridden != (snapshot.source_layer != AgentSourceLayer::Embedded)
         || snapshot.editable != (snapshot.source_layer == AgentSourceLayer::Workspace)
@@ -277,6 +286,65 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
         return Err("agent snapshot ownership flags are incoherent");
     }
     Ok(())
+}
+
+pub fn agent_inventory_entry_projection_digest(entry: &AgentInventoryEntry) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-agent-inventory-projection-v1\0");
+    for value in [
+        Some(entry.name.as_str()),
+        entry.description.as_deref(),
+        entry.model.as_deref(),
+        entry.diagnostic.as_deref(),
+        Some(entry.source_identity.as_str()),
+        Some(entry.revision.as_str()),
+    ] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest_field(&mut digest, value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    digest.update([
+        entry.kind as u8,
+        u8::from(entry.overridden),
+        u8::from(entry.valid),
+        entry.source_layer as u8,
+        u8::from(entry.editable),
+    ]);
+    format!("{:x}", digest.finalize())
+}
+
+pub fn agent_edit_projection_digest(snapshot: &AgentEditSnapshot) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-agent-edit-projection-v1\0");
+    for value in [
+        Some(snapshot.name.as_str()),
+        Some(snapshot.markdown.as_str()),
+        Some(snapshot.canonical_preview.as_str()),
+        Some(snapshot.source_identity.as_str()),
+        Some(snapshot.revision.as_str()),
+        snapshot.goal_supervision_json.as_deref(),
+    ] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest_field(&mut digest, value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    digest.update([
+        snapshot.kind as u8,
+        u8::from(snapshot.overridden),
+        snapshot.source_layer as u8,
+        snapshot.edit_target as u8,
+        u8::from(snapshot.editable),
+        u8::from(snapshot.supports_goal_supervision),
+    ]);
+    format!("{:x}", digest.finalize())
 }
 
 pub fn validate_agent_source_identity(

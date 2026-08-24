@@ -41,11 +41,12 @@ pub use agent_installation::{
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES, agent_definition_revision,
+    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
     agent_inventory_revision, validate_agent_edit_snapshot, validate_agent_mutation_envelope,
     validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
-    CockpitConfigLayer, ConfigCommitStatus, ConfigPublicationStatus, DenylistMutation,
+    CockpitConfigLayer, ConfigCommitStatus, ConfigPublicationStatus, DesiredDenylistEntry,
     ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
     ExtendedConfigPathMutation, RedactedDenylistEntry, RedactedOccurrenceMutation,
 };
@@ -2190,6 +2191,14 @@ pub struct GoalSummary {
     pub updated_at: i64,
 }
 
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantSummary {
     pub name: String,
@@ -2203,9 +2212,15 @@ pub struct AssistantSummary {
     pub registration_revision: String,
     /// Daemon-read exact authored definition; absent when the registered file
     /// cannot be safely opened or parsed.
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_markdown: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_revision: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_diagnostic: Option<String>,
+    /// Digest over the exact already-redacted presentation returned to this
+    /// client. Authority revisions above remain opaque CAS tokens.
+    pub projection_digest: String,
 }
 
 /// Validate the self-contained invariants of a daemon assistant snapshot.
@@ -2213,32 +2228,48 @@ pub struct AssistantSummary {
 /// but every client can enforce revision/diagnostic coherence and the exact
 /// content hash without depending on `cockpit-core`.
 pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'static str> {
-    use sha2::Digest as _;
-
     if summary.name.is_empty() || summary.registration_revision.is_empty() {
         return Err("assistant summary has no name or registration revision");
-    }
-    if summary.registration_revision != assistant_registration_revision(summary) {
-        return Err("assistant registration revision is invalid");
     }
     match (
         summary.definition_markdown.as_deref(),
         summary.definition_revision.as_deref(),
         summary.definition_diagnostic.as_deref(),
     ) {
-        (Some(markdown), Some(revision), None) if !revision.is_empty() => {
-            let hash = format!("{:x}", sha2::Sha256::digest(markdown.as_bytes()));
-            if hash != summary.content_hash {
-                return Err("assistant definition does not match its content hash");
-            }
-            if revision != &assistant_definition_revision(summary, markdown) {
-                return Err("assistant definition revision is invalid");
-            }
-        }
+        (Some(_), Some(revision), None) if !revision.is_empty() => {}
         (None, None, Some(diagnostic)) if !diagnostic.trim().is_empty() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
     }
+    if summary.projection_digest != assistant_projection_digest(summary) {
+        return Err("assistant projection digest is invalid");
+    }
     Ok(())
+}
+
+pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"cockpit-assistant-projection-v1\0");
+    digest.update(summary.created_at.to_le_bytes());
+    for value in [
+        Some(summary.name.as_str()),
+        Some(summary.home_dir.as_str()),
+        Some(summary.config_json.as_str()),
+        Some(summary.content_hash.as_str()),
+        Some(summary.registration_revision.as_str()),
+        summary.definition_markdown.as_deref(),
+        summary.definition_revision.as_deref(),
+        summary.definition_diagnostic.as_deref(),
+    ] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                assistant_revision_field(&mut digest, value);
+            }
+            None => digest.update([0]),
+        }
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {

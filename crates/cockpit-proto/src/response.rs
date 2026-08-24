@@ -425,7 +425,6 @@ pub enum Response {
 
     AssistantDefinitionSaved {
         assistant: AssistantSummary,
-        #[serde(default)]
         consumed_definition_revision: String,
     },
 
@@ -568,10 +567,11 @@ pub enum Response {
         layer: crate::CockpitConfigLayer,
         consumed_revision: String,
         result_revision: String,
-        #[serde(default)]
         status: crate::ConfigCommitStatus,
-        #[serde(default)]
         publication: crate::ConfigPublicationStatus,
+        /// Exact safe post-commit order, with opaque server IDs and digests
+        /// but never denylist literals.
+        denylist: Vec<crate::RedactedDenylistEntry>,
     },
 
     /// Legacy whole-document writer receipt. Daemon-connected settings UI

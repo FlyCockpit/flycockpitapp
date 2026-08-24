@@ -28,6 +28,7 @@ const SETTINGS_CAPABILITY_OWNER_CAP: usize = 32;
 #[derive(Clone)]
 struct SettingsCapability {
     owner: String,
+    snapshot_session_id: String,
     root: PathBuf,
     target: PathBuf,
     kind: cockpit_proto::CockpitConfigLayer,
@@ -299,6 +300,7 @@ pub async fn get_extended_config_snapshot(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
     owner: String,
+    snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
     let redaction = ctx.current_global_redaction();
@@ -341,15 +343,16 @@ pub async fn get_extended_config_snapshot(
                 pending_capabilities.push((
                     id,
                     SettingsCapability {
-                            owner: owner.clone(),
-                            root: root.clone(),
-                            target: target.clone(),
-                            kind,
-                            revision: revision.clone(),
-                            identity,
-                            denylist_ids,
-                            redacted_occurrences,
-                            expires_at: now + SETTINGS_CAPABILITY_TTL,
+                        owner: owner.clone(),
+                        snapshot_session_id: snapshot_session_id.clone(),
+                        root: root.clone(),
+                        target: target.clone(),
+                        kind,
+                        revision: revision.clone(),
+                        identity,
+                        denylist_ids,
+                        redacted_occurrences,
+                        expires_at: now + SETTINGS_CAPABILITY_TTL,
                     },
                 ));
                 layers.push(cockpit_proto::ExtendedConfigLayerSnapshot {
@@ -366,19 +369,32 @@ pub async fn get_extended_config_snapshot(
                 .lock()
                 .map_err(|_| internal("settings capability registry lock poisoned"))?;
             capabilities.retain(|_, cap| cap.expires_at > now);
+            let belongs_to_replaced_group = |cap: &SettingsCapability| {
+                cap.owner == owner
+                    && cap.snapshot_session_id == snapshot_session_id
+                    && cap.root == root
+            };
             let owner_count = capabilities
                 .values()
-                .filter(|cap| cap.owner == owner)
+                .filter(|cap| cap.owner == owner && !belongs_to_replaced_group(cap))
                 .count();
             if owner_count.saturating_add(pending_capabilities.len())
                 > SETTINGS_CAPABILITY_OWNER_CAP
-                || capabilities.len().saturating_add(pending_capabilities.len())
+                || capabilities
+                    .values()
+                    .filter(|cap| !belongs_to_replaced_group(cap))
+                    .count()
+                    .saturating_add(pending_capabilities.len())
                     > SETTINGS_CAPABILITY_GLOBAL_CAP
             {
                 return Err(conflict(
                     "settings snapshot capability capacity is exhausted; wait for an existing snapshot to expire",
                 ));
             }
+            // Refresh is replacement, not accumulation. Capacity is checked
+            // before this exchange, so a rejected refresh leaves the prior
+            // group usable; a successful one is atomic under the same lock.
+            capabilities.retain(|_, cap| !belongs_to_replaced_group(cap));
             capabilities.extend(pending_capabilities);
             Ok(Response::ExtendedConfigSnapshot {
                 layers,
@@ -623,6 +639,7 @@ pub async fn apply_extended_config_patch(
     patch: cockpit_proto::ExtendedConfigPatch,
     expected_revision: String,
     owner: String,
+    snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
     let mut response = join_fs_handler(
@@ -634,15 +651,26 @@ pub async fn apply_extended_config_patch(
                 let mut caps = settings_capabilities().lock().map_err(|_| internal("settings capability registry lock poisoned"))?;
                 let now = Instant::now();
                 caps.retain(|_, cap| cap.expires_at > now);
-                caps.get(&id).cloned()
-                    .ok_or_else(|| conflict("settings snapshot is absent, expired, or stale"))?
+                let capability = caps.get(&id).cloned()
+                    .ok_or_else(|| conflict("settings snapshot is absent, expired, or stale"))?;
+                if capability.owner != owner
+                    || capability.snapshot_session_id != snapshot_session_id
+                    || capability.root != root
+                    || capability.revision != expected_revision
+                {
+                    return Err(conflict("settings snapshot is absent, expired, or stale"));
+                }
+                // One apply consumes the complete snapshot group atomically.
+                // This prevents unused sibling layer capabilities from
+                // outliving the authority view against which the patch was
+                // authored.
+                caps.retain(|_, cap| {
+                    !(cap.owner == owner
+                        && cap.snapshot_session_id == snapshot_session_id
+                        && cap.root == root)
+                });
+                capability
             };
-            if capability.owner != owner
-                || capability.root != root
-                || capability.revision != expected_revision
-            {
-                return Err(conflict("settings snapshot is absent, expired, or stale"));
-            }
             let target = capability.target.clone();
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
@@ -729,7 +757,11 @@ pub async fn apply_extended_config_patch(
                 patch.redacted_mutations,
                 &capability.redacted_occurrences,
             )?;
-            apply_denylist_mutations(object, patch.denylist, &capability.denylist_ids)?;
+            let denylist_values = apply_denylist_sequence(
+                object,
+                patch.denylist,
+                &capability.denylist_ids,
+            )?;
             let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;
             let merged = cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
                 &patched,
@@ -778,9 +810,6 @@ pub async fn apply_extended_config_patch(
             } else {
                 crate::daemon::server::inventory::current_config_generation()
             };
-            settings_capabilities()
-                .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
-                .remove(&id);
             Ok(Response::ExtendedConfigSaved {
                 hash: desired_hash.clone(),
                 config_generation,
@@ -790,6 +819,10 @@ pub async fn apply_extended_config_patch(
                 result_revision: desired_hash,
                 status: cockpit_proto::ConfigCommitStatus::Committed,
                 publication: cockpit_proto::ConfigPublicationStatus::Published,
+                denylist: denylist_values
+                    .iter()
+                    .map(|(id, value)| redacted_denylist_entry(id, value))
+                    .collect(),
             })
         }),
     )
@@ -885,18 +918,22 @@ fn read_optional_config(
 }
 
 fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-redacted-denylist-entry-v1\0");
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value.as_bytes());
     cockpit_proto::RedactedDenylistEntry {
         entry_id: id.to_owned(),
-        fingerprint: id.chars().take(8).collect(),
+        fingerprint: format!("{:x}", digest.finalize()),
         display_mask: format!("•••• ({} bytes)", value.len()),
     }
 }
 
-fn apply_denylist_mutations(
+fn apply_denylist_sequence(
     document: &mut serde_json::Map<String, serde_json::Value>,
-    mutations: Vec<cockpit_proto::DenylistMutation>,
+    desired: Vec<cockpit_proto::DesiredDenylistEntry>,
     occurrence_ids: &[String],
-) -> Result<(), ErrorPayload> {
+) -> Result<Vec<(String, String)>, ErrorPayload> {
     let redact = document
         .entry("redact")
         .or_insert_with(|| serde_json::json!({}))
@@ -907,7 +944,7 @@ fn apply_denylist_mutations(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .ok_or_else(|| bad_request("redact.denylist must be an array"))?;
-    let mut values: Vec<(String, String)> = values
+    let values: Vec<(String, String)> = values
         .iter()
         .zip(occurrence_ids)
         .map(|(value, id)| {
@@ -917,60 +954,43 @@ fn apply_denylist_mutations(
                 .ok_or_else(|| bad_request("redact.denylist entries must be strings"))
         })
         .collect::<Result<_, _>>()?;
-    let locate = |values: &[(String, String)], id: &str| {
-        values.iter().position(|(entry_id, _)| entry_id == id)
-    };
-    for mutation in mutations {
-        match mutation {
-            cockpit_proto::DenylistMutation::Add { value, after_id } => {
+    if values.len() != occurrence_ids.len() {
+        return Err(conflict("denylist occurrences changed since snapshot"));
+    }
+    let by_id = values
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut used = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(desired.len());
+    for entry in desired {
+        match entry {
+            cockpit_proto::DesiredDenylistEntry::Existing { entry_id } => {
+                if !used.insert(entry_id.clone()) {
+                    return Err(bad_request("a denylist occurrence may appear exactly once"));
+                }
+                let value = by_id
+                    .get(&entry_id)
+                    .cloned()
+                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
+                result.push((entry_id, value));
+            }
+            cockpit_proto::DesiredDenylistEntry::New { value } => {
                 validate_new_denylist_literal(&value)?;
-                let index = match after_id {
-                    Some(id) => {
-                        locate(&values, &id)
-                            .ok_or_else(|| conflict("denylist entry changed since snapshot"))?
-                            + 1
-                    }
-                    None => 0,
-                };
-                values.insert(index, (Uuid::new_v4().to_string(), value));
-            }
-            cockpit_proto::DenylistMutation::Update { entry_id, value } => {
-                validate_new_denylist_literal(&value)?;
-                let index = locate(&values, &entry_id)
-                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
-                values[index].1 = value;
-            }
-            cockpit_proto::DenylistMutation::Remove { entry_id } => {
-                let index = locate(&values, &entry_id)
-                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
-                values.remove(index);
-            }
-            cockpit_proto::DenylistMutation::Move { entry_id, after_id } => {
-                let index = locate(&values, &entry_id)
-                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
-                let value = values.remove(index);
-                let target = match after_id {
-                    Some(id) => {
-                        locate(&values, &id)
-                            .ok_or_else(|| conflict("denylist entry changed since snapshot"))?
-                            + 1
-                    }
-                    None => 0,
-                };
-                values.insert(target, value);
+                result.push((Uuid::new_v4().to_string(), value));
             }
         }
     }
     redact.insert(
         "denylist".into(),
         serde_json::Value::Array(
-            values
-                .into_iter()
-                .map(|(_, value)| serde_json::Value::String(value))
+            result
+                .iter()
+                .map(|(_, value)| serde_json::Value::String(value.clone()))
                 .collect(),
         ),
     );
-    Ok(())
+    Ok(result)
 }
 
 fn apply_redacted_occurrence_mutations(

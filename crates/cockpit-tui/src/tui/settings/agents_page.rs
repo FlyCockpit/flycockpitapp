@@ -548,6 +548,8 @@ fn valid_agent_inventory(
                 && (!entry.overridden || builtin)
                 && is_lower_hex_digest(&entry.source_identity)
                 && is_lower_hex_digest(&entry.revision)
+                && entry.projection_digest
+                    == cockpit_proto::agent_inventory_entry_projection_digest(entry)
                 && if entry.valid {
                     entry.diagnostic.is_none() && entry.description.is_some()
                 } else {

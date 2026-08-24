@@ -17,23 +17,11 @@ pub enum ConfigCommitStatus {
     Committed,
 }
 
-impl Default for ConfigCommitStatus {
-    fn default() -> Self {
-        Self::Committed
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigPublicationStatus {
     Published,
     Degraded,
-}
-
-impl Default for ConfigPublicationStatus {
-    fn default() -> Self {
-        Self::Published
-    }
 }
 
 /// A daemon-discovered settings layer. `layer_id` is an ephemeral,
@@ -51,7 +39,6 @@ pub struct ExtendedConfigLayerSnapshot {
     /// Exact typed paths authored by this layer. Values remain redacted; this
     /// list lets a client prove that an Unset removed authorship rather than
     /// merely observing the same effective default.
-    #[serde(default)]
     pub authored_paths: Vec<Vec<String>>,
 }
 
@@ -85,16 +72,15 @@ impl ExtendedConfigPathMutation {
 /// each requested path is represented by that typed projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfigPatch {
-    #[serde(default)]
     pub operations: Vec<ExtendedConfigPathMutation>,
     /// Create the selected layer even when typed values are unchanged.
-    #[serde(default)]
     pub materialize: bool,
-    #[serde(default)]
-    pub denylist: Vec<DenylistMutation>,
+    /// Complete desired denylist sequence. Existing occurrences can only be
+    /// named by the opaque capability-bound ID returned in this snapshot;
+    /// new literals never receive a client-selected identity.
+    pub denylist: Vec<DesiredDenylistEntry>,
     /// Explicit authorization to replace/remove one redacted occurrence.
     /// Merely selecting its top-level field never grants this authority.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redacted_mutations: Vec<RedactedOccurrenceMutation>,
 }
 
@@ -316,23 +302,10 @@ impl ExtendedConfigField {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-pub enum DenylistMutation {
-    Add {
-        value: String,
-        after_id: Option<String>,
-    },
-    Update {
-        entry_id: String,
-        value: String,
-    },
-    Remove {
-        entry_id: String,
-    },
-    Move {
-        entry_id: String,
-        after_id: Option<String>,
-    },
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum DesiredDenylistEntry {
+    Existing { entry_id: String },
+    New { value: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

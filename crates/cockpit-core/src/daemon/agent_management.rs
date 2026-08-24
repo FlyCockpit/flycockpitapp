@@ -308,6 +308,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 source_identity,
                 revision,
                 editable: source_layer == AgentSourceLayer::Workspace && !markdown.is_empty(),
+                projection_digest: String::new(),
             })
         })
         .collect()
@@ -348,6 +349,7 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         goal_supervision_json,
         editable: source_layer == AgentSourceLayer::Workspace,
         supports_goal_supervision: def.vnext.is_none(),
+        projection_digest: String::new(),
     })
 }
 

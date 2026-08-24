@@ -5092,11 +5092,15 @@ async fn handle_serialized_request_impl(
             .await
         }
 
-        Request::GetExtendedConfigSnapshot { project_root } => {
+        Request::GetExtendedConfigSnapshot {
+            project_root,
+            snapshot_session_id,
+        } => {
             crate::daemon::fs_api::get_extended_config_snapshot(
                 ctx,
                 project_root,
                 settings_capability_owner(state),
+                snapshot_session_id,
             )
             .await
         }
@@ -5106,6 +5110,7 @@ async fn handle_serialized_request_impl(
             layer_id,
             patch,
             expected_revision,
+            snapshot_session_id,
         } => {
             crate::daemon::fs_api::apply_extended_config_patch(
                 ctx,
@@ -5114,6 +5119,7 @@ async fn handle_serialized_request_impl(
                 patch,
                 expected_revision,
                 settings_capability_owner(state),
+                snapshot_session_id,
             )
             .await
         }
@@ -9865,11 +9871,15 @@ async fn handle_concurrent_request_impl(
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
-        Request::GetExtendedConfigSnapshot { project_root } => {
+        Request::GetExtendedConfigSnapshot {
+            project_root,
+            snapshot_session_id,
+        } => {
             crate::daemon::fs_api::get_extended_config_snapshot(
                 &ctx,
                 project_root,
                 shared.capability_owner.clone(),
+                snapshot_session_id,
             )
             .await
         }
@@ -13778,6 +13788,7 @@ pub(super) fn assistant_to_proto(
         definition_markdown: None,
         definition_revision: None,
         definition_diagnostic: None,
+        projection_digest: String::new(),
     }
 }
 

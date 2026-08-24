@@ -1,5 +1,18 @@
 use super::shell::PointerOperationId;
 use super::*;
+
+#[test]
+fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {
+    let mut authored = serde_json::json!({
+        "tui": { "mouse": true },
+        "redact": { "scan_environment": true }
+    });
+    let before = authored.clone();
+    apply_json_merge_patch_local(&mut authored, serde_json::json!({ "tui": {} }));
+    assert_eq!(authored, before);
+    let operations = changed_extended_paths(&before, &authored).expect("typed diff");
+    assert!(operations.is_empty());
+}
 use cockpit_config::providers::{ModelEntry, ProviderEntry};
 use cockpit_test_support::TestEnvGuard;
 use providers::{FetchAllState, valid_url};
@@ -63,6 +76,7 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
                 result_revision: "revision-2".into(),
                 status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                 publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                denylist: Vec::new(),
             }),
             Ok(Response::ExtendedConfigSnapshot {
                 layers: vec![cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot {
@@ -115,6 +129,7 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
                 result_revision: "revision-2".into(),
                 status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                 publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                denylist: Vec::new(),
             },
         )])),
         requests: Mutex::new(Vec::new()),

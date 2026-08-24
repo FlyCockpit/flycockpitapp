@@ -1559,6 +1559,7 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         definition_markdown,
         definition_revision: _,
         definition_diagnostic,
+        projection_digest: _,
     } = assistant;
     scrub_string(home_dir, redact);
     scrub_string(config_json, redact);
@@ -1576,6 +1577,42 @@ fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &R
     scrub_string(&mut snapshot.markdown, redact);
     scrub_string(&mut snapshot.canonical_preview, redact);
     scrub_option_string(&mut snapshot.goal_supervision_json, redact);
+}
+
+/// Mint presentation digests only after the final socket-bound redaction
+/// pass. This is infallible and therefore cannot turn a committed mutation
+/// into a post-commit response error.
+fn finalize_response_projections(response: &mut proto::Response) {
+    fn assistant(value: &mut proto::AssistantSummary) {
+        value.projection_digest = proto::assistant_projection_digest(value);
+    }
+    fn agent(value: &mut proto::AgentEditSnapshot) {
+        value.projection_digest = proto::agent_edit_projection_digest(value);
+    }
+    match response {
+        proto::Response::Assistant {
+            assistant: Some(value),
+        } => assistant(value),
+        proto::Response::Assistants { assistants } => assistants.iter_mut().for_each(assistant),
+        proto::Response::AssistantUpserted { assistant: value }
+        | proto::Response::AssistantDefinitionSaved {
+            assistant: value, ..
+        } => assistant(value),
+        proto::Response::AgentInventory { entries, .. } => {
+            for entry in entries {
+                entry.projection_digest = proto::agent_inventory_entry_projection_digest(entry);
+            }
+        }
+        proto::Response::AgentEditSnapshot(value) => agent(value),
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            if let Some(value) = &mut result.snapshot {
+                agent(value);
+            }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot),
+        _ => {}
+    }
 }
 
 fn scrub_assistant_session_created(
@@ -5355,7 +5392,10 @@ fn response_envelope_for_shared(
                 Some(response)
             };
             match response {
-                Some(response) => Envelope::response(id, response),
+                Some(mut response) => {
+                    finalize_response_projections(&mut response);
+                    Envelope::response(id, response)
+                }
                 None => Envelope::error(
                     Some(id),
                     ErrorPayload {

@@ -205,7 +205,8 @@
         "registration_revision": "79aff49b93fd8d542e0f06df5af9d74068518331fc7ac87829882b1d9f8c662f",
         "definition_markdown": "---\nschemaVersion: 2\npublisher: local/11111111-1111-4111-8111-111111111111\nname: helper-bot\ndescription: Helps\nexecutionKind: local_model\n---\n\nHelp.\n",
         "definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
-        "definition_diagnostic": null
+        "definition_diagnostic": null,
+        "projection_digest": "f0dab748cadf30e98f718d9d1c78b3851cacb5135de9b88a17c21cc3a7f7e1e1"
       }
     },
     "response": "assistant_upserted"
@@ -222,7 +223,8 @@
           "registration_revision": "79aff49b93fd8d542e0f06df5af9d74068518331fc7ac87829882b1d9f8c662f",
           "definition_markdown": "---\nschemaVersion: 2\npublisher: local/11111111-1111-4111-8111-111111111111\nname: helper-bot\ndescription: Helps\nexecutionKind: local_model\n---\n\nHelp.\n",
           "definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
-          "definition_diagnostic": null
+          "definition_diagnostic": null,
+          "projection_digest": "f0dab748cadf30e98f718d9d1c78b3851cacb5135de9b88a17c21cc3a7f7e1e1"
         }
       ]
     },
@@ -1909,7 +1911,8 @@
       "consumed_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "result_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "status": "committed",
-      "publication": "published"
+      "publication": "published",
+      "denylist": []
     },
     "response": "extended_config_saved"
   },
@@ -2137,7 +2140,8 @@
         "registration_revision": "79aff49b93fd8d542e0f06df5af9d74068518331fc7ac87829882b1d9f8c662f",
         "definition_markdown": "---\nschemaVersion: 2\npublisher: local/11111111-1111-4111-8111-111111111111\nname: helper-bot\ndescription: Helps\nexecutionKind: local_model\n---\n\nHelp.\n",
         "definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
-        "definition_diagnostic": null
+        "definition_diagnostic": null,
+        "projection_digest": "f0dab748cadf30e98f718d9d1c78b3851cacb5135de9b88a17c21cc3a7f7e1e1"
       },
       "consumed_definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a"
     }
@@ -2388,7 +2392,8 @@
           "source_layer": "embedded",
           "source_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
-          "editable": false
+          "editable": false,
+          "projection_digest": "86140051f166246406a7ef12cd52d8a74862fb3d287184f20c2f36f7fe594ab8"
         }
       ],
       "inventory_revision": "ea9bc9cf151c9298f6c5d6a0a388c9e5b03444e873c4f3a301d0f274bda60290",
@@ -2409,7 +2414,8 @@
       "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
       "goal_supervision_json": null,
       "editable": false,
-      "supports_goal_supervision": true
+      "supports_goal_supervision": true,
+      "projection_digest": "413eda73a54cb49c4c299d21d11bd43c1024bcc680eb2a37aceb7a312abbdf76"
     }
   },
   "agent_mutated": {
@@ -2441,7 +2447,8 @@
         "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
         "goal_supervision_json": null,
         "editable": false,
-        "supports_goal_supervision": true
+        "supports_goal_supervision": true,
+        "projection_digest": "413eda73a54cb49c4c299d21d11bd43c1024bcc680eb2a37aceb7a312abbdf76"
       }
     }
   },

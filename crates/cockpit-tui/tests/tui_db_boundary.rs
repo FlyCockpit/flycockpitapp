@@ -94,6 +94,47 @@ fn production_source(source: &str) -> String {
     String::from_utf8(bytes).expect("Rust source remains UTF-8 after masking")
 }
 
+fn flattened_use_paths(tree: &syn::UseTree) -> Vec<String> {
+    fn visit(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                visit(&path.tree, prefix, out);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                if name.ident == "self" {
+                    out.push(prefix.join("::"));
+                } else {
+                    prefix.push(name.ident.to_string());
+                    out.push(prefix.join("::"));
+                    prefix.pop();
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                // Authority follows the imported source identifier, never its
+                // local alias.
+                if rename.ident == "self" {
+                    out.push(prefix.join("::"));
+                } else {
+                    prefix.push(rename.ident.to_string());
+                    out.push(prefix.join("::"));
+                    prefix.pop();
+                }
+            }
+            syn::UseTree::Glob(_) => out.push(format!("{}::*", prefix.join("::"))),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    visit(item, prefix, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(tree, &mut Vec::new(), &mut out);
+    out
+}
+
 fn use_tree_has_rename(tree: &syn::UseTree) -> bool {
     match tree {
         syn::UseTree::Rename(_) => true,
@@ -113,7 +154,7 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
                 .chars()
                 .filter(|ch| !ch.is_whitespace())
                 .collect();
-            let authority = [
+            let forbidden = [
                 "std::fs",
                 "std::process",
                 "std::net",
@@ -123,23 +164,34 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
                 "cockpit_core::agents",
                 "cockpit_core::assistants",
                 "cockpit_core::db",
+                "cockpit_core::config",
                 "cockpit_config::extended::ExtendedConfigDoc",
                 "cockpit_config::providers::ConfigDoc",
                 "cockpit_config::dirs::scaffold_config_dir",
-            ]
-            .iter()
-            .any(|path| tokens.contains(path));
+            ];
+            let paths = flattened_use_paths(&item.tree);
+            let authority = paths.iter().any(|candidate| {
+                forbidden
+                    .iter()
+                    .any(|path| candidate == path || candidate.starts_with(&format!("{path}::")))
+            });
             let root_alias = tokens.starts_with("usestdas")
                 || tokens.starts_with("usetokioas")
                 || tokens.starts_with("usecockpit_coreas")
                 || tokens.starts_with("usecockpit_configas");
-            if (authority || root_alias)
-                && (use_tree_has_rename(&item.tree)
-                    || !matches!(&item.vis, syn::Visibility::Inherited))
+            // Direct imports remain visible to the separate exact-call
+            // ratchet. What this syntax gate forbids is obscuring any
+            // authority subtree through an alias or re-export, including a
+            // rename nested inside an arbitrarily grouped UseTree.
+            if root_alias
+                || (authority
+                    && (use_tree_has_rename(&item.tree)
+                        || !matches!(&item.vis, syn::Visibility::Inherited)))
             {
                 self.0.push(format!(
-                    "line {}: aliased or re-exported authority import: {tokens}",
-                    item.span().start().line
+                    "line {}: forbidden authority import {:?}: {tokens}",
+                    item.span().start().line,
+                    paths
                 ));
             }
             syn::visit::visit_item_use(self, item);
@@ -835,6 +887,9 @@ fn syntax_aware_authority_filter_has_negative_fixtures() {
         "use std::fs as storage;",
         "pub use tokio::process::Command;",
         "use cockpit_core as owner;",
+        "use cockpit_core::{agents::{self as agent_owner, resolve as find}, proto};",
+        "use cockpit_config::{providers::{ConfigDoc as HiddenDoc}, extended};",
+        "use cockpit_core::{proto, config::{self, trust as workspace_trust}};",
         "macro_rules! hidden { () => { std::net::TcpStream::connect(\"x\") } }",
     ] {
         assert!(

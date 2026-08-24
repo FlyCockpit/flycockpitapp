@@ -71,6 +71,28 @@ pub(crate) struct PreparedTaskDelegationPayload {
     cleanup_abs_path: Option<PathBuf>,
 }
 
+pub(crate) struct CommittedTaskDelegationPayload {
+    pub(crate) row: TaskDelegationPayloadRow,
+    cleanup_abs_path: Option<PathBuf>,
+}
+
+impl CommittedTaskDelegationPayload {
+    pub(crate) fn confirm_outer_commit(mut self) -> TaskDelegationPayloadRow {
+        self.cleanup_abs_path = None;
+        self.row
+    }
+}
+
+impl Drop for CommittedTaskDelegationPayload {
+    fn drop(&mut self) {
+        if let Some(path) = self.cleanup_abs_path.take()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(%error, path=%path.display(), "failed to clean uncommitted delegation sidecar");
+        }
+    }
+}
+
 impl Drop for PreparedTaskDelegationPayload {
     fn drop(&mut self) {
         if let Some(path) = self.cleanup_abs_path.take()
@@ -102,12 +124,16 @@ impl Db {
         &self,
         payload: NewTaskDelegationPayload<'_>,
     ) -> Result<TaskDelegationPayloadRow> {
-        let prepared = self.prepare_task_delegation_payload(payload)?;
-        self.write(move |conn| Self::insert_prepared_task_delegation_payload_conn(conn, prepared))
-            .await
+        let prepared = self.prepare_task_delegation_payload(payload).await?;
+        let committed = self
+            .write(move |conn| Self::insert_prepared_task_delegation_payload_conn(conn, prepared))
+            .await?;
+        let row = committed.confirm_outer_commit();
+        self.reconcile_delegation_sidecar_cleanup_intents().await?;
+        Ok(row)
     }
 
-    pub(crate) fn prepare_task_delegation_payload(
+    pub(crate) async fn prepare_task_delegation_payload(
         &self,
         payload: NewTaskDelegationPayload<'_>,
     ) -> Result<PreparedTaskDelegationPayload> {
@@ -115,7 +141,8 @@ impl Db {
         let byte_len = payload.prompt.len();
         let created_at = Utc::now().timestamp();
         let (body_inline, sidecar_path, cleanup_abs_path) =
-            self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)?;
+            self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)
+                .await?;
         Ok(PreparedTaskDelegationPayload {
             task_call_id: payload.task_call_id.to_owned(),
             label: payload.label.to_owned(),
@@ -135,7 +162,7 @@ impl Db {
     pub(crate) fn insert_prepared_task_delegation_payload_conn(
         conn: &Connection,
         mut payload: PreparedTaskDelegationPayload,
-    ) -> Result<TaskDelegationPayloadRow> {
+    ) -> Result<CommittedTaskDelegationPayload> {
         // A replacement must retain deletion authority for the old unique
         // pathname in the same transaction that removes its last reference.
         conn.execute(
@@ -180,8 +207,18 @@ impl Db {
         .context("inserting task delegation payload")?;
         let row = Self::task_delegation_payload_conn(conn, &payload.task_call_id, &payload.label)?
             .context("inserted task delegation payload missing")?;
-        payload.cleanup_abs_path = None;
-        Ok(row)
+        if let Some(sidecar_path) = payload.sidecar_path.as_deref() {
+            let removed = conn.execute(
+                "DELETE FROM task_delegation_sidecar_prepare_intents WHERE sidecar_path=?1",
+                [sidecar_path],
+            )?;
+            anyhow::ensure!(removed == 1, "published sidecar prepare intent is missing");
+        }
+        let cleanup_abs_path = payload.cleanup_abs_path.take();
+        Ok(CommittedTaskDelegationPayload {
+            row,
+            cleanup_abs_path,
+        })
     }
 
     pub async fn task_delegation_payload(
@@ -344,7 +381,7 @@ impl Db {
         Ok(Some(self.delegation_payload_base_dir()?.join(rel)))
     }
 
-    fn persist_delegation_payload_body(
+    async fn persist_delegation_payload_body(
         &self,
         session_id: Uuid,
         hash: &str,
@@ -358,6 +395,18 @@ impl Db {
         // content hash as a deleted predecessor.
         let rel = delegation_payload_relative_path(session_id, hash, Uuid::now_v7());
         let abs = self.delegation_payload_base_dir()?.join(&rel);
+        let relative = rel_to_string(&rel);
+        let intent_relative = relative.clone();
+        self.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO task_delegation_sidecar_prepare_intents(sidecar_path,session_id,created_at_unix_ms)
+                 VALUES(?1,?2,?3)",
+                params![intent_relative, session_id.to_string(), Utc::now().timestamp_millis()],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("recording delegation sidecar prepare intent")?;
         crate::db::files::ensure_parent_dir_private(&abs)?;
         if abs.exists() {
             let existing = std::fs::read_to_string(&abs).with_context(|| {
@@ -371,10 +420,10 @@ impl Db {
                 );
             }
         } else {
-            crate::db::files::write_private_file(&abs, body.as_bytes())
-                .with_context(|| format!("writing delegation payload {}", abs.display()))?;
+            crate::db::files::publish_private_file_durable(&abs, body.as_bytes())
+                .with_context(|| format!("publishing delegation payload {}", abs.display()))?;
         }
-        Ok((None, Some(rel_to_string(&rel)), Some(abs)))
+        Ok((None, Some(relative), Some(abs)))
     }
 
     fn load_task_delegation_payload_body(&self, row: &TaskDelegationPayloadRow) -> Result<String> {
@@ -405,6 +454,59 @@ impl Db {
             return Ok(parent.to_path_buf());
         }
         crate::db::files::cockpit_data_dir()
+    }
+
+    /// Recover publication attempts that never reached an outer payload-row
+    /// commit. The durable intent precedes the rename, so absence is success;
+    /// a live payload reference instead proves the outer commit won and only
+    /// the stale prepare marker is removed.
+    pub async fn reconcile_delegation_sidecar_prepare_intents(&self) -> Result<usize> {
+        let rows = self
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT sidecar_path FROM task_delegation_sidecar_prepare_intents
+                     ORDER BY created_at_unix_ms,sidecar_path",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        let base = self.delegation_payload_base_dir()?;
+        let mut completed = 0;
+        for relative in rows {
+            let cleanup_base = base.clone();
+            let cleanup_relative = relative.clone();
+            let result = self
+                .transaction(move |conn| {
+                    let referenced: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_delegation_payloads WHERE sidecar_path=?1)",
+                        [&cleanup_relative],
+                        |row| row.get(0),
+                    )?;
+                    if !referenced {
+                        crate::db::files::delete_relative_file_durable_nofollow(
+                            &cleanup_base,
+                            Path::new(&cleanup_relative),
+                        )?;
+                    }
+                    Ok(conn.execute(
+                        "DELETE FROM task_delegation_sidecar_prepare_intents WHERE sidecar_path=?1",
+                        [cleanup_relative],
+                    )? == 1)
+                })
+                .await;
+            match result {
+                Ok(true) => completed += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    sidecar_path = %relative,
+                    "delegation sidecar prepare recovery remains pending"
+                ),
+            }
+        }
+        Ok(completed)
     }
 }
 
@@ -551,5 +653,136 @@ mod tests {
             err.to_string().contains("reading delegation payload"),
             "{err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_sidecar_is_recoverable_before_payload_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session = db.create_session("p", "/proj", "Build").await.unwrap();
+        let prepared = db
+            .prepare_task_delegation_payload(NewTaskDelegationPayload {
+                task_call_id: "crash-before-row",
+                function_call_id: None,
+                parent_session_id: session.session_id,
+                parent_agent: "Build",
+                label: "default",
+                child_agent: "explore",
+                prompt: "published before the row",
+            })
+            .await
+            .unwrap();
+        let published = prepared.cleanup_abs_path.clone().unwrap();
+        assert!(published.exists());
+        std::mem::forget(prepared); // simulate process loss before RAII cleanup
+        assert_eq!(
+            db.reconcile_delegation_sidecar_prepare_intents()
+                .await
+                .unwrap(),
+            1,
+            "boot recovery must retire the durable crash intent"
+        );
+        assert!(!published.exists());
+    }
+
+    #[tokio::test]
+    async fn outer_commit_failure_keeps_cleanup_armed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.upsert_task_delegation_job(
+            session.session_id,
+            "rollback",
+            None,
+            "Build",
+            None,
+            &[crate::db::task_delegations::DelegationChildInit {
+                label: "default",
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let prepared = db
+            .prepare_task_delegation_payload(NewTaskDelegationPayload {
+                task_call_id: "rollback",
+                function_call_id: None,
+                parent_session_id: session.session_id,
+                parent_agent: "Build",
+                label: "default",
+                child_agent: "explore",
+                prompt: "must not survive rollback",
+            })
+            .await
+            .unwrap();
+        let published = prepared.cleanup_abs_path.clone().unwrap();
+        let result: Result<()> = db
+            .transaction(move |conn| {
+                let committed =
+                    Db::insert_prepared_task_delegation_payload_conn(conn, prepared)?;
+                drop(committed);
+                bail!("injected outer transaction failure")
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!published.exists());
+        assert!(
+            db.task_delegation_payload("rollback", "default")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_upsert_reconciles_replaced_unique_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session = db.create_session("p", "/proj", "Build").await.unwrap();
+        db.upsert_task_delegation_job(
+            session.session_id,
+            "replace",
+            None,
+            "Build",
+            None,
+            &[crate::db::task_delegations::DelegationChildInit {
+                label: "default",
+                child_agent: "explore",
+                model: None,
+                output_dir: None,
+                requested_cwd: None,
+                resolved_cwd: None,
+                todo_ids_json: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let make = |prompt| NewTaskDelegationPayload {
+            task_call_id: "replace",
+            function_call_id: None,
+            parent_session_id: session.session_id,
+            parent_agent: "Build",
+            label: "default",
+            child_agent: "explore",
+            prompt,
+        };
+        let first = db.insert_task_delegation_payload(make("first")).await.unwrap();
+        let first_path = db
+            .task_delegation_payload_sidecar_abs_path(&first)
+            .unwrap()
+            .unwrap();
+        let second = db.insert_task_delegation_payload(make("second")).await.unwrap();
+        let second_path = db
+            .task_delegation_payload_sidecar_abs_path(&second)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first_path, second_path);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
     }
 }

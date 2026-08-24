@@ -251,14 +251,14 @@ impl Db {
     ) -> Result<Vec<TaskDelegationPayloadRow>> {
         let now = Utc::now().timestamp();
         let job = TaskDelegationJobWrite::from(job);
-        let prepared_payloads = payloads
-            .into_iter()
-            .map(|payload| self.prepare_task_delegation_payload(payload))
-            .collect::<Result<Vec<_>>>()?;
+        let mut prepared_payloads = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            prepared_payloads.push(self.prepare_task_delegation_payload(payload).await?);
+        }
         // Keep the owner check, job, children, and payload rows under the
         // same immediate transaction.  `upsert_task_delegation_job_conn` is a
         // connection helper specifically so this does not nest transactions.
-        self.transaction(move |conn| {
+        let committed = self.transaction(move |conn| {
             Self::upsert_task_delegation_job_conn(conn, job, now)?;
             let mut rows = Vec::with_capacity(prepared_payloads.len());
             for prepared_payload in prepared_payloads {
@@ -269,7 +269,13 @@ impl Db {
             }
             Ok(rows)
         })
-        .await
+        .await?;
+        let rows = committed
+            .into_iter()
+            .map(|payload| payload.confirm_outer_commit())
+            .collect();
+        self.reconcile_delegation_sidecar_cleanup_intents().await?;
+        Ok(rows)
     }
 
     fn upsert_task_delegation_job_conn(

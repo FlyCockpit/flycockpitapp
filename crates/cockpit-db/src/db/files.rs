@@ -254,20 +254,79 @@ pub(crate) fn create_private_file_if_missing(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Publish a new DB-owned sidecar through a fully durable, private temporary
+/// file. The final pathname becomes visible only after its bytes are synced;
+/// syncing the parent then makes the rename durable before SQLite may refer to
+/// it. `destination` must not already exist (callers use non-reusable names).
+pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = opts
-        .open(path)
-        .with_context(|| format!("opening {} for write", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    file.write_all(bytes)?;
-    Ok(())
+    let parent = destination
+        .parent()
+        .context("durable sidecar destination has no parent")?;
+    ensure_private_dir(parent)?;
+    let file_name = destination
+        .file_name()
+        .context("durable sidecar destination has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::now_v7()));
+
+    struct TempGuard(PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let guard = TempGuard(temporary.clone());
+    #[cfg(unix)]
+    let file_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+    };
+    #[cfg(not(unix))]
+    let file_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary);
+    let mut file = file_result.with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
+    drop(file);
+    anyhow::ensure!(
+        !destination.exists(),
+        "refusing to replace existing durable sidecar {}",
+        destination.display()
+    );
+    std::fs::rename(&temporary, destination).with_context(|| {
+        format!(
+            "publishing durable sidecar {} as {}",
+            temporary.display(),
+            destination.display()
+        )
+    })?;
+    std::mem::forget(guard);
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            // FILE_FLAG_BACKUP_SEMANTICS is required to open a directory.
+            .custom_flags(0x0200_0000)
+            .open(parent)
+    };
+    #[cfg(not(windows))]
+    let directory = std::fs::File::open(parent);
+    let directory = directory
+        .with_context(|| format!("opening sidecar parent {}", parent.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("syncing sidecar parent {}", parent.display()))
 }
 
 /// Unlink a DB-owned sidecar beneath `base` without following any path
@@ -357,10 +416,4 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("unlinking delegation payload sidecar"),
     }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
 }

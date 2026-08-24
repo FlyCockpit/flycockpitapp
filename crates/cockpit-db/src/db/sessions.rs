@@ -858,17 +858,37 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
 pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    #[cfg(windows)]
+    for member in collect_subtree(conn, session_id)? {
+        let sidecars: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_delegation_payloads
+              WHERE parent_session_id=?1 AND sidecar_path IS NOT NULL",
+            [member.to_string()],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            sidecars == 0,
+            "session deletion with delegation sidecars is unavailable on Windows until durable reparse-safe cleanup is supported"
+        );
+    }
     // Media metadata may cascade only after owned bytes have independently
     // reached a deletion-evidenced terminal. Starting cleanup is owned by the
     // media storage orchestrator; this DB boundary is the final fail-closed
     // guard for every current and future session-deletion caller.
-    let unsafe_media: i64 = conn
-        .query_row(
-            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("checking session media deletion barrier")?;
+    let mut unsafe_media = 0_i64;
+    for member in collect_subtree(conn, session_id)? {
+        unsafe_media += conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_attachments a
+                  WHERE a.session_id=?1 AND (
+                    a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted')
+                    OR EXISTS(SELECT 1 FROM media_attachment_components c
+                               WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted'))",
+                [member.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("checking session media deletion barrier")?;
+    }
     anyhow::ensure!(
         unsafe_media == 0,
         "session media cleanup must complete before session deletion"
@@ -1810,17 +1830,14 @@ impl Db {
         now_unix_ms: i64,
     ) -> Result<()> {
         ensure!(now_unix_ms >= 0, "cleanup intent timestamp must be nonnegative");
-        conn.execute(
-            "WITH RECURSIVE subtree(session_id) AS (
-                 SELECT ?1 UNION
-                 SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id
-             )
-             INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)
-             SELECT p.sidecar_path,p.parent_session_id,?2
-             FROM task_delegation_payloads p JOIN subtree s ON s.session_id=p.parent_session_id
-             WHERE p.sidecar_path IS NOT NULL",
-            params![session_id.to_string(), now_unix_ms],
-        )?;
+        for member in collect_subtree(conn, session_id)? {
+            conn.execute(
+                "INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)
+                 SELECT sidecar_path,parent_session_id,?2 FROM task_delegation_payloads
+                  WHERE parent_session_id=?1 AND sidecar_path IS NOT NULL",
+                params![member.to_string(), now_unix_ms],
+            )?;
+        }
         Ok(())
     }
 
@@ -2171,34 +2188,7 @@ impl Db {
     /// against cyclic/dangling parents. Used by the daemon to decide
     /// which live workers to interrupt before a cascading archive/delete.
     pub async fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
-        if root == node {
-            return Ok(true);
-        }
-        self.read(move |conn| {
-            let mut cur = node;
-            // Bound the walk so a corrupted parent cycle can't spin.
-            for _ in 0..10_000 {
-                let parent: Option<String> = match conn.query_row(
-                    "SELECT parent_session_id FROM sessions WHERE session_id = ?1",
-                    [cur.to_string()],
-                    |row| row.get(0),
-                ) {
-                    Ok(p) => p,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
-                    Err(e) => return Err(anyhow::Error::from(e)).context("is_in_subtree walk"),
-                };
-                let Some(parent) = parent else {
-                    return Ok(false);
-                };
-                let parent =
-                    parse_uuid(&parent).map_err(|e| anyhow::anyhow!("decoding parent id: {e}"))?;
-                if parent == root {
-                    return Ok(true);
-                }
-                cur = parent;
-            }
-            Ok(false)
-        })
+        self.read(move |conn| Ok(collect_subtree(conn, root)?.contains(&node)))
         .await
     }
 
@@ -2778,7 +2768,7 @@ fn summary_pin_count_or_zero(session_id: Uuid, result: Result<i64>) -> u32 {
 /// an unknown id yields an empty set. Echoing it would report a delete set for
 /// a session that does not exist, and `delete_session_conn` would write a
 /// tombstone for a row whose deletion cascades nothing.
-fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
+pub fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
     let mut stmt = conn
         .prepare(
             "WITH RECURSIVE cascade(session_id) AS (
@@ -4422,6 +4412,20 @@ mod tests {
         let root = db.create_session("p", "/x", "a").await.unwrap();
         let child = db.create_fork(root.session_id, None).await.unwrap();
         let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+        let btw_only = db.create_session("p", "/x", "a").await.unwrap();
+        db.write({
+            let root = root.session_id;
+            let btw_only = btw_only.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id=NULL,btw_parent_session_id=?2 WHERE session_id=?1",
+                    params![btw_only.to_string(), root.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
         let other = db.create_session("p", "/x", "a").await.unwrap();
         assert!(
             db.is_in_subtree(root.session_id, root.session_id)
@@ -4437,6 +4441,12 @@ mod tests {
             db.is_in_subtree(root.session_id, grandchild.session_id)
                 .await
                 .unwrap()
+        );
+        assert!(
+            db.is_in_subtree(root.session_id, btw_only.session_id)
+                .await
+                .unwrap(),
+            "the shared subtree walker follows the BTW cascade edge"
         );
         assert!(
             !db.is_in_subtree(root.session_id, other.session_id)

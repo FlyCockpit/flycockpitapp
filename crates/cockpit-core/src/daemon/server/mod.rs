@@ -3147,6 +3147,9 @@ pub(crate) async fn boot_with_db(
     timer.phase("prune_and_sweep");
     #[cfg_attr(test, allow(unused_mut))]
     let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    db.reconcile_delegation_sidecar_prepare_intents()
+        .await
+        .context("reconciling delegation sidecar prepare intents")?;
     db.reconcile_delegation_sidecar_cleanup_intents()
         .await
         .context("reconciling delegation sidecar cleanup intents")?;

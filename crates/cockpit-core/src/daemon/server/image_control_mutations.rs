@@ -132,6 +132,14 @@ fn rebuild(
         workflows,
         old.openrouter_provider_allowlist().to_vec(),
     )
+    // `new` resets top-level scalars (e.g. the base-tier threshold) to their
+    // defaults; a mutation edits only endpoints/targets/workflows, so carry the
+    // prior authored threshold across so it is not silently reset.
+    .and_then(|config| {
+        config.with_base_tier_known_cost_threshold_usd_micros(
+            old.base_tier_known_cost_threshold_usd_micros(),
+        )
+    })
     .map_err(map_config_error)
 }
 

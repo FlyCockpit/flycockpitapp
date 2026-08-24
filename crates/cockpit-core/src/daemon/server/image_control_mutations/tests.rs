@@ -9,7 +9,8 @@
 //! carry NO secret even when the edit introduces one.
 
 use cockpit_config::config::image_generation::{
-    IMAGE_GENERATION_ROUTE_PROFILE_VERSION, ImageAdapterKind, ImageCapabilityEvidence,
+    DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS, IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+    ImageAdapterKind, ImageCapabilityEvidence,
     ImageDimensionDescriptor, ImageDimensionRequestPolicy, ImageEndpoint, ImageEvidence,
     ImageFormat, ImageGenerationConfig, ImageGenerationTarget, ImageLocationClass, ImageParameter,
     ImageParameterDescriptor, ImagePrice, ImageTargetIdentity, ReferenceImageSupport,
@@ -375,6 +376,30 @@ fn workflow_upload_appends_and_upserts() {
     assert!(cfg.workflows().iter().any(|w| w.id == "wf-new"));
     assert_eq!(changes.len(), 1);
     assert!(matches!(&changes[0], PendingChange::WorkflowUpsert(id) if id == "wf-new"));
+}
+
+#[test]
+fn mutation_preserves_authored_base_tier_threshold() {
+    // AC8: a registry mutation edits only endpoints/targets/workflows. It must
+    // NOT reset a non-default authored base-tier threshold — `::new` defaults
+    // the field, so `rebuild` re-applies the prior value across the edit.
+    let authored = base()
+        .with_base_tier_known_cost_threshold_usd_micros(1_000_000)
+        .expect("in-range threshold");
+    assert_ne!(
+        authored.base_tier_known_cost_threshold_usd_micros(),
+        DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS
+    );
+    let (cfg, _changes) = apply_edit(
+        &authored,
+        Edit::WorkflowUpload(serde_json::to_string(&workflow("wf-new", None)).unwrap()),
+    )
+    .expect("upload ok");
+    assert_eq!(
+        cfg.base_tier_known_cost_threshold_usd_micros(),
+        1_000_000,
+        "an authored base-tier threshold must survive a registry edit"
+    );
 }
 
 #[test]

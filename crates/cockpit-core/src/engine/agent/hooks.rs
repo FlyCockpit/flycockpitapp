@@ -48,6 +48,11 @@ pub(crate) const ENVELOPE_VALUE_MAX_BYTES: usize = 128 * 1024;
 /// Independent cap for stdout and stderr (64 KiB each).
 pub(crate) const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 
+/// Grace window for reaping a deadline-killed hook child before giving up and
+/// deferring to the lease's containment teardown. Bounds the post-`start_kill`
+/// wait so an uninterruptible (D-state) child cannot stall the caller.
+const HOOK_CHILD_REAP_GRACE: Duration = Duration::from_secs(2);
+
 /// Maximum UTF-8-safe character length for a denial reason (1,024 chars).
 pub(crate) const REASON_MAX_CHARS: usize = 1_024;
 
@@ -992,27 +997,27 @@ async fn spawn_real_hook_child(
         }
     };
 
-    // Write stdin.
-    if let Some(mut child_stdin) = child.stdin.take() {
-        if child_stdin.write_all(stdin.as_bytes()).await.is_err() {
-            let _ = child.kill().await;
-            return ChildRunOutcome {
-                stdout: String::new(),
-                exit_code: None,
-                spawn_failed: true,
-                timed_out: false,
-            };
-        }
-        drop(child_stdin);
-    }
+    // Take all three pipes so stdin write, stdout capture, and stderr drain run
+    // CONCURRENTLY. Writing the whole stdin before reading (or never reading
+    // stderr) deadlocks whenever the child fills a kernel pipe buffer — a hook
+    // that emits >64KiB on stderr, or that never consumes its stdin, would wedge.
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
 
-    // Take stdout before spawning the wait future (avoids double mutable
-    // borrow of `child`).
-    let mut child_stdout = child.stdout.take();
+    // Best-effort stdin writer. A child that exits or is killed mid-write yields
+    // a broken pipe, which is not a hook failure — the deadline path owns the
+    // outcome. Dropping the handle closes stdin so the child observes EOF.
+    let stdin_bytes = stdin.as_bytes().to_vec();
+    let stdin_fut = async move {
+        if let Some(mut sin) = child_stdin {
+            let _ = sin.write_all(&stdin_bytes).await;
+        }
+    };
 
     // Read stdout with independent cap.
-    let stdout_fut = async {
-        if let Some(mut out) = child_stdout.take() {
+    let stdout_fut = async move {
+        if let Some(mut out) = child_stdout {
             let mut temp = vec![0u8; OUTPUT_CAP_BYTES + 1];
             let mut total = Vec::new();
             loop {
@@ -1033,31 +1038,72 @@ async fn spawn_real_hook_child(
         }
     };
 
-    let wait_fut = async {
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            Ok(Err(_)) => {
-                let _ = child.kill().await;
-                None
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                None
+    // Drain stderr to EOF and discard it — only stdout carries the hook
+    // decision. The drain exists solely so a chatty child never blocks on a full
+    // stderr pipe.
+    let stderr_fut = async move {
+        if let Some(mut err) = child_stderr {
+            let mut temp = vec![0u8; 8192];
+            loop {
+                match err.read(&mut temp).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
             }
         }
     };
 
-    let (stdout_result, exit_code) = tokio::join!(stdout_fut, wait_fut);
+    // Bound the ENTIRE interaction — stdin write, both drains, AND wait — under a
+    // single deadline. Bounding only `child.wait()` is not enough: a hook can
+    // fork a background descendant that inherits the pipe fds, so after the
+    // direct child exits or is killed the drains never observe EOF and the join
+    // would hang forever, starving the caller's lease teardown. On elapse we kill
+    // the direct child and return; the caller's `terminate_and_await_empty` then
+    // kills the whole containment group (descendants included), which is the real
+    // authority for closing inherited pipes.
+    let interaction = async {
+        let (_stdin_done, stdout_result, _stderr_drained, wait_res) =
+            tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait());
+        (stdout_result, wait_res)
+    };
 
-    let stdout_bytes = stdout_result.unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let timed_out = exit_code.is_none();
-    ChildRunOutcome {
-        stdout,
-        exit_code,
-        spawn_failed: false,
-        timed_out,
+    match tokio::time::timeout(timeout, interaction).await {
+        Ok((stdout_result, wait_res)) => {
+            let exit_code = match wait_res {
+                Ok(status) => status.code(),
+                Err(_) => None,
+            };
+            let stdout_bytes = stdout_result.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+            // A missing exit status (wait error) is reported as a non-completion;
+            // the caller maps both timeout and no-status to a Failed decision.
+            let timed_out = exit_code.is_none();
+            ChildRunOutcome {
+                stdout,
+                exit_code,
+                spawn_failed: false,
+                timed_out,
+            }
+        }
+        Err(_elapsed) => {
+            // Deadline hit. Kill+reap the direct child, but keep the reap itself
+            // BOUNDED: an uninterruptible (D-state) child, or a `start_kill` that
+            // does not immediately take, must not turn this into another
+            // unbounded await that stalls the caller's lease teardown. The
+            // `kill_on_drop(true)` handle plus the caller's
+            // `terminate_and_await_empty` (which kills the whole containment
+            // group) are the ultimate authority. Partial stdout is intentionally
+            // dropped: the caller maps `timeout` to Failed and never parses it.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(HOOK_CHILD_REAP_GRACE, child.wait()).await;
+            ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: false,
+                timed_out: true,
+            }
+        }
     }
 }
 

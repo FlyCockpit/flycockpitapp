@@ -93,10 +93,14 @@ pub(crate) struct IndexStats {
     pub indexed_files: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct AttachedBundle {
     pub scope: BundleScope,
     pub root: PathBuf,
+    /// Retains the exact assistant knowledge directory inode for every path
+    /// operation performed through the descriptor spelling in `root`.
+    #[cfg(unix)]
+    _assistant_authority: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1110,10 +1114,14 @@ pub(crate) async fn attached_bundles(
             // `snapshot` validates the persisted row's canonical home and
             // definition identity through the unified assistant coordinator.
             let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
-            if root.exists() {
+            if let Some((root, authority)) = retained_assistant_knowledge_root(&root)? {
+                #[cfg(not(unix))]
+                let _ = authority;
                 bundles.push(AttachedBundle {
                     scope: BundleScope::Assistant,
                     root,
+                    #[cfg(unix)]
+                    _assistant_authority: Some(authority),
                 });
             }
         }
@@ -1124,9 +1132,57 @@ pub(crate) async fn attached_bundles(
         bundles.push(AttachedBundle {
             scope: BundleScope::Project,
             root: project_root,
+            #[cfg(unix)]
+            _assistant_authority: None,
         });
     }
     Ok(bundles)
+}
+
+#[cfg(unix)]
+fn retained_assistant_knowledge_root(
+    diagnostic_root: &Path,
+) -> Result<Option<(PathBuf, Arc<std::fs::File>)>> {
+    use std::os::fd::AsRawFd as _;
+
+    match std::fs::symlink_metadata(diagnostic_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "assistant knowledge root is not a retained no-follow directory: {}",
+                diagnostic_root.display()
+            );
+        }
+        Ok(_) => {}
+    }
+    let authority = Arc::new(
+        crate::private_fs::open_private_dir_handle(diagnostic_root).with_context(|| {
+            format!(
+                "opening assistant knowledge root {}",
+                diagnostic_root.display()
+            )
+        })?,
+    );
+    #[cfg(target_os = "linux")]
+    let root = PathBuf::from(format!("/proc/self/fd/{}", authority.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let root = PathBuf::from(format!("/dev/fd/{}", authority.as_raw_fd()));
+    // The descriptor spelling, not the diagnostic pathname, is passed into
+    // bundle parsing and SQLite. Keeping `authority` alive closes the
+    // substitution window for every descendant open.
+    Ok(Some((root, authority)))
+}
+
+#[cfg(not(unix))]
+fn retained_assistant_knowledge_root(diagnostic_root: &Path) -> Result<Option<(PathBuf, ())>> {
+    match std::fs::symlink_metadata(diagnostic_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => bail!(
+            "assistant knowledge is unavailable on this platform until directory-handle-relative indexing is available"
+        ),
+    }
 }
 
 fn project_bundle_trusted() -> bool {

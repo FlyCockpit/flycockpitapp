@@ -417,16 +417,6 @@ pub(super) fn remote_queue_mutation_response(
 /// and the dispatch image-duplicate fast path so BOTH reserve the operation
 /// through the SAME ledger primitive (no remote send returns accepted without a
 /// ledger operation row).
-pub(crate) enum RemoteSendDecision {
-    /// A fresh operation identity reserved and committed a ledger row.
-    Accepted,
-    /// The operation identity was already committed (exact replay).
-    Replayed,
-    /// Reject the send WITHOUT accepting: operation/actor conflict, or a
-    /// capacity/ledger failure. No fresh acceptance occurs.
-    Rejected(proto::ErrorPayload),
-}
-
 /// Reserve+commit the transactional remote-operation ledger row for a remote
 /// send. The request hash (bound to session + client_submission_id + payload in
 /// dispatch) is the exactly-once key: a replayed identity returns `Replayed`
@@ -465,10 +455,11 @@ pub(crate) enum RemoteSendDecision {
 /// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
 /// the ledger row; the marker is unchanged from main; the cross-record atomicity
 /// is the V2 cutover's job.
-pub(crate) async fn reserve_remote_send_operation(
+pub(super) async fn reserve_remote_send_operation_impl(
     db: &crate::db::Db,
     remote: &crate::daemon::session_worker::RemoteQueueOperation,
-) -> RemoteSendDecision {
+) -> crate::daemon::session_worker::RemoteSendDecision {
+    use crate::daemon::session_worker::RemoteSendDecision;
     let outcome = db
         .execute_transactional_remote_operation(
             crate::db::remote_attachment_operations::ReserveRemoteOperation {

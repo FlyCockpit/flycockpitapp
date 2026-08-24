@@ -504,6 +504,7 @@ mod effective_sandbox;
 mod handle;
 mod helpers;
 mod lifecycle;
+mod remote;
 mod run;
 #[cfg(test)]
 mod tests;
@@ -517,8 +518,13 @@ pub use effective_sandbox::{
 };
 pub use handle::{
     InteractiveClientGuard, OversizedRunInvocationAdmission, OversizedTextArtifactAdmission,
-    RemoteQueueOperation, ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot,
-    SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
+    ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
+    SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
+};
+pub use remote::{RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision, reserve_remote_send_operation};
+pub use remote::{
+    RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision,
+    reserve_remote_send_operation,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;
@@ -528,4 +534,3 @@ pub(crate) use helpers::{
     resolve_root_agent_conn,
 };
 pub(crate) use lifecycle::{initial_active_agent, initial_active_agent_for_llm_mode};
-pub(crate) use run::{RemoteSendDecision, reserve_remote_send_operation};

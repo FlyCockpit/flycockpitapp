@@ -61,6 +61,9 @@ pub struct SwarmRunCtx {
     /// its completion even through backpressure; teardown reconciles directly
     /// and therefore must never block its task join on the event queue.
     pub teardown: tokio_util::sync::CancellationToken,
+    /// Shared exactly-once claim for the terminal `Completed` publication.
+    /// The normal runner and its panic supervisor race through this same CAS.
+    pub terminal_claimed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -172,6 +175,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         cmd_tx,
         cancel,
         teardown,
+        terminal_claimed,
     } = run;
 
     let lifecycle_event_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -184,6 +188,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         send_swarm_terminal(
             &event_tx,
             &teardown,
+            &terminal_claimed,
             ScheduleEvent::Completed {
                 job_id,
                 label,
@@ -210,14 +215,20 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         match begin_write_scope_transfer(&spec, &ctx).await {
             Ok(handle) => handle,
             Err(refusal) => {
-                send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
-                        job_id,
-                        label,
-                        kind: ScheduleKind::Swarm,
-                        result: refusal,
-                        failed: true,
-                        requests: Vec::new(),
-                    }).await;
+                send_swarm_terminal(
+                    &event_tx,
+                    &teardown,
+                    &terminal_claimed,
+                    ScheduleEvent::Completed {
+                    job_id,
+                    label,
+                    kind: ScheduleKind::Swarm,
+                    result: refusal,
+                    failed: true,
+                    requests: Vec::new(),
+                    },
+                )
+                .await;
                 return;
             }
         }
@@ -240,9 +251,15 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     if !spec.worker.is_goal_control()
         && lifecycle_event_emitted.load(std::sync::atomic::Ordering::Acquire)
     {
-        send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::SwarmChildStopGateCompleted {
-                job_id: job_id.clone(),
-            }).await;
+        send_swarm_terminal(
+            &event_tx,
+            &teardown,
+            &terminal_claimed,
+            ScheduleEvent::SwarmChildStopGateCompleted {
+            job_id: job_id.clone(),
+            },
+        )
+        .await;
     }
 
     // The child is terminal either way. Invalidate its token and drain the
@@ -265,21 +282,27 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }
         Err(e) => {
             let cancelled = cancel.is_cancelled();
-            send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
-                    job_id,
-                    label,
-                    kind: ScheduleKind::Swarm,
-                    result: if cancelled {
-                        "swarm subagent cancelled".to_string()
-                    } else {
-                        format!("swarm subagent error: {e:#}")
-                    },
-                    // Cancellation is an aborted lifecycle, not a provider /
-                    // child failure. The driver maps this no-gate-completed
-                    // terminal to `endReason: aborted`.
-                    failed: !cancelled,
-                    requests: Vec::new(),
-                }).await;
+            send_swarm_terminal(
+                &event_tx,
+                &teardown,
+                &terminal_claimed,
+                ScheduleEvent::Completed {
+                job_id,
+                label,
+                kind: ScheduleKind::Swarm,
+                result: if cancelled {
+                    "swarm subagent cancelled".to_string()
+                } else {
+                    format!("swarm subagent error: {e:#}")
+                },
+                // Cancellation is an aborted lifecycle, not a provider /
+                // child failure. The driver maps this no-gate-completed
+                // terminal to `endReason: aborted`.
+                failed: !cancelled,
+                requests: Vec::new(),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -289,21 +312,40 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     } else {
         budget_result(&label, &spec, &result)
     };
-    send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
-            job_id,
-            label,
-            kind: ScheduleKind::Swarm,
-            result: body,
-            failed: false,
-            requests: Vec::new(),
-        }).await;
+    send_swarm_terminal(
+        &event_tx,
+        &teardown,
+        &terminal_claimed,
+        ScheduleEvent::Completed {
+        job_id,
+        label,
+        kind: ScheduleKind::Swarm,
+        result: body,
+        failed: false,
+        requests: Vec::new(),
+        },
+    )
+    .await;
 }
 
 pub(super) async fn send_swarm_terminal(
     event_tx: &mpsc::Sender<ScheduleEvent>,
     teardown: &tokio_util::sync::CancellationToken,
+    terminal_claimed: &std::sync::atomic::AtomicBool,
     event: ScheduleEvent,
 ) {
+    if matches!(&event, ScheduleEvent::Completed { .. })
+        && terminal_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+    {
+        return;
+    }
     if teardown.is_cancelled() {
         let _ = event_tx.try_send(event);
         return;
@@ -957,11 +999,13 @@ mod tests {
             .await
             .unwrap();
         let teardown = tokio_util::sync::CancellationToken::new();
+        let terminal_claimed = std::sync::atomic::AtomicBool::new(false);
         let sender_teardown = teardown.clone();
         let send = tokio::spawn(async move {
             send_swarm_terminal(
                 &event_tx,
                 &sender_teardown,
+                &terminal_claimed,
                 ScheduleEvent::SwarmChildStopGateCompleted {
                     job_id: "blocked".into(),
                 },
@@ -980,6 +1024,38 @@ mod tests {
             event_rx.recv().await,
             Some(ScheduleEvent::Completed { job_id, .. }) if job_id == "filler"
         ));
+    }
+
+    #[tokio::test]
+    async fn runner_and_panic_supervisor_publish_one_terminal_completion() {
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let terminal_claimed = std::sync::atomic::AtomicBool::new(false);
+        for result in ["runner", "panic supervisor"] {
+            send_swarm_terminal(
+                &event_tx,
+                &teardown,
+                &terminal_claimed,
+                ScheduleEvent::Completed {
+                    job_id: "shared-job".into(),
+                    label: "shared".into(),
+                    kind: ScheduleKind::Swarm,
+                    result: result.into(),
+                    failed: result != "runner",
+                    requests: Vec::new(),
+                },
+            )
+            .await;
+        }
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ScheduleEvent::Completed { result, .. }) if result == "runner"
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "terminal CAS must reject the loser"
+        );
     }
 
     #[test]

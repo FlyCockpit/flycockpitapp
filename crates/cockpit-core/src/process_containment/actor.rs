@@ -19,8 +19,8 @@ use crate::db::Db;
 use crate::db::execution_containments::{CasExecutionContainment, ExecutionContainmentRow};
 
 use super::adapter::{
-    AdapterHandle, ContainerExecRequest, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest,
-    SharedAdapter,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest, NativeChildIo,
+    NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
 };
 use super::state_machine::reduce;
 use super::types::{
@@ -617,11 +617,49 @@ struct PendingUnpublished {
     waiters: Vec<UnpublishedCompletion>,
 }
 
+struct PreparedIoAllocation {
+    record: ContainmentRecord,
+    request: NativeIoSpawnRequest,
+    cancellation: tokio_util::sync::CancellationToken,
+    reply: IoCreateReply,
+}
+
+struct PreparedNativeAllocation {
+    record: ContainmentRecord,
+    request: NativeSpawnRequest,
+    reply: Reply<Result<ContainmentLease, ContainmentError>>,
+}
+
+struct PreparedContainerAllocation {
+    record: ContainmentRecord,
+    request: ContainerExecRequest,
+    reply: Reply<Result<ContainmentLease, ContainmentError>>,
+}
+
+enum AllocationCompletion {
+    Native {
+        prepared: PreparedNativeAllocation,
+        result: Result<AllocatedContainment, ContainmentError>,
+    },
+    Io {
+        prepared: PreparedIoAllocation,
+        result: Result<AllocatedNativeIo, ContainmentError>,
+    },
+    Container {
+        prepared: PreparedContainerAllocation,
+        result: Result<AllocatedContainment, ContainmentError>,
+    },
+}
+
 type IoCreateReply = Reply<Result<(ContainmentLease, NativeChildIo), ContainmentError>>;
 
 enum ReconciliationCompletion {
     Empty(Reply<Result<(), ContainmentError>>),
-    CancelledIo(IoCreateReply),
+    FailedLease(
+        Reply<Result<ContainmentLease, ContainmentError>>,
+        ContainmentError,
+    ),
+    FailedIo(IoCreateReply, ContainmentError),
 }
 
 enum UnpublishedCompletion {
@@ -632,6 +670,8 @@ enum UnpublishedCompletion {
 const RECONCILIATION_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const ACTOR_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+/// Prevent a permanently ready ordinary queue from starving due cleanup.
+const MAX_ORDINARY_OP_BURST: usize = 8;
 
 async fn actor_loop(
     db: Db,
@@ -651,25 +691,60 @@ async fn actor_loop(
         pending_unpublished: Vec::new(),
     };
     let mut reconciliation_open = true;
+    let mut ordinary_op_burst = 0usize;
+    let mut allocations = tokio::task::JoinSet::new();
+    let mut begin_shutdown_waiters = Vec::new();
     loop {
         // `watch::changed` is edge-triggered, but shutdown is a level. Check
         // it before selecting so a ready queued operation can never win after
         // the owner has closed intake.
         if *shutdown_rx.borrow_and_update() {
-            drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+            drain_shutdown_reconciliation(
+                &mut state,
+                &mut rx,
+                &mut reconciliation_rx,
+                &mut allocations,
+            )
+            .await;
             break;
         }
-        let op = if state.pending_reconciliation.is_empty() && state.pending_unpublished.is_empty() {
+        if allocations.is_empty() && !begin_shutdown_waiters.is_empty() {
+            finish_begin_shutdown(&mut state, &mut begin_shutdown_waiters).await;
+        }
+        let cleanup_due = state
+            .pending_reconciliation
+            .iter()
+            .map(|pending| pending.next_attempt)
+            .chain(state.pending_unpublished.iter().map(|pending| pending.next_attempt))
+            .min()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        if cleanup_due && ordinary_op_burst >= MAX_ORDINARY_OP_BURST {
+            reconcile_one_pending(&mut state).await;
+            ordinary_op_burst = 0;
+            continue;
+        }
+        let op = if state.pending_reconciliation.is_empty()
+            && state.pending_unpublished.is_empty()
+        {
             tokio::select! {
                 biased;
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow_and_update() {
-                        drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                        drain_shutdown_reconciliation(
+                            &mut state,
+                            &mut rx,
+                            &mut reconciliation_rx,
+                            &mut allocations,
+                        )
+                        .await;
                         break;
                     }
                     continue;
                 }
-                op = rx.recv() => op,
+                completed = allocations.join_next(), if !allocations.is_empty() => {
+                    handle_allocation_join(&mut state, completed).await;
+                    continue;
+                }
                 request = reconciliation_rx.recv(), if reconciliation_open => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
@@ -678,18 +753,28 @@ async fn actor_loop(
                     }
                     continue;
                 }
+                op = rx.recv() => op,
             }
         } else {
             tokio::select! {
                 biased;
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow_and_update() {
-                        drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                        drain_shutdown_reconciliation(
+                            &mut state,
+                            &mut rx,
+                            &mut reconciliation_rx,
+                            &mut allocations,
+                        )
+                        .await;
                         break;
                     }
                     continue;
                 }
-                op = rx.recv() => op,
+                completed = allocations.join_next(), if !allocations.is_empty() => {
+                    handle_allocation_join(&mut state, completed).await;
+                    continue;
+                }
                 request = reconciliation_rx.recv(), if reconciliation_open => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
@@ -698,6 +783,7 @@ async fn actor_loop(
                     }
                     continue;
                 }
+                op = rx.recv() => op,
                 _ = tokio::time::sleep_until(
                     state.pending_reconciliation
                         .iter()
@@ -707,6 +793,7 @@ async fn actor_loop(
                         .expect("non-empty reconciliation queue has a deadline")
                 ) => {
                     reconcile_one_pending(&mut state).await;
+                    ordinary_op_burst = 0;
                     continue;
                 }
             }
@@ -715,31 +802,26 @@ async fn actor_loop(
             // Every sender disappeared without the explicit owner signal.
             // This is still a shutdown boundary: retain and reconcile all
             // live ownership before the actor thread exits.
-            drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+            drain_shutdown_reconciliation(
+                &mut state,
+                &mut rx,
+                &mut reconciliation_rx,
+                &mut allocations,
+            )
+            .await;
             break;
         };
+        ordinary_op_burst = ordinary_op_burst.saturating_add(1);
         match op {
             Op::SafeMetadata { reply } => {
                 let _ = reply.send(state.adapter.safe_metadata());
             }
             Op::BeginShutdown { reply } => {
                 state.intake_closed = true;
-                // Terminate every live containment.
-                let leases: Vec<_> = state
-                    .live
-                    .iter()
-                    .map(|(id, e)| ContainmentLease {
-                        containment_id: *id,
-                        session_id: e.record.session_id,
-                        generation: e.record.generation,
-                        guarantee: e.record.guarantee,
-                        token: e.lease_token.clone(),
-                    })
-                    .collect();
-                for lease in leases {
-                    let _ = terminate_one(&mut state, lease).await;
-                }
-                let _ = reply.send(());
+                // The accepted allocation set is part of the shutdown
+                // snapshot. Defer acknowledgement until each allocation has
+                // published or transferred to request-specific cleanup.
+                begin_shutdown_waiters.push(reply);
             }
             Op::CreateAndSpawn {
                 session_id,
@@ -750,8 +832,7 @@ async fn actor_loop(
                 require_proven,
                 reply,
             } => {
-                let unpublished_before = state.pending_unpublished.len();
-                let result = create_native(
+                match prepare_native(
                     &mut state,
                     session_id,
                     operation_id,
@@ -759,20 +840,20 @@ async fn actor_loop(
                     args,
                     cwd,
                     require_proven,
+                    reply,
                 )
-                .await;
-                if state.pending_unpublished.len() > unpublished_before {
-                    let error = match result {
-                        Err(error) => error,
-                        Ok(_) => unreachable!("unpublished allocation cannot return a lease"),
-                    };
-                    state.pending_unpublished[unpublished_before]
-                        .waiters
-                        .push(UnpublishedCompletion::Lease(reply, error));
-                    continue;
-                }
-                if let Err(Ok(lease)) = reply.send(result) {
-                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
+                .await
+                {
+                    Ok(prepared) => {
+                        let adapter = state.adapter.clone();
+                        allocations.spawn(async move {
+                            let result = adapter.create_and_spawn(prepared.request.clone()).await;
+                            AllocationCompletion::Native { prepared, result }
+                        });
+                    }
+                    Err((reply, error)) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
             Op::CreateAndSpawnWithIo {
@@ -786,11 +867,13 @@ async fn actor_loop(
                 cancellation,
                 reply,
             } => {
-                let unpublished_before = state.pending_unpublished.len();
-                let result = if cancellation.is_cancelled() {
-                    Err(ContainmentError::Internal("allocation request cancelled".into()))
-                } else {
-                    create_native_with_io(
+                if cancellation.is_cancelled() {
+                    let _ = reply.send(Err(ContainmentError::Internal(
+                        "allocation request cancelled".into(),
+                    )));
+                    continue;
+                }
+                match prepare_native_with_io(
                     &mut state,
                     session_id,
                     operation_id,
@@ -799,40 +882,23 @@ async fn actor_loop(
                     env,
                     cwd,
                     require_proven,
+                    cancellation,
+                    reply,
                 )
                 .await
-                };
-                if let Ok((lease, _)) = result.as_ref()
-                    && cancellation.is_cancelled()
                 {
-                    enqueue_pending_reconciliation_with_completion(
-                        &mut state,
-                        lease.clone(),
-                        ReconciliationCompletion::CancelledIo(reply),
-                    );
-                    continue;
-                }
-                if state.pending_unpublished.len() > unpublished_before {
-                    // Allocation crossed the spawn boundary but publication
-                    // failed. Attach this request to only the item created by
-                    // this operation; unrelated cleanup must not delay it.
-                    let error = match result {
-                        Err(_error) if cancellation.is_cancelled() => ContainmentError::Internal(
-                            "allocation request cancelled after cleanup".into(),
-                        ),
-                        Err(error) => error,
-                        Ok(_) => unreachable!("published allocation cannot remain unpublished"),
-                    };
-                    state.pending_unpublished[unpublished_before]
-                        .waiters
-                        .push(UnpublishedCompletion::Io(reply, error));
-                    continue;
-                }
-                if let Err(Ok((lease, _io))) = reply.send(result) {
-                    // The requester was cancelled after allocation. Ownership
-                    // stays with the actor, so reclaim the unpublished lease
-                    // instead of leaving a live group with no external owner.
-                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
+                    Ok(prepared) => {
+                        let adapter = state.adapter.clone();
+                        allocations.spawn(async move {
+                            let result = adapter
+                                .create_and_spawn_with_io(prepared.request.clone())
+                                .await;
+                            AllocationCompletion::Io { prepared, result }
+                        });
+                    }
+                    Err((reply, error)) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
             Op::CreateContainerAndExec {
@@ -845,8 +911,7 @@ async fn actor_loop(
                 require_proven,
                 reply,
             } => {
-                let unpublished_before = state.pending_unpublished.len();
-                let result = create_container(
+                match prepare_container(
                     &mut state,
                     session_id,
                     operation_id,
@@ -855,20 +920,22 @@ async fn actor_loop(
                     installation_id,
                     nonce,
                     require_proven,
+                    reply,
                 )
-                .await;
-                if state.pending_unpublished.len() > unpublished_before {
-                    let error = match result {
-                        Err(error) => error,
-                        Ok(_) => unreachable!("unpublished allocation cannot return a lease"),
-                    };
-                    state.pending_unpublished[unpublished_before]
-                        .waiters
-                        .push(UnpublishedCompletion::Lease(reply, error));
-                    continue;
-                }
-                if let Err(Ok(lease)) = reply.send(result) {
-                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
+                .await
+                {
+                    Ok(prepared) => {
+                        let adapter = state.adapter.clone();
+                        allocations.spawn(async move {
+                            let result = adapter
+                                .create_container_and_exec(prepared.request.clone())
+                                .await;
+                            AllocationCompletion::Container { prepared, result }
+                        });
+                    }
+                    Err((reply, error)) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
             Op::Terminate { lease, reply } => {
@@ -916,6 +983,27 @@ async fn actor_loop(
     }
 }
 
+async fn finish_begin_shutdown(state: &mut ActorState, waiters: &mut Vec<Reply<()>>) {
+    let leases: Vec<_> = state
+        .live
+        .iter()
+        .filter(|(_, entry)| entry.record.state.is_nonempty())
+        .map(|(containment_id, entry)| ContainmentLease {
+            containment_id: *containment_id,
+            session_id: entry.record.session_id,
+            generation: entry.record.generation,
+            guarantee: entry.record.guarantee,
+            token: entry.lease_token.clone(),
+        })
+        .collect();
+    for lease in leases {
+        let _ = terminate_one(state, lease).await;
+    }
+    for reply in waiters.drain(..) {
+        let _ = reply.send(());
+    }
+}
+
 fn enqueue_pending_reconciliation(state: &mut ActorState, request: ReconciliationRequest) {
     let completion = request.completion.map(ReconciliationCompletion::Empty);
     enqueue_pending_reconciliation_inner(state, request.lease, completion);
@@ -953,15 +1041,30 @@ fn enqueue_pending_reconciliation_inner(
 
 async fn drain_shutdown_reconciliation(
     state: &mut ActorState,
+    rx: &mut mpsc::Receiver<Op>,
     reconciliation_rx: &mut mpsc::UnboundedReceiver<ReconciliationRequest>,
+    allocations: &mut tokio::task::JoinSet<AllocationCompletion>,
 ) {
     state.intake_closed = true;
+    // Close ordinary intake at the shutdown observation boundary. Every
+    // already-queued request receives a bounded terminal reply; new sends are
+    // rejected by the closed channel instead of hanging behind reconciliation.
+    rx.close();
+    reject_queued_ops_after_shutdown(rx, &state.adapter);
     // Freeze cleanup intake before taking the live snapshot. `close` rejects
     // later ownership transfers; all requests accepted before this boundary
     // remain readable and are drained below.
     reconciliation_rx.close();
     while let Ok(request) = reconciliation_rx.try_recv() {
         enqueue_pending_reconciliation(state, request);
+    }
+    // Allocation tasks are actor-owned once accepted. Do not abort or drop
+    // them at shutdown: an adapter may already have crossed its native spawn
+    // boundary. Poll every task to completion, then route its exact request
+    // through normal publication-or-reconciliation handling.
+    while !allocations.is_empty() {
+        let completed = allocations.join_next().await;
+        handle_allocation_join(state, completed).await;
     }
     let live: Vec<_> = state
         .live
@@ -982,6 +1085,63 @@ async fn drain_shutdown_reconciliation(
         reconcile_one_pending(state).await;
         if !state.pending_reconciliation.is_empty() || !state.pending_unpublished.is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+async fn handle_allocation_join(
+    state: &mut ActorState,
+    completed: Option<Result<AllocationCompletion, tokio::task::JoinError>>,
+) {
+    match completed {
+        Some(Ok(AllocationCompletion::Native { prepared, result })) => {
+            finish_native(state, prepared, result).await;
+        }
+        Some(Ok(AllocationCompletion::Io { prepared, result })) => {
+            finish_native_with_io(state, prepared, result).await;
+        }
+        Some(Ok(AllocationCompletion::Container { prepared, result })) => {
+            finish_container(state, prepared, result).await;
+        }
+        Some(Err(error)) => {
+            // Adapter implementations are trusted daemon code. A panic is a
+            // process-ownership invariant violation because the task's reply
+            // and any not-yet-returned opaque handle were unwound together.
+            tracing::error!(%error, "containment allocation task failed");
+        }
+        None => {}
+    }
+}
+
+fn reject_queued_ops_after_shutdown(rx: &mut mpsc::Receiver<Op>, adapter: &SharedAdapter) {
+    while let Ok(op) = rx.try_recv() {
+        let error = || ContainmentError::ShutdownIntakeClosed;
+        match op {
+            Op::CreateAndSpawn { reply, .. }
+            | Op::CreateContainerAndExec { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Op::CreateAndSpawnWithIo { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Op::Terminate { reply, .. }
+            | Op::BeginSessionDeletion { reply, .. }
+            | Op::FinishSessionDeletion { reply, .. }
+            | Op::AwaitAllEmpty { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Op::AwaitEmpty { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Op::Recover { reply } => {
+                let _ = reply.send(Err(error()));
+            }
+            Op::SafeMetadata { reply } => {
+                let _ = reply.send(adapter.safe_metadata());
+            }
+            Op::BeginShutdown { reply } | Op::LateCallback { reply, .. } => {
+                let _ = reply.send(());
+            }
         }
     }
 }
@@ -1064,17 +1224,19 @@ async fn reconcile_one_pending(state: &mut ActorState) {
                     ReconciliationCompletion::Empty(waiter) => {
                         let _ = waiter.send(Ok(()));
                     }
-                    ReconciliationCompletion::CancelledIo(waiter) => {
-                        let _ = waiter.send(Err(ContainmentError::Internal(
-                            "allocation request cancelled after cleanup".into(),
-                        )));
+                    ReconciliationCompletion::FailedLease(waiter, error) => {
+                        let _ = waiter.send(Err(error));
+                    }
+                    ReconciliationCompletion::FailedIo(waiter, error) => {
+                        let _ = waiter.send(Err(error));
                     }
                 }
             }
         }
         // The actor remains the sole owner and retries later. Other actor
-        // commands get priority at the select above, so a slow/uncertain
-        // cleanup cannot become a queue-saturation spin or starve shutdown.
+        // The actor remains responsive between bounded attempts, so a slow or
+        // uncertain cleanup cannot become a queue-saturation spin. The
+        // shutdown control branch retains absolute priority.
         _ => {
             pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
             pending.backoff = pending
@@ -1086,7 +1248,7 @@ async fn reconcile_one_pending(state: &mut ActorState) {
     }
 }
 
-async fn create_native(
+async fn prepare_native(
     state: &mut ActorState,
     session_id: Uuid,
     operation_id: String,
@@ -1094,18 +1256,25 @@ async fn create_native(
     args: Vec<String>,
     cwd: PathBuf,
     require_proven: bool,
-) -> Result<ContainmentLease, ContainmentError> {
+    reply: Reply<Result<ContainmentLease, ContainmentError>>,
+) -> Result<
+    PreparedNativeAllocation,
+    (
+        Reply<Result<ContainmentLease, ContainmentError>>,
+        ContainmentError,
+    ),
+> {
     if state.intake_closed {
-        return Err(ContainmentError::ShutdownIntakeClosed);
+        return Err((reply, ContainmentError::ShutdownIntakeClosed));
     }
-    if state.deleting_sessions.contains(&session_id)
-        || state
-            .db
-            .is_session_deleting(session_id)
-            .await
-            .map_err(|e| ContainmentError::Internal(e.to_string()))?
-    {
-        return Err(ContainmentError::SessionDeleting);
+    let deleting = match state.db.is_session_deleting(session_id).await {
+        Ok(deleting) => deleting,
+        Err(error) => {
+            return Err((reply, ContainmentError::Internal(error.to_string())));
+        }
+    };
+    if state.deleting_sessions.contains(&session_id) || deleting {
+        return Err((reply, ContainmentError::SessionDeleting));
     }
 
     let containment_id = Uuid::new_v4();
@@ -1124,13 +1293,18 @@ async fn create_native(
         guarantee,
         now_wall_ms: now,
     };
-    let mut record = match reduce(None, event) {
+    let record = match reduce(None, event) {
         ReduceResult::Applied(r) => *r,
         other => {
-            return Err(ContainmentError::Internal(format!("reduce: {other:?}")));
+            return Err((
+                reply,
+                ContainmentError::Internal(format!("reduce: {other:?}")),
+            ));
         }
     };
-    persist_insert(state, &record).await?;
+    if let Err(error) = persist_insert(state, &record).await {
+        return Err((reply, error));
+    }
 
     if require_proven && guarantee == ContainmentGuarantee::Unsupported {
         let reason = state
@@ -1147,51 +1321,86 @@ async fn create_native(
             },
         ) {
             ReduceResult::Applied(r) => *r,
-            o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+            other => {
+                return Err((
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            }
         };
-        persist_cas(state, &record, &rec).await?;
-        return Err(ContainmentError::DescendantContainmentUnavailable { reason });
+        if let Err(error) = persist_cas(state, &record, &rec).await {
+            return Err((reply, error));
+        }
+        return Err((
+            reply,
+            ContainmentError::DescendantContainmentUnavailable { reason },
+        ));
     }
 
-    let allocated = match state
-        .adapter
-        .create_and_spawn(NativeSpawnRequest {
+    Ok(PreparedNativeAllocation {
+        record,
+        request: NativeSpawnRequest {
             containment_id,
             session_id,
             generation,
-            operation_id: operation_id.clone(),
+            operation_id,
             program,
             args,
             cwd,
             require_proven,
-        })
-        .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            let reason = match &e {
-                ContainmentError::DescendantContainmentUnavailable { reason } => reason.clone(),
-                other => other.to_string(),
-            };
-            let rec = match reduce(
-                Some(record.clone()),
-                ContainmentEvent::MarkUnsupported {
+        },
+        reply,
+    })
+}
+
+async fn finish_native(
+    state: &mut ActorState,
+    prepared: PreparedNativeAllocation,
+    result: Result<AllocatedContainment, ContainmentError>,
+) {
+    let PreparedNativeAllocation {
+        mut record,
+        request,
+        reply,
+    } = prepared;
+    let containment_id = request.containment_id;
+    let session_id = request.session_id;
+    let generation = request.generation;
+    let require_proven = request.require_proven;
+    let allocated = match result {
+        Ok(allocated) => allocated,
+        Err(error) => {
+            let terminal = match &error {
+                ContainmentError::DescendantContainmentUnavailable { reason } => {
+                    ContainmentEvent::MarkUnsupported {
+                        generation,
+                        reason: reason.clone(),
+                        now_wall_ms: wall_ms(),
+                    }
+                }
+                _ => ContainmentEvent::CreateFailed {
                     generation,
-                    reason: reason.clone(),
                     now_wall_ms: wall_ms(),
                 },
-            ) {
-                ReduceResult::Applied(r) => *r,
-                o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            persist_cas(state, &record, &rec).await?;
-            return Err(e);
+            let failed = match reduce(Some(record.clone()), terminal) {
+                ReduceResult::Applied(record) => *record,
+                other => {
+                    let _ = reply.send(Err(ContainmentError::Internal(format!(
+                        "{other:?}"
+                    ))));
+                    return;
+                }
+            };
+            let reply_result = match persist_cas(state, &record, &failed).await {
+                Ok(()) => Err(error),
+                Err(persist_error) => Err(persist_error),
+            };
+            let _ = reply.send(reply_result);
+            return;
         }
     };
 
-    // Adapter success transfers an opaque live handle to the actor. Install
-    // rollback ownership before any fallible validation/reduction/persistence;
-    // no early return below may silently detach that allocation.
     let rollback_index = state.pending_unpublished.len();
     reclaim_unpublished_allocation(
         state,
@@ -1201,9 +1410,15 @@ async fn create_native(
     );
 
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        return Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: "adapter returned a non-proven native allocation".into(),
-        });
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Lease(
+                reply,
+                ContainmentError::DescendantContainmentUnavailable {
+                    reason: "adapter returned a non-proven native allocation".into(),
+                },
+            ));
+        return;
     }
 
     record = match reduce(
@@ -1215,9 +1430,22 @@ async fn create_native(
         },
     ) {
         ReduceResult::Applied(r) => *r,
-        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+        other => {
+            state.pending_unpublished[rollback_index]
+                .waiters
+                .push(UnpublishedCompletion::Lease(
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            return;
+        }
     };
-    persist_cas_from_creating(state, &record).await?;
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Lease(reply, error));
+        return;
+    }
     state.pending_unpublished.swap_remove(rollback_index);
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
@@ -1229,13 +1457,33 @@ async fn create_native(
             lease_token: token.clone(),
         },
     );
-    Ok(ContainmentLease {
+    let lease = ContainmentLease {
         containment_id,
         session_id,
         generation,
         guarantee: allocated.guarantee,
         token,
-    })
+    };
+    if state.intake_closed || state.deleting_sessions.contains(&session_id) {
+        let error = if state.intake_closed {
+            ContainmentError::ShutdownIntakeClosed
+        } else {
+            ContainmentError::SessionDeleting
+        };
+        enqueue_pending_reconciliation_with_completion(
+            state,
+            lease,
+            ReconciliationCompletion::FailedLease(reply, error),
+        );
+    } else if let Err(Ok(lease)) = reply.send(Ok(lease)) {
+        enqueue_pending_reconciliation(
+            state,
+            ReconciliationRequest {
+                lease,
+                completion: None,
+            },
+        );
+    }
 }
 
 fn reclaim_unpublished_allocation(
@@ -1255,7 +1503,7 @@ fn reclaim_unpublished_allocation(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_native_with_io(
+async fn prepare_native_with_io(
     state: &mut ActorState,
     session_id: Uuid,
     operation_id: String,
@@ -1264,18 +1512,20 @@ async fn create_native_with_io(
     env: std::collections::BTreeMap<String, String>,
     cwd: PathBuf,
     require_proven: bool,
-) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
+    cancellation: tokio_util::sync::CancellationToken,
+    reply: IoCreateReply,
+) -> Result<PreparedIoAllocation, (IoCreateReply, ContainmentError)> {
     if state.intake_closed {
-        return Err(ContainmentError::ShutdownIntakeClosed);
+        return Err((reply, ContainmentError::ShutdownIntakeClosed));
     }
-    if state.deleting_sessions.contains(&session_id)
-        || state
-            .db
-            .is_session_deleting(session_id)
-            .await
-            .map_err(|error| ContainmentError::Internal(error.to_string()))?
-    {
-        return Err(ContainmentError::SessionDeleting);
+    let deleting = match state.db.is_session_deleting(session_id).await {
+        Ok(deleting) => deleting,
+        Err(error) => {
+            return Err((reply, ContainmentError::Internal(error.to_string())));
+        }
+    };
+    if state.deleting_sessions.contains(&session_id) || deleting {
+        return Err((reply, ContainmentError::SessionDeleting));
     }
 
     let containment_id = Uuid::new_v4();
@@ -1291,11 +1541,18 @@ async fn create_native_with_io(
         guarantee,
         now_wall_ms: now,
     };
-    let mut record = match reduce(None, event) {
+    let record = match reduce(None, event) {
         ReduceResult::Applied(record) => *record,
-        other => return Err(ContainmentError::Internal(format!("reduce: {other:?}"))),
+        other => {
+            return Err((
+                reply,
+                ContainmentError::Internal(format!("reduce: {other:?}")),
+            ));
+        }
     };
-    persist_insert(state, &record).await?;
+    if let Err(error) = persist_insert(state, &record).await {
+        return Err((reply, error));
+    }
 
     if require_proven && guarantee == ContainmentGuarantee::Unsupported {
         let reason = state
@@ -1312,15 +1569,25 @@ async fn create_native_with_io(
             },
         ) {
             ReduceResult::Applied(record) => *record,
-            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+            other => {
+                return Err((
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            }
         };
-        persist_cas(state, &record, &unsupported).await?;
-        return Err(ContainmentError::DescendantContainmentUnavailable { reason });
+        if let Err(error) = persist_cas(state, &record, &unsupported).await {
+            return Err((reply, error));
+        }
+        return Err((
+            reply,
+            ContainmentError::DescendantContainmentUnavailable { reason },
+        ));
     }
 
-    let allocated = match state
-        .adapter
-        .create_and_spawn_with_io(NativeIoSpawnRequest {
+    Ok(PreparedIoAllocation {
+        record,
+        request: NativeIoSpawnRequest {
             containment_id,
             session_id,
             generation,
@@ -1330,9 +1597,28 @@ async fn create_native_with_io(
             cwd,
             env,
             require_proven,
-        })
-        .await
-    {
+        },
+        cancellation,
+        reply,
+    })
+}
+
+async fn finish_native_with_io(
+    state: &mut ActorState,
+    prepared: PreparedIoAllocation,
+    result: Result<AllocatedNativeIo, ContainmentError>,
+) {
+    let PreparedIoAllocation {
+        mut record,
+        request,
+        cancellation,
+        reply,
+    } = prepared;
+    let containment_id = request.containment_id;
+    let session_id = request.session_id;
+    let generation = request.generation;
+    let require_proven = request.require_proven;
+    let allocated = match result {
         Ok(allocated) => allocated,
         Err(error) => {
             let terminal = match &error {
@@ -1350,10 +1636,19 @@ async fn create_native_with_io(
             };
             let failed = match reduce(Some(record.clone()), terminal) {
                 ReduceResult::Applied(record) => *record,
-                other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+                other => {
+                    let _ = reply.send(Err(ContainmentError::Internal(format!(
+                        "{other:?}"
+                    ))));
+                    return;
+                }
             };
-            persist_cas(state, &record, &failed).await?;
-            return Err(error);
+            let result = match persist_cas(state, &record, &failed).await {
+                Ok(()) => Err(error),
+                Err(persist_error) => Err(persist_error),
+            };
+            let _ = reply.send(result);
+            return;
         }
     };
 
@@ -1366,9 +1661,15 @@ async fn create_native_with_io(
     );
 
     if require_proven && allocated.allocation.guarantee != ContainmentGuarantee::Proven {
-        return Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: "adapter returned a non-proven IO allocation".into(),
-        });
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Io(
+                reply,
+                ContainmentError::DescendantContainmentUnavailable {
+                    reason: "adapter returned a non-proven IO allocation".into(),
+                },
+            ));
+        return;
     }
 
     record = match reduce(
@@ -1380,9 +1681,22 @@ async fn create_native_with_io(
         },
     ) {
         ReduceResult::Applied(record) => *record,
-        other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        other => {
+            state.pending_unpublished[rollback_index]
+                .waiters
+                .push(UnpublishedCompletion::Io(
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            return;
+        }
     };
-    persist_cas_from_creating(state, &record).await?;
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Io(reply, error));
+        return;
+    }
     state.pending_unpublished.swap_remove(rollback_index);
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(
@@ -1393,20 +1707,42 @@ async fn create_native_with_io(
             lease_token: token.clone(),
         },
     );
-    Ok((
-        ContainmentLease {
-            containment_id,
-            session_id,
-            generation,
-            guarantee: allocated.allocation.guarantee,
-            token,
-        },
-        allocated.io,
-    ))
+    let lease = ContainmentLease {
+        containment_id,
+        session_id,
+        generation,
+        guarantee: allocated.allocation.guarantee,
+        token,
+    };
+    if cancellation.is_cancelled()
+        || state.intake_closed
+        || state.deleting_sessions.contains(&session_id)
+    {
+        let error = if state.intake_closed {
+            ContainmentError::ShutdownIntakeClosed
+        } else if state.deleting_sessions.contains(&session_id) {
+            ContainmentError::SessionDeleting
+        } else {
+            ContainmentError::Internal("allocation request cancelled after cleanup".into())
+        };
+        enqueue_pending_reconciliation_with_completion(
+            state,
+            lease,
+            ReconciliationCompletion::FailedIo(reply, error),
+        );
+    } else if let Err(Ok((lease, _io))) = reply.send(Ok((lease, allocated.io))) {
+        enqueue_pending_reconciliation(
+            state,
+            ReconciliationRequest {
+                lease,
+                completion: None,
+            },
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn create_container(
+async fn prepare_container(
     state: &mut ActorState,
     session_id: Uuid,
     operation_id: String,
@@ -1415,18 +1751,25 @@ async fn create_container(
     installation_id: String,
     nonce: String,
     require_proven: bool,
-) -> Result<ContainmentLease, ContainmentError> {
+    reply: Reply<Result<ContainmentLease, ContainmentError>>,
+) -> Result<
+    PreparedContainerAllocation,
+    (
+        Reply<Result<ContainmentLease, ContainmentError>>,
+        ContainmentError,
+    ),
+> {
     if state.intake_closed {
-        return Err(ContainmentError::ShutdownIntakeClosed);
+        return Err((reply, ContainmentError::ShutdownIntakeClosed));
     }
-    if state.deleting_sessions.contains(&session_id)
-        || state
-            .db
-            .is_session_deleting(session_id)
-            .await
-            .map_err(|e| ContainmentError::Internal(e.to_string()))?
-    {
-        return Err(ContainmentError::SessionDeleting);
+    let deleting = match state.db.is_session_deleting(session_id).await {
+        Ok(deleting) => deleting,
+        Err(error) => {
+            return Err((reply, ContainmentError::Internal(error.to_string())));
+        }
+    };
+    if state.deleting_sessions.contains(&session_id) || deleting {
+        return Err((reply, ContainmentError::SessionDeleting));
     }
 
     let containment_id = Uuid::new_v4();
@@ -1435,7 +1778,7 @@ async fn create_container(
     let platform_kind = state.adapter.platform_kind();
     let guarantee = state.adapter.guarantee();
 
-    let mut record = match reduce(
+    let record = match reduce(
         None,
         ContainmentEvent::BeginCreate {
             containment_id,
@@ -1448,9 +1791,16 @@ async fn create_container(
         },
     ) {
         ReduceResult::Applied(r) => *r,
-        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+        other => {
+            return Err((
+                reply,
+                ContainmentError::Internal(format!("{other:?}")),
+            ));
+        }
     };
-    persist_insert(state, &record).await?;
+    if let Err(error) = persist_insert(state, &record).await {
+        return Err((reply, error));
+    }
 
     if require_proven && guarantee == ContainmentGuarantee::Unsupported {
         let reason = state
@@ -1467,15 +1817,25 @@ async fn create_container(
             },
         ) {
             ReduceResult::Applied(record) => *record,
-            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+            other => {
+                return Err((
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            }
         };
-        persist_cas(state, &record, &unsupported).await?;
-        return Err(ContainmentError::DescendantContainmentUnavailable { reason });
+        if let Err(error) = persist_cas(state, &record, &unsupported).await {
+            return Err((reply, error));
+        }
+        return Err((
+            reply,
+            ContainmentError::DescendantContainmentUnavailable { reason },
+        ));
     }
 
-    let allocated = match state
-        .adapter
-        .create_container_and_exec(ContainerExecRequest {
+    Ok(PreparedContainerAllocation {
+        record,
+        request: ContainerExecRequest {
             containment_id,
             session_id,
             generation,
@@ -1485,28 +1845,58 @@ async fn create_container(
             require_proven,
             installation_id,
             nonce,
-        })
-        .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            let reason = e.to_string();
-            let rec = match reduce(
-                Some(record.clone()),
-                ContainmentEvent::MarkUnsupported {
+        },
+        reply,
+    })
+}
+
+async fn finish_container(
+    state: &mut ActorState,
+    prepared: PreparedContainerAllocation,
+    result: Result<AllocatedContainment, ContainmentError>,
+) {
+    let PreparedContainerAllocation {
+        mut record,
+        request,
+        reply,
+    } = prepared;
+    let containment_id = request.containment_id;
+    let session_id = request.session_id;
+    let generation = request.generation;
+    let require_proven = request.require_proven;
+    let allocated = match result {
+        Ok(allocated) => allocated,
+        Err(error) => {
+            let terminal = match &error {
+                ContainmentError::DescendantContainmentUnavailable { reason } => {
+                    ContainmentEvent::MarkUnsupported {
+                        generation,
+                        reason: reason.clone(),
+                        now_wall_ms: wall_ms(),
+                    }
+                }
+                _ => ContainmentEvent::CreateFailed {
                     generation,
-                    reason,
                     now_wall_ms: wall_ms(),
                 },
-            ) {
-                ReduceResult::Applied(r) => *r,
-                o => return Err(ContainmentError::Internal(format!("{o:?}"))),
             };
-            persist_cas(state, &record, &rec).await?;
-            return Err(e);
+            let failed = match reduce(Some(record.clone()), terminal) {
+                ReduceResult::Applied(record) => *record,
+                other => {
+                    let _ = reply.send(Err(ContainmentError::Internal(format!(
+                        "{other:?}"
+                    ))));
+                    return;
+                }
+            };
+            let reply_result = match persist_cas(state, &record, &failed).await {
+                Ok(()) => Err(error),
+                Err(persist_error) => Err(persist_error),
+            };
+            let _ = reply.send(reply_result);
+            return;
         }
     };
-
     let rollback_index = state.pending_unpublished.len();
     reclaim_unpublished_allocation(
         state,
@@ -1516,9 +1906,15 @@ async fn create_container(
     );
 
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        return Err(ContainmentError::DescendantContainmentUnavailable {
-            reason: "adapter returned a non-proven container allocation".into(),
-        });
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Lease(
+                reply,
+                ContainmentError::DescendantContainmentUnavailable {
+                    reason: "adapter returned a non-proven container allocation".into(),
+                },
+            ));
+        return;
     }
 
     record = match reduce(
@@ -1530,9 +1926,22 @@ async fn create_container(
         },
     ) {
         ReduceResult::Applied(r) => *r,
-        o => return Err(ContainmentError::Internal(format!("{o:?}"))),
+        other => {
+            state.pending_unpublished[rollback_index]
+                .waiters
+                .push(UnpublishedCompletion::Lease(
+                    reply,
+                    ContainmentError::Internal(format!("{other:?}")),
+                ));
+            return;
+        }
     };
-    persist_cas_from_creating(state, &record).await?;
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        state.pending_unpublished[rollback_index]
+            .waiters
+            .push(UnpublishedCompletion::Lease(reply, error));
+        return;
+    }
     state.pending_unpublished.swap_remove(rollback_index);
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
@@ -1544,13 +1953,33 @@ async fn create_container(
             lease_token: token.clone(),
         },
     );
-    Ok(ContainmentLease {
+    let lease = ContainmentLease {
         containment_id,
         session_id,
         generation,
         guarantee: allocated.guarantee,
         token,
-    })
+    };
+    if state.intake_closed || state.deleting_sessions.contains(&session_id) {
+        let error = if state.intake_closed {
+            ContainmentError::ShutdownIntakeClosed
+        } else {
+            ContainmentError::SessionDeleting
+        };
+        enqueue_pending_reconciliation_with_completion(
+            state,
+            lease,
+            ReconciliationCompletion::FailedLease(reply, error),
+        );
+    } else if let Err(Ok(lease)) = reply.send(Ok(lease)) {
+        enqueue_pending_reconciliation(
+            state,
+            ReconciliationRequest {
+                lease,
+                completion: None,
+            },
+        );
+    }
 }
 
 async fn terminate_one(

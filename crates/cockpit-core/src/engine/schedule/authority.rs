@@ -555,6 +555,7 @@ impl ScheduleAuthority {
         // backpressured in a terminal channel send when the driver begins
         // joining it. A passive atomic flag cannot wake that pending send.
         let teardown = tokio_util::sync::CancellationToken::new();
+        let terminal_claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -565,11 +566,13 @@ impl ScheduleAuthority {
             cmd_tx: self.cmd_tx.clone(),
             cancel: cancel.clone(),
             teardown: teardown.clone(),
+            terminal_claimed: terminal_claimed.clone(),
         };
         let panic_job_id = job_id.clone();
         let panic_label = label.clone();
         let panic_event_tx = self.event_tx.clone();
         let panic_teardown = teardown.clone();
+        let panic_terminal_claimed = terminal_claimed;
         let handle = tokio::spawn(async move {
             if let Err(payload) = std::panic::AssertUnwindSafe(swarm::run_swarm(run_ctx))
                 .catch_unwind()
@@ -577,12 +580,13 @@ impl ScheduleAuthority {
             {
                 // A panic/cancellation is otherwise invisible to the driver,
                 // which would strand the registry slot forever. The outer
-                // supervisor is the authoritative terminal producer for this
-                // exceptional path.
+                // supervisor races the runner through their shared terminal
+                // claim for this exceptional path.
                 if !panic_teardown.is_cancelled() {
                     swarm::send_swarm_terminal(
                         &panic_event_tx,
                         &panic_teardown,
+                        &panic_terminal_claimed,
                         ScheduleEvent::Completed {
                             job_id: panic_job_id,
                             label: panic_label,

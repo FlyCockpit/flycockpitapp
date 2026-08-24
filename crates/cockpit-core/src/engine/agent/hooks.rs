@@ -863,9 +863,10 @@ impl CommandRunner for TokioCommandRunner {
         let cancellation_enabled = self.cancellation.is_some();
         // Allocation is part of the hook deadline. Once the bounded actor
         // accepts this request, `allocation_cancel` is its cleanup ticket:
-        // timeout/cancellation requests cancellation and then waits for the
-        // actor's acknowledgement, which is sent only after a crossed spawn
-        // boundary has reached same-generation ProvenEmpty.
+        // timeout/cancellation transfers the request-specific cleanup ticket
+        // to the actor. Allocation is actor-owned after queue acceptance, so
+        // this hook future need not remain pinned behind a stuck platform
+        // allocation; the actor will publish-or-reconcile that exact request.
         let mut allocation = Box::pin(allocation);
         let allocation_deadline = tokio::time::sleep(timeout);
         tokio::pin!(allocation_deadline);
@@ -891,7 +892,6 @@ impl CommandRunner for TokioCommandRunner {
                     AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
                 };
                 allocation_cancel.cancel();
-                let _ = allocation.await;
                 return HookRawOutput {
                     stdout: String::new(),
                     exit_code: None,

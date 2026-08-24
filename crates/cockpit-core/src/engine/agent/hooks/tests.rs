@@ -1122,22 +1122,18 @@ fn observe_hook(event: HookEvent, matcher: &str) -> ResolvedHook {
 
 #[tokio::test]
 async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
-    // Scripted per-event harness. For each wired observe event
-    // (sessionStart / userPromptSubmit / permissionDenied / preCompact /
-    // postCompact / stopFailure from increment 2A, plus subagentStart /
-    // subagentStop / sessionEnd wired in this increment 2B-i):
+    // Scripted per-event acceptance harness. Together with the typed
+    // PRODUCTION_HOOK_BOUNDARIES ownership table, it covers every member of
+    // HookEvent::ALL at its production matcher vocabulary:
     //   1. a hook whose matcher equals the boundary vocabulary fires exactly
     //      one `hook_run` row and receives its first-class typed envelope field
     //      on stdin, and
     //   2. a hook whose matcher is a *lookalike* (a sibling value the boundary
     //      never uses) fires nothing — proving exact-matcher selection, not a
     //      blanket "any hook for this event" dispatch.
-    // The still-unwired `stop` root-continuation event (2B-ii) is deliberately
-    // NOT asserted reachable here.
-    // The typed-field assertions fail to compile against dead-code HEAD (the
-    // `startSource`/`promptSource`/`permissionKind`/`errorClass`/`compactSource`
-    // envelope fields and `ObserveFields` do not exist there), and the row/no-row
-    // assertions fail behaviorally if a boundary's matcher/typed field is wrong.
+    // Stop/tool gates are exercised through their dedicated production-seam
+    // cases below; observe boundaries are driven here. The row/no-row pairs
+    // fail if exact matching regresses into prefix/lookalike acceptance.
     let env = FakeProcessEnv::with_default_resolution();
 
     // sessionStart: matcher `fresh` | `resume`; typed field `startSource`.

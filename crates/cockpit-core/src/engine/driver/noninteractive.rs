@@ -386,7 +386,14 @@ impl NoninteractiveDelegationRegistry {
             .entries
             .get(&key)
             .map(|entry| entry.lifecycle.clone())
-            .unwrap_or_else(|| ChildHookLifecycle::already_started(task_call_id));
+            .unwrap_or_else(|| {
+                ChildHookLifecycle::already_started(
+                    crate::db::task_delegations::delegation_child_lifecycle_id(
+                        task_call_id,
+                        label,
+                    ),
+                )
+            });
         self.entries.insert(
             key,
             NoninteractiveDelegationEntry::running(child_agent, snapshot, lifecycle),
@@ -4987,7 +4994,14 @@ pub(crate) async fn run_noninteractive(
         None,
         steer_target
             .as_ref()
-            .map(|target| ChildHookLifecycle::new(target.task_call_id.clone())),
+            .map(|target| {
+                ChildHookLifecycle::new(
+                    crate::db::task_delegations::delegation_child_lifecycle_id(
+                        &target.task_call_id,
+                        &target.label,
+                    ),
+                )
+            }),
         interrupts,
         cancel,
         approver,
@@ -5877,7 +5891,12 @@ pub(crate) async fn run_noninteractive_resumable(
                         child_cwd,
                         config.clone(),
                         process_containment.clone(),
-                        Some(ChildHookLifecycle::new(task_call_id.clone())),
+                        Some(ChildHookLifecycle::new(
+                            crate::db::task_delegations::delegation_child_lifecycle_id(
+                                &task_call_id,
+                                "default",
+                            ),
+                        )),
                         interrupts.clone(),
                         cancel.clone(),
                         approver.clone(),
@@ -6058,7 +6077,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     // identity. Give every concrete recursive child its own
                     // stable lifecycle key so concurrent start/stop pairs can
                     // never collapse onto the shared batch call id.
-                    let child_hook_id = format!("{task_call_id}:{idx}");
+                    let child_hook_id =
+                        crate::db::task_delegations::delegation_child_lifecycle_id(
+                            &task_call_id,
+                            &entry.label,
+                        );
                     runs.push(async move {
                         // RAII releases each slot as soon as its child ends,
                         // including cancellation, errors, and panics.
@@ -6159,7 +6182,14 @@ mod vnext_child_admission_tests {
     fn recursive_batch_child_lifecycle_ids_are_distinct_from_parent_correlation() {
         let parent = "task-call";
         let ids = (0..3)
-            .map(|idx| ChildHookLifecycle::new(format!("{parent}:{idx}")))
+            .map(|idx| {
+                ChildHookLifecycle::new(
+                    crate::db::task_delegations::delegation_child_lifecycle_id(
+                        parent,
+                        &format!("child-{idx}"),
+                    ),
+                )
+            })
             .map(|lifecycle| lifecycle.subagent_id)
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(ids.len(), 3);

@@ -129,6 +129,9 @@ pub enum ScheduleEvent {
         /// driver teardown that has not drained the ordered marker still
         /// cannot emit a duplicate observe-only stop.
         lifecycle_event_emitted: Arc<AtomicBool>,
+        /// Start rendezvous: the child must not enter its first model turn
+        /// until the driver has dispatched and recorded `subagentStart`.
+        start_ack: tokio::sync::oneshot::Sender<()>,
     },
     /// The detached child completed its controlling `subagentStop` boundary
     /// before publishing its terminal result. This ordered marker lets the
@@ -1452,11 +1455,16 @@ mod tests {
                 .expect("a genuine swarm child must emit an event")
                 .expect("event channel open");
             match first {
-                ScheduleEvent::SwarmChildStarted { subagent_type, .. } => {
+                ScheduleEvent::SwarmChildStarted {
+                    subagent_type,
+                    start_ack,
+                    ..
+                } => {
                     assert_eq!(
                         subagent_type, expected_type,
                         "the start event carries the child agent type"
                     );
+                    let _ = start_ack.send(());
                 }
                 other => panic!("expected SwarmChildStarted for {worker:?}, got {other:?}"),
             }

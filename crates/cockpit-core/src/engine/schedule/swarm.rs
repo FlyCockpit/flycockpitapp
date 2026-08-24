@@ -388,10 +388,12 @@ async fn run_swarm_loop(
     // This task also publishes Completed, preserving FIFO start-before-terminal
     // order on the same authority channel.
     if !spec.worker.is_goal_control() {
+        let (start_ack, start_ready) = tokio::sync::oneshot::channel();
         let started = ScheduleEvent::SwarmChildStarted {
                 job_id: job_id.to_string(),
                 subagent_type: spec.worker.agent_name().to_string(),
                 lifecycle_event_emitted: lifecycle_event_emitted.clone(),
+                start_ack,
             };
         tokio::select! {
             biased;
@@ -399,6 +401,15 @@ async fn run_swarm_loop(
             result = event_tx.send(started) => {
                 result.map_err(|_| anyhow::anyhow!(
                     "swarm lifecycle authority closed before child start could be published"
+                ))?;
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("swarm subagent cancelled before lifecycle start acknowledgement"),
+            result = start_ready => {
+                result.map_err(|_| anyhow::anyhow!(
+                    "swarm lifecycle authority closed before child start was acknowledged"
                 ))?;
             }
         }

@@ -103,34 +103,41 @@ struct TaskDelegationJobWrite {
 
 impl From<TaskDelegationJobUpsert<'_>> for TaskDelegationJobWrite {
     fn from(value: TaskDelegationJobUpsert<'_>) -> Self {
+        let task_call_id = value.task_call_id.to_owned();
         Self {
             session_id: value.session_id,
-            task_call_id: value.task_call_id.to_owned(),
+            task_call_id: task_call_id.clone(),
             function_call_id: value.function_call_id.map(str::to_owned),
             parent_agent: value.parent_agent.to_owned(),
             original_args_json: value.original_args_json.map(str::to_owned),
             children: value
                 .children
                 .iter()
-                .map(DelegationChildInitOwned::from)
+                .map(|child| DelegationChildInitOwned {
+                    label: child.label.to_owned(),
+                    child_uuid: delegation_child_lifecycle_id(&task_call_id, child.label),
+                    child_agent: child.child_agent.to_owned(),
+                    model: child.model.map(str::to_owned),
+                    output_dir: child.output_dir.map(str::to_owned),
+                    requested_cwd: child.requested_cwd.map(str::to_owned),
+                    resolved_cwd: child.resolved_cwd.map(str::to_owned),
+                    todo_ids_json: child.todo_ids_json.map(str::to_owned),
+                })
                 .collect(),
         }
     }
 }
 
-impl From<&DelegationChildInit<'_>> for DelegationChildInitOwned {
-    fn from(value: &DelegationChildInit<'_>) -> Self {
-        Self {
-            label: value.label.to_owned(),
-            child_uuid: Uuid::new_v4().to_string(),
-            child_agent: value.child_agent.to_owned(),
-            model: value.model.map(str::to_owned),
-            output_dir: value.output_dir.map(str::to_owned),
-            requested_cwd: value.requested_cwd.map(str::to_owned),
-            resolved_cwd: value.resolved_cwd.map(str::to_owned),
-            todo_ids_json: value.todo_ids_json.map(str::to_owned),
-        }
-    }
+/// Canonical durable identity for one concrete child of a task call. The
+/// value is stable across retries/recovery and unique within a batch; callers
+/// use this same id for lifecycle start, stop and recovery correlation.
+pub fn delegation_child_lifecycle_id(task_call_id: &str, label: &str) -> String {
+    const NAMESPACE: Uuid = Uuid::from_u128(0x8a4d_56a9_87bf_4f55_aa4d_aeb1_536e_96f0);
+    let mut name = Vec::with_capacity(task_call_id.len() + label.len() + 1);
+    name.extend_from_slice(task_call_id.as_bytes());
+    name.push(0);
+    name.extend_from_slice(label.as_bytes());
+    Uuid::new_v5(&NAMESPACE, &name).to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1002,6 +1009,18 @@ fn decode_child_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<DelegationCh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_lifecycle_identity_is_stable_and_label_scoped() {
+        let first = delegation_child_lifecycle_id("task-call", "left");
+        assert_eq!(
+            first,
+            delegation_child_lifecycle_id("task-call", "left")
+        );
+        assert_ne!(first, delegation_child_lifecycle_id("task-call", "right"));
+        assert_ne!(first, delegation_child_lifecycle_id("other-call", "left"));
+        assert!(Uuid::parse_str(&first).is_ok());
+    }
 
     async fn seed_job(db: &Db, task_call_id: &str, children: &[&str]) -> Uuid {
         let session = db.create_session("p", "/tmp/p", "Build").await.unwrap();

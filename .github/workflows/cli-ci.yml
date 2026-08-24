@@ -17,6 +17,11 @@ name: CLI CI
       - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-preflight.yml"
+      - "dist-workspace.toml"
+      - "infra/systemd/**"
+      - "infra/tmpfiles.d/**"
   pull_request:
     paths:
       - "apps/cli/**"
@@ -29,6 +34,11 @@ name: CLI CI
       - "Cargo.lock"
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-preflight.yml"
+      - "dist-workspace.toml"
+      - "infra/systemd/**"
+      - "infra/tmpfiles.d/**"
   workflow_dispatch:
 
 concurrency:

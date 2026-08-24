@@ -56,16 +56,36 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn primary_gid(uid: u32) -> std::io::Result<u32> {
-    let mut record: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result = std::ptr::null_mut();
-    let mut buffer = vec![0_u8; 16 * 1024];
-    let status = unsafe {
-        libc::getpwuid_r(uid, &mut record, buffer.as_mut_ptr().cast(), buffer.len(), &mut result)
-    };
-    if status != 0 || result.is_null() {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "allowed uid has no account record"))
-    } else {
-        Ok(record.pw_gid)
+    let mut buffer_size = 1024_usize;
+    loop {
+        let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; buffer_size];
+        let status = unsafe {
+            libc::getpwuid_r(uid, &mut record, buffer.as_mut_ptr().cast(), buffer.len(), &mut result)
+        };
+        if status == libc::ERANGE {
+            buffer_size = buffer_size
+                .checked_mul(2)
+                .filter(|size| *size <= 1024 * 1024)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "account record exceeds 1 MiB",
+                    )
+                })?;
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "allowed uid has no account record",
+            ));
+        }
+        return Ok(record.pw_gid);
     }
 }
 

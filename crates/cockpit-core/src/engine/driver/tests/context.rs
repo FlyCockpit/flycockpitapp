@@ -1725,8 +1725,8 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
     assert_eq!(
         *apply_trace.lock().unwrap(),
         [
-            "live_history_swapped",
             "timeline_recorded",
+            "live_history_swapped",
             "compact_ready_emitted",
         ]
     );
@@ -2911,11 +2911,10 @@ async fn compact_hook_event_order(driver: &Driver) -> Vec<String> {
 
 #[tokio::test]
 async fn compact_hooks_fire_pre_before_post_only_on_success() {
-    // Pin the asymmetric (BY DESIGN) preCompact/postCompact contract over the
+    // Pin the transactional preCompact/postCompact contract over the
     // real `do_compact_with_source` boundary:
     //   prepare-fail → 0 pre + 0 post (no compaction attempted)
-    //   apply-fail   → 1 pre + 0 post (preCompact fired before the destructive
-    //                  apply and cannot be retroactively un-fired)
+    //   apply-fail   → 0 pre + 0 post (validation/staging did not commit)
     //   success      → 1 pre + 1 post, preCompact strictly before postCompact
     // Source is "manual" so the auto-compact-gate failure branch is never taken.
 
@@ -2936,7 +2935,7 @@ async fn compact_hooks_fire_pre_before_post_only_on_success() {
         "prepare failure must not fire postCompact"
     );
 
-    // apply-fail → preCompact only.
+    // apply-fail → neither fires.
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     inject_hooks(&mut driver, compact_manual_registry());
     driver.test_compact_force_failure = Some(crate::engine::driver::CompactForceFailure::Apply);
@@ -2944,10 +2943,9 @@ async fn compact_hooks_fire_pre_before_post_only_on_success() {
     driver.do_compact_with_source(&tx, "manual").await;
     drop(tx);
     while rx.recv().await.is_some() {}
-    assert_eq!(
-        observe_hook_events(&driver, "preCompact").await,
-        vec!["failed".to_string()],
-        "apply failure must still fire preCompact (fired before the destructive apply)"
+    assert!(
+        observe_hook_events(&driver, "preCompact").await.is_empty(),
+        "apply failure must NOT fire preCompact"
     );
     assert!(
         observe_hook_events(&driver, "postCompact").await.is_empty(),

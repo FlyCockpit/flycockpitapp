@@ -4813,6 +4813,8 @@ fn session_end_matcher_maps_worker_stop() {
     assert_eq!(WorkerStop::DriverFailed.session_end_matcher(), "error");
     // A driver that exited on its own is a clean completion.
     assert_eq!(WorkerStop::DriverExited.session_end_matcher(), "completed");
+    assert_eq!(WorkerStop::Cancelled.session_end_matcher(), "cancelled");
+    assert_eq!(WorkerStop::Interrupted.session_end_matcher(), "interrupted");
     // An explicit worker stop is a clean completion.
     assert_eq!(WorkerStop::WorkerStopped.session_end_matcher(), "completed");
     // A resumable daemon drain reports `shutdown` (session stays resumable).
@@ -4849,6 +4851,8 @@ fn session_end_matcher_maps_worker_stop() {
     for stop in [
         WorkerStop::DriverFailed,
         WorkerStop::DriverExited,
+        WorkerStop::Cancelled,
+        WorkerStop::Interrupted,
         WorkerStop::WorkerStopped,
         WorkerStop::Shutdown {
             pause_for_resume: true,

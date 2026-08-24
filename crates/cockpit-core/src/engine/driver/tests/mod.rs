@@ -736,6 +736,10 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         history: vec![],
         answering: Some(PendingTaskCall {
             call_id: call_id.to_string(),
+            lifecycle_id: crate::db::task_delegations::delegation_child_lifecycle_id(
+                call_id,
+                "default",
+            ),
             provider_item_id: None,
             function_call_id: Some(function_call_id.to_string()),
             repair_notes: Vec::new(),

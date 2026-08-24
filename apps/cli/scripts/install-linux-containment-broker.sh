@@ -11,16 +11,19 @@ if [ "$#" -ne 1 ]; then
 fi
 
 daemon_user=$1
+payload_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+payload_cli="$payload_root/cockpit"
+payload_broker="$payload_root/cockpit-containment-broker"
 daemon_uid=$(id -u "$daemon_user")
 daemon_gid=$(id -g "$daemon_user")
 case "$daemon_uid:$daemon_gid" in
   *[!0-9:]*|:*) echo "daemon account did not resolve to numeric uid/gid" >&2; exit 1 ;;
 esac
 
-for source in cockpit cockpit-containment-broker \
-  infra/systemd/cockpit-containment-broker@.service \
-  infra/systemd/cockpit-daemon@.service \
-  infra/tmpfiles.d/flycockpit-containment.conf
+for source in "$payload_cli" "$payload_broker" \
+  "$payload_root/infra/systemd/cockpit-containment-broker@.service" \
+  "$payload_root/infra/systemd/cockpit-daemon@.service" \
+  "$payload_root/infra/tmpfiles.d/flycockpit-containment.conf"
 do
   if [ ! -f "$source" ]; then
     echo "missing release artifact: $source" >&2
@@ -33,8 +36,6 @@ if [ -z "$systemd_version" ] || [ "$systemd_version" -lt 253 ]; then
   echo "FlyCockpit containment requires systemd 253 or newer (OpenFile=)" >&2
   exit 1
 fi
-systemd-analyze verify infra/systemd/cockpit-containment-broker@.service infra/systemd/cockpit-daemon@.service
-
 broker_unit="cockpit-containment-broker@$daemon_uid.service"
 daemon_unit="cockpit-daemon@$daemon_uid.service"
 broker_was_active=0
@@ -46,8 +47,8 @@ if systemctl is-active --quiet "$broker_unit"; then broker_was_active=1; fi
 if systemctl is-active --quiet "$daemon_unit"; then daemon_was_active=1; fi
 if systemctl is-enabled --quiet "$broker_unit"; then broker_was_enabled=1; fi
 if systemctl is-enabled --quiet "$daemon_unit"; then daemon_was_enabled=1; fi
-if [ "$daemon_was_active" -eq 0 ] && [ -x /usr/bin/cockpit ] \
-  && runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null 2>&1
+if [ "$daemon_was_active" -eq 0 ] \
+  && runuser -u "$daemon_user" -- "$payload_cli" daemon status --json >/dev/null 2>&1
 then
   detached_was_active=1
 fi
@@ -97,13 +98,16 @@ rollback() {
   rm -rf "$transaction"
   exit "$status"
 }
-trap rollback EXIT HUP INT TERM
+trap rollback EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 systemctl stop "$daemon_unit" "$broker_unit" 2>/dev/null || true
-if [ -x /usr/bin/cockpit ]; then
-  # Stop a legacy detached daemon too. An error aborts the install rather than
-  # permitting two daemon authorities for the same uid.
-  runuser -u "$daemon_user" -- /usr/bin/cockpit daemon stop --grace 30
+if [ "$detached_was_active" -eq 1 ]; then
+  # Address the daemon through its canonical runtime endpoint. This also finds
+  # installs whose launching executable lived outside Cargo home or /usr/bin.
+  runuser -u "$daemon_user" -- "$payload_cli" daemon stop --grace 30
 fi
 
 install -d -m 0755 /etc/flycockpit /usr/libexec/flycockpit /usr/lib/systemd/system /usr/lib/tmpfiles.d
@@ -124,11 +128,16 @@ stage_install() {
   mv -f "$staged" "$destination"
 }
 
-stage_install cockpit /usr/bin/cockpit 0755
-stage_install cockpit-containment-broker /usr/libexec/flycockpit/cockpit-containment-broker 0755
-stage_install infra/systemd/cockpit-containment-broker@.service /usr/lib/systemd/system/cockpit-containment-broker@.service 0644
-stage_install infra/systemd/cockpit-daemon@.service /usr/lib/systemd/system/cockpit-daemon@.service 0644
-stage_install infra/tmpfiles.d/flycockpit-containment.conf /usr/lib/tmpfiles.d/flycockpit-containment.conf 0644
+stage_install "$payload_cli" /usr/bin/cockpit 0755
+stage_install "$payload_broker" /usr/libexec/flycockpit/cockpit-containment-broker 0755
+stage_install "$payload_root/infra/systemd/cockpit-containment-broker@.service" /usr/lib/systemd/system/cockpit-containment-broker@.service 0644
+stage_install "$payload_root/infra/systemd/cockpit-daemon@.service" /usr/lib/systemd/system/cockpit-daemon@.service 0644
+stage_install "$payload_root/infra/tmpfiles.d/flycockpit-containment.conf" /usr/lib/tmpfiles.d/flycockpit-containment.conf 0644
+
+# Verify the exact installed transaction, after both referenced executables
+# exist. A clean host must not fail validation merely because /usr paths were
+# absent before the transaction began.
+systemd-analyze verify /usr/lib/systemd/system/cockpit-containment-broker@.service /usr/lib/systemd/system/cockpit-daemon@.service
 
 capability=/etc/flycockpit/containment-capability-$daemon_uid
 if [ ! -e "$capability" ]; then

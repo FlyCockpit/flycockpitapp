@@ -226,6 +226,10 @@ pub(super) enum WorkerStop {
     },
     DriverFailed,
     DriverExited,
+    /// Explicit terminal user/session cancellation (not a daemon drain).
+    Cancelled,
+    /// An interrupt-park abandonment that terminally closes the session.
+    Interrupted,
     WorkerStopped,
 }
 
@@ -234,6 +238,8 @@ impl WorkerStop {
         match self {
             WorkerStop::DriverFailed => "driver failed",
             WorkerStop::DriverExited => "driver exited",
+            WorkerStop::Cancelled => "session cancelled",
+            WorkerStop::Interrupted => "session interrupted",
             WorkerStop::Shutdown { .. } | WorkerStop::WorkerStopped => "worker stopped",
         }
     }
@@ -251,17 +257,15 @@ impl WorkerStop {
     /// - a driver that exited on its own ⇒ `completed`
     /// - a resumable (`pause_for_resume: true`) daemon drain ⇒ `shutdown`
     ///   (the session stays resumable rather than ending)
-    /// - a non-resumable shutdown or an explicit worker stop ⇒ `completed`
-    ///
-    /// `interrupted` / `cancelled` are reserved matcher tokens for future
-    /// teardown causes; today no `WorkerStop` variant classifies them, so they
-    /// are intentionally not produced (mapping to them would be a
-    /// plausible-but-wrong value). When such a cause is added, extend
-    /// `WorkerStop` and this match together.
+    /// - an explicit cancellation ⇒ `cancelled`
+    /// - terminal interrupt abandonment ⇒ `interrupted`
+    /// - a non-resumable shutdown or an explicit clean worker stop ⇒ `completed`
     pub(super) fn session_end_matcher(&self) -> &'static str {
         match self {
             WorkerStop::DriverFailed => "error",
             WorkerStop::DriverExited => "completed",
+            WorkerStop::Cancelled => "cancelled",
+            WorkerStop::Interrupted => "interrupted",
             WorkerStop::Shutdown {
                 pause_for_resume: true,
                 ..

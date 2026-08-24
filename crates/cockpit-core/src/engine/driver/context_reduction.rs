@@ -1205,15 +1205,11 @@ impl Driver {
         self.do_compact_with_source(tx, "manual").await;
     }
 
-    /// Compaction `preCompact` / `postCompact` hook contract (asymmetric BY
-    /// DESIGN, matching Claude-Code semantics):
-    /// - **PREPARE failure** (assembly/brief/prune) fires NEITHER `preCompact`
-    ///   nor `postCompact` — no compaction was attempted.
-    /// - **APPLY failure** (the successor mutation) fires `preCompact` ONLY:
-    ///   `preCompact` runs strictly before the destructive apply and cannot be
-    ///   retroactively un-fired if the apply then errors; `postCompact` is
-    ///   withheld because no durable successor exists.
-    /// - **SUCCESS** fires BOTH, `preCompact` strictly before `postCompact`.
+    /// Compaction lifecycle hooks are transactional with the requested
+    /// compaction: preparation or validation failure fires neither hook. Once
+    /// validation succeeds, `preCompact` runs immediately before the
+    /// infallible in-memory commit and `postCompact` after the successor is
+    /// durable. No failed compaction can leave an orphaned lifecycle pair.
     pub(in crate::engine::driver) async fn do_compact_with_source(
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -1236,11 +1232,24 @@ impl Driver {
                 return;
             }
         };
-        // `preCompact` observe hooks: PREPARE succeeded, so a compaction WILL be
-        // attempted — fire now, strictly before the destructive apply below.
-        // Matcher / `compactSource` is the closed compaction source (`manual`
-        // | `auto` | `manual`). Observe-only / fail-open. (Prepare-failure above
-        // returned before reaching here, so it fires neither pre nor post.)
+        if let Err(error) = self.stage_prepared_compaction(&prepared).await {
+            let text = match error {
+                PreparedCompactionApplyError::Stale { .. } => {
+                    "/compact: prepared compaction is stale; history was left unchanged"
+                        .to_string()
+                }
+                PreparedCompactionApplyError::StoreTextArtifacts(error) => {
+                    format!(
+                        "/compact: recording prepared artifacts failed: {error}; history was left unchanged"
+                    )
+                }
+            };
+            let _ = tx.send(TurnEvent::Notice { text }).await;
+            return;
+        }
+        // Validation and all fallible preparation are complete. No other task
+        // can mutate this driver through the exclusive borrow while hooks run,
+        // so the commit immediately below cannot become stale.
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PreCompact,
             source,
@@ -1252,39 +1261,18 @@ impl Driver {
             },
         )
         .await;
-        match self.apply_prepared_compaction(prepared, tx).await {
-            Ok(()) => {
-                // `postCompact` observe hooks: fire ONLY after the successor is
-                // durable (apply returned Ok), strictly after `preCompact`. An
-                // apply failure (Err arm below) fires `preCompact` only — never
-                // `postCompact` — and never `stop`.
-                self.fire_observe_hook(
-                    crate::config::extended::hooks::HookEvent::PostCompact,
-                    source,
-                    None,
-                    None,
-                    crate::engine::agent::hooks::ObserveFields {
-                        compact_source: Some(source),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            }
-            Err(error) => {
-                let text = match error {
-                    PreparedCompactionApplyError::Stale { .. } => {
-                        "/compact: prepared compaction is stale; history was left unchanged"
-                            .to_string()
-                    }
-                    PreparedCompactionApplyError::StoreTextArtifacts(error) => {
-                        format!(
-                            "/compact: recording prepared artifacts failed: {error}; history was left unchanged"
-                        )
-                    }
-                };
-                let _ = tx.send(TurnEvent::Notice { text }).await;
-            }
-        }
+        self.commit_prepared_compaction(prepared, tx).await;
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PostCompact,
+            source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(source),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     pub(in crate::engine::driver) async fn prepare_compaction_with_source(
@@ -1495,41 +1483,16 @@ impl Driver {
         prepared: PreparedCompaction,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<(), PreparedCompactionApplyError> {
-        #[cfg(test)]
-        if self.test_compact_force_failure == Some(super::CompactForceFailure::Apply) {
-            // Exercise the real apply-failure branch (a store error /
-            // concurrent-history `Stale` is genuinely reachable in production).
-            return Err(PreparedCompactionApplyError::StoreTextArtifacts(
-                "test-injected compaction apply failure".to_string(),
-            ));
-        }
+        self.stage_prepared_compaction(&prepared).await?;
+        self.commit_prepared_compaction(prepared, tx).await;
+        Ok(())
+    }
 
-        let actual =
-            prepared_compaction_coverage(&self.stack.last().expect("stack never empty").history);
-        if actual != prepared.coverage {
-            return Err(PreparedCompactionApplyError::Stale {
-                expected: prepared.coverage,
-                actual,
-            });
-        }
-
-        // 5. Reset the foreground model context in place.
-        self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
-        self.drop_stale_owner_ledgers().await;
-        #[cfg(test)]
-        self.trace_compaction_apply("live_history_swapped");
-
-        // Timeline boundary: `/compact` reset this session in place. The record
-        // embeds the drafting model's brief/handoff text and the retained tail,
-        // so journal it through the frame-carrying path against the AUTHORING
-        // model's trust (K1, decision 10.3): a trusted author's session-table
-        // literal journals (or fail-closed scrubs) rather than persisting raw.
-        // A shadow written before the authoring id existed leaves both ids empty
-        // (`#[serde(default)]`); `resolve_trust` of an empty pair falls to the
-        // default (untrusted) so the frame journals nothing — the record still
-        // persists. `self.config` is the turn-pinned snapshot; `self.redact` is
-        // the session's pre-policy table (same shape the SubagentReport finalizer
-        // uses).
+    async fn stage_prepared_compaction(
+        &self,
+        prepared: &PreparedCompaction,
+    ) -> Result<(), PreparedCompactionApplyError> {
+        self.validate_prepared_compaction(prepared)?;
         let compaction_frame = (!prepared.authoring_provider_id.is_empty()
             && !prepared.authoring_model_id.is_empty())
         .then_some(crate::session::SessionEventModelFrame {
@@ -1538,8 +1501,7 @@ impl Driver {
             config: &self.config,
             session_table: self.redact.as_ref(),
         });
-        if let Err(e) = self
-            .session
+        self.session
             .record_session_compacted_with_source(
                 &prepared.agent_name,
                 crate::session::SessionCompactionRecord {
@@ -1560,12 +1522,49 @@ impl Driver {
                 compaction_frame,
             )
             .await
-        {
-            tracing::warn!(error = %e, "record session_compacted event failed");
-        } else {
-            #[cfg(test)]
-            self.trace_compaction_apply("timeline_recorded");
+            .map_err(|error| {
+                PreparedCompactionApplyError::StoreTextArtifacts(error.to_string())
+            })?;
+        #[cfg(test)]
+        self.trace_compaction_apply("timeline_recorded");
+        Ok(())
+    }
+
+    fn validate_prepared_compaction(
+        &self,
+        prepared: &PreparedCompaction,
+    ) -> Result<(), PreparedCompactionApplyError> {
+        #[cfg(test)]
+        if self.test_compact_force_failure == Some(super::CompactForceFailure::Apply) {
+            // Exercise the real apply-failure branch (a store error /
+            // concurrent-history `Stale` is genuinely reachable in production).
+            return Err(PreparedCompactionApplyError::StoreTextArtifacts(
+                "test-injected compaction apply failure".to_string(),
+            ));
         }
+
+        let actual =
+            prepared_compaction_coverage(&self.stack.last().expect("stack never empty").history);
+        if actual != prepared.coverage {
+            return Err(PreparedCompactionApplyError::Stale {
+                expected: prepared.coverage.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    async fn commit_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+
+        // 5. Reset the foreground model context in place.
+        self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
+        self.drop_stale_owner_ledgers().await;
+        #[cfg(test)]
+        self.trace_compaction_apply("live_history_swapped");
 
         self.session.reset_compact_self_nudge_latch();
         self.auto_compact_gate.mark_committed();
@@ -1587,7 +1586,6 @@ impl Driver {
             .await;
         #[cfg(test)]
         self.trace_compaction_apply("compact_ready_emitted");
-        Ok(())
     }
 
     pub(in crate::engine::driver) async fn compact_brief_draft(

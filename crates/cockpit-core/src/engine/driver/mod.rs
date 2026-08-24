@@ -485,6 +485,10 @@ struct SwarmSubagentHookState {
 #[derive(Debug, Clone)]
 pub struct PendingTaskCall {
     pub call_id: String,
+    /// Canonical persisted child UUID. Unlike `call_id` (the parent tool-call
+    /// correlation), this identifies the concrete child lifecycle across
+    /// start, stop and recovery.
+    pub lifecycle_id: String,
     pub provider_item_id: Option<String>,
     pub function_call_id: Option<String>,
     pub repair_notes: Vec<String>,
@@ -3441,10 +3445,12 @@ impl Driver {
                 msg = input_queue.recv_for(Some(&active_target_id)) => {
                     goal_watchdog = None;
                     let Some(first) = msg else { break };
-                    // Fold anything else that's already queued behind the
-                    // first message (rare but harmless).
-                    let mut batch = vec![first];
-                    drain_queue(&input_queue, &mut batch, &active_target_id).await;
+                    // Accept exactly one queue item at a turn boundary. Later
+                    // items remain queue-owned until this turn passes its stop
+                    // gate and returns here; retaining a local drained batch
+                    // would also let cancellation accidentally execute work
+                    // that `discard_pending_input` could no longer see.
+                    let batch = vec![first];
                     let items = fold_submission_commands(batch);
                     if items.iter().any(|item| matches!(item, FoldedSubmission::User(_))) {
                         // Foreground work wins as soon as a user submission is
@@ -4911,7 +4917,7 @@ impl Driver {
                     frame
                         .answering
                         .as_ref()
-                        .map(|pending| pending.call_id.clone()),
+                        .map(|pending| pending.lifecycle_id.clone()),
                 )
             })
             .collect();
@@ -5111,7 +5117,10 @@ impl Driver {
         }
         let frame = self.stack.last_mut().expect("stack checked nonempty");
         let child_type = frame.agent.name.clone();
-        let child_id = frame.answering.as_ref().map(|pending| pending.call_id.clone());
+        let child_id = frame
+            .answering
+            .as_ref()
+            .map(|pending| pending.lifecycle_id.clone());
         let mut state = std::mem::take(&mut frame.stop_gate);
         let snapshot = self.config.snapshot();
         let runner = self.hook_runner();
@@ -5133,7 +5142,10 @@ impl Driver {
         .await;
         if let Some(frame) = self.stack.last_mut()
             && frame.agent.name == child_type
-            && frame.answering.as_ref().map(|pending| pending.call_id.as_str())
+            && frame
+                .answering
+                .as_ref()
+                .map(|pending| pending.lifecycle_id.as_str())
                 == child_id.as_deref()
         {
             frame.stop_gate_consulted |= state.lifecycle_event_emitted;
@@ -5870,113 +5882,15 @@ impl Driver {
         true
     }
 
-    async fn run_prepared_queued_user_batch(
-        &mut self,
-        submissions: Vec<UserSubmission>,
-        input_rx: &crate::engine::message::UserSubmissionQueue,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<()> {
-        if submissions.is_empty() {
-            return Ok(());
-        }
-        // A phase-one FCM2 lease is tied to exactly one user event and must
-        // survive to that event's phase-two materialization. Folding it into
-        // leading history would both lose the owner slot and let the old
-        // inline recording path run, so process every member independently.
-        if submissions.iter().any(|submission| {
-            matches!(
-                submission.pending_terminal_disposition,
-                Some(
-                    crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
-                )
-            )
-        }) {
-            for submission in submissions {
-                self.run_user_input(submission, input_rx, tx).await?;
-            }
-            return Ok(());
-        }
-        if submissions.len() == 1
-            || submissions
-                .iter()
-                .take(submissions.len().saturating_sub(1))
-                .any(|submission| submission.forced_skill.is_some())
-        {
-            for submission in submissions {
-                self.run_user_input(submission, input_rx, tx).await?;
-            }
-            return Ok(());
-        }
-
-        let mut pending = std::collections::VecDeque::from(submissions);
-        let last = pending
-            .pop_back()
-            .expect("non-empty batch has a final turn");
-        let mut leading_history = Vec::with_capacity(pending.len());
-        let mut leading_queue_item_ids = Vec::new();
-        while let Some(submission) = pending.pop_front() {
-            if self.record_queued_user_fold(&submission, tx).await.is_err() {
-                if let Some(top) = self.stack.last_mut() {
-                    top.history.extend(leading_history);
-                }
-                pending.push_front(submission);
-                pending.push_back(last);
-                while let Some(submission) = pending.pop_back() {
-                    input_rx
-                        .requeue_front_after(
-                            submission,
-                            self.active_queue_target(),
-                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                        )
-                        .await;
-                }
-                input_rx.finish(&leading_queue_item_ids).await;
-                return Ok(());
-            }
-            leading_queue_item_ids.extend(submission.queue_item_ids.iter().copied());
-            leading_history.push(crate::engine::message::build_user_message(UserSubmission {
-                expected_model_state_generation: None,
-                expected_model: None,
-                kind: UserSubmissionKind::User,
-                origin: submission.origin,
-                text: submission.text,
-                display_text: None,
-                tag_expansions: Vec::new(),
-                images: submission.images,
-                forced_skill: None,
-                origin_principal: None,
-                job_id: None,
-                preflight_cleaned: None,
-                queue_item_ids: Vec::new(),
-                client_submissions: Vec::new(),
-                queue_target: None,
-                pending_terminal_disposition: None,
-                run_invocation_id: None,
-            }));
-        }
-        let result = self
-            .run_user_input_with_leading_history(last, leading_history, true, input_rx, tx)
-            .await;
-        input_rx.finish(&leading_queue_item_ids).await;
-        result
-    }
-
     async fn run_folded_submission_commands(
         &mut self,
         items: Vec<FoldedSubmission>,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        let mut pending_users = Vec::new();
         for item in items {
             match item {
                 FoldedSubmission::Compact(queue_item_ids) => {
-                    self.run_prepared_queued_user_batch(
-                        std::mem::take(&mut pending_users),
-                        input_rx,
-                        tx,
-                    )
-                    .await?;
                     self.do_compact(tx).await;
                     input_rx.finish(&queue_item_ids).await;
                 }
@@ -5987,20 +5901,16 @@ impl Driver {
                         .await
                     else {
                         input_rx.finish(&queue_item_ids).await;
-                        self.run_prepared_queued_user_batch(
-                            std::mem::take(&mut pending_users),
-                            input_rx,
-                            tx,
-                        )
-                        .await?;
                         return Ok(());
                     };
-                    pending_users.push(prepared);
+                    // Do not pre-accept the remainder of a drained batch.
+                    // This turn must finish (including its stop gate) before
+                    // the next item crosses the recording/folding boundary.
+                    self.run_user_input(prepared, input_rx, tx).await?;
                 }
             }
         }
-        self.run_prepared_queued_user_batch(pending_users, input_rx, tx)
-            .await
+        Ok(())
     }
 
     async fn refresh_goal_watchdog(&self, watchdog: &mut Option<Pin<Box<Sleep>>>) {
@@ -7222,6 +7132,10 @@ impl Driver {
             .answering
             .as_ref()
             .map(|pending| pending.call_id.as_str());
+        let child_lifecycle_id = child
+            .answering
+            .as_ref()
+            .map(|pending| pending.lifecycle_id.as_str());
         let task_function_call_id = child
             .answering
             .as_ref()
@@ -7237,7 +7151,11 @@ impl Driver {
         // delegating `task` call id, `endReason` is `completed` (this is the
         // normal success pop; the abort/teardown path is a separate site).
         if !child.stop_gate_consulted {
-            self.fire_terminal_subagent_stop(&child.agent.name, task_call_id, "completed")
+            self.fire_terminal_subagent_stop(
+                &child.agent.name,
+                child_lifecycle_id,
+                "completed",
+            )
                 .await;
         }
         let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
@@ -7370,6 +7288,10 @@ impl Driver {
                 .answering
                 .as_ref()
                 .map(|pending| pending.call_id.as_str());
+            let child_lifecycle_id = child
+                .answering
+                .as_ref()
+                .map(|pending| pending.lifecycle_id.as_str());
             let task_function_call_id = child
                 .answering
                 .as_ref()
@@ -7388,7 +7310,11 @@ impl Driver {
             // `completed`). Child-only; matcher / `subagentType` is the child
             // agent type, `subagentId` is the delegating `task` call id.
             if !child.stop_gate_consulted {
-                self.fire_terminal_subagent_stop(&child.agent.name, task_call_id, "aborted")
+                self.fire_terminal_subagent_stop(
+                    &child.agent.name,
+                    child_lifecycle_id,
+                    "aborted",
+                )
                     .await;
             }
             let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
@@ -7513,6 +7439,20 @@ impl Driver {
             .await
     }
 
+    /// Canonical acceptance boundary for every foreground turn, including a
+    /// submission drained from the daemon queue. All generation-sensitive
+    /// state is pinned together here; callers must not manufacture a queued
+    /// provider prompt inside an existing turn.
+    async fn begin_turn(&mut self, tx: &mpsc::Sender<TurnEvent>) {
+        self.current_lifecycle_turn_id = Some(uuid::Uuid::new_v4().to_string());
+        self.repin_config_for_turn();
+        self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
+        self.reset_delegation_retry_budget();
+        self.refresh_redaction_table_for_turn(tx).await;
+        self.refresh_active_frame_for_turn(tx).await;
+        self.refresh_wire_api_for_turn();
+    }
+
     async fn run_user_input_with_leading_history(
         &mut self,
         submission: UserSubmission,
@@ -7599,17 +7539,11 @@ impl Driver {
         // before assembling or dispatching the user's inference.
         self.preempt_shadow_brief_for_foreground().await;
         self.preempt_self_improvement_review_for_foreground();
-        let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
-        self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
-        // Pin the session config snapshot for this turn's duration: a
-        // re-resolution that lands mid-turn is observed only at the next turn
-        // boundary (`engine-config-snapshot-adoption`).
-        self.repin_config_for_turn();
-        self.max_primary_rounds = self.load_max_primary_rounds_for_turn().await;
-        self.reset_delegation_retry_budget();
-        self.refresh_redaction_table_for_turn(tx).await;
-        self.refresh_active_frame_for_turn(tx).await;
-        self.refresh_wire_api_for_turn();
+        self.begin_turn(tx).await;
+        let lifecycle_turn_id = self
+            .current_lifecycle_turn_id
+            .clone()
+            .expect("begin_turn installs lifecycle identity");
         // Pasted image parts (vision models only) ride alongside the text
         // through every text-only step below (titling, skills, seed,
         // time prelude) and are reattached when the prompt `Message` is
@@ -8794,7 +8728,6 @@ impl Driver {
                         }
                     }
 
-                    let target_id = self.active_queue_target_id();
                     let last_tool_result = {
                         let top = self.stack.last_mut().expect("stack never empty");
                         top.history
@@ -8802,85 +8735,12 @@ impl Driver {
                             .expect("Continue with empty history is unreachable")
                     };
 
-                    // Carry at most one queued user message onto this upcoming
-                    // inference. Later queued messages remain pending so their
-                    // original turn boundaries and metadata are preserved.
-                    let mut queued: Vec<UserSubmission> = Vec::new();
-                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                    if let Some(queued) = queued.into_iter().next() {
-                        let queue_item_ids = queued.queue_item_ids.clone();
-                        self.stack
-                            .last_mut()
-                            .expect("stack never empty")
-                            .history
-                            .push(last_tool_result.clone());
-                        match queued.kind {
-                            UserSubmissionKind::Compact => {
-                                input_rx
-                                    .requeue_front(queued, self.active_queue_target())
-                                    .await;
-                                if let Some(frame) = self.stack.last_mut() {
-                                    let _ = frame.history.pop();
-                                }
-                                next_prompt = last_tool_result;
-                            }
-                            UserSubmissionKind::User => {
-                                let Some(prepared) = self
-                                    .prepare_queued_user_submission(queued, input_rx, tx)
-                                    .await
-                                else {
-                                    input_rx.finish(&queue_item_ids).await;
-                                    return Ok(());
-                                };
-                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                    input_rx
-                                        .requeue_front_after(
-                                            prepared,
-                                            self.active_queue_target(),
-                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                        )
-                                        .await;
-                                    if let Some(frame) = self.stack.last_mut() {
-                                        let _ = frame.history.pop();
-                                    }
-                                    next_prompt = last_tool_result;
-                                    continue;
-                                }
-                                input_rx.finish(&queue_item_ids).await;
-                                self.reset_delegation_retry_budget();
-                                // The folded external submission is a new
-                                // originating user turn even though this method
-                                // keeps the provider loop hot. Its root stop
-                                // budget must not inherit continuations granted
-                                // to the submission that just completed.
-                                root_stop_gate =
-                                    crate::engine::agent::hooks::StopGateState::default();
-                                next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin:
-                                            crate::engine::message::SubmissionOrigin::AutoContinue,
-                                        text: self.with_time_prelude(prepared.text),
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: None,
-                                    });
-                            }
-                        }
-                    } else {
-                        next_prompt = last_tool_result;
-                    }
+                    // `Continue` belongs to the current originating turn.
+                    // Queued external work must remain pending until this turn
+                    // reaches and passes its root stop gate; accepting it here
+                    // would splice a new turn into the old turn's config and
+                    // continuation budget.
+                    next_prompt = last_tool_result;
                     continue;
                 }
                 TurnOutcome::Return { fields } => {
@@ -8942,71 +8802,11 @@ impl Driver {
                             continue;
                         }
                     }
-                    // Root agent is done with this user message. Before
-                    // we wait for the next user input, check if more
-                    // landed in the queue while we were busy — fold
-                    // them and start a new run with the combined text.
-                    let mut queued: Vec<UserSubmission> = Vec::new();
-                    let target_id = self.active_queue_target_id();
-                    drain_queue_limit(input_rx, &mut queued, &target_id, 1).await;
-                    if let Some(queued) = queued.into_iter().next() {
-                        let queue_item_ids = queued.queue_item_ids.clone();
-                        match queued.kind {
-                            UserSubmissionKind::Compact => {
-                                self.do_compact(tx).await;
-                                input_rx.finish(&queue_item_ids).await;
-                                continue;
-                            }
-                            UserSubmissionKind::User => {
-                                let Some(prepared) = self
-                                    .prepare_queued_user_submission(queued, input_rx, tx)
-                                    .await
-                                else {
-                                    input_rx.finish(&queue_item_ids).await;
-                                    return Ok(());
-                                };
-                                if self.record_queued_user_fold(&prepared, tx).await.is_err() {
-                                    input_rx
-                                        .requeue_front_after(
-                                            prepared,
-                                            self.active_queue_target(),
-                                            DURABLE_SUBMISSION_RETRY_BACKOFF,
-                                        )
-                                        .await;
-                                    return Ok(());
-                                }
-                                input_rx.finish(&queue_item_ids).await;
-                                self.reset_delegation_retry_budget();
-                                root_stop_gate =
-                                    crate::engine::agent::hooks::StopGateState::default();
-                                next_prompt =
-                                    crate::engine::message::build_user_message(UserSubmission {
-                                        expected_model_state_generation: None,
-                                        expected_model: None,
-                                        kind: UserSubmissionKind::User,
-                                        origin: crate::engine::message::SubmissionOrigin::GoalContinuation,
-                                        text: prepared.text,
-                                        display_text: None,
-                                        tag_expansions: Vec::new(),
-                                        images: prepared.images,
-                                        forced_skill: None,
-                                        origin_principal: None,
-                                        job_id: None,
-                                        preflight_cleaned: None,
-                                        queue_item_ids: Vec::new(),
-                                        client_submissions: Vec::new(),
-                                        queue_target: None,
-                                        pending_terminal_disposition: None,
-                                        run_invocation_id: prepared.run_invocation_id,
-                                    });
-                                // Continue under the next invocation's identity when present.
-                                // (Outer `run_invocation_id` still binds the original run.)
-                                continue;
-                            }
-                        }
-                    }
-                    // Root turn reached a genuine normal `Done` and no queued
-                    // user work remains: consult the ROOT stop gate. This is the
+                    // Root turn reached a genuine normal `Done`: consult the
+                    // ROOT stop gate before looking at queued work. The outer
+                    // driver loop accepts the next queued item only after this
+                    // invocation returns, giving it a fresh canonical turn
+                    // pin and lifecycle id.
                     // ONLY entry to the gate — the cancel / parked-interrupt /
                     // daemon-drain / inference-error branches all `return`ed from
                     // the `Err(..)` arms above WITHOUT reaching this `match`, and
@@ -9321,6 +9121,11 @@ impl Driver {
                         history: delegation_payload_history,
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
+                            lifecycle_id:
+                                crate::db::task_delegations::delegation_child_lifecycle_id(
+                                    &task_call_id,
+                                    "default",
+                                ),
                             provider_item_id: task_provider_item_id,
                             function_call_id: task_function_call_id,
                             repair_notes,
@@ -9338,8 +9143,12 @@ impl Driver {
                     // session has just been pushed onto the stack (spawn mode 1
                     // of 3). Child-only; matcher / `subagentType` is the child
                     // agent type, `subagentId` is the delegating `task` call id.
-                    self.fire_subagent_hook(&child_agent, Some(&task_call_id))
-                    .await;
+                    let lifecycle_id = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.answering.as_ref())
+                        .map(|pending| pending.lifecycle_id.as_str());
+                    self.fire_subagent_hook(&child_agent, lifecycle_id).await;
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
                     let _ = tx

@@ -24,6 +24,7 @@ impl Driver {
                 job_id,
                 subagent_type,
                 lifecycle_event_emitted,
+                start_ack,
             } => {
                 // A genuine detached-`Swarm` child (`bee` / `scout`) started
                 // (spawn mode 3 of 3). Fire `subagentStart` and track it so the
@@ -36,6 +37,10 @@ impl Driver {
                     lifecycle_event_emitted,
                 )
                     .await;
+                // The start hook is observe-only/fail-open, but the boundary
+                // itself is now fully dispatched and tracked. Release the
+                // child only after that state exists, never on mere enqueue.
+                let _ = start_ack.send(());
             }
             ScheduleEvent::SwarmChildStopGateCompleted { job_id } => {
                 self.mark_swarm_subagent_stop_gate_completed(&job_id);

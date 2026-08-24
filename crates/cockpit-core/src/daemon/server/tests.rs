@@ -810,9 +810,8 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
     let response = handle_request(
         Request::UpsertAssistant {
             name: "reviewer".into(),
-            home_dir: "/tmp/reviewer".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "reviewer".into(),
+            prompt: "review".into(),
         },
         &mut state,
         &ctx,
@@ -974,9 +973,8 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         },
         Request::UpsertAssistant {
             name: "helper-bot".into(),
-            home_dir: "/tmp/helper".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "helper".into(),
+            prompt: "help".into(),
         },
     ];
     for request in mutations {
@@ -1404,9 +1402,8 @@ async fn upsert_assistant_rejects_non_owner_principal() {
     let error = handle_request(
         Request::UpsertAssistant {
             name: "reviewer".into(),
-            home_dir: "/tmp/reviewer".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "reviewer".into(),
+            prompt: "review".into(),
         },
         &mut state,
         &ctx,
@@ -16214,9 +16211,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_assistants" => Request::ListAssistants,
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: root,
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: root,
         },
         "resolve_assistant_session" => Request::ResolveAssistantSession {
             assistant_id: "missing-assistant".into(),
@@ -20551,9 +20547,8 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         },
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: "/repo".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: "help".into(),
         },
         _ => unreachable!(),
     };
@@ -20597,9 +20592,8 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
         },
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: "/repo".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: "help".into(),
         },
         _ => unreachable!(),
     };
@@ -23447,9 +23441,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::UpsertAssistant {
                 name: "a".into(),
-                home_dir: "/tmp".into(),
-                config_json: "{}".into(),
-                content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                description: "assistant".into(),
+                prompt: "help".into(),
             },
             kind: "upsert_assistant",
             session_id: None,

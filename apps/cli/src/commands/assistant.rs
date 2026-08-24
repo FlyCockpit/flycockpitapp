@@ -3,13 +3,16 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::agents::{AgentDef, GoalSettingsOverride};
 use crate::assistants::{
-    AssistantConfig, CreateAssistantSpec, assistant_definition_path, default_home_dir, identity,
-    markdown_content_hash, spec_from_wizard,
+    CreateAssistantSpec, default_home_dir, spec_from_wizard,
 };
+#[cfg(test)]
+use crate::assistants::{AssistantConfig, assistant_definition_path, identity, markdown_content_hash};
 use crate::cli::{
     AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
     MediaAccountingCommand,
@@ -139,6 +142,7 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 /// `cockpit_core::assistants::create_assistant` (the DB persist is remoted).
 /// Pure local IO — no daemon — so a parity test can compare its output against
 /// the canonical `create_assistant` and fail if the two ever drift.
+#[cfg(test)]
 fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
     write_assistant_home_with_installation_id(spec, Uuid::new_v4())
 }
@@ -147,6 +151,7 @@ fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> 
 ///
 /// Keeping identity allocation explicit here allows the caller to use the
 /// exact same identity in the definition and persisted registry config.
+#[cfg(test)]
 fn write_assistant_home_with_installation_id(
     spec: &CreateAssistantSpec,
     installation_id: Uuid,
@@ -203,8 +208,6 @@ fn write_assistant_home_with_installation_id(
 /// persist is remoted so the CLI never opens SQLite. Returns the persisted
 /// (name, home_dir) for the wizard's confirmation line.
 async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, String)> {
-    let (config_json, content_hash) = write_assistant_home(&spec)?;
-
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant persist")?;
@@ -212,9 +215,8 @@ async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, Str
         .client
         .request(Request::UpsertAssistant {
             name: spec.name.clone(),
-            home_dir: spec.home_dir.to_string_lossy().into_owned(),
-            config_json,
-            content_hash,
+            description: spec.description,
+            prompt: spec.prompt,
         })
         .await
         .context("requesting assistant persist from daemon")?

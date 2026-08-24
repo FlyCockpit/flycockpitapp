@@ -4217,16 +4217,14 @@ async fn handle_serialized_request_impl(
         }
         Request::UpsertAssistant {
             name,
-            home_dir,
-            config_json,
-            content_hash,
+            description,
+            prompt,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::UpsertAssistant {
                 name: name.clone(),
-                home_dir: home_dir.clone(),
-                config_json: config_json.clone(),
-                content_hash: content_hash.clone(),
+                description: description.clone(),
+                prompt: prompt.clone(),
             };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -4241,9 +4239,17 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let row = ctx
-                .db
-                .upsert_assistant(&name, &home_dir, &config_json, &content_hash)
+            let home_dir = crate::assistants::default_home_dir(&name)
+                .map_err(|error| bad_request(error.to_string()))?;
+            let row = crate::assistants::create_assistant(
+                &ctx.db,
+                crate::assistants::CreateAssistantSpec {
+                    name,
+                    description,
+                    prompt,
+                    home_dir,
+                },
+            )
                 .await
                 .map_err(|error| bad_request(error.to_string()))?;
             let response = Response::AssistantUpserted {

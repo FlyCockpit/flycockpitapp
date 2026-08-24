@@ -164,15 +164,23 @@ pub async fn create_assistant_with_installation_id(
     installation_id: Uuid,
 ) -> Result<AssistantRow> {
     validate_assistant_name(&spec.name)?;
+    if db.get_assistant(&spec.name).await?.is_some() {
+        bail!("assistant `{}` already exists", spec.name);
+    }
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
     }
     if spec.prompt.trim().is_empty() {
         bail!("assistant prompt is required");
     }
+    let canonical_home = default_home_dir(&spec.name)?;
+    if spec.home_dir != canonical_home {
+        bail!("assistant creation requires the daemon-owned canonical home");
+    }
     std::fs::create_dir_all(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description,
@@ -199,8 +207,6 @@ pub async fn create_assistant_with_installation_id(
     };
     crate::agents::validate_invariants(&agent)?;
     let markdown = agent.to_markdown()?;
-    std::fs::write(&path, &markdown)
-        .with_context(|| format!("writing assistant definition {}", path.display()))?;
     identity::seed_identity_files(&spec.home_dir)?;
     let config = AssistantConfig {
         installation_id,
@@ -211,13 +217,30 @@ pub async fn create_assistant_with_installation_id(
     };
     let config_json = serde_json::to_string(&config)?;
     let content_hash = sha256_hex(markdown.as_bytes());
-    db.upsert_assistant(
+    let journal = AssistantCreationJournal {
+        operation_id: Uuid::new_v4().to_string(),
+        name: spec.name.clone(),
+        home_dir: spec.home_dir.to_string_lossy().into_owned(),
+        config_json: config_json.clone(),
+        content_hash: content_hash.clone(),
+        markdown: markdown.clone(),
+    };
+    let journal_path = creation_journal_path(&spec.home_dir);
+    cockpit_config::config::write_config_bytes_atomic(
+        &journal_path,
+        &serde_json::to_vec_pretty(&journal)?,
+    )?;
+    cockpit_config::config::write_config_bytes_atomic(&path, markdown.as_bytes())
+        .with_context(|| format!("writing assistant definition {}", path.display()))?;
+    let row = db.upsert_assistant(
         &spec.name,
         &spec.home_dir.to_string_lossy(),
         &config_json,
         &content_hash,
     )
-    .await
+    .await?;
+    cockpit_config::config::remove_config_file_atomic(&journal_path)?;
+    Ok(row)
 }
 
 /// The sole daemon-owned v2 template for private assistants.  CLI-side
@@ -417,11 +440,88 @@ struct DefinitionSaveJournal {
     next_markdown: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct AssistantCreationJournal {
+    operation_id: String,
+    name: String,
+    home_dir: String,
+    config_json: String,
+    content_hash: String,
+    markdown: String,
+}
+
 fn definition_journal_path(home: &Path) -> PathBuf {
     home.join(".assistant-definition-save.journal.json")
 }
 
-async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
+fn creation_journal_path(home: &Path) -> PathBuf {
+    home.join(".assistant-creation.journal.json")
+}
+
+async fn recover_creation_journal(db: &Db, home: &Path) -> Result<()> {
+    let journal_path = creation_journal_path(home);
+    let Some(raw) = cockpit_config::config::read_config_file_nofollow(&journal_path)? else {
+        return Ok(());
+    };
+    let journal: AssistantCreationJournal =
+        serde_json::from_slice(&raw).context("parsing assistant creation journal")?;
+    let operation_id = Uuid::parse_str(&journal.operation_id)
+        .context("assistant creation journal operation ID is invalid")?;
+    if operation_id.to_string() != journal.operation_id
+        || default_home_dir(&journal.name)? != home
+        || Path::new(&journal.home_dir) != home
+    {
+        bail!("assistant creation journal identity is invalid");
+    }
+    if markdown_content_hash(&journal.markdown) != journal.content_hash {
+        bail!("assistant creation journal hash does not match exact markdown bytes");
+    }
+    let target = assistant_definition_path(home);
+    let row_for_validation = AssistantRow {
+        name: journal.name.clone(),
+        created_at: 0,
+        home_dir: journal.home_dir.clone(),
+        config_json: journal.config_json.clone(),
+        content_hash: journal.content_hash.clone(),
+    };
+    let parsed = crate::agents::parse_daemon_local_markdown(&journal.markdown, &journal.name)?;
+    validate_definition_identity(&row_for_validation, &parsed)?;
+    identity::seed_identity_files(home)?;
+    if let Some(existing) = db.get_assistant(&journal.name).await? {
+        if existing.home_dir != journal.home_dir
+            || existing.config_json != journal.config_json
+            || existing.content_hash != journal.content_hash
+        {
+            bail!("assistant creation journal conflicts with registry row");
+        }
+        match cockpit_config::config::read_config_file_nofollow(&target)? {
+            Some(bytes) if sha256_hex(&bytes) == journal.content_hash => {}
+            Some(_) => bail!("assistant creation target conflicts with journal bytes"),
+            None => cockpit_config::config::write_config_bytes_atomic(
+                &target,
+                journal.markdown.as_bytes(),
+            )?,
+        }
+    } else {
+        cockpit_config::config::write_config_bytes_atomic(&target, journal.markdown.as_bytes())?;
+        db.upsert_assistant(
+            &journal.name,
+            &journal.home_dir,
+            &journal.config_json,
+            &journal.content_hash,
+        )
+        .await?;
+    }
+    let current = cockpit_config::config::read_config_file_nofollow(&target)?
+        .context("assistant definition disappeared during creation recovery")?;
+    if sha256_hex(&current) != journal.content_hash {
+        bail!("assistant creation target conflicts with journal bytes");
+    }
+    cockpit_config::config::remove_config_file_atomic(&journal_path)?;
+    Ok(())
+}
+
+async fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Result<()> {
     let home = Path::new(&row.home_dir);
     let journal_path = definition_journal_path(home);
     let Some(raw) = cockpit_config::config::read_config_file_nofollow(&journal_path)? else {
@@ -435,7 +535,23 @@ async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
     {
         bail!("assistant definition journal identity no longer matches registry row");
     }
+    if markdown_content_hash(&journal.prior_markdown) != journal.prior_hash
+        || markdown_content_hash(&journal.next_markdown) != journal.next_hash
+    {
+        bail!("assistant definition journal hashes do not match exact stored bytes");
+    }
+    for markdown in [&journal.prior_markdown, &journal.next_markdown] {
+        let parsed = crate::agents::parse_daemon_local_markdown(markdown, &row.name)
+            .context("parsing assistant definition journal version")?;
+        validate_definition_identity(row, &parsed)?;
+    }
     let target = assistant_definition_path(home);
+    let current = cockpit_config::config::read_config_file_nofollow(&target)?
+        .context("assistant definition is missing during journal recovery")?;
+    let current_hash = sha256_hex(&current);
+    if current_hash != journal.prior_hash && current_hash != journal.next_hash {
+        bail!("assistant definition bytes conflict with both journal versions");
+    }
     if row.content_hash == journal.next_hash {
         cockpit_config::config::write_config_bytes_atomic(
             &target,
@@ -456,7 +572,30 @@ async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
     Ok(())
 }
 
+async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
+    let target = assistant_definition_path(Path::new(&row.home_dir));
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+    recover_definition_journal_locked(db, row).await
+}
+
 pub async fn recover_definition_journals(db: &Db) -> Result<()> {
+    let assistants_root = crate::config::resolve::cockpit_data_dir()?.join("assistants");
+    match std::fs::read_dir(&assistants_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let home = entry.path();
+                let target = assistant_definition_path(&home);
+                let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+                recover_creation_journal(db, &home).await?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     for row in db.list_assistants().await? {
         recover_definition_journal(db, &row).await?;
     }
@@ -469,9 +608,9 @@ pub async fn save_definition_cas(
     markdown: String,
     expected_revision: &str,
 ) -> Result<AssistantRow> {
-    recover_definition_journal(db, &row).await?;
     let target = assistant_definition_path(Path::new(&row.home_dir));
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+    recover_definition_journal_locked(db, &row).await?;
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition is missing")?;
     let current = String::from_utf8(current).context("assistant definition is not valid UTF-8")?;

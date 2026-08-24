@@ -771,7 +771,7 @@ pub struct Driver {
     /// slot. It is completed at driver-loop bootstrap before accepting new
     /// work, so a crash after `preCompact` cannot expose the predecessor as if
     /// no compaction had been requested.
-    recovered_compaction_intent: Option<PreparedCompaction>,
+    recovered_compaction_intent: Option<context_reduction::DurableCompactionTransaction>,
     shadow_brief_generation: u64,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,

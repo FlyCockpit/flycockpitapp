@@ -6385,6 +6385,7 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                compaction_id: uuid::Uuid::new_v4(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id,
                 seed_tool_count: 2,
@@ -6492,6 +6493,7 @@ mod tests {
             .record_session_compacted_with_source(
                 "Build",
                 crate::session::SessionCompactionRecord {
+                    compaction_id: uuid::Uuid::new_v4(),
                     successor_session_id: s.id,
                     successor_short_id: &s.short_id,
                     seed_tool_count: 0,
@@ -6543,6 +6545,7 @@ mod tests {
         s.record_session_compacted_with_source(
             "Build",
             crate::session::SessionCompactionRecord {
+                compaction_id: uuid::Uuid::new_v4(),
                 successor_session_id: s.id,
                 successor_short_id: &s.short_id,
                 seed_tool_count: 0,

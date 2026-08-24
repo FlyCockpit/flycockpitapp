@@ -3320,6 +3320,40 @@ pub(super) async fn run_worker(
                     cancel_handle.cancel();
                     break WorkerStop::Cancelled;
                 }
+                SessionWork::InterruptAndStop => {
+                    tracing::info!(session_id = %session_id, "terminal session interruption requested");
+                    if let Some(staged) = driver_input_queue.stage_discard_pending().await {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
+                        match persist_staged_terminal_removal(
+                            &session,
+                            &driver_input_queue,
+                            staged,
+                            disposition,
+                        )
+                        .await
+                        {
+                            Ok((_, _, receipts)) => send_terminal_receipts_event(
+                                &event_tx,
+                                &redaction,
+                                session_id,
+                                &receipts,
+                                disposition,
+                            ),
+                            Err(_) => send_current_event(
+                                &event_tx,
+                                &redaction,
+                                proto::Event::Notice {
+                                    session_id,
+                                    text: "Could not durably abandon queued messages; their exact payloads remain held. Retry interruption after storage recovers."
+                                        .to_string(),
+                                },
+                            ),
+                        }
+                    }
+                    cancel_handle.cancel();
+                    break WorkerStop::Interrupted;
+                }
                 SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,

@@ -229,8 +229,10 @@ jobs:
           for target in ${{ join(matrix.targets, ' ') }}; do
             case "$target" in
               *linux*)
-                cargo build --locked --release --target "$target" -p cockpit-cli \
-                  --bin cockpit-containment-broker --features linux-containment-broker-bin
+                CARGO_TARGET_DIR=target/containment-build \
+                  cargo build --locked --release --target "$target" -p cockpit-cli \
+                  --bin cockpit --bin cockpit-containment-broker \
+                  --features linux-containment-broker-bin
                 ;;
               *) ;;
             esac
@@ -244,7 +246,8 @@ jobs:
           for target in ${{ join(matrix.targets, ' ') }}; do
             case "$target" in
               *linux*)
-                apps/cli/scripts/assemble-linux-containment-bundle.sh \
+                FLYCOCKPIT_BUNDLE_BINARY_ROOT=target/containment-build \
+                  apps/cli/scripts/assemble-linux-containment-bundle.sh \
                   "$target" "${{ needs.plan-cli-release.outputs.tag }}" target/distrib
                 python3 apps/cli/scripts/verify-linux-containment-archive.py \
                   target/distrib "$target" "${{ needs.plan-cli-release.outputs.tag }}"
@@ -384,11 +387,24 @@ jobs:
             echo "::error::expected two target-specific containment bundles and two checksums"
             exit 1
           fi
+          jq -n \
+            --arg release "${{ needs.plan-cli-release.outputs.tag }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg x86 "$(sed -n '1s/[[:space:]].*$//p' target/distrib/flycockpit-containment-${{ needs.plan-cli-release.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz.sha256)" \
+            --arg arm "$(sed -n '1s/[[:space:]].*$//p' target/distrib/flycockpit-containment-${{ needs.plan-cli-release.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz.sha256)" \
+            '{schemaVersion:1, release:$release, bundles:[
+              {target:"x86_64-unknown-linux-gnu",sha256:$x86,url:("https://github.com/"+$repository+"/releases/download/"+$release+"/flycockpit-containment-"+$release+"-x86_64-unknown-linux-gnu.tar.gz")},
+              {target:"aarch64-unknown-linux-gnu",sha256:$arm,url:("https://github.com/"+$repository+"/releases/download/"+$release+"/flycockpit-containment-"+$release+"-aarch64-unknown-linux-gnu.tar.gz")}
+            ]}' > target/distrib/flycockpit-containment-index.json
+          (cd target/distrib && sha256sum flycockpit-containment-index.json > flycockpit-containment-index.json.sha256)
           # These independently checksummed Linux-only bundles deliberately do
           # not enter cargo-dist's cross-platform include graph.
           printf '%s\n' "$containment_assets" | while IFS= read -r asset; do
             gh release upload "${{ needs.plan-cli-release.outputs.tag }}" "$asset" --clobber
           done
+          gh release upload "${{ needs.plan-cli-release.outputs.tag }}" \
+            target/distrib/flycockpit-containment-index.json \
+            target/distrib/flycockpit-containment-index.json.sha256 --clobber
           echo "artifacts uploaded and released successfully"
           cat target/distrib/dist-manifest.json
           echo "manifest=$(jq -c "." target/distrib/dist-manifest.json)" >> "$GITHUB_OUTPUT"

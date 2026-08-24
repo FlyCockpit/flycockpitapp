@@ -1764,7 +1764,7 @@ fn stop_and_stop_failure_registry() -> crate::config::extended::hooks::HookRegis
     }
 }
 
-pub(crate) async fn probe_root_stop_boundary() {
+pub(crate) async fn probe_root_stop_boundary() -> String {
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("all finished".into()))
@@ -1787,6 +1787,16 @@ pub(crate) async fn probe_root_stop_boundary() {
         vec!["failed".to_string()],
         "a genuine root Done must consult the stop gate exactly once"
     );
+    driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == "hook_run")
+        .and_then(|row| row.data["event"].as_str().map(str::to_owned))
+        .expect("production root-stop boundary persisted its hook event")
 }
 
 #[tokio::test(start_paused = true)]

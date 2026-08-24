@@ -35,6 +35,8 @@ pub struct DiagnosticsSnapshot {
     pub approval_mode: String,
     pub database: Vec<String>,
     pub daemon: Vec<String>,
+    /// Managed native-containment deployment and authenticated readiness.
+    pub containment: Vec<String>,
     pub providers: Vec<String>,
     pub git: Vec<String>,
     pub network: Vec<String>,
@@ -194,6 +196,7 @@ pub fn render(snapshot: &DiagnosticsSnapshot) -> String {
     out.push_str(&format!("approval: {}\n", snapshot.approval_mode));
     push_section(&mut out, "database", &snapshot.database);
     push_section(&mut out, "daemon", &snapshot.daemon);
+    push_section(&mut out, "managed containment", &snapshot.containment);
     push_section(&mut out, "providers", &snapshot.providers);
     push_section(&mut out, concat!("net", "work"), &snapshot.network);
     push_section(&mut out, "git", &snapshot.git);
@@ -236,6 +239,7 @@ fn build_snapshot(
     let (providers, provider_failures) =
         provider_lines(&providers, &extended, delegation_enabled, secret_lookup);
     let (external_journal, external_journal_failed) = external_journal_lines(db);
+    let (containment, containment_failed) = managed_containment_lines();
 
     let dependencies = match crate::external_runtime::global_health_store().current_bundle() {
         Some((snapshot, descriptors)) => {
@@ -293,6 +297,7 @@ fn build_snapshot(
         approval_mode: extended.default_approval_mode.as_str().to_string(),
         database: Vec::new(),
         daemon: Vec::new(),
+        containment,
         providers,
         git: git_lines(&input.cwd),
         network: Vec::new(),
@@ -306,8 +311,58 @@ fn build_snapshot(
         default_model_journals: default_model_journal_lines(&input.cwd),
         external_journal,
         dependencies,
-        has_failures: provider_failures || external_journal_failed,
+        has_failures: provider_failures || external_journal_failed || containment_failed,
     })
+}
+
+/// Secret-free public view of the Linux managed broker contract. The
+/// authenticated handshake runs only when systemd actually supplied the named
+/// capability FD; an ordinary interactive doctor reports that distinction
+/// without attempting to open the root-only capability path itself.
+fn managed_containment_lines() -> (Vec<String>, bool) {
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let socket = std::path::PathBuf::from(format!(
+            "/run/flycockpit/containment-broker-{uid}.sock"
+        ));
+        let capability_fd = crate::process_containment::inherited_linux_broker_capability_fd();
+        let named_fd = if capability_fd.is_some() {
+            "present"
+        } else {
+            "absent (this process was not launched by the managed systemd unit)"
+        };
+        let mut lines = vec![
+            format!("daemon uid: {uid} ({})", if uid == 0 { "INVALID: root" } else { "non-root" }),
+            format!("systemd named capability fd: {named_fd}"),
+            format!("broker socket: {} ({})", socket.display(), if socket.exists() { "present" } else { "absent" }),
+        ];
+        let mut failed = uid == 0 && capability_fd.is_some();
+        let guarantee = match capability_fd {
+            Some(capability_fd) => {
+                let result = crate::process_containment::doctor_linux_containment_broker(
+                    crate::process_containment::LinuxBrokerConfig {
+                        socket_path: socket,
+                        expected_broker_uid: 0,
+                        capability_fd: Some(capability_fd),
+                    },
+                );
+                if result.is_ok() {
+                    "Proven (authenticated broker handshake succeeded)".to_string()
+                } else {
+                    failed = true;
+                    format!("FAILED (authenticated broker handshake: {})", one_line(&result.unwrap_err().to_string()))
+                }
+            }
+            None => "unavailable (named capability fd absent)".to_string(),
+        };
+        lines.push(format!("native guarantee: {guarantee}"));
+        return (lines, failed);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (vec!["native guarantee: unsupported on this platform".to_string()], false)
+    }
 }
 
 /// One safe line per pending effective-default journal.

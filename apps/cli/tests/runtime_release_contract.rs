@@ -111,6 +111,11 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         "--doctor --allowed-uid",
         "systemd-run --quiet --wait --collect",
         "retry 30 broker_protocol_ready",
+        "the managed FlyCockpit daemon must use a dedicated non-root account",
+        "sha256sum --strict --check MANIFEST.sha256",
+        "does not match host architecture",
+        "snapshot_unit_links",
+        "cp -a --preserve=all",
     ] {
         assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
     }
@@ -119,6 +124,7 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
     assert!(DAEMON_UNIT.contains("ExecStartPost=/usr/libexec/flycockpit/cockpit-containment-broker --doctor"));
     assert!(DAEMON_UNIT.contains("--capability-fd 3"));
     assert!(!BROKER_UNIT.contains("ProcSubset=pid"));
+    assert!(DAEMON_UNIT.contains("ProtectHome=no"));
     assert!(WORKFLOW.contains("Assemble and verify target-specific containment bundles"));
     assert!(WORKFLOW.contains("gh release upload"));
     assert!(WORKFLOW.contains("expected two target-specific containment bundles and two checksums"));
@@ -126,6 +132,8 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
     assert!(!DIST.contains("install-linux-containment-broker.sh"));
     assert!(!WORKFLOW.contains("assemble-linux-containment-archive.py"));
     assert!(WORKFLOW.contains("--features linux-containment-broker-bin"));
+    assert!(WORKFLOW.contains("--bin cockpit --bin cockpit-containment-broker"));
+    assert!(WORKFLOW.contains("flycockpit-containment-index.json"));
     let dist_build = WORKFLOW.find("dist build ${{ needs.plan-cli-release.outputs.tag-flag }}").unwrap();
     let archive_verify = WORKFLOW.find("verify-linux-containment-archive.py").unwrap();
     assert!(dist_build < archive_verify);
@@ -144,9 +152,12 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         assert!(CONTAINMENT_ARCHIVE_CHECK.contains(payload));
         assert!(CONTAINMENT_BUNDLE_ASSEMBLER.contains(payload));
     }
+    assert!(CONTAINMENT_ARCHIVE_CHECK.contains("MANIFEST.sha256"));
+    assert!(CONTAINMENT_ARCHIVE_CHECK.contains("digest_stream"));
+    assert!(CONTAINMENT_BUNDLE_ASSEMBLER.contains("MANIFEST.sha256"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn linux_containment_bundle_fixture_has_exact_target_checksum_and_payload() {
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
@@ -160,10 +171,13 @@ fn linux_containment_bundle_fixture_has_exact_target_checksum_and_payload() {
     fs::create_dir_all(&binaries).unwrap();
     for binary in ["cockpit", "cockpit-containment-broker"] {
         let path = binaries.join(binary);
-        let mut elf = vec![0_u8; 20];
+        let mut elf = vec![0_u8; 24];
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4..6].copy_from_slice(b"\x02\x01");
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&3_u16.to_le_bytes());
         elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
         fs::write(&path, elf).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -181,6 +195,36 @@ fn linux_containment_bundle_fixture_has_exact_target_checksum_and_payload() {
         .arg(&verifier).arg(&output)
         .args(["x86_64-unknown-linux-gnu", "v-fixture"])
         .status().unwrap().success());
+
+    let archive = output.join(
+        "flycockpit-containment-v-fixture-x86_64-unknown-linux-gnu.tar.gz",
+    );
+    let checksum = output.join(
+        "flycockpit-containment-v-fixture-x86_64-unknown-linux-gnu.tar.gz.sha256",
+    );
+    let valid_archive = fs::read(&archive).unwrap();
+    let valid_checksum = fs::read(&checksum).unwrap();
+    fs::write(
+        &checksum,
+        format!(
+            "{}  {}\n",
+            "0".repeat(64),
+            archive.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+    assert!(!Command::new("python3")
+        .arg(&verifier).arg(&output)
+        .args(["x86_64-unknown-linux-gnu", "v-fixture"])
+        .status().unwrap().success());
+    fs::write(&checksum, &valid_checksum).unwrap();
+    fs::write(&archive, &valid_archive[..valid_archive.len() / 2]).unwrap();
+    assert!(!Command::new("python3")
+        .arg(&verifier).arg(&output)
+        .args(["x86_64-unknown-linux-gnu", "v-fixture"])
+        .status().unwrap().success());
+    fs::write(&archive, valid_archive).unwrap();
+    fs::write(&checksum, valid_checksum).unwrap();
     assert!(!Command::new("python3")
         .arg(verifier).arg(&output)
         .args(["x86_64-apple-darwin", "v-fixture"])

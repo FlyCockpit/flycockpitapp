@@ -279,7 +279,7 @@ fn submission_origin_user_prompt_source_only_fires_for_external_user() {
     }
 }
 
-pub(crate) async fn probe_user_prompt_submit_boundary() {
+pub(crate) async fn probe_user_prompt_submit_boundary() -> String {
     // Drive the record boundary directly with each resolved source. `user`
     // fires one row; a `queued`-only hook does not fire for `user` (exact
     // matcher); and `None` (a host/goal/scheduled origin) fires ZERO rows even
@@ -305,6 +305,16 @@ pub(crate) async fn probe_user_prompt_submit_boundary() {
         vec!["failed".to_string()],
         "a genuine user submission must fire exactly one userPromptSubmit hook"
     );
+    let observed = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == "hook_run")
+        .and_then(|row| row.data["event"].as_str().map(str::to_owned))
+        .expect("production boundary persisted its hook event");
 
     // A queued-only hook must NOT fire for a `user` submission.
     let (mut driver, _tmp) = test_driver_without_network(1);
@@ -344,6 +354,7 @@ pub(crate) async fn probe_user_prompt_submit_boundary() {
             .is_empty(),
         "a host/goal/scheduled auto-turn must fire NO userPromptSubmit hook"
     );
+    observed
 }
 
 #[tokio::test]
@@ -351,7 +362,7 @@ async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
     probe_user_prompt_submit_boundary().await;
 }
 
-pub(crate) async fn probe_stop_failure_boundary() {
+pub(crate) async fn probe_stop_failure_boundary() -> String {
     // The production `run_stop_failure_hooks` helper (the exact call the two
     // inference-failure arms make before unwinding) fires a `stopFailure` hook
     // matched on the error-class token, and does not fire on a lookalike class.
@@ -371,6 +382,16 @@ pub(crate) async fn probe_stop_failure_boundary() {
         vec!["failed".to_string()],
         "a network inference failure must fire exactly one stopFailure hook"
     );
+    let observed = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == "hook_run")
+        .and_then(|row| row.data["event"].as_str().map(str::to_owned))
+        .expect("production failure boundary persisted its hook event");
 
     // A `timeout_ttft`-only hook must not fire on a network failure.
     let (mut driver, _tmp) = test_driver_without_network(1);
@@ -388,6 +409,7 @@ pub(crate) async fn probe_stop_failure_boundary() {
         observe_hook_events(&driver, "stopFailure").await.is_empty(),
         "a timeout_ttft-only hook must not fire on a network failure"
     );
+    observed
 }
 
 #[tokio::test]
@@ -406,7 +428,7 @@ async fn stop_failure_hook_fires_on_inference_error_class() {
 // pushes a child whose agent name is `builder`.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn probe_subagent_stop_boundary() {
+pub(crate) async fn probe_subagent_stop_boundary() -> String {
     // Drive the real success-pop boundary: a `subagentStop` hook matched on the
     // child agent type fires exactly once when the child frame is popped.
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -425,6 +447,16 @@ pub(crate) async fn probe_subagent_stop_boundary() {
         vec!["failed".to_string()],
         "popping an interactive child must fire exactly one subagentStop hook"
     );
+    let observed = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == "hook_run")
+        .and_then(|row| row.data["event"].as_str().map(str::to_owned))
+        .expect("production child-stop boundary persisted its hook event");
     drop(tx);
     while rx.recv().await.is_some() {}
 
@@ -448,6 +480,7 @@ pub(crate) async fn probe_subagent_stop_boundary() {
     );
     drop(tx);
     while rx.recv().await.is_some() {}
+    observed
 }
 
 #[tokio::test]
@@ -487,7 +520,7 @@ async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
     while rx.recv().await.is_some() {}
 }
 
-pub(crate) async fn probe_subagent_start_boundary() {
+pub(crate) async fn probe_subagent_start_boundary() -> String {
     // The production `fire_subagent_hook` helper (the exact call the interactive
     // spawn boundary makes) fires a `subagentStart` hook matched on the child
     // agent type, and does not fire on a different-agent-type lookalike.
@@ -507,6 +540,16 @@ pub(crate) async fn probe_subagent_start_boundary() {
         vec!["failed".to_string()],
         "a builder child spawn must fire exactly one subagentStart hook"
     );
+    let observed = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == "hook_run")
+        .and_then(|row| row.data["event"].as_str().map(str::to_owned))
+        .expect("production child-start boundary persisted its hook event");
 
     let (mut driver, _tmp) = test_driver_without_network(1);
     inject_hooks(
@@ -525,6 +568,7 @@ pub(crate) async fn probe_subagent_start_boundary() {
             .is_empty(),
         "an explore-only hook must not fire on a builder child spawn"
     );
+    observed
 }
 
 #[tokio::test]

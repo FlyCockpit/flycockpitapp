@@ -1263,6 +1263,7 @@ async fn hook_dispatcher_matches_typed_lifecycle_envelopes() {
             None,
             ObserveFields {
                 compact_source: Some(source),
+                compaction_id: Some("01890f3e-4c00-7000-8000-000000000099"),
                 ..Default::default()
             },
         )
@@ -1271,6 +1272,10 @@ async fn hook_dispatcher_matches_typed_lifecycle_envelopes() {
         let stdin = stdin.expect("compact hook invoked");
         assert_eq!(stdin["hookEventName"], key);
         assert_eq!(stdin["compactSource"], source);
+        assert_eq!(
+            stdin["compactionId"],
+            "01890f3e-4c00-7000-8000-000000000099"
+        );
     }
     // A manual compaction must not fire an `auto`-only hook.
     let (rows, _) = observe_once(
@@ -1469,37 +1474,31 @@ async fn hook_dispatcher_matches_typed_lifecycle_envelopes() {
 async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
     tokio::time::resume();
 
-    let [session_start, session_end] =
+    let worker_events =
         crate::daemon::session_worker::tests::production_worker_lifecycle_hook_probe().await;
-    let mut observed = vec![session_start];
+    let mut observed = vec![worker_events[0].clone()];
 
-    crate::engine::driver::tests::misc::probe_user_prompt_submit_boundary().await;
-    observed.push(HookEvent::UserPromptSubmit);
+    observed.push(crate::engine::driver::tests::misc::probe_user_prompt_submit_boundary().await);
 
     observed.extend(
         crate::engine::agent::tool_dispatch::tests::production_tool_lifecycle_hook_probe().await,
     );
 
-    crate::engine::driver::tests::turn_loop::probe_root_stop_boundary().await;
+    observed.push(crate::engine::driver::tests::turn_loop::probe_root_stop_boundary().await);
     crate::engine::driver::tests::turn_loop::probe_root_stop_lookalike_boundary().await;
-    observed.push(HookEvent::Stop);
 
-    crate::engine::driver::tests::misc::probe_stop_failure_boundary().await;
-    observed.push(HookEvent::StopFailure);
+    observed.push(crate::engine::driver::tests::misc::probe_stop_failure_boundary().await);
 
-    crate::engine::driver::tests::misc::probe_subagent_start_boundary().await;
-    observed.push(HookEvent::SubagentStart);
+    observed.push(crate::engine::driver::tests::misc::probe_subagent_start_boundary().await);
 
-    crate::engine::driver::tests::misc::probe_subagent_stop_boundary().await;
-    observed.push(HookEvent::SubagentStop);
+    observed.push(crate::engine::driver::tests::misc::probe_subagent_stop_boundary().await);
 
-    crate::engine::driver::tests::context::probe_compact_boundaries().await;
-    observed.extend([HookEvent::PreCompact, HookEvent::PostCompact]);
-    observed.push(session_end);
+    observed.extend(crate::engine::driver::tests::context::probe_compact_boundaries().await);
+    observed.push(worker_events[1].clone());
 
     assert_eq!(
         observed.as_slice(),
-        HookEvent::ALL.as_slice(),
+        HookEvent::ALL.map(HookEvent::key).as_slice(),
         "every typed lifecycle event must be exercised exactly once in normative order"
     );
 }

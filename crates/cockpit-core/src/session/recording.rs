@@ -2003,6 +2003,7 @@ impl Session {
         self.record_session_compacted_with_source(
             agent,
             SessionCompactionRecord {
+                compaction_id: Uuid::new_v4(),
                 successor_session_id,
                 successor_short_id,
                 seed_tool_count,
@@ -2039,8 +2040,16 @@ impl Session {
         record: SessionCompactionRecord<'_>,
         frame: Option<SessionEventModelFrame<'_>>,
     ) -> Result<i64> {
+        if let Some(seq) = self
+            .db
+            .session_compaction_event_seq(self.id, record.compaction_id)
+            .await?
+        {
+            return Ok(seq);
+        }
         const INLINE_HANDOFF_MAX_BYTES: usize = 16 * 1024;
         let data = serde_json::json!({
+            "compaction_id": record.compaction_id.to_string(),
             "kind": "compaction",
             "predecessor_session_id": self.id.to_string(),
             "predecessor_short_id": self.short_id,
@@ -2059,13 +2068,14 @@ impl Session {
             "tail_messages": record.tail_messages,
         });
         if data.to_string().len() > INLINE_HANDOFF_MAX_BYTES {
-            let handoff_id = Uuid::new_v4();
+            let handoff_id = record.compaction_id;
             // The full model-authored payload is offloaded to
             // `compaction_handoffs`; journal (or fail-closed scrub) its trusted
             // table-matched literals so none is stored raw there (K1).
             self.store_compaction_payload_journaled(handoff_id, &data, frame)
                 .await?;
             let trimmed = serde_json::json!({
+                "compaction_id": record.compaction_id.to_string(),
                 "kind": "compaction",
                 "predecessor_session_id": self.id.to_string(),
                 "predecessor_short_id": self.short_id,
@@ -2892,6 +2902,7 @@ mod trusted_journaling_tests {
         let sid = session.id.to_string();
 
         let record = |brief: &'static str| SessionCompactionRecord {
+            compaction_id: Uuid::new_v4(),
             successor_session_id: session.id,
             successor_short_id: "succ",
             seed_tool_count: 0,

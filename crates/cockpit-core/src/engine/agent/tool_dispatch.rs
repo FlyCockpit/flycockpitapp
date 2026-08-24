@@ -2577,8 +2577,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    pub(crate) async fn production_tool_lifecycle_hook_probe(
-    ) -> [crate::config::extended::hooks::HookEvent; 4] {
+    pub(crate) async fn production_tool_lifecycle_hook_probe() -> Vec<String> {
         use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
 
         fn registry(entries: &[(HookEvent, &str)]) -> HookRegistry {
@@ -2726,6 +2725,7 @@ pub(crate) mod tests {
             rows(&session).await,
             vec![HookEvent::PermissionDenied.key().to_string()]
         );
+        let permission_denied = rows(&session).await;
 
         let session = test_session(tmp.path());
         let (tx, _rx) = mpsc::channel(8);
@@ -2752,12 +2752,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(rows(&session).await.is_empty());
 
-        [
-            HookEvent::PreToolUse,
-            HookEvent::PostToolUse,
-            HookEvent::PostToolUseFailure,
-            HookEvent::PermissionDenied,
-        ]
+        let mut observed = success;
+        observed.extend(failure);
+        observed.extend(permission_denied);
+        observed
     }
 
     #[tokio::test]

@@ -853,7 +853,12 @@ async fn durable_shadow_payload_round_trips_with_prepared_compaction() {
         .prepare_compaction_with_source(&tx, "manual")
         .await
         .expect("prepare succeeds");
-    let payload = DurableCompactionShadow::PreparedCompaction(Box::new(prepared));
+    let payload = DurableCompactionShadow::CompactionTransaction(Box::new(
+        DurableCompactionTransaction {
+            phase: CompactionTransactionPhase::Prepared,
+            prepared,
+        },
+    ));
     let encoded = serde_json::to_string(&payload).unwrap();
     let decoded: DurableCompactionShadow = serde_json::from_str(&encoded).unwrap();
 
@@ -2913,7 +2918,7 @@ async fn compact_hook_event_order(driver: &Driver) -> Vec<String> {
         .collect()
 }
 
-pub(crate) async fn probe_compact_boundaries() {
+pub(crate) async fn probe_compact_boundaries() -> Vec<String> {
     // Pin the transactional preCompact/postCompact contract over the
     // real `do_compact_with_source` boundary:
     //   prepare-fail → 0 pre + 0 post (no compaction attempted)
@@ -2977,6 +2982,7 @@ pub(crate) async fn probe_compact_boundaries() {
         vec!["preCompact".to_string(), "postCompact".to_string()],
         "preCompact must be recorded strictly before postCompact"
     );
+    let observed = compact_hook_event_order(&driver).await;
 
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     inject_hooks(&mut driver, compact_registry("auto"));
@@ -2988,6 +2994,7 @@ pub(crate) async fn probe_compact_boundaries() {
         compact_hook_event_order(&driver).await.is_empty(),
         "auto-only compact hooks must not fire at the manual production boundary"
     );
+    observed
 }
 
 #[tokio::test]
@@ -3005,7 +3012,12 @@ async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
         .await
         .expect("prepare succeeds");
     let expected_history = prepared.history.clone();
-    let intent = DurableCompactionShadow::PreparedCompaction(Box::new(prepared));
+    let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
+        DurableCompactionTransaction {
+            phase: CompactionTransactionPhase::Prepared,
+            prepared,
+        },
+    ));
     driver
         .session
         .db
@@ -3036,5 +3048,104 @@ async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
             .unwrap()
             .is_none(),
         "successful recovery clears its durable intent"
+    );
+}
+
+#[tokio::test]
+async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_boundaries() {
+    use CompactionTransactionPhase as Phase;
+
+    for (phase, expected_hooks) in [
+        (Phase::Prepared, vec!["preCompact", "postCompact"]),
+        (Phase::PreDispatched, vec!["postCompact"]),
+        (Phase::SuccessorCommitted, vec!["postCompact"]),
+        (Phase::PostDispatched, vec![]),
+    ] {
+        let (mut driver, _tmp) = prepare_apply_fixture().await;
+        inject_hooks(&mut driver, compact_manual_registry());
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let prepared = driver
+            .prepare_compaction_with_source(&tx, "manual")
+            .await
+            .expect("prepare succeeds");
+
+        if matches!(phase, Phase::SuccessorCommitted | Phase::PostDispatched) {
+            driver
+                .stage_prepared_compaction(&prepared)
+                .await
+                .expect("pre-crash successor commit succeeds");
+        }
+        let intent = DurableCompactionShadow::CompactionTransaction(Box::new(
+            DurableCompactionTransaction { phase, prepared },
+        ));
+        driver
+            .session
+            .db
+            .upsert_compaction_shadow(
+                driver.session.id,
+                &serde_json::to_string(&intent).unwrap(),
+            )
+            .await
+            .unwrap();
+        driver.load_compaction_shadow_from_store().await;
+        driver.recover_compaction_intent(&tx).await;
+
+        let hooks = compact_hook_event_order(&driver).await;
+        assert_eq!(
+            hooks,
+            expected_hooks
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "phase {phase:?} must resume only undispatched boundaries"
+        );
+        let compacted = driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == "session_compacted")
+            .count();
+        assert_eq!(compacted, 1, "phase {phase:?} must commit one successor");
+        assert!(
+            driver
+                .session
+                .db
+                .compaction_shadow(driver.session.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "phase {phase:?} must converge to a cleared transaction"
+        );
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+}
+
+#[tokio::test]
+async fn compaction_timeline_commit_is_idempotent_by_compaction_id() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+
+    driver.stage_prepared_compaction(&prepared).await.unwrap();
+    driver.stage_prepared_compaction(&prepared).await.unwrap();
+
+    assert_eq!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == "session_compacted")
+            .count(),
+        1
     );
 }

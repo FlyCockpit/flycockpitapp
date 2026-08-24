@@ -18,9 +18,14 @@ status_cli=$payload_cli
 if [ -x /usr/bin/cockpit ]; then status_cli=/usr/bin/cockpit; fi
 daemon_uid=$(id -u "$daemon_user")
 daemon_gid=$(id -g "$daemon_user")
+capability=/etc/flycockpit/containment-capability-$daemon_uid
 case "$daemon_uid:$daemon_gid" in
   *[!0-9:]*|:*) echo "daemon account did not resolve to numeric uid/gid" >&2; exit 1 ;;
 esac
+if [ "$daemon_uid" -eq 0 ]; then
+  echo "the managed FlyCockpit daemon must use a dedicated non-root account" >&2
+  exit 1
+fi
 
 for source in "$payload_cli" "$payload_broker" \
   "$payload_root/infra/systemd/cockpit-containment-broker@.service" \
@@ -32,6 +37,57 @@ do
     exit 1
   fi
 done
+
+# Authenticate and identify the complete extracted bundle before stopping a
+# daemon or writing any privileged path. This installer is Linux-only, so its
+# verification tools are explicit prerequisites, never weaker fallbacks.
+for tool in sha256sum readelf uname; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "required bundle verification tool is unavailable: $tool" >&2
+    exit 1
+  fi
+done
+bundle_target=$(sed -n '1p' "$payload_root/TARGET" 2>/dev/null || true)
+case "$(uname -m):$bundle_target" in
+  x86_64:x86_64-unknown-linux-gnu|aarch64:aarch64-unknown-linux-gnu) ;;
+  *) echo "containment bundle target '$bundle_target' does not match host architecture '$(uname -m)'" >&2; exit 1 ;;
+esac
+if [ ! -s "$payload_root/RELEASE" ] || [ ! -f "$payload_root/MANIFEST.sha256" ]; then
+  echo "containment bundle release metadata is missing" >&2
+  exit 1
+fi
+if ! (cd "$payload_root" && sha256sum --strict --check MANIFEST.sha256 >/dev/null); then
+  echo "containment bundle member verification failed" >&2
+  exit 1
+fi
+manifest_members=$(sed -n 's/^[0-9a-fA-F]\{64\}[[:space:]][ *]\{0,1\}//p' "$payload_root/MANIFEST.sha256" | LC_ALL=C sort)
+expected_members=$(printf '%s\n' \
+  RELEASE TARGET cockpit cockpit-containment-broker \
+  infra/systemd/cockpit-containment-broker@.service \
+  infra/systemd/cockpit-daemon@.service \
+  infra/tmpfiles.d/flycockpit-containment.conf \
+  install-linux-containment-broker.sh | LC_ALL=C sort)
+if [ "$manifest_members" != "$expected_members" ]; then
+  echo "containment bundle manifest does not cover the exact release payload" >&2
+  exit 1
+fi
+expected_machine=$(case "$bundle_target" in x86_64-*) echo Advanced Micro Devices X86-64;; aarch64-*) echo AArch64;; esac)
+for binary in "$payload_cli" "$payload_broker"; do
+  if [ ! -f "$binary" ] || [ -L "$binary" ] || [ ! -x "$binary" ] \
+    || ! readelf -h "$binary" 2>/dev/null | grep -F "Machine:" | grep -F "$expected_machine" >/dev/null
+  then
+    echo "bundle executable is invalid for $bundle_target: $binary" >&2
+    exit 1
+  fi
+done
+if [ -L "$capability" ]; then
+  echo "existing containment capability must not be a symlink" >&2
+  exit 1
+fi
+if [ -e "$capability" ] && [ "$(stat -c '%u:%g:%a:%s' "$capability")" != "0:0:400:32" ]; then
+  echo "existing containment capability has unsafe ownership, mode, or size" >&2
+  exit 1
+fi
 
 systemd_version=$(systemd-analyze --version | sed -n '1s/^systemd \([0-9][0-9]*\).*/\1/p')
 if [ -z "$systemd_version" ] || [ "$systemd_version" -lt 253 ]; then
@@ -54,6 +110,45 @@ then
 fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
 committed=0
+
+# Preserve actual enablement topology; `is-enabled` alone loses custom wants,
+# aliases, runtime links, and masks.
+snapshot_unit_links() {
+  unit=$1
+  output=$2
+  : >"$output"
+  for root in /etc/systemd/system /run/systemd/system; do
+    [ -d "$root" ] || continue
+    find "$root" -type l -print | while IFS= read -r link; do
+      target=$(readlink "$link")
+      case "$(basename "$link"):$(basename "$target")" in
+        "$unit":*|*:"$unit") printf '%s\t%s\n' "$link" "$target" >>"$output" ;;
+      esac
+    done
+  done
+}
+
+restore_unit_links() {
+  unit=$1
+  snapshot=$2
+  for root in /etc/systemd/system /run/systemd/system; do
+    [ -d "$root" ] || continue
+    find "$root" -type l -print | while IFS= read -r link; do
+      target=$(readlink "$link")
+      case "$(basename "$link"):$(basename "$target")" in
+        "$unit":*|*:"$unit") rm -f -- "$link" ;;
+      esac
+    done
+  done
+  while IFS="$(printf '\t')" read -r link target; do
+    [ -n "$link" ] || continue
+    mkdir -p "$(dirname "$link")"
+    ln -s "$target" "$link"
+  done <"$snapshot"
+}
+
+snapshot_unit_links "$broker_unit" "$transaction/broker.links"
+snapshot_unit_links "$daemon_unit" "$transaction/daemon.links"
 
 restore_enablement() {
   unit=$1
@@ -103,8 +198,11 @@ rollback() {
       /usr/lib/tmpfiles.d/flycockpit-containment.conf
     do
       name=$(printf '%s' "$destination" | tr '/' '_')
-      if [ -f "$transaction/$name.previous" ]; then
-        install -m "$(stat -c '%a' "$transaction/$name.previous")" "$transaction/$name.previous" "$destination"
+      if [ -e "$transaction/$name.previous" ] || [ -L "$transaction/$name.previous" ]; then
+        restored="$destination.flycockpit-restore-$$"
+        rm -f -- "$restored"
+        cp -a --preserve=all "$transaction/$name.previous" "$restored"
+        mv -Tf "$restored" "$destination"
       elif [ -f "$transaction/$name.created" ]; then
         rm -f "$destination"
       fi
@@ -112,6 +210,8 @@ rollback() {
     systemctl daemon-reload 2>/dev/null || true
     restore_enablement "$broker_unit" "$broker_enablement"
     restore_enablement "$daemon_unit" "$daemon_enablement"
+    restore_unit_links "$broker_unit" "$transaction/broker.links"
+    restore_unit_links "$daemon_unit" "$transaction/daemon.links"
     if [ -f "$transaction/capability.created" ]; then
       rm -f "/etc/flycockpit/containment-capability-$daemon_uid"
     fi
@@ -155,8 +255,8 @@ stage_install() {
   destination=$2
   mode=$3
   name=$(printf '%s' "$destination" | tr '/' '_')
-  if [ -e "$destination" ]; then
-    cp -a "$destination" "$transaction/$name.previous"
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    cp -a --preserve=all "$destination" "$transaction/$name.previous"
   else
     : >"$transaction/$name.created"
   fi
@@ -177,7 +277,6 @@ stage_install "$payload_root/infra/tmpfiles.d/flycockpit-containment.conf" /usr/
 # absent before the transaction began.
 systemd-analyze verify /usr/lib/systemd/system/cockpit-containment-broker@.service /usr/lib/systemd/system/cockpit-daemon@.service
 
-capability=/etc/flycockpit/containment-capability-$daemon_uid
 if [ ! -e "$capability" ]; then
   umask 077
   capability_staged="$capability.flycockpit-new-$$"

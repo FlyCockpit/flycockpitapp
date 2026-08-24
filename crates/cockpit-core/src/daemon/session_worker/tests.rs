@@ -4802,60 +4802,98 @@ async fn queue_item_carries_display_text() {
 // `sessionEnd` hook matcher: closed deterministic WorkerStop -> matcher map.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn production_worker_lifecycle_hook_probe(
-) -> [crate::config::extended::hooks::HookEvent; 2] {
+pub(crate) async fn production_worker_lifecycle_hook_probe() -> Vec<String> {
     use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
-
-    async fn run(event: HookEvent, actual: &str, configured: &str) -> usize {
-        let root = tempfile::tempdir().unwrap();
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
+    let root = tempfile::tempdir().unwrap();
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Arc::new(
+        Session::create_for_test(
+            db.clone(),
             root.path().to_path_buf(),
             "Build",
             crate::session::test_redaction_key_resolver(),
         )
-        .unwrap();
-        let registry = HookRegistry {
-            hooks: vec![ResolvedHook {
+        .unwrap(),
+    );
+    let registry = HookRegistry {
+        hooks: [
+            (HookEvent::SessionStart, "fresh"),
+            (HookEvent::SessionEnd, "interrupted"),
+        ]
+        .into_iter()
+        .map(|(event, matcher)| ResolvedHook {
                 event,
-                matcher: Some([configured.to_string()].into_iter().collect()),
+                matcher: Some([matcher.to_string()].into_iter().collect()),
                 command: vec!["cockpit-worker-hook-does-not-exist".to_string()],
                 timeout_secs: 5,
                 env: std::collections::BTreeMap::new(),
                 origin: HookOrigin::for_test("project:abcdef0123456789:0"),
                 source_config_path: root.path().join("config.json"),
                 source_directory: root.path().to_path_buf(),
-            }],
-            warnings: Vec::new(),
-        };
-        super::run::fire_worker_lifecycle_hook(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
-            &registry,
-            match event {
-                HookEvent::SessionStart => super::run::WorkerLifecycleHook::Start(actual),
-                HookEvent::SessionEnd => super::run::WorkerLifecycleHook::End(actual),
-                _ => unreachable!("worker probe only owns session lifecycle events"),
-            },
-            &session,
-            root.path(),
-        )
-        .await;
-        session
-            .db
-            .list_session_events(session.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.kind == "hook_run")
-            .count()
-    }
+            })
+        .collect(),
+        warnings: Vec::new(),
+    };
+    let providers = lmstudio_test_providers();
+    let redaction = Arc::new(RedactionTable::empty());
+    let model = Arc::new(
+        crate::engine::model::Model::from_config(&providers, redaction.clone()).unwrap(),
+    );
+    let mut extended = crate::config::extended::ExtendedConfig::default();
+    extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+    let trust_policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::TrustRoot {
+            opened_path: root.path().to_path_buf(),
+            root: root.path().to_path_buf(),
+            kind: crate::config::trust::TrustRootKind::Directory,
+        },
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    let snapshot = SessionConfigSnapshot::with_hooks(
+        0,
+        providers,
+        extended.clone(),
+        registry,
+    );
+    let session_id = session.id;
+    let (handle, join) = spawn(
+        session,
+        Arc::new(LockManager::in_memory(db.clone())),
+        redaction,
+        model,
+        None,
+        None,
+        None,
+        root.path().to_path_buf(),
+        false,
+        false,
+        &extended,
+        Arc::new(crate::daemon::lsp::LspManager::new()),
+        None,
+        Arc::new(StdMutex::new(None)),
+        Arc::new(StdMutex::new(None)),
+        None,
+        trust_policy,
+        None,
+        EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        ),
+        snapshot,
+    );
+    handle.send_work(SessionWork::InterruptAndStop).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .expect("interrupted worker teardown completes")
+        .unwrap();
 
-    assert_eq!(run(HookEvent::SessionStart, "fresh", "fresh").await, 1);
-    assert_eq!(run(HookEvent::SessionStart, "fresh", "resume").await, 0);
-    assert_eq!(run(HookEvent::SessionEnd, "completed", "completed").await, 1);
-    assert_eq!(run(HookEvent::SessionEnd, "completed", "error").await, 0);
-    [HookEvent::SessionStart, HookEvent::SessionEnd]
+    db.list_session_events(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.kind == "hook_run")
+        .filter_map(|row| row.data["event"].as_str().map(str::to_owned))
+        .collect()
 }
 
 #[tokio::test]

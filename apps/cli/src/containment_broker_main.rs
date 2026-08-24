@@ -34,6 +34,9 @@ fn main() -> std::io::Result<()> {
         }
     }
     let uid = uid.ok_or_else(|| invalid("--allowed-uid is required"))?;
+    if uid == 0 {
+        return Err(invalid("--allowed-uid must identify a non-root daemon account"));
+    }
     if doctor && prepare_cgroup_root {
         return Err(invalid("--doctor and --prepare-cgroup-root are mutually exclusive"));
     }

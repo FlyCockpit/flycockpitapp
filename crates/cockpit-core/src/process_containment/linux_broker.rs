@@ -177,7 +177,13 @@ enum Response {
 #[serde(rename_all = "snake_case")]
 enum OperationStatus {
     Prepared,
-    Committing,
+    /// The commit decision is durable, but release of the child gate has not
+    /// yet been durably acknowledged. Recovery must conservatively abort this
+    /// generation: it may have crossed the release boundary.
+    CommitDecided,
+    /// The child gate was opened. This phase prevents a crash between release
+    /// and publication of `Committed` from ever being recovered as cancelled.
+    Released,
     Committed,
     /// Kill has been requested but kernel-proven emptiness has not yet been
     /// observed. This durable state is retryable and must never be reported as
@@ -189,6 +195,9 @@ enum OperationStatus {
     /// The broker killed this generation because its authenticated owner
     /// disconnected. It must never be reconciled as a successful commit.
     DisconnectAborted,
+    /// Natural exit was observed and its code was durably recorded, but the
+    /// terminal publication (and any remaining directory removal) is pending.
+    ExitPersistenceRequired,
     Exited,
 }
 
@@ -631,6 +640,7 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
         stream.set_write_timeout(Some(FRAME_TIMEOUT))?;
         loop {
             retry_pending_cleanups(&config, &mut state);
+            retry_pending_exits(&config, &mut state);
             match serve_one(&mut stream, &config, &mut state) {
                 Ok(()) => {}
                 Err(error)
@@ -931,12 +941,6 @@ fn serve_one(
                 );
             }
             let operation_key = (session_id.clone(), operation_id.clone());
-            if state.tombstones.contains(&session_id, &operation_id) {
-                return send_response(stream, &Response::Error {
-                    version: PROTOCOL_VERSION,
-                    code: "operation_identity_retired".into(),
-                }, &[]);
-            }
             let expected_digest = canonical_spawn_digest(
                 &containment_id,
                 &session_id,
@@ -970,6 +974,15 @@ fn serve_one(
                     }
                     _ => send_response(stream, &Response::Operation { version: PROTOCOL_VERSION, state: existing.status, key: Some(existing.key.clone()) }, &[]),
                 };
+            }
+            // Exact durable state is authoritative. GC deliberately publishes
+            // the Bloom filter before unlinking exact rows, so a crash may
+            // leave both representations behind.
+            if state.tombstones.contains(&session_id, &operation_id) {
+                return send_response(stream, &Response::Error {
+                    version: PROTOCOL_VERSION,
+                    code: "operation_identity_retired".into(),
+                }, &[]);
             }
             if state.operations.iter().any(|(identity, operation)| {
                 operation.key == requested_key && identity != &operation_key
@@ -1089,7 +1102,7 @@ fn serve_one(
                 if !matches!(operation.status, OperationStatus::Prepared) {
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_cancelled".into() }, &[]);
                 }
-                operation.status = OperationStatus::Committing;
+                operation.status = OperationStatus::CommitDecided;
                 (
                     operation.key.clone(),
                     operation.generation,
@@ -1116,7 +1129,7 @@ fn serve_one(
                     config,
                     &session_id,
                     &operation_id,
-                    OperationStatus::Committing,
+                    OperationStatus::CommitDecided,
                     &key,
                     generation,
                     &digest,
@@ -1138,12 +1151,16 @@ fn serve_one(
                 }
                 Err(error) => {
                     let operation = state.operations.get_mut(&identity).expect("operation exists");
-                    operation.status = OperationStatus::CleanupRequired;
+                    // Once this transaction was attempted, an I/O error does
+                    // not prove whether the durable decision or release write
+                    // crossed its boundary. Abort conservatively; never
+                    // publish cancellation for a child that may have run.
+                    operation.status = OperationStatus::DisconnectCleanupRequired;
                     let _ = persist_operation(
                         config,
                         &session_id,
                         &operation_id,
-                        OperationStatus::CleanupRequired,
+                        OperationStatus::DisconnectCleanupRequired,
                         &key,
                         generation,
                         &digest,
@@ -1159,6 +1176,13 @@ fn serve_one(
             // cleanup_connection_children still kills and proves this child
             // empty instead of orphaning an untracked running generation.
             state.children.insert(key.clone(), spawned.pid);
+            if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::Released, &key, generation, &digest) {
+                let operation = state.operations.get_mut(&identity).expect("operation exists");
+                operation.status = OperationStatus::DisconnectCleanupRequired;
+                let _ = persist_operation(config, &session_id, &operation_id, OperationStatus::DisconnectCleanupRequired, &key, generation, &digest);
+                return Err(error);
+            }
+            state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Released;
             if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &key, generation, &digest) {
                 let operation = state.operations.get_mut(&identity).expect("operation exists");
                 operation.status = OperationStatus::DisconnectCleanupRequired;
@@ -1206,10 +1230,11 @@ fn serve_one(
                     return Err(error);
                 }
             };
+            persist_pending_exit_for_key(config, state, &key, OperationStatus::CleanupRequired, cleanup_exit)?;
+            persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled)?;
             state.children.remove(&key);
             state.exit_statuses.insert(key.clone(), cleanup_exit);
             state.remember_empty(key.clone());
-            persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled)?;
             send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
         }
         Request::OperationStatus { version, session_id, operation_id }
@@ -1254,14 +1279,26 @@ fn serve_one(
             let events = fs::read_to_string(path.join("cgroup.events"))?;
             let populated = parse_populated(&events)?;
             if !populated {
-                if let Some(pid) = state.children.get(&key).copied() {
-                    let exit_status = reap_child(pid)?;
-                    state.exit_statuses.insert(key.clone(), exit_status);
-                    state.children.remove(&key);
-                }
+                let exit_status = match state.children.get(&key).copied() {
+                    Some(pid) => reap_child(pid)?,
+                    None => state.exit_statuses.get(&key).copied().flatten(),
+                };
+                // Cache the observation for an in-process persistence retry,
+                // but retain child ownership and do not report terminal state
+                // until both durable writes below succeed.
+                state.exit_statuses.insert(key.clone(), exit_status);
+                persist_pending_exit_for_key(
+                    config,
+                    state,
+                    &key,
+                    OperationStatus::ExitPersistenceRequired,
+                    exit_status,
+                )?;
                 fs::remove_dir(&path)?;
-                state.remember_empty(key.clone());
                 persist_terminal_for_key(config, state, &key, OperationStatus::Exited)?;
+                state.children.remove(&key);
+                state.exit_statuses.insert(key.clone(), exit_status);
+                state.remember_empty(key.clone());
             }
             send_response(&stream, &Response::Population { version: PROTOCOL_VERSION, populated }, &[])
         }
@@ -1274,7 +1311,6 @@ fn serve_one(
             } else {
                 let pid = state.children.get(&key).copied().ok_or_else(|| invalid("unknown child"))?;
                 let exit_code = reap_child(pid)?;
-                state.children.remove(&key);
                 state.exit_statuses.insert(key.clone(), exit_code);
                 exit_code
             };
@@ -1286,7 +1322,15 @@ fn serve_one(
             } else {
                 status
             };
+            let pending_terminal = if matches!(terminal, OperationStatus::Exited) {
+                OperationStatus::ExitPersistenceRequired
+            } else {
+                terminal
+            };
+            persist_pending_exit_for_key(config, state, &key, pending_terminal, exit_code)?;
             persist_terminal_for_key(config, state, &key, terminal)?;
+            state.children.remove(&key);
+            state.exit_statuses.insert(key.clone(), exit_code);
             send_response(&stream, &Response::Exited { version: PROTOCOL_VERSION, status: terminal, exit_code }, &[])
         }
         _ => send_response(
@@ -1861,10 +1905,10 @@ fn cleanup_connection_children(config: &LinuxBrokerServerConfig, state: &mut Bro
         let generation = operation.generation;
         let digest = operation.request_digest.clone();
         let (pending, terminal) = match operation.status {
-            OperationStatus::Prepared | OperationStatus::Committing | OperationStatus::CleanupRequired => {
+            OperationStatus::Prepared | OperationStatus::CleanupRequired => {
                 (OperationStatus::CleanupRequired, OperationStatus::Cancelled)
             }
-            OperationStatus::Committed | OperationStatus::DisconnectCleanupRequired => {
+            OperationStatus::CommitDecided | OperationStatus::Released | OperationStatus::Committed | OperationStatus::DisconnectCleanupRequired => {
                 (OperationStatus::DisconnectCleanupRequired, OperationStatus::DisconnectAborted)
             }
             _ => continue,
@@ -1882,10 +1926,16 @@ fn cleanup_connection_children(config: &LinuxBrokerServerConfig, state: &mut Bro
                 continue;
             }
         };
+        if persist_pending_exit_for_key(config, state, &key, pending, cleanup_exit).is_err() {
+            if let Some(pid) = pid { state.children.insert(key, pid); }
+            continue;
+        }
+        if persist_terminal_for_key(config, state, &key, terminal).is_err() {
+            continue;
+        }
         state.children.remove(&key);
         state.exit_statuses.insert(key.clone(), cleanup_exit);
         state.remember_empty(key.clone());
-        let _ = persist_terminal_for_key(config, state, &key, terminal);
     }
 }
 
@@ -1902,13 +1952,57 @@ fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &mut BrokerSt
         if cleanup_generation(config, &key, generation, None, std::time::Duration::ZERO).is_err() {
             continue;
         }
-        if let Some(pid) = state.children.remove(&key) {
+        let exit_status = if let Some(pid) = state.children.get(&key).copied() {
             if let Ok(exit_status) = reap_child(pid) {
-                state.exit_statuses.insert(key.clone(), exit_status);
+                exit_status
+            } else {
+                continue;
+            }
+        } else {
+            state.exit_statuses.get(&key).copied().flatten()
+        };
+        let pending_status = match terminal {
+            OperationStatus::Cancelled => OperationStatus::CleanupRequired,
+            OperationStatus::DisconnectAborted => OperationStatus::DisconnectCleanupRequired,
+            _ => continue,
+        };
+        if persist_pending_exit_for_key(config, state, &key, pending_status, exit_status).is_err() {
+            continue;
+        }
+        if persist_terminal_for_key(config, state, &key, terminal).is_err() {
+            continue;
+        }
+        state.children.remove(&key);
+        state.exit_statuses.insert(key.clone(), exit_status);
+        state.remember_empty(key.clone());
+    }
+}
+
+fn retry_pending_exits(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
+    let pending = state.operations.values()
+        .filter(|operation| matches!(operation.status, OperationStatus::ExitPersistenceRequired))
+        .map(|operation| (operation.key.clone(), operation.generation, operation.exit_code))
+        .collect::<Vec<_>>();
+    for (key, generation, exit_code) in pending {
+        let path = match resolve_key_if_present(config, &key, generation) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if let Some(path) = path {
+            let events = match fs::read_to_string(path.join("cgroup.events")) {
+                Ok(events) => events,
+                Err(_) => continue,
+            };
+            if !matches!(parse_populated(&events), Ok(false)) || fs::remove_dir(path).is_err() {
+                continue;
             }
         }
-        state.remember_empty(key.clone());
-        let _ = persist_terminal_for_key(config, state, &key, terminal);
+        if persist_terminal_for_key(config, state, &key, OperationStatus::Exited).is_err() {
+            continue;
+        }
+        state.children.remove(&key);
+        state.exit_statuses.insert(key.clone(), exit_code);
+        state.remember_empty(key);
     }
 }
 
@@ -1923,9 +2017,9 @@ fn persist_terminal_for_key(
         .map(|(identity, _)| identity.clone());
     let (session_id, operation_id) = identity
         .ok_or_else(|| invalid("terminal status has no durable operation identity"))?;
-    let exit_code = state.exit_statuses.get(key).copied().flatten();
     let operation = state.operations.get_mut(&(session_id.clone(), operation_id.clone()))
         .expect("operation identity came from map");
+    let exit_code = state.exit_statuses.get(key).copied().flatten().or(operation.exit_code);
     let destination = operation_record_path(config, &session_id, &operation_id)?;
     let record = DurableOperation {
         broker_epoch: broker_epoch()?, session_id, operation_id, status,
@@ -1938,6 +2032,34 @@ fn persist_terminal_for_key(
     operation.status = status;
     operation.exit_code = record.exit_code;
     gc_terminal_operations(config, &mut state.operations, &mut state.tombstones)?;
+    Ok(())
+}
+
+fn persist_pending_exit_for_key(
+    config: &LinuxBrokerServerConfig,
+    state: &mut BrokerState,
+    key: &str,
+    status: OperationStatus,
+    exit_code: Option<i32>,
+) -> std::io::Result<()> {
+    let identity = state.operations.iter()
+        .find(|(_, operation)| operation.key == key)
+        .map(|(identity, _)| identity.clone())
+        .ok_or_else(|| invalid("pending exit has no durable operation identity"))?;
+    let operation = state.operations.get(&identity).expect("operation identity came from map");
+    persist_operation_with_exit(
+        config,
+        &identity.0,
+        &identity.1,
+        status,
+        &operation.key,
+        operation.generation,
+        &operation.request_digest,
+        exit_code,
+    )?;
+    let operation = state.operations.get_mut(&identity).expect("operation identity came from map");
+    operation.status = status;
+    operation.exit_code = exit_code;
     Ok(())
 }
 
@@ -2403,6 +2525,29 @@ fn persist_operation(
     generation: u64,
     request_digest: &str,
 ) -> std::io::Result<()> {
+    persist_operation_with_exit(
+        config,
+        session_id,
+        operation_id,
+        status,
+        key,
+        generation,
+        request_digest,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_operation_with_exit(
+    config: &LinuxBrokerServerConfig,
+    session_id: &str,
+    operation_id: &str,
+    status: OperationStatus,
+    key: &str,
+    generation: u64,
+    request_digest: &str,
+    exit_code: Option<i32>,
+) -> std::io::Result<()> {
     let destination = operation_record_path(config, session_id, operation_id)?;
     let record = DurableOperation {
         broker_epoch: broker_epoch()?,
@@ -2412,7 +2557,7 @@ fn persist_operation(
         key: key.to_owned(),
         generation,
         request_digest: request_digest.to_owned(),
-        exit_code: None,
+        exit_code,
     };
     let bytes = serde_json::to_vec(&record).map_err(invalid)?;
     atomic_replace_operation_record(config, &destination, &bytes)
@@ -2511,16 +2656,28 @@ fn recover_operation_records(
         let proven_empty = recovered_empty.contains(&record.key)
             || !config.cgroup_root.join(&record.key).exists();
         let recovered_status = match record.status {
-            OperationStatus::Prepared | OperationStatus::Committing | OperationStatus::CleanupRequired => {
+            OperationStatus::Prepared | OperationStatus::CleanupRequired => {
                 if proven_empty { OperationStatus::Cancelled } else { OperationStatus::CleanupRequired }
             }
-            OperationStatus::Committed | OperationStatus::DisconnectCleanupRequired => {
+            OperationStatus::CommitDecided | OperationStatus::Released | OperationStatus::Committed | OperationStatus::DisconnectCleanupRequired => {
                 if proven_empty { OperationStatus::DisconnectAborted } else { OperationStatus::DisconnectCleanupRequired }
+            }
+            OperationStatus::ExitPersistenceRequired => {
+                if proven_empty { OperationStatus::Exited } else { OperationStatus::ExitPersistenceRequired }
             }
             status => status,
         };
         if !matches!(record.status, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited) {
-            persist_operation(config, &record.session_id, &record.operation_id, recovered_status, &record.key, record.generation, &record.request_digest)?;
+            persist_operation_with_exit(
+                config,
+                &record.session_id,
+                &record.operation_id,
+                recovered_status,
+                &record.key,
+                record.generation,
+                &record.request_digest,
+                record.exit_code,
+            )?;
         }
         if operations.insert(identity, BrokerOperation {
             status: recovered_status,
@@ -3014,15 +3171,16 @@ fn recv_retry_until(
                 socket,
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
-                libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT,
             )
         };
         if received >= 0 {
             return Ok(received);
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match error.kind() {
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => continue,
+            _ => return Err(error),
         }
     }
 }
@@ -3226,6 +3384,41 @@ mod tests {
         };
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(encoded.contains("\"status\":\"disconnect_aborted\""));
+    }
+
+    #[test]
+    fn every_ambiguous_commit_phase_recovers_fail_closed() {
+        for status in [OperationStatus::CommitDecided, OperationStatus::Released] {
+            let recovered = match status {
+                OperationStatus::CommitDecided | OperationStatus::Released => {
+                    OperationStatus::DisconnectCleanupRequired
+                }
+                _ => unreachable!(),
+            };
+            assert!(matches!(recovered, OperationStatus::DisconnectCleanupRequired));
+            assert!(!matches!(recovered, OperationStatus::Cancelled));
+        }
+    }
+
+    #[test]
+    fn fragmented_frame_tail_is_reassembled_without_recvmsg_only_flags() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let body = serde_json::to_vec(&Response::Cancelled {
+            version: PROTOCOL_VERSION,
+        }).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        let writer = std::thread::spawn(move || {
+            for byte in frame {
+                sender.write_all(&[byte]).unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let (response, fds) = recv_response_with_fds(&receiver).unwrap();
+        writer.join().unwrap();
+        assert!(matches!(response, Response::Cancelled { version: PROTOCOL_VERSION }));
+        assert!(fds.is_empty());
     }
 
     #[test]

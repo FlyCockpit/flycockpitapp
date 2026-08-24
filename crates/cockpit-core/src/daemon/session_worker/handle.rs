@@ -1660,6 +1660,10 @@ pub enum SessionWork {
     /// Unlike `Cancel` (which only aborts the current turn), this carries the
     /// typed teardown cause through the worker's single `sessionEnd` boundary.
     CancelAndStop,
+    /// Terminally abandon the session because its owning operation was
+    /// interrupted. Kept distinct from explicit cancellation so the worker's
+    /// authoritative teardown boundary emits `sessionEnd(interrupted)`.
+    InterruptAndStop,
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,

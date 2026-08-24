@@ -716,6 +716,29 @@ pub fn now_ms() -> i64 {
 }
 
 impl Db {
+    /// Return the committed timeline row for a durable compaction identity.
+    /// The matching partial unique index makes this the authoritative
+    /// idempotency lookup for restart recovery.
+    pub async fn session_compaction_event_seq(
+        &self,
+        session_id: Uuid,
+        compaction_id: Uuid,
+    ) -> Result<Option<i64>> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT seq FROM session_events
+                  WHERE session_id = ?1
+                    AND type = 'session_compacted'
+                    AND json_extract(data_json, '$.compaction_id') = ?2",
+                params![session_id.to_string(), compaction_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("querying compaction timeline identity")
+        })
+        .await
+    }
+
     /// Persist one live hook-run audit through its closed safe projection.
     ///
     /// Ledger failure must remain best-effort at the hook runtime call site:

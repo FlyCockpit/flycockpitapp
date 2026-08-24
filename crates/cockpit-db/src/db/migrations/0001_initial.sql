@@ -1484,6 +1484,9 @@ CREATE TABLE session_events (
 );
 
 CREATE UNIQUE INDEX uq_session_events_session_seq ON session_events (session_id, seq);
+CREATE UNIQUE INDEX uq_session_compaction_id
+    ON session_events (session_id, json_extract(data_json, '$.compaction_id'))
+    WHERE type = 'session_compacted';
 CREATE INDEX idx_sevents_call        ON session_events (call_id);
 CREATE INDEX idx_sevents_task_child  ON session_events (session_id, task_call_id, label, seq)
   WHERE task_call_id IS NOT NULL;

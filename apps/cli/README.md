@@ -369,6 +369,11 @@ A normal root-turn `stop` and a child-only `subagentStop` are distinct events:
 for child subagent frames. `sessionEnd` is observe-only and fires once per
 session regardless of how it ended.
 
+`preCompact` and `postCompact` envelopes also include the same opaque
+`compactionId`. Hook handlers should use it as their idempotency key: recovery
+never re-dispatches `preCompact`, while it may repeat `postCompact` after an
+ambiguous process crash so the successful boundary is never lost.
+
 #### Source ordering, argv, and trust
 
 Hook handlers are discovered from the same layered `config.json` sources as the
@@ -546,7 +551,10 @@ proof; a missing arbitrary or malformed path is never accepted as proof.
 
 Download the `flycockpit-containment-<version>-<linux-target>.tar.gz` bundle and
 its `.sha256` sidecar for the host architecture, verify the sidecar, and extract
-it. Install the managed deployment from that extracted directory with
+it. Automation can discover the target URLs and hashes from the checksummed
+`flycockpit-containment-index.json` release asset; the stable bootstrap URL is
+`https://github.com/FlyCockpit/flycockpitapp/releases/latest/download/flycockpit-containment-index.json`.
+Install the managed deployment from that extracted directory with
 `sudo ./install-linux-containment-broker.sh DAEMON_USER`. The bundle contains
 the matching CLI and broker binaries plus the complete unit payload. The
 installer creates the capability, installs the broker and daemon units, and
@@ -558,6 +566,12 @@ legacy detached daemons, and runs the authenticated broker readiness probe as
 the configured daemon UID. A bounded readiness window must establish both the
 broker's Proven state and daemon availability. On failure, the installer
 restores prior files, exact enablement state, and prior service activity.
+The installer rejects root as the daemon account, rejects a bundle for another
+host architecture, and verifies every extracted member before stopping any
+existing service or mutating system paths. `cockpit doctor` exposes the managed
+daemon UID, systemd named-capability-FD presence, broker socket status, and the
+result of the authenticated Proven-readiness handshake when run by the managed
+unit.
 macOS and Windows still reject this combined primitive before spawn. The fake
 adapter exercises the lifecycle contract in tests; it is not a production
 fallback. Cockpit never spawns a hook first and attaches containment afterward.

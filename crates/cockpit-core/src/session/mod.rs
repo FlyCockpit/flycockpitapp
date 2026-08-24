@@ -72,6 +72,7 @@ pub struct SessionEventLineage {
 }
 
 pub struct SessionCompactionRecord<'a> {
+    pub compaction_id: Uuid,
     pub successor_session_id: Uuid,
     pub successor_short_id: &'a str,
     pub seed_tool_count: usize,

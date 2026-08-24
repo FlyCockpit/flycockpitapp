@@ -1549,7 +1549,7 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
 
 fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {
     let proto::AssistantSummary {
-        name,
+        name: _,
         created_at: _,
         home_dir,
         config_json,
@@ -1558,7 +1558,6 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         definition_revision: _,
         definition_diagnostic,
     } = assistant;
-    scrub_string(name, redact);
     scrub_string(home_dir, redact);
     scrub_string(config_json, redact);
     scrub_option_string(definition_markdown, redact);
@@ -1566,14 +1565,12 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
 }
 
 fn scrub_agent_inventory_entry(entry: &mut proto::AgentInventoryEntry, redact: &RedactionTable) {
-    scrub_string(&mut entry.name, redact);
     scrub_option_string(&mut entry.description, redact);
     scrub_option_string(&mut entry.model, redact);
     scrub_option_string(&mut entry.diagnostic, redact);
 }
 
 fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &RedactionTable) {
-    scrub_string(&mut snapshot.name, redact);
     scrub_string(&mut snapshot.markdown, redact);
     scrub_string(&mut snapshot.canonical_preview, redact);
     scrub_option_string(&mut snapshot.goal_supervision_json, redact);

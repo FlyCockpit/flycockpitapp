@@ -1659,6 +1659,38 @@ pub(crate) fn remove_file_nofollow(path: &Path) -> Result<()> {
     prepare_file_removal(path)?.commit()
 }
 
+#[cfg(unix)]
+fn link_unlink_noreplace(
+    source_parent: &std::fs::File,
+    source_name: &std::ffi::CStr,
+    destination_parent: &std::fs::File,
+    destination_name: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: all descriptors and component strings remain live. linkat
+    // atomically fails when the destination already exists.
+    let linked = unsafe {
+        libc::linkat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    };
+    if linked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    destination_parent.sync_all()?;
+    // SAFETY: the retained source parent and component remain live.
+    let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
+    if unlinked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -1706,13 +1738,33 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
                 )
             };
             if renamed != 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!(
-                        "renaming without replacement {} to {}",
-                        source.display(),
-                        destination.display()
+                let error = std::io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOSYS || code == libc::EINVAL
+                ) {
+                    link_unlink_noreplace(
+                        &source_parent,
+                        &source_name_c,
+                        &destination_parent,
+                        &destination_name_c,
                     )
-                });
+                    .with_context(|| {
+                        format!(
+                            "linking without replacement {} to {} after renameat2 was unavailable",
+                            source.display(),
+                            destination.display()
+                        )
+                    })?;
+                } else {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "renaming without replacement {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    });
+                }
             }
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1721,34 +1773,19 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
             // destination only when absent, then unlinkat removes the source.
             // If unlink fails both names safely reference the same inode and
             // recovery reports a conflict instead of losing either file.
-            // SAFETY: all descriptors and component strings remain live.
-            let linked = unsafe {
-                libc::linkat(
-                    source_parent.as_raw_fd(),
-                    source_name_c.as_ptr(),
-                    destination_parent.as_raw_fd(),
-                    destination_name_c.as_ptr(),
-                    0,
+            link_unlink_noreplace(
+                &source_parent,
+                &source_name_c,
+                &destination_parent,
+                &destination_name_c,
+            )
+            .with_context(|| {
+                format!(
+                    "linking without replacement {} to {}",
+                    source.display(),
+                    destination.display()
                 )
-            };
-            if linked != 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!(
-                        "linking without replacement {} to {}",
-                        source.display(),
-                        destination.display()
-                    )
-                });
-            }
-            destination_parent.sync_all()?;
-            // SAFETY: the retained source parent and component remain live.
-            let unlinked =
-                unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name_c.as_ptr(), 0) };
-            if unlinked != 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!("removing linked rename source {}", source.display())
-                });
-            }
+            })?;
         }
         source_parent.sync_all()?;
         destination_parent.sync_all()?;

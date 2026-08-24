@@ -135,6 +135,12 @@ pub fn read_terminal_ingress_file_verified(
         .map(|(_, bytes, identity)| (bytes, identity)))
 }
 
+/// Read an authority-bearing configuration file without following a planted
+/// path component. Missing files are reported as `None`.
+pub fn read_config_file_nofollow(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+    files::read_file_nofollow(path)
+}
+
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {

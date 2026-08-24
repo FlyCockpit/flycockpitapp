@@ -346,16 +346,9 @@ pub async fn apply_extended_config_patch(
             .map_err(bad_request_config)?;
             let desired_hash = content_hash(&merged);
             if desired_hash != current_hash {
-                let generation =
-                    crate::daemon::server::inventory::current_config_generation();
-                crate::daemon::server::inventory::compare_and_bump_config_generation(generation)
-                    .ok_or_else(|| ErrorPayload {
-                        code: ErrorCode::Conflict,
-                        message: "configuration generation changed concurrently; retry the patch"
-                            .into(),
-                    })?;
                 cockpit_config::config::write_config_bytes_atomic(&target, &merged)
                     .map_err(internal)?;
+                crate::daemon::server::inventory::publish_committed_config_generation();
             }
             Ok(Response::ExtendedConfigSaved { hash: desired_hash })
         }),
@@ -393,11 +386,6 @@ fn save_extended_config_sync(
         return Err(bad_request("extended config target must be config.json"));
     }
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    // Read the config generation FIRST — before reading/merging the file — so a
-    // concurrent image-control mutation that lands between here and the CAS
-    // below fails the bump closed rather than persisting a config built on a
-    // stale registry. Mirrors the ordering in `dispatch_image_control_mutation`.
-    let current_generation = crate::daemon::server::inventory::current_config_generation();
     // Only a genuinely-absent file is an empty config. A non-NotFound read error
     // (EACCES/EIO/EMFILE/…) must NOT be coerced to empty: the merge would then
     // find no on-disk `image_generation` to preserve and the atomic write would
@@ -432,15 +420,8 @@ fn save_extended_config_sync(
         .map_err(bad_request_config)?;
     let desired_hash = content_hash(&merged);
     if desired_hash != current_hash {
-        // Advance the daemon config generation so the image-control-plane
-        // generation CAS observes this config.json write. Fail closed (nothing
-        // written) if it moved concurrently.
-        crate::daemon::server::inventory::compare_and_bump_config_generation(current_generation)
-            .ok_or_else(|| ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "configuration generation changed concurrently; retry the save".into(),
-            })?;
         cockpit_config::config::write_config_bytes_atomic(&target, &merged).map_err(internal)?;
+        crate::daemon::server::inventory::publish_committed_config_generation();
     }
     Ok(Response::ExtendedConfigSaved { hash: desired_hash })
 }

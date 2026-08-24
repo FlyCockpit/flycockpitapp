@@ -2682,11 +2682,7 @@ impl Request {
             }
             Self::GetAgentEditSnapshot { project_root, name } => {
                 validate_owner_project_root(project_root)?;
-                validate_owner_identifier(
-                    "agent name",
-                    name,
-                    crate::MAX_AGENT_NAME_BYTES,
-                )?;
+                validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
             }
             Self::MutateAgent {
                 project_root,
@@ -2697,24 +2693,28 @@ impl Request {
                 let name = match mutation {
                     crate::AgentMutation::EjectBuiltin { name }
                     | crate::AgentMutation::SaveDefinition { name, .. }
+                    | crate::AgentMutation::CreateDefinition { name, .. }
                     | crate::AgentMutation::DeleteCustom { name }
                     | crate::AgentMutation::ResetBuiltin { name }
                     | crate::AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
                     crate::AgentMutation::ResetAllBuiltins => None,
                 };
                 if let Some(name) = name {
-                    validate_owner_identifier(
-                        "agent name",
-                        name,
-                        crate::MAX_AGENT_NAME_BYTES,
-                    )?;
+                    validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
                 }
-                if let crate::AgentMutation::SaveDefinition { markdown, .. } = mutation
-                    && markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES
+                let markdown = match mutation {
+                    crate::AgentMutation::SaveDefinition { markdown, .. }
+                    | crate::AgentMutation::CreateDefinition { markdown, .. } => Some(markdown),
+                    _ => None,
+                };
+                if markdown.is_some_and(|markdown| markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES)
                 {
                     return Err("agent markdown exceeds maximum length".to_string());
                 }
-                if expected_revision.as_ref().is_some_and(|value| value.len() > 128) {
+                if expected_revision
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 128)
+                {
                     return Err("agent revision exceeds maximum length".to_string());
                 }
             }
@@ -2724,11 +2724,7 @@ impl Request {
                 expected_revision,
             } => {
                 validate_owner_project_root(project_root)?;
-                validate_owner_identifier(
-                    "agent name",
-                    name,
-                    crate::MAX_AGENT_NAME_BYTES,
-                )?;
+                validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
                 if expected_revision.is_empty() || expected_revision.len() > 128 {
                     return Err("agent revision is invalid".to_string());
                 }

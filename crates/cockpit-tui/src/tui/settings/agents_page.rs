@@ -283,15 +283,17 @@ impl AgentsPage {
         };
         match outcome {
             super::pointer_actions::ExternalEditOutcome::Saved => {
-                let draft = pending.draft.take();
+                let edited_markdown = std::fs::read_to_string(&pending.staging);
+                let mut draft = pending.draft.take();
                 let commit = (|| -> Result<(), String> {
-                    let markdown = std::fs::read_to_string(&pending.staging)
+                    let markdown = edited_markdown
+                        .as_ref()
                         .map_err(|error| format!("failed to read editor staging file: {error}"))?;
                     match crate::tui::agent_runner::daemon_request_blocking(
                         cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
                             project_root: cwd.to_string_lossy().into_owned(),
                             lease_id: pending.lease_id.clone(),
-                            markdown: Some(markdown),
+                            markdown: Some(markdown.clone()),
                         },
                     )? {
                         cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(_) => {
@@ -308,6 +310,19 @@ impl AgentsPage {
                         }
                     }
                     Err(error) => {
+                        // The daemon retains retryable leases, but this effect
+                        // has ended. Explicitly cancel it and preserve the
+                        // external editor's bytes in the in-TUI recovery draft.
+                        let _ = crate::tui::agent_runner::daemon_request_blocking(
+                            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                                project_root: cwd.to_string_lossy().into_owned(),
+                                lease_id: pending.lease_id.clone(),
+                                markdown: None,
+                            },
+                        );
+                        if let (Some(editor), Ok(markdown)) = (&mut draft, edited_markdown) {
+                            editor.replace_with_recovery_text(&markdown);
+                        }
                         self.editing = draft;
                         self.status = Some(format!(
                             "failed to atomically commit external edit: {error}"
@@ -408,6 +423,19 @@ fn agent_snapshot(
     )? {
         cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) => Ok(snapshot),
         other => Err(format!("unexpected agent snapshot response: {other:?}")),
+    }
+}
+
+fn agent_inventory_revision(cwd: &std::path::Path) -> Result<String, String> {
+    match crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::GetAgentInventory {
+            project_root: cwd.to_string_lossy().into_owned(),
+        },
+    )? {
+        cockpit_core::daemon::proto::Response::AgentInventory {
+            inventory_revision, ..
+        } => Ok(inventory_revision),
+        other => Err(format!("unexpected agent inventory response: {other:?}")),
     }
 }
 
@@ -627,11 +655,14 @@ impl SettingsCx {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     p.confirm_reset = false;
                     let cwd = self.agents_cwd();
-                    match mutate_agent(
-                        &cwd,
-                        cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
-                        None,
-                    ) {
+                    let reset = agent_inventory_revision(&cwd).and_then(|revision| {
+                        mutate_agent(
+                            &cwd,
+                            cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
+                            Some(revision),
+                        )
+                    });
+                    match reset {
                         Ok(result) => {
                             p.status = Some(format!(
                                 "reset {} built-in override(s) to default",

@@ -21,6 +21,7 @@ pub(super) struct AgentEditor {
     /// Opaque daemon revision captured with the editable snapshot. `None` is
     /// reserved for daemon-local assistant definitions on their separate RPC.
     pub(super) revision: Option<String>,
+    vim_enabled: bool,
     editor: VimEditor,
 }
 
@@ -53,12 +54,17 @@ impl AgentEditor {
             name,
             path,
             revision,
+            vim_enabled,
             editor: VimEditor::new(text, vim_enabled),
         }
     }
 
     pub(super) fn text(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(super) fn replace_with_recovery_text(&mut self, text: &str) {
+        self.editor = VimEditor::new(text, self.vim_enabled);
     }
 
     /// Insert pasted text at the cursor. This is a full-file multiline

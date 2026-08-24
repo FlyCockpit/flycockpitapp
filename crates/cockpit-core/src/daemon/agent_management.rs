@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
-    AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationResult, ErrorCode, ErrorPayload, Response,
+    AgentEditSnapshot, AgentEditTarget, AgentEditorLease, AgentEntryKind, AgentInventoryEntry,
+    AgentMutation, AgentMutationResult, AgentSourceLayer, ErrorCode, ErrorPayload, Response,
 };
 use crate::daemon::server::DaemonContext;
 
@@ -18,7 +19,11 @@ struct EditorLeaseState {
     root: PathBuf,
     name: String,
     revision: String,
+    expires_at: Instant,
 }
+
+const EDITOR_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_EDITOR_LEASES: usize = 64;
 
 fn editor_leases() -> &'static Mutex<HashMap<Uuid, EditorLeaseState>> {
     static LEASES: OnceLock<Mutex<HashMap<Uuid, EditorLeaseState>>> = OnceLock::new();
@@ -76,14 +81,22 @@ pub async fn begin_editor_lease(
     .map_err(join_error)??;
     ensure_revision(&snapshot.revision, Some(&expected_revision))?;
     let lease_id = Uuid::new_v4();
-    editor_leases().lock().map_err(lock_poison)?.insert(
+    let mut leases = editor_leases().lock().map_err(lock_poison)?;
+    let now = Instant::now();
+    leases.retain(|_, lease| lease.expires_at > now);
+    if leases.len() >= MAX_EDITOR_LEASES {
+        return Err(conflict("too many active agent editor leases"));
+    }
+    leases.insert(
         lease_id,
         EditorLeaseState {
             root,
             name,
             revision: expected_revision,
+            expires_at: now + EDITOR_LEASE_TTL,
         },
     );
+    drop(leases);
     Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
         lease_id: lease_id.to_string(),
         snapshot,
@@ -98,11 +111,15 @@ pub async fn complete_editor_lease(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     let id = Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    let lease = editor_leases()
-        .lock()
-        .map_err(lock_poison)?
-        .remove(&id)
-        .ok_or_else(|| conflict("editor lease is absent or already completed"))?;
+    let lease = {
+        let mut leases = editor_leases().lock().map_err(lock_poison)?;
+        let now = Instant::now();
+        leases.retain(|_, lease| lease.expires_at > now);
+        leases
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?
+    };
     if lease.root != root {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
@@ -129,6 +146,9 @@ pub async fn complete_editor_lease(
     let Response::AgentMutated(result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
     };
+    // A validation/CAS/write error returns above and deliberately retains the
+    // lease for retry. Success and explicit cancellation consume it.
+    editor_leases().lock().map_err(lock_poison)?.remove(&id);
     Ok(Response::AgentEditorLeaseCompleted(result))
 }
 
@@ -174,8 +194,10 @@ fn inventory_sync(root: &Path) -> Result<Response, ErrorPayload> {
             }
         })
         .collect();
+    let inventory_revision = inventory_revision(root)?;
     Ok(Response::AgentInventory {
         entries,
+        inventory_revision,
         config_generation: crate::daemon::server::inventory::current_config_generation(),
     })
 }
@@ -185,10 +207,39 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
     let def = crate::agents::resolve(root, name)
         .map_err(bad_config)?
         .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
-    let markdown = def.to_markdown().map_err(bad_config)?;
+    let canonical_preview = def.to_markdown().map_err(bad_config)?;
     let project_override = project_agent_path(root, name)?;
-    let overridden = project_override.is_file();
-    let revision = revision_for(name, &markdown, overridden);
+    let target_exists = nofollow_read(&project_override)?.is_some();
+    let (source_layer, source_identity, markdown) = match crate::agents::find_override(root, name) {
+        Some(source) => {
+            if source.is_dir() {
+                return Err(bad_request(
+                    "directory-form agents are read-only in the settings editor",
+                ));
+            }
+            let raw = nofollow_read(&source)?.ok_or_else(|| {
+                conflict("agent source changed while the snapshot was being acquired")
+            })?;
+            let markdown = String::from_utf8(raw)
+                .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
+            let layer = classify_source_layer(root, &source, &project_override);
+            let identity = opaque_source_identity(root, &source, layer);
+            (layer, identity, markdown)
+        }
+        None => (
+            AgentSourceLayer::Embedded,
+            format!("embedded:{name}"),
+            canonical_preview.clone(),
+        ),
+    };
+    let overridden = source_layer != AgentSourceLayer::Embedded;
+    let revision = revision_for(
+        name,
+        source_layer,
+        &source_identity,
+        &markdown,
+        target_exists,
+    );
     let goal_supervision_json = (!def.goal_supervision.is_empty())
         .then(|| serde_json::to_string(&def.goal_supervision).map_err(bad_config))
         .transpose()?;
@@ -201,9 +252,13 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         },
         overridden,
         markdown,
+        canonical_preview,
+        source_layer,
+        source_identity,
+        edit_target: AgentEditTarget::Workspace,
         revision,
         goal_supervision_json,
-        editable: overridden || !crate::agents::is_builtin_agent(name),
+        editable: source_layer == AgentSourceLayer::Workspace,
         supports_goal_supervision: def.vnext.is_none(),
     })
 }
@@ -216,10 +271,7 @@ fn mutate_sync(
     let lock_target = root.join(".cockpit/config.json");
     let _guard =
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
-    let generation = crate::daemon::server::inventory::compare_and_bump_config_generation(
-        crate::daemon::server::inventory::current_config_generation(),
-    )
-    .ok_or_else(|| conflict("configuration generation changed concurrently"))?;
+    let generation_before = crate::daemon::server::inventory::current_config_generation();
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
             validate_name(&name)?;
@@ -228,8 +280,9 @@ fn mutate_sync(
             }
             let before = snapshot_sync(root, &name)?;
             ensure_revision(&before.revision, expected_revision.as_deref())?;
+            ensure_workspace_source_or_embedded(&before)?;
             let target = project_agent_path(root, &name)?;
-            if target.exists() {
+            if nofollow_read(&target)?.is_some() {
                 (false, 0, Some(snapshot_sync(root, &name)?))
             } else {
                 let parent = target.parent().expect("agent path has parent");
@@ -246,11 +299,54 @@ fn mutate_sync(
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "save refused: select/eject the workspace layer explicitly first",
+                ));
+            }
             let parsed =
                 crate::agents::parse_agent(&markdown, &name, PathBuf::from("<daemon-agent-edit>"))
                     .map_err(bad_config)?;
             crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
             let target = project_agent_path(root, &name)?;
+            std::fs::create_dir_all(target.parent().expect("agent path has parent"))
+                .map_err(internal)?;
+            let old =
+                nofollow_read(&target)?.ok_or_else(|| conflict("workspace agent disappeared"))?;
+            if old == markdown.as_bytes() {
+                (false, 0, Some(current))
+            } else {
+                cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
+                    .map_err(internal)?;
+                (true, 1, Some(snapshot_sync(root, &name)?))
+            }
+        }
+        AgentMutation::CreateDefinition { name, markdown } => {
+            validate_name(&name)?;
+            if crate::agents::resolve(root, &name)
+                .map_err(bad_config)?
+                .is_some()
+            {
+                return Err(conflict(
+                    "agent name already resolves in a configuration layer",
+                ));
+            }
+            let target = project_agent_path(root, &name)?;
+            if nofollow_read(&target)?.is_some() {
+                return Err(conflict("workspace agent already exists"));
+            }
+            if expected_revision.is_some() {
+                return Err(bad_request(
+                    "create uses the daemon's authoritative absence check, not a document revision",
+                ));
+            }
+            let parsed = crate::agents::parse_agent(
+                &markdown,
+                &name,
+                PathBuf::from("<daemon-agent-create>"),
+            )
+            .map_err(bad_config)?;
+            crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
                 .map_err(internal)?;
             cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
@@ -264,6 +360,9 @@ fn mutate_sync(
             }
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict("custom agent is not owned by the workspace layer"));
+            }
             let target = project_agent_path(root, &name)?;
             if !target.is_file() {
                 return Err(bad_request(
@@ -280,6 +379,11 @@ fn mutate_sync(
             }
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "built-in override is not owned by the workspace layer",
+                ));
+            }
             let target = project_agent_path(root, &name)?;
             if target.is_file() {
                 cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
@@ -289,9 +393,10 @@ fn mutate_sync(
             }
         }
         AgentMutation::ResetAllBuiltins => {
-            if expected_revision.is_some() {
-                return Err(bad_request("reset-all does not accept a document revision"));
-            }
+            let current_inventory_revision = inventory_revision(root)?;
+            ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
+            // Only workspace-owned overrides are in scope. Other layers are
+            // never deleted as a side effect of a workspace reset.
             let mut affected = 0;
             for name in crate::agents::BUILTIN_AGENT_NAMES {
                 let target = project_agent_path(root, name)?;
@@ -302,13 +407,15 @@ fn mutate_sync(
             }
             (affected != 0, affected, None)
         }
-        AgentMutation::SaveGoalSupervision {
-            name,
-            goal_supervision_json,
-        } => {
+        AgentMutation::SaveGoalSupervision { name, patch } => {
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "goal settings require an explicit workspace-layer override",
+                ));
+            }
             let mut def = crate::agents::parse_agent(
                 &current.markdown,
                 &name,
@@ -320,21 +427,34 @@ fn mutate_sync(
                     "agent-scoped goal settings are unavailable for vNext agents",
                 ));
             }
-            def.goal_supervision = match goal_supervision_json {
-                Some(raw) => {
-                    crate::agents::parse_goal_settings_override_json(&raw).map_err(bad_config)?
-                }
-                None => crate::agents::GoalSettingsOverride::default(),
-            };
+            if let Some(value) = patch.cold_skeptic_count {
+                def.goal_supervision.cold_skeptic_count = value;
+            }
+            if let Some(value) = patch.cold_skeptic_model {
+                def.goal_supervision.cold_skeptic_model = value;
+            }
+            if let Some(value) = patch.max_verification_attempts {
+                def.goal_supervision.max_verification_attempts = value;
+            }
+            def.goal_supervision.validate().map_err(bad_config)?;
             crate::agents::validate_invariants(&def).map_err(bad_config)?;
             let markdown = def.to_markdown().map_err(bad_config)?;
             let target = project_agent_path(root, &name)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
                 .map_err(internal)?;
-            cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
-                .map_err(internal)?;
-            (true, 1, Some(snapshot_sync(root, &name)?))
+            if markdown.as_bytes() == current.markdown.as_bytes() {
+                (false, 0, Some(current))
+            } else {
+                cockpit_config::config::write_config_bytes_atomic(&target, markdown.as_bytes())
+                    .map_err(internal)?;
+                (true, 1, Some(snapshot_sync(root, &name)?))
+            }
         }
+    };
+    let generation = if changed {
+        crate::daemon::server::inventory::publish_committed_config_generation()
+    } else {
+        generation_before
     };
     Ok(Response::AgentMutated(AgentMutationResult {
         changed,
@@ -368,12 +488,68 @@ fn validate_name(name: &str) -> Result<(), ErrorPayload> {
     Ok(())
 }
 
-fn revision_for(name: &str, markdown: &str, overridden: bool) -> String {
+fn revision_for(
+    name: &str,
+    source_layer: AgentSourceLayer,
+    source_identity: &str,
+    markdown: &str,
+    target_exists: bool,
+) -> String {
     let mut digest = Sha256::new();
     digest.update(name.as_bytes());
-    digest.update([u8::from(overridden)]);
+    digest.update(format!("{source_layer:?}").as_bytes());
+    digest.update(source_identity.as_bytes());
+    digest.update([u8::from(target_exists)]);
     digest.update(markdown.as_bytes());
     format!("{:x}", digest.finalize())
+}
+
+fn nofollow_read(path: &Path) -> Result<Option<Vec<u8>>, ErrorPayload> {
+    cockpit_config::config::read_config_file_nofollow(path).map_err(internal)
+}
+
+fn classify_source_layer(root: &Path, source: &Path, target: &Path) -> AgentSourceLayer {
+    if source == target {
+        return AgentSourceLayer::Workspace;
+    }
+    let configured = crate::agents::agent_search_dirs(root);
+    let ordinary_count = crate::config::dirs::discover_config_dirs(root).len();
+    let index = configured.iter().position(|dir| source.starts_with(dir));
+    if index.is_some_and(|index| index >= ordinary_count) {
+        AgentSourceLayer::ConfiguredDirectory
+    } else {
+        AgentSourceLayer::OtherConfigLayer
+    }
+}
+
+fn ensure_workspace_source_or_embedded(snapshot: &AgentEditSnapshot) -> Result<(), ErrorPayload> {
+    if matches!(
+        snapshot.source_layer,
+        AgentSourceLayer::Workspace | AgentSourceLayer::Embedded
+    ) {
+        Ok(())
+    } else {
+        Err(conflict(
+            "eject refused: another configuration layer already owns this override",
+        ))
+    }
+}
+
+fn opaque_source_identity(root: &Path, source: &Path, layer: AgentSourceLayer) -> String {
+    let mut digest = Sha256::new();
+    digest.update(root.as_os_str().as_encoded_bytes());
+    digest.update(source.as_os_str().as_encoded_bytes());
+    format!("{layer:?}:{:x}", digest.finalize())
+}
+
+fn inventory_revision(root: &Path) -> Result<String, ErrorPayload> {
+    let mut digest = Sha256::new();
+    for name in crate::agents::BUILTIN_AGENT_NAMES {
+        let snapshot = snapshot_sync(root, name)?;
+        digest.update(name.as_bytes());
+        digest.update(snapshot.revision.as_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPayload> {

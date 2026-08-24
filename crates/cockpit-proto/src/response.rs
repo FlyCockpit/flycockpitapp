@@ -567,6 +567,8 @@ pub enum Response {
 
     AgentInventory {
         entries: Vec<crate::AgentInventoryEntry>,
+        /// Opaque revision covering the resettable workspace inventory.
+        inventory_revision: String,
         config_generation: u64,
     },
 

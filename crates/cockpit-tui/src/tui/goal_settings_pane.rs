@@ -231,7 +231,7 @@ impl GoalSettingsPane {
                 self.status = Some("save cancelled".to_string());
                 None
             }
-            KeyCode::Enter | KeyCode::Char('y') => Some(self.confirmed_save()),
+            KeyCode::Enter | KeyCode::Char('y') => self.confirmed_save(),
             _ => None,
         }
     }
@@ -290,24 +290,26 @@ impl GoalSettingsPane {
         ));
     }
 
-    fn confirmed_save(&mut self) -> GoalSettingsOutcome {
+    fn confirmed_save(&mut self) -> Option<GoalSettingsOutcome> {
         if !self.root_foreground {
             self.confirm = None;
             self.status = Some(
                 "Goal settings changes were refused because an interactive subagent holds the foreground."
                     .to_string(),
             );
-            return GoalSettingsOutcome::Close;
+            return None;
         }
         let target = self
             .confirm
             .take()
             .unwrap_or(GoalSettingsSaveTarget::Session);
         match self.build_save(target) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Some(outcome),
             Err(error) => {
                 self.status = Some(error.to_string());
-                GoalSettingsOutcome::Close
+                // Keep the pane and draft open so a conflict can be
+                // reconciled or retried instead of discarding user input.
+                None
             }
         }
     }
@@ -328,7 +330,18 @@ impl GoalSettingsPane {
                     project_root: self.cwd.to_string_lossy().into_owned(),
                     mutation: cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
                         name: self.agent_name.clone(),
-                        goal_supervision_json: override_json.clone(),
+                        patch: cockpit_core::daemon::proto::GoalSupervisionPatch {
+                            cold_skeptic_count: Some(self.draft.cold_skeptic_count),
+                            cold_skeptic_model: Some(
+                                self.draft
+                                    .cold_skeptic_model
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_string),
+                            ),
+                            max_verification_attempts: Some(self.draft.max_verification_attempts),
+                        },
                     },
                     expected_revision: Some(self.revision.clone()),
                 },
@@ -466,7 +479,7 @@ mod tests {
 
         let outcome = pane.confirmed_save();
 
-        assert_eq!(outcome, GoalSettingsOutcome::Close);
+        assert_eq!(outcome, None);
         assert!(
             pane.status_text()
                 .is_some_and(|status| status.contains("unavailable for vNext agents")),

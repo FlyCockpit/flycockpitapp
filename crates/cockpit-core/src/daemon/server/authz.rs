@@ -972,13 +972,15 @@ pub(super) async fn authorize_session_row_reader(
 //   best-effort id. Any authz tag not mapped above (and every `custom` handler)
 //   fails closed. A read-only ceiling therefore denies every write category.
 
-use cockpit_proto::remote_public_service_policy::{
+#[cfg(feature = "remote")]
+use cockpit_proto::capability_ceiling::{
     RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
 };
 
 /// Resolve a raw project-root string to its 16-byte control-plane project id
 /// through the injected deny-closed resolver. A canonicalization failure or a
 /// resolver miss is a hard authorization failure (fail closed).
+#[cfg(feature = "remote")]
 fn attempt_grant_resolve_project_id(
     ctx: &DaemonContext,
     raw_root: &str,
@@ -993,6 +995,7 @@ fn attempt_grant_resolve_project_id(
 
 /// Require a project capability on the resolver-resolved control-plane project
 /// id for `raw_root`. Deny-closed on resolver miss or absent capability.
+#[cfg(feature = "remote")]
 fn attempt_grant_require_project_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     ctx: &DaemonContext,
@@ -1011,6 +1014,7 @@ fn attempt_grant_require_project_capability(
 
 /// Require an attachment capability in the verified ceiling. Deny-closed on
 /// absence.
+#[cfg(feature = "remote")]
 fn attempt_grant_require_attachment_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     capability: RemoteAttachmentCapabilityV1,
@@ -1026,6 +1030,7 @@ fn attempt_grant_require_attachment_capability(
 
 /// Require a project capability on the *attached* session's resolved project
 /// root. Not attached → fail closed; resolver miss / absent capability → deny.
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_attached_session_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     state: &MutableClientState,
@@ -1050,6 +1055,7 @@ async fn attempt_grant_require_attached_session_capability(
 }
 
 /// Shared-snapshot variant of [`attempt_grant_require_attached_session_capability`].
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_shared_session_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     shared: &SharedClientState,
@@ -1078,6 +1084,7 @@ async fn attempt_grant_require_shared_session_capability(
 
 /// Require a project capability on a specific target session's resolved project
 /// root. Unknown session → typed error; resolver miss / absent capability → deny.
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_session_row_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     ctx: &DaemonContext,
@@ -1099,6 +1106,7 @@ async fn attempt_grant_require_session_row_capability(
 /// Map one command-table row's authz tag onto a verified-ceiling capability
 /// query for a `MutableClientState` (serialized executor path). Every unmapped
 /// tag and every `custom` handler fails closed.
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_value {
     ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -1178,6 +1186,7 @@ macro_rules! command_authorize_attempt_grant_value {
 }
 
 /// Shared-snapshot analogue of [`command_authorize_attempt_grant_value`].
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_shared_value {
     ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -1311,6 +1320,7 @@ macro_rules! command_authorize_request_match {
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_request_match {
     (($request:ident, $state:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
@@ -1333,6 +1343,7 @@ pub(super) async fn authorize_request(
     // An attempt-grant principal is authorized only against its verified
     // ceiling — never through the legacy `PrincipalScope` helpers. Fail-closed
     // on any unmapped category or resolver miss.
+    #[cfg(feature = "remote")]
     if let Some(auth) = principal.attempt_grant_authorization() {
         return proto::command!(
             command_authorize_attempt_grant_request_match,
@@ -1410,6 +1421,7 @@ macro_rules! command_authorize_shared_request_match {
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_shared_request_match {
     (($request:ident, $shared:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
@@ -1430,6 +1442,7 @@ pub(super) async fn authorize_request_shared(
     }
 
     // Attempt-grant principals: ceiling-only enforcement on the shared path too.
+    #[cfg(feature = "remote")]
     if let Some(auth) = principal.attempt_grant_authorization() {
         return proto::command!(
             command_authorize_attempt_grant_shared_request_match,

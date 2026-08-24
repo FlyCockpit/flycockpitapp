@@ -24,6 +24,7 @@ pub fn wall_ms_now() -> i64 {
 pub fn principal_digest(principal: &ClientPrincipal) -> String {
     let tag = match principal {
         ClientPrincipal::Owner => "owner".to_string(),
+        #[cfg(feature = "remote")]
         ClientPrincipal::Remote(remote) => format!("flycockpit:{}", remote.user_id),
     };
     let mut hasher = Sha256::new();

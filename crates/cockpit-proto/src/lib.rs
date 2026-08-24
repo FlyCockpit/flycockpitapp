@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod agent_installation;
+pub mod capability_ceiling;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use agent_installation::{

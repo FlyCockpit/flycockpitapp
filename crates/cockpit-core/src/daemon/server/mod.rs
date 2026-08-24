@@ -2101,6 +2101,7 @@ pub struct DaemonContext {
     /// root hash). The default is an empty deny-all resolver; production wiring
     /// against attachment/operation-ledger state is owned by the
     /// transport-wiring prompts.
+    #[cfg(feature = "remote")]
     pub remote_project_resolver:
         Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
     /// Daemon-owned host capability snapshot. Authority for feature gating.
@@ -2383,6 +2384,7 @@ impl DaemonContext {
             // Deny-all default: an empty resolver maps no root, so the
             // attempt-grant authorization path fails closed until the
             // transport-wiring prompts install the real resolver.
+            #[cfg(feature = "remote")]
             remote_project_resolver: Arc::new(
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
             ),
@@ -2401,6 +2403,7 @@ impl DaemonContext {
     /// resolver backed by attachment/operation-ledger state; tests inject a
     /// deterministic static mapping. The resolver never widens authority: an
     /// unmapped root fails closed.
+    #[cfg(feature = "remote")]
     pub fn with_remote_project_resolver(
         mut self,
         resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,

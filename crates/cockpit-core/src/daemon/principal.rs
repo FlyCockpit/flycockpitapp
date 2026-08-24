@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use cockpit_proto::remote_public_service_policy::{
+#[cfg(feature = "remote")]
+use cockpit_proto::capability_ceiling::{
     RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
 };
 
@@ -13,9 +14,11 @@ use crate::daemon::proto::{self, Request};
 #[allow(clippy::large_enum_variant)]
 pub enum ClientPrincipal {
     Owner,
+    #[cfg(feature = "remote")]
     Remote(RemotePrincipal),
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemotePrincipal {
     pub user_id: String,
@@ -31,6 +34,7 @@ pub struct RemotePrincipal {
 /// Transport-neutral copy of the authenticated device binding. Keeping this
 /// DTO in the daemon authority layer prevents the local build from depending
 /// on or compiling the legacy relay envelope crate.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientActorBindingV1 {
     pub schema_version: u8,
@@ -47,6 +51,7 @@ pub struct ClientActorBindingV1 {
 /// and is deleted wholesale by `remote-standalone-relay-cutover`. `AttemptGrant`
 /// is constructed only by
 /// `crate::daemon::remote_attempt::construct_principal_from_grant`.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteAuthorization {
     /// Legacy relay-derived scopes. Connector relay boundary only.
@@ -60,6 +65,7 @@ pub enum RemoteAuthorization {
 /// typed permission ceiling verbatim (attachment capabilities + per-project
 /// capability sets keyed by 16-byte project id), never a lossy projection onto
 /// the legacy scope vocabulary.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptGrantAuthorization {
     /// Canonical 22-char base64url (no padding) alias of the grant's
@@ -75,12 +81,14 @@ pub struct AttemptGrantAuthorization {
 /// A typed permission ceiling: attachment capabilities plus per-project
 /// capability sets keyed by the 16-byte control-plane project id. Imported
 /// from the foundation policy enums; never redefined.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCeilingAuthorization {
     pub attachment_capabilities: Vec<RemoteAttachmentCapabilityV1>,
     pub projects: Vec<([u8; 16], Vec<RemoteProjectCapabilityV1>)>,
 }
 
+#[cfg(feature = "remote")]
 impl RemoteCeilingAuthorization {
     /// True if the attachment capability set contains `cap`.
     pub fn has_attachment_capability(&self, cap: RemoteAttachmentCapabilityV1) -> bool {
@@ -103,6 +111,7 @@ impl RemoteCeilingAuthorization {
 /// The device/attachment binding carried by an attempt-grant principal. Sourced
 /// only from verified grant claims — never from a relay envelope — so the
 /// module guard scans stay green.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantDeviceBinding {
     pub client_device_id: [u8; 16],
@@ -166,6 +175,7 @@ impl ClientPrincipal {
     /// rather than from a relay-stamped envelope. The optional
     /// `actor_binding` is the device-bound verification artifact carried
     /// alongside the verified grants.
+    #[cfg(feature = "remote")]
     pub fn from_verified_remote(
         user_id: String,
         grants: Vec<PrincipalGrant>,
@@ -182,6 +192,7 @@ impl ClientPrincipal {
     /// This is the only constructor that produces an
     /// `RemoteAuthorization::AttemptGrant`, and it never yields `Owner` — the
     /// authorization is exactly the grant's verified ceiling.
+    #[cfg(feature = "remote")]
     pub fn from_attempt_grant(
         user_id: String,
         authorization: AttemptGrantAuthorization,
@@ -196,6 +207,7 @@ impl ClientPrincipal {
 
     /// The verified attempt-grant authorization, if this principal is an
     /// attempt-grant principal. `None` for `Owner` and legacy relay principals.
+    #[cfg(feature = "remote")]
     pub fn attempt_grant_authorization(&self) -> Option<&AttemptGrantAuthorization> {
         match self {
             Self::Remote(remote) => match &remote.authorization {
@@ -213,6 +225,7 @@ impl ClientPrincipal {
     pub fn tag(&self) -> Option<String> {
         match self {
             Self::Owner => None,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => Some(format!("flycockpit:{}", remote.user_id)),
         }
     }
@@ -220,6 +233,7 @@ impl ClientPrincipal {
     pub fn steer_origin(&self) -> String {
         match self {
             Self::Owner => format!("local:{}", local_principal_name()),
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => format!("flycockpit:{}", remote.user_id),
         }
     }
@@ -244,6 +258,7 @@ impl ClientPrincipal {
     pub fn has_project_scope(&self, scope: PrincipalScope, project_root: &str) -> bool {
         match self {
             Self::Owner => true,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => grants
                     .iter()
@@ -260,6 +275,7 @@ impl ClientPrincipal {
     fn has_scope(&self, scope: PrincipalScope) -> bool {
         match self {
             Self::Owner => true,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => {
                     grants.iter().any(|grant| grant.scope == scope)

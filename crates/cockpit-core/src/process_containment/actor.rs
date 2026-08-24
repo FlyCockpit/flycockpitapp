@@ -109,11 +109,16 @@ struct LiveEntry {
     lease_token: Arc<LeaseToken>,
 }
 
+struct ReconciliationRequest {
+    lease: ContainmentLease,
+    completion: Option<Reply<Result<(), ContainmentError>>>,
+}
+
 /// Async handle to the ProcessContainment actor.
 #[derive(Clone)]
 pub struct ProcessContainmentHandle {
     tx: mpsc::Sender<Op>,
-    reconciliation_tx: mpsc::UnboundedSender<ContainmentLease>,
+    reconciliation_tx: mpsc::UnboundedSender<ReconciliationRequest>,
 }
 
 impl ProcessContainmentHandle {
@@ -246,8 +251,25 @@ impl ProcessContainmentHandle {
         lease: ContainmentLease,
     ) -> Result<(), ContainmentError> {
         self.reconciliation_tx
-            .send(lease)
+            .send(ReconciliationRequest { lease, completion: None })
             .map_err(|_| ContainmentError::ActorStopped)
+    }
+
+    /// Transfer cleanup to the actor and wait until its oracle has proved the
+    /// exact published generation empty. The actor retries incrementally, so
+    /// this wait never monopolizes its command loop.
+    pub(crate) async fn reconcile_and_await_empty(
+        &self,
+        lease: ContainmentLease,
+    ) -> Result<(), ContainmentError> {
+        let (completion, rx) = oneshot::channel();
+        self.reconciliation_tx
+            .send(ReconciliationRequest {
+                lease,
+                completion: Some(completion),
+            })
+            .map_err(|_| ContainmentError::ActorStopped)?;
+        Self::await_reply(rx).await?
     }
 
     /// Startup recovery for durable rows.
@@ -450,12 +472,17 @@ struct ActorState {
 
 struct PendingReconciliation {
     lease: ContainmentLease,
+    waiters: Vec<Reply<Result<(), ContainmentError>>>,
     next_attempt: tokio::time::Instant,
     backoff: Duration,
 }
 
 struct PendingUnpublished {
     handle: AdapterHandle,
+    /// The durable Creating row is retained until the adapter proves this
+    /// exact generation empty. Only then may reconciliation publish the
+    /// terminal CreateFailed transition.
+    record: ContainmentRecord,
     generation: u64,
     next_attempt: tokio::time::Instant,
     backoff: Duration,
@@ -469,7 +496,7 @@ async fn actor_loop(
     db: Db,
     adapter: SharedAdapter,
     mut rx: mpsc::Receiver<Op>,
-    mut reconciliation_rx: mpsc::UnboundedReceiver<ContainmentLease>,
+    mut reconciliation_rx: mpsc::UnboundedReceiver<ReconciliationRequest>,
 ) {
     let mut state = ActorState {
         db,
@@ -485,9 +512,9 @@ async fn actor_loop(
         let op = if state.pending_reconciliation.is_empty() && state.pending_unpublished.is_empty() {
             tokio::select! {
                 op = rx.recv() => op,
-                lease = reconciliation_rx.recv() => {
-                    if let Some(lease) = lease {
-                        enqueue_pending_reconciliation(&mut state, lease);
+                request = reconciliation_rx.recv() => {
+                    if let Some(request) = request {
+                        enqueue_pending_reconciliation(&mut state, request);
                     }
                     continue;
                 }
@@ -495,9 +522,9 @@ async fn actor_loop(
         } else {
             tokio::select! {
                 op = rx.recv() => op,
-                lease = reconciliation_rx.recv() => {
-                    if let Some(lease) = lease {
-                        enqueue_pending_reconciliation(&mut state, lease);
+                request = reconciliation_rx.recv() => {
+                    if let Some(request) = request {
+                        enqueue_pending_reconciliation(&mut state, request);
                     }
                     continue;
                 }
@@ -579,7 +606,7 @@ async fn actor_loop(
                 )
                 .await;
                 if let Err(Ok(lease)) = reply.send(result) {
-                    enqueue_pending_reconciliation(&mut state, lease);
+                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
                 }
             }
             Op::CreateAndSpawnWithIo {
@@ -607,7 +634,7 @@ async fn actor_loop(
                     // The requester was cancelled after allocation. Ownership
                     // stays with the actor, so reclaim the unpublished lease
                     // instead of leaving a live group with no external owner.
-                    enqueue_pending_reconciliation(&mut state, lease);
+                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
                 }
             }
             Op::CreateContainerAndExec {
@@ -632,7 +659,7 @@ async fn actor_loop(
                 )
                 .await;
                 if let Err(Ok(lease)) = reply.send(result) {
-                    enqueue_pending_reconciliation(&mut state, lease);
+                    enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
                 }
             }
             Op::Terminate { lease, reply } => {
@@ -680,14 +707,18 @@ async fn actor_loop(
     }
 }
 
-fn enqueue_pending_reconciliation(state: &mut ActorState, lease: ContainmentLease) {
-    let duplicate = state.pending_reconciliation.iter().any(|pending| {
-        pending.lease.containment_id == lease.containment_id
-            && pending.lease.generation == lease.generation
-    });
-    if !duplicate {
+fn enqueue_pending_reconciliation(state: &mut ActorState, request: ReconciliationRequest) {
+    if let Some(pending) = state.pending_reconciliation.iter_mut().find(|pending| {
+        pending.lease.containment_id == request.lease.containment_id
+            && pending.lease.generation == request.lease.generation
+    }) {
+        if let Some(completion) = request.completion {
+            pending.waiters.push(completion);
+        }
+    } else {
         state.pending_reconciliation.push(PendingReconciliation {
-            lease,
+            lease: request.lease,
+            waiters: request.completion.into_iter().collect(),
             next_attempt: tokio::time::Instant::now(),
             backoff: RECONCILIATION_INITIAL_BACKOFF,
         });
@@ -696,11 +727,11 @@ fn enqueue_pending_reconciliation(state: &mut ActorState, lease: ContainmentLeas
 
 async fn drain_shutdown_reconciliation(
     state: &mut ActorState,
-    reconciliation_rx: &mut mpsc::UnboundedReceiver<ContainmentLease>,
+    reconciliation_rx: &mut mpsc::UnboundedReceiver<ReconciliationRequest>,
 ) {
     state.intake_closed = true;
-    while let Ok(lease) = reconciliation_rx.try_recv() {
-        enqueue_pending_reconciliation(state, lease);
+    while let Ok(request) = reconciliation_rx.try_recv() {
+        enqueue_pending_reconciliation(state, request);
     }
     let live: Vec<_> = state
         .live
@@ -715,7 +746,7 @@ async fn drain_shutdown_reconciliation(
         })
         .collect();
     for lease in live {
-        enqueue_pending_reconciliation(state, lease);
+        enqueue_pending_reconciliation(state, ReconciliationRequest { lease, completion: None });
     }
     while !state.pending_reconciliation.is_empty() || !state.pending_unpublished.is_empty() {
         reconcile_one_pending(state).await;
@@ -736,10 +767,33 @@ async fn reconcile_one_pending(state: &mut ActorState) {
     {
         let mut pending = state.pending_unpublished.swap_remove(index);
         let _ = state.adapter.terminate(&pending.handle, pending.generation).await;
-        if !matches!(
+        let proven_empty = matches!(
             state.adapter.await_empty(&pending.handle, pending.generation).await,
             Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == pending.generation
-        ) {
+        );
+        if proven_empty {
+            let failed = match reduce(
+                Some(pending.record.clone()),
+                ContainmentEvent::CreateFailed {
+                    generation: pending.generation,
+                    now_wall_ms: wall_ms(),
+                },
+            ) {
+                ReduceResult::Applied(record) => *record,
+                other => {
+                    tracing::error!(?other, "unpublished containment terminal reduction failed");
+                    pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
+                    pending.backoff = pending.backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
+                    state.pending_unpublished.push(pending);
+                    return;
+                }
+            };
+            if persist_cas(state, &pending.record, &failed).await.is_err() {
+                pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
+                pending.backoff = pending.backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
+                state.pending_unpublished.push(pending);
+            }
+        } else {
             pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
             pending.backoff = pending.backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
             state.pending_unpublished.push(pending);
@@ -763,7 +817,11 @@ async fn reconcile_one_pending(state: &mut ActorState) {
     let lease = pending.lease.clone();
     let _ = terminate_one(state, lease.clone()).await;
     match await_empty_one(state, lease.clone()).await {
-        Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation => {}
+        Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation => {
+            for waiter in pending.waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
         // The actor remains the sole owner and retries later. Other actor
         // commands get priority at the select above, so a slow/uncertain
         // cleanup cannot become a queue-saturation spin or starve shutdown.
@@ -882,23 +940,13 @@ async fn create_native(
     };
 
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, &allocated.handle, generation);
-        let failed = match reduce(
-            Some(record.clone()),
-            ContainmentEvent::CreateFailed {
-                generation,
-                now_wall_ms: wall_ms(),
-            },
-        ) {
-            ReduceResult::Applied(record) => *record,
-            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
-        };
-        persist_cas(state, &record, &failed).await?;
+        reclaim_unpublished_allocation(state, allocated.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven native allocation".into(),
         });
     }
 
+    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -911,7 +959,7 @@ async fn create_native(
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
     if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(state, &allocated.handle, generation);
+        reclaim_unpublished_allocation(state, allocated.handle, creating_record, generation);
         return Err(error);
     }
 
@@ -935,11 +983,13 @@ async fn create_native(
 
 fn reclaim_unpublished_allocation(
     state: &mut ActorState,
-    handle: &AdapterHandle,
+    handle: AdapterHandle,
+    record: ContainmentRecord,
     generation: u64,
 ) {
     state.pending_unpublished.push(PendingUnpublished {
-        handle: handle.clone(),
+        handle,
+        record,
         generation,
         next_attempt: tokio::time::Instant::now(),
         backoff: RECONCILIATION_INITIAL_BACKOFF,
@@ -1050,23 +1100,13 @@ async fn create_native_with_io(
     };
 
     if require_proven && allocated.allocation.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, &allocated.allocation.handle, generation);
-        let failed = match reduce(
-            Some(record.clone()),
-            ContainmentEvent::CreateFailed {
-                generation,
-                now_wall_ms: wall_ms(),
-            },
-        ) {
-            ReduceResult::Applied(record) => *record,
-            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
-        };
-        persist_cas(state, &record, &failed).await?;
+        reclaim_unpublished_allocation(state, allocated.allocation.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven IO allocation".into(),
         });
     }
 
+    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -1079,7 +1119,12 @@ async fn create_native_with_io(
         other => return Err(ContainmentError::Internal(format!("{other:?}"))),
     };
     if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(state, &allocated.allocation.handle, generation);
+        reclaim_unpublished_allocation(
+            state,
+            allocated.allocation.handle,
+            creating_record,
+            generation,
+        );
         return Err(error);
     }
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
@@ -1206,23 +1251,13 @@ async fn create_container(
     };
 
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, &allocated.handle, generation);
-        let failed = match reduce(
-            Some(record.clone()),
-            ContainmentEvent::CreateFailed {
-                generation,
-                now_wall_ms: wall_ms(),
-            },
-        ) {
-            ReduceResult::Applied(record) => *record,
-            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
-        };
-        persist_cas(state, &record, &failed).await?;
+        reclaim_unpublished_allocation(state, allocated.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven container allocation".into(),
         });
     }
 
+    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -1235,7 +1270,7 @@ async fn create_container(
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
     if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(state, &allocated.handle, generation);
+        reclaim_unpublished_allocation(state, allocated.handle, creating_record, generation);
         return Err(error);
     }
 
@@ -1519,8 +1554,9 @@ async fn finish_session_deletion(
 
 async fn await_all_empty(
     state: &mut ActorState,
-    _deadline: Option<Duration>,
+    deadline: Option<Duration>,
 ) -> Result<(), ContainmentError> {
+    let expires_at = deadline.map(|duration| tokio::time::Instant::now() + duration);
     let leases: Vec<_> = state
         .live
         .iter()
@@ -1534,8 +1570,18 @@ async fn await_all_empty(
         })
         .collect();
     for lease in leases {
-        let _ = terminate_one(state, lease.clone()).await;
-        match await_empty_one(state, lease).await? {
+        let settle = async {
+            let _ = terminate_one(state, lease.clone()).await;
+            await_empty_one(state, lease).await
+        };
+        let outcome = match expires_at {
+            Some(expires_at) => match tokio::time::timeout_at(expires_at, settle).await {
+                Ok(result) => result?,
+                Err(_) => break,
+            },
+            None => settle.await?,
+        };
+        match outcome {
             EmptyOutcome::ProvenEmpty { .. } => {}
             EmptyOutcome::Uncertain { .. } | EmptyOutcome::Unsupported { .. } => {}
         }

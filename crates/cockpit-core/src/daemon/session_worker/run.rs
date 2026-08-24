@@ -1981,6 +1981,11 @@ pub(super) async fn run_worker(
             driver
                 .settle_noninteractive_jobs_for_teardown(&engine_event_tx)
                 .await;
+            // Swarm children use cooperative cancellation because their stop
+            // hooks and process containment must settle. Join them before
+            // synthesizing orphan stops so a late normal terminal cannot race
+            // the teardown-owned abnormal terminal.
+            driver.schedule.settle_swarm_for_teardown().await;
             // Pairing teardown: a driver-loop exit that still holds interactive
             // child frames (only reachable via a fatal `Err` — every clean /
             // cancel / gate / interrupt / inference-failure path already

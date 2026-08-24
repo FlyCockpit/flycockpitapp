@@ -184,16 +184,14 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         match begin_write_scope_transfer(&spec, &ctx).await {
             Ok(handle) => handle,
             Err(refusal) => {
-                let _ = event_tx
-                    .send(ScheduleEvent::Completed {
+                send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
                         job_id,
                         label,
                         kind: ScheduleKind::Swarm,
                         result: refusal,
                         failed: true,
                         requests: Vec::new(),
-                    })
-                    .await;
+                    }).await;
                 return;
             }
         }
@@ -216,11 +214,9 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     if !spec.worker.is_goal_control()
         && lifecycle_event_emitted.load(std::sync::atomic::Ordering::Acquire)
     {
-        let _ = event_tx
-            .send(ScheduleEvent::SwarmChildStopGateCompleted {
+        send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::SwarmChildStopGateCompleted {
                 job_id: job_id.clone(),
-            })
-            .await;
+            }).await;
     }
 
     // The child is terminal either way. Invalidate its token and drain the
@@ -243,8 +239,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }
         Err(e) => {
             let cancelled = cancel.is_cancelled();
-            let _ = event_tx
-                .send(ScheduleEvent::Completed {
+            send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
                     job_id,
                     label,
                     kind: ScheduleKind::Swarm,
@@ -258,8 +253,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
                     // terminal to `endReason: aborted`.
                     failed: !cancelled,
                     requests: Vec::new(),
-                })
-                .await;
+                }).await;
             return;
         }
     };
@@ -269,16 +263,37 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     } else {
         budget_result(&label, &spec, &result)
     };
-    let _ = event_tx
-        .send(ScheduleEvent::Completed {
+    send_swarm_terminal(&event_tx, &cancel, ScheduleEvent::Completed {
             job_id,
             label,
             kind: ScheduleKind::Swarm,
             result: body,
             failed: false,
             requests: Vec::new(),
-        })
-        .await;
+        }).await;
+}
+
+async fn send_swarm_terminal(
+    event_tx: &mpsc::Sender<ScheduleEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+    event: ScheduleEvent,
+) {
+    if cancel.is_cancelled() {
+        let _ = event_tx.try_send(event);
+        return;
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // Teardown owns abnormal lifecycle reconciliation and is waiting
+            // to join this task. Never deadlock that join on a full event
+            // channel which the driver has intentionally stopped draining.
+            let _ = event_tx.try_send(event);
+        }
+        result = event_tx.send(event) => {
+            let _ = result;
+        }
+    }
 }
 
 /// Run the child's `Swarm` agent loop, intercepting its own

@@ -785,19 +785,10 @@ async fn terminate_and_prove_empty(
     // A hook execution is not settled while the containment oracle can still
     // see descendants. `Uncertain` is deliberately not converted into a hook
     // failure: doing so would return control while an untrusted descendant may
-    // still be alive. Reconciliation remains cancellation-safe through the
-    // drop guard and is retried here until the same generation is proven empty.
-    loop {
-        handle.terminate(lease.clone()).await?;
-        if matches!(
-            handle.await_empty(lease.clone()).await?,
-            crate::process_containment::EmptyOutcome::ProvenEmpty { generation }
-                if generation == lease.generation()
-        ) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // still be alive. Ownership transfers to the actor's reconciliation queue;
+    // its completion ticket resolves only after the same generation is proven
+    // empty, while retries remain interleaved with ordinary actor commands.
+    handle.reconcile_and_await_empty(lease.clone()).await
 }
 
 impl Drop for HookContainmentDropGuard {
@@ -826,18 +817,19 @@ impl CommandRunner for TokioCommandRunner {
         session_id: Uuid,
     ) -> HookRawOutput {
         let start = std::time::Instant::now();
-        if self
-            .cancellation
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        if timeout.is_zero()
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
             return HookRawOutput {
                 stdout: String::new(),
                 exit_code: None,
                 duration_ms: 0,
                 spawn_failed: false,
-                timeout: false,
-                failure_reason: Some(REASON_HOOK_CANCELLED),
+                timeout: timeout.is_zero(),
+                failure_reason: (!timeout.is_zero()).then_some(REASON_HOOK_CANCELLED),
                 output_truncated: false,
             };
         }

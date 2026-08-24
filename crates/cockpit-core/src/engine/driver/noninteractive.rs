@@ -12,6 +12,7 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
 #[derive(Debug, Clone)]
 pub(in crate::engine::driver) struct ChildHookLifecycle {
     subagent_id: String,
+    start_event_emitted: bool,
     lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -19,6 +20,15 @@ impl ChildHookLifecycle {
     fn new(subagent_id: impl Into<String>) -> Self {
         Self {
             subagent_id: subagent_id.into(),
+            start_event_emitted: false,
+            lifecycle_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn already_started(subagent_id: impl Into<String>) -> Self {
+        Self {
+            subagent_id: subagent_id.into(),
+            start_event_emitted: true,
             lifecycle_event_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -376,7 +386,7 @@ impl NoninteractiveDelegationRegistry {
             .entries
             .get(&key)
             .map(|entry| entry.lifecycle.clone())
-            .unwrap_or_else(|| ChildHookLifecycle::new(task_call_id));
+            .unwrap_or_else(|| ChildHookLifecycle::already_started(task_call_id));
         self.entries.insert(
             key,
             NoninteractiveDelegationEntry::running(child_agent, snapshot, lifecycle),
@@ -2637,14 +2647,31 @@ impl Driver {
         for job in jobs.values() {
             job.cancel.cancel();
         }
+        // Drain completions concurrently with joins. A child can otherwise be
+        // blocked publishing into the bounded completion channel while the
+        // teardown owner waits for that same child to join.
+        let mut joins = tokio::task::JoinSet::new();
         for (task_call_id, job) in jobs {
-            if let Err(error) = job.handle.await {
-                tracing::warn!(%error, %task_call_id, "background child failed while joining teardown");
-            }
+            joins.spawn(async move { (task_call_id, job.handle.await) });
         }
-
         let mut completions: Vec<BackgroundNoninteractiveCompletion> =
             self.pending_noninteractive_completions.drain(..).collect();
+        let mut completion_channel_open = true;
+        while !joins.is_empty() {
+            tokio::select! {
+                joined = joins.join_next() => {
+                    if let Some(Ok((task_call_id, Err(error)))) = joined {
+                        tracing::warn!(%error, %task_call_id, "background child failed while joining teardown");
+                    }
+                }
+                completion = self.noninteractive_complete_rx.recv(), if completion_channel_open => {
+                    match completion {
+                        Some(completion) => completions.push(completion),
+                        None => completion_channel_open = false,
+                    }
+                }
+            }
+        }
         while let Ok(completion) = self.noninteractive_complete_rx.try_recv() {
             completions.push(completion);
         }
@@ -5289,6 +5316,47 @@ impl std::fmt::Display for NoninteractiveRunError {
 
 impl std::error::Error for NoninteractiveRunError {}
 
+async fn fire_recursive_child_abnormal_stop(
+    lifecycle: Option<&ChildHookLifecycle>,
+    agent: &Agent,
+    session: &Session,
+    cwd: &std::path::Path,
+    config: &crate::daemon::session_worker::SessionConfigHandle,
+    process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    end_reason: &'static str,
+) {
+    let Some(lifecycle) = lifecycle.filter(|lifecycle| {
+        !lifecycle.start_event_emitted && !lifecycle.emitted()
+    }) else {
+        return;
+    };
+    let snapshot = config.snapshot();
+    let hook_runner = process_containment.map_or_else(
+        crate::engine::agent::hooks::TokioCommandRunner::new,
+        crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+    );
+    crate::engine::agent::hooks::run_observe_hooks(
+        &hook_runner,
+        &crate::engine::agent::hooks::DefaultProcessEnv,
+        snapshot.hooks(),
+        crate::config::extended::hooks::HookEvent::SubagentStop,
+        &agent.name,
+        session.id,
+        cwd,
+        &session.db,
+        None,
+        None,
+        Some(&agent.name),
+        Some(&lifecycle.subagent_id),
+        crate::engine::agent::hooks::ObserveFields {
+            end_reason: Some(end_reason),
+            ..Default::default()
+        },
+    )
+    .await;
+    lifecycle.publish(true);
+}
+
 /// Run a child agent's loop to completion, optionally **rehydrated** from a
 /// prior transcript (`prior_history`). Returns the report + the full
 /// transcript. [`run_noninteractive`] is the no-rehydrate wrapper used by the
@@ -5321,6 +5389,32 @@ pub(crate) async fn run_noninteractive_resumable(
     steer_target: Option<NoninteractiveSteerTarget>,
 ) -> std::result::Result<NoninteractiveOutcome, NoninteractiveRunError> {
     use crate::engine::agent::turn_with_backup;
+
+    if let Some(lifecycle) = child_lifecycle.as_ref()
+        && !lifecycle.start_event_emitted
+    {
+        let snapshot = config.snapshot();
+        let hook_runner = process_containment.clone().map_or_else(
+            crate::engine::agent::hooks::TokioCommandRunner::new,
+            crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+        );
+        crate::engine::agent::hooks::run_observe_hooks(
+            &hook_runner,
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            &child.name,
+            session.id,
+            &cwd,
+            &session.db,
+            None,
+            None,
+            Some(&child.name),
+            Some(&lifecycle.subagent_id),
+            crate::engine::agent::hooks::ObserveFields::default(),
+        )
+        .await;
+    }
 
     let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);
     // Recursive vNext structural tasks need the original sender for their
@@ -5480,6 +5574,16 @@ pub(crate) async fn run_noninteractive_resumable(
                     )
                     .await;
                 }
+                fire_recursive_child_abnormal_stop(
+                    child_lifecycle.as_ref(),
+                    &agent,
+                    &session,
+                    &cwd,
+                    &config,
+                    process_containment.clone(),
+                    "failed",
+                )
+                .await;
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
@@ -5529,6 +5633,10 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 }
                 if cancel.is_cancelled() {
+                    fire_recursive_child_abnormal_stop(
+                        child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
+                        process_containment.clone(), "aborted",
+                    ).await;
                     drop(child_tx);
                     let _ = forwarder.await;
                     return Err(NoninteractiveRunError::new(
@@ -5583,6 +5691,10 @@ pub(crate) async fn run_noninteractive_resumable(
                     }
                 }
                 if cancel.is_cancelled() {
+                    fire_recursive_child_abnormal_stop(
+                        child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
+                        process_containment.clone(), "aborted",
+                    ).await;
                     drop(child_tx);
                     let _ = forwarder.await;
                     return Err(NoninteractiveRunError::new(
@@ -5914,7 +6026,11 @@ pub(crate) async fn run_noninteractive_resumable(
                     let tandem = tandem.clone();
                     let event_tx = event_tx.clone();
                     let steer_target = steer_target.clone();
-                    let child_hook_id = task_call_id.clone();
+                    // A batch tool call is the parent correlation, not a child
+                    // identity. Give every concrete recursive child its own
+                    // stable lifecycle key so concurrent start/stop pairs can
+                    // never collapse onto the shared batch call id.
+                    let child_hook_id = format!("{task_call_id}:{idx}");
                     runs.push(async move {
                         // RAII releases each slot as soon as its child ends,
                         // including cancellation, errors, and panics.
@@ -5972,6 +6088,10 @@ pub(crate) async fn run_noninteractive_resumable(
                 // happen, but if it does we bail rather than spin (the single
                 // async-job authority is the main driver, never a noninteractive
                 // subagent — §22 anti-runaway).
+                fire_recursive_child_abnormal_stop(
+                    child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
+                    process_containment.clone(), "failed",
+                ).await;
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
@@ -5986,6 +6106,10 @@ pub(crate) async fn run_noninteractive_resumable(
             }
         }
     }
+    fire_recursive_child_abnormal_stop(
+        child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
+        process_containment, "failed",
+    ).await;
     drop(child_tx);
     let _ = forwarder.await;
     Err(NoninteractiveRunError::new(
@@ -6002,6 +6126,17 @@ pub(crate) async fn run_noninteractive_resumable(
 #[cfg(test)]
 mod vnext_child_admission_tests {
     use super::*;
+
+    #[test]
+    fn recursive_batch_child_lifecycle_ids_are_distinct_from_parent_correlation() {
+        let parent = "task-call";
+        let ids = (0..3)
+            .map(|idx| ChildHookLifecycle::new(format!("{parent}:{idx}")))
+            .map(|lifecycle| lifecycle.subagent_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(parent));
+    }
 
     #[test]
     fn agent_vnext_batch_child_admission_is_atomic_and_reusable() {

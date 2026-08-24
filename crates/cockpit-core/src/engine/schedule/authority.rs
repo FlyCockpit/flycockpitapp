@@ -343,6 +343,10 @@ pub struct SpawnSpec {
 /// The single async-job authority. Owned by the driver; never cloned.
 pub struct ScheduleAuthority {
     registry: BTreeMap<String, ScheduleEntry>,
+    /// Join ownership for cooperative Swarm tasks. Abort handles are not a
+    /// lifecycle barrier: teardown cancels these tasks and joins them before
+    /// the driver drains unmatched child-hook state.
+    swarm_tasks: BTreeMap<String, tokio::task::JoinHandle<()>>,
     /// Cap on concurrently-running jobs.
     pub max_concurrent: usize,
     /// Sender the authority hands to spawned tasks + timers so they post
@@ -391,6 +395,7 @@ impl ScheduleAuthority {
     ) -> Self {
         Self {
             registry: BTreeMap::new(),
+            swarm_tasks: BTreeMap::new(),
             max_concurrent: max_concurrent.max(1),
             event_tx,
             cmd_tx,
@@ -531,6 +536,7 @@ impl ScheduleAuthority {
             background: None,
         };
         self.registry.insert(job_id.clone(), entry);
+        self.swarm_tasks.insert(job_id.clone(), handle);
         job_id
     }
 
@@ -599,6 +605,30 @@ impl ScheduleAuthority {
             }
             entry.abort.take();
         }
+        self.swarm_tasks.remove(job_id);
+    }
+
+    /// Cooperatively stop and join every recursive child task. This must run
+    /// before orphan lifecycle reconciliation, otherwise a still-running task
+    /// can publish its normal stop after teardown has already synthesized an
+    /// aborted stop for the same child.
+    pub async fn settle_swarm_for_teardown(&mut self) {
+        self.swarm_queue.clear();
+        for entry in self.registry.values_mut() {
+            if entry.kind == ScheduleKind::Swarm
+                && let Some(cancel) = entry.cancel.take()
+            {
+                cancel.cancel();
+            }
+        }
+        let tasks = std::mem::take(&mut self.swarm_tasks);
+        for (job_id, task) in tasks {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, %job_id, "swarm child failed while joining teardown");
+            }
+            self.registry.remove(&job_id);
+        }
+        self.running_swarm = 0;
     }
 
     /// `true` when the concurrency cap would be exceeded by one more job.

@@ -739,33 +739,43 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
     let home = validate_row_home(&row)?;
     let target = assistant_definition_path(&home);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-    recover_creation_journal_locked(db, &home)?;
-    let row = get_assistant_blocking(db, &row.name)?
-        .context("assistant disappeared while acquiring its snapshot")?;
-    validate_row_home(&row)?;
-    recover_definition_journal_locked(db, &row)?;
-    let row = get_assistant_blocking(db, &row.name)?
-        .context("assistant disappeared during definition recovery")?;
-    validate_row_home(&row)?;
-
-    let unavailable = |diagnostic: String| AssistantSnapshot {
-        row: row.clone(),
+    let unavailable = |row: AssistantRow, diagnostic: String| AssistantSnapshot {
+        row,
         definition_markdown: None,
         definition_revision: None,
         definition_diagnostic: Some(diagnostic),
     };
+    if let Err(error) = recover_creation_journal_locked(db, &home) {
+        return Ok(unavailable(
+            row,
+            format!("assistant creation recovery is unavailable: {error:#}"),
+        ));
+    }
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared while acquiring its snapshot")?;
+    validate_row_home(&row)?;
+    if let Err(error) = recover_definition_journal_locked(db, &row) {
+        return Ok(unavailable(
+            row,
+            format!("assistant definition recovery is unavailable: {error:#}"),
+        ));
+    }
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during definition recovery")?;
+    validate_row_home(&row)?;
+
     let Some(bytes) = cockpit_config::config::read_config_file_nofollow(&target)? else {
-        return Ok(unavailable("assistant definition is missing".into()));
+        return Ok(unavailable(row, "assistant definition is missing".into()));
     };
     if sha256_hex(&bytes) != row.content_hash {
-        return Ok(unavailable(
+        return Ok(unavailable(row,
             "assistant definition does not match the registry content hash".into(),
         ));
     }
     let markdown = match String::from_utf8(bytes) {
         Ok(markdown) => markdown,
         Err(_) => {
-            return Ok(unavailable(
+            return Ok(unavailable(row,
                 "assistant definition is not valid UTF-8".into(),
             ));
         }
@@ -773,14 +783,19 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
     let definition = match crate::agents::parse_daemon_local_markdown(&markdown, &row.name) {
         Ok(definition) => definition,
         Err(error) => {
-            return Ok(unavailable(format!(
+            return Ok(unavailable(row, format!(
                 "assistant definition is invalid: {error:#}"
             )));
         }
     };
     // A valid document claiming a different installation identity is an
     // authority violation, not ordinary row-local corruption.
-    validate_definition_identity(&row, &definition)?;
+    if let Err(error) = validate_definition_identity(&row, &definition) {
+        return Ok(unavailable(
+            row,
+            format!("assistant definition identity/config is invalid: {error:#}"),
+        ));
+    }
     let revision = definition_revision(&row, &markdown);
     Ok(AssistantSnapshot {
         row,
@@ -895,29 +910,83 @@ fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Res
     };
     let home = validate_row_home(&row)?;
     let target = assistant_definition_path(&home);
-    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
-    recover_creation_journal_locked(db, &home)?;
+    let guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
     let row = get_assistant_blocking(db, name)?
-        .context("assistant disappeared during delete recovery")?;
+        .context("assistant disappeared while acquiring delete authority")?;
     validate_row_home(&row)?;
     if registration_revision(&row) != expected_revision {
         bail!("assistant registration changed since delete confirmation");
     }
-    // Explicit unregister supersedes an unfinished definition save. The
-    // definition/home are intentionally retained, but the private recovery
-    // journal must not remain able to influence a later registration. This is
-    // also what makes a missing or corrupt definition safely unregisterable.
-    let definition_journal = definition_journal_path(&home);
-    if cockpit_config::config::read_config_file_nofollow(&definition_journal)?.is_some() {
-        cockpit_config::config::remove_config_file_atomic(&definition_journal)?;
-    }
-    db.write_blocking(move |conn| {
+    // Unregister is intentionally independent of definition parsing. Corrupt
+    // or conflicting recovery inputs are moved out of the active namespace
+    // under the same lock, retained for forensics, and restored if the row CAS
+    // fails. They are never interpreted merely to authorize deletion.
+    let quarantine = quarantine_unregister_journals(&guard, &home)?;
+    let delete_result = db.write_blocking(move |conn| {
         let changed = conn.execute(
             "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
             rusqlite::params![row.name, row.created_at, row.home_dir, row.config_json, row.content_hash],
         )?;
         Ok(changed == 1)
-    })
+    });
+    match delete_result {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            restore_unregister_journals(&guard, &home, &quarantine)?;
+            Ok(false)
+        }
+        Err(error) => {
+            restore_unregister_journals(&guard, &home, &quarantine)?;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QuarantinedJournal {
+    active: PathBuf,
+    retained: PathBuf,
+}
+
+fn quarantine_unregister_journals(
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    home: &Path,
+) -> Result<Vec<QuarantinedJournal>> {
+    let root = home.join(".assistant-unregister-quarantine");
+    crate::private_fs::ensure_private_dir(&root)?;
+    let operation = root.join(Uuid::new_v4().to_string());
+    crate::private_fs::ensure_private_dir(&operation)?;
+    let mut quarantined = Vec::new();
+    for (active, retained_name) in [
+        (creation_journal_path(home), "creation.journal.json"),
+        (definition_journal_path(home), "definition-save.journal.json"),
+    ] {
+        if cockpit_config::config::read_config_file_nofollow(&active)?.is_none() {
+            continue;
+        }
+        let retained = operation.join(retained_name);
+        cockpit_config::config::rename_config_file_nofollow(guard, &active, &retained)?;
+        quarantined.push(QuarantinedJournal { active, retained });
+    }
+    cockpit_config::config::sync_directory_nofollow(&operation)?;
+    cockpit_config::config::sync_directory_nofollow(home)?;
+    Ok(quarantined)
+}
+
+fn restore_unregister_journals(
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    home: &Path,
+    quarantined: &[QuarantinedJournal],
+) -> Result<()> {
+    for journal in quarantined.iter().rev() {
+        cockpit_config::config::rename_config_file_nofollow(
+            guard,
+            &journal.retained,
+            &journal.active,
+        )?;
+    }
+    cockpit_config::config::sync_directory_nofollow(home)?;
+    Ok(())
 }
 
 fn get_assistant_blocking(db: &Db, name: &str) -> Result<Option<AssistantRow>> {

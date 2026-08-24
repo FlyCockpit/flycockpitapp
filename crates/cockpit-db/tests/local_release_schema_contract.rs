@@ -49,8 +49,15 @@ fn ownership() -> BTreeMap<String, Ownership> {
 
 #[test]
 fn local_base_and_remote_extension_have_exact_physical_ownership() {
+    let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
+    for remote_vocabulary in ["remote_device", "public_remote"] {
+        assert!(
+            !local_sql.contains(remote_vocabulary),
+            "local launch schema contains remote-only vocabulary {remote_vocabulary}"
+        );
+    }
     let local = Connection::open_in_memory().unwrap();
-    local.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+    local.execute_batch(local_sql)
         .expect("0001_initial.sql must execute as SQLite");
     let local_inventory = schema_inventory(&local);
     let local_tables = local_inventory.get("table").cloned().unwrap_or_default();

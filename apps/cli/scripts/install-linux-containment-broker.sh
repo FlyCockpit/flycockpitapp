@@ -9,6 +9,12 @@ if [ "$#" -ne 1 ]; then
   echo "usage: install-linux-containment-broker.sh DAEMON_USER" >&2
   exit 2
 fi
+for tool in getent awk sed stat readlink tr cut grep; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "required containment installer tool is unavailable: $tool" >&2
+    exit 1
+  fi
+done
 
 daemon_user=$1
 payload_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)

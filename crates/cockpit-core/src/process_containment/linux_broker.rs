@@ -633,11 +633,15 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     let recovered_exit_statuses = operations.values()
         .filter_map(|operation| operation.exit_code.map(|code| (operation.key.clone(), Some(code))))
         .collect();
+    let operation_keys = operations.iter().map(|(identity, operation)| {
+        (operation.key.clone(), identity.clone())
+    }).collect();
     let state = Arc::new(BrokerState {
         children: Mutex::new(BTreeMap::new()),
         operations: Mutex::new(operations.into_iter().map(|(identity, operation)| {
             (identity, Arc::new(Mutex::new(operation)))
         }).collect()),
+        operation_keys: Mutex::new(operation_keys),
         emptied: Mutex::new(durable_empty),
         exit_statuses: Mutex::new(recovered_exit_statuses),
         tombstones: Mutex::new(tombstones),
@@ -808,6 +812,7 @@ fn try_reserve_connection(
 struct BrokerState {
     children: Mutex<BTreeMap<String, libc::pid_t>>,
     operations: Mutex<BTreeMap<(String, String), Arc<Mutex<BrokerOperation>>>>,
+    operation_keys: Mutex<BTreeMap<String, (String, String)>>,
     emptied: Mutex<BTreeSet<String>>,
     exit_statuses: Mutex<BTreeMap<String, Option<i32>>>,
     tombstones: Mutex<ReplayIdentityStore>,
@@ -930,11 +935,8 @@ impl BrokerState {
     }
 
     fn operation_for_key(&self, key: &str) -> Option<((String, String), Arc<Mutex<BrokerOperation>>)> {
-        let operations = self.operations.lock().expect("operation-map lock poisoned")
-            .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
-        operations.into_iter().find(|(_, operation)| {
-            operation.lock().expect("operation lock poisoned").key == key
-        })
+        let identity = self.operation_keys.lock().expect("operation-key lock poisoned").get(key).cloned()?;
+        self.operation(&identity).map(|operation| (identity, operation))
     }
 
     fn remember_empty(&self, key: String) {
@@ -1055,12 +1057,8 @@ fn serve_one(
                     code: "operation_identity_retired".into(),
                 }, &[]);
             }
-            let operation_snapshot = state.operations.lock().expect("operation-map lock poisoned")
-                .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
-            let locator_bound = operation_snapshot.iter().any(|(identity, operation)| {
-                    operation.lock().expect("operation lock poisoned").key == requested_key
-                        && identity != &operation_key
-                });
+            let locator_bound = state.operation_keys.lock().expect("operation-key lock poisoned")
+                .get(&requested_key).is_some_and(|identity| identity != &operation_key);
             if locator_bound {
                 return send_response(
                     stream,
@@ -1104,8 +1102,16 @@ fn serve_one(
             {
                 let mut operations = state.operations.lock().expect("operation-map lock poisoned");
                 if operations.contains_key(&operation_key) {
+                    drop(operations);
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_owner_active".into() }, &[]);
                 }
+                let mut keys = state.operation_keys.lock().expect("operation-key lock poisoned");
+                if keys.contains_key(&requested_key) {
+                    drop(keys);
+                    drop(operations);
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "containment_locator_already_bound".into() }, &[]);
+                }
+                keys.insert(requested_key.clone(), operation_key.clone());
                 operations.insert(operation_key.clone(), operation.clone());
             }
             let spawned = spawn_atomic(
@@ -1179,6 +1185,7 @@ fn serve_one(
                     let mut operations = state.operations.lock().expect("operation-map lock poisoned");
                     if operations.get(&operation_key).is_some_and(|found| Arc::ptr_eq(found, &operation)) {
                         operations.remove(&operation_key);
+                        state.operation_keys.lock().expect("operation-key lock poisoned").remove(&requested_key);
                     }
                     drop(operations);
                     send_response(&stream, &Response::Error {
@@ -2973,7 +2980,7 @@ fn gc_runtime_terminal_operations(
             let operation = operation.try_lock().ok()?;
             matches!(operation.status,
                 OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited)
-                .then(|| identity.clone())
+                .then(|| (identity.clone(), operation.key.clone()))
         }).take(operations.len().saturating_sub(target)).collect::<Vec<_>>()
     };
     if retired.is_empty() {
@@ -2982,17 +2989,20 @@ fn gc_runtime_terminal_operations(
     {
         let mut tombstones = state.tombstones.lock().expect("replay-state lock poisoned");
         let newly_retired = retired.iter()
+            .map(|(identity, _)| identity)
             .filter(|identity| !tombstones.identities.contains(*identity))
             .cloned().collect::<Vec<_>>();
         tombstones.append(config, &newly_retired)?;
     }
-    for identity in &retired {
+    for (identity, _) in &retired {
         fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?)?;
     }
     File::open(&config.state_root)?.sync_all()?;
     let mut operations = state.operations.lock().expect("operation-map lock poisoned");
-    for identity in retired {
+    let mut keys = state.operation_keys.lock().expect("operation-key lock poisoned");
+    for (identity, key) in retired {
         operations.remove(&identity);
+        keys.remove(&key);
     }
     Ok(())
 }

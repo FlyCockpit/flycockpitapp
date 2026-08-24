@@ -8,7 +8,9 @@ use super::*;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "remote")]
+use std::collections::HashSet;
 use std::io;
 // Brings the `Write` trait methods (`write_all`) into scope for the
 // `zip::ZipWriter` calls below without binding a name (so it neither shadows the
@@ -858,7 +860,7 @@ async fn list_packages_response_carries_no_planted_secret() {
     // Precondition: the secret really lives in the daemon vault.
     assert_eq!(
         store.named_secret("list-packages-redaction-probe"),
-        Some(token.clone())
+        Some(token.as_str())
     );
     crate::packages::add_local(&ctx.db, "fixture-pkg", std::env::temp_dir().as_path())
         .await
@@ -1795,6 +1797,7 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
     );
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
     use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
@@ -1842,6 +1845,7 @@ async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
     );
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
     let ctx = test_ctx();
@@ -1874,33 +1878,36 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         .unwrap();
     assert_ne!(first, second);
 
-    let operation_id = characterized_operation_id();
-    let side_effects = std::sync::atomic::AtomicUsize::new(0);
-    let first_hash = remote_request_hash(&ctx, &first);
-    let second_hash = remote_request_hash(&ctx, &second);
-    assert!(matches!(
-        characterize_operation_dispatch(
-            &ctx.db,
-            Uuid::new_v4(),
-            operation_id,
-            first_hash,
-            &side_effects,
-        )
-        .await,
-        CharacterizedDispatchOutcome::Applied(_)
-    ));
-    assert_eq!(
-        characterize_operation_dispatch(
-            &ctx.db,
-            Uuid::new_v4(),
-            operation_id,
-            second_hash,
-            &side_effects,
-        )
-        .await,
-        CharacterizedDispatchOutcome::Conflict
-    );
-    assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    #[cfg(feature = "remote")]
+    {
+        let operation_id = characterized_operation_id();
+        let side_effects = std::sync::atomic::AtomicUsize::new(0);
+        let first_hash = remote_request_hash(&ctx, &first);
+        let second_hash = remote_request_hash(&ctx, &second);
+        assert!(matches!(
+            characterize_operation_dispatch(
+                &ctx.db,
+                Uuid::new_v4(),
+                operation_id,
+                first_hash,
+                &side_effects,
+            )
+            .await,
+            CharacterizedDispatchOutcome::Applied(_)
+        ));
+        assert_eq!(
+            characterize_operation_dispatch(
+                &ctx.db,
+                Uuid::new_v4(),
+                operation_id,
+                second_hash,
+                &side_effects,
+            )
+            .await,
+            CharacterizedDispatchOutcome::Conflict
+        );
+        assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
@@ -11046,16 +11053,19 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     // The durable `complete_*` request carries only the client-supplied flow id
     // and callback input — never the server-held verifier — and its canonical
     // remote-operation params encode exactly those two fields.
-    let request = Request::CompleteProviderOAuth {
-        flow_id: "flow-123".into(),
-        input: Some("https://callback.example/?code=abc".into()),
-    };
-    let params = request.canonical_remote_operation_params_v1().unwrap();
-    assert!(
-        !params
-            .windows(verifier.len())
-            .any(|w| w == verifier.as_bytes())
-    );
+    #[cfg(feature = "remote")]
+    {
+        let request = Request::CompleteProviderOAuth {
+            flow_id: "flow-123".into(),
+            input: Some("https://callback.example/?code=abc".into()),
+        };
+        let params = request.canonical_remote_operation_params_v1().unwrap();
+        assert!(
+            !params
+                .windows(verifier.len())
+                .any(|w| w == verifier.as_bytes())
+        );
+    }
 }
 
 #[tokio::test]
@@ -13715,12 +13725,14 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, PartialEq, Eq)]
 enum CharacterizedDispatchOutcome {
     Applied(Vec<u8>),
     Conflict,
 }
 
+#[cfg(feature = "remote")]
 async fn characterize_operation_dispatch(
     db: &crate::db::Db,
     _request_id: Uuid,
@@ -13771,6 +13783,7 @@ async fn characterize_operation_dispatch(
     }
 }
 
+#[cfg(feature = "remote")]
 fn characterized_operation_id() -> Uuid {
     Uuid::parse_str("01890f3e-4c00-7000-8000-000000000001").unwrap()
 }
@@ -13885,6 +13898,7 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GetRunInvocationStatus,
+    #[cfg(feature = "remote")]
     OperationStatus,
     GoalDisposition,
     GetInventoryBundle,
@@ -13954,6 +13968,7 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
             kind: "get_run_invocation_status",
             case: ReadonlyDispatchCaseKind::GetRunInvocationStatus,
         },
+        #[cfg(feature = "remote")]
         ReadonlyDispatchCase {
             kind: "operation_status",
             case: ReadonlyDispatchCaseKind::OperationStatus,
@@ -15075,7 +15090,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("prune"),
         authz_session_writer("compact"),
         authz_session_writer("pin"),
+        #[cfg(feature = "remote")]
         authz_owner_only("store_flycockpit_credential"),
+        #[cfg(feature = "remote")]
         authz_owner_only("clear_flycockpit_credential"),
         // v10 owner-remoted CLI-surface RPCs.
         authz_owner_only("list_packages"),
@@ -15083,7 +15100,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("import_package"),
         authz_owner_only("prune_packages"),
         authz_owner_only("import_kcl_packages"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_connector_state"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_org_sync_status"),
         authz_owner_only("list_failed_tool_calls"),
         authz_owner_only("get_session_compactions"),
@@ -15107,6 +15126,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_named_secret"),
         authz_owner_only("put_provider_credential"),
         authz_owner_only("delete_provider_credential"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_flycockpit_account"),
         authz_owner_only("begin_provider_oauth"),
         authz_owner_only("complete_provider_oauth"),
@@ -15144,8 +15164,11 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("image_workflow_upload"),
         authz_owner_only("image_workflow_bind"),
         authz_owner_only("image_workflow_delete"),
+        #[cfg(feature = "remote")]
         authz_owner_only("set_flycockpit_connector_enabled"),
+        #[cfg(feature = "remote")]
         authz_owner_only("sync_flycockpit_org_policy"),
+        #[cfg(feature = "remote")]
         authz_owner_only("enroll_flycockpit_org_sync"),
         authz_owner_only("refresh_host_capabilities"),
         authz_owner_only("migrate_kek_placement"),
@@ -15665,7 +15688,7 @@ fn assert_authz_allowed_outcome(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
     let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level).await;
     let result = dispatch_authz_request_after(
@@ -15711,7 +15734,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -15764,7 +15787,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn authz_cross_session_paused_work_scenario(
     kind: &'static str,
     level: AuthzLevel,
@@ -15822,7 +15845,7 @@ async fn authz_cross_session_paused_work_scenario(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) -> ClientPrincipal {
     let project_root = project_root.to_string_lossy().into_owned();
     match level {
@@ -16302,6 +16325,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_run_invocation_status" => Request::GetRunInvocationStatus {
             client_submission_id: Uuid::new_v4(),
         },
+        #[cfg(feature = "remote")]
         "operation_status" => Request::OperationStatus {
             operation_id: Uuid::from_u128(99),
         },
@@ -16413,10 +16437,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "pin" => Request::Pin {
             text: "remember".into(),
         },
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" => Request::StoreFlycockpitCredential {
             credential: flycockpit_credential(),
             force: false,
         },
+        #[cfg(feature = "remote")]
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
         "put_subscription_ack" => Request::PutSubscriptionAck {
             provider_id: "codex-oauth".into(),
@@ -16596,6 +16622,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             cursor: None,
             limit: None,
         },
+        #[cfg(feature = "remote")]
         "get_flycockpit_account" => Request::GetFlycockpitAccount,
         "put_named_secret" => Request::PutNamedSecret {
             name: "matrix-secret".into(),
@@ -16733,12 +16760,15 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             wizard_id: "security".into(),
             answers_json: "{}".into(),
         },
+        #[cfg(feature = "remote")]
         "enroll_flycockpit_org_sync" => Request::EnrollFlycockpitOrgSync {
             org_id: "matrix-org".into(),
         },
+        #[cfg(feature = "remote")]
         "set_flycockpit_connector_enabled" => {
             Request::SetFlycockpitConnectorEnabled { enabled: true }
         }
+        #[cfg(feature = "remote")]
         "sync_flycockpit_org_policy" => Request::SyncFlycockpitOrgPolicy,
         "list_packages" => Request::ListPackages,
         "add_package" => Request::AddPackage {
@@ -16764,7 +16794,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "import_kcl_packages" => Request::ImportKclPackages {
             project_root: root.clone(),
         },
+        #[cfg(feature = "remote")]
         "get_connector_state" => Request::GetConnectorState,
+        #[cfg(feature = "remote")]
         "get_org_sync_status" => Request::GetOrgSyncStatus,
         "list_failed_tool_calls" => Request::ListFailedToolCalls {
             since_epoch: 0,
@@ -17237,6 +17269,7 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(status.client_submission_id, id);
                 assert_eq!(status.schema_version, 1);
             }
+            #[cfg(feature = "remote")]
             Self::OperationStatus => {
                 let ctx = test_ctx();
                 let operation_id = Uuid::now_v7();
@@ -17643,6 +17676,7 @@ impl ReadonlyDispatchCaseKind {
                 .expect_err("nil client_submission_id is rejected");
                 assert_eq!(err.code, ErrorCode::BadRequest);
             }
+            #[cfg(feature = "remote")]
             Self::OperationStatus => {
                 let ctx = test_ctx();
                 let err = dispatch_matrix_request(
@@ -18121,6 +18155,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert!(counts.is_empty());
         }
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
             let ctx = test_ctx();
             let request = if case.kind == "store_flycockpit_credential" {
@@ -18500,11 +18535,13 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_queued_user_message",
                     SessionWork::RemoveQueuedUserMessage {
                         queue_item_id,
+                        #[cfg(feature = "remote")]
                         remote_operation,
                         respond_to,
                     },
                 ) => {
                     assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    #[cfg(feature = "remote")]
                     assert!(remote_operation.is_none());
                     respond_to
                         .send(Ok(proto::RemoveQueuedUserMessageResult {
@@ -21323,6 +21360,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert_eq!(counts.get("/help"), Some(&1));
         }
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("credential.json");
@@ -21359,6 +21397,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             }
             let _ = path;
         }
+        #[cfg(feature = "remote")]
         "set_flycockpit_connector_enabled" => {
             let ctx = persistent_test_ctx_with_credential_path(
                 tempfile::tempdir().unwrap().path().join("credential.json"),
@@ -21381,6 +21420,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                 .expect("connector state");
             assert!(state.enabled);
         }
+        #[cfg(feature = "remote")]
         "sync_flycockpit_org_policy" => {
             // The daemon owns this network/policy operation. A test daemon
             // without a credential proves the dispatch path is typed and
@@ -21398,6 +21438,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                 }
             ));
         }
+        #[cfg(feature = "remote")]
         "enroll_flycockpit_org_sync" => {
             let ctx = persistent_test_ctx_with_credential_path(
                 tempfile::tempdir().unwrap().path().join("credential.json"),
@@ -21686,7 +21727,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
             (*ordering == principal::RequestOrdering::Concurrent).then_some(*kind)
         })
         .collect();
-    let expected = BTreeSet::from([
+    let mut expected = BTreeSet::from([
         "agent_installation_inspect",
         "agent_installation_list",
         "daemon_status",
@@ -21732,14 +21773,14 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "subagent_transcript",
         "terminal_ingress_status",
         "list_packages",
-        "get_connector_state",
-        "get_org_sync_status",
         "list_failed_tool_calls",
         "get_session_compactions",
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
     ]);
+    #[cfg(feature = "remote")]
+    expected.extend(["get_connector_state", "get_org_sync_status"]);
     assert_eq!(actual, expected);
     for serialized in [
         "attach",
@@ -27513,6 +27554,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
+        #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -27533,6 +27575,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        #[cfg(feature = "remote")]
         remote_project_resolver: base.remote_project_resolver.clone(),
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
@@ -27723,6 +27766,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
+        #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -27743,6 +27787,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        #[cfg(feature = "remote")]
         remote_project_resolver: base.remote_project_resolver.clone(),
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
@@ -29446,6 +29491,7 @@ async fn daemon_load_configs_uses_session_policy_over_global_policy() {
     crate::config::trust::clear_runtime_policy_for_tests();
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn response_redaction_scrubs_queue_display_metadata() {
     crate::auth::flycockpit::with_redaction_token_override("fci_response_secret_12345", || {
@@ -29476,6 +29522,7 @@ async fn response_redaction_scrubs_queue_display_metadata() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn redaction_preserves_uuid_when_secret_overlaps() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
@@ -29523,6 +29570,7 @@ async fn redaction_preserves_uuid_when_secret_overlaps() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn event_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
@@ -29567,6 +29615,7 @@ async fn event_redaction_preserves_typed_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn redaction_preserves_structural_string_fields() {
     crate::auth::flycockpit::with_redaction_token_override("secret-struct", || {
@@ -29660,6 +29709,7 @@ async fn redaction_preserves_structural_string_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn history_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("call-secret-123", || {
@@ -29710,6 +29760,7 @@ async fn history_redaction_preserves_typed_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn history_redaction_scrubs_display_text_and_tag_expansions() {
     crate::auth::flycockpit::with_redaction_token_override("fci_history_secret_12345", || {
@@ -29744,6 +29795,7 @@ async fn history_redaction_scrubs_display_text_and_tag_expansions() {
 // Attempt-grant ceiling authorization (AC7 / AC3a)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "remote")]
 fn attempt_grant_test_ctx(
     resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
 ) -> Arc<DaemonContext> {
@@ -29766,6 +29818,7 @@ fn attempt_grant_test_ctx(
     )
 }
 
+#[cfg(feature = "remote")]
 fn attempt_grant_principal(
     ceiling: cockpit_proto::remote_public_service_policy::RemotePermissionCeilingV1,
 ) -> ClientPrincipal {

@@ -282,6 +282,7 @@ mod tests {
             crate::auth::codex_oauth::CREDENTIAL_KEY,
             json!({"access_token":"codex","refresh_token":"refresh","expires_at":9_999_999_999i64}),
         );
+        #[cfg(feature = "remote")]
         store.set(
             crate::auth::flycockpit::CREDENTIAL_KEY,
             json!({"keep":true}),
@@ -309,6 +310,7 @@ mod tests {
                 .get(crate::auth::codex_oauth::CREDENTIAL_KEY)
                 .is_some()
         );
+        #[cfg(feature = "remote")]
         assert!(store.get(crate::auth::flycockpit::CREDENTIAL_KEY).is_some());
     }
 

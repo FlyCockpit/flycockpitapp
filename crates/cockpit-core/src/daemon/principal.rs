@@ -538,7 +538,7 @@ mod tests {
             rows.len() > 80,
             "command table should enumerate Request rows"
         );
-        let expected = std::collections::BTreeSet::from([
+        let mut expected = std::collections::BTreeSet::from([
             "agent_installation_inspect",
             "agent_installation_list",
             "daemon_status",
@@ -584,14 +584,14 @@ mod tests {
             "subagent_transcript",
             "terminal_ingress_status",
             "list_packages",
-            "get_connector_state",
-            "get_org_sync_status",
             "list_failed_tool_calls",
             "get_session_compactions",
             "get_assistant",
             "diagnose_media_reservation",
             "get_doctor_snapshot",
         ]);
+        #[cfg(feature = "remote")]
+        expected.extend(["get_connector_state", "get_org_sync_status"]);
         let actual: std::collections::BTreeSet<_> = rows
             .iter()
             .filter_map(|(kind, ordering)| {

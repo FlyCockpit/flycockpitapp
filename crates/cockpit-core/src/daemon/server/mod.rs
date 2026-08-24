@@ -267,6 +267,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         | proto::Response::FsWrite { hash: _ }
         | proto::Response::ExtendedConfigSaved { .. }
+        | proto::Response::ExtendedConfigWritten { .. }
         | proto::Response::SetupWizardApplied { .. }
         | proto::Response::UsageCounts {
             models: _,

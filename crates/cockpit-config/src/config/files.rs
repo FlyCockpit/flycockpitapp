@@ -740,6 +740,284 @@ pub(crate) fn read_leaf_from_directory_handle(
     }
 }
 
+pub(crate) fn snapshot_markdown_tree_nofollow(
+    root: &Path,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<(PathBuf, String)>> {
+    let root_handle = open_directory_handle_nofollow(root)?;
+    let mut output = Vec::new();
+    let mut total = 0usize;
+    snapshot_markdown_directory(
+        &root_handle,
+        Path::new(""),
+        &mut output,
+        &mut total,
+        max_files,
+        max_file_bytes,
+        max_total_bytes,
+    )?;
+    output.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(output)
+}
+
+fn accept_markdown_document(
+    relative: PathBuf,
+    mut file: std::fs::File,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::io::{Read as _, Seek as _};
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > max_file_bytes as u64 || output.len() >= max_files {
+        anyhow::bail!("knowledge document exceeds the retained snapshot bounds");
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(max_file_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    file.rewind()?;
+    let mut verification = Vec::with_capacity(bytes.len());
+    (&mut file)
+        .take(max_file_bytes as u64 + 1)
+        .read_to_end(&mut verification)?;
+    let after = file.metadata()?;
+    if bytes.len() > max_file_bytes
+        || bytes != verification
+        || before.len() != after.len()
+        || before.modified()? != after.modified()?
+    {
+        anyhow::bail!("knowledge document changed during retained snapshot");
+    }
+    *total = total
+        .checked_add(bytes.len())
+        .filter(|total| *total <= max_total_bytes)
+        .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its aggregate byte limit"))?;
+    output.push((
+        relative,
+        String::from_utf8(bytes).context("knowledge document is not valid UTF-8")?,
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn snapshot_markdown_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicating knowledge directory");
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error()).context("enumerating knowledge directory");
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            #[cfg(target_os = "macos")]
+            let errno_code = unsafe { *libc::__error() };
+            #[cfg(not(target_os = "macos"))]
+            let errno_code = unsafe { *libc::__errno_location() };
+            unsafe { libc::closedir(stream) };
+            if errno_code != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno_code))
+                    .context("reading retained knowledge directory");
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." || name.starts_with(b".") {
+            continue;
+        }
+        names.push(OsStr::from_bytes(name).to_os_string());
+    }
+    names.sort();
+    for name in names {
+        let component = path_component_cstring(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening retained knowledge descendant {name:?}"));
+        }
+        let child = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = child.metadata()?;
+        let child_relative = relative.join(&name);
+        if metadata.is_dir() {
+            snapshot_markdown_directory(
+                &child,
+                &child_relative,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
+            accept_markdown_document(
+                child_relative,
+                child,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.file_type().is_symlink() {
+            anyhow::bail!("knowledge snapshot refused a symbolic link");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn snapshot_markdown_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_TRAVERSE, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        GetFileInformationByHandleEx, SYNCHRONIZE,
+    };
+
+    let mut names = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let class = if restart {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                class,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        restart = false;
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(error).context("enumerating retained Windows knowledge directory");
+        }
+        let mut offset = 0usize;
+        loop {
+            let info = unsafe { &*(buffer.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>()) };
+            let length = info.FileNameLength as usize / 2;
+            let name = std::ffi::OsString::from_wide(unsafe {
+                std::slice::from_raw_parts(info.FileName.as_ptr(), length)
+            });
+            if name != "." && name != ".." && !name.to_string_lossy().starts_with('.') {
+                names.push((name, info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0));
+            }
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(info.NextEntryOffset as usize)
+                .filter(|offset| *offset < buffer.len())
+                .ok_or_else(|| anyhow::anyhow!("invalid Windows directory enumeration offset"))?;
+        }
+    }
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, directory_hint) in names {
+        let child_relative = relative.join(&name);
+        let child = open_windows_relative_nofollow(
+            directory,
+            &name,
+            false,
+            if directory_hint {
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            } else {
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            },
+            FILE_OPEN,
+        )?;
+        reject_windows_reparse_handle(&child, &child_relative)?;
+        let metadata = child.metadata()?;
+        if metadata.is_dir() {
+            snapshot_markdown_directory(
+                &child,
+                &child_relative,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
+            accept_markdown_document(
+                child_relative,
+                child,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn snapshot_markdown_directory(
+    _: &std::fs::File,
+    _: &Path,
+    _: &mut Vec<(PathBuf, String)>,
+    _: &mut usize,
+    _: usize,
+    _: usize,
+    _: usize,
+) -> Result<()> {
+    anyhow::bail!("retained knowledge snapshots are unsupported on this platform")
+}
+
 #[cfg(windows)]
 fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;

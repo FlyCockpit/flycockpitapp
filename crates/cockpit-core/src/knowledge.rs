@@ -1,9 +1,10 @@
-//! OKF v0.1 knowledge bundles and disposable per-bundle retrieval indexes.
+//! OKF v0.1 knowledge bundles and disposable retrieval indexes.
 //!
 //! Cockpit treats the markdown bundle as the source of truth. The SQLite file
-//! inside each bundle is a derived cache: delete it and it rebuilds from the
-//! markdown. The cache is intentionally per-bundle so embeddings and vector
-//! tables never enter the main `cockpit.db`.
+//! is a derived cache: delete it and it rebuilds from markdown. Assistant
+//! bundles are securely snapshotted as read-only input and indexed in the
+//! daemon's private state; project bundles retain their existing colocated
+//! disposable cache. Embeddings and vector tables never enter `cockpit.db`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
@@ -33,6 +34,9 @@ const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const MAX_KNOWLEDGE_FILES: usize = 4096;
+const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -97,10 +101,10 @@ pub(crate) struct IndexStats {
 pub(crate) struct AttachedBundle {
     pub scope: BundleScope,
     pub root: PathBuf,
-    /// Retains the exact assistant knowledge directory inode for every path
-    /// operation performed through the descriptor spelling in `root`.
-    #[cfg(unix)]
-    _assistant_authority: Option<Arc<std::fs::File>>,
+    /// Assistant bundles are immutable, identity-bound in-memory snapshots.
+    /// Project bundles remain path-based under explicit workspace trust.
+    snapshot: Option<KnowledgeBundle>,
+    sidecar_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +158,33 @@ pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     }
 
     concepts.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(KnowledgeBundle {
+        root,
+        index_md,
+        log_md,
+        concepts,
+    })
+}
+
+fn parse_bundle_snapshot(
+    root: PathBuf,
+    documents: Vec<(PathBuf, String)>,
+) -> Result<KnowledgeBundle> {
+    let mut index_md = None;
+    let mut log_md = None;
+    let mut concepts = Vec::new();
+    for (rel, body) in documents {
+        match rel.to_string_lossy().as_ref() {
+            "index.md" => index_md = Some(body),
+            "log.md" => log_md = Some(body),
+            _ => {
+                if let Some(concept) = parse_concept(&root, rel, &body)? {
+                    concepts.push(concept);
+                }
+            }
+        }
+    }
+    concepts.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(KnowledgeBundle {
         root,
         index_md,
@@ -379,11 +410,11 @@ async fn embedding_dimensions_probe(embedder: &dyn Embedder) -> Result<usize> {
     Ok(dimensions)
 }
 
-fn sidecar_vec_table_exists(root: &Path) -> Result<bool> {
-    if !root.join(SIDE_CAR_FILE).exists() {
+fn sidecar_vec_table_exists(sidecar: &Path) -> Result<bool> {
+    if !sidecar.exists() {
         return Ok(false);
     }
-    let conn = open_sidecar_connection(root)?;
+    let conn = open_sidecar_connection(sidecar)?;
     table_exists(&conn, "vec_chunks")
 }
 
@@ -402,7 +433,15 @@ impl KnowledgeIndex {
         fs::create_dir_all(&root)
             .with_context(|| format!("creating knowledge bundle {}", root.display()))?;
         let bundle = parse_bundle(&root)?;
-        let conn = open_sidecar_connection(&root)?;
+        Self::open_snapshot(bundle, root.join(SIDE_CAR_FILE), embedder).await
+    }
+
+    async fn open_snapshot(
+        bundle: KnowledgeBundle,
+        sidecar_path: PathBuf,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<(Self, IndexStats)> {
+        let conn = open_sidecar_connection(&sidecar_path)?;
         ensure_schema(&conn)?;
         let mut plan = plan_reindex(&conn, &bundle)?;
         drop(conn);
@@ -412,7 +451,7 @@ impl KnowledgeIndex {
                 .stored_dimensions
                 .is_some_and(|stored| stored != current_dimensions);
             let dimensions_missing_for_existing_table =
-                plan.stored_dimensions.is_none() && sidecar_vec_table_exists(&root)?;
+                plan.stored_dimensions.is_none() && sidecar_vec_table_exists(&sidecar_path)?;
             if dimensions_changed || dimensions_missing_for_existing_table {
                 plan.concepts = bundle.concepts.clone();
                 plan.stats.reused_files = 0;
@@ -422,7 +461,7 @@ impl KnowledgeIndex {
         }
         let (embedded, embedded_chunks) =
             embed_planned_concepts(&plan.concepts, embedder.as_ref()).await?;
-        let conn = open_sidecar_connection(&root)?;
+        let conn = open_sidecar_connection(&sidecar_path)?;
         ensure_schema(&conn)?;
         if plan.force_clear_before_apply {
             clear_index(&conn)?;
@@ -465,9 +504,9 @@ impl KnowledgeIndex {
     }
 }
 
-fn open_sidecar_connection(root: &Path) -> Result<Connection> {
-    let conn = Connection::open(root.join(SIDE_CAR_FILE))
-        .with_context(|| format!("opening knowledge sidecar in {}", root.display()))?;
+fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
+    let conn = Connection::open(sidecar)
+        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))?;
     load_sqlite_vec_for_sidecar(&conn)?;
     Ok(conn)
 }
@@ -1073,7 +1112,17 @@ async fn search_bundles(
         .context("embedding query returned no vector")?;
     let mut all = Vec::new();
     for bundle in bundles {
-        let (index, _) = KnowledgeIndex::open(&bundle.root, embedder.clone()).await?;
+        let (index, _) = match &bundle.snapshot {
+            Some(snapshot) => {
+                KnowledgeIndex::open_snapshot(
+                    snapshot.clone(),
+                    bundle.sidecar_path.clone(),
+                    embedder.clone(),
+                )
+                .await?
+            }
+            None => KnowledgeIndex::open(&bundle.root, embedder.clone()).await?,
+        };
         all.extend(index.search_with_vector(&query_vector, query, limit)?);
     }
     all.sort_by(|a, b| {
@@ -1114,14 +1163,21 @@ pub(crate) async fn attached_bundles(
             // `snapshot` validates the persisted row's canonical home and
             // definition identity through the unified assistant coordinator.
             let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
-            if let Some((root, authority)) = retained_assistant_knowledge_root(&root)? {
-                #[cfg(not(unix))]
-                let _ = authority;
+            if let Some(bundle_snapshot) = assistant_knowledge_snapshot(&snapshot.row, &root)? {
+                let config: crate::assistants::AssistantConfig =
+                    serde_json::from_str(&snapshot.row.config_json)
+                        .context("parsing assistant identity for knowledge cache")?;
+                if config.installation_id.is_nil() {
+                    bail!("assistant knowledge has no installation identity");
+                }
+                let cache_root =
+                    crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
+                crate::private_fs::ensure_private_dir(&cache_root)?;
                 bundles.push(AttachedBundle {
                     scope: BundleScope::Assistant,
                     root,
-                    #[cfg(unix)]
-                    _assistant_authority: Some(authority),
+                    snapshot: Some(bundle_snapshot),
+                    sidecar_path: cache_root.join(format!("{}.sqlite", config.installation_id)),
                 });
             }
         }
@@ -1131,58 +1187,48 @@ pub(crate) async fn attached_bundles(
     if extended.project_knowledge && project_bundle_trusted() && project_root.exists() {
         bundles.push(AttachedBundle {
             scope: BundleScope::Project,
+            sidecar_path: project_root.join(SIDE_CAR_FILE),
             root: project_root,
-            #[cfg(unix)]
-            _assistant_authority: None,
+            snapshot: None,
         });
     }
     Ok(bundles)
 }
 
-#[cfg(unix)]
-fn retained_assistant_knowledge_root(
+fn assistant_knowledge_snapshot(
+    row: &crate::db::assistants::AssistantRow,
     diagnostic_root: &Path,
-) -> Result<Option<(PathBuf, Arc<std::fs::File>)>> {
-    use std::os::fd::AsRawFd as _;
-
-    match std::fs::symlink_metadata(diagnostic_root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            bail!(
-                "assistant knowledge root is not a retained no-follow directory: {}",
-                diagnostic_root.display()
-            );
+) -> Result<Option<KnowledgeBundle>> {
+    let handle = match cockpit_config::config::open_config_directory_nofollow(diagnostic_root) {
+        Ok(handle) => handle,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
         }
-        Ok(_) => {}
-    }
-    let authority = Arc::new(
-        crate::private_fs::open_private_dir_handle(diagnostic_root).with_context(|| {
-            format!(
-                "opening assistant knowledge root {}",
-                diagnostic_root.display()
-            )
-        })?,
-    );
-    #[cfg(target_os = "linux")]
-    let root = PathBuf::from(format!("/proc/self/fd/{}", authority.as_raw_fd()));
-    #[cfg(not(target_os = "linux"))]
-    let root = PathBuf::from(format!("/dev/fd/{}", authority.as_raw_fd()));
-    // The descriptor spelling, not the diagnostic pathname, is passed into
-    // bundle parsing and SQLite. Keeping `authority` alive closes the
-    // substitution window for every descendant open.
-    Ok(Some((root, authority)))
-}
-
-#[cfg(not(unix))]
-fn retained_assistant_knowledge_root(diagnostic_root: &Path) -> Result<Option<(PathBuf, ())>> {
-    match std::fs::symlink_metadata(diagnostic_root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-        Ok(_) => bail!(
-            "assistant knowledge is unavailable on this platform until directory-handle-relative indexing is available"
-        ),
-    }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "opening assistant knowledge root {}",
+                    diagnostic_root.display()
+                )
+            });
+        }
+    };
+    drop(handle);
+    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        diagnostic_root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )?;
+    parse_bundle_snapshot(
+        PathBuf::from(format!("assistant://{}/knowledge", row.name)),
+        documents,
+    )
+    .map(Some)
 }
 
 fn project_bundle_trusted() -> bool {

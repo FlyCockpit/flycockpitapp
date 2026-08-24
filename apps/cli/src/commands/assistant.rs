@@ -336,22 +336,27 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
             return Ok(());
         }
     }
+    let expected_revision = assistant.registration_revision.clone();
+    if expected_revision.is_empty() {
+        bail!("assistant registration has no deletion revision");
+    }
     let response = daemon
         .client
-        .request(delete_assistant_request(
-            &args.name,
-            (!assistant.registration_revision.is_empty())
-                .then_some(assistant.registration_revision.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("assistant registration has no deletion revision")
-                })?,
-        ))
+        .request(delete_assistant_request(&args.name, &expected_revision))
         .await
         .context("requesting assistant delete from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
-    let Response::AssistantDeleted { .. } = response else {
+    let Response::AssistantDeleted {
+        name,
+        consumed_registration_revision,
+        deleted: true,
+    } = response
+    else {
         bail!("daemon returned unexpected response to assistant delete: {response:?}");
     };
+    if name != args.name || consumed_registration_revision != expected_revision {
+        bail!("daemon returned an incoherent assistant deletion receipt");
+    }
     println!(
         "deleted assistant `{}`; home directory left intact: {}",
         args.name, assistant.home_dir

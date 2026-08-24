@@ -44,6 +44,17 @@ pub struct ExtendedConfigPatch {
     pub materialize: bool,
     #[serde(default)]
     pub denylist: Vec<DenylistMutation>,
+    /// Explicit authorization to replace/remove one redacted occurrence.
+    /// Merely selecting its top-level field never grants this authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_mutations: Vec<RedactedOccurrenceMutation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RedactedOccurrenceMutation {
+    Set { pointer: String, value: String },
+    Unset { pointer: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

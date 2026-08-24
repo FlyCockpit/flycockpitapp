@@ -449,36 +449,23 @@ pub fn markdown_content_hash(markdown: &str) -> String {
 }
 
 pub fn definition_revision(row: &AssistantRow, markdown: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-assistant-definition-revision-v2\0");
-    for value in [
+    cockpit_proto::calculate_assistant_definition_revision(
         &row.name,
         &row.home_dir,
         &row.config_json,
         &row.content_hash,
-    ] {
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
-    }
-    digest.update((markdown.len() as u64).to_le_bytes());
-    digest.update(markdown.as_bytes());
-    format!("{:x}", digest.finalize())
+        markdown,
+    )
 }
 
 pub fn registration_revision(row: &AssistantRow) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-assistant-registration-revision-v1\0");
-    digest.update(row.created_at.to_le_bytes());
-    for value in [
+    cockpit_proto::calculate_assistant_registration_revision(
+        row.created_at,
         &row.name,
         &row.home_dir,
         &row.config_json,
         &row.content_hash,
-    ] {
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
-    }
-    format!("{:x}", digest.finalize())
+    )
 }
 
 pub fn validate_definition_identity(row: &AssistantRow, definition: &AgentDef) -> Result<()> {
@@ -679,6 +666,7 @@ async fn recover_definition_journal(db: &Db, row: &AssistantRow) -> Result<()> {
 }
 
 pub async fn recover_definition_journals(db: &Db) -> Result<()> {
+    recover_unregister_journals(db).await?;
     let assistants_root = crate::config::resolve::cockpit_data_dir()?.join("assistants");
     match std::fs::read_dir(&assistants_root) {
         Ok(entries) => {
@@ -712,6 +700,7 @@ pub async fn recover_definition_journals(db: &Db) -> Result<()> {
 pub async fn snapshots(db: &Db) -> Result<Vec<AssistantSnapshot>> {
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
+        recover_unregister_journals_sync(&db)?;
         let rows = db.write_blocking(crate::db::Db::list_assistants_conn)?;
         let mut names = std::collections::HashSet::new();
         let mut snapshots = Vec::with_capacity(rows.len());
@@ -733,6 +722,7 @@ pub async fn snapshot(db: &Db, name: &str) -> Result<Option<AssistantSnapshot>> 
     let db = db.clone();
     let name = name.to_string();
     tokio::task::spawn_blocking(move || {
+        recover_unregister_journals_sync(&db)?;
         let Some(row) = get_assistant_blocking(&db, &name)? else {
             return Ok(None);
         };
@@ -914,6 +904,7 @@ pub async fn delete_registration(db: &Db, name: &str, expected_revision: &str) -
 }
 
 fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Result<bool> {
+    recover_unregister_journals_sync(db)?;
     validate_assistant_name(name)?;
     let Some(row) = get_assistant_blocking(db, name)? else {
         return Ok(false);
@@ -931,76 +922,269 @@ fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Res
     // or conflicting recovery inputs are moved out of the active namespace
     // under the same lock, retained for forensics, and restored if the row CAS
     // fails. They are never interpreted merely to authorize deletion.
-    let quarantine = quarantine_unregister_journals(&guard, &home)?;
-    let delete_result = db.write_blocking(move |conn| {
-        let changed = conn.execute(
-            "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
-            rusqlite::params![row.name, row.created_at, row.home_dir, row.config_json, row.content_hash],
-        )?;
-        Ok(changed == 1)
-    });
-    match delete_result {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            restore_unregister_journals(&guard, &home, &quarantine)?;
-            Ok(false)
-        }
-        Err(error) => {
-            restore_unregister_journals(&guard, &home, &quarantine)?;
-            Err(error)
-        }
+    let operation_id = Uuid::new_v4().to_string();
+    let mut journal = build_unregister_journal(&row, &home, operation_id)?;
+    persist_unregister_journal(&journal)?;
+    quarantine_unregister_journals(&guard, &home, &journal)?;
+    journal.phase = UnregisterPhase::Quarantined;
+    persist_unregister_journal(&journal)?;
+    let deleted = delete_registered_row_cas(db, &journal)?;
+    if !deleted {
+        restore_unregister_journals(&guard, &home, &journal)?;
+        remove_unregister_journal(&journal)?;
+        return Ok(false);
     }
+    journal.phase = UnregisterPhase::RegistryDeleted;
+    persist_unregister_journal(&journal)?;
+    remove_unregister_journal(&journal)?;
+    Ok(true)
 }
 
-#[derive(Clone)]
-struct QuarantinedJournal {
-    active: PathBuf,
-    retained: PathBuf,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UnregisterPhase {
+    Prepared,
+    Quarantined,
+    RegistryDeleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnregisterArtifact {
+    active_name: String,
+    retained_name: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnregisterJournal {
+    operation_id: String,
+    phase: UnregisterPhase,
+    name: String,
+    created_at: i64,
+    home_dir: String,
+    config_json: String,
+    content_hash: String,
+    registration_revision: String,
+    artifacts: Vec<UnregisterArtifact>,
+}
+
+fn unregister_journal_root() -> Result<PathBuf> {
+    Ok(crate::config::resolve::cockpit_data_dir()?
+        .join("assistants")
+        .join(".unregister-journals"))
+}
+
+fn unregister_journal_path(journal: &UnregisterJournal) -> Result<PathBuf> {
+    Ok(unregister_journal_root()?.join(format!("{}.json", journal.operation_id)))
+}
+
+fn build_unregister_journal(
+    row: &AssistantRow,
+    home: &Path,
+    operation_id: String,
+) -> Result<UnregisterJournal> {
+    let mut artifacts = Vec::new();
+    for (active_name, retained_name) in [
+        (".assistant-creation.journal.json", "creation.journal.json"),
+        (
+            ".assistant-definition-save.journal.json",
+            "definition-save.journal.json",
+        ),
+    ] {
+        if let Some(bytes) =
+            cockpit_config::config::read_config_file_nofollow(&home.join(active_name))?
+        {
+            artifacts.push(UnregisterArtifact {
+                active_name: active_name.into(),
+                retained_name: retained_name.into(),
+                sha256: sha256_hex(&bytes),
+            });
+        }
+    }
+    Ok(UnregisterJournal {
+        operation_id,
+        phase: UnregisterPhase::Prepared,
+        name: row.name.clone(),
+        created_at: row.created_at,
+        home_dir: row.home_dir.clone(),
+        config_json: row.config_json.clone(),
+        content_hash: row.content_hash.clone(),
+        registration_revision: registration_revision(row),
+        artifacts,
+    })
+}
+
+fn persist_unregister_journal(journal: &UnregisterJournal) -> Result<()> {
+    let root = unregister_journal_root()?;
+    crate::private_fs::ensure_private_dir(&root)?;
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    cockpit_config::config::write_config_bytes_atomic(&unregister_journal_path(journal)?, &bytes)?;
+    cockpit_config::config::sync_directory_nofollow(&root)
+}
+
+fn remove_unregister_journal(journal: &UnregisterJournal) -> Result<()> {
+    cockpit_config::config::remove_config_file_atomic(&unregister_journal_path(journal)?)?;
+    cockpit_config::config::sync_directory_nofollow(&unregister_journal_root()?)
+}
+
+fn quarantine_operation_dir(home: &Path, journal: &UnregisterJournal) -> PathBuf {
+    home.join(".assistant-unregister-quarantine")
+        .join(&journal.operation_id)
 }
 
 fn quarantine_unregister_journals(
     guard: &cockpit_config::config::HeldConfigMutationLock,
     home: &Path,
-) -> Result<Vec<QuarantinedJournal>> {
+    journal: &UnregisterJournal,
+) -> Result<()> {
     let root = home.join(".assistant-unregister-quarantine");
     crate::private_fs::ensure_private_dir(&root)?;
-    let operation = root.join(Uuid::new_v4().to_string());
+    let operation = quarantine_operation_dir(home, journal);
     crate::private_fs::ensure_private_dir(&operation)?;
     cockpit_config::config::sync_directory_nofollow(&root)?;
     cockpit_config::config::sync_directory_nofollow(&operation)?;
-    let mut quarantined = Vec::new();
-    for (active, retained_name) in [
-        (creation_journal_path(home), "creation.journal.json"),
-        (
-            definition_journal_path(home),
-            "definition-save.journal.json",
-        ),
-    ] {
-        if cockpit_config::config::read_config_file_nofollow(&active)?.is_none() {
-            continue;
+    for artifact in &journal.artifacts {
+        let active = home.join(&artifact.active_name);
+        let retained = operation.join(&artifact.retained_name);
+        match (
+            cockpit_config::config::read_config_file_nofollow(&active)?,
+            cockpit_config::config::read_config_file_nofollow(&retained)?,
+        ) {
+            (Some(bytes), None) if sha256_hex(&bytes) == artifact.sha256 => {
+                cockpit_config::config::rename_config_file_nofollow(guard, &active, &retained)?;
+            }
+            (None, Some(bytes)) if sha256_hex(&bytes) == artifact.sha256 => {}
+            _ => bail!("assistant unregister quarantine artifact identity is ambiguous"),
         }
-        let retained = operation.join(retained_name);
-        cockpit_config::config::rename_config_file_nofollow(guard, &active, &retained)?;
-        quarantined.push(QuarantinedJournal { active, retained });
     }
     cockpit_config::config::sync_directory_nofollow(&operation)?;
     cockpit_config::config::sync_directory_nofollow(home)?;
-    Ok(quarantined)
+    Ok(())
 }
 
 fn restore_unregister_journals(
     guard: &cockpit_config::config::HeldConfigMutationLock,
     home: &Path,
-    quarantined: &[QuarantinedJournal],
+    journal: &UnregisterJournal,
 ) -> Result<()> {
-    for journal in quarantined.iter().rev() {
-        cockpit_config::config::rename_config_file_nofollow(
-            guard,
-            &journal.retained,
-            &journal.active,
-        )?;
+    let operation = quarantine_operation_dir(home, journal);
+    for artifact in journal.artifacts.iter().rev() {
+        let active = home.join(&artifact.active_name);
+        let retained = operation.join(&artifact.retained_name);
+        match (
+            cockpit_config::config::read_config_file_nofollow(&active)?,
+            cockpit_config::config::read_config_file_nofollow(&retained)?,
+        ) {
+            (None, Some(bytes)) if sha256_hex(&bytes) == artifact.sha256 => {
+                cockpit_config::config::rename_config_file_nofollow(guard, &retained, &active)?;
+            }
+            (Some(bytes), None) if sha256_hex(&bytes) == artifact.sha256 => {}
+            _ => bail!("assistant unregister rollback artifact identity is ambiguous"),
+        }
     }
     cockpit_config::config::sync_directory_nofollow(home)?;
+    Ok(())
+}
+
+fn delete_registered_row_cas(db: &Db, journal: &UnregisterJournal) -> Result<bool> {
+    let journal = journal.clone();
+    db.write_blocking(move |conn| {
+        let changed = conn.execute(
+            "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
+            rusqlite::params![journal.name, journal.created_at, journal.home_dir, journal.config_json, journal.content_hash],
+        )?;
+        Ok(changed == 1)
+    })
+}
+
+pub async fn recover_unregister_journals(db: &Db) -> Result<()> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || recover_unregister_journals_sync(&db))
+        .await
+        .context("assistant unregister recovery coordinator joined")?
+}
+
+fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
+    let root = unregister_journal_root()?;
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() || !entry.file_type()?.is_file() {
+            bail!("assistant unregister journal namespace contains a non-file entry");
+        }
+        let raw = cockpit_config::config::read_config_file_nofollow(&entry.path())?
+            .context("assistant unregister journal disappeared")?;
+        let mut journal: UnregisterJournal =
+            serde_json::from_slice(&raw).context("parsing assistant unregister journal")?;
+        let operation_id = Uuid::parse_str(&journal.operation_id)
+            .context("assistant unregister journal operation ID is invalid")?;
+        if operation_id.to_string() != journal.operation_id
+            || entry.file_name() != format!("{}.json", journal.operation_id)
+        {
+            bail!("assistant unregister journal filename does not match its identity");
+        }
+        validate_assistant_name(&journal.name)?;
+        let expected_home = default_home_dir(&journal.name)?;
+        if Path::new(&journal.home_dir) != expected_home
+            || journal.registration_revision
+                != cockpit_proto::calculate_assistant_registration_revision(
+                    journal.created_at,
+                    &journal.name,
+                    &journal.home_dir,
+                    &journal.config_json,
+                    &journal.content_hash,
+                )
+        {
+            bail!("assistant unregister journal identity is invalid");
+        }
+        let target = assistant_definition_path(&expected_home);
+        let guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+        let current = get_assistant_blocking(db, &journal.name)?;
+        match (&journal.phase, current) {
+            (UnregisterPhase::Prepared, Some(row))
+                if registration_revision(&row) == journal.registration_revision =>
+            {
+                quarantine_unregister_journals(&guard, &expected_home, &journal)?;
+                journal.phase = UnregisterPhase::Quarantined;
+                persist_unregister_journal(&journal)?;
+                if !delete_registered_row_cas(db, &journal)? {
+                    bail!("assistant unregister registry CAS failed during recovery");
+                }
+                journal.phase = UnregisterPhase::RegistryDeleted;
+                persist_unregister_journal(&journal)?;
+                remove_unregister_journal(&journal)?;
+            }
+            (UnregisterPhase::Prepared, None)
+            | (UnregisterPhase::Quarantined, None)
+            | (UnregisterPhase::RegistryDeleted, None) => {
+                journal.phase = UnregisterPhase::RegistryDeleted;
+                persist_unregister_journal(&journal)?;
+                remove_unregister_journal(&journal)?;
+            }
+            (UnregisterPhase::Quarantined, Some(row))
+                if registration_revision(&row) == journal.registration_revision =>
+            {
+                quarantine_unregister_journals(&guard, &expected_home, &journal)?;
+                if !delete_registered_row_cas(db, &journal)? {
+                    bail!("assistant unregister registry CAS failed during recovery");
+                }
+                journal.phase = UnregisterPhase::RegistryDeleted;
+                persist_unregister_journal(&journal)?;
+                remove_unregister_journal(&journal)?;
+            }
+            (UnregisterPhase::Prepared | UnregisterPhase::Quarantined, Some(_)) => {
+                restore_unregister_journals(&guard, &expected_home, &journal)?;
+                remove_unregister_journal(&journal)?;
+            }
+            (UnregisterPhase::RegistryDeleted, Some(_)) => {
+                bail!("assistant unregister journal conflicts with a recreated registration")
+            }
+        }
+    }
     Ok(())
 }
 

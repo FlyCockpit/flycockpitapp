@@ -40,11 +40,13 @@ pub use agent_installation::{
 };
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES,
+    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES, agent_definition_revision,
+    agent_inventory_revision, agent_source_identity, validate_agent_edit_snapshot,
+    validate_agent_source_identity,
 };
 pub use config_management::{
     CockpitConfigLayer, DenylistMutation, ExtendedConfigField, ExtendedConfigLayerSnapshot,
-    ExtendedConfigPatch, RedactedDenylistEntry,
+    ExtendedConfigPatch, RedactedDenylistEntry, RedactedOccurrenceMutation,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
@@ -1015,15 +1017,15 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version.
 ///
-/// Current wire schema version. v13 adds daemon-owned revisioned settings,
+/// Current wire schema version. v14 adds exact identity-bearing settings,
 /// workspace-agent, and assistant-definition authority RPCs.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 13.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
+pub const PROTOCOL_VERSION: u32 = 14;
 
-/// Oldest wire schema version this binary accepts. v13 is current-only: the
+/// Oldest wire schema version this binary accepts. v14 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 13;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 14;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2197,7 +2199,6 @@ pub struct AssistantSummary {
     /// Opaque CAS token for the registry binding itself. Unlike the editable
     /// definition revision this remains available when definition bytes are
     /// missing or corrupt, so the user can still unregister a damaged row.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub registration_revision: String,
     /// Daemon-read exact authored definition; absent when the registered file
     /// cannot be safely opened or parsed.
@@ -2216,6 +2217,9 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
     if summary.name.is_empty() || summary.registration_revision.is_empty() {
         return Err("assistant summary has no name or registration revision");
     }
+    if summary.registration_revision != assistant_registration_revision(summary) {
+        return Err("assistant registration revision is invalid");
+    }
     match (
         summary.definition_markdown.as_deref(),
         summary.definition_revision.as_deref(),
@@ -2226,11 +2230,73 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
             if hash != summary.content_hash {
                 return Err("assistant definition does not match its content hash");
             }
+            if revision != &assistant_definition_revision(summary, markdown) {
+                return Err("assistant definition revision is invalid");
+            }
         }
         (None, None, Some(diagnostic)) if !diagnostic.trim().is_empty() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
     }
     Ok(())
+}
+
+fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {
+    use sha2::Digest as _;
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value.as_bytes());
+}
+
+pub fn assistant_registration_revision(summary: &AssistantSummary) -> String {
+    calculate_assistant_registration_revision(
+        summary.created_at,
+        &summary.name,
+        &summary.home_dir,
+        &summary.config_json,
+        &summary.content_hash,
+    )
+}
+
+pub fn calculate_assistant_registration_revision(
+    created_at: i64,
+    name: &str,
+    home_dir: &str,
+    config_json: &str,
+    content_hash: &str,
+) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"cockpit-assistant-registration-revision-v1\0");
+    digest.update(created_at.to_le_bytes());
+    for value in [name, home_dir, config_json, content_hash] {
+        assistant_revision_field(&mut digest, value);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+pub fn assistant_definition_revision(summary: &AssistantSummary, markdown: &str) -> String {
+    calculate_assistant_definition_revision(
+        &summary.name,
+        &summary.home_dir,
+        &summary.config_json,
+        &summary.content_hash,
+        markdown,
+    )
+}
+
+pub fn calculate_assistant_definition_revision(
+    name: &str,
+    home_dir: &str,
+    config_json: &str,
+    content_hash: &str,
+    markdown: &str,
+) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"cockpit-assistant-definition-revision-v2\0");
+    for value in [name, home_dir, config_json, content_hash, markdown] {
+        assistant_revision_field(&mut digest, value);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3394,8 +3460,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[13];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[14];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -6516,7 +6582,11 @@ mod tests {
                 session_ids_json: "[]".into(),
             },
             Response::Assistant { assistant: None },
-            Response::AssistantDeleted { deleted: true },
+            Response::AssistantDeleted {
+                name: "helper".into(),
+                consumed_registration_revision: "revision".into(),
+                deleted: true,
+            },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
             },
@@ -6759,7 +6829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v13_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v14_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6810,13 +6880,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 13);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
         let fixture = proto_fixture_tests::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v13 config_refreshed fixture")
+                .expect("current v14 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6831,20 +6901,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 13);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
         let fixture = proto_fixture_tests::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v13 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v14 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v13 {response_name} must freeze the inclusive verification cap"
+                "current v14 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v13 {response_name} must deserialize: {error}")
+                panic!("current v14 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -6853,29 +6923,27 @@ mod tests {
     fn assistant_registration_revision_is_present_in_current_response_fixtures() {
         let fixture = proto_fixture_tests::read_fixture("response.json");
         for response_name in ["assistant_upserted", "assistant_definition_saved"] {
-            let revision = fixture[response_name]["data"]["assistant"]["registration_revision"]
-                .as_str()
-                .unwrap_or_default();
-            assert!(
-                !revision.is_empty(),
-                "current v13 {response_name} must carry a registry CAS token"
-            );
+            let summary: AssistantSummary =
+                serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
+                    .unwrap();
+            validate_assistant_summary(&summary).unwrap_or_else(|error| {
+                panic!("current v14 {response_name} assistant identity is invalid: {error}")
+            });
         }
-        let revision = fixture["assistants"]["data"]["assistants"][0]["registration_revision"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            !revision.is_empty(),
-            "current v13 assistant inventory must carry registry CAS tokens"
-        );
+        let summary: AssistantSummary =
+            serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
+        validate_assistant_summary(&summary)
+            .expect("current v14 assistant inventory must carry exact revisions");
     }
 
     #[test]
-    fn archived_v12_fixture_is_retained_but_not_in_the_live_compatibility_window() {
-        assert!(!is_protocol_compatible(12));
-        let archived = proto_fixture_tests::read_fixture_for(12, "response.json");
-        assert!(archived.contains_key("config_refreshed"));
-        assert!(archived.contains_key("goal_status"));
-        assert!(archived.contains_key("goal_updated"));
+    fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
+        for version in [12, 13] {
+            assert!(!is_protocol_compatible(version));
+            let archived = proto_fixture_tests::read_fixture_for(version, "response.json");
+            assert!(archived.contains_key("config_refreshed"));
+            assert!(archived.contains_key("goal_status"));
+            assert!(archived.contains_key("goal_updated"));
+        }
     }
 }

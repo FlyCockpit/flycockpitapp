@@ -135,6 +135,8 @@ impl GoalSettingsPane {
         let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
             anyhow::bail!("daemon returned an unexpected agent snapshot");
         };
+        super::settings::agents_page::validate_agent_snapshot(&snapshot, cwd, agent_name, None)
+            .map_err(anyhow::Error::msg)?;
         let draft = GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())?;
         let status = (!root_foreground).then(|| {
             "Apply is disabled while an interactive subagent holds the foreground.".to_string()
@@ -325,31 +327,40 @@ impl GoalSettingsPane {
                     "agent-scoped goal settings are unavailable for vNext agents; save them for this session instead"
                 );
             }
+            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
+                name: self.agent_name.clone(),
+                patch: cockpit_core::daemon::proto::GoalSupervisionPatch {
+                    cold_skeptic_count: Some(self.draft.cold_skeptic_count),
+                    cold_skeptic_model: Some(
+                        self.draft
+                            .cold_skeptic_model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    ),
+                    max_verification_attempts: Some(self.draft.max_verification_attempts),
+                },
+            };
+            let expected_revision = self.revision.clone();
             let response = crate::tui::agent_runner::daemon_request_blocking(
                 cockpit_core::daemon::proto::Request::MutateAgent {
                     project_root: self.cwd.to_string_lossy().into_owned(),
-                    mutation: cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
-                        name: self.agent_name.clone(),
-                        patch: cockpit_core::daemon::proto::GoalSupervisionPatch {
-                            cold_skeptic_count: Some(self.draft.cold_skeptic_count),
-                            cold_skeptic_model: Some(
-                                self.draft
-                                    .cold_skeptic_model
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|value| !value.is_empty())
-                                    .map(str::to_string),
-                            ),
-                            max_verification_attempts: Some(self.draft.max_verification_attempts),
-                        },
-                    },
-                    expected_revision: Some(self.revision.clone()),
+                    mutation: mutation.clone(),
+                    expected_revision: Some(expected_revision.clone()),
                 },
             )
             .map_err(anyhow::Error::msg)?;
             let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
                 anyhow::bail!("daemon returned an unexpected goal-settings response");
             };
+            super::settings::agents_page::validate_agent_mutation_result(
+                &result,
+                &self.cwd,
+                &mutation,
+                Some(&expected_revision),
+            )
+            .map_err(anyhow::Error::msg)?;
             if let Some(snapshot) = result.snapshot {
                 self.revision = snapshot.revision;
             }

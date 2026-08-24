@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -195,6 +194,7 @@ pub async fn complete_editor_lease(
             affected: 0,
             snapshot: None,
             config_generation: crate::daemon::server::inventory::current_config_generation(),
+            inventory_revision: None,
         }),
     };
     let Response::AgentMutated(result) = result else {
@@ -235,14 +235,50 @@ fn inventory_sync(
     guard: &cockpit_config::config::HeldConfigMutationLock,
 ) -> Result<Response, ErrorPayload> {
     recover_reset_all_locked(root, guard)?;
-    let entries = crate::agents::list_all(root)
+    let entries = inventory_entries(root)?;
+    let inventory_revision = cockpit_proto::agent_inventory_revision(&entries);
+    Ok(Response::AgentInventory {
+        entries,
+        inventory_revision,
+        config_generation: crate::daemon::server::inventory::current_config_generation(),
+    })
+}
+
+fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPayload> {
+    crate::agents::list_all(root)
         .into_iter()
         .map(|entry| {
+            let source = source_snapshot_parts(root, &entry.name).or_else(|error| {
+                let Some(path) = crate::agents::find_override(root, &entry.name) else {
+                    return Err(error);
+                };
+                let metadata = std::fs::symlink_metadata(&path).map_err(internal)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(error);
+                }
+                let target = project_agent_path(root, &entry.name)?;
+                let layer = classify_source_layer(root, &path, &target);
+                Ok((
+                    layer,
+                    opaque_source_identity(root, &path, layer),
+                    path.to_string_lossy().into_owned(),
+                    String::new(),
+                    nofollow_read(&target)?.is_some(),
+                ))
+            });
             let (description, model, valid, diagnostic) = match entry.def {
                 Ok(def) => (Some(def.description), def.model, true, None),
                 Err(error) => (None, None, false, Some(format!("{error:#}"))),
             };
-            AgentInventoryEntry {
+            let (source_layer, source_identity, source_locator, markdown, target_exists) = source?;
+            let revision = cockpit_proto::agent_definition_revision(
+                &entry.name,
+                source_layer,
+                &source_identity,
+                &crate::assistants::markdown_content_hash(&markdown),
+                target_exists,
+            );
+            Ok(AgentInventoryEntry {
                 name: entry.name,
                 kind: match entry.kind {
                     crate::agents::AgentKind::Builtin { .. } => AgentEntryKind::Builtin,
@@ -256,15 +292,15 @@ fn inventory_sync(
                 model,
                 valid,
                 diagnostic,
-            }
+                source_layer,
+                source_identity,
+                source_locator,
+                revision,
+                source_content_hash: crate::assistants::markdown_content_hash(&markdown),
+                editable: source_layer == AgentSourceLayer::Workspace && !markdown.is_empty(),
+            })
         })
-        .collect();
-    let inventory_revision = inventory_revision(root)?;
-    Ok(Response::AgentInventory {
-        entries,
-        inventory_revision,
-        config_generation: crate::daemon::server::inventory::current_config_generation(),
-    })
+        .collect()
 }
 
 fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayload> {
@@ -273,36 +309,13 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         .map_err(bad_config)?
         .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
     let canonical_preview = def.to_markdown().map_err(bad_config)?;
-    let project_override = project_agent_path(root, name)?;
-    let target_exists = nofollow_read(&project_override)?.is_some();
-    let (source_layer, source_identity, markdown) = match crate::agents::find_override(root, name) {
-        Some(source) => {
-            if source.is_dir() {
-                return Err(bad_request(
-                    "directory-form agents are read-only in the settings editor",
-                ));
-            }
-            let raw = nofollow_read(&source)?.ok_or_else(|| {
-                conflict("agent source changed while the snapshot was being acquired")
-            })?;
-            let markdown = String::from_utf8(raw)
-                .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
-            let layer = classify_source_layer(root, &source, &project_override);
-            let identity = opaque_source_identity(root, &source, layer);
-            (layer, identity, markdown)
-        }
-        None => (
-            AgentSourceLayer::Embedded,
-            format!("embedded:{name}"),
-            canonical_preview.clone(),
-        ),
-    };
-    let overridden = source_layer != AgentSourceLayer::Embedded;
-    let revision = revision_for(
+    let (source_layer, source_identity, source_locator, markdown, target_exists) =
+        source_snapshot_parts(root, name)?;
+    let revision = cockpit_proto::agent_definition_revision(
         name,
         source_layer,
         &source_identity,
-        &markdown,
+        &crate::assistants::markdown_content_hash(&markdown),
         target_exists,
     );
     let goal_supervision_json = (!def.goal_supervision.is_empty())
@@ -315,17 +328,67 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         } else {
             AgentEntryKind::Custom
         },
-        overridden,
+        overridden: source_layer != AgentSourceLayer::Embedded,
         markdown,
         canonical_preview,
         source_layer,
         source_identity,
+        source_locator,
         edit_target: AgentEditTarget::Workspace,
         revision,
         goal_supervision_json,
         editable: source_layer == AgentSourceLayer::Workspace,
         supports_goal_supervision: def.vnext.is_none(),
     })
+}
+
+fn source_snapshot_parts(
+    root: &Path,
+    name: &str,
+) -> Result<(AgentSourceLayer, String, String, String, bool), ErrorPayload> {
+    let project_override = project_agent_path(root, name)?;
+    let target_exists = nofollow_read(&project_override)?.is_some();
+    match crate::agents::find_override(root, name) {
+        Some(source) => {
+            if std::fs::symlink_metadata(&source)
+                .map_err(internal)?
+                .file_type()
+                .is_dir()
+            {
+                return Err(bad_request(
+                    "directory-form agents are read-only in the settings editor",
+                ));
+            }
+            let raw = nofollow_read(&source)?.ok_or_else(|| {
+                conflict("agent source changed while the snapshot was being acquired")
+            })?;
+            let markdown = String::from_utf8(raw)
+                .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
+            let layer = classify_source_layer(root, &source, &project_override);
+            let identity = opaque_source_identity(root, &source, layer);
+            Ok((
+                layer,
+                identity,
+                source.to_string_lossy().into_owned(),
+                markdown,
+                target_exists,
+            ))
+        }
+        None => {
+            let markdown = crate::agents::resolve(root, name)
+                .map_err(bad_config)?
+                .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?
+                .to_markdown()
+                .map_err(bad_config)?;
+            Ok((
+                AgentSourceLayer::Embedded,
+                format!("embedded:{name}"),
+                format!("embedded:{name}"),
+                markdown,
+                target_exists,
+            ))
+        }
+    }
 }
 
 fn mutate_sync(
@@ -338,6 +401,7 @@ fn mutate_sync(
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
     recover_reset_all_locked(root, &guard)?;
     let generation_before = crate::daemon::server::inventory::current_config_generation();
+    let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
             validate_name(&name)?;
@@ -461,7 +525,7 @@ fn mutate_sync(
             }
         }
         AgentMutation::ResetAllBuiltins => {
-            let current_inventory_revision = inventory_revision(root)?;
+            let current_inventory_revision = current_inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
             let affected = reset_all_builtins_atomic_locked(root, &guard)?;
             (affected != 0, affected, None)
@@ -518,11 +582,15 @@ fn mutate_sync(
     } else {
         generation_before
     };
+    let result_inventory_revision = resets_inventory
+        .then(|| current_inventory_revision(root))
+        .transpose()?;
     Ok(Response::AgentMutated(AgentMutationResult {
         changed,
         affected,
         snapshot,
         config_generation: generation,
+        inventory_revision: result_inventory_revision,
     }))
 }
 
@@ -548,22 +616,6 @@ fn validate_name(name: &str) -> Result<(), ErrorPayload> {
         return Err(bad_request("agent name is invalid"));
     }
     Ok(())
-}
-
-fn revision_for(
-    name: &str,
-    source_layer: AgentSourceLayer,
-    source_identity: &str,
-    markdown: &str,
-    target_exists: bool,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(name.as_bytes());
-    digest.update(format!("{source_layer:?}").as_bytes());
-    digest.update(source_identity.as_bytes());
-    digest.update([u8::from(target_exists)]);
-    digest.update(markdown.as_bytes());
-    format!("{:x}", digest.finalize())
 }
 
 fn nofollow_read(path: &Path) -> Result<Option<Vec<u8>>, ErrorPayload> {
@@ -611,27 +663,17 @@ fn ensure_workspace_source_or_embedded(snapshot: &AgentEditSnapshot) -> Result<(
 }
 
 fn opaque_source_identity(root: &Path, source: &Path, layer: AgentSourceLayer) -> String {
-    let mut digest = Sha256::new();
-    digest.update(root.as_os_str().as_encoded_bytes());
-    digest.update(source.as_os_str().as_encoded_bytes());
-    format!("{layer:?}:{:x}", digest.finalize())
+    cockpit_proto::agent_source_identity(
+        root.to_string_lossy().as_ref(),
+        source.to_string_lossy().as_ref(),
+        layer,
+    )
 }
 
-fn inventory_revision(root: &Path) -> Result<String, ErrorPayload> {
-    let mut digest = Sha256::new();
-    for name in crate::agents::BUILTIN_AGENT_NAMES {
-        digest.update(name.as_bytes());
-        let target = project_agent_path(root, name)?;
-        match nofollow_read(&target)? {
-            Some(bytes) => {
-                digest.update([1]);
-                digest.update((bytes.len() as u64).to_le_bytes());
-                digest.update(bytes);
-            }
-            None => digest.update([0]),
-        }
-    }
-    Ok(format!("{:x}", digest.finalize()))
+fn current_inventory_revision(root: &Path) -> Result<String, ErrorPayload> {
+    Ok(cockpit_proto::agent_inventory_revision(&inventory_entries(
+        root,
+    )?))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

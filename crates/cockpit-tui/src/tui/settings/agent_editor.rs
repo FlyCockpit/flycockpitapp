@@ -24,6 +24,7 @@ pub(super) struct AgentEditor {
     /// files and daemon-local assistant definitions require one to save; the
     /// `assistant_definition` bit selects their distinct typed mutation RPCs.
     pub(super) revision: Option<String>,
+    pub(super) authority_id: super::pointer_actions::AgentId,
     assistant_definition: bool,
     vim_enabled: bool,
     editor: VimEditor,
@@ -54,6 +55,7 @@ impl AgentEditor {
         revision: Option<String>,
     ) -> Self {
         Self {
+            authority_id: super::pointer_actions::AgentId::workspace(&name),
             name,
             path,
             revision,
@@ -72,11 +74,20 @@ impl AgentEditor {
     ) -> Self {
         let mut editor = Self::new(name, path, text, vim_enabled, Some(revision));
         editor.assistant_definition = true;
+        editor.authority_id = super::pointer_actions::AgentId::assistant(&editor.name);
         editor
     }
 
     pub(super) fn is_assistant_definition(&self) -> bool {
         self.assistant_definition
+    }
+
+    pub(super) fn with_authority_id(
+        mut self,
+        authority_id: super::pointer_actions::AgentId,
+    ) -> Self {
+        self.authority_id = authority_id;
+        self
     }
 
     pub(super) fn text(&self) -> &str {

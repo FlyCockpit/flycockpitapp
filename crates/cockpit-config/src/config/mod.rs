@@ -174,6 +174,19 @@ pub fn read_config_leaf_from_retained_directory(
     files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
 }
 
+/// Snapshot every visible Markdown document below an existing directory using
+/// component-relative, no-follow handles. Symlinks/reparse points and identity
+/// ambiguity fail the entire snapshot; callers never mix trusted and untrusted
+/// descendants.
+pub fn snapshot_markdown_tree_nofollow(
+    root: &std::path::Path,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
+    files::snapshot_markdown_tree_nofollow(root, max_files, max_file_bytes, max_total_bytes)
+}
+
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {

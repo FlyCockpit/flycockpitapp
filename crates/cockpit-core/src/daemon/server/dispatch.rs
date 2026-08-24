@@ -4578,7 +4578,11 @@ async fn handle_serialized_request_impl(
             if !deleted {
                 return Err(conflict("assistant changed or no longer exists"));
             }
-            let response = Response::AssistantDeleted { deleted };
+            let response = Response::AssistantDeleted {
+                name,
+                consumed_registration_revision: expected_revision,
+                deleted,
+            };
             finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
         }
 

@@ -30,6 +30,7 @@ struct SettingsCapability {
     owner: String,
     root: PathBuf,
     target: PathBuf,
+    kind: cockpit_proto::CockpitConfigLayer,
     revision: String,
     identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
     denylist_ids: Vec<String>,
@@ -347,6 +348,7 @@ pub async fn get_extended_config_snapshot(
                             owner: owner.clone(),
                             root: root.clone(),
                             target: target.clone(),
+                            kind,
                             revision: revision.clone(),
                             identity,
                             denylist_ids,
@@ -440,7 +442,7 @@ const SETTINGS_REDACTED_OCCURRENCE_PREFIX: &str = "__cockpit_redacted_setting_v1
 fn restore_redacted_occurrences(
     value: &mut serde_json::Value,
     occurrences: &std::collections::HashMap<String, RedactedSettingOccurrence>,
-    selected_fields: &std::collections::HashSet<&str>,
+    authorized_pointers: &std::collections::HashSet<String>,
 ) -> Result<(), ErrorPayload> {
     fn visit(
         value: &mut serde_json::Value,
@@ -482,16 +484,9 @@ fn restore_redacted_occurrences(
     let mut seen = std::collections::HashSet::new();
     visit(value, "", occurrences, &mut seen)?;
     for (token, occurrence) in occurrences {
-        let top_level = occurrence
-            .pointer
-            .strip_prefix('/')
-            .and_then(|pointer| pointer.split('/').next())
-            .unwrap_or("")
-            .replace("~1", "/")
-            .replace("~0", "~");
-        if !seen.contains(token) && !selected_fields.contains(top_level.as_str()) {
+        if !seen.contains(token) && !authorized_pointers.contains(&occurrence.pointer) {
             return Err(bad_request(
-                "redacted settings placeholder was removed outside an explicitly selected field",
+                "redacted settings placeholder was removed without exact pointer authorization",
             ));
         }
     }
@@ -529,7 +524,7 @@ pub async fn apply_extended_config_patch(
             {
                 return Err(conflict("settings snapshot is absent, expired, or stale"));
             }
-            let target = capability.target;
+            let target = capability.target.clone();
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
             let (raw, identity) = read_optional_config(&target)?;
@@ -566,10 +561,18 @@ pub async fn apply_extended_config_patch(
                     ));
                 }
             }
+            let authorized_redacted_pointers = patch
+                .redacted_mutations
+                .iter()
+                .map(|mutation| match mutation {
+                    cockpit_proto::RedactedOccurrenceMutation::Set { pointer, .. }
+                    | cockpit_proto::RedactedOccurrenceMutation::Unset { pointer } => pointer.clone(),
+                })
+                .collect();
             restore_redacted_occurrences(
                 &mut candidate,
                 &capability.redacted_occurrences,
-                &selected_fields,
+                &authorized_redacted_pointers,
             )?;
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
@@ -608,6 +611,11 @@ pub async fn apply_extended_config_patch(
             for field in patch.unset_fields {
                 object.remove(field.json_key());
             }
+            apply_redacted_occurrence_mutations(
+                object,
+                patch.redacted_mutations,
+                &capability.redacted_occurrences,
+            )?;
             apply_denylist_mutations(object, patch.denylist, &capability.denylist_ids)?;
             let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;
             let merged = cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
@@ -637,7 +645,14 @@ pub async fn apply_extended_config_patch(
             settings_capabilities()
                 .lock().map_err(|_| internal("settings capability registry lock poisoned"))?
                 .remove(&id);
-            Ok(Response::ExtendedConfigSaved { hash: desired_hash, config_generation })
+            Ok(Response::ExtendedConfigSaved {
+                hash: desired_hash.clone(),
+                config_generation,
+                layer_id,
+                layer: capability.kind,
+                consumed_revision: expected_revision,
+                result_revision: desired_hash,
+            })
         }),
     )
     .await
@@ -776,6 +791,13 @@ fn merge_changed_known_value(
             serde_json::Value::Object(current),
             serde_json::Value::Object(candidate),
         ) => {
+            // Remove only keys known to the typed schema. Unknown raw keys are
+            // absent from `current` and therefore survive untouched.
+            for key in current.keys() {
+                if !candidate.contains_key(key) {
+                    target.remove(key);
+                }
+            }
             for (key, value) in candidate {
                 if let Some(current) = current.get(&key) {
                     merge_changed_known_value(
@@ -783,6 +805,8 @@ fn merge_changed_known_value(
                         current,
                         value,
                     );
+                } else {
+                    target.insert(key, value);
                 }
             }
         }
@@ -871,6 +895,112 @@ fn apply_denylist_mutations(
     Ok(())
 }
 
+fn apply_redacted_occurrence_mutations(
+    document: &mut serde_json::Map<String, serde_json::Value>,
+    mutations: Vec<cockpit_proto::RedactedOccurrenceMutation>,
+    occurrences: &std::collections::HashMap<String, RedactedSettingOccurrence>,
+) -> Result<(), ErrorPayload> {
+    fn decode(segment: &str) -> String {
+        segment.replace("~1", "/").replace("~0", "~")
+    }
+    fn parent_mut<'a>(
+        root: &'a mut serde_json::Value,
+        pointer: &str,
+    ) -> Result<(&'a mut serde_json::Value, String), ErrorPayload> {
+        let mut segments = pointer
+            .strip_prefix('/')
+            .ok_or_else(|| bad_request("redacted mutation pointer must be absolute"))?
+            .split('/')
+            .map(decode)
+            .collect::<Vec<_>>();
+        let leaf = segments
+            .pop()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| bad_request("redacted mutation pointer has no leaf"))?;
+        let mut current = root;
+        for segment in segments {
+            current = match current {
+                serde_json::Value::Object(object) => object
+                    .get_mut(&segment)
+                    .ok_or_else(|| conflict("redacted mutation parent changed"))?,
+                serde_json::Value::Array(array) => array
+                    .get_mut(
+                        segment
+                            .parse::<usize>()
+                            .map_err(|_| bad_request("redacted array pointer is invalid"))?,
+                    )
+                    .ok_or_else(|| conflict("redacted mutation array parent changed"))?,
+                _ => {
+                    return Err(conflict(
+                        "redacted mutation parent is no longer a container",
+                    ));
+                }
+            };
+        }
+        Ok((current, leaf))
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut root = serde_json::Value::Object(std::mem::take(document));
+    for mutation in mutations {
+        let pointer = match &mutation {
+            cockpit_proto::RedactedOccurrenceMutation::Set { pointer, .. }
+            | cockpit_proto::RedactedOccurrenceMutation::Unset { pointer } => pointer,
+        };
+        if !seen.insert(pointer.clone())
+            || !occurrences.values().any(|entry| entry.pointer == *pointer)
+        {
+            return Err(bad_request(
+                "redacted mutation is not bound to one snapshot occurrence",
+            ));
+        }
+        let (parent, leaf) = parent_mut(&mut root, pointer)?;
+        match (parent, mutation) {
+            (
+                serde_json::Value::Object(object),
+                cockpit_proto::RedactedOccurrenceMutation::Set { value, .. },
+            ) => {
+                object.insert(leaf, serde_json::Value::String(value));
+            }
+            (
+                serde_json::Value::Object(object),
+                cockpit_proto::RedactedOccurrenceMutation::Unset { .. },
+            ) => {
+                if object.remove(&leaf).is_none() {
+                    return Err(conflict("redacted mutation target changed"));
+                }
+            }
+            (
+                serde_json::Value::Array(array),
+                cockpit_proto::RedactedOccurrenceMutation::Set { value, .. },
+            ) => {
+                let index = leaf
+                    .parse::<usize>()
+                    .map_err(|_| bad_request("redacted array pointer is invalid"))?;
+                let slot = array
+                    .get_mut(index)
+                    .ok_or_else(|| conflict("redacted mutation target changed"))?;
+                *slot = serde_json::Value::String(value);
+            }
+            (
+                serde_json::Value::Array(array),
+                cockpit_proto::RedactedOccurrenceMutation::Unset { .. },
+            ) => {
+                let index = leaf
+                    .parse::<usize>()
+                    .map_err(|_| bad_request("redacted array pointer is invalid"))?;
+                if index >= array.len() {
+                    return Err(conflict("redacted mutation target changed"));
+                }
+                array.remove(index);
+            }
+            _ => return Err(conflict("redacted mutation parent changed type")),
+        }
+    }
+    *document = root.as_object_mut().expect("root remains object").clone();
+    Ok(())
+}
+
 fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
     if value.is_empty() || value.len() > 64 * 1024 || value.contains('\0') {
         return Err(bad_request("denylist literal is invalid"));
@@ -934,7 +1064,7 @@ fn save_extended_config_sync(
     } else {
         crate::daemon::server::inventory::current_config_generation()
     };
-    Ok(Response::ExtendedConfigSaved {
+    Ok(Response::ExtendedConfigWritten {
         hash: desired_hash,
         config_generation,
     })

@@ -562,6 +562,17 @@ pub enum Response {
     ExtendedConfigSaved {
         hash: String,
         config_generation: u64,
+        layer_id: String,
+        layer: crate::CockpitConfigLayer,
+        consumed_revision: String,
+        result_revision: String,
+    },
+
+    /// Legacy whole-document writer receipt. Daemon-connected settings UI
+    /// never uses this unscoped path.
+    ExtendedConfigWritten {
+        hash: String,
+        config_generation: u64,
     },
 
     ExtendedConfigSnapshot {
@@ -831,6 +842,8 @@ pub enum Response {
     },
     /// Result of deleting an assistant registry row.
     AssistantDeleted {
+        name: String,
+        consumed_registration_revision: String,
         deleted: bool,
     },
     /// Media reservation accounting diagnosis as JSON.
@@ -1184,6 +1197,7 @@ macro_rules! response_variants {
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
+            (Response::ExtendedConfigWritten { .. }, "extended_config_written");
             (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
             (Response::AgentInventory { .. }, "agent_inventory");
             (Response::AgentEditSnapshot(..), "agent_edit_snapshot");

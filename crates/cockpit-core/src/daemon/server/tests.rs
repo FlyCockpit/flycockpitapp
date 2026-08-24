@@ -822,9 +822,15 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
         panic!("expected assistant")
     };
     assert_eq!(assistant.name, "reviewer");
+    let expected_hash = crate::assistants::markdown_content_hash(
+        assistant
+            .definition_markdown
+            .as_deref()
+            .expect("daemon returns the authored assistant markdown"),
+    );
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        expected_hash
     );
 }
 

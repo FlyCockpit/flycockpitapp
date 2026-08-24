@@ -38,7 +38,7 @@
 //! background task writes into and the event loop reads on each tick.
 
 mod agent_editor;
-mod agents_page;
+pub(crate) mod agents_page;
 mod auth;
 mod category;
 mod dependencies_page;
@@ -160,7 +160,10 @@ fn extended_config_layer_snapshot(
             .await
             .map_err(|error| error.to_string())?
         {
-            Ok(Response::ExtendedConfigSnapshot { layers, .. }) => {
+            Ok(Response::ExtendedConfigSnapshot {
+                layers,
+                config_generation,
+            }) => {
                 let layer = layers
                     .into_iter()
                     .find(|layer| layer.display_path == requested_path)
@@ -181,6 +184,20 @@ fn extended_config_layer_snapshot(
                     .insert(
                         "__cockpit_denylist_entries".into(),
                         serde_json::to_value(denylist).map_err(|error| error.to_string())?,
+                    );
+                value
+                    .as_object_mut()
+                    .expect("ExtendedConfig serializes as object")
+                    .insert(
+                        "__cockpit_settings_layer_kind".into(),
+                        serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
+                    );
+                value
+                    .as_object_mut()
+                    .expect("ExtendedConfig serializes as object")
+                    .insert(
+                        "__cockpit_settings_generation".into(),
+                        serde_json::Value::Number(config_generation.into()),
                     );
                 value
                     .as_object_mut()
@@ -213,6 +230,7 @@ fn apply_settings_patch_via_daemon(
         unset_fields,
         materialize: false,
         denylist,
+        redacted_mutations: Vec::new(),
     };
     let project_root = config_layer_request(path, project_root)?;
     let layer_id = base
@@ -221,22 +239,70 @@ fn apply_settings_patch_via_daemon(
         .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
         .to_owned();
     let expected_revision = revision.to_string();
+    let expected_layer = serde_json::from_value(
+        base.get("__cockpit_settings_layer_kind")
+            .cloned()
+            .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_generation = base
+        .get("__cockpit_settings_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+    let requested_path = path.display().to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
             .map_err(|error| error.to_string())?;
-        match client
+        let response = client
             .request(Request::ApplyExtendedConfigPatch {
-                project_root,
-                layer_id,
+                project_root: project_root.clone(),
+                layer_id: layer_id.clone(),
                 patch,
-                expected_revision,
+                expected_revision: expected_revision.clone(),
             })
+            .await
+            .map_err(|error| error.to_string())?;
+        let (result_revision, result_generation) = match response {
+            Ok(Response::ExtendedConfigSaved {
+                hash,
+                config_generation,
+                layer_id: returned_layer_id,
+                layer,
+                consumed_revision,
+                result_revision,
+            }) if returned_layer_id == layer_id
+                && layer == expected_layer
+                && consumed_revision == expected_revision
+                && hash == result_revision
+                && (config_generation == expected_generation
+                    || config_generation == expected_generation.saturating_add(1)) =>
+            {
+                (result_revision, config_generation)
+            }
+            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }?;
+        match client
+            .request(Request::GetExtendedConfigSnapshot { project_root })
             .await
             .map_err(|error| error.to_string())?
         {
-            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
-            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+            Ok(Response::ExtendedConfigSnapshot {
+                layers,
+                config_generation,
+            }) if config_generation == result_generation
+                && layers.iter().any(|layer| {
+                    layer.display_path == requested_path
+                        && layer.kind == expected_layer
+                        && layer.revision == result_revision
+                }) =>
+            {
+                Ok(())
+            }
+            Ok(_) => {
+                Err("settings commit could not be reconciled to an authoritative snapshot".into())
+            }
             Err(error) => Err(error.to_string()),
         }
     })
@@ -261,6 +327,7 @@ pub(super) fn apply_typed_settings_document_edit(
         unset_fields,
         materialize: true,
         denylist,
+        redacted_mutations: Vec::new(),
     };
     let project_root = config_layer_request(path, project_root)?;
     let layer_id = authority_base
@@ -268,22 +335,71 @@ pub(super) fn apply_typed_settings_document_edit(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
         .to_owned();
+    let expected_layer = serde_json::from_value(
+        authority_base
+            .get("__cockpit_settings_layer_kind")
+            .cloned()
+            .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_generation = authority_base
+        .get("__cockpit_settings_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+    let requested_path = path.display().to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
             .map_err(|error| error.to_string())?;
-        match client
+        let response = client
             .request(Request::ApplyExtendedConfigPatch {
-                project_root,
-                layer_id,
+                project_root: project_root.clone(),
+                layer_id: layer_id.clone(),
                 patch,
-                expected_revision: revision,
+                expected_revision: revision.clone(),
             })
+            .await
+            .map_err(|error| error.to_string())?;
+        let (result_revision, result_generation) = match response {
+            Ok(Response::ExtendedConfigSaved {
+                hash,
+                config_generation,
+                layer_id: returned_layer_id,
+                layer,
+                consumed_revision,
+                result_revision,
+            }) if returned_layer_id == layer_id
+                && layer == expected_layer
+                && consumed_revision == revision
+                && hash == result_revision
+                && (config_generation == expected_generation
+                    || config_generation == expected_generation.saturating_add(1)) =>
+            {
+                (result_revision, config_generation)
+            }
+            Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }?;
+        match client
+            .request(Request::GetExtendedConfigSnapshot { project_root })
             .await
             .map_err(|error| error.to_string())?
         {
-            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
-            Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
+            Ok(Response::ExtendedConfigSnapshot {
+                layers,
+                config_generation,
+            }) if config_generation == result_generation
+                && layers.iter().any(|layer| {
+                    layer.display_path == requested_path
+                        && layer.kind == expected_layer
+                        && layer.revision == result_revision
+                }) =>
+            {
+                Ok(())
+            }
+            Ok(_) => {
+                Err("settings commit could not be reconciled to an authoritative snapshot".into())
+            }
             Err(error) => Err(error.to_string()),
         }
     })

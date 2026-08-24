@@ -188,6 +188,29 @@ CREATE TABLE sessions (
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- Parent links form an acyclic ownership graph. The recursive UNION is also
+-- cycle-safe if a pre-release database was externally corrupted before this
+-- trigger existed; valid mutations fail before introducing another cycle.
+CREATE TRIGGER sessions_parent_cycle_guard
+BEFORE UPDATE OF parent_session_id, btw_parent_session_id ON sessions
+WHEN EXISTS (
+    WITH RECURSIVE ancestors(session_id) AS (
+        SELECT NEW.parent_session_id WHERE NEW.parent_session_id IS NOT NULL
+        UNION
+        SELECT NEW.btw_parent_session_id WHERE NEW.btw_parent_session_id IS NOT NULL
+        UNION
+        SELECT s.parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.parent_session_id IS NOT NULL
+        UNION
+        SELECT s.btw_parent_session_id FROM sessions s JOIN ancestors a ON s.session_id=a.session_id
+          WHERE s.btw_parent_session_id IS NOT NULL
+    )
+    SELECT 1 FROM ancestors WHERE session_id=NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session parent cycle');
+END;
+
 -- ---- typed media attachments ----------------------------------------------
 -- Full-range monotonic values are canonical decimal text because SQLite's
 -- INTEGER is signed i64. Application codecs reject zero, leading zeroes and

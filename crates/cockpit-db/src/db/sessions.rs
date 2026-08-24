@@ -864,7 +864,7 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
     // guard for every current and future session-deletion caller.
     let unsafe_media: i64 = conn
         .query_row(
-            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION ALL SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
+            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
             [session_id.to_string()],
             |row| row.get(0),
         )
@@ -1812,7 +1812,7 @@ impl Db {
         ensure!(now_unix_ms >= 0, "cleanup intent timestamp must be nonnegative");
         conn.execute(
             "WITH RECURSIVE subtree(session_id) AS (
-                 SELECT ?1 UNION ALL
+                 SELECT ?1 UNION
                  SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id
              )
              INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)

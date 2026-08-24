@@ -66,6 +66,19 @@ pub(crate) struct PreparedTaskDelegationPayload {
     body_inline: Option<String>,
     sidecar_path: Option<String>,
     created_at: i64,
+    /// Armed until the database row has committed. This closes the ordinary
+    /// insert-failure window without letting an unpublished sidecar leak.
+    cleanup_abs_path: Option<PathBuf>,
+}
+
+impl Drop for PreparedTaskDelegationPayload {
+    fn drop(&mut self) {
+        if let Some(path) = self.cleanup_abs_path.take()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(%error, path=%path.display(), "failed to clean unpublished delegation sidecar");
+        }
+    }
 }
 
 pub fn delegation_payload_hash(content: &str) -> String {
@@ -101,7 +114,7 @@ impl Db {
         let hash = delegation_payload_hash(payload.prompt);
         let byte_len = payload.prompt.len();
         let created_at = Utc::now().timestamp();
-        let (body_inline, sidecar_path) =
+        let (body_inline, sidecar_path, cleanup_abs_path) =
             self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)?;
         Ok(PreparedTaskDelegationPayload {
             task_call_id: payload.task_call_id.to_owned(),
@@ -115,13 +128,24 @@ impl Db {
             body_inline,
             sidecar_path,
             created_at,
+            cleanup_abs_path,
         })
     }
 
     pub(crate) fn insert_prepared_task_delegation_payload_conn(
         conn: &Connection,
-        payload: PreparedTaskDelegationPayload,
+        mut payload: PreparedTaskDelegationPayload,
     ) -> Result<TaskDelegationPayloadRow> {
+        // A replacement must retain deletion authority for the old unique
+        // pathname in the same transaction that removes its last reference.
+        conn.execute(
+            "INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents
+             (sidecar_path,session_id,created_at_unix_ms)
+             SELECT sidecar_path,parent_session_id,?3 FROM task_delegation_payloads
+              WHERE task_call_id=?1 AND label=?2 AND sidecar_path IS NOT NULL
+                AND sidecar_path IS NOT ?4",
+            params![payload.task_call_id, payload.label, Utc::now().timestamp_millis(), payload.sidecar_path],
+        ).context("recording replaced delegation sidecar cleanup intent")?;
         conn.execute(
             "INSERT INTO task_delegation_payloads (
                     task_call_id, label, payload_hash, parent_session_id, parent_agent,
@@ -154,8 +178,10 @@ impl Db {
             ],
         )
         .context("inserting task delegation payload")?;
-        Self::task_delegation_payload_conn(conn, &payload.task_call_id, &payload.label)?
-            .context("inserted task delegation payload missing")
+        let row = Self::task_delegation_payload_conn(conn, &payload.task_call_id, &payload.label)?
+            .context("inserted task delegation payload missing")?;
+        payload.cleanup_abs_path = None;
+        Ok(row)
     }
 
     pub async fn task_delegation_payload(
@@ -323,9 +349,9 @@ impl Db {
         session_id: Uuid,
         hash: &str,
         body: &str,
-    ) -> Result<(Option<String>, Option<String>)> {
+    ) -> Result<(Option<String>, Option<String>, Option<PathBuf>)> {
         let Some(_db_path) = self.path() else {
-            return Ok((Some(body.to_string()), None));
+            return Ok((Some(body.to_string()), None, None));
         };
         // Each durable payload gets a non-reusable pathname. Cleanup can then
         // never unlink a freshly prepared row which happens to have the same
@@ -348,7 +374,7 @@ impl Db {
             crate::db::files::write_private_file(&abs, body.as_bytes())
                 .with_context(|| format!("writing delegation payload {}", abs.display()))?;
         }
-        Ok((None, Some(rel_to_string(&rel))))
+        Ok((None, Some(rel_to_string(&rel)), Some(abs)))
     }
 
     fn load_task_delegation_payload_body(&self, row: &TaskDelegationPayloadRow) -> Result<String> {

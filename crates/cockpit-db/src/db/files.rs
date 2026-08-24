@@ -343,38 +343,10 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
 
 #[cfg(windows)]
 pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    let components = relative.components().collect::<Vec<_>>();
-    anyhow::ensure!(
-        !components.is_empty()
-            && components
-                .iter()
-                .all(|component| matches!(component, std::path::Component::Normal(_))),
-        "sidecar cleanup path must be relative and normalized"
-    );
-    let path = base.join(relative);
-    for ancestor in path.ancestors().take_while(|candidate| *candidate != base) {
-        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
-            anyhow::ensure!(!metadata.file_type().is_symlink(), "sidecar cleanup path contains symlink");
-        }
-    }
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("unlinking delegation payload sidecar"),
-    }
-    let parent = path.parent().context("sidecar path has no parent")?;
-    anyhow::ensure!(
-        !sidecar_parent_sync_forced_failure(parent),
-        "injected delegation payload sidecar parent fsync failure"
-    );
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: open directory handle.
-        .open(parent)
-        .and_then(|directory| directory.sync_all())
-        .context("fsyncing delegation payload sidecar parent")
+    let _ = (base, relative);
+    anyhow::bail!(
+        "durable no-follow sidecar deletion is unsupported on Windows; cleanup is retained for a future safe implementation"
+    )
 }
 
 #[cfg(not(any(unix, windows)))]

@@ -474,7 +474,8 @@ fn restore_redacted_occurrences(
                     visit(value, &format!("{pointer}/{key}"), occurrences, seen)?;
                 }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
         }
         Ok(())
     }

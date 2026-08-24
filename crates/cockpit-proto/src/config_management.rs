@@ -37,7 +37,7 @@ pub struct ExtendedConfigPatch {
     /// Selected optional/default-valued fields that must be removed from this
     /// layer. This distinguishes an intentional clear from serde's
     /// `skip_serializing_if` omission.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unset_fields: Vec<ExtendedConfigField>,
     /// Create the selected layer even when typed values are unchanged.
     #[serde(default)]

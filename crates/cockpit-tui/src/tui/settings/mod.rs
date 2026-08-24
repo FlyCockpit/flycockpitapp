@@ -1006,13 +1006,17 @@ pub struct SettingsCx {
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
     /// Daemon-redacted snapshot loaded when the dialog opened or last saved.
-    /// Used to construct a typed patch; the daemon re-reads and merges the
-    /// authoritative raw document under its revisioned capability.
+    /// Every secret placeholder is a unique, location-bound occurrence under
+    /// the opaque revisioned capability. The daemon rejects moved, duplicated,
+    /// altered, or unselected removals before merging selected typed fields
+    /// into the authoritative raw document.
     original_config: ProvidersConfig,
     /// Cached secret-free cockpit-only settings projection. Read by the UI and
     /// Tools pages; mutations are committed only by the daemon.
     pub(super) extended: ExtendedConfig,
-    /// Safe daemon snapshot used to calculate a minimal typed merge patch.
+    /// Safe daemon snapshot used to calculate a minimal typed set/unset patch;
+    /// serde-omitted optional/default fields are cleared only when named in
+    /// the explicit unset list.
     extended_base: serde_json::Value,
     /// Opaque revision of the raw authoritative layer corresponding to
     /// `extended_base`.

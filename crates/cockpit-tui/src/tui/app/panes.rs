@@ -133,13 +133,13 @@ impl App {
     }
 
     /// The `/settings → Agents` page asked to edit an agent file in
-    /// `$EDITOR` (implementation note). The page can't
-    /// suspend the TUI from inside a key handler, so it records the path
-    /// and we service it here: suspend ratatui, run `$EDITOR <file>`, then
-    /// hand the outcome back so the page re-reads + re-parses the file
-    /// (surfacing a parse error inline, never silently accepting a broken
-    /// agent). External-process failure leaves the file untouched and is
-    /// reported inline. Reuses the same suspension guard as Ctrl+G.
+    /// `$EDITOR` (implementation note). The page owns a private temporary
+    /// directory plus a retained directory handle; this host effect receives
+    /// only its staging pathname, never the authoritative agent pathname.
+    /// After suspension the page reads the leaf relative to that retained
+    /// handle and submits the bytes under the daemon editor lease. Process or
+    /// RPC failure preserves a recovery draft and cannot partially write the
+    /// authoritative definition. Reuses the same suspension guard as Ctrl+G.
     pub(super) async fn maybe_service_agent_file_edit(
         &mut self,
         terminal: &mut DefaultTerminal,

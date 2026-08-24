@@ -219,6 +219,7 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
         }
         DaemonCommand::DiagnosticSnapshot {
             path,
+            database_snapshot,
             offline,
             no_sandbox,
         } => {
@@ -227,9 +228,17 @@ pub async fn run(cmd: DaemonCommand) -> Result<()> {
             // diagnostics probe to report openability / schema health. The CLI
             // itself opens no session DB (its ratchet ALLOWED stays empty); the
             // single permitted default-path opener lives in cockpit-core.
-            let snapshot =
-                crate::diagnostics::cli_snapshot(path.as_deref(), no_sandbox, offline, None)
-                    .await?;
+            let snapshot_db = database_snapshot
+                .as_deref()
+                .map(crate::db::Db::open_read_only_diagnostic_snapshot)
+                .transpose()?;
+            let snapshot = crate::diagnostics::cli_snapshot(
+                path.as_deref(),
+                no_sandbox,
+                offline,
+                snapshot_db.as_ref(),
+            )
+            .await?;
             println!(
                 "{}",
                 serde_json::json!({

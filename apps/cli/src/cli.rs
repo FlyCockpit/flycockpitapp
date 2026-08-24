@@ -1006,6 +1006,9 @@ pub enum DaemonCommand {
     DiagnosticSnapshot {
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+        /// Explicit offline SQLite copy to inspect. Hidden worker use only.
+        #[arg(long, hide = true)]
+        database_snapshot: Option<std::path::PathBuf>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]

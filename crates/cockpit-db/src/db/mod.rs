@@ -482,6 +482,21 @@ impl Db {
             anyhow::bail!("database does not exist at {}", path.display());
         }
         let diagnostic_lock = Arc::new(files::DatabaseDiagnosticLock::try_acquire(&path)?);
+        Self::open_read_only_diagnostic_impl(path, Some(diagnostic_lock))
+    }
+
+    /// Inspect an explicitly supplied offline copy/snapshot. Unlike the
+    /// canonical database path, a copied database has no ownership sidecar;
+    /// the caller must opt into this API and the file is opened read-only.
+    pub fn open_read_only_diagnostic_snapshot(path: &Path) -> Result<Self> {
+        anyhow::ensure!(path.is_file(), "database snapshot does not exist at {}", path.display());
+        Self::open_read_only_diagnostic_impl(path.to_path_buf(), None)
+    }
+
+    fn open_read_only_diagnostic_impl(
+        path: PathBuf,
+        diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
+    ) -> Result<Self> {
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -501,7 +516,7 @@ impl Db {
             read_pool: None,
             path: Some(path),
             _owner_lock: None,
-            _diagnostic_lock: Some(diagnostic_lock),
+            _diagnostic_lock: diagnostic_lock,
             read_only: true,
         })
     }

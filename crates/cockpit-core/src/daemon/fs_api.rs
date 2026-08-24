@@ -178,7 +178,6 @@ pub(crate) fn fs_read_sync(
             kind,
         });
     }
-
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let cap = crate::text::floor_char_boundary(&text, FS_TEXT_READ_BYTE_CAP.min(text.len()));
     let truncated = text.len() > cap;
@@ -495,12 +494,12 @@ async fn trusted_settings_root(
     let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
         .await
         .map_err(|error| ErrorPayload {
-            code: ErrorCode::PermissionDenied,
+            code: ErrorCode::WorkspaceTrust,
             message: format!("workspace trust is required for settings mutation: {error:#}"),
         })?;
     if policy.mode != crate::db::workspace_trust::WorkspaceTrustMode::Trust {
         return Err(ErrorPayload {
-            code: ErrorCode::PermissionDenied,
+            code: ErrorCode::WorkspaceTrust,
             message: "settings mutation requires a trusted workspace".into(),
         });
     }

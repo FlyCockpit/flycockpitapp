@@ -79,6 +79,19 @@ pub struct CreateAssistantSpec {
     pub home_dir: PathBuf,
 }
 
+/// A daemon-coordinated registry/definition snapshot.  A row-local damaged
+/// definition is represented diagnostically so one bad assistant does not
+/// hide the rest of the inventory.  Authority violations (for example a
+/// non-canonical home or a definition claiming another installation identity)
+/// remain hard errors.
+#[derive(Debug, Clone)]
+pub struct AssistantSnapshot {
+    pub row: AssistantRow,
+    pub definition_markdown: Option<String>,
+    pub definition_revision: Option<String>,
+    pub definition_diagnostic: Option<String>,
+}
+
 pub fn validate_assistant_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("assistant name is required");
@@ -652,6 +665,90 @@ pub async fn recover_definition_journals(db: &Db) -> Result<()> {
         recover_definition_journal(db, &row).await?;
     }
     Ok(())
+}
+
+/// Read all assistant definitions through the same lock and recovery path as
+/// save/delete/identity operations.
+pub async fn snapshots(db: &Db) -> Result<Vec<AssistantSnapshot>> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let rows = db.write_blocking(crate::db::Db::list_assistants_conn)?;
+        rows.into_iter()
+            .map(|row| snapshot_from_row_sync(&db, row))
+            .collect()
+    })
+    .await
+    .context("assistant snapshot coordinator joined")?
+}
+
+/// Read one assistant through the same lock and recovery path as mutations.
+pub async fn snapshot(db: &Db, name: &str) -> Result<Option<AssistantSnapshot>> {
+    validate_assistant_name(name)?;
+    let db = db.clone();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let Some(row) = get_assistant_blocking(&db, &name)? else {
+            return Ok(None);
+        };
+        snapshot_from_row_sync(&db, row).map(Some)
+    })
+    .await
+    .context("assistant snapshot coordinator joined")?
+}
+
+fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapshot> {
+    let home = validate_row_home(&row)?;
+    let target = assistant_definition_path(&home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+    recover_creation_journal_locked(db, &home)?;
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared while acquiring its snapshot")?;
+    validate_row_home(&row)?;
+    recover_definition_journal_locked(db, &row)?;
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during definition recovery")?;
+    validate_row_home(&row)?;
+
+    let unavailable = |diagnostic: String| AssistantSnapshot {
+        row: row.clone(),
+        definition_markdown: None,
+        definition_revision: None,
+        definition_diagnostic: Some(diagnostic),
+    };
+    let Some(bytes) = cockpit_config::config::read_config_file_nofollow(&target)? else {
+        return Ok(unavailable("assistant definition is missing".into()));
+    };
+    if sha256_hex(&bytes) != row.content_hash {
+        return Ok(unavailable(
+            "assistant definition does not match the registry content hash".into(),
+        ));
+    }
+    let markdown = match String::from_utf8(bytes) {
+        Ok(markdown) => markdown,
+        Err(_) => {
+            return Ok(unavailable(
+                "assistant definition is not valid UTF-8".into(),
+            ));
+        }
+    };
+    let definition = match crate::agents::parse_daemon_local_markdown(&markdown, &row.name) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return Ok(unavailable(format!(
+                "assistant definition is invalid: {error:#}"
+            )));
+        }
+    };
+    // A valid document claiming a different installation identity is an
+    // authority violation, not ordinary row-local corruption.
+    validate_definition_identity(&row, &definition)?;
+    let revision = definition_revision(&row, &markdown);
+    Ok(AssistantSnapshot {
+        row,
+        definition_markdown: Some(markdown),
+        definition_revision: Some(revision),
+        definition_diagnostic: None,
+    })
 }
 
 pub async fn save_definition_cas(

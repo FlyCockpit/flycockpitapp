@@ -98,7 +98,25 @@ pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
 }
 
 pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
-    let home_dir = crate::assistants::validate_row_home(row)?;
+    let db = db.clone();
+    let row = row.clone();
+    tokio::task::spawn_blocking(move || load_for_session_sync(&db, &row))
+        .await
+        .context("assistant identity coordinator joined")?
+}
+
+fn load_for_session_sync(db: &Db, requested: &AssistantRow) -> Result<IdentityLoad> {
+    let home_dir = crate::assistants::validate_row_home(requested)?;
+    let definition = crate::assistants::assistant_definition_path(&home_dir);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, &home_dir)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .with_context(|| format!("assistant `{}` disappeared", requested.name))?;
+    crate::assistants::validate_row_home(&row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .with_context(|| format!("assistant `{}` disappeared during recovery", row.name))?;
+    crate::assistants::validate_row_home(&row)?;
     let original_config: crate::assistants::AssistantConfig =
         serde_json::from_str(&row.config_json)
             .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
@@ -141,8 +159,7 @@ pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoa
         || config.user_hash != original_config.user_hash
     {
         let config_json = serde_json::to_string(&config)?;
-        db.update_assistant_identity_hashes_cas(row.clone(), &config_json)
-            .await
+        update_identity_hashes_cas_blocking(db, row.clone(), config_json)
             .with_context(|| format!("updating identity hashes for assistant `{}`", row.name))?;
     }
 
@@ -156,6 +173,35 @@ pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoa
     Ok(IdentityLoad {
         system_prefix,
         notices,
+    })
+}
+
+fn update_identity_hashes_cas_blocking(
+    db: &Db,
+    expected: AssistantRow,
+    config_json: String,
+) -> Result<AssistantRow> {
+    serde_json::from_str::<serde_json::Value>(&config_json)
+        .context("assistant config must be valid JSON")?;
+    db.write_blocking(move |conn| {
+        let changed = conn.execute(
+            "UPDATE assistants SET config_json = ?6
+             WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+               AND config_json = ?4 AND content_hash = ?5",
+            rusqlite::params![
+                expected.name,
+                expected.created_at,
+                expected.home_dir,
+                expected.config_json,
+                expected.content_hash,
+                config_json,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed while identity files were read");
+        }
+        crate::db::Db::get_assistant_conn(conn, &expected.name)?
+            .context("assistant disappeared after identity hash update")
     })
 }
 

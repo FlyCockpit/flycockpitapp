@@ -204,7 +204,19 @@ fn reinsert_editor_lease(id: Uuid, lease: EditorLeaseState) -> Result<(), ErrorP
         return Ok(());
     }
     let mut leases = editor_leases().lock().map_err(lock_poison)?;
-    leases.entry(id).or_insert(lease);
+    let now = Instant::now();
+    leases.retain(|_, existing| existing.expires_at > now);
+    if leases.contains_key(&id) {
+        return Err(conflict(
+            "editor lease retry token was concurrently replaced; reload before retrying",
+        ));
+    }
+    if leases.len() >= MAX_EDITOR_LEASES {
+        return Err(conflict(
+            "editor lease could not be retained after a failed completion because capacity was exhausted; reload before retrying",
+        ));
+    }
+    leases.insert(id, lease);
     Ok(())
 }
 
@@ -713,10 +725,7 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                 let staged_exists = nofollow_read(&staged)?.is_some();
                 let target_exists = nofollow_read(&target)?.is_some();
                 match (staged_exists, target_exists) {
-                    (true, false) => {
-                        cockpit_config::config::rename_config_file_nofollow(&staged, &target)
-                            .map_err(internal)?
-                    }
+                    (true, false) => rename_config_noreplace(&staged, &target)?,
                     // This entry was not staged yet, or an earlier recovery
                     // pass already restored it.
                     (false, true) => {}
@@ -861,11 +870,11 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     for name in &journal.entries {
         let source = project_agent_path(root, name)?;
         let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = cockpit_config::config::rename_config_file_nofollow(&source, &staged) {
+        if let Err(error) = rename_config_noreplace(&source, &staged) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
             let _ = recover_reset_all(root);
-            return Err(internal(error));
+            return Err(error);
         }
     }
     sync_dir(&agents_dir)?;
@@ -889,6 +898,24 @@ fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPay
         Some(_) => Err(conflict("agent changed since the snapshot was read")),
         None => Err(conflict("agent mutation requires an expected revision")),
     }
+}
+
+fn rename_config_noreplace(source: &Path, destination: &Path) -> Result<(), ErrorPayload> {
+    cockpit_config::config::rename_config_file_nofollow(source, destination).map_err(|error| {
+        let destination_exists = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+        });
+        if destination_exists {
+            conflict(format!(
+                "agent reset destination already exists: {}",
+                destination.display()
+            ))
+        } else {
+            internal(error)
+        }
+    })
 }
 
 fn bad_request(message: impl Into<String>) -> ErrorPayload {

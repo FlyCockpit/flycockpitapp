@@ -1690,20 +1690,65 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
                 source.display()
             );
         }
-        // SAFETY: both retained directory descriptors and both component
-        // strings remain live for the call.
-        let renamed = unsafe {
-            libc::renameat(
-                source_parent.as_raw_fd(),
-                source_name_c.as_ptr(),
-                destination_parent.as_raw_fd(),
-                destination_name_c.as_ptr(),
-            )
-        };
-        if renamed != 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!("renaming {} to {}", source.display(), destination.display())
-            });
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: both retained directory descriptors and component
+            // strings remain live. RENAME_NOREPLACE makes destination
+            // existence an atomic conflict rather than overwriting it.
+            let renamed = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    source_parent.as_raw_fd(),
+                    source_name_c.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination_name_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if renamed != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "renaming without replacement {} to {}",
+                        source.display(),
+                        destination.display()
+                    )
+                });
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // Portable retained-directory fallback: linkat publishes the
+            // destination only when absent, then unlinkat removes the source.
+            // If unlink fails both names safely reference the same inode and
+            // recovery reports a conflict instead of losing either file.
+            // SAFETY: all descriptors and component strings remain live.
+            let linked = unsafe {
+                libc::linkat(
+                    source_parent.as_raw_fd(),
+                    source_name_c.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination_name_c.as_ptr(),
+                    0,
+                )
+            };
+            if linked != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "linking without replacement {} to {}",
+                        source.display(),
+                        destination.display()
+                    )
+                });
+            }
+            destination_parent.sync_all()?;
+            // SAFETY: the retained source parent and component remain live.
+            let unlinked =
+                unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name_c.as_ptr(), 0) };
+            if unlinked != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("removing linked rename source {}", source.display())
+                });
+            }
         }
         source_parent.sync_all()?;
         destination_parent.sync_all()?;

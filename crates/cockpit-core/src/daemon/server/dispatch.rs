@@ -4205,13 +4205,11 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ListAssistants => {
-            let assistants = ctx
-                .db
-                .list_assistants()
+            let assistants = crate::assistants::snapshots(&ctx.db)
                 .await
                 .map_err(internal)?
                 .into_iter()
-                .map(assistant_to_proto_with_definition)
+                .map(assistant_snapshot_to_proto)
                 .collect();
             Ok(Response::Assistants { assistants })
         }
@@ -4278,15 +4276,18 @@ async fn handle_serialized_request_impl(
                 .await
                 .map_err(internal)?
                 .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
-            let updated =
-                crate::assistants::save_definition_cas(&ctx.db, row, markdown, &expected_revision)
-                    .await
-                    .map_err(|error| ErrorPayload {
-                        code: ErrorCode::Conflict,
-                        message: format!("assistant definition save rejected: {error:#}"),
-                    })?;
+            crate::assistants::save_definition_cas(&ctx.db, row, markdown, &expected_revision)
+                .await
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: format!("assistant definition save rejected: {error:#}"),
+                })?;
+            let assistant = crate::assistants::snapshot(&ctx.db, &name)
+                .await
+                .map_err(internal)?
+                .context("assistant disappeared after definition save")?;
             Ok(Response::AssistantDefinitionSaved {
-                assistant: assistant_to_proto_with_definition(updated).map_err(internal)?,
+                assistant: assistant_snapshot_to_proto(assistant),
             })
         }
 
@@ -8999,26 +9000,19 @@ async fn handle_serialized_request_impl(
 }
 
 fn agent_editor_lease_owner(state: &MutableClientState) -> String {
-    let session = state
-        .attached
-        .as_ref()
-        .map(|attached| attached.handle.session_id.to_string())
-        .unwrap_or_else(|| "detached".into());
-    format!(
-        "{}:{}:{}:{session}",
-        principal_digest(&state.principal),
-        state.terminal_context.client_instance_id,
-        state.terminal_context.connection_epoch,
-    )
+    // Editor leases intentionally survive a transport reconnect.  The opaque
+    // lease remains additionally bound to its canonical workspace, agent and
+    // exact revision in the daemon registry; this stable authenticated
+    // principal digest prevents another principal from claiming it without
+    // tying it to one short-lived socket connection.
+    principal_digest(&state.principal)
 }
 
 fn settings_capability_owner(state: &MutableClientState) -> String {
-    format!(
-        "{}:{}:{}",
-        principal_digest(&state.principal),
-        state.terminal_context.client_instance_id,
-        state.terminal_context.connection_epoch,
-    )
+    // Settings dialogs use short-lived daemon connections.  Bind the
+    // unguessable capability to the authenticated principal, while the
+    // capability record itself binds root, target identity and revision.
+    principal_digest(&state.principal)
 }
 
 #[cfg(feature = "remote")]
@@ -9373,13 +9367,11 @@ async fn handle_concurrent_request_impl(
             })
         }
         Request::ListAssistants => {
-            let assistants = ctx
-                .db
-                .list_assistants()
+            let assistants = crate::assistants::snapshots(&ctx.db)
                 .await
                 .map_err(internal)?
                 .into_iter()
-                .map(assistant_to_proto_with_definition)
+                .map(assistant_snapshot_to_proto)
                 .collect();
             Ok(Response::Assistants { assistants })
         }
@@ -13762,27 +13754,14 @@ pub(super) fn assistant_to_proto(
     }
 }
 
-fn assistant_to_proto_with_definition(
-    row: crate::db::assistants::AssistantRow,
-) -> anyhow::Result<proto::AssistantSummary> {
-    let home = crate::assistants::validate_row_home(&row)?;
-    let path = crate::assistants::assistant_definition_path(&home);
-    let bytes = cockpit_config::config::read_config_file_nofollow(&path)?
-        .context("assistant definition is missing")?;
-    let actual_hash = crate::assistants::sha256_hex(&bytes);
-    anyhow::ensure!(
-        actual_hash == row.content_hash,
-        "assistant definition bytes do not match the registry content hash"
-    );
-    let markdown = String::from_utf8(bytes).context("assistant definition is not valid UTF-8")?;
-    let definition = crate::agents::parse_daemon_local_markdown(&markdown, &row.name)
-        .context("assistant definition is invalid")?;
-    crate::assistants::validate_definition_identity(&row, &definition)?;
-    let revision = crate::assistants::definition_revision(&row, &markdown);
-    let mut summary = assistant_to_proto(row);
-    summary.definition_revision = Some(revision);
-    summary.definition_markdown = Some(markdown);
-    Ok(summary)
+fn assistant_snapshot_to_proto(
+    snapshot: crate::assistants::AssistantSnapshot,
+) -> proto::AssistantSummary {
+    let mut summary = assistant_to_proto(snapshot.row);
+    summary.definition_markdown = snapshot.definition_markdown;
+    summary.definition_revision = snapshot.definition_revision;
+    summary.definition_diagnostic = snapshot.definition_diagnostic;
+    summary
 }
 
 /// Non-secret JSON projection of a registered package row for the
@@ -14020,10 +13999,11 @@ async fn get_assistant_response(
     ctx: &Arc<DaemonContext>,
     name: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let row = ctx.db.get_assistant(&name).await.map_err(internal)?;
-    Ok(Response::Assistant {
-        assistant: row.map(assistant_to_proto_with_definition),
-    })
+    let assistant = crate::assistants::snapshot(&ctx.db, &name)
+        .await
+        .map_err(internal)?
+        .map(assistant_snapshot_to_proto);
+    Ok(Response::Assistant { assistant })
 }
 
 async fn diagnose_media_reservation_response(

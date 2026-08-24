@@ -151,6 +151,11 @@ struct Inner {
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
     external_journal: Arc<Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>>,
+    /// Daemon descendant process-containment handle. Late-installed like
+    /// `external_journal` (the daemon builds the actor after this registry
+    /// exists), then copied onto every worker `Session` so lifecycle hooks run
+    /// their children under a proven containment lease.
+    process_containment: Arc<Mutex<Option<crate::process_containment::ProcessContainmentHandle>>>,
     /// Required protected redaction-history key resolver installed on every
     /// `Session` this registry builds (decision 16). Late-installed at daemon
     /// boot after the secure-key actor attaches — the same seam that installs
@@ -483,6 +488,7 @@ impl SessionRegistry {
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
+                process_containment: Arc::new(Mutex::new(None)),
                 redaction_key_resolver: Arc::new(Mutex::new(None)),
                 secret_vault: Arc::new(Mutex::new(None)),
                 command_secret_cache: Mutex::new(
@@ -568,6 +574,20 @@ impl SessionRegistry {
 
     fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         crate::sync::lock_or_recover(&self.inner.external_journal).clone()
+    }
+
+    /// Install the daemon's descendant process-containment handle. Called once
+    /// at boot after the containment actor attaches; every worker session built
+    /// afterwards copies this handle so its lifecycle hooks are contained.
+    pub fn set_process_containment(
+        &self,
+        handle: crate::process_containment::ProcessContainmentHandle,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.process_containment) = Some(handle);
+    }
+
+    fn process_containment(&self) -> Option<crate::process_containment::ProcessContainmentHandle> {
+        crate::sync::lock_or_recover(&self.inner.process_containment).clone()
     }
 
     /// Install the daemon's shared protected redaction-history key resolver.
@@ -1181,6 +1201,10 @@ impl SessionRegistry {
         let model_override = model_override.map(|_| model.clone());
 
         session.set_external_journal(self.external_journal());
+        // Copy the daemon containment handle onto the worker session so every
+        // lifecycle hook (driver, noninteractive, swarm — all share this
+        // `Session`) spawns its child under a proven containment lease.
+        session.set_process_containment(self.process_containment());
         let session = Arc::new(session);
         let cleanup_inner = Arc::downgrade(&self.inner);
         let cleanup =

@@ -5413,6 +5413,34 @@ async fn forked_task_session_inherits_command_secret_cache_via_real_path() {
     );
 }
 
+#[tokio::test]
+async fn forked_task_session_inherits_process_containment_via_real_path() {
+    // A forked task session's lifecycle hooks must run under the parent's
+    // containment handle; if `prepare_fork_task_context` omitted the copy the
+    // child would get `None` and every hook would silently fail open as
+    // `descendant_containment_unsupported` once a real broker lands.
+    let (driver, _tmp) = test_driver_without_network(1);
+    let actor = crate::process_containment::ProcessContainmentActor::start(
+        driver.session.db.clone(),
+        std::sync::Arc::new(crate::process_containment::FakeProvenAdapter::new(
+            crate::process_containment::PlatformKind::Fake,
+        )),
+    );
+    driver.session.set_process_containment(Some(actor.handle()));
+
+    // Real production derivation — NOT a manual child handle install.
+    let (child, _history) = driver
+        .prepare_fork_task_context()
+        .await
+        .expect("fork task context");
+
+    assert!(
+        child.process_containment().is_some(),
+        "the forked child must inherit the parent's containment handle via \
+         prepare_fork_task_context"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Noninteractive subagent lifecycle observe-hook boundary wiring
 // (subagentStart / subagentStop). These drive the REAL driver production

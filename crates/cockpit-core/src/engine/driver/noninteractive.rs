@@ -1028,6 +1028,10 @@ impl Driver {
         // store funnel injects the same resolved command outputs (its
         // model/redaction/backup stores would otherwise resolve as missing).
         session.set_command_secret_cache(self.session.command_secret_cache());
+        // Inherit the parent's descendant containment handle so the forked task
+        // session's lifecycle hooks run their children under a proven lease (they
+        // would otherwise get `None` and fail open as unsupported).
+        session.set_process_containment(self.session.process_containment());
         Ok((Arc::new(session), history))
     }
 

@@ -335,7 +335,7 @@ Cockpit recognizes exactly these event keys (in canonical order):
 | `stopFailure` | observe | inferenceErrorOnly | errorClass | 5s | no |
 | `subagentStart` | observe | childOnly | childAgentType | 5s | no |
 | `subagentStop` | stop | childOnly | childAgentType | 60s | yes |
-| `preCompact` | observe | successfulCompactionOnly | closed: `manual`, `auto` | 5s | no |
+| `preCompact` | observe | preparedApplyAttempt | closed: `manual`, `auto` | 5s | no |
 | `postCompact` | observe | successfulCompactionOnly | closed: `manual`, `auto` | 5s | no |
 | `sessionEnd` | observe | everySession | closed: `completed`, `interrupted`, `cancelled`, `shutdown`, `error` | 5s | no |
 
@@ -429,8 +429,11 @@ Each hook receives a Cockpit-native JSON envelope on stdin (camelCase). It
 contains `hookEventName`, `sessionId`, `workspaceRoot`, `timestamp`, and
 event-specific fields: `toolName`, `toolCallId`, `toolInput`,
 `toolInputTruncated`, `toolResult`, `toolResultTruncated`, `toolError`,
-`subagentId`, `subagentType`, `source`, and `reason`. Only fields relevant to
-the event are present.
+`subagentId`, `subagentType`, `source`, `reason`, `startSource`,
+`promptSource`, `permissionKind`, `errorClass`, `compactSource`, `endReason`,
+`stopReason`, and `stopHookActive`. Only fields relevant to the event are
+present; typed lifecycle discriminators are not overloaded onto generic
+`source` or `reason`.
 
 Envelope bounds: `toolInput` and `toolResult` values are serialized to a
 maximum of 128 KiB each; excess is replaced with a UTF-8-safe prefix and the
@@ -468,7 +471,7 @@ A hook communicates by printing a single JSON object to stdout.
 - `{"decision":"allow"}` — allow the stop (the turn ends normally).
 - `{"decision":"deny",...}` — invalid for a stop gate; treated as a failed
   run (fail-open).
-- An unknown decision is observe-only (fail-open).
+- An unknown or missing decision is ignored (fail-open).
 
 **Observe-only events** (`sessionStart`, `userPromptSubmit`, `postToolUse`,
 `postToolUseFailure`, `permissionDenied`, `stopFailure`, `subagentStart`,
@@ -479,19 +482,28 @@ failed run; otherwise the run is a success.
 #### Fail-open behavior
 
 Only an explicit, parseable `preToolUse` `{"decision":"deny",...}` blocks a
-tool. Every other failure mode is **fail-open**: the run is recorded as
-`failed` in the audit ledger and the agent continues. Fail-open conditions are:
+tool. Every execution or gate-vocabulary failure below is **fail-open**: the
+run is recorded as `failed` in the audit ledger and the agent continues. An
+unknown stop-gate decision is instead ignored and recorded as success because
+it is not a gate failure. Failed conditions are:
 
 - `spawn failed` (the executable could not be launched)
 - `executable not found` (a bare command could not be resolved before the clean environment was built)
 - `malformed JSON output` (stdout was not valid JSON)
+- `output is not a JSON object`
+- `malformed hook output` (the object did not match the closed output shape)
 - `hook timed out`
 - `descendant_containment_unsupported` (the platform could not prove descendant containment before spawn)
 - `hook output exceeded limit` (stdout/stderr exceeded the 64 KiB cap)
 - `hook exited with non-zero status` (followed by the numeric exit status)
 - `hook exited without status` (the process crashed or its wait handle failed)
-- `descendant emptiness not proven` (the same-generation empty oracle was uncertain)
 - `hook pipe I/O failed` (stdin delivery or stdout/stderr capture failed)
+- `unexpected decision 'block' for pre-tool event`, `unexpected decision
+  'deny' for stop event`, or `unknown or missing decision` when a gate uses the
+  wrong decision vocabulary
+- `hook cancelled` (the owning turn was cancelled; Cockpit terminates the
+  containment and waits for the same-generation ProvenEmpty result before the
+  runner returns)
 
 Native hook execution additionally requires the host containment adapter to
 support atomic process placement with retained stdin/stdout/stderr endpoints.

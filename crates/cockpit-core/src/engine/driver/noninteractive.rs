@@ -5371,6 +5371,34 @@ pub(crate) async fn run_noninteractive_resumable(
                 if let Some(fallback) = turn_metadata.fallback_decision.take() {
                     fallback_decision = Some(fallback);
                 }
+                if let Some(failure) = crate::engine::model::as_inference_failure(&error) {
+                    let match_value =
+                        crate::engine::agent::hooks::error_class_match_value(&failure.class);
+                    let snapshot = config.snapshot();
+                    let hook_runner = process_containment.clone().map_or_else(
+                        crate::engine::agent::hooks::TokioCommandRunner::new,
+                        crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                    );
+                    crate::engine::agent::hooks::run_observe_hooks(
+                        &hook_runner,
+                        &crate::engine::agent::hooks::DefaultProcessEnv,
+                        snapshot.hooks(),
+                        crate::config::extended::hooks::HookEvent::StopFailure,
+                        match_value,
+                        session.id,
+                        &cwd,
+                        &session.db,
+                        None,
+                        None,
+                        Some(&agent.name),
+                        child_lifecycle.as_ref().map(|lifecycle| lifecycle.subagent_id.as_str()),
+                        crate::engine::agent::hooks::ObserveFields {
+                            error_class: Some(match_value),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 return Err(NoninteractiveRunError::new(
@@ -5397,7 +5425,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                         reason,
                         additional_context,
-                    } = crate::engine::agent::hooks::run_stop_hooks(
+                    } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,
                         snapshot.hooks(),
@@ -5408,6 +5436,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         &session.db,
                         Some(&lifecycle.subagent_id),
                         &mut stop_gate,
+                        &cancel,
                     )
                     .await
                         && !cancel.is_cancelled()
@@ -5448,7 +5477,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                         reason,
                         additional_context,
-                    } = crate::engine::agent::hooks::run_stop_hooks(
+                    } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,
                         snapshot.hooks(),
@@ -5459,6 +5488,7 @@ pub(crate) async fn run_noninteractive_resumable(
                         &session.db,
                         Some(&lifecycle.subagent_id),
                         &mut stop_gate,
+                        &cancel,
                     )
                     .await
                         && !cancel.is_cancelled()

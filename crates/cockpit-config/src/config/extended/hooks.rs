@@ -112,7 +112,13 @@ impl HookEvent {
             Self::SubagentStop => {
                 HookEventPolicy::new(G::Stop, A::ChildOnly, M::ChildAgentType, 60)
             }
-            Self::PreCompact | Self::PostCompact => HookEventPolicy::new(
+            Self::PreCompact => HookEventPolicy::new(
+                G::Observe,
+                A::PreparedApplyAttempt,
+                M::Closed(&["manual", "auto"]),
+                5,
+            ),
+            Self::PostCompact => HookEventPolicy::new(
                 G::Observe,
                 A::SuccessfulCompactionOnly,
                 M::Closed(&["manual", "auto"]),
@@ -151,6 +157,7 @@ pub enum HookApplicability {
     NormalRootDoneOnly,
     InferenceErrorOnly,
     ChildOnly,
+    PreparedApplyAttempt,
     SuccessfulCompactionOnly,
     EverySession,
 }

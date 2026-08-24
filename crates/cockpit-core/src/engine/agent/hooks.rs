@@ -61,8 +61,8 @@ pub(crate) const REASON_MALFORMED_JSON_OUTPUT: &str = "malformed JSON output";
 pub(crate) const REASON_OUTPUT_LIMIT_EXCEEDED: &str = "hook output exceeded limit";
 pub(crate) const REASON_NONZERO_EXIT_PREFIX: &str = "hook exited with non-zero status";
 pub(crate) const REASON_NO_EXIT_STATUS: &str = "hook exited without status";
-pub(crate) const REASON_EMPTY_NOT_PROVEN: &str = "descendant emptiness not proven";
 pub(crate) const REASON_PIPE_IO_FAILED: &str = "hook pipe I/O failed";
+pub(crate) const REASON_HOOK_CANCELLED: &str = "hook cancelled";
 pub(crate) const REASON_OUTPUT_NOT_JSON_OBJECT: &str = "output is not a JSON object";
 pub(crate) const REASON_MALFORMED_HOOK_OUTPUT: &str = "malformed hook output";
 pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
@@ -94,7 +94,6 @@ pub(crate) const PRODUCTION_HOOK_BOUNDARIES: &[(HookEvent, &str)] = &[
 ];
 
 /// Reserved environment keys overwritten after configured env.
-#[allow(dead_code)]
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "COCKPIT_HOOK_EVENT",
     "COCKPIT_HOOK_NAME",
@@ -159,8 +158,7 @@ pub struct HookEnvelope {
     /// from [`error_class_match_value`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<String>,
-    /// `preCompact` / `postCompact` discriminator: `agent_requested` | `auto`
-    /// | `manual`.
+    /// `preCompact` / `postCompact` discriminator: `manual` | `auto`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_source: Option<String>,
     /// End-reason discriminator (Decision 8) — a first-class typed field, not
@@ -629,21 +627,21 @@ pub(crate) fn build_child_env(
     }
 
     // Overwrite reserved keys after configured env.
-    env.insert("COCKPIT_HOOK_EVENT".to_string(), event.key().to_string());
+    env.insert(RESERVED_ENV_KEYS[0].to_string(), event.key().to_string());
     env.insert(
-        "COCKPIT_HOOK_NAME".to_string(),
+        RESERVED_ENV_KEYS[1].to_string(),
         hook.origin.as_str().to_string(),
     );
-    env.insert("COCKPIT_SESSION_ID".to_string(), session_id.to_string());
+    env.insert(RESERVED_ENV_KEYS[2].to_string(), session_id.to_string());
     env.insert(
-        "COCKPIT_WORKSPACE_ROOT".to_string(),
+        RESERVED_ENV_KEYS[3].to_string(),
         workspace_root.to_string_lossy().to_string(),
     );
     if let Some(name) = tool_name {
-        env.insert("COCKPIT_TOOL_NAME".to_string(), name.to_string());
+        env.insert(RESERVED_ENV_KEYS[4].to_string(), name.to_string());
     }
     if let Some(id) = tool_call_id {
-        env.insert("COCKPIT_TOOL_CALL_ID".to_string(), id.to_string());
+        env.insert(RESERVED_ENV_KEYS[5].to_string(), id.to_string());
     }
 
     Ok(env)
@@ -703,21 +701,46 @@ pub trait CommandRunner: Send + Sync {
         timeout: Duration,
         session_id: Uuid,
     ) -> HookRawOutput;
+
+    /// Stop-gate variant with an explicit caller cancellation boundary. Test
+    /// runners own no descendant process, so the default may race the fake.
+    /// The production runner overrides this and proves containment empty
+    /// before cancellation is reported.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_cancellable(
+        &self,
+        executable: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+        stdin: &str,
+        timeout: Duration,
+        session_id: Uuid,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HookRawOutput {
+        tokio::select! {
+            output = self.run(executable, args, env, cwd, stdin, timeout, session_id) => output,
+            _ = cancel.cancelled() => HookRawOutput {
+                stdout: String::new(), exit_code: None, duration_ms: 0,
+                spawn_failed: false, timeout: false,
+                failure_reason: Some(REASON_HOOK_CANCELLED), output_truncated: false,
+            },
+        }
+    }
 }
 
 /// Production command runner using tokio::process.
 #[derive(Clone)]
 pub struct TokioCommandRunner {
-    #[allow(dead_code)]
-    process_env: std::sync::Arc<dyn ProcessEnv>,
     containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl TokioCommandRunner {
     pub fn new() -> Self {
         Self {
-            process_env: std::sync::Arc::new(DefaultProcessEnv),
             containment: None,
+            cancellation: None,
         }
     }
 
@@ -725,9 +748,14 @@ impl TokioCommandRunner {
         containment: crate::process_containment::ProcessContainmentHandle,
     ) -> Self {
         Self {
-            process_env: std::sync::Arc::new(DefaultProcessEnv),
             containment: Some(containment),
+            cancellation: None,
         }
+    }
+
+    fn with_cancellation(mut self, cancellation: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 }
 
@@ -777,10 +805,12 @@ impl Drop for HookContainmentDropGuard {
         };
         let handle = self.handle.clone();
         // Drop/cancellation cannot await, so transfer reconciliation to a
-        // daemon task. Normal timeout/completion paths await the same barrier
-        // inline and disarm this guard before returning.
+        // short delivery task. Once the bounded actor accepts the lease, the
+        // actor owns all retries; this task does not run a cleanup loop.
+        // Normal timeout/completion paths await the barrier inline and disarm
+        // this guard before returning.
         tokio::spawn(async move {
-            terminate_and_prove_empty(&handle, &lease).await;
+            let _ = handle.reconcile_lease(lease).await;
         });
     }
 }
@@ -869,6 +899,7 @@ impl CommandRunner for TokioCommandRunner {
         let mut child_stdin = io.stdin.take();
         let mut child_stdout = io.stdout.take();
         let mut child_stderr = io.stderr.take();
+        let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         let stdin_fut = async {
             if let Some(mut input) = child_stdin.take() {
@@ -878,7 +909,8 @@ impl CommandRunner for TokioCommandRunner {
         };
 
         // Read stdout with independent cap.
-        let stdout_fut = async {
+        let stdout_overflow = overflow_tx.clone();
+        let stdout_fut = async move {
             if let Some(mut out) = child_stdout.take() {
                 let mut temp = vec![0u8; OUTPUT_CAP_BYTES + 1];
                 let mut total = Vec::new();
@@ -891,6 +923,7 @@ impl CommandRunner for TokioCommandRunner {
                     total.extend_from_slice(&temp[..n]);
                     if total.len() > OUTPUT_CAP_BYTES {
                         total.truncate(OUTPUT_CAP_BYTES);
+                        let _ = stdout_overflow.try_send(());
                         return (Some((total, true)), false);
                     }
                 }
@@ -900,7 +933,7 @@ impl CommandRunner for TokioCommandRunner {
             }
         };
 
-        let stderr_fut = async {
+        let stderr_fut = async move {
             if let Some(mut err) = child_stderr.take() {
                 let mut buffer = vec![0_u8; OUTPUT_CAP_BYTES + 1];
                 let mut total = 0_usize;
@@ -911,6 +944,7 @@ impl CommandRunner for TokioCommandRunner {
                         Ok(read) => {
                             total = total.saturating_add(read);
                             if total > OUTPUT_CAP_BYTES {
+                                let _ = overflow_tx.try_send(());
                                 return (true, false);
                             }
                         }
@@ -929,8 +963,17 @@ impl CommandRunner for TokioCommandRunner {
                 tokio::join!(stdin_fut, stdout_fut, stderr_fut, io.wait.as_mut());
             (stdin_result, stdout_result, stderr_result, wait_result)
         };
-        let (stdin_failed, stdout_result, stdout_pipe_failed, stderr_truncated, stderr_pipe_failed, exit_code, timed_out) =
-            match tokio::time::timeout(timeout, operation).await {
+        let cancellation = self
+            .cancellation
+            .clone()
+            .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+        let cancellation_enabled = self.cancellation.is_some();
+        let (stdin_failed, stdout_result, stdout_pipe_failed, stderr_truncated, stderr_pipe_failed, exit_code, timed_out, overflowed, cancelled) =
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled(), if cancellation_enabled => (false, None, false, false, false, None, false, false, true),
+                _ = overflow_rx.recv() => (false, None, false, false, false, None, false, true, false),
+                completed = tokio::time::timeout(timeout, operation) => match completed {
                 Ok((stdin_result, (stdout_result, stdout_pipe_failed), (stderr_truncated, stderr_pipe_failed), wait_result)) => (
                     stdin_result.is_err(),
                     stdout_result,
@@ -939,8 +982,11 @@ impl CommandRunner for TokioCommandRunner {
                     stderr_pipe_failed,
                     wait_result.unwrap_or(None),
                     false,
+                    false,
+                    false,
                 ),
-                Err(_) => (false, None, false, false, false, None, true),
+                Err(_) => (false, None, false, false, false, None, true, false, false),
+                }
             };
 
         terminate_and_prove_empty(containment, &lease).await;
@@ -956,21 +1002,40 @@ impl CommandRunner for TokioCommandRunner {
             duration_ms,
             spawn_failed: stdin_failed,
             timeout: timed_out,
-            failure_reason: if timed_out {
+            failure_reason: if cancelled {
+                Some(REASON_HOOK_CANCELLED)
+            } else if timed_out {
                 Some(REASON_HOOK_TIMED_OUT)
             } else if stdin_failed {
                 Some(REASON_PIPE_IO_FAILED)
             } else if stdout_pipe_failed || stderr_pipe_failed {
                 Some(REASON_PIPE_IO_FAILED)
-            } else if stdout_truncated || stderr_truncated {
+            } else if overflowed || stdout_truncated || stderr_truncated {
                 Some(REASON_OUTPUT_LIMIT_EXCEEDED)
             } else if exit_code.is_none() && !timed_out {
                 Some(REASON_NO_EXIT_STATUS)
             } else {
                 None
             },
-            output_truncated: stdout_truncated || stderr_truncated,
+            output_truncated: overflowed || stdout_truncated || stderr_truncated,
         }
+    }
+
+    async fn run_cancellable(
+        &self,
+        executable: &Path,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+        stdin: &str,
+        timeout: Duration,
+        session_id: Uuid,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HookRawOutput {
+        self.clone()
+            .with_cancellation(cancel.clone())
+            .run(executable, args, env, cwd, stdin, timeout, session_id)
+            .await
     }
 }
 
@@ -1532,6 +1597,36 @@ pub(crate) async fn run_stop_hooks(
     subagent_id: Option<&str>,
     state: &mut StopGateState,
 ) -> StopHookOutcome {
+    run_stop_hooks_cancellable(
+        runner,
+        process_env,
+        registry,
+        event,
+        match_value,
+        session_id,
+        workspace_root,
+        db,
+        subagent_id,
+        state,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_stop_hooks_cancellable(
+    runner: &dyn CommandRunner,
+    process_env: &dyn ProcessEnv,
+    registry: &HookRegistry,
+    event: HookEvent,
+    match_value: &str,
+    session_id: Uuid,
+    workspace_root: &Path,
+    db: &crate::db::Db,
+    subagent_id: Option<&str>,
+    state: &mut StopGateState,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> StopHookOutcome {
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
         if let Err(error) = db
@@ -1643,7 +1738,7 @@ pub(crate) async fn run_stop_hooks(
         let timeout = Duration::from_secs(hook.timeout_secs as u64);
         let args = &hook.command[1..];
         let raw = runner
-            .run(
+            .run_cancellable(
                 &executable,
                 args,
                 &child_env,
@@ -1651,6 +1746,7 @@ pub(crate) async fn run_stop_hooks(
                 &stdin,
                 timeout,
                 session_id,
+                cancel,
             )
             .await;
 

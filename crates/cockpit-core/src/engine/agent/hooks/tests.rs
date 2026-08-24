@@ -1254,12 +1254,10 @@ async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
     );
 
     // preCompact / postCompact: matcher = compact source; typed field
-    // `compactSource`. `agent_requested` is preserved as its OWN value (F2),
-    // never collapsed into `auto`.
+    // `compactSource` uses the closed public `manual` / `auto` vocabulary.
     for (event, key, source) in [
         (HookEvent::PreCompact, "preCompact", "manual"),
         (HookEvent::PostCompact, "postCompact", "auto"),
-        (HookEvent::PreCompact, "preCompact", "agent_requested"),
     ] {
         let (rows, stdin) = observe_once(
             &env,
@@ -1278,22 +1276,22 @@ async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
         assert_eq!(stdin["hookEventName"], key);
         assert_eq!(stdin["compactSource"], source);
     }
-    // An `agent_requested` compaction must not fire an `auto`-only hook.
+    // A manual compaction must not fire an `auto`-only hook.
     let (rows, _) = observe_once(
         &env,
         &registry(vec![observe_hook(HookEvent::PreCompact, "auto")]),
         HookEvent::PreCompact,
-        "agent_requested",
+        "manual",
         None,
         ObserveFields {
-            compact_source: Some("agent_requested"),
+            compact_source: Some("manual"),
             ..Default::default()
         },
     )
     .await;
     assert!(
         rows.is_empty(),
-        "agent_requested must stay a distinct compactSource from auto"
+        "manual must stay a distinct compactSource from auto"
     );
 
     // stopFailure: matcher = `error_class_match_value`; typed field `errorClass`.
@@ -1683,6 +1681,10 @@ async fn tool_hook_runner_argv_timeout_and_proven_empty() {
 
     let (db, contained_session_id) = db_session().await;
     let adapter = crate::process_containment::FakeProvenAdapter::default();
+    // The first platform kill fails after the durable state reaches Stopping.
+    // The runner must retry the adapter operation, not mistake the duplicate
+    // durable RequestStop transition for completed cleanup.
+    adapter.set_kill_fail_once(true);
     let actor = crate::process_containment::ProcessContainmentActor::start(
         db,
         Arc::new(adapter.clone()),
@@ -1700,7 +1702,7 @@ async fn tool_hook_runner_argv_timeout_and_proven_empty() {
         .await;
     assert_eq!(contained.exit_code, Some(0));
     assert_eq!(adapter.spawn_log().len(), 1);
-    assert_eq!(adapter.terminate_log().len(), 1);
+    assert_eq!(adapter.terminate_log().len(), 2);
 }
 
 use uuid::Uuid;
@@ -2725,6 +2727,7 @@ impl HookDocumentationContract {
                     HookApplicability::NormalRootDoneOnly => "normalRootDoneOnly",
                     HookApplicability::InferenceErrorOnly => "inferenceErrorOnly",
                     HookApplicability::ChildOnly => "childOnly",
+                    HookApplicability::PreparedApplyAttempt => "preparedApplyAttempt",
                     HookApplicability::SuccessfulCompactionOnly => "successfulCompactionOnly",
                     HookApplicability::EverySession => "everySession",
                 };
@@ -2779,7 +2782,7 @@ impl HookDocumentationContract {
                 REASON_OUTPUT_LIMIT_EXCEEDED,
                 REASON_NONZERO_EXIT_PREFIX,
                 REASON_NO_EXIT_STATUS,
-                REASON_EMPTY_NOT_PROVEN,
+                REASON_HOOK_CANCELLED,
                 REASON_PIPE_IO_FAILED,
             ],
             unsupported_formats: vec![

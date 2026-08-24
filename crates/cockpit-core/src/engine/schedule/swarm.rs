@@ -330,7 +330,7 @@ async fn run_swarm_loop(
     let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
 
     for _ in 0..SWARM_MAX_TURNS {
-        let outcome = crate::engine::agent::turn_with_backup(
+        let outcome_result = crate::engine::agent::turn_with_backup(
             &agent,
             backup_model.as_ref(),
             &fallback_models,
@@ -366,7 +366,41 @@ async fn run_swarm_loop(
             turn_tx,
             None,
         )
-        .await?;
+        .await;
+        let outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(failure) = crate::engine::model::as_inference_failure(&error) {
+                    let match_value =
+                        crate::engine::agent::hooks::error_class_match_value(&failure.class);
+                    let hook_snapshot = pinned.snapshot();
+                    let hook_runner = ctx.process_containment.clone().map_or_else(
+                        crate::engine::agent::hooks::TokioCommandRunner::new,
+                        crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                    );
+                    crate::engine::agent::hooks::run_observe_hooks(
+                        &hook_runner,
+                        &crate::engine::agent::hooks::DefaultProcessEnv,
+                        hook_snapshot.hooks(),
+                        crate::config::extended::hooks::HookEvent::StopFailure,
+                        match_value,
+                        ctx.session.id,
+                        &ctx.cwd,
+                        &ctx.session.db,
+                        None,
+                        None,
+                        Some(spec.worker.agent_name()),
+                        Some(job_id),
+                        crate::engine::agent::hooks::ObserveFields {
+                            error_class: Some(match_value),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -385,7 +419,7 @@ async fn run_swarm_loop(
                 if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                     reason,
                     additional_context,
-                } = crate::engine::agent::hooks::run_stop_hooks(
+                } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                     &hook_runner,
                     &crate::engine::agent::hooks::DefaultProcessEnv,
                     hook_snapshot.hooks(),
@@ -396,6 +430,7 @@ async fn run_swarm_loop(
                     &ctx.session.db,
                     Some(job_id),
                     &mut stop_gate,
+                    &cancel,
                 )
                 .await
                     && !cancel.is_cancelled()
@@ -464,7 +499,7 @@ async fn run_swarm_loop(
                 if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                     reason,
                     additional_context,
-                } = crate::engine::agent::hooks::run_stop_hooks(
+                } = crate::engine::agent::hooks::run_stop_hooks_cancellable(
                     &hook_runner,
                     &crate::engine::agent::hooks::DefaultProcessEnv,
                     hook_snapshot.hooks(),
@@ -475,6 +510,7 @@ async fn run_swarm_loop(
                     &ctx.session.db,
                     Some(job_id),
                     &mut stop_gate,
+                    &cancel,
                 )
                 .await
                     && !cancel.is_cancelled()

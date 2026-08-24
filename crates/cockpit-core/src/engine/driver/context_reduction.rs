@@ -1152,7 +1152,10 @@ impl Driver {
             return false;
         }
         if self.session.take_agent_compact_request() {
-            self.do_compact_with_source(tx, "agent_requested").await;
+            // The public hook vocabulary intentionally exposes why the
+            // compaction ran (`manual` versus pressure-driven `auto`), not the
+            // internal mechanism that submitted it.
+            self.do_compact_with_source(tx, "manual").await;
             return true;
         }
         // One-shot: `/compact` hands off to a fresh session, so firing again
@@ -1235,7 +1238,7 @@ impl Driver {
         };
         // `preCompact` observe hooks: PREPARE succeeded, so a compaction WILL be
         // attempted — fire now, strictly before the destructive apply below.
-        // Matcher / `compactSource` is the compaction source (`agent_requested`
+        // Matcher / `compactSource` is the closed compaction source (`manual`
         // | `auto` | `manual`). Observe-only / fail-open. (Prepare-failure above
         // returned before reaching here, so it fires neither pre nor post.)
         self.fire_observe_hook(

@@ -4930,9 +4930,10 @@ impl Driver {
         runner: &dyn crate::engine::agent::hooks::CommandRunner,
         process_env: &dyn crate::engine::agent::hooks::ProcessEnv,
         state: &mut crate::engine::agent::hooks::StopGateState,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> crate::engine::agent::hooks::StopHookOutcome {
         let snapshot = self.config.snapshot();
-        crate::engine::agent::hooks::run_stop_hooks(
+        crate::engine::agent::hooks::run_stop_hooks_cancellable(
             runner,
             process_env,
             snapshot.hooks(),
@@ -4943,6 +4944,7 @@ impl Driver {
             &self.session.db,
             None,
             state,
+            cancel,
         )
         .await
     }
@@ -4953,6 +4955,7 @@ impl Driver {
     /// still active. Terminal unwind paths never call this helper.
     async fn consult_active_child_stop_gate(
         &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> crate::engine::agent::hooks::StopHookOutcome {
         if self.stack.len() <= 1 {
             return crate::engine::agent::hooks::StopHookOutcome::End;
@@ -4963,7 +4966,7 @@ impl Driver {
         let mut state = std::mem::take(&mut frame.stop_gate);
         let snapshot = self.config.snapshot();
         let runner = self.hook_runner();
-        let outcome = crate::engine::agent::hooks::run_stop_hooks(
+        let outcome = crate::engine::agent::hooks::run_stop_hooks_cancellable(
             &runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
@@ -4974,6 +4977,7 @@ impl Driver {
             &self.session.db,
             child_id.as_deref(),
             &mut state,
+            cancel,
         )
         .await;
         if let Some(frame) = self.stack.last_mut()
@@ -8741,7 +8745,7 @@ impl Driver {
                     // and inject the structured envelope as the parent's tool
                     // result. `Return` is only ever emitted by a delegated
                     // child, so the stack always has a parent below it.
-                    let gate_outcome = self.consult_active_child_stop_gate().await;
+                    let gate_outcome = self.consult_active_child_stop_gate(&cancel).await;
                     if cancel.is_cancelled() {
                         self.unwind_stack_to_root_and_discard_pending_input(
                             StackUnwindReason::Cancelled,
@@ -8767,7 +8771,7 @@ impl Driver {
                 }
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
-                        let gate_outcome = self.consult_active_child_stop_gate().await;
+                        let gate_outcome = self.consult_active_child_stop_gate(&cancel).await;
                         if cancel.is_cancelled() {
                             self.unwind_stack_to_root_and_discard_pending_input(
                                 StackUnwindReason::Cancelled,
@@ -8872,6 +8876,7 @@ impl Driver {
                             &hook_runner,
                             &crate::engine::agent::hooks::DefaultProcessEnv,
                             &mut root_stop_gate,
+                            &cancel,
                         )
                         .await
                     {
@@ -8903,6 +8908,16 @@ impl Driver {
                         crate::engine::agent::hooks::StopHookOutcome::Continue { .. }
                         | crate::engine::agent::hooks::StopHookOutcome::End
                         | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd(_) => {}
+                    }
+                    if cancel.is_cancelled() {
+                        self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
+                        self.unwind_stack_to_root_and_discard_pending_input(
+                            StackUnwindReason::Cancelled,
+                            input_rx,
+                            tx,
+                        )
+                        .await;
+                        return Ok(());
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq).await {

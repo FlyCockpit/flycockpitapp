@@ -2612,7 +2612,7 @@ async fn request_compact_honored_at_safe_boundary() {
         .filter(|event| event.kind == "session_compacted")
         .collect();
     assert_eq!(compact_events.len(), 1);
-    assert_eq!(compact_events[0].data["source"], "agent_requested");
+    assert_eq!(compact_events[0].data["source"], "manual");
 }
 
 #[tokio::test]

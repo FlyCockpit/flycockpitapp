@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +36,8 @@ const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const MAX_KNOWLEDGE_FILES: usize = 4096;
+const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
+const MAX_KNOWLEDGE_DEPTH: usize = 32;
 const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
@@ -138,26 +141,47 @@ struct EmbeddedConcept {
 
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
-    let mut index_md = None;
-    let mut log_md = None;
-    let mut concepts = Vec::new();
+    if !root.exists() {
+        return Ok(KnowledgeBundle {
+            root,
+            index_md: None,
+            log_md: None,
+            concepts: Vec::new(),
+        });
+    }
+    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        &root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )?;
+    parse_bundle_snapshot(root, documents)
+}
 
-    for path in markdown_files(&root)? {
-        let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        let body = fs::read_to_string(&path)
-            .with_context(|| format!("reading knowledge file {}", path.display()))?;
-        match rel.to_string_lossy().as_ref() {
-            "index.md" => index_md = Some(body),
-            "log.md" => log_md = Some(body),
-            _ => {
-                if let Some(concept) = parse_concept(&root, rel, &body)? {
-                    concepts.push(concept);
-                }
-            }
+fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for concept in concepts {
+        if !ids.insert(concept.id.as_str()) {
+            bail!(
+                "knowledge bundle {} contains duplicate concept ID `{}`",
+                root.display(),
+                concept.id
+            );
         }
     }
+    Ok(())
+}
 
+fn finish_bundle(
+    root: PathBuf,
+    index_md: Option<String>,
+    log_md: Option<String>,
+    mut concepts: Vec<KnowledgeConcept>,
+) -> Result<KnowledgeBundle> {
     concepts.sort_by(|a, b| a.path.cmp(&b.path));
+    validate_unique_concept_ids(&root, &concepts)?;
     Ok(KnowledgeBundle {
         root,
         index_md,
@@ -184,13 +208,7 @@ fn parse_bundle_snapshot(
             }
         }
     }
-    concepts.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(KnowledgeBundle {
-        root,
-        index_md,
-        log_md,
-        concepts,
-    })
+    finish_bundle(root, index_md, log_md, concepts)
 }
 
 pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
@@ -238,33 +256,6 @@ pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
         }
     }
     out
-}
-
-fn markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    collect_markdown_files(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            collect_markdown_files(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<KnowledgeConcept>> {
@@ -430,8 +421,9 @@ impl KnowledgeIndex {
         embedder: Arc<dyn Embedder>,
     ) -> Result<(Self, IndexStats)> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("creating knowledge bundle {}", root.display()))?;
+        if !root.exists() {
+            bail!("knowledge bundle does not exist: {}", root.display());
+        }
         let bundle = parse_bundle(&root)?;
         Self::open_snapshot(bundle, root.join(SIDE_CAR_FILE), embedder).await
     }
@@ -505,6 +497,21 @@ impl KnowledgeIndex {
 }
 
 fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
+    if !sidecar.exists() {
+        match crate::private_fs::write_private_file_exclusive(sidecar, b"") {
+            Ok(()) => {}
+            Err(error) if sidecar.exists() => {
+                crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+                    .map_err(anyhow::Error::from)
+                    .context("securing concurrently-created knowledge sidecar")?;
+                tracing::debug!(%error, "knowledge sidecar was created concurrently");
+            }
+            Err(error) => return Err(error).context("creating private knowledge sidecar"),
+        }
+    } else {
+        crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+            .map_err(anyhow::Error::from)?;
+    }
     let conn = Connection::open(sidecar)
         .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))?;
     load_sqlite_vec_for_sidecar(&conn)?;
@@ -1221,6 +1228,8 @@ fn assistant_knowledge_snapshot(
     let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
         diagnostic_root,
         MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
         MAX_KNOWLEDGE_FILE_BYTES,
         MAX_KNOWLEDGE_TOTAL_BYTES,
     )?;

@@ -7,6 +7,131 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, TestBackend};
 use std::collections::BTreeMap;
 
+struct QueuedSettingsDaemon {
+    responses: Mutex<std::collections::VecDeque<Result<Response, String>>>,
+    requests: Mutex<Vec<Request>>,
+}
+
+impl SettingsDaemonEffect for QueuedSettingsDaemon {
+    fn request(&self, request: Request) -> Result<Response, String> {
+        self.requests.lock().unwrap().push(request);
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("queued settings daemon response")
+    }
+}
+
+fn settings_layer_base(
+    config: &ExtendedConfig,
+    layer_id: &str,
+    generation: u64,
+) -> serde_json::Value {
+    let mut base = serde_json::to_value(config).unwrap();
+    let object = base.as_object_mut().unwrap();
+    object.insert(
+        "__cockpit_settings_layer_id".into(),
+        serde_json::Value::String(layer_id.into()),
+    );
+    object.insert(
+        "__cockpit_settings_layer_kind".into(),
+        serde_json::to_value(cockpit_core::daemon::proto::CockpitConfigLayer::Project).unwrap(),
+    );
+    object.insert(
+        "__cockpit_settings_generation".into(),
+        serde_json::Value::Number(generation.into()),
+    );
+    object.insert("__cockpit_denylist_entries".into(), serde_json::json!([]));
+    base
+}
+
+#[test]
+fn injected_settings_transport_uses_production_receipt_and_reconciliation_path() {
+    let path = std::path::PathBuf::from("/workspace/.cockpit/config.json");
+    let config = ExtendedConfig::default();
+    let layer_id = "layer-capability";
+    let base = settings_layer_base(&config, layer_id, 7);
+    let effect = Arc::new(QueuedSettingsDaemon {
+        responses: Mutex::new(std::collections::VecDeque::from([
+            Ok(Response::ExtendedConfigSaved {
+                hash: "revision-2".into(),
+                config_generation: 8,
+                layer_id: layer_id.into(),
+                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                consumed_revision: "revision-1".into(),
+                result_revision: "revision-2".into(),
+                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+            }),
+            Ok(Response::ExtendedConfigSnapshot {
+                layers: vec![cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot {
+                    layer_id: layer_id.into(),
+                    kind: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                    display_path: path.display().to_string(),
+                    config: Box::new(config.clone()),
+                    denylist: Vec::new(),
+                    revision: "revision-2".into(),
+                    authored_paths: Vec::new(),
+                }],
+                config_generation: 8,
+            }),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+
+    with_settings_daemon_effect(effect.clone(), || {
+        apply_settings_patch_via_daemon(
+            &path,
+            Some(std::path::Path::new("/workspace")),
+            &base,
+            &config,
+            "revision-1",
+        )
+        .unwrap();
+    });
+    let requests = effect.requests.lock().unwrap();
+    assert!(matches!(
+        requests[0],
+        Request::ApplyExtendedConfigPatch { .. }
+    ));
+    assert!(matches!(
+        requests[1],
+        Request::GetExtendedConfigSnapshot { .. }
+    ));
+}
+
+#[test]
+fn injected_settings_transport_rejects_wrong_consumed_revision() {
+    let config = ExtendedConfig::default();
+    let effect = Arc::new(QueuedSettingsDaemon {
+        responses: Mutex::new(std::collections::VecDeque::from([Ok(
+            Response::ExtendedConfigSaved {
+                hash: "revision-2".into(),
+                config_generation: 8,
+                layer_id: "layer-capability".into(),
+                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                consumed_revision: "wrong-revision".into(),
+                result_revision: "revision-2".into(),
+                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+            },
+        )])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let error = with_settings_daemon_effect(effect, || {
+        apply_settings_patch_via_daemon(
+            std::path::Path::new("/workspace/.cockpit/config.json"),
+            Some(std::path::Path::new("/workspace")),
+            &settings_layer_base(&config, "layer-capability", 7),
+            &config,
+            "revision-1",
+        )
+        .unwrap_err()
+    });
+    assert!(error.contains("unexpected settings patch response"));
+}
+
 #[test]
 fn settings_config_mutations_stay_daemon_owned() {
     let source = include_str!("mod.rs");
@@ -24,29 +149,20 @@ fn settings_config_mutations_stay_daemon_owned() {
     assert!(!source.contains("base_hash = None"));
     // The retired local-save helper must be gone entirely.
     assert!(!source.contains("remove_raw_path_and_save"));
-    // Direct local config writes / directory scaffolding survive only as
-    // `#[cfg(test)]` fallbacks; the production branch of every funnel uses the
-    // daemon. Prove each occurrence is test-gated (an ungated production write
-    // would regress the owner boundary).
-    for pattern in ["doc.write(&self.extended)", "scaffold_config_dir("] {
-        let mut rest = source;
-        let mut seen = 0usize;
-        while let Some(idx) = rest.find(pattern) {
-            seen += 1;
-            let preceding = &rest[..idx];
-            let window = &preceding[preceding.len().saturating_sub(240)..];
-            assert!(
-                window.contains("#[cfg(test)]"),
-                "local config write `{pattern}` must stay behind #[cfg(test)]; \
-                 production must go through the daemon"
-            );
-            rest = &rest[idx + pattern.len()..];
-        }
+    for forbidden in [
+        "ExtendedConfigDoc",
+        "doc.write(&self.extended)",
+        "scaffold_config_dir(",
+        "remove_raw_path_and_save",
+    ] {
         assert!(
-            seen > 0,
-            "expected `{pattern}` to exist as a test-only fallback"
+            !source.contains(forbidden),
+            "settings tests must not retain local authority substitute `{forbidden}`"
         );
     }
+    assert!(source.contains("trait SettingsDaemonEffect"));
+    assert!(source.contains("with_settings_daemon_effect"));
+    assert!(source.contains("settings_daemon_request(Request::ApplyExtendedConfigPatch"));
 }
 
 fn entry(id_models: &[&str]) -> ProviderEntry {

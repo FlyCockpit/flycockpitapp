@@ -2123,6 +2123,7 @@ pub enum Request {
         name: String,
         /// Revision returned by `GetAssistant`, covering the registry row and
         /// exact daemon-read definition bytes.
+        #[serde(default)]
         expected_revision: String,
     },
 
@@ -2753,9 +2754,29 @@ impl Request {
                 if encoded.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("extended config patch exceeds maximum length".to_string());
                 }
-                let mut fields = std::collections::HashSet::new();
-                if !patch.fields.iter().all(|field| fields.insert(*field)) {
-                    return Err("extended config patch repeats a field".to_string());
+                if patch.operations.len() > 128
+                    || (patch.operations.is_empty()
+                        && patch.denylist.is_empty()
+                        && patch.redacted_mutations.is_empty()
+                        && !patch.materialize)
+                {
+                    return Err("extended config patch operation count is invalid".to_string());
+                }
+                let mut paths = std::collections::HashSet::new();
+                for operation in &patch.operations {
+                    let path = operation.path();
+                    if path.is_empty()
+                        || path.len() > 16
+                        || path.iter().any(|part| {
+                            part.is_empty()
+                                || part.len() > 128
+                                || part.contains('\0')
+                                || part.contains("__cockpit_redacted_setting_v1_")
+                        })
+                        || !paths.insert(path)
+                    {
+                        return Err("extended config patch path is invalid or repeated".to_string());
+                    }
                 }
                 if expected_revision.is_empty() || expected_revision.len() > 128 {
                     return Err("extended config revision is invalid".to_string());

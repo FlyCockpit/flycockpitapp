@@ -293,6 +293,11 @@ pub struct GoalSettingsOverride {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_verification_attempts: Option<u32>,
+    /// Forward-compatible keys that this daemon does not interpret. Agent
+    /// settings mutations preserve them byte-semantically instead of
+    /// rebuilding the object from only the three fields exposed by the TUI.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl GoalSettingsOverride {
@@ -304,6 +309,7 @@ impl GoalSettingsOverride {
             && self.cold_skeptic_count.is_none()
             && self.cold_skeptic_model.is_none()
             && self.max_verification_attempts.is_none()
+            && self.extra.is_empty()
     }
 
     pub fn validate(&self) -> Result<()> {

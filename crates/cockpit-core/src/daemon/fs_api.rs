@@ -37,7 +37,6 @@ struct SettingsCapability {
     /// Exact values replaced by opaque per-occurrence placeholders in the
     /// typed owner projection. These bytes never cross the daemon boundary.
     redacted_occurrences: std::collections::HashMap<String, RedactedSettingOccurrence>,
-    issued_at: Instant,
     expires_at: Instant,
 }
 
@@ -307,16 +306,16 @@ pub async fn get_extended_config_snapshot(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
             let mut layers = Vec::new();
+            let mut pending_capabilities = Vec::new();
             let now = Instant::now();
-            settings_capabilities()
-                .lock()
-                .map_err(|_| internal("settings capability registry lock poisoned"))?
-                .retain(|_, cap| cap.expires_at > now);
             for (kind, target) in discovered_settings_layers(&root)? {
                 let guard =
                     cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
                 let (raw, identity) = read_optional_config(&target)?;
                 let revision = content_hash(&raw);
+                let raw_document: serde_json::Value =
+                    serde_json::from_slice(&raw).map_err(bad_request_config)?;
+                let authored_paths = authored_typed_paths(&raw_document);
                 let mut config: cockpit_config::config::extended::ExtendedConfig =
                     serde_json::from_slice(&raw).map_err(bad_request_config)?;
                 let denylist_ids: Vec<String> = config
@@ -339,12 +338,9 @@ pub async fn get_extended_config_snapshot(
                 config = redacted_config;
                 let id = Uuid::new_v4();
                 drop(guard);
-                settings_capabilities()
-                    .lock()
-                    .map_err(|_| internal("settings capability registry lock poisoned"))?
-                    .insert(
-                        id,
-                        SettingsCapability {
+                pending_capabilities.push((
+                    id,
+                    SettingsCapability {
                             owner: owner.clone(),
                             root: root.clone(),
                             target: target.clone(),
@@ -353,11 +349,9 @@ pub async fn get_extended_config_snapshot(
                             identity,
                             denylist_ids,
                             redacted_occurrences,
-                            issued_at: now,
                             expires_at: now + SETTINGS_CAPABILITY_TTL,
-                        },
-                    );
-                enforce_settings_capability_caps(&owner)?;
+                    },
+                ));
                 layers.push(cockpit_proto::ExtendedConfigLayerSnapshot {
                     layer_id: id.to_string(),
                     kind,
@@ -365,8 +359,27 @@ pub async fn get_extended_config_snapshot(
                     config: Box::new(config),
                     denylist,
                     revision,
+                    authored_paths,
                 });
             }
+            let mut capabilities = settings_capabilities()
+                .lock()
+                .map_err(|_| internal("settings capability registry lock poisoned"))?;
+            capabilities.retain(|_, cap| cap.expires_at > now);
+            let owner_count = capabilities
+                .values()
+                .filter(|cap| cap.owner == owner)
+                .count();
+            if owner_count.saturating_add(pending_capabilities.len())
+                > SETTINGS_CAPABILITY_OWNER_CAP
+                || capabilities.len().saturating_add(pending_capabilities.len())
+                    > SETTINGS_CAPABILITY_GLOBAL_CAP
+            {
+                return Err(conflict(
+                    "settings snapshot capability capacity is exhausted; wait for an existing snapshot to expire",
+                ));
+            }
+            capabilities.extend(pending_capabilities);
             Ok(Response::ExtendedConfigSnapshot {
                 layers,
                 config_generation: crate::daemon::server::inventory::current_config_generation(),
@@ -374,6 +387,33 @@ pub async fn get_extended_config_snapshot(
         }),
     )
     .await
+}
+
+fn authored_typed_paths(document: &serde_json::Value) -> Vec<Vec<String>> {
+    fn visit(value: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        match value {
+            serde_json::Value::Object(object) if !object.is_empty() => {
+                for (key, value) in object {
+                    path.push(key.clone());
+                    visit(value, path, out);
+                    path.pop();
+                }
+            }
+            _ => out.push(path.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(object) = document.as_object() {
+        for (key, value) in object {
+            if cockpit_proto::ExtendedConfigField::from_json_key(key).is_none() {
+                continue;
+            }
+            let mut path = vec![key.clone()];
+            visit(value, &mut path, &mut out);
+        }
+    }
+    out.sort();
+    out
 }
 
 fn redact_extended_config_projection(
@@ -439,10 +479,23 @@ fn redact_extended_config_projection(
 
 const SETTINGS_REDACTED_OCCURRENCE_PREFIX: &str = "__cockpit_redacted_setting_v1_";
 
-fn restore_redacted_occurrences(
-    value: &mut serde_json::Value,
+fn pointer_for_path(path: &[String]) -> String {
+    path.iter().fold(String::new(), |mut pointer, part| {
+        pointer.push('/');
+        pointer.push_str(&part.replace('~', "~0").replace('/', "~1"));
+        pointer
+    })
+}
+
+fn path_is_prefix(prefix: &[String], pointer: &str) -> bool {
+    let encoded = pointer_for_path(prefix);
+    pointer == encoded || pointer.starts_with(&format!("{encoded}/"))
+}
+
+fn restore_patch_redacted_occurrences(
+    operations: &mut [cockpit_proto::ExtendedConfigPathMutation],
     occurrences: &std::collections::HashMap<String, RedactedSettingOccurrence>,
-    authorized_pointers: &std::collections::HashSet<String>,
+    explicitly_authorized: &std::collections::HashSet<String>,
 ) -> Result<(), ErrorPayload> {
     fn visit(
         value: &mut serde_json::Value,
@@ -476,27 +529,93 @@ fn restore_redacted_occurrences(
                     visit(value, &format!("{pointer}/{key}"), occurrences, seen)?;
                 }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
+            _ => {}
         }
         Ok(())
     }
+
     let mut seen = std::collections::HashSet::new();
-    visit(value, "", occurrences, &mut seen)?;
+    for operation in operations.iter_mut() {
+        if let cockpit_proto::ExtendedConfigPathMutation::Set { path, value } = operation {
+            visit(value, &pointer_for_path(path), occurrences, &mut seen)?;
+        }
+    }
     for (token, occurrence) in occurrences {
-        if !seen.contains(token) && !authorized_pointers.contains(&occurrence.pointer) {
+        let touched_by_parent = operations
+            .iter()
+            .any(|operation| path_is_prefix(operation.path(), &occurrence.pointer));
+        if touched_by_parent
+            && !seen.contains(token)
+            && !explicitly_authorized.contains(&occurrence.pointer)
+        {
             return Err(bad_request(
-                "redacted settings placeholder was removed without exact pointer authorization",
+                "redacted setting would be removed without an exact-path Set or Unset",
             ));
         }
     }
     Ok(())
 }
 
-/// Apply a client-generated JSON merge patch under the daemon's config lock.
-/// Unknown and secret-bearing keys absent from the patch remain byte-for-byte
-/// represented in the parsed document; the final typed render validates all
-/// known settings and preserves the daemon-owned image registry.
+fn value_at_object_path<'a>(
+    root: &'a serde_json::Value,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    path.iter()
+        .try_fold(root, |value, key| value.as_object()?.get(key))
+}
+
+fn set_object_path(
+    root: &mut serde_json::Value,
+    path: &[String],
+    value: serde_json::Value,
+) -> Result<(), ErrorPayload> {
+    let (leaf, parents) = path
+        .split_last()
+        .ok_or_else(|| bad_request("settings path cannot be empty"))?;
+    let mut cursor = root;
+    for key in parents {
+        if !cursor.is_object() {
+            return Err(bad_request("settings path crosses a non-object value"));
+        }
+        cursor = cursor
+            .as_object_mut()
+            .expect("checked object")
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    cursor
+        .as_object_mut()
+        .ok_or_else(|| bad_request("settings path parent is not an object"))?
+        .insert(leaf.clone(), value);
+    Ok(())
+}
+
+fn unset_object_path(root: &mut serde_json::Value, path: &[String]) -> Result<(), ErrorPayload> {
+    let (leaf, parents) = path
+        .split_last()
+        .ok_or_else(|| bad_request("settings path cannot be empty"))?;
+    let mut cursor = root;
+    for key in parents {
+        let Some(next) = cursor
+            .as_object_mut()
+            .and_then(|object| object.get_mut(key))
+        else {
+            return Ok(());
+        };
+        cursor = next;
+    }
+    if let Some(object) = cursor.as_object_mut() {
+        object.remove(leaf);
+        Ok(())
+    } else {
+        Err(bad_request("settings path parent is not an object"))
+    }
+}
+
+/// Apply exact typed path operations under the daemon's config lock. Unknown
+/// and secret-bearing keys outside those paths remain represented in the raw
+/// document; the final typed render validates every selected path and
+/// preserves the daemon-owned image registry.
 pub async fn apply_extended_config_patch(
     ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
@@ -506,7 +625,7 @@ pub async fn apply_extended_config_patch(
     owner: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
-    join_fs_handler(
+    let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
             let id = Uuid::parse_str(&layer_id)
@@ -544,24 +663,33 @@ pub async fn apply_extended_config_patch(
             }
             let mut document: serde_json::Value =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            let current_typed: cockpit_config::config::extended::ExtendedConfig =
-                serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            let current_typed = serde_json::to_value(current_typed).map_err(internal)?;
-            let mut candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
-            let mut selected_fields = std::collections::HashSet::new();
-            for field in patch.fields.iter().chain(&patch.unset_fields) {
-                if !selected_fields.insert(field.json_key()) {
-                    return Err(bad_request(
-                        "a settings field may be selected exactly once",
-                    ));
-                }
-                if *field == cockpit_proto::ExtendedConfigField::ImageGeneration {
+            let mut operations = patch.operations;
+            let mut selected_paths = std::collections::HashSet::new();
+            for operation in &operations {
+                let path = operation.path();
+                let Some(root_field) = path
+                    .first()
+                    .and_then(|key| cockpit_proto::ExtendedConfigField::from_json_key(key))
+                else {
+                    return Err(bad_request("settings mutation path is not owned by the typed schema"));
+                };
+                if root_field == cockpit_proto::ExtendedConfigField::ImageGeneration {
                     return Err(bad_request(
                         "image generation settings require the dedicated daemon API",
                     ));
                 }
+                if path == ["redact".to_string(), "denylist".to_string()] {
+                    return Err(bad_request("redact.denylist requires its opaque occurrence API"));
+                }
+                if !selected_paths.insert(path.to_vec()) {
+                    return Err(bad_request("a settings path may be selected exactly once"));
+                }
             }
-            let authorized_redacted_pointers = patch
+            let mut authorized_redacted_pointers: std::collections::HashSet<String> = operations
+                .iter()
+                .map(|operation| pointer_for_path(operation.path()))
+                .collect();
+            let explicit_redacted_pointers: std::collections::HashSet<String> = patch
                 .redacted_mutations
                 .iter()
                 .map(|mutation| match mutation {
@@ -569,48 +697,33 @@ pub async fn apply_extended_config_patch(
                     | cockpit_proto::RedactedOccurrenceMutation::Unset { pointer } => pointer.clone(),
                 })
                 .collect();
-            restore_redacted_occurrences(
-                &mut candidate,
+            if explicit_redacted_pointers.iter().any(|pointer| {
+                pointer.len() > 2_048
+                    || pointer.contains('\0')
+                    || !pointer.starts_with('/')
+                    || pointer.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX)
+            }) {
+                return Err(bad_request("redacted settings pointer is invalid"));
+            }
+            authorized_redacted_pointers.extend(explicit_redacted_pointers);
+            restore_patch_redacted_occurrences(
+                &mut operations,
                 &capability.redacted_occurrences,
                 &authorized_redacted_pointers,
             )?;
+            for operation in &operations {
+                match operation {
+                    cockpit_proto::ExtendedConfigPathMutation::Set { path, value } => {
+                        set_object_path(&mut document, path, value.clone())?;
+                    }
+                    cockpit_proto::ExtendedConfigPathMutation::Unset { path } => {
+                        unset_object_path(&mut document, path)?;
+                    }
+                }
+            }
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;
-            let candidate = candidate.as_object().expect("ExtendedConfig serializes as object");
-            let current_typed = current_typed.as_object()
-                .expect("ExtendedConfig serializes as object");
-            for field in patch.fields {
-                let key = field.json_key();
-                let value = candidate.get(key).cloned().ok_or_else(|| {
-                    bad_request(format!("typed settings candidate omitted `{key}`"))
-                })?;
-                let current = current_typed.get(key).ok_or_else(|| {
-                    bad_request(format!("typed settings schema omitted `{key}`"))
-                })?;
-                if field == cockpit_proto::ExtendedConfigField::Redact {
-                    let existing = object
-                        .get("redact")
-                        .and_then(serde_json::Value::as_object)
-                        .and_then(|redact| redact.get("denylist"))
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([]));
-                    let mut value = value;
-                    value.as_object_mut().expect("RedactConfig serializes as object")
-                        .insert("denylist".into(), existing.clone());
-                    let mut current = current.clone();
-                    current.as_object_mut().expect("RedactConfig serializes as object")
-                        .insert("denylist".into(), existing.clone());
-                    merge_changed_known_value(
-                        object.entry(key).or_insert(serde_json::Value::Null), &current, value);
-                } else {
-                    merge_changed_known_value(
-                        object.entry(key).or_insert(serde_json::Value::Null), current, value);
-                }
-            }
-            for field in patch.unset_fields {
-                object.remove(field.json_key());
-            }
             apply_redacted_occurrence_mutations(
                 object,
                 patch.redacted_mutations,
@@ -623,6 +736,29 @@ pub async fn apply_extended_config_patch(
                 &raw,
             )
             .map_err(bad_request_config)?;
+            let merged_document: serde_json::Value =
+                serde_json::from_slice(&merged).map_err(bad_request_config)?;
+            let typed_projection = serde_json::to_value(
+                serde_json::from_slice::<cockpit_config::config::extended::ExtendedConfig>(&merged)
+                    .map_err(bad_request_config)?,
+            )
+            .map_err(internal)?;
+            for operation in &operations {
+                match operation {
+                    cockpit_proto::ExtendedConfigPathMutation::Set { path, value } => {
+                        if value_at_object_path(&typed_projection, path) != Some(value) {
+                            return Err(bad_request(
+                                "settings Set path is not represented exactly by the typed schema",
+                            ));
+                        }
+                    }
+                    cockpit_proto::ExtendedConfigPathMutation::Unset { path } => {
+                        if value_at_object_path(&merged_document, path).is_some() {
+                            return Err(internal("settings Unset path remained authored after rendering"));
+                        }
+                    }
+                }
+            }
             let desired_hash = content_hash(&merged);
             let config_generation = if desired_hash != current_hash || (materialize && !existed) {
                 // Re-open immediately before publication while the real
@@ -652,10 +788,19 @@ pub async fn apply_extended_config_patch(
                 layer: capability.kind,
                 consumed_revision: expected_revision,
                 result_revision: desired_hash,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
             })
         }),
     )
-    .await
+    .await?;
+    if let Err(error) = ctx.refresh_redaction_table() {
+        ctx.poison_redaction_publication(&error);
+        if let Response::ExtendedConfigSaved { publication, .. } = &mut response {
+            *publication = cockpit_proto::ConfigPublicationStatus::Degraded;
+        }
+    }
+    Ok(response)
 }
 
 async fn trusted_settings_root(
@@ -739,78 +884,11 @@ fn read_optional_config(
     )
 }
 
-fn enforce_settings_capability_caps(owner: &str) -> Result<(), ErrorPayload> {
-    let mut caps = settings_capabilities()
-        .lock()
-        .map_err(|_| internal("settings capability registry lock poisoned"))?;
-    while caps.values().filter(|cap| cap.owner == owner).count() > SETTINGS_CAPABILITY_OWNER_CAP {
-        let oldest = caps
-            .iter()
-            .filter(|(_, cap)| cap.owner == owner)
-            .min_by_key(|(_, cap)| cap.issued_at)
-            .map(|(id, _)| *id);
-        if let Some(id) = oldest {
-            caps.remove(&id);
-        } else {
-            break;
-        }
-    }
-    while caps.len() > SETTINGS_CAPABILITY_GLOBAL_CAP {
-        let oldest = caps
-            .iter()
-            .min_by_key(|(_, cap)| cap.issued_at)
-            .map(|(id, _)| *id);
-        if let Some(id) = oldest {
-            caps.remove(&id);
-        } else {
-            break;
-        }
-    }
-    Ok(())
-}
-
 fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {
     cockpit_proto::RedactedDenylistEntry {
         entry_id: id.to_owned(),
         fingerprint: id.chars().take(8).collect(),
         display_mask: format!("•••• ({} bytes)", value.len()),
-    }
-}
-
-fn merge_changed_known_value(
-    target: &mut serde_json::Value,
-    current: &serde_json::Value,
-    candidate: serde_json::Value,
-) {
-    if current == &candidate {
-        return;
-    }
-    match (target, current, candidate) {
-        (
-            serde_json::Value::Object(target),
-            serde_json::Value::Object(current),
-            serde_json::Value::Object(candidate),
-        ) => {
-            // Remove only keys known to the typed schema. Unknown raw keys are
-            // absent from `current` and therefore survive untouched.
-            for key in current.keys() {
-                if !candidate.contains_key(key) {
-                    target.remove(key);
-                }
-            }
-            for (key, value) in candidate {
-                if let Some(current) = current.get(&key) {
-                    merge_changed_known_value(
-                        target.entry(key).or_insert(serde_json::Value::Null),
-                        current,
-                        value,
-                    );
-                } else {
-                    target.insert(key, value);
-                }
-            }
-        }
-        (target, _, candidate) => *target = candidate,
     }
 }
 
@@ -953,6 +1031,13 @@ fn apply_redacted_occurrence_mutations(
             return Err(bad_request(
                 "redacted mutation is not bound to one snapshot occurrence",
             ));
+        }
+        if let cockpit_proto::RedactedOccurrenceMutation::Set { value, .. } = &mutation
+            && (value.len() > 64 * 1024
+                || value.contains('\0')
+                || value.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX))
+        {
+            return Err(bad_request("redacted setting replacement is invalid"));
         }
         let (parent, leaf) = parent_mut(&mut root, pointer)?;
         match (parent, mutation) {

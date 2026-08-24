@@ -181,10 +181,19 @@ pub fn read_config_leaf_from_retained_directory(
 pub fn snapshot_markdown_tree_nofollow(
     root: &std::path::Path,
     max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
-    files::snapshot_markdown_tree_nofollow(root, max_files, max_file_bytes, max_total_bytes)
+    files::snapshot_markdown_tree_nofollow(
+        root,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
 }
 
 pub fn hold_terminal_ingress_file_verified(

@@ -41,12 +41,13 @@ pub use agent_installation::{
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES, agent_definition_revision,
-    agent_inventory_revision, agent_source_identity, validate_agent_edit_snapshot,
-    validate_agent_source_identity,
+    agent_inventory_revision, validate_agent_edit_snapshot, validate_agent_mutation_envelope,
+    validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
-    CockpitConfigLayer, DenylistMutation, ExtendedConfigField, ExtendedConfigLayerSnapshot,
-    ExtendedConfigPatch, RedactedDenylistEntry, RedactedOccurrenceMutation,
+    CockpitConfigLayer, ConfigCommitStatus, ConfigPublicationStatus, DenylistMutation,
+    ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
+    ExtendedConfigPathMutation, RedactedDenylistEntry, RedactedOccurrenceMutation,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;

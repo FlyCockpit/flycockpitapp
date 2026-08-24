@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -166,6 +167,8 @@ pub async fn complete_editor_lease(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
+    let completed_lease_id = id.to_string();
+    let consumed_lease_revision = lease.revision.clone();
     let result = match markdown {
         Some(markdown) => {
             match tokio::task::spawn_blocking(move || {
@@ -195,11 +198,14 @@ pub async fn complete_editor_lease(
             snapshot: None,
             config_generation: crate::daemon::server::inventory::current_config_generation(),
             inventory_revision: None,
+            consumed_revision: Some(consumed_lease_revision),
+            completed_lease_id: None,
         }),
     };
-    let Response::AgentMutated(result) = result else {
+    let Response::AgentMutated(mut result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
     };
+    result.completed_lease_id = Some(completed_lease_id);
     editor_leases().lock().map_err(lock_poison)?.remove(&id);
     Ok(Response::AgentEditorLeaseCompleted(result))
 }
@@ -260,17 +266,23 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 let layer = classify_source_layer(root, &path, &target);
                 Ok((
                     layer,
-                    opaque_source_identity(root, &path, layer),
-                    path.to_string_lossy().into_owned(),
+                    opaque_source_identity(root, &path, layer, b"")?,
                     String::new(),
                     nofollow_read(&target)?.is_some(),
                 ))
             });
             let (description, model, valid, diagnostic) = match entry.def {
                 Ok(def) => (Some(def.description), def.model, true, None),
-                Err(error) => (None, None, false, Some(format!("{error:#}"))),
+                Err(_) => (
+                    None,
+                    None,
+                    false,
+                    Some(
+                        "agent definition is invalid; inspect it through the daemon editor".into(),
+                    ),
+                ),
             };
-            let (source_layer, source_identity, source_locator, markdown, target_exists) = source?;
+            let (source_layer, source_identity, markdown, target_exists) = source?;
             let revision = cockpit_proto::agent_definition_revision(
                 &entry.name,
                 source_layer,
@@ -294,9 +306,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 diagnostic,
                 source_layer,
                 source_identity,
-                source_locator,
                 revision,
-                source_content_hash: crate::assistants::markdown_content_hash(&markdown),
                 editable: source_layer == AgentSourceLayer::Workspace && !markdown.is_empty(),
             })
         })
@@ -309,7 +319,7 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         .map_err(bad_config)?
         .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
     let canonical_preview = def.to_markdown().map_err(bad_config)?;
-    let (source_layer, source_identity, source_locator, markdown, target_exists) =
+    let (source_layer, source_identity, markdown, target_exists) =
         source_snapshot_parts(root, name)?;
     let revision = cockpit_proto::agent_definition_revision(
         name,
@@ -333,7 +343,6 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         canonical_preview,
         source_layer,
         source_identity,
-        source_locator,
         edit_target: AgentEditTarget::Workspace,
         revision,
         goal_supervision_json,
@@ -345,7 +354,7 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
 fn source_snapshot_parts(
     root: &Path,
     name: &str,
-) -> Result<(AgentSourceLayer, String, String, String, bool), ErrorPayload> {
+) -> Result<(AgentSourceLayer, String, String, bool), ErrorPayload> {
     let project_override = project_agent_path(root, name)?;
     let target_exists = nofollow_read(&project_override)?.is_some();
     match crate::agents::find_override(root, name) {
@@ -365,14 +374,8 @@ fn source_snapshot_parts(
             let markdown = String::from_utf8(raw)
                 .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
             let layer = classify_source_layer(root, &source, &project_override);
-            let identity = opaque_source_identity(root, &source, layer);
-            Ok((
-                layer,
-                identity,
-                source.to_string_lossy().into_owned(),
-                markdown,
-                target_exists,
-            ))
+            let identity = opaque_source_identity(root, &source, layer, markdown.as_bytes())?;
+            Ok((layer, identity, markdown, target_exists))
         }
         None => {
             let markdown = crate::agents::resolve(root, name)
@@ -380,10 +383,10 @@ fn source_snapshot_parts(
                 .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?
                 .to_markdown()
                 .map_err(bad_config)?;
+            let identity = embedded_source_identity(root, name, markdown.as_bytes());
             Ok((
                 AgentSourceLayer::Embedded,
-                format!("embedded:{name}"),
-                format!("embedded:{name}"),
+                identity,
                 markdown,
                 target_exists,
             ))
@@ -396,6 +399,7 @@ fn mutate_sync(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let consumed_revision = expected_revision.clone();
     let lock_target = root.join(".cockpit/config.json");
     let guard =
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
@@ -591,6 +595,8 @@ fn mutate_sync(
         snapshot,
         config_generation: generation,
         inventory_revision: result_inventory_revision,
+        consumed_revision,
+        completed_lease_id: None,
     }))
 }
 
@@ -662,12 +668,53 @@ fn ensure_workspace_source_or_embedded(snapshot: &AgentEditSnapshot) -> Result<(
     }
 }
 
-fn opaque_source_identity(root: &Path, source: &Path, layer: AgentSourceLayer) -> String {
-    cockpit_proto::agent_source_identity(
-        root.to_string_lossy().as_ref(),
-        source.to_string_lossy().as_ref(),
-        layer,
-    )
+fn digest_identity_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn embedded_source_identity(root: &Path, name: &str, content: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-agent-source-occurrence-v2\0embedded\0");
+    digest_identity_field(&mut digest, root.as_os_str().as_encoded_bytes());
+    digest_identity_field(&mut digest, name.as_bytes());
+    digest_identity_field(&mut digest, content);
+    format!("{digest:x}")
+}
+
+fn opaque_source_identity(
+    root: &Path,
+    source: &Path,
+    layer: AgentSourceLayer,
+    content: &[u8],
+) -> Result<String, ErrorPayload> {
+    let metadata = std::fs::symlink_metadata(source).map_err(internal)?;
+    if metadata.file_type().is_symlink() {
+        return Err(conflict(
+            "agent source became a symlink while minting its identity",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-agent-source-occurrence-v2\0");
+    digest.update([layer as u8]);
+    digest_identity_field(&mut digest, root.as_os_str().as_encoded_bytes());
+    digest_identity_field(&mut digest, source.as_os_str().as_encoded_bytes());
+    digest_identity_field(&mut digest, content);
+    digest.update(metadata.len().to_le_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        digest.update(metadata.file_attributes().to_le_bytes());
+        digest.update(metadata.creation_time().to_le_bytes());
+        digest.update(metadata.last_write_time().to_le_bytes());
+    }
+    Ok(format!("{digest:x}"))
 }
 
 fn current_inventory_revision(root: &Path) -> Result<String, ErrorPayload> {

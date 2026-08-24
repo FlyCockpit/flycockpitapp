@@ -339,7 +339,7 @@
   },
   "attachment_upload_started": {
     "data": {
-      "max_chunk_base64_bytes": 7,
+      "max_chunk_base64_bytes": 262144,
       "upload_id": "11111111-1111-4111-8111-111111111111"
     },
     "response": "attachment_upload_started"
@@ -1907,7 +1907,9 @@
       "layer_id": "11111111-1111-4111-8111-111111111111",
       "layer": "project",
       "consumed_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "result_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "result_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "committed",
+      "publication": "published"
     },
     "response": "extended_config_saved"
   },
@@ -2136,7 +2138,8 @@
         "definition_markdown": "---\nschemaVersion: 2\npublisher: local/11111111-1111-4111-8111-111111111111\nname: helper-bot\ndescription: Helps\nexecutionKind: local_model\n---\n\nHelp.\n",
         "definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
         "definition_diagnostic": null
-      }
+      },
+      "consumed_definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a"
     }
   },
   "extended_config_snapshot": {
@@ -2363,7 +2366,8 @@
             "intelCentralityRanking": true
           },
           "denylist": [],
-          "revision": "revision"
+          "revision": "revision",
+          "authored_paths": []
         }
       ],
       "config_generation": 7
@@ -2382,14 +2386,12 @@
           "valid": true,
           "diagnostic": null,
           "source_layer": "embedded",
-          "source_identity": "embedded:build",
-          "source_locator": "embedded:build",
-          "revision": "e941e41bae1c6556b69472736514f9e59fbd6f45ed6f6e6c4b93c380c1a9c438",
-          "source_content_hash": "bee5eb0cc499ccce6a159649e1550759b5cd42b75faf40ab0f054a7562e90ac9",
+          "source_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
           "editable": false
         }
       ],
-      "inventory_revision": "06620ba02e24ea0aeaee2df2a00923ba76898274eda0565e94a6d3af0a8c1cdf",
+      "inventory_revision": "ea9bc9cf151c9298f6c5d6a0a388c9e5b03444e873c4f3a301d0f274bda60290",
       "config_generation": 7
     }
   },
@@ -2402,13 +2404,12 @@
       "markdown": "---\n---\nBuild.\n",
       "canonical_preview": "---\n---\nBuild.\n",
       "source_layer": "embedded",
-      "source_identity": "embedded:build",
+      "source_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "edit_target": "workspace",
-      "revision": "e941e41bae1c6556b69472736514f9e59fbd6f45ed6f6e6c4b93c380c1a9c438",
+      "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
       "goal_supervision_json": null,
       "editable": false,
-      "supports_goal_supervision": true,
-      "source_locator": "embedded:build"
+      "supports_goal_supervision": true
     }
   },
   "agent_mutated": {
@@ -2418,7 +2419,9 @@
       "affected": 1,
       "snapshot": null,
       "config_generation": 8,
-      "inventory_revision": null
+      "inventory_revision": null,
+      "consumed_revision": "old-revision",
+      "completed_lease_id": null
     }
   },
   "agent_editor_lease_begun": {
@@ -2433,13 +2436,12 @@
         "markdown": "---\n---\nBuild.\n",
         "canonical_preview": "---\n---\nBuild.\n",
         "source_layer": "embedded",
-        "source_identity": "embedded:build",
+        "source_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "edit_target": "workspace",
-        "revision": "e941e41bae1c6556b69472736514f9e59fbd6f45ed6f6e6c4b93c380c1a9c438",
+        "revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
         "goal_supervision_json": null,
         "editable": false,
-        "supports_goal_supervision": true,
-        "source_locator": "embedded:build"
+        "supports_goal_supervision": true
       }
     }
   },
@@ -2450,7 +2452,9 @@
       "affected": 0,
       "snapshot": null,
       "config_generation": 8,
-      "inventory_revision": null
+      "inventory_revision": null,
+      "consumed_revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
+      "completed_lease_id": "11111111-1111-4111-8111-111111111111"
     }
   },
   "extended_config_written": {

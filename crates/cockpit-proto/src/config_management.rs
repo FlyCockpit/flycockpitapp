@@ -11,6 +11,31 @@ pub enum CockpitConfigLayer {
     Project,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigCommitStatus {
+    Committed,
+}
+
+impl Default for ConfigCommitStatus {
+    fn default() -> Self {
+        Self::Committed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigPublicationStatus {
+    Published,
+    Degraded,
+}
+
+impl Default for ConfigPublicationStatus {
+    fn default() -> Self {
+        Self::Published
+    }
+}
+
 /// A daemon-discovered settings layer. `layer_id` is an ephemeral,
 /// occurrence-bound capability; clients never nominate a path or ancestry
 /// depth for a mutation.
@@ -23,22 +48,45 @@ pub struct ExtendedConfigLayerSnapshot {
     pub config: Box<cockpit_config::config::extended::ExtendedConfig>,
     pub denylist: Vec<RedactedDenylistEntry>,
     pub revision: String,
+    /// Exact typed paths authored by this layer. Values remain redacted; this
+    /// list lets a client prove that an Unset removed authorship rather than
+    /// merely observing the same effective default.
+    #[serde(default)]
+    pub authored_paths: Vec<Vec<String>>,
 }
 
-/// The complete typed candidate plus an explicit allowlist of fields to copy
-/// into the authoritative raw document. A client cannot mutate an unknown key:
-/// values are deserialized through `ExtendedConfig` and only named fields are
-/// selected. Secret-bearing denylist entries have a separate opaque-ID API.
+/// A path-scoped mutation of the daemon's authoritative typed settings
+/// document. Paths contain unescaped JSON object keys (not a stringly JSON
+/// pointer), which avoids ambiguous escaping and lets both peers apply the
+/// exact same operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ExtendedConfigPathMutation {
+    Set {
+        path: Vec<String>,
+        value: serde_json::Value,
+    },
+    Unset {
+        path: Vec<String>,
+    },
+}
+
+impl ExtendedConfigPathMutation {
+    pub fn path(&self) -> &[String] {
+        match self {
+            Self::Set { path, .. } | Self::Unset { path } => path,
+        }
+    }
+}
+
+/// Exact typed operations to apply to one daemon-issued layer capability.
+/// Unknown keys elsewhere in the raw document are preserved. The daemon
+/// validates the complete result through `ExtendedConfig` and verifies that
+/// each requested path is represented by that typed projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfigPatch {
-    pub candidate: cockpit_config::config::extended::ExtendedConfig,
-    /// Selected fields whose serialized value is present in `candidate`.
-    pub fields: Vec<ExtendedConfigField>,
-    /// Selected optional/default-valued fields that must be removed from this
-    /// layer. This distinguishes an intentional clear from serde's
-    /// `skip_serializing_if` omission.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unset_fields: Vec<ExtendedConfigField>,
+    #[serde(default)]
+    pub operations: Vec<ExtendedConfigPathMutation>,
     /// Create the selected layer even when typed values are unchanged.
     #[serde(default)]
     pub materialize: bool,
@@ -127,6 +175,76 @@ pub enum ExtendedConfigField {
 }
 
 impl ExtendedConfigField {
+    pub fn from_json_key(key: &str) -> Option<Self> {
+        const ALL: &[ExtendedConfigField] = &[
+            ExtendedConfigField::ResponseMetricsTokenizer,
+            ExtendedConfigField::ImageGeneration,
+            ExtendedConfigField::Harnesses,
+            ExtendedConfigField::AgentGuidanceFiles,
+            ExtendedConfigField::Concurrency,
+            ExtendedConfigField::AgentDirs,
+            ExtendedConfigField::GitignoreAllow,
+            ExtendedConfigField::Redact,
+            ExtendedConfigField::Tui,
+            ExtendedConfigField::Name,
+            ExtendedConfigField::PackagesDirectory,
+            ExtendedConfigField::Tools,
+            ExtendedConfigField::Web,
+            ExtendedConfigField::ComputerUse,
+            ExtendedConfigField::AllowRemoteConfig,
+            ExtendedConfigField::UtilityModel,
+            ExtendedConfigField::TranslationModel,
+            ExtendedConfigField::CheapCode,
+            ExtendedConfigField::SmartCode,
+            ExtendedConfigField::Reasoning,
+            ExtendedConfigField::AgentChoosesSubagentModel,
+            ExtendedConfigField::AutoTitle,
+            ExtendedConfigField::SkillInjection,
+            ExtendedConfigField::PredictNextMessageModel,
+            ExtendedConfigField::HarnessReportSummarization,
+            ExtendedConfigField::CompactModel,
+            ExtendedConfigField::BtwModel,
+            ExtendedConfigField::EmbeddingModel,
+            ExtendedConfigField::ProjectKnowledge,
+            ExtendedConfigField::KnowledgeInjectMaxTokens,
+            ExtendedConfigField::CompactPrompt,
+            ExtendedConfigField::PromptInjectionGuard,
+            ExtendedConfigField::Preflight,
+            ExtendedConfigField::SystemPrompt,
+            ExtendedConfigField::Schedule,
+            ExtendedConfigField::ResourceScheduler,
+            ExtendedConfigField::Sandbox,
+            ExtendedConfigField::Daemon,
+            ExtendedConfigField::MediaResources,
+            ExtendedConfigField::Retention,
+            ExtendedConfigField::Delegation,
+            ExtendedConfigField::Deepthink,
+            ExtendedConfigField::Review,
+            ExtendedConfigField::GoalSupervision,
+            ExtendedConfigField::Lsp,
+            ExtendedConfigField::DataSyntax,
+            ExtendedConfigField::LoopGuard,
+            ExtendedConfigField::MaxPrimaryRounds,
+            ExtendedConfigField::Dialog,
+            ExtendedConfigField::Skills,
+            ExtendedConfigField::LlmMode,
+            ExtendedConfigField::DefaultPrimaryAgent,
+            ExtendedConfigField::RemovedDefaultPrimaryAgent,
+            ExtendedConfigField::Translation,
+            ExtendedConfigField::SandboxEscalationEnabled,
+            ExtendedConfigField::DefaultApprovalMode,
+            ExtendedConfigField::ApprovalPolicy,
+            ExtendedConfigField::PredictNextMessage,
+            ExtendedConfigField::ShellCompression,
+            ExtendedConfigField::CommandResourceProfiles,
+            ExtendedConfigField::InlineThink,
+            ExtendedConfigField::HintToolCallCorrections,
+            ExtendedConfigField::TextEmbeddedRecovery,
+            ExtendedConfigField::IntelCentralityRanking,
+        ];
+        ALL.iter().copied().find(|field| field.json_key() == key)
+    }
+
     pub fn json_key(self) -> &'static str {
         match self {
             Self::ResponseMetricsTokenizer => "response_metrics_tokenizer",

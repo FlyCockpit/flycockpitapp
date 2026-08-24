@@ -40,6 +40,7 @@ struct GoalSettingsDraft {
     cold_skeptic_count: Option<usize>,
     cold_skeptic_model: Option<String>,
     max_verification_attempts: Option<u32>,
+    original: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GoalSettingsDraft {
@@ -48,19 +49,63 @@ impl GoalSettingsDraft {
             .map(serde_json::from_str::<serde_json::Value>)
             .transpose()?
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("goal supervision snapshot must be an object"))?;
+        let checked_u64 = |key: &str| -> Result<Option<u64>> {
+            object
+                .get(key)
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!("goal supervision `{key}` must be an unsigned integer")
+                    })
+                })
+                .transpose()
+        };
+        let cold_skeptic_count = checked_u64("coldSkepticCount")?
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("coldSkepticCount is outside this platform's range"))?;
+        if cold_skeptic_count.is_some_and(|value| !(1..=5).contains(&value)) {
+            anyhow::bail!("coldSkepticCount must be between 1 and 5");
+        }
+        let max_verification_attempts = checked_u64("maxVerificationAttempts")?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("maxVerificationAttempts is outside the u32 range"))?;
+        if max_verification_attempts == Some(0) {
+            anyhow::bail!("maxVerificationAttempts must be at least 1");
+        }
+        let cold_skeptic_model = object
+            .get("coldSkepticModel")
+            .map(|value| {
+                let model = value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("goal supervision `coldSkepticModel` must be a string")
+                })?;
+                validate_model_reference(model)?;
+                Ok::<_, anyhow::Error>(model.to_string())
+            })
+            .transpose()?;
+        for key in ["plannerModel", "evaluatorModel", "gatekeeperModel"] {
+            if let Some(value) = object.get(key) {
+                let model = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("goal supervision `{key}` must be a string"))?;
+                validate_model_reference(model)?;
+            }
+        }
+        if let Some(value) = object.get("defaultTokenBudget") {
+            if value.as_i64().is_none_or(|value| value <= 0) {
+                anyhow::bail!(
+                    "goal supervision `defaultTokenBudget` must be a positive signed integer"
+                );
+            }
+        }
         Ok(Self {
-            cold_skeptic_count: value
-                .get("coldSkepticCount")
-                .and_then(serde_json::Value::as_u64)
-                .map(|value| value as usize),
-            cold_skeptic_model: value
-                .get("coldSkepticModel")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            max_verification_attempts: value
-                .get("maxVerificationAttempts")
-                .and_then(serde_json::Value::as_u64)
-                .map(|value| value as u32),
+            cold_skeptic_count,
+            cold_skeptic_model,
+            max_verification_attempts,
+            original: object.clone(),
         })
     }
 
@@ -74,9 +119,11 @@ impl GoalSettingsDraft {
         if self.max_verification_attempts == Some(0) {
             anyhow::bail!("max rounds must be at least 1");
         }
-        let mut object = serde_json::Map::new();
+        let mut object = self.original.clone();
         if let Some(value) = self.cold_skeptic_count {
             object.insert("coldSkepticCount".into(), value.into());
+        } else {
+            object.remove("coldSkepticCount");
         }
         if let Some(value) = self
             .cold_skeptic_model
@@ -84,16 +131,15 @@ impl GoalSettingsDraft {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let valid = value
-                .split_once('/')
-                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty());
-            if !valid {
-                anyhow::bail!("skeptic model must use provider/model form");
-            }
+            validate_model_reference(value)?;
             object.insert("coldSkepticModel".into(), value.into());
+        } else {
+            object.remove("coldSkepticModel");
         }
         if let Some(value) = self.max_verification_attempts {
             object.insert("maxVerificationAttempts".into(), value.into());
+        } else {
+            object.remove("maxVerificationAttempts");
         }
         if object.is_empty() {
             Ok(None)
@@ -109,6 +155,19 @@ impl GoalSettingsDraft {
             GoalSettingsField::MaxRounds => self.max_verification_attempts = None,
         }
     }
+}
+
+fn validate_model_reference(value: &str) -> Result<()> {
+    let valid = value.split_once('/').is_some_and(|(provider, model)| {
+        !provider.is_empty()
+            && !model.is_empty()
+            && !provider.chars().any(char::is_whitespace)
+            && !model.chars().any(char::is_whitespace)
+    });
+    if !valid {
+        anyhow::bail!("model references must use non-empty provider/model form");
+    }
+    Ok(())
 }
 
 pub(crate) struct GoalSettingsPane {
@@ -327,20 +386,26 @@ impl GoalSettingsPane {
                     "agent-scoped goal settings are unavailable for vNext agents; save them for this session instead"
                 );
             }
+            let prior_goal_json = if self.draft.original.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&self.draft.original)?)
+            };
+            let goal_patch = cockpit_core::daemon::proto::GoalSupervisionPatch {
+                cold_skeptic_count: Some(self.draft.cold_skeptic_count),
+                cold_skeptic_model: Some(
+                    self.draft
+                        .cold_skeptic_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                ),
+                max_verification_attempts: Some(self.draft.max_verification_attempts),
+            };
             let mutation = cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
                 name: self.agent_name.clone(),
-                patch: cockpit_core::daemon::proto::GoalSupervisionPatch {
-                    cold_skeptic_count: Some(self.draft.cold_skeptic_count),
-                    cold_skeptic_model: Some(
-                        self.draft
-                            .cold_skeptic_model
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string),
-                    ),
-                    max_verification_attempts: Some(self.draft.max_verification_attempts),
-                },
+                patch: goal_patch.clone(),
             };
             let expected_revision = self.revision.clone();
             let response = crate::tui::agent_runner::daemon_request_blocking(
@@ -359,11 +424,25 @@ impl GoalSettingsPane {
                 &self.cwd,
                 &mutation,
                 Some(&expected_revision),
+                None,
             )
             .map_err(anyhow::Error::msg)?;
-            if let Some(snapshot) = result.snapshot {
-                self.revision = snapshot.revision;
-            }
+            let snapshot = result
+                .snapshot
+                .ok_or_else(|| anyhow::anyhow!("daemon omitted the goal-settings snapshot"))?;
+            cockpit_proto::validate_goal_supervision_projection(
+                prior_goal_json.as_deref(),
+                &goal_patch,
+                snapshot.goal_supervision_json.as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            self.revision = snapshot.revision;
+            self.draft.original = snapshot
+                .goal_supervision_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default();
         }
         Ok(GoalSettingsOutcome::Apply {
             override_json,

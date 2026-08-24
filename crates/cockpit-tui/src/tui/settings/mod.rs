@@ -81,17 +81,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-#[cfg(test)]
-use cockpit_config::dirs::scaffold_config_dir;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs,
 };
 use cockpit_config::extended::ExtendedConfig;
-#[cfg(test)]
-use cockpit_config::extended::ExtendedConfigDoc;
-#[cfg(test)]
-use cockpit_config::providers::ConfigDoc;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 
 /// Settings-side operations that need provider secrets must use the persistent
@@ -134,6 +128,61 @@ fn run_settings_daemon<T>(
     Err("settings daemon RPC requires the application runtime".to_string())
 }
 
+/// Injectable transport boundary for settings daemon effects.  Both the real
+/// client and tests feed responses through the same snapshot/patch/receipt
+/// validation below; a test double may replace only transport, never config
+/// loading or persistence.
+trait SettingsDaemonEffect: Send + Sync {
+    fn request(&self, request: Request) -> Result<Response, String>;
+}
+
+struct ProductionSettingsDaemonEffect;
+
+impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
+    fn request(&self, request: Request) -> Result<Response, String> {
+        run_settings_daemon(async move {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_DAEMON_EFFECT: std::cell::RefCell<Option<Arc<dyn SettingsDaemonEffect>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn settings_daemon_request(request: Request) -> Result<Response, String> {
+    #[cfg(test)]
+    if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
+        return effect.request(request);
+    }
+    ProductionSettingsDaemonEffect.request(request)
+}
+
+#[cfg(test)]
+fn with_settings_daemon_effect<T>(
+    effect: Arc<dyn SettingsDaemonEffect>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<Arc<dyn SettingsDaemonEffect>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SETTINGS_DAEMON_EFFECT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.replace(Some(effect)));
+    let _reset = Reset(previous);
+    operation()
+}
+
 fn config_layer_request(
     _path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -151,67 +200,63 @@ fn extended_config_layer_snapshot(
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
     let project_root = config_layer_request(path, project_root)?;
     let requested_path = path.display().to_string();
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        match client
-            .request(Request::GetExtendedConfigSnapshot { project_root })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Ok(Response::ExtendedConfigSnapshot {
-                layers,
-                config_generation,
-            }) => {
-                let layer = layers
-                    .into_iter()
-                    .find(|layer| layer.display_path == requested_path)
-                    .ok_or_else(|| {
-                        "settings target is not a daemon-discovered layer".to_string()
-                    })?;
-                let mut config = *layer.config;
-                let denylist = layer.denylist;
-                let revision = layer.revision;
-                config.redact.denylist = denylist
-                    .iter()
-                    .map(|entry| entry.display_mask.clone())
-                    .collect();
-                let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
-                value
-                    .as_object_mut()
-                    .expect("ExtendedConfig serializes as object")
-                    .insert(
-                        "__cockpit_denylist_entries".into(),
-                        serde_json::to_value(denylist).map_err(|error| error.to_string())?,
-                    );
-                value
-                    .as_object_mut()
-                    .expect("ExtendedConfig serializes as object")
-                    .insert(
-                        "__cockpit_settings_layer_kind".into(),
-                        serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
-                    );
-                value
-                    .as_object_mut()
-                    .expect("ExtendedConfig serializes as object")
-                    .insert(
-                        "__cockpit_settings_generation".into(),
-                        serde_json::Value::Number(config_generation.into()),
-                    );
-                value
-                    .as_object_mut()
-                    .expect("ExtendedConfig serializes as object")
-                    .insert(
-                        "__cockpit_settings_layer_id".into(),
-                        serde_json::Value::String(layer.layer_id),
-                    );
-                Ok((config, value, revision))
-            }
-            Ok(other) => Err(format!("unexpected settings snapshot response: {other:?}")),
-            Err(error) => Err(error.to_string()),
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+        Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        } => {
+            let layer = layers
+                .into_iter()
+                .find(|layer| layer.display_path == requested_path)
+                .ok_or_else(|| "settings target is not a daemon-discovered layer".to_string())?;
+            let mut config = *layer.config;
+            let denylist = layer.denylist;
+            let revision = layer.revision;
+            let authored_paths = layer.authored_paths;
+            config.redact.denylist = denylist
+                .iter()
+                .map(|entry| entry.display_mask.clone())
+                .collect();
+            let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
+            value
+                .as_object_mut()
+                .expect("ExtendedConfig serializes as object")
+                .insert(
+                    "__cockpit_denylist_entries".into(),
+                    serde_json::to_value(denylist).map_err(|error| error.to_string())?,
+                );
+            value
+                .as_object_mut()
+                .expect("ExtendedConfig serializes as object")
+                .insert(
+                    "__cockpit_settings_authored_paths".into(),
+                    serde_json::to_value(authored_paths).map_err(|error| error.to_string())?,
+                );
+            value
+                .as_object_mut()
+                .expect("ExtendedConfig serializes as object")
+                .insert(
+                    "__cockpit_settings_layer_kind".into(),
+                    serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
+                );
+            value
+                .as_object_mut()
+                .expect("ExtendedConfig serializes as object")
+                .insert(
+                    "__cockpit_settings_generation".into(),
+                    serde_json::Value::Number(config_generation.into()),
+                );
+            value
+                .as_object_mut()
+                .expect("ExtendedConfig serializes as object")
+                .insert(
+                    "__cockpit_settings_layer_id".into(),
+                    serde_json::Value::String(layer.layer_id),
+                );
+            Ok((config, value, revision))
         }
-    })
+        other => Err(format!("unexpected settings snapshot response: {other:?}")),
+    }
 }
 
 fn apply_settings_patch_via_daemon(
@@ -222,12 +267,10 @@ fn apply_settings_patch_via_daemon(
     revision: &str,
 ) -> Result<(), String> {
     let desired_value = serde_json::to_value(desired).map_err(|error| error.to_string())?;
-    let (fields, unset_fields) = changed_extended_fields(base, &desired_value)?;
+    let operations = changed_extended_paths(base, &desired_value)?;
     let denylist = denylist_mutations(base, &desired.redact.denylist)?;
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
-        candidate: desired.clone(),
-        fields,
-        unset_fields,
+        operations: operations.clone(),
         materialize: false,
         denylist,
         redacted_mutations: Vec::new(),
@@ -250,62 +293,58 @@ fn apply_settings_patch_via_daemon(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        let response = client
-            .request(Request::ApplyExtendedConfigPatch {
-                project_root: project_root.clone(),
-                layer_id: layer_id.clone(),
-                patch,
-                expected_revision: expected_revision.clone(),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        let (result_revision, result_generation) = match response {
-            Ok(Response::ExtendedConfigSaved {
-                hash,
-                config_generation,
-                layer_id: returned_layer_id,
-                layer,
-                consumed_revision,
-                result_revision,
-            }) if returned_layer_id == layer_id
-                && layer == expected_layer
-                && consumed_revision == expected_revision
-                && hash == result_revision
-                && (config_generation == expected_generation
-                    || config_generation == expected_generation.saturating_add(1)) =>
-            {
-                (result_revision, config_generation)
-            }
-            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
-            Err(error) => Err(error.to_string()),
-        }?;
-        match client
-            .request(Request::GetExtendedConfigSnapshot { project_root })
-            .await
-            .map_err(|error| error.to_string())?
+    let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        project_root: project_root.clone(),
+        layer_id: layer_id.clone(),
+        patch,
+        expected_revision: expected_revision.clone(),
+    });
+    let (result_revision, result_generation) = match response {
+        Ok(Response::ExtendedConfigSaved {
+            hash,
+            config_generation,
+            layer_id: returned_layer_id,
+            layer,
+            consumed_revision,
+            result_revision,
+            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            publication,
+        }) if returned_layer_id == layer_id
+            && layer == expected_layer
+            && consumed_revision == expected_revision
+            && hash == result_revision
+            && (config_generation == expected_generation
+                || config_generation == expected_generation.saturating_add(1)) =>
         {
-            Ok(Response::ExtendedConfigSnapshot {
-                layers,
-                config_generation,
-            }) if config_generation == result_generation
-                && layers.iter().any(|layer| {
-                    layer.display_path == requested_path
-                        && layer.kind == expected_layer
-                        && layer.revision == result_revision
-                }) =>
-            {
-                Ok(())
+            if publication == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded {
+                return Err("settings committed but redaction publication is degraded; restart the daemon before continuing".into());
             }
-            Ok(_) => {
-                Err("settings commit could not be reconciled to an authoritative snapshot".into())
-            }
-            Err(error) => Err(error.to_string()),
+            (result_revision, config_generation)
         }
-    })
+        Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }?;
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+        Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        } if config_generation == result_generation
+            && layers.iter().any(|layer| {
+                layer.display_path == requested_path
+                    && layer.kind == expected_layer
+                    && layer.revision == result_revision
+                    && validate_settings_operations(
+                        &operations,
+                        &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
+                        &layer.authored_paths,
+                    )
+                    .is_ok()
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err("settings commit could not be reconciled to an authoritative snapshot".into()),
+    }
 }
 
 pub(super) fn apply_typed_settings_document_edit(
@@ -315,16 +354,14 @@ pub(super) fn apply_typed_settings_document_edit(
 ) -> Result<(), String> {
     let (_, mut document, revision) = extended_config_layer_snapshot(path, project_root)?;
     let authority_base = document.clone();
+    let operations = operations_from_merge_patch(&patch)?;
     apply_json_merge_patch_local(&mut document, patch);
     let desired: ExtendedConfig = serde_json::from_value(document)
         .map_err(|error| format!("invalid typed settings edit: {error}"))?;
-    let desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
-    let (fields, unset_fields) = changed_extended_fields(&authority_base, &desired_value)?;
+    let _desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
     let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
-        candidate: desired,
-        fields,
-        unset_fields,
+        operations: operations.clone(),
         materialize: true,
         denylist,
         redacted_mutations: Vec::new(),
@@ -347,62 +384,58 @@ pub(super) fn apply_typed_settings_document_edit(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        let response = client
-            .request(Request::ApplyExtendedConfigPatch {
-                project_root: project_root.clone(),
-                layer_id: layer_id.clone(),
-                patch,
-                expected_revision: revision.clone(),
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        let (result_revision, result_generation) = match response {
-            Ok(Response::ExtendedConfigSaved {
-                hash,
-                config_generation,
-                layer_id: returned_layer_id,
-                layer,
-                consumed_revision,
-                result_revision,
-            }) if returned_layer_id == layer_id
-                && layer == expected_layer
-                && consumed_revision == revision
-                && hash == result_revision
-                && (config_generation == expected_generation
-                    || config_generation == expected_generation.saturating_add(1)) =>
-            {
-                (result_revision, config_generation)
-            }
-            Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
-            Err(error) => Err(error.to_string()),
-        }?;
-        match client
-            .request(Request::GetExtendedConfigSnapshot { project_root })
-            .await
-            .map_err(|error| error.to_string())?
+    let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        project_root: project_root.clone(),
+        layer_id: layer_id.clone(),
+        patch,
+        expected_revision: revision.clone(),
+    });
+    let (result_revision, result_generation) = match response {
+        Ok(Response::ExtendedConfigSaved {
+            hash,
+            config_generation,
+            layer_id: returned_layer_id,
+            layer,
+            consumed_revision,
+            result_revision,
+            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            publication,
+        }) if returned_layer_id == layer_id
+            && layer == expected_layer
+            && consumed_revision == revision
+            && hash == result_revision
+            && (config_generation == expected_generation
+                || config_generation == expected_generation.saturating_add(1)) =>
         {
-            Ok(Response::ExtendedConfigSnapshot {
-                layers,
-                config_generation,
-            }) if config_generation == result_generation
-                && layers.iter().any(|layer| {
-                    layer.display_path == requested_path
-                        && layer.kind == expected_layer
-                        && layer.revision == result_revision
-                }) =>
-            {
-                Ok(())
+            if publication == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded {
+                return Err("settings committed but redaction publication is degraded; restart the daemon before continuing".into());
             }
-            Ok(_) => {
-                Err("settings commit could not be reconciled to an authoritative snapshot".into())
-            }
-            Err(error) => Err(error.to_string()),
+            (result_revision, config_generation)
         }
-    })
+        Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }?;
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot { project_root })? {
+        Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        } if config_generation == result_generation
+            && layers.iter().any(|layer| {
+                layer.display_path == requested_path
+                    && layer.kind == expected_layer
+                    && layer.revision == result_revision
+                    && validate_settings_operations(
+                        &operations,
+                        &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
+                        &layer.authored_paths,
+                    )
+                    .is_ok()
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err("settings commit could not be reconciled to an authoritative snapshot".into()),
+    }
 }
 
 fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_json::Value) {
@@ -423,102 +456,162 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
     }
 }
 
-fn changed_extended_fields(
+fn changed_extended_paths(
     base: &serde_json::Value,
     desired: &serde_json::Value,
-) -> Result<
-    (
-        Vec<cockpit_core::daemon::proto::ExtendedConfigField>,
-        Vec<cockpit_core::daemon::proto::ExtendedConfigField>,
-    ),
-    String,
-> {
-    use cockpit_core::daemon::proto::ExtendedConfigField as F;
-    let all = [
-        F::ResponseMetricsTokenizer,
-        F::ImageGeneration,
-        F::Harnesses,
-        F::AgentGuidanceFiles,
-        F::Concurrency,
-        F::AgentDirs,
-        F::GitignoreAllow,
-        F::Redact,
-        F::Tui,
-        F::Name,
-        F::PackagesDirectory,
-        F::Tools,
-        F::Web,
-        F::ComputerUse,
-        F::AllowRemoteConfig,
-        F::UtilityModel,
-        F::TranslationModel,
-        F::CheapCode,
-        F::SmartCode,
-        F::Reasoning,
-        F::AgentChoosesSubagentModel,
-        F::AutoTitle,
-        F::SkillInjection,
-        F::PredictNextMessageModel,
-        F::HarnessReportSummarization,
-        F::CompactModel,
-        F::BtwModel,
-        F::EmbeddingModel,
-        F::ProjectKnowledge,
-        F::KnowledgeInjectMaxTokens,
-        F::CompactPrompt,
-        F::PromptInjectionGuard,
-        F::Preflight,
-        F::SystemPrompt,
-        F::Schedule,
-        F::ResourceScheduler,
-        F::Sandbox,
-        F::Daemon,
-        F::MediaResources,
-        F::Retention,
-        F::Delegation,
-        F::Deepthink,
-        F::Review,
-        F::GoalSupervision,
-        F::Lsp,
-        F::DataSyntax,
-        F::LoopGuard,
-        F::MaxPrimaryRounds,
-        F::Dialog,
-        F::Skills,
-        F::LlmMode,
-        F::DefaultPrimaryAgent,
-        F::RemovedDefaultPrimaryAgent,
-        F::Translation,
-        F::SandboxEscalationEnabled,
-        F::DefaultApprovalMode,
-        F::ApprovalPolicy,
-        F::PredictNextMessage,
-        F::ShellCompression,
-        F::CommandResourceProfiles,
-        F::InlineThink,
-        F::HintToolCallCorrections,
-        F::TextEmbeddedRecovery,
-        F::IntelCentralityRanking,
-    ];
+) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
+    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
     let base = base
         .as_object()
         .ok_or_else(|| "settings base is not an object".to_string())?;
     let desired = desired
         .as_object()
         .ok_or_else(|| "settings candidate is not an object".to_string())?;
-    let mut set = Vec::new();
-    let mut unset = Vec::new();
-    for field in all {
-        if base.get(field.json_key()) == desired.get(field.json_key()) {
-            continue;
+    fn diff(
+        base: Option<&serde_json::Value>,
+        desired: Option<&serde_json::Value>,
+        path: &mut Vec<String>,
+        out: &mut Vec<M>,
+    ) {
+        if base == desired {
+            return;
         }
-        if desired.contains_key(field.json_key()) {
-            set.push(field);
-        } else {
-            unset.push(field);
+        match (base, desired) {
+            (_, None) => out.push(M::Unset { path: path.clone() }),
+            (Some(serde_json::Value::Object(left)), Some(serde_json::Value::Object(right))) => {
+                let mut keys = left.keys().chain(right.keys()).cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    if path.len() == 1 && path[0] == "redact" && key == "denylist" {
+                        continue;
+                    }
+                    path.push(key.clone());
+                    diff(left.get(&key), right.get(&key), path, out);
+                    path.pop();
+                }
+            }
+            (_, Some(value)) => out.push(M::Set {
+                path: path.clone(),
+                value: value.clone(),
+            }),
         }
     }
-    Ok((set, unset))
+    let mut operations = Vec::new();
+    let mut keys = base
+        .keys()
+        .chain(desired.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let Some(field) = ExtendedConfigField::from_json_key(&key) else {
+            continue;
+        };
+        if field == ExtendedConfigField::ImageGeneration {
+            continue;
+        }
+        let mut path = vec![key.clone()];
+        diff(
+            base.get(&key),
+            desired.get(&key),
+            &mut path,
+            &mut operations,
+        );
+    }
+    Ok(operations)
+}
+
+fn operations_from_merge_patch(
+    patch: &serde_json::Value,
+) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
+    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
+    fn visit(value: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<M>) {
+        match value {
+            serde_json::Value::Null => out.push(M::Unset { path: path.clone() }),
+            serde_json::Value::Object(object) if !object.is_empty() => {
+                for (key, value) in object {
+                    path.push(key.clone());
+                    visit(value, path, out);
+                    path.pop();
+                }
+            }
+            value => out.push(M::Set {
+                path: path.clone(),
+                value: value.clone(),
+            }),
+        }
+    }
+    let object = patch
+        .as_object()
+        .ok_or_else(|| "typed settings patch root must be an object".to_string())?;
+    let mut operations = Vec::new();
+    for (key, value) in object {
+        let Some(field) = ExtendedConfigField::from_json_key(key) else {
+            return Err(format!("settings patch path `{key}` is not typed"));
+        };
+        if field == ExtendedConfigField::ImageGeneration {
+            return Err("image generation settings require their dedicated API".into());
+        }
+        let mut path = vec![key.clone()];
+        visit(value, &mut path, &mut operations);
+    }
+    Ok(operations)
+}
+
+fn validate_settings_operations(
+    operations: &[cockpit_core::daemon::proto::ExtendedConfigPathMutation],
+    snapshot: &serde_json::Value,
+    authored_paths: &[Vec<String>],
+) -> Result<(), String> {
+    fn at_path<'a>(value: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
+        path.iter()
+            .try_fold(value, |value, key| value.as_object()?.get(key))
+    }
+    fn coherent(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+        match (expected, actual) {
+            (serde_json::Value::String(expected), serde_json::Value::String(actual))
+                if expected.contains("__cockpit_redacted_setting_v1_") =>
+            {
+                actual.contains("__cockpit_redacted_setting_v1_")
+            }
+            (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+                expected.len() == actual.len()
+                    && expected.iter().zip(actual).all(|(a, b)| coherent(a, b))
+            }
+            (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => expected
+                .iter()
+                .all(|(key, value)| actual.get(key).is_some_and(|other| coherent(value, other))),
+            _ => expected == actual,
+        }
+    }
+    for operation in operations {
+        match operation {
+            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Set { path, value } => {
+                if !authored_paths
+                    .iter()
+                    .any(|authored| authored == path || authored.starts_with(path))
+                    || !at_path(snapshot, path).is_some_and(|actual| coherent(value, actual))
+                {
+                    return Err(
+                        "authoritative settings snapshot did not preserve an exact Set".into(),
+                    );
+                }
+            }
+            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Unset { path } => {
+                if authored_paths
+                    .iter()
+                    .any(|authored| authored == path || authored.starts_with(path))
+                {
+                    return Err(
+                        "authoritative settings snapshot still authors an Unset path".into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn denylist_mutations(
@@ -1137,9 +1230,8 @@ pub struct SettingsCx {
     /// Opaque revision of the raw authoritative layer corresponding to
     /// `extended_base`.
     extended_revision: Option<String>,
-    /// Malformed known extended-config fields skipped during the most
-    /// recent load. Unknown raw keys are preserved separately by
-    /// [`ExtendedConfigDoc`].
+    /// Malformed known extended-config fields reported by the daemon during
+    /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
@@ -1863,12 +1955,6 @@ impl Dialog {
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
-        #[cfg(test)]
-        {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths).providers.is_empty()
-        }
-        #[cfg(not(test))]
         daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
 
@@ -2032,12 +2118,6 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        #[cfg(test)]
-        let cfg = {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths)
-        };
-        #[cfg(not(test))]
         let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
             return Self::open(cwd);
         };
@@ -2765,17 +2845,11 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let project_root = config_path
             .parent()
             .and_then(std::path::Path::parent)
             .or_else(|| config_path.parent())
             .unwrap_or_else(|| std::path::Path::new("."));
-        #[cfg(not(test))]
         let config = daemon_provider_snapshot(project_root, None).unwrap_or_default();
         Self::open_with_config(config_path, config)
     }
@@ -2787,11 +2861,6 @@ impl SettingsDialog {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
-        #[cfg(test)]
-        let (mut extended, extended_warnings) = ExtendedConfigDoc::load(&extended_path)
-            .map(|d| d.config_with_warnings())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let (extended, extended_base, extended_revision, extended_warnings) =
             extended_config_layer_snapshot(&extended_path, None)
                 .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
@@ -2800,21 +2869,10 @@ impl SettingsDialog {
                     let value = serde_json::to_value(&config).unwrap_or_default();
                     (config, value, None, Vec::new())
                 });
-        #[cfg(test)]
-        let extended_base = serde_json::to_value(&extended).unwrap_or_default();
-        #[cfg(test)]
-        let extended_revision = None;
         // Fresh install (no config at this location yet): seed the
         // skills scan-dir list with the defaults so they show as ordinary
         // editable rows. Materialization-only — an existing config whose
         // `scan_dirs` is absent/empty stays empty (clean break).
-        #[cfg(test)]
-        if !extended_path.exists() {
-            extended.skills.scan_dirs = cockpit_config::extended::SEEDED_SCAN_DIRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
         let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
         Self {
             page: root_page(0),
@@ -2865,22 +2923,10 @@ impl SettingsDialog {
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
         let mut s = Self::open_with_config(config_path, config);
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
-        #[cfg(test)]
-        {
-            s.cx.mcp_config = cockpit_core::mcp::config::McpConfig::discover(
-                s.active_project_root.as_deref().expect("picker cwd"),
-            );
-        }
-        #[cfg(not(test))]
         if let Some(snapshot) = s
             .active_project_root
             .as_deref()
@@ -2897,16 +2943,8 @@ impl SettingsDialog {
         s
     }
 
-    /// Reload extended-config from disk. Used after saving so the
-    /// cached view stays in sync.
+    /// Reload the authoritative extended-config snapshot after saving.
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
         if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
@@ -2920,31 +2958,22 @@ impl SettingsDialog {
         }
     }
 
-    /// Persist the cached extended-config to disk.
+    /// Persist the cached extended-config through daemon authority.
     pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        #[cfg(test)]
-        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        {
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-        }
-        #[cfg(not(test))]
-        {
-            let revision = self.extended_revision.as_deref().ok_or_else(|| {
-                "settings snapshot has no revision; reload before saving".to_string()
-            })?;
-            apply_settings_patch_via_daemon(
-                &self.extended_path,
-                self.active_project_root
-                    .as_deref()
-                    .or(self.picker_cwd.as_deref()),
-                &self.extended_base,
-                &self.extended,
-                revision,
-            )?;
-            self.reload_extended();
-        }
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
+        )?;
+        self.reload_extended();
         Ok(())
     }
 
@@ -4089,13 +4118,6 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
         if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
@@ -4110,29 +4132,20 @@ impl SettingsCx {
     }
 
     pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        #[cfg(test)]
-        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        {
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-        }
-        #[cfg(not(test))]
-        {
-            let revision = self.extended_revision.as_deref().ok_or_else(|| {
-                "settings snapshot has no revision; reload before saving".to_string()
-            })?;
-            apply_settings_patch_via_daemon(
-                &self.extended_path,
-                self.active_project_root
-                    .as_deref()
-                    .or(self.picker_cwd.as_deref()),
-                &self.extended_base,
-                &self.extended,
-                revision,
-            )?;
-            self.reload_extended();
-        }
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
+        )?;
+        self.reload_extended();
         Ok(())
     }
 
@@ -4456,26 +4469,20 @@ fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
 ) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        match client
-            .request(Request::GetProviderCatalogSnapshot {
-                project_root,
-                provider_id,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Ok(Response::ProviderCatalogSnapshot { config }) => Ok(config),
-            Ok(other) => Err(format!(
-                "unexpected daemon provider snapshot response: {other:?}"
-            )),
-            Err(error) => Err(error.to_string()),
+    match settings_daemon_request(Request::GetProviderCatalogSnapshot {
+        project_root,
+        provider_id,
+    }) {
+        Ok(Response::ProviderCatalogSnapshot { config }) => Some(config),
+        Ok(other) => {
+            tracing::warn!(response = ?other, "unexpected daemon provider snapshot response");
+            None
         }
-    })
-    .ok()
+        Err(error) => {
+            tracing::warn!(%error, "daemon provider snapshot failed");
+            None
+        }
+    }
 }
 
 fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -4493,11 +4500,6 @@ fn daemon_mcp_snapshot(
         .and_then(std::path::Path::parent)
         .or_else(|| config_path.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
-    #[cfg(test)]
-    {
-        Some(cockpit_core::mcp::config::McpConfig::discover(cwd))
-    }
-    #[cfg(not(test))]
     daemon_provider_view_snapshot(cwd, None)
         .and_then(|config| config.mcp_config_json)
         .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
@@ -5364,20 +5366,13 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 }
 
 fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
-    #[cfg(test)]
-    {
-        scaffold_config_dir(dir).map_err(|error| error.to_string())
-    }
-    #[cfg(not(test))]
-    {
-        let config_path = dir.join(CONFIG_FILE);
-        apply_typed_settings_document_edit(
-            &config_path,
-            None,
-            serde_json::json!({ "agents": {}, "tools": {} }),
-        )?;
-        Ok(config_path)
-    }
+    let config_path = dir.join(CONFIG_FILE);
+    apply_typed_settings_document_edit(
+        &config_path,
+        None,
+        serde_json::json!({ "agents": {}, "tools": {} }),
+    )?;
+    Ok(config_path)
 }
 
 fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {

@@ -4310,6 +4310,7 @@ async fn handle_serialized_request_impl(
                 .context("assistant disappeared after definition save")?;
             Ok(Response::AssistantDefinitionSaved {
                 assistant: assistant_snapshot_to_proto(assistant),
+                consumed_definition_revision: expected_revision,
             })
         }
 
@@ -5106,7 +5107,7 @@ async fn handle_serialized_request_impl(
             patch,
             expected_revision,
         } => {
-            let response = crate::daemon::fs_api::apply_extended_config_patch(
+            crate::daemon::fs_api::apply_extended_config_patch(
                 ctx,
                 project_root,
                 layer_id,
@@ -5114,12 +5115,7 @@ async fn handle_serialized_request_impl(
                 expected_revision,
                 settings_capability_owner(state),
             )
-            .await?;
-            if let Err(error) = ctx.refresh_redaction_table() {
-                ctx.poison_redaction_publication(&error);
-                return Err(internal(error));
-            }
-            Ok(response)
+            .await
         }
 
         Request::SaveExtendedConfig {

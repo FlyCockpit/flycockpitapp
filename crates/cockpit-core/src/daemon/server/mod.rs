@@ -665,7 +665,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_session_summary(session, redact);
         }
         proto::Response::AssistantUpserted { assistant }
-        | proto::Response::AssistantDefinitionSaved { assistant } => {
+        | proto::Response::AssistantDefinitionSaved { assistant, .. } => {
             scrub_assistant_summary(assistant, redact)
         }
         proto::Response::ImportSessionArchive { .. } => {}

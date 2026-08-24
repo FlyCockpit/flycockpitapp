@@ -949,6 +949,7 @@ enum UnregisterPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnregisterArtifact {
     active_name: String,
     retained_name: String,
@@ -956,6 +957,7 @@ struct UnregisterArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnregisterJournal {
     operation_id: String,
     phase: UnregisterPhase,
@@ -966,6 +968,58 @@ struct UnregisterJournal {
     content_hash: String,
     registration_revision: String,
     artifacts: Vec<UnregisterArtifact>,
+}
+
+const UNREGISTER_ARTIFACT_NAMES: [(&str, &str); 2] = [
+    (".assistant-creation.journal.json", "creation.journal.json"),
+    (
+        ".assistant-definition-save.journal.json",
+        "definition-save.journal.json",
+    ),
+];
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_unregister_artifacts(artifacts: &[UnregisterArtifact]) -> Result<()> {
+    let mut previous_index = None;
+    for artifact in artifacts {
+        let index = UNREGISTER_ARTIFACT_NAMES
+            .iter()
+            .position(|names| artifact.active_name == names.0 && artifact.retained_name == names.1)
+            .context("assistant unregister journal contains an unknown artifact identity")?;
+        if previous_index.is_some_and(|previous| index <= previous) {
+            bail!("assistant unregister journal artifact identities are duplicated or unordered");
+        }
+        if !valid_sha256_hex(&artifact.sha256) {
+            bail!("assistant unregister journal artifact digest is invalid");
+        }
+        previous_index = Some(index);
+    }
+    Ok(())
+}
+
+fn validate_unregister_artifact_set(home: &Path, journal: &UnregisterJournal) -> Result<()> {
+    let operation = quarantine_operation_dir(home, journal);
+    for (active_name, retained_name) in UNREGISTER_ARTIFACT_NAMES {
+        let declared = journal.artifacts.iter().find(|artifact| {
+            artifact.active_name == active_name && artifact.retained_name == retained_name
+        });
+        let active = cockpit_config::config::read_config_file_nofollow(&home.join(active_name))?;
+        let retained =
+            cockpit_config::config::read_config_file_nofollow(&operation.join(retained_name))?;
+        match (declared, active, retained) {
+            (None, None, None) => {}
+            (Some(artifact), Some(bytes), None) | (Some(artifact), None, Some(bytes))
+                if sha256_hex(&bytes) == artifact.sha256 => {}
+            _ => bail!("assistant unregister journal artifact set is not exact"),
+        }
+    }
+    Ok(())
 }
 
 fn unregister_journal_root() -> Result<PathBuf> {
@@ -984,13 +1038,7 @@ fn build_unregister_journal(
     operation_id: String,
 ) -> Result<UnregisterJournal> {
     let mut artifacts = Vec::new();
-    for (active_name, retained_name) in [
-        (".assistant-creation.journal.json", "creation.journal.json"),
-        (
-            ".assistant-definition-save.journal.json",
-            "definition-save.journal.json",
-        ),
-    ] {
+    for (active_name, retained_name) in UNREGISTER_ARTIFACT_NAMES {
         if let Some(bytes) =
             cockpit_config::config::read_config_file_nofollow(&home.join(active_name))?
         {
@@ -1141,8 +1189,10 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
         {
             bail!("assistant unregister journal identity is invalid");
         }
+        validate_unregister_artifacts(&journal.artifacts)?;
         let target = assistant_definition_path(&expected_home);
         let guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+        validate_unregister_artifact_set(&expected_home, &journal)?;
         let current = get_assistant_blocking(db, &journal.name)?;
         match (&journal.phase, current) {
             (UnregisterPhase::Prepared, Some(row))

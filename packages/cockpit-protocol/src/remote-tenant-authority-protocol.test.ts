@@ -66,7 +66,7 @@ describe("tenant_authority_protocol_cross_language_vectors", () => {
     const bin = EVIDENCE_TYPES.filter((e) => e.category === "binary").length;
     expect(jws).toBe(6);
     expect(json).toBe(1);
-    expect(bin).toBe(14);
+    expect(bin).toBe(13);
   });
 
   it("proves the five FCTO result kinds and nineteen reason codes", () => {

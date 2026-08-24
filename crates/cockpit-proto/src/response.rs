@@ -425,6 +425,8 @@ pub enum Response {
 
     AssistantDefinitionSaved {
         assistant: AssistantSummary,
+        #[serde(default)]
+        consumed_definition_revision: String,
     },
 
     AssistantSessionCreated {
@@ -566,6 +568,10 @@ pub enum Response {
         layer: crate::CockpitConfigLayer,
         consumed_revision: String,
         result_revision: String,
+        #[serde(default)]
+        status: crate::ConfigCommitStatus,
+        #[serde(default)]
+        publication: crate::ConfigPublicationStatus,
     },
 
     /// Legacy whole-document writer receipt. Daemon-connected settings UI

@@ -802,7 +802,7 @@ async fn project_note_list_preserves_sidebar_order() {
 }
 
 #[tokio::test]
-async fn upsert_assistant_rpc_parity_with_direct_db_call() {
+async fn upsert_assistant_rpc_creates_daemon_owned_definition() {
     // `upsert_assistant` is now an owner-remoted persistent mutation, so it is
     // dispatched against a persistent (non-ephemeral) daemon.
     let ctx = persistent_test_ctx();

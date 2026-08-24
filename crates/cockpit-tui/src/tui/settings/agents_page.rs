@@ -100,6 +100,7 @@ pub(super) struct AgentExternalEdit {
     staging_dir: tempfile::TempDir,
     staging_path: PathBuf,
     lease_id: String,
+    consumed_revision: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
     /// failed/cancelled operation restores this exact editor for retry.
     draft: Option<AgentEditor>,
@@ -387,20 +388,32 @@ impl AgentsPage {
                     )? {
                         cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(
                             result,
-                        ) => validate_agent_mutation_result(
-                            &result,
-                            &cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                                name: agent.name().to_string(),
-                                markdown: markdown.clone(),
-                            },
-                            None,
-                        ),
+                        ) => {
+                            validate_agent_mutation_result(
+                                &result,
+                                cwd,
+                                &cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                                    name: agent.name().to_string(),
+                                    markdown: markdown.clone(),
+                                },
+                                Some(&pending.consumed_revision),
+                                Some(&pending.lease_id),
+                            )?;
+                            let snapshot = result.snapshot.ok_or_else(|| {
+                                "daemon omitted the completed editor identity".to_string()
+                            })?;
+                            Ok(super::pointer_actions::AgentId::workspace_occurrence(
+                                &snapshot.name,
+                                &snapshot.source_identity,
+                                &snapshot.revision,
+                            ))
+                        }
                         other => Err(format!("unexpected editor completion response: {other:?}")),
                     }
                 })();
                 match commit {
-                    Ok(_) => {
-                        self.refresh_after_edit(cwd, Some(&agent));
+                    Ok(new_id) => {
+                        self.refresh_after_edit(cwd, Some(&new_id));
                         if let Some(detail) = detail {
                             self.status = Some(format!("saved `{}`; {detail}", agent.name()));
                         }
@@ -520,7 +533,7 @@ fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
 }
 
 fn valid_agent_inventory(
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
     entries: &[cockpit_core::daemon::proto::AgentInventoryEntry],
     revision: &str,
 ) -> bool {
@@ -533,26 +546,8 @@ fn valid_agent_inventory(
                 && names.insert(entry.name.as_str())
                 && (entry.kind == cockpit_core::daemon::proto::AgentEntryKind::Builtin) == builtin
                 && (!entry.overridden || builtin)
-                && entry.source_identity
-                    == match entry.source_layer {
-                        cockpit_core::daemon::proto::AgentSourceLayer::Embedded => {
-                            format!("embedded:{}", entry.name)
-                        }
-                        layer => cockpit_proto::agent_source_identity(
-                            cwd.to_string_lossy().as_ref(),
-                            &entry.source_locator,
-                            layer,
-                        ),
-                    }
-                && entry.revision
-                    == cockpit_proto::agent_definition_revision(
-                        &entry.name,
-                        entry.source_layer,
-                        &entry.source_identity,
-                        &entry.source_content_hash,
-                        entry.source_layer
-                            == cockpit_core::daemon::proto::AgentSourceLayer::Workspace,
-                    )
+                && is_lower_hex_digest(&entry.source_identity)
+                && is_lower_hex_digest(&entry.revision)
                 && if entry.valid {
                     entry.diagnostic.is_none() && entry.description.is_some()
                 } else {
@@ -564,6 +559,13 @@ fn valid_agent_inventory(
                             .is_some_and(|diagnostic| !diagnostic.trim().is_empty())
                 }
         })
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn agent_snapshot(
@@ -617,6 +619,7 @@ fn mutate_agent(
                 cwd,
                 &validation_mutation,
                 validation_revision.as_deref(),
+                None,
             )?;
             if matches!(
                 validation_mutation,
@@ -768,9 +771,11 @@ fn coherent_assistant_save_revision(
     assistant: &cockpit_core::daemon::proto::AssistantSummary,
     expected_name: &str,
     expected_markdown: &str,
+    consumed_revision: &str,
+    expected_consumed_revision: &str,
 ) -> Result<String, String> {
     cockpit_proto::validate_assistant_summary(assistant).map_err(str::to_string)?;
-    if assistant.name != expected_name {
+    if assistant.name != expected_name || consumed_revision != expected_consumed_revision {
         return Err("daemon returned a misrouted assistant save snapshot".into());
     }
     match (
@@ -829,10 +834,18 @@ pub(crate) fn validate_agent_mutation_result(
     cwd: &std::path::Path,
     mutation: &cockpit_core::daemon::proto::AgentMutation,
     prior_revision: Option<&str>,
+    completed_lease_id: Option<&str>,
 ) -> Result<(), String> {
     use cockpit_core::daemon::proto::{
         AgentEntryKind as K, AgentMutation as M, AgentSourceLayer as L,
     };
+    cockpit_proto::validate_agent_mutation_envelope(
+        result,
+        prior_revision,
+        completed_lease_id,
+        matches!(mutation, M::ResetAllBuiltins),
+    )
+    .map_err(str::to_string)?;
     let coherent_count = result.affected == u32::from(result.changed);
     let require_snapshot = |name: &str, markdown: Option<&str>| {
         let snapshot = result
@@ -1051,11 +1064,12 @@ impl SettingsCx {
                                 cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
                                     name: name.clone(),
                                     markdown: text.clone(),
-                                    expected_revision: revision,
+                                    expected_revision: revision.clone(),
                                 },
                             ) {
-                                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { assistant }) => {
-                                    coherent_assistant_save_revision(&assistant, &name, &text).map(|_| ())
+                                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { assistant, consumed_definition_revision }) => {
+                                    coherent_assistant_save_revision(&assistant, &name, &text, &consumed_definition_revision, &revision)
+                                        .map(|_| super::pointer_actions::AgentId::assistant_occurrence(&name, &assistant.registration_revision))
                                 }
                                 Ok(other) => Err(format!("unexpected assistant save response: {other:?}")),
                                 Err(error) => Err(error),
@@ -1069,17 +1083,23 @@ impl SettingsCx {
                                 },
                                 Some(revision),
                             )
-                            .map(|_| ()),
+                            .and_then(|result| {
+                                let snapshot = result.snapshot.ok_or_else(|| "daemon omitted saved agent identity".to_string())?;
+                                Ok(super::pointer_actions::AgentId::workspace_occurrence(
+                                    &name,
+                                    &snapshot.source_identity,
+                                    &snapshot.revision,
+                                ))
+                            }),
                         None => Err(
                             "assistant definitions must be edited through their daemon-owned settings flow"
                                 .to_string(),
                         ),
                     };
                     match saved {
-                        Ok(()) => {
+                        Ok(new_id) => {
                             p.editing = None;
-                            let id = editor.authority_id.clone();
-                            p.refresh_after_edit(&cwd, Some(&id));
+                            p.refresh_after_edit(&cwd, Some(&new_id));
                         }
                         Err(e) => {
                             p.status = Some(format!("write failed: {e}"));
@@ -1233,6 +1253,7 @@ impl SettingsCx {
             staging_dir: staging.directory,
             staging_dir_handle: staging.directory_handle,
             lease_id: lease.lease_id,
+            consumed_revision: lease.snapshot.revision,
             draft,
             servicing: false,
         });
@@ -1418,6 +1439,7 @@ impl SettingsCx {
                 return;
             }
         };
+        let committed_id;
         if let AgentRowSource::Assistant { .. } = &detail.source {
             let Some(expected_revision) = detail.revision.clone() else {
                 detail.status = Some("save failed: missing assistant revision".into());
@@ -1427,14 +1449,32 @@ impl SettingsCx {
                 cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
                     name: detail.name.clone(),
                     markdown: markdown.clone(),
-                    expected_revision,
+                    expected_revision: expected_revision.clone(),
                 },
             );
             match response {
                 Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
                     assistant,
-                }) => match coherent_assistant_save_revision(&assistant, &detail.name, &markdown) {
-                    Ok(revision) => detail.revision = Some(revision),
+                    consumed_definition_revision,
+                }) => match coherent_assistant_save_revision(
+                    &assistant,
+                    &detail.name,
+                    &markdown,
+                    &consumed_definition_revision,
+                    &expected_revision,
+                ) {
+                    Ok(revision) => {
+                        detail.revision = Some(revision.clone());
+                        detail.source = AgentRowSource::Assistant {
+                            markdown: markdown.clone(),
+                            revision,
+                            registration_revision: assistant.registration_revision.clone(),
+                        };
+                        committed_id = super::pointer_actions::AgentId::assistant_occurrence(
+                            &detail.name,
+                            &assistant.registration_revision,
+                        );
+                    }
                     Err(error) => {
                         detail.status = Some(error);
                         return;
@@ -1459,17 +1499,27 @@ impl SettingsCx {
                 Some(revision),
             ) {
                 Ok(result) => {
-                    let Some(revision) = result
-                        .snapshot
-                        .map(|snapshot| snapshot.revision)
-                        .filter(|revision| !revision.is_empty())
-                    else {
+                    let Some(snapshot) = result.snapshot else {
                         detail.status = Some(
                             "daemon returned a save result without a coherent revision".into(),
                         );
                         return;
                     };
-                    detail.revision = Some(revision);
+                    if snapshot.revision.is_empty() {
+                        detail.status =
+                            Some("daemon returned an empty committed agent revision".into());
+                        return;
+                    }
+                    detail.revision = Some(snapshot.revision.clone());
+                    detail.source = AgentRowSource::Agent {
+                        source_identity: snapshot.source_identity.clone(),
+                        revision: snapshot.revision.clone(),
+                    };
+                    committed_id = super::pointer_actions::AgentId::workspace_occurrence(
+                        &detail.name,
+                        &snapshot.source_identity,
+                        &snapshot.revision,
+                    );
                 }
                 Err(error) => {
                     detail.status = Some(format!("save failed: {error}"));
@@ -1487,7 +1537,17 @@ impl SettingsCx {
         });
         let cwd = self.agents_cwd();
         let (rows, status) = rows_for(&cwd);
+        let Some(cursor) = rows
+            .iter()
+            .position(|row| row_agent_id(&row.name, &row.source) == committed_id)
+        else {
+            detail.status = Some(
+                "save committed, but refreshed inventory omitted the exact new identity".into(),
+            );
+            return;
+        };
         p.rows = rows;
+        p.cursor = cursor;
         if status.is_some() {
             p.status = status;
         }
@@ -1592,6 +1652,7 @@ impl SettingsCx {
                 staging_dir: staging.directory,
                 staging_dir_handle: staging.directory_handle,
                 lease_id: lease.lease_id,
+                consumed_revision: lease.snapshot.revision,
                 draft: Some(draft),
                 servicing: false,
             });
@@ -2249,16 +2310,20 @@ impl AgentsPage {
         cwd: &std::path::Path,
         identity: Option<&super::pointer_actions::AgentId>,
     ) {
-        self.rows = rows_for(cwd).0;
+        let refreshed = rows_for(cwd).0;
         if let Some(identity) = identity {
             let name = identity.name();
-            if let Some(idx) = self
-                .rows
+            let Some(idx) = refreshed
                 .iter()
                 .position(|row| row_agent_id(&row.name, &row.source) == *identity)
-            {
-                self.cursor = idx;
-            }
+            else {
+                self.status = Some(format!(
+                    "saved `{name}`, but the refreshed inventory omitted its exact committed identity"
+                ));
+                return;
+            };
+            self.rows = refreshed;
+            self.cursor = idx;
             // Surface a parse error from the just-edited file rather than
             // silently accepting a broken agent.
             if let Some(row) = self.rows.get(self.cursor) {
@@ -2267,6 +2332,8 @@ impl AgentsPage {
                     Ok(_) => format!("saved `{name}`"),
                 });
             }
+        } else {
+            self.rows = refreshed;
         }
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }

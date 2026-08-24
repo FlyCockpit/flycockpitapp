@@ -743,18 +743,25 @@ pub(crate) fn read_leaf_from_directory_handle(
 pub(crate) fn snapshot_markdown_tree_nofollow(
     root: &Path,
     max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<Vec<(PathBuf, String)>> {
     let root_handle = open_directory_handle_nofollow(root)?;
     let mut output = Vec::new();
     let mut total = 0usize;
+    let mut entries = 0usize;
     snapshot_markdown_directory(
         &root_handle,
         Path::new(""),
         &mut output,
         &mut total,
+        &mut entries,
+        0,
         max_files,
+        max_entries,
+        max_depth,
         max_file_bytes,
         max_total_bytes,
     )?;
@@ -810,7 +817,11 @@ fn snapshot_markdown_directory(
     relative: &Path,
     output: &mut Vec<(PathBuf, String)>,
     total: &mut usize,
+    entries: &mut usize,
+    depth: usize,
     max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<()> {
@@ -818,6 +829,9 @@ fn snapshot_markdown_directory(
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
 
+    if depth > max_depth {
+        anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
+    }
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
     if duplicate < 0 {
         return Err(std::io::Error::last_os_error()).context("duplicating knowledge directory");
@@ -858,6 +872,10 @@ fn snapshot_markdown_directory(
     }
     names.sort();
     for name in names {
+        *entries = entries
+            .checked_add(1)
+            .filter(|entries| *entries <= max_entries)
+            .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
         let component = path_component_cstring(&name)?;
         let fd = unsafe {
             libc::openat(
@@ -879,7 +897,11 @@ fn snapshot_markdown_directory(
                 &child_relative,
                 output,
                 total,
+                entries,
+                depth + 1,
                 max_files,
+                max_entries,
+                max_depth,
                 max_file_bytes,
                 max_total_bytes,
             )?;
@@ -906,7 +928,11 @@ fn snapshot_markdown_directory(
     relative: &Path,
     output: &mut Vec<(PathBuf, String)>,
     total: &mut usize,
+    entries: &mut usize,
+    depth: usize,
     max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<()> {
@@ -920,6 +946,9 @@ fn snapshot_markdown_directory(
         GetFileInformationByHandleEx, SYNCHRONIZE,
     };
 
+    if depth > max_depth {
+        anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
+    }
     let mut names = Vec::new();
     let mut restart = true;
     loop {
@@ -966,6 +995,10 @@ fn snapshot_markdown_directory(
     }
     names.sort_by(|left, right| left.0.cmp(&right.0));
     for (name, directory_hint) in names {
+        *entries = entries
+            .checked_add(1)
+            .filter(|entries| *entries <= max_entries)
+            .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
         let child_relative = relative.join(&name);
         let child = open_windows_relative_nofollow(
             directory,
@@ -986,7 +1019,11 @@ fn snapshot_markdown_directory(
                 &child_relative,
                 output,
                 total,
+                entries,
+                depth + 1,
                 max_files,
+                max_entries,
+                max_depth,
                 max_file_bytes,
                 max_total_bytes,
             )?;
@@ -1011,6 +1048,10 @@ fn snapshot_markdown_directory(
     _: &Path,
     _: &mut Vec<(PathBuf, String)>,
     _: &mut usize,
+    _: &mut usize,
+    _: usize,
+    _: usize,
+    _: usize,
     _: usize,
     _: usize,
     _: usize,

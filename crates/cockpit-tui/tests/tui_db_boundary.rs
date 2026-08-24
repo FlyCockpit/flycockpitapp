@@ -1,5 +1,8 @@
+use quote::ToTokens;
 use std::fs;
 use std::path::{Path, PathBuf};
+use syn::spanned::Spanned;
+use syn::visit::Visit;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -9,8 +12,179 @@ fn read(relative: &str) -> String {
     fs::read_to_string(repo_root().join(relative)).unwrap()
 }
 
+fn cfg_test_only(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        let compact: String = attribute
+            .meta
+            .to_token_stream()
+            .to_string()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        compact == "cfg(test)"
+    })
+}
+
+fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(value) => &value.attrs,
+        syn::Item::Enum(value) => &value.attrs,
+        syn::Item::ExternCrate(value) => &value.attrs,
+        syn::Item::Fn(value) => &value.attrs,
+        syn::Item::ForeignMod(value) => &value.attrs,
+        syn::Item::Impl(value) => &value.attrs,
+        syn::Item::Macro(value) => &value.attrs,
+        syn::Item::Mod(value) => &value.attrs,
+        syn::Item::Static(value) => &value.attrs,
+        syn::Item::Struct(value) => &value.attrs,
+        syn::Item::Trait(value) => &value.attrs,
+        syn::Item::TraitAlias(value) => &value.attrs,
+        syn::Item::Type(value) => &value.attrs,
+        syn::Item::Union(value) => &value.attrs,
+        syn::Item::Use(value) => &value.attrs,
+        _ => &[],
+    }
+}
+
+/// Return the complete source with only structurally parsed `#[cfg(test)]`
+/// items blanked. Newlines are retained so exact source-line allowlists and
+/// diagnostics remain stable, and production declared after a test module is
+/// still audited.
+fn production_source(source: &str) -> String {
+    struct TestItems(Vec<(proc_macro2::LineColumn, proc_macro2::LineColumn)>);
+    impl<'ast> Visit<'ast> for TestItems {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if cfg_test_only(item_attributes(item)) {
+                let attrs = item_attributes(item);
+                let start = attrs
+                    .first()
+                    .map_or_else(|| item.span().start(), |a| a.span().start());
+                self.0.push((start, item.span().end()));
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        panic!("TUI authority ratchet could not parse Rust source");
+    };
+    let mut visitor = TestItems(Vec::new());
+    visitor.visit_file(&file);
+    let mut offsets = Vec::with_capacity(source.lines().count() + 1);
+    offsets.push(0usize);
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(index + 1);
+        }
+    }
+    let byte_offset =
+        |point: proc_macro2::LineColumn| offsets[point.line.saturating_sub(1)] + point.column;
+    let mut bytes = source.as_bytes().to_vec();
+    for (start, end) in visitor.0 {
+        for byte in &mut bytes[byte_offset(start)..byte_offset(end)] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).expect("Rust source remains UTF-8 after masking")
+}
+
+fn use_tree_has_rename(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Rename(_) => true,
+        syn::UseTree::Path(path) => use_tree_has_rename(&path.tree),
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_has_rename),
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn obscured_authority_findings(source: &str) -> Vec<String> {
+    struct AuthorityVisitor(Vec<String>);
+    impl<'ast> Visit<'ast> for AuthorityVisitor {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let tokens: String = item
+                .to_token_stream()
+                .to_string()
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            let authority = [
+                "std::fs",
+                "std::process",
+                "std::net",
+                "tokio::fs",
+                "tokio::process",
+                "tokio::net",
+                "cockpit_core::agents",
+                "cockpit_core::assistants",
+                "cockpit_core::db",
+                "cockpit_config::extended::ExtendedConfigDoc",
+                "cockpit_config::providers::ConfigDoc",
+                "cockpit_config::dirs::scaffold_config_dir",
+            ]
+            .iter()
+            .any(|path| tokens.contains(path));
+            let root_alias = tokens.starts_with("usestdas")
+                || tokens.starts_with("usetokioas")
+                || tokens.starts_with("usecockpit_coreas")
+                || tokens.starts_with("usecockpit_configas");
+            if (authority || root_alias)
+                && (use_tree_has_rename(&item.tree)
+                    || !matches!(&item.vis, syn::Visibility::Inherited))
+            {
+                self.0.push(format!(
+                    "line {}: aliased or re-exported authority import: {tokens}",
+                    item.span().start().line
+                ));
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_macro(&mut self, value: &'ast syn::Macro) {
+            let tokens: String = value
+                .tokens
+                .to_string()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if [
+                "std::fs",
+                "std::process",
+                "std::net",
+                "tokio::fs",
+                "tokio::process",
+                "tokio::net",
+                "cockpit_core::agents",
+                "cockpit_core::assistants",
+                "cockpit_core::db",
+                "cockpit_config::extended",
+                "cockpit_config::providers",
+                "cockpit_config::config",
+            ]
+            .iter()
+            .any(|path| tokens.contains(path))
+            {
+                self.0.push(format!(
+                    "line {}: macro obscures authority path",
+                    value.span().start().line
+                ));
+            }
+            syn::visit::visit_macro(self, value);
+        }
+    }
+    let file = syn::parse_file(source).expect("production source remains parseable");
+    let mut visitor = AuthorityVisitor(Vec::new());
+    visitor.visit_file(&file);
+    visitor.0
+}
+
 /// A `*_tests.rs` spelling is not evidence that a module is test-only. Accept
-/// the exclusion only when its owning module declaration is itself cfg(test).
+/// the exclusion only when syn finds an owning `mod` item with `#[cfg(test)]`.
 fn is_explicit_cfg_test_module(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
         return false;
@@ -23,8 +197,12 @@ fn is_explicit_cfg_test_module(path: &Path) -> bool {
         let Ok(source) = fs::read_to_string(owner) else {
             return false;
         };
-        let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
-        compact.contains(&format!("#[cfg(test)]mod{stem};"))
+        let Ok(file) = syn::parse_file(&source) else {
+            panic!("TUI authority ratchet could not parse module owner");
+        };
+        file.items.into_iter().any(|item| {
+            matches!(item, syn::Item::Mod(module) if module.ident == stem && cfg_test_only(&module.attrs))
+        })
     })
 }
 
@@ -103,16 +281,9 @@ fn tui_db_surface_behavior_matrix() {
 
 #[test]
 fn tui_agent_authority_is_daemon_owned() {
-    fn production_part(source: String) -> String {
-        source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap_or(&source)
-            .to_string()
-    }
-    let agents = production_part(read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
-    let goals = production_part(read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));
-    let tools = production_part(read("crates/cockpit-tui/src/tui/tools_pane.rs"));
+    let agents = production_source(&read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
+    let goals = production_source(&read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));
+    let tools = production_source(&read("crates/cockpit-tui/src/tui/tools_pane.rs"));
     let production = format!("{agents}\n{goals}\n{tools}");
     for forbidden in [
         "cockpit_core::agents::resolve(",
@@ -168,10 +339,12 @@ fn full_production_tree_rejects_agent_and_config_authority() {
                 continue;
             }
             let source = fs::read_to_string(&path).unwrap();
-            let production = source
-                .split("#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or(&source);
+            let production = production_source(&source);
+            findings.extend(
+                obscured_authority_findings(&production)
+                    .into_iter()
+                    .map(|finding| format!("{}: {finding}", path.display())),
+            );
             for forbidden in [
                 "cockpit_core::agents::resolve(",
                 "cockpit_core::agents::list_all(",
@@ -182,7 +355,10 @@ fn full_production_tree_rejects_agent_and_config_authority() {
                 "cockpit_core::agents::load_daemon_local_named_from_file(",
                 "cockpit_core::assistants::load_from_home(",
                 "cockpit_core::assistants::load_verified(",
-                "cockpit_config::config::extended::ExtendedConfigDoc::load(",
+                "ExtendedConfigDoc",
+                "ConfigDoc::load(",
+                "ConfigDoc::providers_from_paths(",
+                "McpConfig::discover(",
                 "Request::SaveExtendedConfig",
                 "patch_json:",
             ] {
@@ -262,10 +438,7 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
                 continue;
             }
             let source = fs::read_to_string(&path).unwrap();
-            let production = source
-                .split("#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or(&source);
+            let production = production_source(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
             for (line_number, line) in production.lines().enumerate() {
                 for authority in AUTHORITY {
@@ -508,10 +681,7 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                 continue;
             }
             let source = fs::read_to_string(&path).unwrap();
-            let production = source
-                .split("#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or(&source);
+            let production = production_source(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
             for (line_number, line) in production.lines().enumerate() {
                 let trimmed = line.trim_start();
@@ -647,4 +817,30 @@ fn tui_db_boundary_gate_first_has_real_negative_alias_fixtures() {
     let gate = read("scripts/check-tui-db-boundary.sh");
     assert!(gate.contains("cargo check"));
     assert!(gate.contains("negative fixture unexpectedly compiled"));
+}
+
+#[test]
+fn syntax_aware_authority_filter_has_negative_fixtures() {
+    let source = r#"
+        #[cfg(test)]
+        mod tests { fn hidden() { std::fs::write("x", b"x").unwrap(); } }
+        fn production_after_tests() { std::fs::write("x", b"x").unwrap(); }
+    "#;
+    let production = production_source(source);
+    assert!(!production.contains("hidden"));
+    assert!(production.contains("production_after_tests"));
+    assert!(production.contains("std::fs::write"));
+
+    for fixture in [
+        "use std::fs as storage;",
+        "pub use tokio::process::Command;",
+        "use cockpit_core as owner;",
+        "macro_rules! hidden { () => { std::net::TcpStream::connect(\"x\") } }",
+    ] {
+        assert!(
+            !obscured_authority_findings(fixture).is_empty(),
+            "negative authority fixture escaped: {fixture}"
+        );
+    }
+    assert!(obscured_authority_findings("use std::process::{Command, Stdio};").is_empty());
 }

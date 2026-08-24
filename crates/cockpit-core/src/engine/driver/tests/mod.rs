@@ -283,28 +283,10 @@ fn learn_driver(
     let root = tmp.path().join("skills");
     let config_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(
-        config_dir.join("config.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "skills": {
-                "scan_dirs": [root.to_string_lossy()],
-                "write_approval": approval
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let agents_dir = config_dir.join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(
-        agents_dir.join("Build.md"),
-        crate::agents::embedded_default("Build")
-            .expect("known built-in")
-            .to_markdown()
-            .expect("v2 bundled override"),
-    )
-    .unwrap();
 
+    // Create the scripted provider first so its URL can be written to a
+    // per-provider file (the loader strips inline `providers` from
+    // config.json and only reads `.cockpit/providers/<id>.json`).
     let mut provider_builder = ScriptedProvider::builder().turn(Turn::ToolCall {
         id: "learn-save".into(),
         name: "skill_manage".into(),
@@ -315,6 +297,59 @@ fn learn_driver(
     }
     let provider = provider_builder.start_blocking();
     let provider_url = provider.base_url();
+
+    // config.json carries skills settings and the atomic active_model.
+    // Provider definitions go in a separate file (see comment above).
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "skills": {
+                "scan_dirs": [root.to_string_lossy()],
+                "write_approval": approval
+            },
+            "active_model": {
+                "provider": "scripted",
+                "model": "local"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        providers_dir.join("scripted.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "url": provider_url,
+            "wireApi": "completions"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    // Use a custom agent name "LearnBuild" instead of "Build" so that
+    // `default_disabled_tools_for` (which disables `skill_manage` for Build
+    // and other built-in primaries) does not remove the tool from the
+    // rebuilt agent's surface during `refresh_active_tool_surface_for_turn`.
+    // The v2 format does not support `toolTiers` overrides, so the only way
+    // to keep `skill_manage` enabled through the rebuild is to use a name
+    // not in the disabled-by-default list.  The `cockpit` publisher prefix
+    // is reserved for binary-owned definitions, so change the vNext agentId.
+    let mut build_def = crate::agents::embedded_default("Build")
+        .expect("known built-in");
+    if let Some(vnext) = &mut build_def.vnext {
+        vnext.agent_id = "authored/learnbuild".to_string();
+    }
+    std::fs::write(
+        agents_dir.join("LearnBuild.md"),
+        build_def
+            .to_markdown()
+            .expect("v2 bundled override"),
+    )
+    .unwrap();
     let mut providers = BTreeMap::new();
     providers.insert(
         "scripted".to_string(),
@@ -343,7 +378,7 @@ fn learn_driver(
         .unwrap(),
     );
     let agent = Arc::new(Agent {
-        name: "Build".into(),
+        name: "LearnBuild".into(),
         system: "Author reusable skills from verified evidence.".into(),
         role_prompt: "Author reusable skills from verified evidence.".into(),
         tools: crate::engine::tool::ToolBox::new()
@@ -352,7 +387,7 @@ fn learn_driver(
         params: crate::engine::model::ModelParams::default(),
         scan_tool_results: false,
         llm_mode: crate::config::extended::LlmMode::default(),
-        lock_identity: "Build".to_string(),
+        lock_identity: "LearnBuild".to_string(),
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
@@ -365,7 +400,7 @@ fn learn_driver(
         Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
-            "Build",
+            "LearnBuild",
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap(),

@@ -3567,14 +3567,13 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
         if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
             tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
         }
-        if let Err(error) = crate::assistants::recover_definition_journals(&ctx.db).await {
-            tracing::error!(%error, "startup assistant-definition journal recovery failed; assistant saves will retry it");
-        }
-        if let Err(error) =
-            crate::daemon::agent_management::recover_known_workspace_resets(&ctx).await
-        {
-            tracing::error!(message=%error.message, "startup agent reset journal recovery failed; agent requests will retry it");
-        }
+        crate::assistants::recover_definition_journals(&ctx.db)
+            .await
+            .context("startup assistant-definition journal recovery failed")?;
+        crate::daemon::agent_management::recover_known_workspace_resets(&ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup agent reset journal recovery failed")?;
         match crate::daemon::effective_default_recovery::recover_effective_default_journals(
             &ctx.db, &cwd, None,
         )

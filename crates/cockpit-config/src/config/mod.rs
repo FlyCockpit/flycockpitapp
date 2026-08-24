@@ -75,6 +75,13 @@ pub fn remove_config_file_atomic(path: &std::path::Path) -> anyhow::Result<()> {
     files::remove_file_nofollow(path)
 }
 
+/// Durably commit directory-entry changes without following a symlink at the
+/// directory itself. Multi-file daemon journals use this after each rename or
+/// unlink so their persisted phase never gets ahead of filesystem metadata.
+pub fn sync_directory_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
+    files::fsync_dir(path)
+}
+
 /// Reuse the audited component-relative/no-follow private-file primitive for
 /// short-lived terminal ingress. Callers must still enforce their own root,
 /// filename, media, and lifecycle policy.

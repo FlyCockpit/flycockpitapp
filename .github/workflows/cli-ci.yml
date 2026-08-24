@@ -164,6 +164,25 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  remote-workspace-static:
+    name: Opt-in remote workspace compile contract
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: remote-workspace
+          workspaces: . -> target
+      - name: Check full remote CLI and workspace
+        run: >
+          cargo check --locked --workspace --all-targets
+          --features cockpit-cli/remote,tenant-authority/remote
+
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)
     if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance

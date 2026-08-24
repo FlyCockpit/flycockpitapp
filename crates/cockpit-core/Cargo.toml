@@ -40,6 +40,18 @@ turn-coturn-conformance = ["remote"]
 [lints]
 workspace = true
 
+[[test]]
+name = "remote_transport_selection_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_turn_socket_provider_coturn_conformance"
+required-features = ["turn-coturn-conformance"]
+
+[[test]]
+name = "remote_turn_socket_provider_dependency_audit"
+required-features = ["remote"]
+
 [dependencies]
 tokio = { workspace = true, features = [
     "rt-multi-thread", "macros", "process", "io-util", "fs",

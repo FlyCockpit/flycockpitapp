@@ -9730,6 +9730,77 @@ async fn remote_ledger_state(
 
 #[tokio::test]
 #[cfg(feature = "remote")]
+async fn remote_archive_unarchive_and_rename_reject_unknown_session_before_ledger_commit() {
+    let ctx = persistent_test_ctx();
+    let missing = Uuid::new_v4();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+
+    for request in [
+        Request::ArchiveSession {
+            session_id: missing,
+            cascade: true,
+        },
+        Request::UnarchiveSession {
+            session_id: missing,
+        },
+        Request::RenameSession {
+            session_id: missing,
+            title: "missing".into(),
+        },
+    ] {
+        let operation = remote_owner_operation();
+        let error = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+            .await
+            .expect_err("unknown remote session mutation must fail closed");
+        assert_eq!(error.code, ErrorCode::UnknownSession);
+        assert_eq!(
+            remote_ledger_state(&ctx, &operation).await,
+            None,
+            "target resolution failure must not consume a remote operation id"
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn remote_archive_stops_worker_before_committing_archive() {
+    let ctx = persistent_test_ctx();
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    insert_hung_worker(&ctx, session.session_id);
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation();
+
+    let error = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        Request::ArchiveSession {
+            session_id: session.session_id,
+            cascade: false,
+        },
+        &operation,
+    )
+    .await
+    .expect_err("a hung worker must block remote archive");
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none(),
+        "archive transaction must not commit when worker stop fails"
+    );
+    assert_eq!(remote_ledger_state(&ctx, &operation).await, None);
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
 async fn fork_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
@@ -9815,6 +9886,7 @@ async fn discard_session_remote_path_commits_transactional_ledger() {
 /// ledger lookup BEFORE detaching the client or stopping any worker — no side
 /// effect on a rejected op.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn discard_session_reused_operation_conflict_rejects_before_detach() {
     let ctx = persistent_test_ctx();
     let project = tempfile::tempdir().unwrap();
@@ -10011,6 +10083,7 @@ async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn transactional_mutation_inventory_has_ledger_site() {
     // Every `transactional_mutation` classification row that a remote actor can
     // be admitted for must have a real daemon ledger site. Owner-only rows are

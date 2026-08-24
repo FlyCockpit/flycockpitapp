@@ -3112,8 +3112,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_delete_cascades_to_retained_local_children() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/p", "Build").await.unwrap();
+        db.insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserNote,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": "local child" }),
+        )
+        .await
+        .unwrap();
+
+        db.delete_session(session.session_id).await.unwrap();
+        let remaining: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "retained local child rows must cascade");
+    }
+
+    #[tokio::test]
     #[cfg(feature = "remote")]
-    async fn session_delete_cascades_to_all_tables() {
+    async fn session_delete_cascades_to_remote_audit_extension() {
         let db = Db::open_in_memory().unwrap();
         let session_id = Uuid::new_v4();
         let id = session_id.to_string();

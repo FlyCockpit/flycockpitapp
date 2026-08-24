@@ -5339,6 +5339,8 @@ mod secret_store_boot_tests;
 #[cfg(test)]
 mod secret_store_local_tests;
 mod sessions;
+#[cfg(feature = "remote")]
+mod sessions_remote;
 #[cfg(test)]
 mod tests;
 

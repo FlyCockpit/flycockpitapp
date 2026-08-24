@@ -1,141 +1,6 @@
 use super::authz::*;
 use super::*;
 
-/// Ledger identity + canonical FCOR request hash for a session mutation
-/// admitted as an authenticated remote operation. Built at the dispatch
-/// boundary from the admitted [`super::RemoteOperationContext`] and the
-/// FCOR-encoded request, then threaded into the session helper so the durable
-/// mutation and its exactly-once replay/outbox record commit in ONE writer
-/// transaction. Owner/local callers pass `None` and take the plain path.
-pub(super) struct RemoteSessionLedger {
-    logical_attachment_id: String,
-    operation_id: String,
-    authenticated_device_id: String,
-    authenticated_device_generation: u64,
-    request_hash: [u8; 32],
-}
-
-impl RemoteSessionLedger {
-    pub(super) fn new(operation: &super::RemoteOperationContext, request_hash: [u8; 32]) -> Self {
-        Self {
-            logical_attachment_id: operation.logical_attachment_id.to_string(),
-            operation_id: operation.operation_id.to_string(),
-            authenticated_device_id: operation.authenticated_device_id.to_string(),
-            authenticated_device_generation: operation.authenticated_device_generation,
-            request_hash,
-        }
-    }
-
-    /// If this operation identity is already committed (exact actor/hash match),
-    /// return its cached response so a DESTRUCTIVE request can short-circuit an
-    /// exact replay before re-resolving (now-absent) target state. A mismatched
-    /// actor/hash is a conflict; a fresh/unknown identity returns `Ok(None)` to
-    /// take the normal resolve-then-reserve path (L18 for fresh reservations).
-    async fn committed_replay(
-        &self,
-        ctx: &DaemonContext,
-    ) -> std::result::Result<Option<Response>, ErrorPayload> {
-        let lookup = ctx
-            .db
-            .lookup_committed_transactional_operation(
-                crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                    logical_attachment_id: &self.logical_attachment_id,
-                    operation_id: &self.operation_id,
-                    authenticated_device_id: &self.authenticated_device_id,
-                    authenticated_device_generation: self.authenticated_device_generation,
-                    operation_class:
-                        crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                    request_hash: self.request_hash,
-                    now_ms: chrono::Utc::now().timestamp_millis(),
-                },
-            )
-            .await
-            .map_err(internal)?;
-        match lookup {
-            crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::CommittedReplay(bytes) => {
-                Ok(Some(serde_json::from_slice(&bytes).map_err(internal)?))
-            }
-            crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationConflict
-            | crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::OperationActorConflict => {
-                Err(ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: "remote operation conflict".into(),
-                })
-            }
-            crate::db::remote_attachment_operations::RemoteTransactionalReplayLookup::NotCommitted => {
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// Run `mutation` inside the transactional remote-operation ledger so the
-/// durable session mutation and its replay/outbox record commit atomically in
-/// one writer transaction. A replayed operation identity returns the cached
-/// response WITHOUT re-running the mutation (exactly-once); an operation/actor
-/// conflict fails closed. `mutation` must run only connection-direct
-/// statements — it executes inside the ledger's transaction and must not open
-/// a nested one.
-pub(super) async fn commit_session_remote_mutation<F>(
-    ctx: &DaemonContext,
-    ledger: &RemoteSessionLedger,
-    outbox_kind: &'static str,
-    mutation: F,
-) -> std::result::Result<Response, ErrorPayload>
-where
-    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Response> + Send + 'static,
-{
-    let outcome = ctx
-        .db
-        .execute_transactional_remote_operation(
-            crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                logical_attachment_id: &ledger.logical_attachment_id,
-                operation_id: &ledger.operation_id,
-                authenticated_device_id: &ledger.authenticated_device_id,
-                authenticated_device_generation: ledger.authenticated_device_generation,
-                operation_class:
-                    crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                request_hash: ledger.request_hash,
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            },
-            move |conn| {
-                let response = mutation(conn)?;
-                let safe_response = serde_json::to_vec(&response)?;
-                Ok(
-                    crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                        value: response,
-                        safe_response: safe_response.clone(),
-                        outbox_kind: outbox_kind.into(),
-                        outbox_payload: safe_response,
-                    },
-                )
-            },
-        )
-        .await
-        .map_err(internal)?;
-    match outcome {
-        crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(
-            response,
-        ) => Ok(response),
-        crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(
-            bytes,
-        ) => serde_json::from_slice(&bytes).map_err(internal),
-        crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-        | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => {
-            Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "remote operation conflict".into(),
-            })
-        }
-        crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => {
-            Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "remote operation capacity reached".into(),
-            })
-        }
-    }
-}
-
 pub(super) async fn list_sessions(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
@@ -348,7 +213,6 @@ pub(super) async fn fork_session(
     parent_session_id: Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
-    remote: Option<&RemoteSessionLedger>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // Guard rail: refuse forks of unknown parents with the typed
     // `UnknownSession` code so the TUI can surface a friendlier error
@@ -365,38 +229,6 @@ pub(super) async fn fork_session(
         Err(e) => return Err(internal(e)),
     }
     let created_by = principal.tag();
-    if let Some(ledger) = remote {
-        // Authenticated remote path: the fork row, its `created_by_principal`
-        // stamp, and the exactly-once replay/outbox record commit in one
-        // writer transaction via `create_fork_row_conn` (no nested BEGIN).
-        let session_id = Uuid::new_v4();
-        let now = chrono::Utc::now().timestamp();
-        let fork_point = fork_point_turn_id.clone();
-        return commit_session_remote_mutation(ctx, ledger, "fork_session", move |conn| {
-            let row = crate::db::Db::create_fork_row_conn(
-                conn,
-                parent_session_id,
-                fork_point,
-                ephemeral,
-                session_id,
-                now,
-            )?;
-            if let Some(tag) = created_by.as_deref() {
-                crate::db::Db::set_session_created_by_principal_conn(
-                    conn,
-                    row.session_id,
-                    Some(tag),
-                )?;
-            }
-            Ok(Response::Forked {
-                session_id: row.session_id,
-                short_id: row.short_id.unwrap_or_default(),
-                parent_session_id,
-                fork_point_turn_id,
-            })
-        })
-        .await;
-    }
     // `/side` forks land ephemeral (excluded from lists, never auto-titled,
     // discarded on end/exit); `/fork` forks persist normally.
     let row = if ephemeral {
@@ -439,7 +271,6 @@ pub(super) async fn create_btw_fork(
     principal: &ClientPrincipal,
     parent_session_id: Uuid,
     tangent: bool,
-    remote: Option<&RemoteSessionLedger>,
 ) -> std::result::Result<Response, ErrorPayload> {
     match ctx.db.get_session(parent_session_id).await {
         Ok(Some(_)) => {}
@@ -452,36 +283,6 @@ pub(super) async fn create_btw_fork(
         Err(e) => return Err(internal(e)),
     }
     let created_by = principal.tag();
-    if let Some(ledger) = remote {
-        // Authenticated remote path: the `/btw` fork (or the idempotent
-        // existing-fork lookup), its `created_by_principal` stamp, and the
-        // replay/outbox record commit in one writer transaction.
-        let session_id = Uuid::new_v4();
-        let now = chrono::Utc::now().timestamp();
-        return commit_session_remote_mutation(ctx, ledger, "btw_create", move |conn| {
-            let result = crate::db::Db::create_btw_fork_conn(
-                conn,
-                parent_session_id,
-                tangent,
-                session_id,
-                now,
-            )?;
-            if result.created
-                && let Some(tag) = created_by.as_deref()
-            {
-                crate::db::Db::set_session_created_by_principal_conn(
-                    conn,
-                    result.info.session_id,
-                    Some(tag),
-                )?;
-            }
-            Ok(Response::BtwFork {
-                info: btw_info_to_proto(result.info),
-                created: result.created,
-            })
-        })
-        .await;
-    }
     let result = ctx
         .db
         .create_btw_fork(parent_session_id, tangent)
@@ -504,19 +305,7 @@ pub(super) async fn create_btw_fork(
 pub(super) async fn end_btw_fork(
     ctx: &DaemonContext,
     parent_session_id: Uuid,
-    remote: Option<&RemoteSessionLedger>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    // Resolve the operation identity through the ledger BEFORE any worker-stop
-    // side effect: an exact committed replay short-circuits to its cached Ack,
-    // and a MISMATCHED actor/hash on a reused operation id is rejected here —
-    // never after stopping a live worker. Only a fresh authorized operation (or
-    // an idempotent replay, whose re-run of `interrupt_and_stop` is harmless)
-    // proceeds to stop + mutate + reserve.
-    if let Some(ledger) = remote
-        && let Some(cached) = ledger.committed_replay(ctx).await?
-    {
-        return Ok(cached);
-    }
     // Stop the live `/btw` worker first (idempotent — safe to repeat on a
     // replayed operation) so the durable deletion below never races a
     // running worker.
@@ -530,13 +319,6 @@ pub(super) async fn end_btw_fork(
             .interrupt_and_stop(info.session_id)
             .await
             .map_err(internal)?;
-    }
-    if let Some(ledger) = remote {
-        return commit_session_remote_mutation(ctx, ledger, "btw_end", move |conn| {
-            crate::db::Db::end_btw_fork_conn(conn, parent_session_id)?;
-            Ok(Response::Ack)
-        })
-        .await;
     }
     ctx.db
         .end_btw_fork(parent_session_id)
@@ -554,18 +336,7 @@ pub(super) async fn discard_session(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
     session_id: Uuid,
-    remote: Option<&RemoteSessionLedger>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    // Resolve the operation identity through the ledger BEFORE any side effect:
-    // an exact committed replay short-circuits to its cached Ack, and a
-    // MISMATCHED actor/hash on a reused operation id is rejected here — never
-    // after detaching the client or stopping a live worker. Only a fresh
-    // authorized operation (or an idempotent replay) proceeds.
-    if let Some(ledger) = remote
-        && let Some(cached) = ledger.committed_replay(ctx).await?
-    {
-        return Ok(cached);
-    }
     // Detach this client from the session it's discarding so the daemon
     // doesn't keep streaming a torn-down worker's events at it.
     if let Some(att) = &state.attached
@@ -580,13 +351,6 @@ pub(super) async fn discard_session(
         .interrupt_and_stop(session_id)
         .await
         .map_err(internal)?;
-    if let Some(ledger) = remote {
-        return commit_session_remote_mutation(ctx, ledger, "discard_session", move |conn| {
-            crate::db::Db::discard_ephemeral_session_conn(conn, session_id)?;
-            Ok(Response::Ack)
-        })
-        .await;
-    }
     ctx.db
         .discard_ephemeral_session(session_id)
         .await
@@ -654,19 +418,7 @@ pub(super) async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     negotiated_protocol_version: u32,
-    remote: Option<&RemoteSessionLedger>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    // Replay short-circuit (#6): an EXACT committed replay of this operation
-    // identity returns its cached Ack BEFORE any destructive-state resolution,
-    // so a retry after a successful delete does not fail `UnknownSession` on the
-    // now-absent target. A mismatched actor/hash is a conflict. A genuinely
-    // fresh operation (or unknown identity) falls through to resolve-then-reserve
-    // — an unknown TARGET still fails `UnknownSession` WITHOUT reserving a row.
-    if let Some(ledger) = remote
-        && let Some(cached) = ledger.committed_replay(ctx).await?
-    {
-        return Ok(cached);
-    }
     let session = match ctx.db.get_session(session_id).await {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -692,6 +444,25 @@ pub(super) async fn delete_session(
             message: format!("session {session_id} is active; end it before deleting"),
         });
     }
+    prepare_session_deletion(ctx, session_id).await?;
+    let now_wall_ms = super::run_invocation::wall_ms_now();
+    // Local/owner path: terminalize then delete (each its own autocommit).
+    ctx.db
+        .terminalize_session_run_invocations(session_id, now_wall_ms)
+        .await
+        .map_err(internal)?;
+    ctx.db.delete_session(session_id).await.map_err(internal)?;
+    Ok(Response::Ack)
+}
+
+/// Complete every asynchronous, idempotent side-effect phase that must precede
+/// the session-row transaction. Both the local and remote commit paths call
+/// this exact sequence; the remote adapter performs committed-replay lookup
+/// before entering it.
+pub(super) async fn prepare_session_deletion(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
     // Don't delete out from under a running worker (GOALS §17h): stop any
     // live workers in the affected subtree first — that cancels their
     // async jobs and ends the current turn cleanly.
@@ -750,37 +521,7 @@ pub(super) async fn delete_session(
             .await
             .map_err(internal)?;
     }
-    if let Some(ledger) = remote {
-        // Collect sidecar payload paths BEFORE the deletion transaction (the
-        // rows vanish with it), ledger EVERY durable domain mutation of this
-        // request in ONE writer transaction — run-invocation terminalization AND
-        // the session delete + tombstone commit atomically with the replay
-        // record (#5) — then remove the sidecar files post-commit (best-effort;
-        // a missing/failed sidecar removal never fails the ledgered operation
-        // the caller can no longer retry).
-        let sidecars = ctx
-            .db
-            .session_delegation_sidecar_paths(session_id)
-            .await
-            .map_err(internal)?;
-        let response = commit_session_remote_mutation(ctx, ledger, "delete_session", move |conn| {
-            crate::db::Db::terminalize_session_run_invocations_conn(conn, session_id, now_wall_ms)?;
-            crate::db::Db::delete_session_row_conn(conn, session_id)?;
-            Ok(Response::Ack)
-        })
-        .await?;
-        if let Err(error) = crate::db::Db::remove_delegation_sidecars(sidecars) {
-            tracing::warn!(%error, %session_id, "post-commit delegation sidecar cleanup failed; ledgered delete stands");
-        }
-        return Ok(response);
-    }
-    // Local/owner path: terminalize then delete (each its own autocommit).
-    ctx.db
-        .terminalize_session_run_invocations(session_id, now_wall_ms)
-        .await
-        .map_err(internal)?;
-    ctx.db.delete_session(session_id).await.map_err(internal)?;
-    Ok(Response::Ack)
+    Ok(())
 }
 
 pub(super) async fn archive_session(

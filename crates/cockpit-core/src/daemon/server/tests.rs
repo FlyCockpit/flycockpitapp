@@ -13840,7 +13840,6 @@ fn dispatch_matrix_class_for_command(
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("get_run_invocation_status", "public_read", false)
-        | ("operation_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
@@ -13849,6 +13848,8 @@ fn dispatch_matrix_class_for_command(
         | ("get_media_attachment_status", "public_read", false)
         | ("get_media_attachment_preview", "public_read", false)
         | ("get_media_upload_status", "public_read", false) => DispatchMatrixClass::Readonly,
+        #[cfg(feature = "remote")]
+        ("operation_status", "public_read", false) => DispatchMatrixClass::Readonly,
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
@@ -13885,6 +13886,7 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GetRunInvocationStatus,
+    #[cfg(feature = "remote")]
     OperationStatus,
     GoalDisposition,
     GetInventoryBundle,
@@ -13954,6 +13956,7 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
             kind: "get_run_invocation_status",
             case: ReadonlyDispatchCaseKind::GetRunInvocationStatus,
         },
+        #[cfg(feature = "remote")]
         ReadonlyDispatchCase {
             kind: "operation_status",
             case: ReadonlyDispatchCaseKind::OperationStatus,
@@ -15593,7 +15596,7 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 struct AuthzSocketScenario {
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -15605,7 +15608,7 @@ struct AuthzSocketScenario {
     _tmp: tempfile::TempDir,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 fn assert_authz_matrix_result(
     case: &AuthzDispatchCase,
     level: AuthzLevel,
@@ -15636,7 +15639,7 @@ fn assert_authz_matrix_result(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 fn assert_authz_allowed_outcome(
     kind: &str,
     level: AuthzLevel,
@@ -15665,7 +15668,7 @@ fn assert_authz_allowed_outcome(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: AuthzKnownHole) {
     let scenario = authz_cross_session_paused_work_scenario(kind, known_hole.level).await;
     let result = dispatch_authz_request_after(
@@ -15711,7 +15714,7 @@ async fn assert_authz_known_hole_socket_case(kind: &'static str, known_hole: Aut
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSocketScenario {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -15764,7 +15767,7 @@ async fn authz_socket_scenario(kind: &'static str, level: AuthzLevel) -> AuthzSo
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 async fn authz_cross_session_paused_work_scenario(
     kind: &'static str,
     level: AuthzLevel,
@@ -15822,7 +15825,7 @@ async fn authz_cross_session_paused_work_scenario(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) -> ClientPrincipal {
     let project_root = project_root.to_string_lossy().into_owned();
     match level {
@@ -16302,6 +16305,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_run_invocation_status" => Request::GetRunInvocationStatus {
             client_submission_id: Uuid::new_v4(),
         },
+        #[cfg(feature = "remote")]
         "operation_status" => Request::OperationStatus {
             operation_id: Uuid::from_u128(99),
         },
@@ -17237,6 +17241,7 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(status.client_submission_id, id);
                 assert_eq!(status.schema_version, 1);
             }
+            #[cfg(feature = "remote")]
             Self::OperationStatus => {
                 let ctx = test_ctx();
                 let operation_id = Uuid::now_v7();
@@ -17643,6 +17648,7 @@ impl ReadonlyDispatchCaseKind {
                 .expect_err("nil client_submission_id is rejected");
                 assert_eq!(err.code, ErrorCode::BadRequest);
             }
+            #[cfg(feature = "remote")]
             Self::OperationStatus => {
                 let ctx = test_ctx();
                 let err = dispatch_matrix_request(
@@ -21932,6 +21938,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: false,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::OperationStatus {
                 operation_id: Uuid::from_u128(99),
@@ -23635,6 +23642,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::AgentInstallationSubmitChoice(..) => "AgentInstallationSubmitChoice",
                         Request::AgentInstallationList(..) => "AgentInstallationList",
                         Request::AgentInstallationInspect(..) => "AgentInstallationInspect",
+                        #[cfg(feature = "remote")]
+                        Request::OperationStatus { .. } => "OperationStatus",
                         $(Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
@@ -23646,6 +23655,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
                     "AgentInstallationBegin", "AgentInstallationSubmitChoice",
                     "AgentInstallationList", "AgentInstallationInspect",
+                    #[cfg(feature = "remote")]
+                    "OperationStatus",
                     $(stringify!($variant)),*, "Unknown"
                 ];
             };
@@ -23659,7 +23670,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SendUserMessage,
         SendUserMessageBulk,
         GetRunInvocationStatus,
-        OperationStatus,
         CancelRunInvocation,
         SteerDelegation,
         BeginAttachmentUpload,
@@ -27513,6 +27523,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
+        #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -27533,6 +27544,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        #[cfg(feature = "remote")]
         remote_project_resolver: base.remote_project_resolver.clone(),
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
@@ -27723,6 +27735,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         shutdown_grace_override: StdMutex::new(None),
         env_baseline: base.env_baseline.clone(),
         upload_accounting: base.upload_accounting.clone(),
+        #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
@@ -27743,6 +27756,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        #[cfg(feature = "remote")]
         remote_project_resolver: base.remote_project_resolver.clone(),
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
@@ -29744,6 +29758,7 @@ async fn history_redaction_scrubs_display_text_and_tag_expansions() {
 // Attempt-grant ceiling authorization (AC7 / AC3a)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "remote")]
 fn attempt_grant_test_ctx(
     resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
 ) -> Arc<DaemonContext> {
@@ -29766,6 +29781,7 @@ fn attempt_grant_test_ctx(
     )
 }
 
+#[cfg(feature = "remote")]
 fn attempt_grant_principal(
     ceiling: cockpit_proto::remote_public_service_policy::RemotePermissionCeilingV1,
 ) -> ClientPrincipal {

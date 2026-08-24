@@ -14520,6 +14520,7 @@ enum AuthzLevel {
 }
 
 impl AuthzLevel {
+    #[cfg(feature = "remote")]
     const ALL: [Self; 4] = [Self::Owner, Self::Writer, Self::Readonly, Self::NoAccess];
 
     fn label(self) -> &'static str {
@@ -14539,9 +14540,11 @@ struct AuthzDispatchCase {
     writer: AuthzExpectation,
     readonly: AuthzExpectation,
     no_access: AuthzExpectation,
+    #[cfg(feature = "remote")]
     known_holes: &'static [AuthzKnownHole],
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone)]
 struct AuthzKnownHole {
     marker: &'static str,
@@ -14568,12 +14571,25 @@ fn authz_owner_only(kind: &'static str) -> AuthzDispatchCase {
         writer: AuthzExpectation::Deny(ErrorCode::Authorization),
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
 
 fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
-    authz_session_writer_with_known_holes(kind, &[])
+    #[cfg(feature = "remote")]
+    {
+        return authz_session_writer_with_known_holes(kind, &[]);
+    }
+
+    #[cfg(not(feature = "remote"))]
+    AuthzDispatchCase {
+        kind,
+        owner: authz_allow(kind),
+        writer: authz_allow(kind),
+        readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+    }
 }
 
 /// Bulk message bytes are bound to an authenticated remote operation, rather
@@ -14589,6 +14605,7 @@ fn authz_bulk_user_message() -> AuthzDispatchCase {
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14606,10 +14623,12 @@ fn authz_bulk_transfer_chunk() -> AuthzDispatchCase {
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
 
+#[cfg(feature = "remote")]
 fn authz_session_writer_with_known_holes(
     kind: &'static str,
     known_holes: &'static [AuthzKnownHole],
@@ -14631,6 +14650,7 @@ fn authz_session_reader(kind: &'static str) -> AuthzDispatchCase {
         writer: authz_allow(kind),
         readonly: authz_allow(kind),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14642,6 +14662,7 @@ fn authz_project_files(kind: &'static str) -> AuthzDispatchCase {
         writer: authz_allow(kind),
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14653,6 +14674,7 @@ fn authz_project_read(kind: &'static str) -> AuthzDispatchCase {
         writer: authz_allow(kind),
         readonly: authz_allow(kind),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14664,6 +14686,7 @@ fn authz_terminal(kind: &'static str) -> AuthzDispatchCase {
         writer: authz_allow(kind),
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -21772,7 +21795,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
             (*ordering == principal::RequestOrdering::Concurrent).then_some(*kind)
         })
         .collect();
-    let mut expected = BTreeSet::from([
+    let expected_base = [
         "agent_installation_inspect",
         "agent_installation_list",
         "daemon_status",
@@ -21823,12 +21846,14 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
-    ]);
+    ];
+    #[cfg(not(feature = "remote"))]
+    let expected = BTreeSet::from(expected_base);
     #[cfg(feature = "remote")]
-    {
-        expected.insert("get_connector_state");
-        expected.insert("get_org_sync_status");
-    }
+    let expected = expected_base
+        .into_iter()
+        .chain(["get_connector_state", "get_org_sync_status"])
+        .collect();
     assert_eq!(actual, expected);
     for serialized in [
         "attach",

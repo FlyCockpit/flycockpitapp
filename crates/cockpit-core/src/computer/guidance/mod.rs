@@ -828,5 +828,9 @@ pub fn is_consequential_action(class: ActionClass) -> bool {
     class.is_consequential()
 }
 
+/// Daemon-memory custody for pending proposals (typed values + rationale live in
+/// memory only; the durable receipt/counter/audit half is separate).
+pub mod lifecycle;
+
 #[cfg(test)]
 mod tests;

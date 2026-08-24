@@ -537,8 +537,29 @@ pub(crate) async fn execute_ordinary_call(
     // here is a hallucination.
     // Loop-guard / safety-gate blocks are NOT rejections in this sense (the
     // call was valid and advertised) and are not classified.
+    // Generic-dispatch refusal of a provider identifier reserved for the
+    // native computer-use tool (`computer-coordinator-live-loop-and-dispatch-
+    // wiring.md` §4). A provider may surface a native `computer_call` /
+    // `computer_20251124` / `computer_20250124` item to the generic Rig
+    // `AssistantContent::ToolCall` layer; ordinary function-tool dispatch must
+    // never execute it as an ordinary tool nor re-parse native computer JSON
+    // here (those items are executed only through the coordinator's raw-content
+    // extraction seam). This is a tool-call NAME/TYPE guard — it is orthogonal
+    // to the `computer` subagent, which is built only via `task` delegation
+    // (`engine::builtin::load`) and never reaches this ordinary path. The name
+    // is not in the advertised toolbox, so absent this guard it would already
+    // fall to `not_in_advertised_set` below; the explicit, reserved-specific
+    // refusal makes the intent auditable and cannot be defeated by a future
+    // toolbox change that registers the name.
+    let reserved_native_computer =
+        crate::computer::is_reserved_native_computer_tool_name(resolved_name);
     let rejection_reason: Option<&'static str> =
-        if placeholder_blocked || loop_guard_reject || gate_block.is_some() || cage_block.is_some()
+        if reserved_native_computer {
+            Some("reserved_native_computer_tool")
+        } else if placeholder_blocked
+            || loop_guard_reject
+            || gate_block.is_some()
+            || cage_block.is_some()
         {
             None
         } else if !repair_outcome.valid {
@@ -616,7 +637,16 @@ pub(crate) async fn execute_ordinary_call(
     // block status for the gate, the tool-call-completed lifecycle status for
     // the loop guard, and the canonical `review_cage_denied` kind for the cage).
     let permission_denied_kind: Option<&'static str> =
-        if placeholder_blocked || !repair_outcome.valid || repeated_recoverable_tool_call_reject {
+        // A reserved native-computer name is a structural refusal, never a
+        // permission denial — even when the same call would ALSO trip the loop
+        // guard or review cage (its reserved-refusal arm wins the `result`
+        // below). Classify it as `None` so no `permissionDenied` observe hook
+        // fires under it.
+        if reserved_native_computer
+            || placeholder_blocked
+            || !repair_outcome.valid
+            || repeated_recoverable_tool_call_reject
+        {
             None
         } else if loop_guard_reject {
             Some("blocked_loop_guard")
@@ -632,7 +662,19 @@ pub(crate) async fn execute_ordinary_call(
     // rejections, and placeholder blocks are NOT executions and fire no post
     // hook. Only the `dispatch_one_timed` path is a real execution.
     let mut tool_was_dispatched = false;
-    let (result, duration_ms) = if let Some(err) = placeholder_block {
+    let (result, duration_ms) = if reserved_native_computer {
+        // Refuse with zero backend input — never call `dispatch_one_timed`.
+        // The model reads back a deterministic diagnostic; the native computer
+        // path is the only route that executes these items.
+        (
+            Err(invalid_input(format!(
+                "`{resolved_name}` is reserved for the provider-native computer-use tool and \
+                 cannot be executed as an ordinary function tool; native computer actions are \
+                 dispatched only through the native computer path, not generic tool calls"
+            ))),
+            0,
+        )
+    } else if let Some(err) = placeholder_block {
         (Err(err), 0)
     } else if let Some(msg) = repeated_recoverable_tool_call.clone() {
         (Err(invalid_input(msg)), 0)
@@ -3845,6 +3887,93 @@ mod tests {
             .find(|event| event.kind == "tool_rejected")
             .expect("tool_rejected event");
         assert_eq!(rejected.data["reason"], "not_in_advertised_set");
+    }
+
+    /// AC20 (`computer-coordinator-live-loop-and-dispatch-wiring.md` §4):
+    /// generic Rig function-tool dispatch refuses a provider identifier
+    /// reserved for the native computer-use tool — it is never executed as an
+    /// ordinary tool and no backend receives input. The refusal is explicit
+    /// (its own `reserved_native_computer_tool` rejection reason), not folded
+    /// into the generic `not_in_advertised_set` hallucination reason.
+    #[tokio::test]
+    async fn computer_live_generic_rig_refuses_native_computer() {
+        for reserved in ["computer", "computer_20251124", "computer_20250124"] {
+            let tmp = tempfile::tempdir().unwrap();
+            // Register a tool UNDER the reserved name: the guard must refuse the
+            // call before dispatch even when the name resolves in the toolbox,
+            // so the tool body is never reached (zero backend input).
+            let called = Arc::new(AtomicBool::new(false));
+            let tools = ToolBox::new().with(Arc::new(NeverCalledTool {
+                name: reserved,
+                called: called.clone(),
+            }));
+            let agent = test_agent(tools.clone());
+            let session = test_session(tmp.path());
+            let model = test_model();
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+            let env = DispatchEnv {
+                agent: &agent,
+                session: &session,
+                model: &model,
+                active_tools: &tools,
+                ctx: &ctx,
+                tx: &tx,
+                hint_corrections: false,
+                loop_guard_threshold: 10,
+                hooks: &crate::config::extended::hooks::HookRegistry::default(),
+                cwd: tmp.path(),
+            };
+            // Native computer JSON args must never be re-parsed here.
+            let call = tool_call(reserved, serde_json::json!({ "action": "screenshot" }));
+            let mut history = Vec::new();
+            push_assistant_call(&mut history, &call);
+
+            execute_ordinary_call(&env, &mut history, &call, reserved, Recovery::Clean, None)
+                .await
+                .unwrap();
+
+            // Refused: the model gets exactly one tool_result and the call is
+            // marked hard-fail.
+            assert_eq!(history.len(), 2, "{reserved}: assistant call + tool_result");
+            assert!(
+                matches!(rx.recv().await, Some(TurnEvent::ToolStart { tool, .. }) if tool == reserved)
+            );
+            assert!(
+                matches!(
+                    rx.recv().await,
+                    Some(TurnEvent::ToolError { tool, error, .. })
+                        if tool == reserved
+                            && error.contains("reserved for the provider-native computer-use tool")
+                ),
+                "{reserved}: reserved refusal surfaced to the model"
+            );
+
+            // Zero backend input: the tool body was never reached.
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "{reserved}: reserved name must not dispatch to the tool body"
+            );
+
+            let rows = session
+                .db
+                .list_tool_calls_for_session(session.id)
+                .await
+                .expect("tool audit rows load");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].tool, reserved);
+            assert!(rows[0].hard_fail);
+
+            let rejected = session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|event| event.kind == "tool_rejected")
+                .expect("tool_rejected event");
+            assert_eq!(rejected.data["reason"], "reserved_native_computer_tool");
+        }
     }
 
     #[tokio::test]

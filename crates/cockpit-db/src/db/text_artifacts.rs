@@ -402,14 +402,31 @@ pub struct ReservedUserArtifactMaterialization {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReservedUserArtifactMaterializationResult {
-    Materialized {
-        event_seq: i64,
-        source_artifact: TextArtifact,
-        projection_artifact: Option<TextArtifact>,
-    },
+    Materialized(Box<ReservedUserArtifactMaterialized>),
     ProjectionTooLarge,
     Stale,
     Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedUserArtifactMaterialized {
+    pub event_seq: i64,
+    pub source_artifact: TextArtifact,
+    pub projection_artifact: Option<TextArtifact>,
+}
+
+/// Identity and quota inputs for phase-one oversized text reservation.
+#[derive(Debug, Clone)]
+pub struct TextArtifactReservationInput {
+    pub session_id: Uuid,
+    pub operation_id: [u8; 16],
+    pub client_submission_id: [u8; 16],
+    pub queue_item_id: [u8; 16],
+    pub source_digest: [u8; 32],
+    pub source_bytes: usize,
+    pub now_ms: i64,
+    pub run_invocation_bound: bool,
+    pub model_fence: Option<TextArtifactModelFence>,
 }
 
 /// A preflighted import slot. Imported redacted bodies carry structural
@@ -487,29 +504,10 @@ impl Db {
     /// Phase one for an FCM2-admitted oversized, text-only submission.
     pub async fn acquire_text_artifact_reservation(
         &self,
-        session_id: Uuid,
-        operation_id: [u8; 16],
-        client_submission_id: [u8; 16],
-        queue_item_id: [u8; 16],
-        source_digest: [u8; 32],
-        source_bytes: usize,
-        now_ms: i64,
+        input: TextArtifactReservationInput,
     ) -> Result<TextArtifactReservationAcquire> {
-        self.transaction(move |conn| {
-            acquire_reservation_conn(
-                conn,
-                session_id,
-                operation_id,
-                client_submission_id,
-                queue_item_id,
-                source_digest,
-                source_bytes,
-                now_ms,
-                false,
-                None,
-            )
-        })
-        .await
+        self.transaction(move |conn| acquire_reservation_conn(conn, &input))
+            .await
     }
 
     /// Atomically creates/replays the FCM2 receipt triple and reserves worst
@@ -524,8 +522,13 @@ impl Db {
         source_bytes: usize,
     ) -> Result<TextArtifactPhaseOneResult> {
         self.accept_message_with_text_artifact_reservation_with_model_fence(
-            input, join, source_digest, source_bytes, None,
-        ).await
+            input,
+            join,
+            source_digest,
+            source_bytes,
+            None,
+        )
+        .await
     }
 
     /// FCM2 v2 intentionally has no mutable model-fence field.  Oversized
@@ -566,8 +569,14 @@ impl Db {
         invocation: TextArtifactRunInvocationInput,
     ) -> Result<TextArtifactPhaseOneResult> {
         self.accept_message_with_text_artifact_reservation_and_run_invocation_with_model_fence(
-            input, join, source_digest, source_bytes, invocation, None,
-        ).await
+            input,
+            join,
+            source_digest,
+            source_bytes,
+            invocation,
+            None,
+        )
+        .await
     }
 
     pub async fn accept_message_with_text_artifact_reservation_and_run_invocation_with_model_fence(
@@ -718,10 +727,8 @@ impl Db {
         session_id: Uuid,
         client_submission_id: [u8; 16],
     ) -> Result<Option<Uuid>> {
-        self.read(move |conn| {
-            bound_run_invocation_conn(conn, session_id, client_submission_id)
-        })
-        .await
+        self.read(move |conn| bound_run_invocation_conn(conn, session_id, client_submission_id))
+            .await
     }
 
     /// Return the canonical FCM2 bytes retained with an accepted, materialized,
@@ -1962,15 +1969,17 @@ fn accept_message_with_reservation_conn(
             store_artifact_model_fence_conn(conn, input, model_fence)?;
             match acquire_reservation_conn(
                 conn,
-                input.session_id,
-                input.operation_id,
-                input.client_submission_id,
-                input.queue_item_id,
-                source_digest,
-                source_bytes,
-                input.now_ms,
-                run_invocation_bound,
-                model_fence,
+                &TextArtifactReservationInput {
+                    session_id: input.session_id,
+                    operation_id: input.operation_id,
+                    client_submission_id: input.client_submission_id,
+                    queue_item_id: input.queue_item_id,
+                    source_digest,
+                    source_bytes,
+                    now_ms: input.now_ms,
+                    run_invocation_bound,
+                    model_fence: model_fence.cloned(),
+                },
             )? {
                 TextArtifactReservationAcquire::Acquired(reservation) => {
                     Ok(TextArtifactPhaseOneResult::Reserved(reservation))
@@ -1999,45 +2008,45 @@ fn accept_message_with_reservation_conn(
                 return Ok(TextArtifactPhaseOneResult::Conflict);
             }
             match safe_outcome {
-            MessageSafeOutcome::Accepted { queue_item_id }
-                if queue_item_id == input.queue_item_id =>
-            {
-                replay_accepted_artifact_reservation_conn(
-                    conn,
-                    input,
-                    source_digest,
-                    source_bytes,
-                    run_invocation_bound,
-                    model_fence,
-                )
-            }
-            MessageSafeOutcome::Accepted { .. } => Ok(TextArtifactPhaseOneResult::Conflict),
-            MessageSafeOutcome::Materialized { .. } | MessageSafeOutcome::TerminalRejected => {
-                match reservation_replay_conn(
-                    conn,
-                    input.session_id,
-                    input.operation_id,
-                    input.now_ms,
-                )? {
-                    TextArtifactReservationReplay::Materialized {
-                        event_seq,
-                        source_artifact_id,
-                        projection_artifact_id,
-                    } => Ok(TextArtifactPhaseOneResult::Materialized {
-                        event_seq,
-                        source_artifact_id,
-                        projection_artifact_id,
-                    }),
-                    TextArtifactReservationReplay::Terminal { reason } => {
-                        Ok(TextArtifactPhaseOneResult::Terminal { reason })
-                    }
-                    TextArtifactReservationReplay::Live(_)
-                    | TextArtifactReservationReplay::Expired(_)
-                    | TextArtifactReservationReplay::Missing => {
-                        bail!("replayed terminal artifact receipt has inconsistent lease state")
+                MessageSafeOutcome::Accepted { queue_item_id }
+                    if queue_item_id == input.queue_item_id =>
+                {
+                    replay_accepted_artifact_reservation_conn(
+                        conn,
+                        input,
+                        source_digest,
+                        source_bytes,
+                        run_invocation_bound,
+                        model_fence,
+                    )
+                }
+                MessageSafeOutcome::Accepted { .. } => Ok(TextArtifactPhaseOneResult::Conflict),
+                MessageSafeOutcome::Materialized { .. } | MessageSafeOutcome::TerminalRejected => {
+                    match reservation_replay_conn(
+                        conn,
+                        input.session_id,
+                        input.operation_id,
+                        input.now_ms,
+                    )? {
+                        TextArtifactReservationReplay::Materialized {
+                            event_seq,
+                            source_artifact_id,
+                            projection_artifact_id,
+                        } => Ok(TextArtifactPhaseOneResult::Materialized {
+                            event_seq,
+                            source_artifact_id,
+                            projection_artifact_id,
+                        }),
+                        TextArtifactReservationReplay::Terminal { reason } => {
+                            Ok(TextArtifactPhaseOneResult::Terminal { reason })
+                        }
+                        TextArtifactReservationReplay::Live(_)
+                        | TextArtifactReservationReplay::Expired(_)
+                        | TextArtifactReservationReplay::Missing => {
+                            bail!("replayed terminal artifact receipt has inconsistent lease state")
+                        }
                     }
                 }
-            }
                 MessageSafeOutcome::Removed => Ok(TextArtifactPhaseOneResult::Conflict),
             }
         }
@@ -2066,7 +2075,10 @@ fn store_artifact_model_fence_conn(
             input.message_request_digest.as_slice(),
         ],
     )?;
-    ensure!(changed == 1, "accepted receipt changed before model-fence persistence");
+    ensure!(
+        changed == 1,
+        "accepted receipt changed before model-fence persistence"
+    );
     Ok(())
 }
 
@@ -2074,26 +2086,35 @@ fn stored_artifact_model_fence_conn(
     conn: &Connection,
     input: &AcceptMessageInput,
 ) -> Result<Option<TextArtifactModelFence>> {
-    let pair = conn.query_row(
-        "SELECT artifact_model_fence_generation, artifact_model_fence_json
+    let pair = conn
+        .query_row(
+            "SELECT artifact_model_fence_generation, artifact_model_fence_json
            FROM message_operation_receipts
           WHERE session_id=?1 AND operation_id=?2 AND client_submission_id=?3
             AND message_request_digest=?4",
-        params![
-            input.session_id.to_string(),
-            input.operation_id.as_slice(),
-            input.client_submission_id.as_slice(),
-            input.message_request_digest.as_slice(),
-        ],
-        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
-    ).optional()?;
+            params![
+                input.session_id.to_string(),
+                input.operation_id.as_slice(),
+                input.client_submission_id.as_slice(),
+                input.message_request_digest.as_slice(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?;
     let Some((generation, model_json)) = pair else {
         bail!("replayed message receipt disappeared");
     };
     match (generation, model_json) {
         (None, None) => Ok(None),
         (Some(generation), Some(model_json)) => Ok(Some(TextArtifactModelFence {
-            generation: generation.parse().context("invalid persisted artifact model fence generation")?,
+            generation: generation
+                .parse()
+                .context("invalid persisted artifact model fence generation")?,
             model_json,
         })),
         _ => bail!("persisted artifact model fence has mismatched fields"),
@@ -2117,8 +2138,10 @@ fn run_invocation_binding_matches_conn(
                 AND i.session_id=?1 AND i.origin_principal_digest=?4
          )",
         params![
-            session_id.to_string(), client_submission_id.as_slice(),
-            run_invocation_id.to_string(), origin_principal_digest,
+            session_id.to_string(),
+            client_submission_id.as_slice(),
+            run_invocation_id.to_string(),
+            origin_principal_digest,
         ],
         |row| row.get(0),
     )?;
@@ -2137,11 +2160,16 @@ fn bind_run_invocation_conn(
              (session_id,client_submission_id,run_invocation_id,origin_principal_digest)
          VALUES (?1,?2,?3,?4)",
         params![
-            session_id.to_string(), client_submission_id.as_slice(),
-            run_invocation_id.to_string(), origin_principal_digest,
+            session_id.to_string(),
+            client_submission_id.as_slice(),
+            run_invocation_id.to_string(),
+            origin_principal_digest,
         ],
     )?;
-    ensure!(changed == 1, "oversized run invocation binding was not inserted");
+    ensure!(
+        changed == 1,
+        "oversized run invocation binding was not inserted"
+    );
     Ok(())
 }
 
@@ -2311,49 +2339,45 @@ fn terminalize_unreserved_artifact_receipt_conn(
 
 fn acquire_reservation_conn(
     conn: &Connection,
-    session_id: Uuid,
-    operation_id: [u8; 16],
-    client_submission_id: [u8; 16],
-    queue_item_id: [u8; 16],
-    source_digest: [u8; 32],
-    source_bytes: usize,
-    now_ms: i64,
-    run_invocation_bound: bool,
-    model_fence: Option<&TextArtifactModelFence>,
+    input: &TextArtifactReservationInput,
 ) -> Result<TextArtifactReservationAcquire> {
-    validate_text_artifact_model_fence(model_fence)?;
-    if !(65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&source_bytes) {
+    validate_text_artifact_model_fence(input.model_fence.as_ref())?;
+    if !(65_537..=MAX_ARTIFACT_CONTENT_BYTES).contains(&input.source_bytes) {
         bail!("oversized source is outside the artifact reservation domain");
     }
-    if let Some(existing) = reservation_for_submission_conn(conn, session_id, client_submission_id)?
+    if let Some(existing) =
+        reservation_for_submission_conn(conn, input.session_id, input.client_submission_id)?
     {
-        let same_identity = existing.operation_id == operation_id
-            && existing.queue_item_id == queue_item_id
-            && existing.source_digest == source_digest
-            && existing.source_bytes == source_bytes
-            && existing.run_invocation_bound == run_invocation_bound;
-        let same_identity = same_identity && existing.model_fence.as_ref() == model_fence;
+        let same_identity = existing.operation_id == input.operation_id
+            && existing.queue_item_id == input.queue_item_id
+            && existing.source_digest == input.source_digest
+            && existing.source_bytes == input.source_bytes
+            && existing.run_invocation_bound == input.run_invocation_bound;
+        let same_identity =
+            same_identity && existing.model_fence.as_ref() == input.model_fence.as_ref();
         if !same_identity {
             return Ok(TextArtifactReservationAcquire::Conflict);
         }
-        return Ok(if existing.expires_at > now_ms {
+        return Ok(if existing.expires_at > input.now_ms {
             TextArtifactReservationAcquire::Existing(existing)
         } else {
             TextArtifactReservationAcquire::Conflict
         });
     }
-    let reserved_bytes = source_bytes
+    let reserved_bytes = input
+        .source_bytes
         .checked_add(MAX_ARTIFACT_CONTENT_BYTES)
         .ok_or_else(|| anyhow!("text artifact reservation overflow"))?;
-    let total = session_text_artifact_bytes_conn(conn, session_id)?
-        .checked_add(active_reserved_bytes_conn(conn, session_id, None)?)
+    let total = session_text_artifact_bytes_conn(conn, input.session_id)?
+        .checked_add(active_reserved_bytes_conn(conn, input.session_id, None)?)
         .and_then(|value| value.checked_add(reserved_bytes))
         .ok_or_else(|| anyhow!("text artifact quota arithmetic overflow"))?;
     if total > MAX_SESSION_ARTIFACT_CONTENT_BYTES {
         return Ok(TextArtifactReservationAcquire::SessionQuota);
     }
     let lease_token = Uuid::new_v4();
-    let expires_at = now_ms
+    let expires_at = input
+        .now_ms
         .checked_add(ARTIFACT_RESERVATION_TTL_MS)
         .ok_or_else(|| anyhow!("artifact reservation expiry overflow"))?;
     let changed = conn.execute(
@@ -2361,26 +2385,26 @@ fn acquire_reservation_conn(
              (session_id,client_submission_id,operation_id,queue_item_id,source_digest,source_bytes,reserved_bytes,run_invocation_bound,model_fence_generation,model_fence_json,lease_token,expires_at,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
         params![
-            session_id.to_string(), client_submission_id.as_slice(), operation_id.as_slice(),
-            queue_item_id.as_slice(), source_digest.as_slice(), as_i64(source_bytes)?,
-            as_i64(reserved_bytes)?, run_invocation_bound,
-            model_fence.map(|fence| fence.generation.to_string()),
-            model_fence.map(|fence| fence.model_json.as_str()),
-            lease_token.to_string(), expires_at, now_ms,
+            input.session_id.to_string(), input.client_submission_id.as_slice(), input.operation_id.as_slice(),
+            input.queue_item_id.as_slice(), input.source_digest.as_slice(), as_i64(input.source_bytes)?,
+            as_i64(reserved_bytes)?, input.run_invocation_bound,
+            input.model_fence.as_ref().map(|fence| fence.generation.to_string()),
+            input.model_fence.as_ref().map(|fence| fence.model_json.as_str()),
+            lease_token.to_string(), expires_at, input.now_ms,
         ],
     );
     match changed {
         Ok(1) => Ok(TextArtifactReservationAcquire::Acquired(
             TextArtifactReservation {
-                session_id,
-                operation_id,
-                client_submission_id,
-                queue_item_id,
-                source_digest,
-                source_bytes,
+                session_id: input.session_id,
+                operation_id: input.operation_id,
+                client_submission_id: input.client_submission_id,
+                queue_item_id: input.queue_item_id,
+                source_digest: input.source_digest,
+                source_bytes: input.source_bytes,
                 reserved_bytes,
-                run_invocation_bound,
-                model_fence: model_fence.cloned(),
+                run_invocation_bound: input.run_invocation_bound,
+                model_fence: input.model_fence.clone(),
                 lease_token,
                 expires_at,
             },
@@ -2397,17 +2421,24 @@ fn acquire_reservation_conn(
     }
 }
 
-fn validate_text_artifact_model_fence(
-    fence: Option<&TextArtifactModelFence>,
-) -> Result<()> {
+fn validate_text_artifact_model_fence(fence: Option<&TextArtifactModelFence>) -> Result<()> {
     let Some(fence) = fence else {
-        return Ok(();
+        return Ok(());
     };
-    ensure!(fence.model_json.len() <= 8 * 1024, "oversized model fence exceeds bounds");
-    let value: serde_json::Value = serde_json::from_str(&fence.model_json)
-        .context("oversized model fence is not JSON")?;
-    ensure!(value.is_object(), "oversized model fence must be a JSON object");
-    ensure!(serde_json::to_string(&value)? == fence.model_json, "oversized model fence JSON is not canonical");
+    ensure!(
+        fence.model_json.len() <= 8 * 1024,
+        "oversized model fence exceeds bounds"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&fence.model_json).context("oversized model fence is not JSON")?;
+    ensure!(
+        value.is_object(),
+        "oversized model fence must be a JSON object"
+    );
+    ensure!(
+        serde_json::to_string(&value)? == fence.model_json,
+        "oversized model fence JSON is not canonical"
+    );
     Ok(())
 }
 
@@ -2712,7 +2743,9 @@ fn materialize_reserved_user_artifacts_conn(
                 reservation.session_id,
                 reservation.client_submission_id,
             )?
-            .context("bound oversized artifact reservation lacks its exact run invocation binding")?,
+            .context(
+                "bound oversized artifact reservation lacks its exact run invocation binding",
+            )?,
         )
     } else {
         None
@@ -2870,11 +2903,13 @@ fn materialize_reserved_user_artifacts_conn(
             input.now_ms,
         )?;
     }
-    Ok(ReservedUserArtifactMaterializationResult::Materialized {
-        event_seq,
-        source_artifact,
-        projection_artifact,
-    })
+    Ok(ReservedUserArtifactMaterializationResult::Materialized(
+        Box::new(ReservedUserArtifactMaterialized {
+            event_seq,
+            source_artifact,
+            projection_artifact,
+        }),
+    ))
 }
 
 /// Validate the deliberately closed durable accepted-submission envelope.
@@ -2886,57 +2921,147 @@ fn materialize_reserved_user_artifacts_conn(
 /// their type and byte bounds are still checked here so direct SQL cannot
 /// manufacture an ambiguous composition.
 pub(crate) fn validate_user_model_envelope(raw: &str) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(raw).context("invalid user model envelope JSON")?;
-    let object = value.as_object().ok_or_else(|| anyhow!("user model envelope must be an object"))?;
-    ensure!((object.len() == 2 || object.len() == 3) && object.get("version").and_then(serde_json::Value::as_i64) == Some(3), "unknown user model envelope");
-    ensure!(object.keys().all(|key| matches!(key.as_str(), "version" | "parts" | "prelude")), "user model envelope has unknown fields");
+    let value: serde_json::Value =
+        serde_json::from_str(raw).context("invalid user model envelope JSON")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("user model envelope must be an object"))?;
+    ensure!(
+        (object.len() == 2 || object.len() == 3)
+            && object.get("version").and_then(serde_json::Value::as_i64) == Some(3),
+        "unknown user model envelope"
+    );
+    ensure!(
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "version" | "parts" | "prelude")),
+        "user model envelope has unknown fields"
+    );
     if let Some(prelude) = object.get("prelude") {
-        let entries = prelude.as_array().ok_or_else(|| anyhow!("user model envelope prelude must be an array"))?;
-        ensure!(entries.len() <= 1, "user model envelope has too many prelude entries");
+        let entries = prelude
+            .as_array()
+            .ok_or_else(|| anyhow!("user model envelope prelude must be an array"))?;
+        ensure!(
+            entries.len() <= 1,
+            "user model envelope has too many prelude entries"
+        );
         for entry in entries {
-            let entry = entry.as_object().ok_or_else(|| anyhow!("user model envelope prelude is invalid"))?;
-            ensure!(entry.len() == 6 && entry.get("type").and_then(serde_json::Value::as_str) == Some("forced_skill"), "unknown user model envelope prelude");
-            ensure!(entry.get("call_id").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty() && v.len() <= 256), "forced prelude call id is invalid");
-            ensure!(entry.get("name").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty() && v.len() <= 256), "forced prelude name is invalid");
-            let name = entry.get("name").and_then(serde_json::Value::as_str).unwrap();
-            let args = entry.get("args").and_then(serde_json::Value::as_object).ok_or_else(|| anyhow!("forced prelude args must be an object"))?;
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| anyhow!("user model envelope prelude is invalid"))?;
+            ensure!(
+                entry.len() == 6
+                    && entry.get("type").and_then(serde_json::Value::as_str)
+                        == Some("forced_skill"),
+                "unknown user model envelope prelude"
+            );
+            ensure!(
+                entry
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| !v.is_empty() && v.len() <= 256),
+                "forced prelude call id is invalid"
+            );
+            ensure!(
+                entry
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| !v.is_empty() && v.len() <= 256),
+                "forced prelude name is invalid"
+            );
+            let name = entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let args = entry
+                .get("args")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| anyhow!("forced prelude args must be an object"))?;
             ensure!(args.len() == 1, "forced prelude args have unknown fields");
-            ensure!(args.get("name").and_then(serde_json::Value::as_str).is_some_and(|value| !value.is_empty() && value.len() <= 256 && value == name), "forced prelude args name is invalid");
-            ensure!(entry.get("body").and_then(serde_json::Value::as_str).is_some_and(|v| v.len() <= 65_536), "forced prelude body is invalid");
-            ensure!(entry.get("hard_fail").and_then(serde_json::Value::as_bool).is_some(), "forced prelude hard_fail is invalid");
+            ensure!(
+                args.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty() && value.len() <= 256 && value == name),
+                "forced prelude args name is invalid"
+            );
+            ensure!(
+                entry
+                    .get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| v.len() <= 65_536),
+                "forced prelude body is invalid"
+            );
+            ensure!(
+                entry
+                    .get("hard_fail")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some(),
+                "forced prelude hard_fail is invalid"
+            );
         }
     }
-    let parts = object.get("parts").and_then(serde_json::Value::as_array).ok_or_else(|| anyhow!("user model envelope parts must be an array"))?;
-    ensure!(!parts.is_empty() && parts.len() <= 64, "user model envelope has an invalid part count");
+    let parts = object
+        .get("parts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("user model envelope parts must be an array"))?;
+    ensure!(
+        !parts.is_empty() && parts.len() <= 64,
+        "user model envelope has an invalid part count"
+    );
     let mut authored_slots = 0usize;
     for part in parts {
-        let part = part.as_object().ok_or_else(|| anyhow!("user model envelope part must be an object"))?;
-        let kind = part.get("type").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("user model envelope part lacks type"))?;
+        let part = part
+            .as_object()
+            .ok_or_else(|| anyhow!("user model envelope part must be an object"))?;
+        let kind = part
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("user model envelope part lacks type"))?;
         match kind {
             "authored_text_slot" => {
-                ensure!(part.len() == 1, "authored slot carries duplicate source data");
+                ensure!(
+                    part.len() == 1,
+                    "authored slot carries duplicate source data"
+                );
                 authored_slots += 1;
             }
             "text" => {
                 ensure!(part.len() == 2, "text envelope part has unknown fields");
-                let text = part.get("text").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("text envelope part lacks text"))?;
-                ensure!(!text.is_empty() && text.len() <= 65_536, "text envelope part exceeds bounds");
+                let text = part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow!("text envelope part lacks text"))?;
+                ensure!(
+                    !text.is_empty() && text.len() <= 65_536,
+                    "text envelope part exceeds bounds"
+                );
             }
             "image" | "audio" | "video" | "document" | "tool_result" => {
                 ensure!(part.len() == 2, "typed envelope part has unknown fields");
-                let payload = part.get("payload").ok_or_else(|| anyhow!("typed envelope part lacks payload"))?;
+                let payload = part
+                    .get("payload")
+                    .ok_or_else(|| anyhow!("typed envelope part lacks payload"))?;
                 let payload_type = payload
                     .as_object()
                     .and_then(|payload| payload.get("type"))
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow!("typed envelope payload lacks its closed codec tag"))?;
-                ensure!(payload_type == kind, "typed envelope payload has the wrong codec tag");
-                ensure!(serde_json::to_vec(payload)?.len() <= 65_536, "typed envelope payload exceeds bounds");
+                ensure!(
+                    payload_type == kind,
+                    "typed envelope payload has the wrong codec tag"
+                );
+                ensure!(
+                    serde_json::to_vec(payload)?.len() <= 65_536,
+                    "typed envelope payload exceeds bounds"
+                );
             }
             _ => bail!("unknown user model envelope part type"),
         }
     }
-    ensure!(authored_slots == 1, "user model envelope must own exactly one authored slot");
+    ensure!(
+        authored_slots == 1,
+        "user model envelope must own exactly one authored slot"
+    );
     Ok(())
 }
 
@@ -3358,7 +3483,9 @@ fn decode_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<TextArtifactR
     let model_fence = match (generation, model_json) {
         (None, None) => None,
         (Some(generation), Some(model_json)) => Some(TextArtifactModelFence {
-            generation: generation.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+            generation: generation
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
             model_json,
         }),
         _ => return Err(rusqlite::Error::InvalidQuery),
@@ -3468,7 +3595,7 @@ mod tests {
         let source = "s".repeat(65_537);
         let fence = TextArtifactModelFence {
             generation: 7,
-            model_json: r#"{"provider":"openai","model":"gpt-5"}"#.to_owned(),
+            model_json: r#"{"model":"gpt-5","provider":"openai"}"#.to_owned(),
         };
 
         let accepted = db
@@ -3506,7 +3633,7 @@ mod tests {
                 source.len(),
                 Some(TextArtifactModelFence {
                     generation: 8,
-                    model_json: r#"{"provider":"openai","model":"gpt-5"}"#.to_owned(),
+                    model_json: r#"{"model":"gpt-5","provider":"openai"}"#.to_owned(),
                 }),
             )
             .await
@@ -3630,7 +3757,8 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source.clone() }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#.to_owned(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
                 source_text: source,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
@@ -3641,7 +3769,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             materialized,
-            ReservedUserArtifactMaterializationResult::Materialized { .. }
+            ReservedUserArtifactMaterializationResult::Materialized(_)
         ));
         let running = db.get_run_invocation(invocation_id).await.unwrap().unwrap();
         assert_eq!(running.state, "running");
@@ -3740,8 +3868,18 @@ mod tests {
             .await
             .unwrap();
         assert!(result.slots.is_empty());
-        assert!(db.list_text_artifacts(session.session_id).await.unwrap().is_empty());
-        assert_eq!(db.session_text_artifact_bytes(session.session_id).await.unwrap(), 0);
+        assert!(
+            db.list_text_artifacts(session.session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.session_text_artifact_bytes(session.session_id)
+                .await
+                .unwrap(),
+            0
+        );
         let state = db
             .read(move |conn| {
                 conn.query_row(
@@ -4096,7 +4234,8 @@ mod tests {
                     "images": [{"id": Uuid::new_v4()}],
                 })
                 .to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#.to_owned(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
                 source_text: source,
                 model_projection: None,
                 agent: Some("Build".to_owned()),
@@ -4148,7 +4287,8 @@ mod tests {
             .materialize_reserved_user_text_artifacts(ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: serde_json::json!({ "text": source }).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#.to_owned(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
                 source_text: source,
                 model_projection: Some("different model projection".to_owned()),
                 agent: Some("Build".to_owned()),
@@ -4158,11 +4298,9 @@ mod tests {
             .await
             .unwrap();
         let (source_event_seq, source_artifact) = match materialized {
-            ReservedUserArtifactMaterializationResult::Materialized {
-                event_seq,
-                source_artifact,
-                ..
-            } => (event_seq, source_artifact),
+            ReservedUserArtifactMaterializationResult::Materialized(materialized) => {
+                (materialized.event_seq, materialized.source_artifact)
+            }
             other => panic!("expected materialization, got {other:?}"),
         };
         let duplicate_source_id = Uuid::new_v4();
@@ -4890,7 +5028,10 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            db.list_session_events(session.session_id).await.unwrap().is_empty(),
+            db.list_session_events(session.session_id)
+                .await
+                .unwrap()
+                .is_empty(),
             "the failed phase two must not leave a canonical event/envelope owner"
         );
         assert!(
@@ -4911,7 +5052,9 @@ mod tests {
             .await
             .unwrap();
         let event_seq = match committed {
-            ReservedUserArtifactMaterializationResult::Materialized { event_seq, .. } => event_seq,
+            ReservedUserArtifactMaterializationResult::Materialized(materialized) => {
+                materialized.event_seq
+            }
             other => panic!("expected materialization after fault removal, got {other:?}"),
         };
         assert!(matches!(

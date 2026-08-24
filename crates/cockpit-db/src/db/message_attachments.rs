@@ -570,13 +570,13 @@ mod tests {
                 "TEXT must not pass the BLOB guard"
             );
             assert!(update(&under_five).is_err(), "under-five BLOB must fail");
-            assert!(
-                update(&wrong_magic).is_err(),
-                "wrong-magic BLOB must fail"
-            );
+            assert!(update(&wrong_magic).is_err(), "wrong-magic BLOB must fail");
             let mut one_over = vec![b'x'; MAX_QUEUED_CANONICAL_MESSAGE_BYTES + 1];
             one_over[..4].copy_from_slice(b"FCM2");
-            assert!(update(&one_over).is_err(), "outer-cap-plus-one BLOB must fail");
+            assert!(
+                update(&one_over).is_err(),
+                "outer-cap-plus-one BLOB must fail"
+            );
             Ok(())
         })
         .await

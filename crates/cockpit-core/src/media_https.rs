@@ -414,8 +414,12 @@ fn is_public_destination(ip: IpAddr) -> bool {
 }
 
 fn is_public_v4(ip: Ipv4Addr) -> bool {
+    !is_forbidden_v4(ip)
+}
+
+fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    !(a == 0
+    a == 0
         || a == 10
         || a == 127
         || (a == 100 && (64..=127).contains(&b))
@@ -428,7 +432,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
-        || a >= 224)
+        || a >= 224
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
@@ -441,11 +445,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if octets[0] & 0xe0 != 0x20 {
         return false;
     }
-    let segments = ip.segments();
-    !(segments[0] == 0x2001 && segments[1] < 0x0200 // IETF special assignments /23
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation /32
+    !is_forbidden_v6_segments(ip.segments())
+}
+
+fn is_forbidden_v6_segments(segments: [u16; 8]) -> bool {
+    (segments[1] < 0x0200 || segments[1] == 0x0db8) && segments[0] == 0x2001 // IETF special assignments /23 and documentation /32
         || segments[0] == 0x2002 // 6to4 embeds an unchecked IPv4 destination
-        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)) // documentation /20
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0) // documentation /20
 }
 
 pub(crate) fn checked_content_length(value: Option<u64>, limits: &HttpsFetchLimits) -> Result<()> {

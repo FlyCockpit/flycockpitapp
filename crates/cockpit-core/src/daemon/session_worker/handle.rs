@@ -1587,7 +1587,7 @@ pub enum SessionWork {
         /// Present only for text-only sources above 64KiB. Unlike the legacy
         /// in-memory acceptance path, this branch has a durable FCM2 receipt
         /// and exact artifact lease before it reaches the driver.
-        artifact_admission: Option<OversizedTextArtifactAdmission>,
+        artifact_admission: Option<Box<OversizedTextArtifactAdmission>>,
         respond_to: oneshot::Sender<
             std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
         >,

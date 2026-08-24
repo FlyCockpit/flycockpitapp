@@ -55,7 +55,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
@@ -4895,13 +4895,13 @@ impl Driver {
     /// re-fire `userPromptSubmit`.
     fn stop_continuation_prompt(reason: String, additional_context: Option<String>) -> Message {
         let mut text = reason;
-        if let Some(ctx) = additional_context {
-            if !ctx.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&ctx);
+        if let Some(ctx) = additional_context
+            && !ctx.is_empty()
+        {
+            if !text.is_empty() {
+                text.push('\n');
             }
+            text.push_str(&ctx);
         }
         crate::engine::message::build_user_message(UserSubmission {
             expected_model_state_generation: None,
@@ -7545,11 +7545,9 @@ impl Driver {
         // phase two persists the exact resulting composition before the first
         // primary-provider handoff.
         let prepared_auto_skill = if submission_has_oversized_artifact_lease {
-            let skill_probe = crate::engine::text_artifact_frame::bounded_utf8_prefix(
-                &user_text,
-                4 * 1024,
-            )
-            .to_owned();
+            let skill_probe =
+                crate::engine::text_artifact_frame::bounded_utf8_prefix(&user_text, 4 * 1024)
+                    .to_owned();
             Some(self.prepare_auto_skill_injection(&skill_probe).await)
         } else {
             None
@@ -7574,7 +7572,9 @@ impl Driver {
         let accepted_oversized_guidance = if submission_has_oversized_artifact_lease {
             let mut guidance = String::new();
             if let Some(prepared) = prepared_auto_skill.as_ref() {
-                guidance.push_str(&prepared.guidance(&crate::engine::text_artifact_frame::bounded_utf8_prefix(&user_text, 4 * 1024)));
+                guidance.push_str(&prepared.guidance(
+                    crate::engine::text_artifact_frame::bounded_utf8_prefix(&user_text, 4 * 1024),
+                ));
             }
             Some(guidance)
         } else {
@@ -7668,12 +7668,15 @@ impl Driver {
                 .await;
             match materialization {
                 Ok(
-                    crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized {
+                    crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized(
+                        materialized,
+                    ),
+                ) => {
+                    let crate::db::text_artifacts::ReservedUserArtifactMaterialized {
                         event_seq,
                         source_artifact,
                         projection_artifact,
-                    },
-                ) => {
+                    } = *materialized;
                     // From this point the turn is durably accepted. No rejected
                     // source can advance activity/title/provider state.
                     if submission_kind == UserSubmissionKind::User
@@ -8034,23 +8037,26 @@ impl Driver {
         // bounded authored prefix to choose guidance, but the assembled
         // foreground prompt retains that guidance and swaps only authored text
         // for the durable artifact frame.
-        let rendered_oversized_composition = if let Some((event_seq, frame)) = artifact_frame.as_ref() {
-            let envelope = self
-                .session
-                .db
-                .user_message_model_envelope(self.session.id, *event_seq)
-                .await?
-                .ok_or_else(|| anyhow!("materialized oversized user event lacks accepted envelope"))?;
-            Some(
+        let rendered_oversized_composition =
+            if let Some((event_seq, frame)) = artifact_frame.as_ref() {
+                let envelope = self
+                    .session
+                    .db
+                    .user_message_model_envelope(self.session.id, *event_seq)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("materialized oversized user event lacks accepted envelope")
+                    })?;
+                Some(
                 crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
                     &envelope,
                     frame,
                     &self.redact,
                 )?,
             )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let user_text = if rendered_oversized_composition.is_none() {
             self.maybe_inject_skill(&user_text, tx).await
         } else {
@@ -8074,7 +8080,12 @@ impl Driver {
         // and folded into history as a native call/result pair, then the user's
         // text (with any trailing args) drives the turn as the task input.
         if let Some(prepared) = prepared_forced_skill {
-            self.apply_prepared_forced_skill(prepared, tx, rendered_oversized_composition.is_none()).await;
+            self.apply_prepared_forced_skill(
+                prepared,
+                tx,
+                rendered_oversized_composition.is_none(),
+            )
+            .await;
         } else if let Some(skill_name) = forced_skill {
             self.seed_forced_skill(&skill_name, tx).await;
         }
@@ -8138,9 +8149,15 @@ impl Driver {
             })
         } else if let Some(composition) = rendered_oversized_composition {
             if !composition.leading.is_empty() {
-                self.stack.last_mut().expect("stack never empty").history.extend(composition.leading);
+                self.stack
+                    .last_mut()
+                    .expect("stack never empty")
+                    .history
+                    .extend(composition.leading);
             }
-            Message::User { content: composition.content }
+            Message::User {
+                content: composition.content,
+            }
         } else {
             crate::engine::message::build_user_message(UserSubmission {
                 expected_model_state_generation: None,

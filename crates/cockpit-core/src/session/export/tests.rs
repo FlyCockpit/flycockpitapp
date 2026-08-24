@@ -2799,9 +2799,7 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         .await
         .unwrap()
     {
-        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
-            reservation
-        }
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => reservation,
         other => panic!("expected a typed source reservation, got {other:?}"),
     };
     let materialized = db
@@ -2809,7 +2807,8 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
             crate::db::text_artifacts::ReservedUserArtifactMaterialization {
                 reservation,
                 canonical_event_json: json!({"text": source.clone()}).to_string(),
-                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#.to_owned(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#
+                    .to_owned(),
                 source_text: source.clone(),
                 model_projection: None,
                 agent: Some("Build".to_owned()),
@@ -2821,11 +2820,15 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
         .unwrap();
     assert!(matches!(
         materialized,
-        crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized { .. }
+        crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized(_)
     ));
 
-    let bundle = collect_bundle(&db, source_session.session_id).await.unwrap();
-    let archive = trusted_build_zip(&db, &source_session, &bundle).await.unwrap();
+    let bundle = collect_bundle(&db, source_session.session_id)
+        .await
+        .unwrap();
+    let archive = trusted_build_zip(&db, &source_session, &bundle)
+        .await
+        .unwrap();
     let index: Vec<Value> = serde_json::from_str(
         &read_zip_entry(&archive, "text_artifacts/index.json")
             .expect("export contains the typed user source index"),
@@ -2845,14 +2848,11 @@ async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydra
     .await
     .expect("typed oversized source remains importable");
     let imported_session_id = imported.imported[0];
-    let rebuilt = crate::engine::rehydrate::rehydrate_session(
-        &destination,
-        imported_session_id,
-        "Build",
-    )
-    .await
-    .expect("imported typed source is rehydratable")
-    .expect("imported session has history");
+    let rebuilt =
+        crate::engine::rehydrate::rehydrate_session(&destination, imported_session_id, "Build")
+            .await
+            .expect("imported typed source is rehydratable")
+            .expect("imported session has history");
     let rig::message::Message::User { content } = &rebuilt.history[0] else {
         panic!("expected imported user message");
     };
@@ -2885,8 +2885,12 @@ async fn oversized_user_export_keeps_a_legacy_mixed_media_corruption_unimportabl
     // Production dispatch now rejects this shape before it becomes durable.
     // This export/import path proves an old/corrupt database cannot turn it
     // back into a silently accepted, unreplayable event.
-    let bundle = collect_bundle(&db, source_session.session_id).await.unwrap();
-    let archive = trusted_build_zip(&db, &source_session, &bundle).await.unwrap();
+    let bundle = collect_bundle(&db, source_session.session_id)
+        .await
+        .unwrap();
+    let archive = trusted_build_zip(&db, &source_session, &bundle)
+        .await
+        .unwrap();
     let destination = Db::open_in_memory().unwrap();
     let error = crate::session::import::import_archive(
         &destination,
@@ -2895,9 +2899,7 @@ async fn oversized_user_export_keeps_a_legacy_mixed_media_corruption_unimportabl
     .await
     .expect_err("a long mixed-media event must remain artifact-ineligible after export");
     assert!(
-        error
-            .to_string()
-            .contains("cannot carry media/file parts"),
+        error.to_string().contains("cannot carry media/file parts"),
         "unexpected import error: {error:#}"
     );
     assert!(
@@ -2999,9 +3001,13 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
     // The default /3 archive deliberately carries the artifact's
     // length-preserving export representation, even when this test's empty
     // redactor makes the bytes already safe.
-    let source_zip = build_zip(&source, &source_session, std::slice::from_ref(&source_session))
-        .await
-        .unwrap();
+    let source_zip = build_zip(
+        &source,
+        &source_session,
+        std::slice::from_ref(&source_session),
+    )
+    .await
+    .unwrap();
     let imported_db = Db::open_in_memory().unwrap();
     let imported = crate::session::import::import_archive(
         &imported_db,
@@ -3022,7 +3028,10 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
     );
     assert!(imported_artifact.archive_import_id.is_some());
 
-    let child = imported_db.create_fork(imported_session_id, None).await.unwrap();
+    let child = imported_db
+        .create_fork(imported_session_id, None)
+        .await
+        .unwrap();
     let child_artifact = imported_db
         .list_text_artifacts(child.session_id)
         .await
@@ -3033,7 +3042,10 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
         child_artifact.representation,
         crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
     );
-    assert_eq!(child_artifact.archive_import_id, imported_artifact.archive_import_id);
+    assert_eq!(
+        child_artifact.archive_import_id,
+        imported_artifact.archive_import_id
+    );
 
     // An explicit raw local export cannot resurrect a body that was already
     // imported as an irreversible redacted representation. It must preserve
@@ -3050,16 +3062,18 @@ async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible
     )
     .await
     .unwrap();
-    let index: Vec<Value> = serde_json::from_str(
-        &read_zip_entry(&raw_reexport, "text_artifacts/index.json").unwrap(),
-    )
-    .unwrap();
+    let index: Vec<Value> =
+        serde_json::from_str(&read_zip_entry(&raw_reexport, "text_artifacts/index.json").unwrap())
+            .unwrap();
     let child_artifact_id = child_artifact.artifact_id.to_string();
     let entry = index
         .iter()
         .find(|entry| entry["artifact_id"].as_str() == Some(child_artifact_id.as_str()))
         .unwrap();
-    assert_eq!(entry["representation"]["mode"], "redacted_length_preserving");
+    assert_eq!(
+        entry["representation"]["mode"],
+        "redacted_length_preserving"
+    );
     let file = entry["representation"]["content_file"].as_str().unwrap();
     assert_eq!(read_zip_entry(&raw_reexport, file).unwrap(), body);
 }

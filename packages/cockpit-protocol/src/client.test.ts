@@ -157,7 +157,6 @@ describe("RemoteSessionClient", () => {
     const submission = {
       client_submission_id: "44444444-4444-4444-8444-444444444444",
       text: "x".repeat(65_537),
-      display_text: "large body",
     };
     const request = client.sendUserMessage(submission);
 
@@ -181,7 +180,12 @@ describe("RemoteSessionClient", () => {
       kind: "res",
       id: chunk.payload.id,
       response: "bulk_transfer_chunk_accepted",
-      data: { next_chunk_index: 1, received_bytes: "65537", complete: true, idle_timeout_ms: 60_000 },
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
     });
     await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
     const bulk = JSON.parse(socket.sent[1] ?? "{}");
@@ -189,7 +193,6 @@ describe("RemoteSessionClient", () => {
       request: "send_user_message_bulk",
       params: {
         client_submission_id: submission.client_submission_id,
-        display_text: submission.display_text,
         transfer: chunk.payload.params.transfer,
       },
     });
@@ -237,7 +240,7 @@ describe("RemoteSessionClient", () => {
     expect(socket.sent).toHaveLength(2);
   });
 
-  it("keeps an explicitly empty display form inline beside an oversized source transfer", async () => {
+  it("omits an explicitly empty display form beside an oversized source transfer", async () => {
     const { client, socket } = makeClient();
     const submission = {
       client_submission_id: "44444444-4444-4444-8444-444444444445",
@@ -253,12 +256,17 @@ describe("RemoteSessionClient", () => {
       kind: "res",
       id: sourceChunk.payload.id,
       response: "bulk_transfer_chunk_accepted",
-      data: { next_chunk_index: 1, received_bytes: "65537", complete: true, idle_timeout_ms: 60_000 },
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
     });
 
     await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
     const bulk = JSON.parse(socket.sent[1] ?? "{}");
-    expect(bulk.payload.params.display_text).toBe("");
+    expect(bulk.payload.params.display_text).toBeUndefined();
     expect(bulk.payload.params.display_transfer).toBeUndefined();
     expect(JSON.stringify(bulk).length).toBeLessThan(524_360);
 
@@ -306,7 +314,12 @@ describe("RemoteSessionClient", () => {
       kind: "res",
       id: displayChunk.payload.id,
       response: "bulk_transfer_chunk_accepted",
-      data: { next_chunk_index: 1, received_bytes: "65537", complete: true, idle_timeout_ms: 60_000 },
+      data: {
+        next_chunk_index: 1,
+        received_bytes: "65537",
+        complete: true,
+        idle_timeout_ms: 60_000,
+      },
     });
 
     await vi.waitFor(() => expect(socket.sent).toHaveLength(3));
@@ -333,7 +346,7 @@ describe("RemoteSessionClient", () => {
       client_submission_id: "55555555-5555-4555-8555-555555555555",
       text: "z".repeat(8 * 1024 * 1024),
     };
-    const rawChunkBytes = 3 * (256 * 1024 / 4);
+    const rawChunkBytes = 3 * ((256 * 1024) / 4);
     const chunkCount = Math.ceil(new TextEncoder().encode(submission.text).length / rawChunkBytes);
     const request = client.sendUserMessage(submission);
 

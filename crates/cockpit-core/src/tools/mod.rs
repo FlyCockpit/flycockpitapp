@@ -57,6 +57,6 @@ pub mod use_sealed_value;
 pub mod web;
 pub mod write;
 
-pub mod common;
 pub mod artifact_read;
 pub mod artifact_search;
+pub mod common;

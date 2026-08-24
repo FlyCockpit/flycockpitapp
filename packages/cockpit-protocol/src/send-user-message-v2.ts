@@ -168,8 +168,7 @@ function validate(v: CanonicalSendUserMessageV2) {
   if (v.canonical_model_digest.length !== 32) throw new Error("invalid model digest");
   if (!v.canonical_model_digest.some(Boolean)) throw new Error("zero model digest");
   const text = bytes(v.request.text, FCM2_MAX_TEXT_BYTES, "text");
-  if (scalars(v.request.text) > FCM2_MAX_TEXT_SCALARS)
-    throw new Error("text exceeds scalar limit");
+  if (scalars(v.request.text) > FCM2_MAX_TEXT_SCALARS) throw new Error("text exceeds scalar limit");
   if (v.request.display_text !== null) {
     bytes(v.request.display_text, FCM2_MAX_TEXT_BYTES, "display text");
     if (scalars(v.request.display_text) > FCM2_MAX_TEXT_SCALARS)
@@ -332,12 +331,13 @@ class Reader {
 export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUserMessageV2 {
   validateFcm2Length(b.length);
   const r = new Reader(b);
-  if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION) throw new Error("invalid FCM2 header");
+  if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION)
+    throw new Error("invalid FCM2 header");
   const client_submission_id = uuidString(r.raw(16)),
     session_id = uuidString(r.raw(16)),
     canonical_project_digest = r.raw(32),
     model_config_generation = r.u64(),
-    canonical_model_digest = r.raw(32),
+    canonical_model_digest = r.raw(32);
   const text = r.text32();
   const dp = r.u8();
   if (dp > 1) throw new Error("invalid display presence");

@@ -75,9 +75,7 @@ describe("cockpit-proto daemon wire schemas", () => {
       },
     });
     expect(clientEnvelopeSchema.safeParse(envelope("65537")).success).toBe(true);
-    expect(clientEnvelopeSchema.safeParse(envelope(String(8 * 1024 * 1024))).success).toBe(
-      true,
-    );
+    expect(clientEnvelopeSchema.safeParse(envelope(String(8 * 1024 * 1024))).success).toBe(true);
     expect(clientEnvelopeSchema.safeParse(envelope("65536")).success).toBe(false);
     expect(clientEnvelopeSchema.safeParse(envelope(String(8 * 1024 * 1024 + 1))).success).toBe(
       false,

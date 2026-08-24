@@ -2259,19 +2259,23 @@ impl Request {
                             .to_string(),
                     );
                 }
-                let is_opaque_text_transfer = |reference: &crate::remote_transport::bulk::RemoteBulkTransferRef,
-                                                minimum_length: u64| {
-                    reference.mime_class
-                        == crate::remote_transport::bulk::RemoteBulkMimeClass::Opaque
-                        && (minimum_length
-                            ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
-                            .contains(&reference.total_length_value())
+                let is_opaque_text_transfer =
+                    |reference: &crate::remote_transport::bulk::RemoteBulkTransferRef,
+                     minimum_length: u64| {
+                        reference.mime_class
+                            == crate::remote_transport::bulk::RemoteBulkMimeClass::Opaque
+                            && (minimum_length
+                                ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
+                                .contains(&reference.total_length_value())
+                    };
+                let source_minimum_length = if display_transfer.is_some() {
+                    1
+                } else {
+                    65_537
                 };
-                let source_minimum_length = if display_transfer.is_some() { 1 } else { 65_537 };
                 if !is_opaque_text_transfer(transfer, source_minimum_length) {
                     return Err(
-                        "bulk user message must be an opaque 64KiB..8MiB transfer"
-                            .to_string(),
+                        "bulk user message must be an opaque 64KiB..8MiB transfer".to_string()
                     );
                 }
                 if display_text
@@ -2279,8 +2283,7 @@ impl Request {
                     .is_some_and(|value| value.len() > 64 * 1024)
                 {
                     return Err(
-                        "bulk user message display text over 64KiB must use a transfer"
-                            .to_string(),
+                        "bulk user message display text over 64KiB must use a transfer".to_string(),
                     );
                 }
                 if let Some(display_transfer) = display_transfer {
@@ -3909,21 +3912,32 @@ mod tests {
         assert!(encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
         assert!(!String::from_utf8_lossy(&encoded).contains("large remote preview"));
 
-        let conflicting_inline = Request::SendUserMessageBulk {
-            display_text: Some("inline too".to_owned()),
-            ..request.clone()
+        let mut conflicting_inline = request.clone();
+        let Request::SendUserMessageBulk { display_text, .. } = &mut conflicting_inline else {
+            unreachable!();
         };
+        *display_text = Some("inline too".to_owned());
         assert!(conflicting_inline.validate_semantics().is_err());
-        let oversized_inline_display = Request::SendUserMessageBulk {
-            display_transfer: None,
-            display_text: Some("x".repeat(65_537)),
-            ..request.clone()
+        let mut oversized_inline_display = request.clone();
+        let Request::SendUserMessageBulk {
+            display_transfer,
+            display_text,
+            ..
+        } = &mut oversized_inline_display
+        else {
+            unreachable!();
         };
+        *display_transfer = None;
+        *display_text = Some("x".repeat(65_537));
         assert!(oversized_inline_display.validate_semantics().is_err());
-        let shared_transfer = Request::SendUserMessageBulk {
-            display_transfer: Some(transfer),
-            ..request
+        let mut shared_transfer = request;
+        let Request::SendUserMessageBulk {
+            display_transfer, ..
+        } = &mut shared_transfer
+        else {
+            unreachable!();
         };
+        *display_transfer = Some(transfer);
         assert!(shared_transfer.validate_semantics().is_err());
     }
 

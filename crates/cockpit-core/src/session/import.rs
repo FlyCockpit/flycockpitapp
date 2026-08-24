@@ -3,7 +3,9 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use uuid::Uuid;
 
 use cockpit_db::db::Db;
@@ -594,13 +596,8 @@ fn validate_text_artifact_graph(
 /// declaration. Oversized typed-source events are text-only by construction,
 /// so archives must not restore either shape.
 fn user_event_has_media_or_file_parts(data: &Value) -> bool {
-    const MEDIA_OR_FILE_KEYS: [&str; 5] = [
-        "images",
-        "image_refs",
-        "attachments",
-        "files",
-        "file_refs",
-    ];
+    const MEDIA_OR_FILE_KEYS: [&str; 5] =
+        ["images", "image_refs", "attachments", "files", "file_refs"];
 
     data.as_object().is_some_and(|object| {
         MEDIA_OR_FILE_KEYS.iter().any(|key| match object.get(*key) {
@@ -1173,6 +1170,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use rusqlite::OptionalExtension;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
     #[test]
@@ -1422,16 +1420,20 @@ mod tests {
             .await
             .expect_err("an archive cannot reintroduce an artifact-ineligible long media event");
         assert!(
-            error
-                .to_string()
-                .contains("cannot carry media/file parts"),
+            error.to_string().contains("cannot carry media/file parts"),
             "unexpected import error: {error:#}"
         );
         let sessions: i64 = db
-            .read(|conn| conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0)).map_err(Into::into))
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
             .await
             .unwrap();
-        assert_eq!(sessions, 0, "validation fails before any destination rows are written");
+        assert_eq!(
+            sessions, 0,
+            "validation fails before any destination rows are written"
+        );
     }
 
     #[tokio::test]

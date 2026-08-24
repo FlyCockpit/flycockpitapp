@@ -72,6 +72,14 @@ impl UnrenderableWireField {
     }
 }
 
+impl std::fmt::Display for UnrenderableWireField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("message wire field `")?;
+        f.write_str(self.channel)?;
+        f.write_str("` has no renderer for an untrusted dispatch")
+    }
+}
+
 /// Scrub every dynamic text field of one history/prompt [`Message`] through
 /// `redact`, returning a rewritten copy (GOALS §7,
 /// `redaction-cover-all-llm-requests.md`). This is the untrusted-egress wire

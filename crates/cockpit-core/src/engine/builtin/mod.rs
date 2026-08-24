@@ -750,8 +750,18 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Search the current session's compaction lineage.",
             condition: Some("interactive sessions"),
         },
-        BuiltinToolInventoryItem { family: "Session", name: "artifact_read", summary: "Read an immutable session text artifact.", condition: Some("when the session has artifacts") },
-        BuiltinToolInventoryItem { family: "Session", name: "artifact_search", summary: "Search an immutable session text artifact.", condition: Some("when the session has artifacts") },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "artifact_read",
+            summary: "Read an immutable session text artifact.",
+            condition: Some("when the session has artifacts"),
+        },
+        BuiltinToolInventoryItem {
+            family: "Session",
+            name: "artifact_search",
+            summary: "Search an immutable session text artifact.",
+            condition: Some("when the session has artifacts"),
+        },
         BuiltinToolInventoryItem {
             family: "Session",
             name: "delegation_payload_retrieve",

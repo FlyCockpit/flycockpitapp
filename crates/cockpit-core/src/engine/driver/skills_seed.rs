@@ -46,10 +46,7 @@ pub(in crate::engine::driver) struct PreparedForcedSkill {
 }
 
 impl PreparedForcedSkill {
-    /// The exact host-rendered skill contribution that must be retained in an
-    /// accepted oversized envelope.  A later crash may prevent the synthetic
-    /// tool pair from being appended, so the durable user composition itself
-    /// is the authority for the first provider handoff.
+    #[cfg(test)]
     pub(in crate::engine::driver) fn envelope_guidance(&self) -> String {
         if self.missing_tool {
             return String::new();
@@ -61,14 +58,16 @@ impl PreparedForcedSkill {
     }
 
     pub(in crate::engine::driver) fn envelope_prelude(&self) -> Option<serde_json::Value> {
-        (!self.missing_tool).then(|| serde_json::json!({
-            "type": "forced_skill",
-            "call_id": self.call_id,
-            "name": self.skill_name,
-            "args": self.args,
-            "body": self.body,
-            "hard_fail": self.hard_fail,
-        }))
+        (!self.missing_tool).then(|| {
+            serde_json::json!({
+                "type": "forced_skill",
+                "call_id": self.call_id,
+                "name": self.skill_name,
+                "args": self.args,
+                "body": self.body,
+                "hard_fail": self.hard_fail,
+            })
+        })
     }
 }
 
@@ -533,19 +532,19 @@ impl Driver {
             additional_params: None,
         };
         if include_history {
-        let history = &mut self.stack.last_mut().expect("stack never empty").history;
-        history.push(Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(call)],
-        });
-        history.push(Message::User {
-            content: vec![UserContent::ToolResult(ToolResult {
-                call: rig_call_id,
-                provider: provider_call_id.and_then(rig::message::ProviderCallId::new),
-                name: "skill".to_string(),
-                content: vec![ToolResultContent::text(body)],
-            })],
-        });
+            let history = &mut self.stack.last_mut().expect("stack never empty").history;
+            history.push(Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(call)],
+            });
+            history.push(Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: rig_call_id,
+                    provider: provider_call_id.and_then(rig::message::ProviderCallId::new),
+                    name: "skill".to_string(),
+                    content: vec![ToolResultContent::text(body)],
+                })],
+            });
         }
 
         // Record ownership so a later primary swap can strip this pair if the

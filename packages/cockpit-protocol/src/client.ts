@@ -23,7 +23,7 @@ import {
   type ResolveResponse,
   serverMessageSchema,
 } from ".";
-import { encodeProtocolIdBase64Url } from "./remote-protocol-id";
+import { encodeProtocolIdBase64Url, formatCanonicalU64DecimalString } from "./remote-protocol-id";
 import { bytesToHex, sha256 } from "./remote-transport-lanes";
 
 export type RemoteSessionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
@@ -68,7 +68,7 @@ const INLINE_USER_MESSAGE_BYTES = 64 * 1024;
 const MAX_BULK_USER_MESSAGE_BYTES = 8 * 1024 * 1024;
 // Rust accepts base64 chunks up to 256KiB; this raw size encodes exactly to
 // that bound and leaves the relay application frame well below 524360 bytes.
-const BULK_USER_MESSAGE_CHUNK_BYTES = 3 * (256 * 1024 / 4);
+const BULK_USER_MESSAGE_CHUNK_BYTES = 3 * ((256 * 1024) / 4);
 
 function randomBulkTransferId(): string {
   const bytes = new Uint8Array(16);
@@ -230,7 +230,9 @@ export class RemoteSessionClient {
     const encoder = new TextEncoder();
     const textBytes = encoder.encode(requestParams.text);
     const displayBytes =
-      requestParams.display_text === undefined ? undefined : encoder.encode(requestParams.display_text);
+      requestParams.display_text === undefined
+        ? undefined
+        : encoder.encode(requestParams.display_text);
     if (textBytes.length > MAX_BULK_USER_MESSAGE_BYTES) {
       throw new RemoteSessionError(
         "message text exceeds the 8 MiB FCM2 limit",
@@ -275,7 +277,7 @@ export class RemoteSessionClient {
           params: {
             ...metadata,
             transfer,
-            ...(display_transfer ? { display_transfer } : { display_text }),
+            ...(display_transfer ? { display_transfer } : display_text ? { display_text } : {}),
           },
         }),
       );
@@ -296,7 +298,7 @@ export class RemoteSessionClient {
   private async stageOpaqueUserMessageTransfer(bytes: Uint8Array) {
     const transfer = {
       transfer_id: randomBulkTransferId(),
-      total_length: String(bytes.length),
+      total_length: formatCanonicalU64DecimalString(BigInt(bytes.length)),
       sha256: bytesToHex(await sha256(bytes)),
       mime_class: "opaque" as const,
     };

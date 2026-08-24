@@ -549,10 +549,13 @@ pub fn collect_deepfetch_targets(
                 // A prior endpoint probe/fallback is an input to automatic
                 // routing, not a user pin. Keep probing it and let a fresh
                 // live catalog supersede it.
-                explicit_wire_api: (!model.wire_api.is_auto()
-                    && model.wire_api_provenance.is_user_configured())
-                .then_some(model.wire_api)
-                .unwrap_or(WireApi::Auto),
+                explicit_wire_api: if !model.wire_api.is_auto()
+                    && model.wire_api_provenance.is_user_configured()
+                {
+                    model.wire_api
+                } else {
+                    WireApi::Auto
+                },
                 inherited_wire_api: entry.wire_api,
                 supported_wire_apis: model.capabilities.supported_wire_apis.clone(),
                 automatic_wire_api: {

@@ -2167,15 +2167,13 @@ mod tests {
         let delivered =
             crate::tools::common::truncate_head_tail(&full, crate::tools::common::OUTPUT_BYTE_CAP);
         let tool = Arc::new(
-            MontyAdapterTool::new("large_native", delivered).with_capture(
-                TextArtifactCapture {
-                    content: full.clone(),
-                    host_captured_bytes: full.len(),
-                    host_original_bytes: full.len(),
-                    host_dropped_bytes: 0,
-                    stored_source_bytes: full.len(),
-                },
-            ),
+            MontyAdapterTool::new("large_native", delivered).with_capture(TextArtifactCapture {
+                content: full.clone(),
+                host_captured_bytes: full.len(),
+                host_original_bytes: full.len(),
+                host_dropped_bytes: 0,
+                stored_source_bytes: full.len(),
+            }),
         );
         let ctx = crate::tools::common::test_ctx(tmp.path());
         let host = HostContext::from_tool_ctx(&ctx).with_builtin_registry(registry_with(tool));
@@ -2184,10 +2182,10 @@ mod tests {
             .await
             .unwrap();
         let body = monty.as_str().unwrap();
-        assert_eq!(body, crate::tools::common::truncate_head_tail(
-            &full,
-            crate::tools::common::OUTPUT_BYTE_CAP,
-        ));
+        assert_eq!(
+            body,
+            crate::tools::common::truncate_head_tail(&full, crate::tools::common::OUTPUT_BYTE_CAP,)
+        );
     }
 
     #[tokio::test]

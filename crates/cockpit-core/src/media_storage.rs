@@ -1206,9 +1206,9 @@ impl MediaStorageRecovery {
             }
             let intent_digest = crate::intel::hex_lower(&intent_hasher.finalize());
             let existing_intent=self.db.read({let component_id=component_id.clone();move|conn|conn.query_row("SELECT intent_digest FROM media_component_deletion_intents WHERE component_id=?1",[component_id],|row|row.get::<_,String>(0)).optional().map_err(Into::into)}).await?;
-            if !existing_intent
+            if existing_intent
                 .as_ref()
-                .is_none_or(|stored| stored == &intent_digest)
+                .is_some_and(|stored| stored != &intent_digest)
             {
                 self.block_cleanup_security_ambiguity(
                     attachment_id.clone(),
@@ -2817,7 +2817,7 @@ impl MediaStorageRecovery {
 }
 
 fn is_uuid_v7(value: Uuid) -> bool {
-    !value.is_nil() && value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
+    value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
 }
 
 fn preflight_local_operation(

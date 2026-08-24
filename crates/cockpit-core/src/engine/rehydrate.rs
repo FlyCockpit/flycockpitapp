@@ -507,12 +507,12 @@ fn apply_text_artifact_tool_projections(
     Ok(())
 }
 
-fn render_rehydrated_tool_artifact_frame(
-    projection: &serde_json::Map<String, serde_json::Value>,
+fn render_rehydrated_tool_artifact_frame<'a>(
+    projection: &'a serde_json::Map<String, serde_json::Value>,
     artifact: Option<&crate::db::text_artifacts::TextArtifact>,
     expected_slot: i64,
     redaction: &crate::redact::RedactionTable,
-) -> Result<(&str, String)> {
+) -> Result<(&'a str, String)> {
     if projection
         .get("version")
         .and_then(serde_json::Value::as_i64)
@@ -695,7 +695,12 @@ fn render_rehydrated_tool_artifact_frame(
             let reason = projection
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .filter(|reason| matches!(*reason, "artifact_limit" | "session_quota" | "persistence_unavailable"))
+                .filter(|reason| {
+                    matches!(
+                        *reason,
+                        "artifact_limit" | "session_quota" | "persistence_unavailable"
+                    )
+                })
                 .ok_or_else(|| {
                     anyhow!("unavailable tool artifact projection has an invalid reason")
                 })?;
@@ -739,7 +744,7 @@ fn apply_text_artifact_user_projections(
     conn: &Connection,
     session_id: Uuid,
     events: &[SessionEventRow],
-    history: &mut [Message],
+    history: &mut Vec<Message>,
     redaction: &crate::redact::RedactionTable,
 ) -> Result<()> {
     use crate::db::text_artifacts::{
@@ -773,9 +778,7 @@ fn apply_text_artifact_user_projections(
         // media/file-bearing event cannot be materialized by the live ingress
         // path, so fail closed before considering any artifact slots when an
         // old or corrupt ledger claims otherwise.
-        if authored.len() > 64 * 1024
-            && user_event_has_media_or_file_parts(&event.data)
-        {
+        if authored.len() > 64 * 1024 && user_event_has_media_or_file_parts(&event.data) {
             return Err(anyhow!(
                 "oversized user event {} cannot carry media/file parts",
                 event.seq
@@ -882,7 +885,7 @@ fn apply_text_artifact_user_projections(
             .get("text")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("user artifact event lacks canonical text"))?;
-        let Some((index, text)) =
+        let Some((mut index, text)) =
             history
                 .iter_mut()
                 .enumerate()
@@ -912,23 +915,26 @@ fn apply_text_artifact_user_projections(
             ));
         }
         if let Some(frame) = frames.remove(&event.seq) {
-            let envelope = Db::user_message_model_envelope_conn(
-                conn,
-                session_id,
-                event.seq,
-            )?
-            .ok_or_else(|| anyhow!("oversized user event lacks accepted model envelope"))?;
+            let envelope = Db::user_message_model_envelope_conn(conn, session_id, event.seq)?
+                .ok_or_else(|| anyhow!("oversized user event lacks accepted model envelope"))?;
             let composition = crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
                 &envelope, &frame, redaction,
             )?;
-            let leading_call_id = composition.leading.first().and_then(|message| match message {
-                Message::Assistant { content, .. } => content.iter().find_map(|part| match part {
-                    AssistantContent::ToolCall(call) => Some(call.id.to_string()),
+            let leading_call_id = composition
+                .leading
+                .first()
+                .and_then(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        content.iter().find_map(|part| match part {
+                            AssistantContent::ToolCall(call) => Some(call.id.to_string()),
+                            _ => None,
+                        })
+                    }
                     _ => None,
-                }),
-                _ => None,
-            });
-            history[index] = Message::User { content: composition.content };
+                });
+            history[index] = Message::User {
+                content: composition.content,
+            };
             if let Some(call_id) = leading_call_id {
                 let existing = history.iter().any(|message| match message {
                     Message::Assistant { content, .. } => content.iter().any(|part| {
@@ -973,19 +979,14 @@ fn apply_text_artifact_user_projections(
                         if insert_at <= index {
                             index += leading_len;
                         }
-                        next_history += leading_len;
                     } else {
                         // A malformed audit representation must not cause us
                         // to drop unrelated batched tool content. Keep it and
                         // add the authoritative persisted prelude instead.
-                        let leading_len = composition.leading.len();
                         history.splice(index..index, composition.leading);
-                        next_history += leading_len;
                     }
                 } else {
-                    let leading_len = composition.leading.len();
                     history.splice(index..index, composition.leading);
-                    next_history += leading_len;
                 }
             }
         }
@@ -1003,13 +1004,8 @@ fn apply_text_artifact_user_projections(
 /// declaration. The latter is deliberately fail-closed: a canonical user
 /// event has no scalar media/file representation.
 fn user_event_has_media_or_file_parts(data: &serde_json::Value) -> bool {
-    const MEDIA_OR_FILE_KEYS: [&str; 5] = [
-        "images",
-        "image_refs",
-        "attachments",
-        "files",
-        "file_refs",
-    ];
+    const MEDIA_OR_FILE_KEYS: [&str; 5] =
+        ["images", "image_refs", "attachments", "files", "file_refs"];
 
     data.as_object().is_some_and(|object| {
         MEDIA_OR_FILE_KEYS.iter().any(|key| match object.get(*key) {
@@ -3250,9 +3246,7 @@ mod tests {
             .await
             .expect_err("a long mixed-media user event is never artifact-eligible");
         assert!(
-            error
-                .to_string()
-                .contains("cannot carry media/file parts"),
+            error.to_string().contains("cannot carry media/file parts"),
             "unexpected rehydrate error: {error:#}"
         );
     }
@@ -3274,9 +3268,8 @@ mod tests {
         let source = "x".repeat(65_537);
         let operation_id = Uuid::new_v4();
         let submission_id = Uuid::new_v4();
-        let reserved = s
-            .db
-            .accept_message_with_text_artifact_reservation(
+        let reserved =
+            s.db.accept_message_with_text_artifact_reservation(
                 crate::db::message_attachments::AcceptMessageInput {
                     session_id: s.id,
                     operation_id: *operation_id.as_bytes(),
@@ -3303,11 +3296,8 @@ mod tests {
             }
             other => panic!("expected reservation, got {other:?}"),
         };
-        let typed = UserContent::image_base64(
-            "YWJj",
-            Some(rig::message::ImageMediaType::PNG),
-            None,
-        );
+        let typed =
+            UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = json!({
             "version": 3,
             "prelude": [{
@@ -3325,21 +3315,20 @@ mod tests {
                 {"type":"authored_text_slot"}
             ]
         });
-        s.db
-            .materialize_reserved_user_text_artifacts(
-                crate::db::text_artifacts::ReservedUserArtifactMaterialization {
-                    reservation,
-                    canonical_event_json: json!({"text": source.clone()}).to_string(),
-                    model_envelope_json: envelope.to_string(),
-                    source_text: source,
-                    model_projection: None,
-                    agent: Some("Build".to_owned()),
-                    context: crate::db::text_artifacts::TextArtifactEventContext::default(),
-                    now_ms: 11,
-                },
-            )
-            .await
-            .unwrap();
+        s.db.materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: envelope.to_string(),
+                source_text: source,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                now_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
 
         // This is the crash window: phase two is durable but the ordinary
         // post-commit audit bookkeeping did not run. The envelope is therefore
@@ -3392,9 +3381,8 @@ mod tests {
         let source = "x".repeat(65_537);
         let operation_id = Uuid::new_v4();
         let submission_id = Uuid::new_v4();
-        let reserved = s
-            .db
-            .accept_message_with_text_artifact_reservation(
+        let reserved =
+            s.db.accept_message_with_text_artifact_reservation(
                 crate::db::message_attachments::AcceptMessageInput {
                     session_id: s.id,
                     operation_id: *operation_id.as_bytes(),
@@ -3434,21 +3422,20 @@ mod tests {
             }],
             "parts": [{"type":"authored_text_slot"}]
         });
-        s.db
-            .materialize_reserved_user_text_artifacts(
-                crate::db::text_artifacts::ReservedUserArtifactMaterialization {
-                    reservation,
-                    canonical_event_json: json!({"text": source.clone()}).to_string(),
-                    model_envelope_json: envelope.to_string(),
-                    source_text: source,
-                    model_projection: None,
-                    agent: Some("Build".to_owned()),
-                    context: crate::db::text_artifacts::TextArtifactEventContext::default(),
-                    now_ms: 11,
-                },
-            )
-            .await
-            .unwrap();
+        s.db.materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: envelope.to_string(),
+                source_text: source,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                now_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
 
         // Phase two has committed; then the ordinary post-commit `/skill`
         // audit bookkeeping lands. Resume must not trust its unredacted body
@@ -3460,16 +3447,16 @@ mod tests {
             ..crate::config::extended::RedactConfig::default()
         };
         let redaction = Arc::new(
-            crate::redact::RedactionTable::build(&cfg, std::path::Path::new("."))
-                .unwrap(),
+            crate::redact::RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap(),
         );
-        let live_prelude = crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
-            &envelope.to_string(),
-            "live artifact frame is irrelevant to the prelude assertion",
-            redaction.as_ref(),
-        )
-        .unwrap()
-        .leading;
+        let live_prelude =
+            crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
+                &envelope.to_string(),
+                "live artifact frame is irrelevant to the prelude assertion",
+                redaction.as_ref(),
+            )
+            .unwrap()
+            .leading;
         let history = rehydrate_session_with_policy_and_redaction(
             &s.db,
             s.id,

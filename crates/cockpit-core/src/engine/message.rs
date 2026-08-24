@@ -1485,7 +1485,7 @@ mod tests {
 
     fn user_parts(msg: &Message) -> Vec<UserContent> {
         match msg {
-            Message::User { content } => content.iter().cloned().collect(),
+            Message::User { content } => content.to_vec(),
             _ => panic!("expected a user message"),
         }
     }
@@ -1637,7 +1637,7 @@ mod tests {
         ]);
         // Body text carries no tags → stripping is a no-op on the visible body.
         let stripped = strip_think_from_choice(&choice).expect("non-empty turn");
-        assert_eq!(stripped.iter().count(), 2);
+        assert_eq!(stripped.len(), 2);
         assert_eq!(extract_text(&stripped), "the visible answer");
         // Channel reasoning is read out.
         assert_eq!(extract_reasoning(&choice), "internal chain of thought");
@@ -1700,7 +1700,7 @@ mod tests {
         // The tool call keeps the turn non-empty.
         let stripped = strip_think_from_choice(&choice).expect("tool call keeps turn non-empty");
         // Only the tool call survives — no empty Text part.
-        assert_eq!(stripped.iter().count(), 1);
+        assert_eq!(stripped.len(), 1);
         assert!(collect_tool_calls(&stripped).iter().any(|c| c.id == "tc-1"));
         assert_eq!(extract_text(&stripped), "");
     }

@@ -140,7 +140,9 @@ fn render_capped_payload_range(
         }
     }
     if let Some(next) = next {
-        output.push_str(&format!("... [{tool_name} continuation hash={hash} start_line={next}]\n"));
+        output.push_str(&format!(
+            "... [{tool_name} continuation hash={hash} start_line={next}]\n"
+        ));
         ToolOutput::truncated_text(output)
     } else {
         ToolOutput::text(output)
@@ -269,7 +271,7 @@ mod tests {
         assert!(!output.content.contains("delegation_payload_retrieve"));
     }
 
-    #[tokio::test]
+    #[test]
     fn delegation_payload_pages_are_not_artifact_capture_eligible() {
         assert!(!crate::engine::agent::text_artifact_capture_is_eligible(
             "delegation_payload_retrieve"

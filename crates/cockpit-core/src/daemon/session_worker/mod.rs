@@ -516,9 +516,9 @@ pub use effective_sandbox::{
     sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
 };
 pub use handle::{
-    InteractiveClientGuard, RemoteQueueOperation, ReplaceConfigSnapshotResult, SessionConfigHandle,
-    SessionConfigSnapshot, SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
-    spawn,
+    InteractiveClientGuard, OversizedRunInvocationAdmission, OversizedTextArtifactAdmission,
+    RemoteQueueOperation, ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot,
+    SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
 pub use helpers::DAEMON_NO_SANDBOX_ENV;
 pub(crate) use helpers::daemon_no_sandbox;

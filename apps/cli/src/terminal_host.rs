@@ -769,10 +769,10 @@ impl TerminalHost {
         };
         let count = {
             let mut state = crate::sync::lock_or_recover(&terminal);
-            if !state
+            if state
                 .bindings
                 .get(&binding.binding_id)
-                .is_some_and(|record| record.epoch == binding.binding_epoch)
+                .is_none_or(|record| record.epoch != binding.binding_epoch)
             {
                 return;
             }

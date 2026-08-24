@@ -395,38 +395,6 @@ pub struct InferenceTiming {
     pub open_display: Option<crate::engine::response_performance::DisplayStreamClassifier>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn safe_anyhow_projection_omits_provider_request_id() {
-        const SENTINEL: &str = "provider-request-id-must-not-reach-log-fields";
-        let raw = rig::completion::CompletionError::ProviderResponse(
-            rig::ProviderResponseError::new(
-                reqwest::StatusCode::TOO_MANY_REQUESTS,
-                "insufficient balance",
-            )
-            .with_provider_request_id(Some(SENTINEL.to_string())),
-        );
-
-        // Rig owns the request id and renders it in Display, so this proves
-        // the projection cannot pass merely because its fixture omitted it.
-        assert!(raw.to_string().contains(SENTINEL));
-        let wrapped = anyhow::Error::new(raw).context("utility model send failed");
-
-        let safe = safe_inference_error_detail(&wrapped).expect("provider error projection");
-        let rendered = serde_json::to_string(&safe).expect("safe projection serializes");
-        assert!(
-            !rendered.contains(SENTINEL),
-            "safe projection leaked: {rendered}"
-        );
-        assert_eq!(safe.marker, PROVIDER_DETAIL_OMITTED);
-        assert_eq!(safe.observed_status, Some(429));
-        assert_eq!(safe.recovery, ProviderRecoverySignal::BillingExhausted);
-    }
-}
-
 /// Persist a self-healed wire-API endpoint back into config
 /// (implementation note): record `resolved` (a concrete
 /// `completions`/`responses`, never `auto`) onto the `(provider_id, model_id)`
@@ -483,5 +451,34 @@ pub(super) fn persist_wire_api(
     }
     if let Err(e) = doc.write(&cfg) {
         tracing::warn!(error = %e, "persist wire_api: writing config failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_anyhow_projection_omits_provider_request_id() {
+        const SENTINEL: &str = "provider-request-id-must-not-reach-log-fields";
+        let raw = rig::completion::CompletionError::ProviderResponse(
+            rig::ProviderResponseError::new(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "insufficient balance",
+            )
+            .with_provider_request_id(Some(SENTINEL.to_string())),
+        );
+
+        assert!(raw.to_string().contains(SENTINEL));
+        let wrapped = anyhow::Error::new(raw).context("utility model send failed");
+        let safe = safe_inference_error_detail(&wrapped).expect("provider error projection");
+        let rendered = serde_json::to_string(&safe).expect("safe projection serializes");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "safe projection leaked: {rendered}"
+        );
+        assert_eq!(safe.marker, PROVIDER_DETAIL_OMITTED);
+        assert_eq!(safe.observed_status, Some(429));
+        assert_eq!(safe.recovery, ProviderRecoverySignal::BillingExhausted);
     }
 }

@@ -2,6 +2,7 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::run::*;
+use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_artifact_queue};
 use super::*;
 
 #[test]
@@ -181,11 +182,7 @@ async fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() 
         )
         .await;
     assert!(queue.has_accepted(id).await);
-    assert!(!model_fence_allows_insert(
-        Some(&changed),
-        7,
-        &selection
-    ));
+    assert!(!model_fence_allows_insert(Some(&changed), 7, &selection));
 }
 
 /// Regression seam for restart recovery: a durable explicit fence is checked
@@ -252,14 +249,18 @@ async fn reserve_oversized_restart_fixture(
         canonical_message,
         attachments: Vec::new(),
         outbox_sequence: 0,
-        now_ms: 1_000,
+        // Restart reconciliation reaps against the live clock before it
+        // evaluates a durable model fence.  Keep this fixture's phase-one
+        // lease live so the stale-fence branch, rather than expiry, owns the
+        // terminal result under test.
+        now_ms: chrono::Utc::now().timestamp_millis(),
     };
-    let model_fence = fence
-        .as_ref()
-        .map(|(generation, model)| crate::db::text_artifacts::TextArtifactModelFence {
+    let model_fence = fence.as_ref().map(|(generation, model)| {
+        crate::db::text_artifacts::TextArtifactModelFence {
             generation: *generation,
             model_json: encode_durable_model_fence(model).unwrap(),
-        });
+        }
+    });
     let result = if bind_run {
         db.accept_message_with_text_artifact_reservation_and_run_invocation_with_model_fence(
             input,
@@ -330,14 +331,9 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let (stale_operation, stale_submission) = reserve_oversized_restart_fixture(
-        &db,
-        &session,
-        71,
-        Some((7, expected.clone())),
-        true,
-    )
-    .await;
+    let (stale_operation, stale_submission) =
+        reserve_oversized_restart_fixture(&db, &session, 71, Some((7, expected.clone())), true)
+            .await;
     let changed = proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-b".to_owned(),
@@ -362,11 +358,12 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         0
     );
     assert!(restarted_queue.snapshot().await.is_empty());
-    assert!(db
-        .reserved_text_artifact_submission(session.id, *stale_submission.as_bytes())
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        db.reserved_text_artifact_submission(session.id, *stale_submission.as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         db.text_artifact_reservation_replay(session.id, stale_operation, 2_000)
             .await
@@ -375,7 +372,11 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
             reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
         }
     ));
-    let run = db.get_run_invocation(stale_submission).await.unwrap().unwrap();
+    let run = db
+        .get_run_invocation(stale_submission)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(run.state, "failed");
     assert_eq!(run.terminal_reason.as_deref(), Some("failed"));
     let session_id = session.id;
@@ -413,14 +414,9 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
     assert!(db.list_session_events(session.id).await.unwrap().is_empty());
     assert!(db.list_text_artifacts(session.id).await.unwrap().is_empty());
 
-    let (matching_operation, matching_submission) = reserve_oversized_restart_fixture(
-        &db,
-        &session,
-        72,
-        Some((9, expected.clone())),
-        false,
-    )
-    .await;
+    let (matching_operation, matching_submission) =
+        reserve_oversized_restart_fixture(&db, &session, 72, Some((9, expected.clone())), false)
+            .await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: expected.clone(),
         default_selection: None,
@@ -441,11 +437,12 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         1
     );
     assert_eq!(matching_queue.snapshot().await.len(), 1);
-    assert!(db
-        .reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        db.reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(matches!(
         db.text_artifact_reservation_replay(session.id, matching_operation, 2_000)
             .await
@@ -453,10 +450,8 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         crate::db::text_artifacts::TextArtifactReservationReplay::Live(_)
     ));
 
-    let (_implicit_operation, implicit_submission) = reserve_oversized_restart_fixture(
-        &db, &session, 73, None, false,
-    )
-    .await;
+    let (_implicit_operation, implicit_submission) =
+        reserve_oversized_restart_fixture(&db, &session, 73, None, false).await;
     *state.write().unwrap() = Some(proto::ActiveModelState {
         selection: cockpit_config::providers::ActiveModelRef {
             model: "model-c".to_owned(),
@@ -477,15 +472,24 @@ async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_im
         )
         .await
         .unwrap(),
-        2,
-        "the matching fenced lease and implicit lease each replay exactly once"
+        1,
+        "only the implicit lease survives the later explicit-model switch"
     );
-    assert_eq!(implicit_queue.snapshot().await.len(), 2);
-    assert!(db
-        .reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
-        .await
-        .unwrap()
-        .is_some());
+    assert_eq!(implicit_queue.snapshot().await.len(), 1);
+    assert!(
+        db.reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        db.text_artifact_reservation_replay(session.id, matching_operation, 2_000)
+            .await
+            .unwrap(),
+        crate::db::text_artifacts::TextArtifactReservationReplay::Terminal {
+            reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
+        }
+    ));
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -1287,7 +1291,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             .send_work(SessionWork::UserMessage {
                 submission: Box::new(oversized_submission),
                 remote_operation: Some(conflict_operation.clone()),
-                artifact_admission: Some(admission),
+                artifact_admission: Some(Box::new(admission)),
                 respond_to,
             })
             .await
@@ -1486,7 +1490,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             .send_work(SessionWork::UserMessage {
                 submission: Box::new(submission),
                 remote_operation: Some(operation),
-                artifact_admission: Some(admission),
+                artifact_admission: Some(Box::new(admission)),
                 respond_to,
             })
             .await

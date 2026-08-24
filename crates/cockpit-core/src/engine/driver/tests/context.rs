@@ -1417,13 +1417,6 @@ async fn compact_record_without_session_ids(driver: &Driver) -> serde_json::Valu
     data
 }
 
-fn test_json_hash(value: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(serde_json::to_vec(value).unwrap());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[tokio::test]
 async fn prepare_commits_nothing() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
@@ -1605,7 +1598,7 @@ async fn apply_of_prepared_matches_synchronous_path() {
 }
 
 #[tokio::test]
-async fn compact_end_to_end_unchanged() {
+async fn compact_end_to_end_preserves_private_draft_contract() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
 
@@ -1620,37 +1613,47 @@ async fn compact_end_to_end_unchanged() {
         .iter()
         .find(|event| matches!(event, TurnEvent::CompactReady { .. }))
         .expect("CompactReady emitted");
-    let snapshot = serde_json::json!({
-        "history_hash": test_json_hash(&serde_json::to_value(&driver.stack[0].history).unwrap()),
-        "compact_ready": compact_ready_without_session_id(ready),
-        "session_compacted_hash": test_json_hash(&compact_record_without_session_ids(&driver).await),
-    });
     let expected_handoff = format!(
         "test compact brief\n\n---\n## State appendix (deterministic — runtime ledger)\n\n\n**Files read:**\n- `seed.txt`\n\n\n## Context tags\nUse these @file, @file:XX-YY, @dir/, and /skill tags to resolve the working set through the shared tag policy:\n- @seed.txt\n\n\n{}",
         crate::engine::compact::HISTORY_AGENT_NUDGE
     );
-    // Rig 0.42 serializes the required `ToolResult.name` field. This fixture's
-    // canonical `bash` result therefore adds 12 cl100k tokens to both wire
-    // snapshots, and intentionally changes their deterministic JSON hashes.
+    // A private compaction draft has no owning `context_pruned` event, so it
+    // must not invent a text-artifact projection. Its prompt therefore retains
+    // the original body; the old byte-level golden encoded an invalid private
+    // condensation and is intentionally not stable across that contract change.
     assert_eq!(
-        snapshot,
+        compact_ready_without_session_id(ready),
         serde_json::json!({
-            "history_hash": "f81e45c57cd430c7f22c39adf015cb627e1e76b9c56179b96117242632ad1858",
-            "compact_ready": {
-                "brief": "test compact brief",
-                "handoff": expected_handoff,
-                "seed_tool_count": 1,
-                "seed_tool_tokens": 3,
-                "source": "manual",
-                "tail_kept": 2,
-                "tail_trimmed": 0,
-                "tokens_after": 2393,
-                "tokens_before": 3654,
-                "trigger_ctx_pct": null,
-                "turns_summarized": 0,
-            },
-            "session_compacted_hash": "2ef8ed86370834ec6abbccf1d3eea834925a3a823463ea5f9981f98aca9229c3",
+            "brief": "test compact brief",
+            "handoff": expected_handoff,
+            "seed_tool_count": 1,
+            "seed_tool_tokens": 3,
+            "source": "manual",
+            "tail_kept": 2,
+            "tail_trimmed": 0,
+            "tokens_after": crate::engine::compact_draft::wire_token_total(&driver.stack[0].history),
+            "tokens_before": 3654,
+            "trigger_ctx_pct": null,
+            "turns_summarized": 0,
         })
+    );
+    let compact_record = compact_record_without_session_ids(&driver).await;
+    assert_eq!(compact_record["brief_text"], "test compact brief");
+    assert_eq!(compact_record["handoff_text"], expected_handoff);
+    assert_eq!(compact_record["tokens_before"], 3654);
+    assert_eq!(
+        compact_record["tokens_after"],
+        crate::engine::compact_draft::wire_token_total(&driver.stack[0].history)
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_text_artifacts(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a private compaction draft must not create an artifact without a context_pruned owner event"
     );
     assert!(
         matches!(events.last(), Some(TurnEvent::CompactReady { brief, .. }) if brief == "test compact brief"),

@@ -162,7 +162,13 @@ pub(crate) async fn result_recheck_for_artifact_capture(
         RecheckAction::Block => result_injection_override(output, ctx, tx).await.map(Some),
         RecheckAction::Ask => result_injection_ask(output, ctx, tx).await.map(Some),
         RecheckAction::Warn => {
-            let _ = tx.send(TurnEvent::Notice { text: "tool result rated `medium` for prompt injection — delivering with caution".to_owned() }).await;
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text:
+                        "tool result rated `medium` for prompt injection — delivering with caution"
+                            .to_owned(),
+                })
+                .await;
             Ok(Some(output.to_owned()))
         }
         RecheckAction::Pass => Ok(Some(output.to_owned())),

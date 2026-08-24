@@ -735,7 +735,7 @@ fn restore_telemetry_rows(
             .ok_or_else(|| anyhow!("inference call references unknown session"))?;
         let source_call_id = required_string(o, "call_id", "inference call index")?;
         let call_id = inference_call_id_map
-            .get(source_call_id)
+            .get(&source_call_id)
             .ok_or_else(|| anyhow!("inference call is missing its destination id mapping"))?
             .parse::<Uuid>()
             .context("parsing generated inference call id")?;
@@ -871,7 +871,7 @@ fn build_import_inference_call_id_map(
             .as_object()
             .ok_or_else(|| anyhow!("inference call index entry must be an object"))?;
         let call_id = required_string(object, "call_id", "inference call index")?;
-        parse_uuid(call_id, "call_id")?;
+        parse_uuid(call_id.clone(), "call_id")?;
         if !source_call_ids.insert(call_id.to_owned()) {
             bail!("import archive repeats inference call_id {call_id}");
         }

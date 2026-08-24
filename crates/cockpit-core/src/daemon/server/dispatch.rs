@@ -5,7 +5,7 @@ use super::sessions::*;
 use super::*;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 // The named-secret ownership guard primitives were factored into the shared
 // `crate::secret_ownership` funnel so policy import, `cockpit mcp add`,
 // credential refresh, and owner-scoped resolution reuse the SAME model. Re-export
@@ -371,23 +371,38 @@ fn require_terminal_binding(
 /// FCM2-backed source-artifact path.
 const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 
-fn oversized_text_artifact_admission(
+pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
+    pub session_id: Uuid,
+    pub client_submission_id: Uuid,
+    pub expected_model_state_generation: Option<u64>,
+    pub expected_model: Option<&'a cockpit_config::config::providers::ActiveModelRef>,
+    pub text: &'a str,
+    pub display_text: Option<&'a str>,
+    pub tag_expansions: &'a [proto::TagExpansionMeta],
+    pub forced_skill: Option<&'a str>,
+    pub remote_operation: Option<&'a super::RemoteOperationContext>,
+}
+
+pub(super) fn oversized_text_artifact_admission(
     ctx: &DaemonContext,
     handle: &crate::daemon::session_worker::SessionWorkerHandle,
     principal: &ClientPrincipal,
-    session_id: Uuid,
-    client_submission_id: Uuid,
-    expected_model_state_generation: Option<u64>,
-    expected_model: Option<&cockpit_config::config::providers::ActiveModelRef>,
-    text: &str,
-    display_text: Option<&str>,
-    tag_expansions: &[proto::TagExpansionMeta],
-    forced_skill: Option<&str>,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    request: OversizedTextArtifactAdmissionRequest<'_>,
 ) -> std::result::Result<
     Option<crate::daemon::session_worker::OversizedTextArtifactAdmission>,
     ErrorPayload,
 > {
+    let OversizedTextArtifactAdmissionRequest {
+        session_id,
+        client_submission_id,
+        expected_model_state_generation,
+        expected_model,
+        text,
+        display_text,
+        tag_expansions,
+        forced_skill,
+        remote_operation,
+    } = request;
     if text.len() <= INLINE_USER_TEXT_BYTES {
         return Ok(None);
     }
@@ -401,7 +416,12 @@ fn oversized_text_artifact_admission(
     let model_fence = match (expected_model_state_generation, expected_model) {
         (None, None) => None,
         (Some(generation), Some(model)) => Some((generation, model.clone())),
-        _ => return Err(ErrorPayload { code: ErrorCode::BadRequest, message: "expected model fence must include both generation and model".to_owned() }),
+        _ => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "expected model fence must include both generation and model".to_owned(),
+            });
+        }
     };
     let canonical_project_digest = Sha256::digest(
         format!(
@@ -412,11 +432,26 @@ fn oversized_text_artifact_admission(
         .as_bytes(),
     )
     .into();
-    let canonical_model_digest = Sha256::digest(b"flycockpit-fcm2-v2-model-digest\0").into();
+    // An omitted fence deliberately has a fixed canonical identity: it must
+    // replay across active-model changes.  Conversely, an explicit fence is
+    // part of the accepted request identity, so it must be represented in
+    // FCM2 rather than only in the worker-side acceptance check.
+    let (model_config_generation, canonical_model_digest) = match &model_fence {
+        None => (
+            0,
+            Sha256::digest(b"flycockpit-fcm2-v2-model-digest\0").into(),
+        ),
+        Some((generation, model)) => {
+            let model_json = serde_json::to_vec(model).map_err(internal)?;
+            let mut digest_input = b"flycockpit-fcm2-v2-model-digest\0".to_vec();
+            digest_input.extend_from_slice(&model_json);
+            (*generation, Sha256::digest(digest_input).into())
+        }
+    };
     let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
         session_id,
         canonical_project_digest,
-        model_config_generation: 0,
+        model_config_generation,
         canonical_model_digest,
         request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
             client_submission_id,
@@ -578,15 +613,17 @@ async fn handle_send_user_message(
             ctx,
             &handle,
             &state.principal,
-            session_id,
-            client_submission_id,
-            expected_model_state_generation,
-            expected_model.as_ref(),
-            &text,
-            display_text.as_deref(),
-            &tag_expansions,
-            forced_skill.as_deref(),
-            remote_operation,
+            OversizedTextArtifactAdmissionRequest {
+                session_id,
+                client_submission_id,
+                expected_model_state_generation,
+                expected_model: expected_model.as_ref(),
+                text: &text,
+                display_text: display_text.as_deref(),
+                tag_expansions: &tag_expansions,
+                forced_skill: forced_skill.as_deref(),
+                remote_operation,
+            },
         )?
     } else {
         None
@@ -780,7 +817,7 @@ async fn handle_send_user_message(
         .send_work(SessionWork::UserMessage {
             submission: Box::new(submission),
             remote_operation: remote_queue_operation,
-            artifact_admission: artifact_admission.clone(),
+            artifact_admission: artifact_admission.clone().map(Box::new),
             respond_to,
         })
         .await
@@ -816,7 +853,7 @@ async fn handle_send_user_message(
 /// `SendUserMessageBulk` consumer use distinct request operation UUIDs, so the
 /// stable authenticated attachment/device binding (plus principal) is the
 /// operation identity that can safely span the whole transfer.
-fn bulk_user_message_transfer_owner(
+pub(super) fn bulk_user_message_transfer_owner(
     principal: &ClientPrincipal,
     session_id: Uuid,
     remote_operation: Option<&super::RemoteOperationContext>,
@@ -856,7 +893,7 @@ fn bulk_user_message_transfer_owner(
 /// A consumed/expired reference may only be reconstructed for the same stored
 /// message actor, never merely because another client knows its transfer id and
 /// client submission id.
-fn bulk_user_message_replay_actor(
+pub(super) fn bulk_user_message_replay_actor(
     principal: &ClientPrincipal,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
@@ -876,11 +913,23 @@ fn bulk_user_message_replay_actor(
     }
 }
 
-fn unavailable_bulk_user_message_transfer() -> ErrorPayload {
+pub(super) fn unavailable_bulk_user_message_transfer() -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,
         message: "bulk user-message transfer is unavailable".to_owned(),
     }
+}
+
+pub(super) struct BulkUserMessagePayloadRequest<'a> {
+    pub session_id: Uuid,
+    pub owner: &'a crate::daemon::bulk_staging::BulkTransferOwner,
+    pub replay_actor: crate::db::message_attachments::MessageActor,
+    pub client_submission_id: Uuid,
+    pub transfer: &'a cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    pub display_text: &'a Option<String>,
+    pub display_transfer: &'a Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
+    pub tag_expansions: &'a [proto::TagExpansionMeta],
+    pub forced_skill: &'a Option<String>,
 }
 
 /// Resolve the bounded remote bulk references into the exact FCM2 text pair.
@@ -890,17 +939,21 @@ fn unavailable_bulk_user_message_transfer() -> ErrorPayload {
 /// never becomes a new inline submission.
 pub(super) async fn resolve_bulk_user_message_payload(
     ctx: &Arc<DaemonContext>,
-    session_id: Uuid,
-    owner: &crate::daemon::bulk_staging::BulkTransferOwner,
-    replay_actor: crate::db::message_attachments::MessageActor,
-    client_submission_id: Uuid,
-    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
-    display_text: &Option<String>,
-    display_transfer: &Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
-    tag_expansions: &[proto::TagExpansionMeta],
-    forced_skill: &Option<String>,
+    request: BulkUserMessagePayloadRequest<'_>,
 ) -> std::result::Result<(String, Option<String>), ErrorPayload> {
     use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+
+    let BulkUserMessagePayloadRequest {
+        session_id,
+        owner,
+        replay_actor,
+        client_submission_id,
+        transfer,
+        display_text,
+        display_transfer,
+        tag_expansions,
+        forced_skill,
+    } = request;
 
     let is_opaque_text_transfer =
         |reference: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
@@ -1063,15 +1116,17 @@ async fn handle_send_user_message_bulk(
     let replay_actor = bulk_user_message_replay_actor(&state.principal, remote_operation)?;
     let (text, display_text) = resolve_bulk_user_message_payload(
         ctx,
-        session_id,
-        &owner,
-        replay_actor,
-        client_submission_id,
-        &transfer,
-        &display_text,
-        &display_transfer,
-        &tag_expansions,
-        &forced_skill,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &owner,
+            replay_actor,
+            client_submission_id,
+            transfer: &transfer,
+            display_text: &display_text,
+            display_transfer: &display_transfer,
+            tag_expansions: &tag_expansions,
+            forced_skill: &forced_skill,
+        },
     )
     .await?;
     handle_send_user_message(

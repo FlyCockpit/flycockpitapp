@@ -438,23 +438,6 @@ function appendAssistantDelta(history: NativeHistoryEntry[], delta: string): Nat
   return sortNativeHistory([...history, pendingEntry]);
 }
 
-function appendReasoningDelta(history: NativeHistoryEntry[], delta: string): NativeHistoryEntry[] {
-  const pending = history.find(
-    (entry) => entry.kind === "assistant_reasoning" && entry.id === pendingReasoningId,
-  );
-  if (pending?.kind === "assistant_reasoning") {
-    return history.map((entry) =>
-      entry.id === pendingReasoningId && entry.kind === "assistant_reasoning"
-        ? { ...entry, text: entry.text + delta }
-        : entry,
-    );
-  }
-  return sortNativeHistory([
-    ...history,
-    { id: pendingReasoningId, seq: pendingReasoningSeq, kind: "assistant_reasoning", text: delta },
-  ]);
-}
-
 function appendDisplayTextDelta(
   history: NativeHistoryEntry[],
   attemptId: string | number,

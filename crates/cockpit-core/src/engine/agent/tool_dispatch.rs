@@ -1743,15 +1743,14 @@ mod tests {
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
             let captured = "visible line\nsuper-secret-token-value\nhidden line\n".to_string();
-            Ok(ToolOutput::truncated_text("visible line\n[truncated]\n").with_text_artifact_capture(
-                crate::engine::tool::TextArtifactCapture {
+            Ok(ToolOutput::truncated_text("visible line\n[truncated]\n")
+                .with_text_artifact_capture(crate::engine::tool::TextArtifactCapture {
                     host_captured_bytes: captured.len(),
                     host_original_bytes: captured.len(),
                     host_dropped_bytes: 0,
                     stored_source_bytes: captured.len(),
                     content: captured,
-                },
-            ))
+                }))
         }
     }
 
@@ -2042,7 +2041,11 @@ mod tests {
                         host_dropped_bytes: 0,
                         stored_source_bytes: captured.len(),
                         content: captured,
-                    }),
+                    })
+                    // This synthetic fixture models a successful shell run;
+                    // `None` is the production representation of a signaled
+                    // process and correctly receives the failure guard.
+                    .with_exit_code(0),
             )
         }
     }
@@ -2228,36 +2231,35 @@ mod tests {
     ) -> crate::db::text_artifacts::TextArtifact {
         let result = session
             .db
-            .record_event_with_text_artifacts(
-                crate::db::text_artifacts::TextArtifactEventInput {
-                    session_id: session.id,
-                    kind: crate::db::session_log::SessionEventKind::ToolCall,
-                    agent: Some("Build".to_owned()),
-                    call_id: Some(call_id.to_owned()),
-                    context: crate::db::text_artifacts::TextArtifactEventContext::default(),
-                    ts_ms: 1,
-                    data_json: serde_json::json!({ "output": "visible" }).to_string(),
-                    artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
-                        relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
-                        projection_slot: Some(0),
-                        kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
-                        capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
-                        content: content.to_owned(),
-                        host_captured_bytes: content.len(),
-                        host_original_bytes: content.len(),
-                        host_dropped_bytes: 0,
-                        stored_source_bytes: content.len(),
-                        provenance_json: serde_json::json!({
-                            "agent_id": "Build",
-                            "tool": "synthetic",
-                            "call_id": call_id,
-                        })
-                        .to_string(),
-                        created_at: 1,
-                    }],
-                    unavailable_projection: None,
-                },
-            )
+            .record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+                session_id: session.id,
+                kind: crate::db::session_log::SessionEventKind::ToolCall,
+                agent: Some("Build".to_owned()),
+                call_id: Some(call_id.to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                ts_ms: 1,
+                data_json: serde_json::json!({ "output": "visible" }).to_string(),
+                artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                    relation:
+                        crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                    projection_slot: Some(0),
+                    kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                    capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                    content: content.to_owned(),
+                    host_captured_bytes: content.len(),
+                    host_original_bytes: content.len(),
+                    host_dropped_bytes: 0,
+                    stored_source_bytes: content.len(),
+                    provenance_json: serde_json::json!({
+                        "agent_id": "Build",
+                        "tool": "synthetic",
+                        "call_id": call_id,
+                    })
+                    .to_string(),
+                    created_at: 1,
+                }],
+                unavailable_projection: None,
+            })
             .await
             .unwrap();
         match result.slots.into_iter().next().unwrap().admission {
@@ -4212,20 +4214,20 @@ mod tests {
             .unwrap();
 
         let live = last_tool_result_text(&live_history);
-        assert!(live.starts_with("<cockpit_artifact_v1>\n"), "{live}");
+        assert!(
+            live.starts_with("<cockpit_artifact_v1 payload_utf8_bytes="),
+            "{live}"
+        );
         assert!(
             !live.starts_with("visible line\n[truncated]\n"),
             "an artifact frame must replace, not append to, the capped live body: {live}"
         );
 
-        let replayed = crate::engine::rehydrate::rehydrate_session(
-            &session.db,
-            session.id,
-            "Build",
-        )
-        .await
-        .unwrap()
-        .expect("the durable tool turn rehydrates");
+        let replayed =
+            crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+                .await
+                .unwrap()
+                .expect("the durable tool turn rehydrates");
         let replay = last_tool_result_text(&replayed.history);
         assert_eq!(
             live, replay,
@@ -4319,7 +4321,15 @@ mod tests {
         );
         assert!(stored[0].content.contains("visible line"));
         assert!(stored[0].content.contains("hidden line"));
-        assert!(!last_tool_result_text(&history).contains("hidden line"));
+        let projection = last_tool_result_text(&history);
+        assert!(
+            projection.starts_with("<cockpit_artifact_v1 payload_utf8_bytes="),
+            "{projection}"
+        );
+        // This deliberately small capture fits in the deterministic artifact
+        // preview, so its retained line is model-visible without duplicating
+        // the persisted payload in the tool-result event.
+        assert!(projection.contains("hidden line"), "{projection}");
     }
 
     #[tokio::test]
@@ -4380,8 +4390,13 @@ mod tests {
         )
         .unwrap();
         let tools = ToolBox::new().with(Arc::new(BashArtifactCaptureTool));
-        let agent = test_agent(tools.clone());
+        let mut agent = test_agent(tools.clone());
+        agent.scan_tool_results = true;
         let session = test_session(tmp.path());
+        // Full-capture rechecking is deliberately bypassed in Yolo mode. Use
+        // the normal approval posture so an unavailable recheck exercises the
+        // fail-closed capture path below.
+        session.set_approval_mode(ApprovalMode::Manual);
         let model = test_model();
         let (tx, _rx) = mpsc::channel(8);
         let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
@@ -4413,7 +4428,14 @@ mod tests {
 
         let capped = "head line\n... [truncated]\ntail line\n";
         assert_eq!(last_tool_result_text(&history), capped);
-        assert!(session.db.list_text_artifacts(session.id).await.unwrap().is_empty());
+        assert!(
+            session
+                .db
+                .list_text_artifacts(session.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let session_id = session.id;
         let (refs, reservations): (i64, i64) = session
             .db
@@ -4435,12 +4457,17 @@ mod tests {
             .unwrap();
         assert_eq!((refs, reservations), (0, 0));
         let events = session.db.list_session_events(session.id).await.unwrap();
-        let event = events.iter().find(|event| event.kind == "tool_call").unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "tool_call")
+            .unwrap();
         assert!(event.data.get("artifact_projection").is_none());
-        assert!(!event
-            .data
-            .to_string()
-            .contains("INJECTION_SENTINEL_ONLY_IN_RETAINED_TAIL"));
+        assert!(
+            !event
+                .data
+                .to_string()
+                .contains("INJECTION_SENTINEL_ONLY_IN_RETAINED_TAIL")
+        );
         let resumed = crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
             .await
             .unwrap()
@@ -4492,8 +4519,14 @@ mod tests {
             "artifact continuation artifact_id={} start_line=2 start_byte=",
             artifact.artifact_id
         )));
-        let continuation_byte = first_page.content.split("start_byte=").nth(1)
-            .and_then(|suffix| suffix.split(']').next()).unwrap().parse::<usize>().unwrap();
+        let continuation_byte = first_page
+            .content
+            .split("start_byte=")
+            .nth(1)
+            .and_then(|suffix| suffix.split(']').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
 
         let second_page = crate::tools::artifact_read::ArtifactReadTool
             .call(
@@ -4554,7 +4587,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(literal.content, "2:needle once needle twice\n5:needle final\n");
+        assert_eq!(
+            literal.content,
+            "2:needle once needle twice\n5:needle final\n"
+        );
 
         let regex = crate::tools::artifact_search::ArtifactSearchTool
             .call(
@@ -4709,7 +4745,10 @@ mod tests {
         let mut ctx = tool_ctx(imported_session, tmp.path(), &tx);
         ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
         let read = crate::tools::artifact_read::ArtifactReadTool
-            .call(serde_json::json!({ "artifact_id": artifact.artifact_id }), &ctx)
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id }),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(!read.content.contains(secret));

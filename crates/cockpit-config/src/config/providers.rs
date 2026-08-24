@@ -3108,10 +3108,11 @@ impl ProvidersConfig {
         // connection start at Chat Completions. Other providers retain the
         // historic `Auto` result so their learned-endpoint path remains
         // unchanged.
-        entry
-            .is_copilot_identity(provider)
-            .then(|| WireApi::detect(model))
-            .unwrap_or(WireApi::Auto)
+        if entry.is_copilot_identity(provider) {
+            WireApi::detect(model)
+        } else {
+            WireApi::Auto
+        }
     }
 
     /// Whether the endpoint is explicitly pinned by model or provider config.

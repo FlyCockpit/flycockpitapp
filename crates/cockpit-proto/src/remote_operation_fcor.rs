@@ -1950,12 +1950,8 @@ mod tests {
         let decoder = RecordingFoundationDecoder(std::sync::atomic::AtomicBool::new(false));
         let mut exact = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES];
         exact[..FCM2_MAGIC.len()].copy_from_slice(&FCM2_MAGIC);
-        validate_registered_opaque_params(
-            SEND_USER_MESSAGE_V2_REGISTRATION,
-            &exact,
-            &decoder,
-        )
-        .expect("the exact registered FCM2 allocation boundary reaches its owner decoder");
+        validate_registered_opaque_params(SEND_USER_MESSAGE_V2_REGISTRATION, &exact, &decoder)
+            .expect("the exact registered FCM2 allocation boundary reaches its owner decoder");
         assert!(decoder.0.load(std::sync::atomic::Ordering::SeqCst));
         let fcor = encode_fcor_v1("send_user_message", &[], &exact).unwrap();
         assert!(fcor.ends_with(&exact), "FCOR preserves FCM2 bytes exactly");

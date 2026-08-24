@@ -254,7 +254,7 @@ mod tests {
                         Response::BulkTransferChunkAccepted {
                             next_chunk_index: expected_index as u32 + 1,
                             received_bytes:
-                                crate::daemon::proto::CanonicalU64DecimalStringV1::from_u64(
+                                crate::proto_crate::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
                                     received_bytes,
                                 ),
                             complete: expected_index + 1 == expected_chunk_count,

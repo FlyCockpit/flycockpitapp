@@ -2,6 +2,7 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::*;
+use anyhow::Context;
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
@@ -562,9 +563,9 @@ fn validate_oversized_artifact_admission(
         (None, None, None) => {}
         (Some((generation, model)), Some(expected_generation), Some(expected_model))
             if *generation == expected_generation && model == expected_model => {}
-        _ => anyhow::bail!(
-            "oversized artifact admission model fence does not match the submission"
-        ),
+        _ => {
+            anyhow::bail!("oversized artifact admission model fence does not match the submission")
+        }
     }
     let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
         &admission.canonical_message,
@@ -716,7 +717,7 @@ async fn reject_oversized_text_artifact_admission(
 /// in-memory queue is merely reconstituted so the driver can perform phase
 /// two. No security, preflight, translation, title, or provider work occurs
 /// here.
-async fn replay_accepted_oversized_text_artifact_queue(
+pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     session: &Session,
     queue: &crate::engine::message::UserSubmissionQueue,
     target: crate::engine::message::QueueTarget,
@@ -764,8 +765,9 @@ async fn replay_accepted_oversized_text_artifact_queue(
             .ok_or_else(|| {
                 anyhow::anyhow!("accepted oversized FCM2 queue row lacks its reservation")
             })?;
-        let run_invocation_id = if reservation.reservation.run_invocation_bound {
-            session
+        let run_invocation_id =
+            if reservation.reservation.run_invocation_bound {
+                session
                 .db
                 .bound_text_artifact_run_invocation(session.id, row.client_submission_id)
                 .await?
@@ -773,9 +775,9 @@ async fn replay_accepted_oversized_text_artifact_queue(
                     "bound oversized FCM2 reservation lacks its exact run invocation binding"
                 ))
                 .map(Some)?
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let durable_model_fence = match reservation.reservation.model_fence.as_ref() {
             None => None,
             Some(fence) => match decode_durable_model_fence(&fence.model_json) {
@@ -812,6 +814,10 @@ async fn replay_accepted_oversized_text_artifact_queue(
                 continue;
             }
         }
+        let wire_fingerprint = format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&canonical.message_request_digest()?)
+        );
         let mut submission = crate::engine::message::UserSubmission {
             expected_model_state_generation: durable_model_fence
                 .as_ref()
@@ -833,7 +839,7 @@ async fn replay_accepted_oversized_text_artifact_queue(
                 })
                 .collect(),
             images: Vec::new(),
-            forced_skill: canonical.request.forced_skill,
+            forced_skill: canonical.request.forced_skill.clone(),
             origin_principal: None,
             job_id: None,
             preflight_cleaned: None,
@@ -850,10 +856,6 @@ async fn replay_accepted_oversized_text_artifact_queue(
             run_invocation_id,
         };
         let fingerprint = submission.client_fingerprint();
-        let wire_fingerprint = format!(
-            "fcm2:{}",
-            crate::intel::hex_lower(&canonical.message_request_digest()?)
-        );
         submission
             .client_submissions
             .push(crate::engine::message::ClientSubmissionReceipt {
@@ -1993,7 +1995,7 @@ pub(super) async fn run_worker(
 
     // Main work loop.
     enum WorkerInput {
-        Work(SessionWork),
+        Work(Box<SessionWork>),
         ParkedReplay(ParkedReplayCompletion),
         ReapExpiredTextArtifactReservations,
     }
@@ -2024,7 +2026,7 @@ pub(super) async fn run_worker(
             }
             work = work_rx.recv() => {
                 match work {
-                    Some(work) => WorkerInput::Work(work),
+                    Some(work) => WorkerInput::Work(Box::new(work)),
                     None => break WorkerStop::WorkerStopped,
                 }
             }
@@ -2074,7 +2076,7 @@ pub(super) async fn run_worker(
                 )
                 .await;
             }
-            WorkerInput::Work(work) => match work {
+            WorkerInput::Work(work) => match *work {
                 SessionWork::WakeGoal => {
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
@@ -2224,7 +2226,7 @@ pub(super) async fn run_worker(
                         };
                         let source_digest =
                             crate::db::db::text_artifacts::source_digest(&canonical.request.text);
-                        let model_fence = admission
+                        let model_fence = match admission
                             .model_fence
                             .as_ref()
                             .map(|(generation, model)| -> anyhow::Result<_> {
@@ -2237,7 +2239,13 @@ pub(super) async fn run_worker(
                             .map_err(|error: anyhow::Error| proto::ErrorPayload {
                                 code: proto::ErrorCode::BadRequest,
                                 message: format!("invalid oversized model fence: {error}"),
-                            })?;
+                            }) {
+                            Ok(model_fence) => model_fence,
+                            Err(error) => {
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
+                        };
                         let accepted = match admission.run_invocation.as_ref() {
                             Some(run_invocation) => session
                                 .db
@@ -2635,7 +2643,8 @@ pub(super) async fn run_worker(
                     ) {
                         let current = authoritative_active_model_state
                             .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
                         let matches = model_fence_allows_insert(
                             current.as_ref(),
                             expected_generation,
@@ -4381,35 +4390,52 @@ const DURABLE_ACTIVE_MODEL_FENCE_KEYS: [&str; 5] = [
 fn decode_durable_model_fence(
     model_json: &str,
 ) -> anyhow::Result<cockpit_config::providers::ActiveModelRef> {
-    let value: serde_json::Value = serde_json::from_str(model_json)
-        .context("decoding durable oversized model fence")?;
+    let value: serde_json::Value =
+        serde_json::from_str(model_json).context("decoding durable oversized model fence")?;
     let object = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("durable oversized model fence must be an object"))?;
     anyhow::ensure!(
-        object.keys().all(|key| DURABLE_ACTIVE_MODEL_FENCE_KEYS.contains(&key.as_str())),
+        object
+            .keys()
+            .all(|key| DURABLE_ACTIVE_MODEL_FENCE_KEYS.contains(&key.as_str())),
         "durable oversized model fence has unknown fields"
     );
-    let model: cockpit_config::providers::ActiveModelRef = serde_json::from_value(value)
-        .context("decoding typed durable oversized model fence")?;
+    let model: cockpit_config::providers::ActiveModelRef =
+        serde_json::from_value(value).context("decoding typed durable oversized model fence")?;
     model
         .validate()
         .map_err(|error| anyhow::anyhow!(error))
         .context("validating durable oversized model fence")?;
     anyhow::ensure!(
-        serde_json::to_string(&model)? == model_json,
+        canonical_durable_model_fence_json(&model)? == model_json,
         "durable oversized model fence is not canonical"
     );
     Ok(model)
 }
 
-fn encode_durable_model_fence(
+/// Match the database leaf's canonical JSON representation: serialize the
+/// typed DTO into a JSON value first, then render that value.  Direct struct
+/// serialization preserves declaration order while the DB validates the
+/// parsed `Value` representation, so using the latter on both sides makes a
+/// durable fence replay-stable.
+fn canonical_durable_model_fence_json(
+    model: &cockpit_config::providers::ActiveModelRef,
+) -> anyhow::Result<String> {
+    serde_json::to_string(&serde_json::to_value(model)?)
+        .context("encoding canonical durable oversized model fence")
+}
+
+pub(super) fn encode_durable_model_fence(
     model: &cockpit_config::providers::ActiveModelRef,
 ) -> anyhow::Result<String> {
     model.validate().map_err(|error| anyhow::anyhow!(error))?;
-    let encoded = serde_json::to_string(model)?;
+    let encoded = canonical_durable_model_fence_json(model)?;
     let decoded = decode_durable_model_fence(&encoded)?;
-    anyhow::ensure!(decoded == *model, "durable model fence round-trip changed model");
+    anyhow::ensure!(
+        decoded == *model,
+        "durable model fence round-trip changed model"
+    );
     Ok(encoded)
 }
 

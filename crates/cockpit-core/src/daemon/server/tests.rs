@@ -13021,15 +13021,17 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
     let display_reference = opaque_user_transfer_ref(display.as_bytes());
     let (replayed_source, replayed_display) = resolve_bulk_user_message_payload(
         &ctx,
-        session_id,
-        &bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap(),
-        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
-        client_submission_id,
-        &source_reference,
-        &None,
-        &Some(display_reference),
-        &[],
-        &None,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap(),
+            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            client_submission_id,
+            transfer: &source_reference,
+            display_text: &None,
+            display_transfer: &Some(display_reference),
+            tag_expansions: &[],
+            forced_skill: &None,
+        },
     )
     .await
     .expect("durable FCM2 accepts replay after staged bytes are consumed");
@@ -13054,29 +13056,33 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
     let display_transfer = stage_opaque_user_transfer(display.as_bytes(), &owner);
     let foreign_error = resolve_bulk_user_message_payload(
         &ctx,
-        session_id,
-        &foreign,
-        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
-        Uuid::new_v4(),
-        &source_transfer,
-        &None,
-        &Some(display_transfer.clone()),
-        &[],
-        &None,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &foreign,
+            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            client_submission_id: Uuid::new_v4(),
+            transfer: &source_transfer,
+            display_text: &None,
+            display_transfer: &Some(display_transfer.clone()),
+            tag_expansions: &[],
+            forced_skill: &None,
+        },
     )
     .await
     .expect_err("a cross-session/principal owner cannot consume opaque refs");
     let unknown_error = resolve_bulk_user_message_payload(
         &ctx,
-        session_id,
-        &foreign,
-        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
-        Uuid::new_v4(),
-        &opaque_user_transfer_ref(source.as_bytes()),
-        &None,
-        &Some(opaque_user_transfer_ref(display.as_bytes())),
-        &[],
-        &None,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &foreign,
+            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            client_submission_id: Uuid::new_v4(),
+            transfer: &opaque_user_transfer_ref(source.as_bytes()),
+            display_text: &None,
+            display_transfer: &Some(opaque_user_transfer_ref(display.as_bytes())),
+            tag_expansions: &[],
+            forced_skill: &None,
+        },
     )
     .await
     .expect_err("an unknown opaque ref is the same safe response");
@@ -13128,10 +13134,10 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
     let client_submission_id = Uuid::new_v4();
     let operation = remote_owner_operation();
     let mut remote = remote_principal();
-    let ClientPrincipal::Remote(remote_principal) = &mut remote else {
+    let ClientPrincipal::Remote(remote_client) = &mut remote else {
         panic!("remote fixture must remain remote");
     };
-    remote_principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    remote_client.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,
         device_generation: operation.authenticated_device_generation,
@@ -13193,15 +13199,17 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
 
     let (replayed, display) = resolve_bulk_user_message_payload(
         &ctx,
-        session_id,
-        &owner,
-        actor,
-        client_submission_id,
-        &transfer,
-        &None,
-        &None,
-        &[],
-        &None,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &owner,
+            replay_actor: actor,
+            client_submission_id,
+            transfer: &transfer,
+            display_text: &None,
+            display_transfer: &None,
+            tag_expansions: &[],
+            forced_skill: &None,
+        },
     )
     .await
     .expect("the authenticated receipt actor can replay a consumed remote ref");
@@ -13225,19 +13233,24 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
             .unwrap();
     let denied = resolve_bulk_user_message_payload(
         &ctx,
-        session_id,
-        &other_owner,
-        bulk_user_message_replay_actor(&other_principal, Some(&other_operation)).unwrap(),
-        client_submission_id,
-        &transfer,
-        &None,
-        &None,
-        &[],
-        &None,
+        BulkUserMessagePayloadRequest {
+            session_id,
+            owner: &other_owner,
+            replay_actor: bulk_user_message_replay_actor(&other_principal, Some(&other_operation))
+                .unwrap(),
+            client_submission_id,
+            transfer: &transfer,
+            display_text: &None,
+            display_transfer: &None,
+            tag_expansions: &[],
+            forced_skill: &None,
+        },
     )
     .await
     .expect_err("a different authenticated actor cannot replay another actor's consumed ref");
-    assert_eq!(denied, unavailable_bulk_user_message_transfer());
+    let expected = unavailable_bulk_user_message_transfer();
+    assert_eq!(denied.code, expected.code);
+    assert_eq!(denied.message, expected.message);
 }
 
 #[tokio::test]
@@ -13277,15 +13290,17 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         &ctx,
         &handle,
         &state.principal,
-        session_id,
-        client_submission_id,
-        None,
-        None,
-        &source,
-        None,
-        &[],
-        None,
-        None,
+        OversizedTextArtifactAdmissionRequest {
+            session_id,
+            client_submission_id,
+            expected_model_state_generation: None,
+            expected_model: None,
+            text: &source,
+            display_text: None,
+            tag_expansions: &[],
+            forced_skill: None,
+            remote_operation: None,
+        },
     )
     .unwrap()
     .unwrap();
@@ -13307,15 +13322,17 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         &ctx,
         &handle,
         &state.principal,
-        session_id,
-        client_submission_id,
-        None,
-        None,
-        &source,
-        None,
-        &[],
-        None,
-        None,
+        OversizedTextArtifactAdmissionRequest {
+            session_id,
+            client_submission_id,
+            expected_model_state_generation: None,
+            expected_model: None,
+            text: &source,
+            display_text: None,
+            tag_expansions: &[],
+            forced_skill: None,
+            remote_operation: None,
+        },
     )
     .unwrap()
     .unwrap();
@@ -13361,15 +13378,17 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
         &ctx,
         &handle,
         &state.principal,
-        session_id,
-        client_submission_id,
-        Some(99),
-        Some(&switched),
-        &source,
-        None,
-        &[],
-        None,
-        None,
+        OversizedTextArtifactAdmissionRequest {
+            session_id,
+            client_submission_id,
+            expected_model_state_generation: Some(99),
+            expected_model: Some(&switched),
+            text: &source,
+            display_text: None,
+            tag_expansions: &[],
+            forced_skill: None,
+            remote_operation: None,
+        },
     )
     .unwrap()
     .unwrap();
@@ -14368,6 +14387,23 @@ fn authz_bulk_user_message() -> AuthzDispatchCase {
     }
 }
 
+/// The authorization matrix must reach the attached-session writer gate for a
+/// bulk chunk, but it must not stage a valid transfer: the matrix owns no
+/// transfer cleanup and a successful write can leave the socket teardown
+/// waiting on that durable path.  An invalid base64 body is rejected only
+/// after authorization, so it proves the same boundary without entering the
+/// bulk writer.
+fn authz_bulk_transfer_chunk() -> AuthzDispatchCase {
+    AuthzDispatchCase {
+        kind: "write_bulk_transfer_chunk",
+        owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        known_holes: &[],
+    }
+}
+
 fn authz_session_writer_with_known_holes(
     kind: &'static str,
     known_holes: &'static [AuthzKnownHole],
@@ -14775,7 +14811,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
         authz_owner_only("import_session_archive"),
-        authz_session_writer("write_bulk_transfer_chunk"),
+        authz_bulk_transfer_chunk(),
         authz_owner_only("read_bulk_transfer_chunk"),
         authz_owner_only("read_redacted_export_chunk"),
         authz_owner_only("curator"),
@@ -15667,6 +15703,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
         kind,
         "send_user_message"
             | "send_user_message_bulk"
+            | "write_bulk_transfer_chunk"
             | "begin_attachment_upload"
             | "upload_attachment_chunk"
             | "finish_attachment_upload"
@@ -15730,7 +15767,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
-            transfer: opaque_user_transfer_ref(&"authz bulk ".repeat(6_000)),
+            transfer: opaque_user_transfer_ref("authz bulk ".repeat(6_000).as_bytes()),
             display_text: None,
             display_transfer: None,
             tag_expansions: Vec::new(),
@@ -16025,7 +16062,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "write_bulk_transfer_chunk" => Request::WriteBulkTransferChunk {
             transfer: archive_transfer_ref(b"chunk"),
             chunk_index: 0,
-            data_base64: base64::engine::general_purpose::STANDARD.encode(b"chunk"),
+            data_base64: "not-base64".into(),
         },
         "read_bulk_transfer_chunk" => Request::ReadBulkTransferChunk {
             transfer_id: archive_transfer_ref(b"not-staged").transfer_id,
@@ -18643,7 +18680,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             expected_model_state_generation: None,
             expected_model: None,
             client_submission_id: Uuid::new_v4(),
-            transfer: opaque_user_transfer_ref(&"detached bulk ".repeat(5_000)),
+            transfer: opaque_user_transfer_ref("detached bulk ".repeat(5_000).as_bytes()),
             display_text: None,
             display_transfer: None,
             tag_expansions: Vec::new(),
@@ -21673,7 +21710,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 expected_model_state_generation: None,
                 expected_model: None,
                 client_submission_id: Uuid::new_v4(),
-                transfer: opaque_user_transfer_ref(&"bulk metadata".repeat(8_193)),
+                transfer: opaque_user_transfer_ref("bulk metadata".repeat(8_193).as_bytes()),
                 display_text: None,
                 display_transfer: None,
                 tag_expansions: Vec::new(),
@@ -23366,6 +23403,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::DocsAsk { question: "how do tasks work?".into(), package: Some("tokio".into()), project_root: Some("/tmp/project".into()) }, kind: "docs_ask", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::AgentInstallationBegin(cockpit_proto::AgentInstallationBeginV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, idempotency_key: "metadata-agent-installation".into(), operation: cockpit_proto::AgentInstallationOperationKind::Create, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, source_locator: "authored/helper".into(), target_installation_id: None, replace_acknowledged: false, requested_slot: None, execution_kind: Some(cockpit_proto::AgentInstallationExecutionKindV1::Coding), primary_slot_id: Some("primary".into()), auto_select_first_exact: false }), kind: "agent_installation_begin", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, continuation_token: Uuid::new_v4().to_string(), choice_id: Some("choice-a".into()), defer: false }), kind: "agent_installation_submit_choice", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: None }), kind: "agent_installation_list", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: Some(Uuid::new_v4().to_string()) }), kind: "agent_installation_inspect", session_id: None, audit_path: None, mutating: false },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the

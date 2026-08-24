@@ -2,7 +2,7 @@
 //! tombstones. Keys are sole `client_submission_id` UUIDs — never a principal
 //! composite. Rows do not cascade with sessions.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 

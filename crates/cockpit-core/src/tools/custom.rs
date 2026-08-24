@@ -439,10 +439,7 @@ fn boundary_safe_join(table: &RedactionTable, cap: BoundedPipeCapture) -> String
 /// Boundary-safe capture for the immutable artifact.  The host capture has a
 /// fixed 8 MiB boundary; safety removal is represented by a smaller stored
 /// source count rather than being misreported as host loss.
-fn boundary_safe_capture(
-    table: &RedactionTable,
-    combined: &str,
-) -> TextArtifactCapture {
+fn boundary_safe_capture(table: &RedactionTable, combined: &str) -> TextArtifactCapture {
     let mut base = capture_text_artifact_body(combined);
     if base.host_dropped_bytes == 0 {
         return base;
@@ -1186,9 +1183,6 @@ mod tests {
             .as_ref()
             .expect("capture for over-cap output");
         let scrubbed_ret = ctx.redact.scrub(&capture.content);
-        assert!(
-            !scrubbed_ret.contains(SECRET),
-            "capture leaked the secret"
-        );
+        assert!(!scrubbed_ret.contains(SECRET), "capture leaked the secret");
     }
 }

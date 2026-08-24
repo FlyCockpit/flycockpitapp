@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;

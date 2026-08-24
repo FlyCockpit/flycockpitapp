@@ -116,7 +116,7 @@ impl LocalInstallationResolver {
         let mut bindings = BTreeMap::new();
         for (installation_id, definition) in &definitions {
             let identity = LocalInstallationIdentity::from_definition(definition)?;
-            if !bindings.insert(*installation_id, identity).is_none() {
+            if bindings.insert(*installation_id, identity).is_some() {
                 bail!("duplicate daemon-local installation UUID `{installation_id}`");
             }
         }

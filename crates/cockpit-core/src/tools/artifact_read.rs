@@ -57,29 +57,57 @@ impl Tool for ArtifactReadTool {
         let (start, end, start_byte) = artifact_page_bounds(&args)?;
         if start_byte != 0 {
             let Some(line) = outbound_content.lines().nth(start.saturating_sub(1)) else {
-                return Err(invalid_input("`start_byte` names a line outside the artifact"));
+                return Err(invalid_input(
+                    "`start_byte` names a line outside the artifact",
+                ));
             };
             if start_byte > line.len() || !line.is_char_boundary(start_byte) {
-                return Err(invalid_input("`start_byte` must be a UTF-8 boundary within the requested line"));
+                return Err(invalid_input(
+                    "`start_byte` must be a UTF-8 boundary within the requested line",
+                ));
             }
         }
-        Ok(render_capped_artifact_lines(&outbound_content, artifact_id, start, end, start_byte))
+        Ok(render_capped_artifact_lines(
+            &outbound_content,
+            artifact_id,
+            start,
+            end,
+            start_byte,
+        ))
     }
 }
 
 pub(crate) fn artifact_page_bounds(args: &Value) -> Result<(usize, usize, usize)> {
-    let start_byte = args.get("start_byte").map(|value| value.as_u64()
-        .ok_or_else(|| invalid_input("`start_byte` must be a non-negative integer"))
-        .and_then(|value| usize::try_from(value).map_err(|_| invalid_input("`start_byte` exceeds this platform's byte range")))).transpose()?;
+    let start_byte = args
+        .get("start_byte")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| invalid_input("`start_byte` must be a non-negative integer"))
+                .and_then(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        invalid_input("`start_byte` exceeds this platform's byte range")
+                    })
+                })
+        })
+        .transpose()?;
     let start = positive(args, "start_line")?.unwrap_or(1);
-    let end = positive(args, "end_line")?.unwrap_or_else(|| if start_byte.is_some() { start } else { usize::MAX });
+    let end = positive(args, "end_line")?.unwrap_or_else(|| {
+        if start_byte.is_some() {
+            start
+        } else {
+            usize::MAX
+        }
+    });
     if end < start {
         return Err(invalid_input(
             "`end_line` must be greater than or equal to `start_line`",
         ));
     }
     if start_byte.is_some() && start != end {
-        return Err(invalid_input("`start_byte` requires matching `start_line` and `end_line`"));
+        return Err(invalid_input(
+            "`start_byte` requires matching `start_line` and `end_line`",
+        ));
     }
     Ok((start, end, start_byte.unwrap_or(0)))
 }
@@ -135,7 +163,11 @@ pub(crate) fn render_capped_artifact_lines(
         if number < start || number > end {
             continue;
         }
-        let line_offset = if number == start { start_byte.min(line.len()) } else { 0 };
+        let line_offset = if number == start {
+            start_byte.min(line.len())
+        } else {
+            0
+        };
         debug_assert!(line.is_char_boundary(line_offset));
         let slice = &line[line_offset..];
         let remaining = OUTPUT_BYTE_CAP.saturating_sub(out.len());
@@ -163,7 +195,15 @@ pub(crate) fn render_capped_artifact_lines(
         }
     }
     if let Some((next_line, next_byte)) = continuation {
-        let continuation = if next_byte == 0 { format!("... [artifact continuation artifact_id={artifact_id} start_line={next_line}]\n") } else { format!("... [artifact continuation artifact_id={artifact_id} start_line={next_line} start_byte={next_byte}]\n") };
+        let continuation = if next_byte == 0 {
+            format!(
+                "... [artifact continuation artifact_id={artifact_id} start_line={next_line}]\n"
+            )
+        } else {
+            format!(
+                "... [artifact continuation artifact_id={artifact_id} start_line={next_line} start_byte={next_byte}]\n"
+            )
+        };
         debug_assert!(continuation.len() <= CONTINUATION_RESERVE_BYTES);
         while out.len().saturating_add(continuation.len()) > OUTPUT_BYTE_CAP {
             out.pop();

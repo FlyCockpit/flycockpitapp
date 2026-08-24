@@ -157,6 +157,7 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
         expected: PreparedCompactionCoverage,
         actual: PreparedCompactionCoverage,
     },
+    #[cfg_attr(not(test), allow(dead_code))]
     StoreTextArtifacts(String),
 }
 
@@ -573,17 +574,19 @@ impl Driver {
         // Record this auto-prune's effectiveness for the escalation policy
         // (root frame only — a subagent frame's prune is transient). Only when
         // the ctx%-gated figures are known.
-        if auto
+        let effectiveness = if auto
             && depth == 1
             && bodies > 0
             && let (Some(w), Some(used)) = (window, used_before)
         {
             let window_f = f64::from(w);
-            self.note_prune_effectiveness(PruneEffectiveness {
+            Some(PruneEffectiveness {
                 ctx_pct: used as f64 / window_f * 100.0,
                 saved_pct: tokens_saved as f64 / window_f * 100.0,
-            });
-        }
+            })
+        } else {
+            None
+        };
 
         // Timeline event (Part C): record the prune so the export can
         // audit it. Only when something was actually elided — an empty
@@ -730,6 +733,10 @@ impl Driver {
             })
             .unwrap_or_else(|| prune::current_elided_ids(&top.history));
         self.prune_watermark.insert(depth, top.history.len());
+        let _ = top;
+        if let Some(effectiveness) = effectiveness {
+            self.note_prune_effectiveness(effectiveness);
+        }
 
         // Persist the prune ledger so a later resume re-derives this exact
         // pruned form (implementation note). Only the
@@ -1324,7 +1331,7 @@ impl Driver {
         // history until the normal compaction reset commits the final plan.
         let compact_prune =
             prune::dedup_plan(&self.stack.last().expect("stack never empty").history);
-        let mut pruned_history = prune::apply_plan_to(
+        let pruned_history = prune::apply_plan_to(
             &self.stack.last().expect("stack never empty").history,
             &compact_prune,
         );

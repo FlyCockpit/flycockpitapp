@@ -637,7 +637,11 @@ async fn prepared_forced_skill_is_side_effect_free_until_applied() {
             .len(),
         before_rows.len()
     );
-    assert!(prepared.envelope_guidance().contains("forced, package result"));
+    assert!(
+        prepared
+            .envelope_guidance()
+            .contains("forced, package result")
+    );
 }
 
 #[test]
@@ -678,7 +682,9 @@ async fn rejected_oversized_phase_two_discards_prepared_auto_and_forced_skills()
         ]),
         diagnostics: crate::skills::auto_select::SelectionDiagnostics::default(),
     };
-    let forced = driver.prepare_forced_skill("definitely-not-a-real-skill-xyz").await;
+    let forced = driver
+        .prepare_forced_skill("definitely-not-a-real-skill-xyz")
+        .await;
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 
     // Simulate the materialization failure branch: neither `apply_*` method
@@ -687,30 +693,39 @@ async fn rejected_oversized_phase_two_discards_prepared_auto_and_forced_skills()
     drop(forced);
     drop(tx);
 
-    assert!(rx.try_recv().is_err(), "rejected phase two emits no skill rows");
+    assert!(
+        rx.try_recv().is_err(),
+        "rejected phase two emits no skill rows"
+    );
     assert!(driver.active_skills.is_empty());
     assert!(driver.auto_injected_skills.is_empty());
     assert!(driver.skill_pairs.is_empty());
     assert!(driver.stack[0].history.is_empty());
-    assert!(driver
-        .session
-        .db
-        .list_tool_calls_for_session(driver.session.id)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(driver
-        .session
-        .db
-        .list_session_events(driver.session.id)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(driver
-        .session
-        .db
-        .list_text_artifacts(driver.session.id)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        driver
+            .session
+            .db
+            .list_tool_calls_for_session(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_text_artifacts(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

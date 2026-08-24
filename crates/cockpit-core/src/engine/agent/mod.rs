@@ -448,8 +448,7 @@ pub(crate) fn text_artifact_capture_is_persistable(
             !value.content.is_empty()
                 && value.content != delivered_body
                 && value.host_original_bytes >= value.host_captured_bytes
-                && value.host_dropped_bytes
-                    == value.host_original_bytes - value.host_captured_bytes
+                && value.host_dropped_bytes == value.host_original_bytes - value.host_captured_bytes
                 && value.stored_source_bytes == value.content.len()
                 && value.stored_source_bytes <= value.host_captured_bytes
         })
@@ -1653,12 +1652,18 @@ mod text_artifact_tests {
                 host_original_bytes: 24,
                 host_dropped_bytes: 0,
                 stored_source_bytes: 24,
-                provenance_json: serde_json::json!({"tool":"bash","call_id":"call-1","agent_id":"Build"}).to_string(),
+                provenance_json:
+                    serde_json::json!({"tool":"bash","call_id":"call-1","agent_id":"Build"})
+                        .to_string(),
                 created_at: 1,
             }],
             unavailable_projection: None,
         };
-        session.db.record_event_with_text_artifacts(event).await.unwrap();
+        session
+            .db
+            .record_event_with_text_artifacts(event)
+            .await
+            .unwrap();
         assert!(
             toolbox_with_retrieval_if_needed(
                 tools,
@@ -1669,9 +1674,16 @@ mod text_artifact_tests {
             .names()
             .contains(&"artifact_read")
         );
-        assert!(toolbox_with_retrieval_if_needed(
-            ToolBox::new(), &session, crate::config::extended::LlmMode::Normal,
-        ).await.names().contains(&"artifact_search"));
+        assert!(
+            toolbox_with_retrieval_if_needed(
+                ToolBox::new(),
+                &session,
+                crate::config::extended::LlmMode::Normal,
+            )
+            .await
+            .names()
+            .contains(&"artifact_search")
+        );
     }
 
     #[test]
@@ -1859,7 +1871,7 @@ mod stored_choice_tests {
             tool_call("tc-1"),
         ];
         let stored = stored_assistant_choice(true, &choice).expect("tool call keeps turn");
-        assert_eq!(stored.iter().count(), 1);
+        assert_eq!(stored.len(), 1);
         assert!(collect_tool_calls(&stored).iter().any(|c| c.id == "tc-1"));
     }
 

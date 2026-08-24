@@ -98,12 +98,7 @@ pub fn render_prune_artifact_frame(
     artifact: Option<&crate::db::text_artifacts::TextArtifact>,
     unavailable_reason: Option<&str>,
 ) -> String {
-    render_prune_artifact_frame_with_agent(
-        candidate,
-        artifact,
-        unavailable_reason,
-        None,
-    )
+    render_prune_artifact_frame_with_agent(candidate, artifact, unavailable_reason, None)
 }
 
 /// Render a prune frame with the exact agent provenance that the owning
@@ -763,11 +758,7 @@ fn static_reason(reason: &str) -> &'static str {
 /// reproduces the exact marker. `watermark` is the depth-1 `prune_watermark`
 /// (root history length at the last prune).
 pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
-    capture_ledger_with_prune_boundary_calls(
-        history,
-        watermark,
-        &std::collections::BTreeSet::new(),
-    )
+    capture_ledger_with_prune_boundary_calls(history, watermark, &std::collections::BTreeSet::new())
 }
 
 /// Capture the wire-prune delta using durable prune-boundary owner ids rather

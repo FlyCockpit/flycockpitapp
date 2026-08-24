@@ -106,13 +106,19 @@ pub fn render_accepted_user_envelope(
                         | (UserContent::Document(_), "document")
                         | (UserContent::ToolResult(_), "tool_result")
                 );
-                ensure!(matches_kind, "accepted typed envelope payload has the wrong codec");
+                ensure!(
+                    matches_kind,
+                    "accepted typed envelope payload has the wrong codec"
+                );
                 rendered.push(content);
             }
             _ => bail!("accepted user envelope has an unknown part"),
         }
     }
-    ensure!(slots == 1, "accepted user envelope must have one authored slot");
+    ensure!(
+        slots == 1,
+        "accepted user envelope must have one authored slot"
+    );
     Ok(rendered)
 }
 
@@ -134,22 +140,66 @@ pub fn render_accepted_user_composition(
     let mut leading = Vec::new();
     if let Some(prelude) = value.get("prelude").and_then(serde_json::Value::as_array) {
         for entry in prelude {
-            let object = entry.as_object().ok_or_else(|| anyhow!("invalid accepted envelope prelude"))?;
-            ensure!(object.get("type").and_then(serde_json::Value::as_str) == Some("forced_skill"), "unknown accepted envelope prelude");
-            let call_id = object.get("call_id").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("forced prelude lacks call id"))?;
-            let _skill_name = object.get("name").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("forced prelude lacks name"))?;
-            let args = object.get("args").and_then(serde_json::Value::as_object).ok_or_else(|| anyhow!("forced prelude args must be an object"))?;
+            let object = entry
+                .as_object()
+                .ok_or_else(|| anyhow!("invalid accepted envelope prelude"))?;
+            ensure!(
+                object.get("type").and_then(serde_json::Value::as_str) == Some("forced_skill"),
+                "unknown accepted envelope prelude"
+            );
+            let call_id = object
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("forced prelude lacks call id"))?;
+            let _skill_name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("forced prelude lacks name"))?;
+            let args = object
+                .get("args")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| anyhow!("forced prelude args must be an object"))?;
             ensure!(args.len() == 1, "forced prelude args have unknown fields");
-            ensure!(args.get("name").and_then(serde_json::Value::as_str) == Some(_skill_name), "forced prelude args name is invalid");
+            ensure!(
+                args.get("name").and_then(serde_json::Value::as_str) == Some(_skill_name),
+                "forced prelude args name is invalid"
+            );
             let args = serde_json::Value::Object(args.clone());
-            let body = object.get("body").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow!("forced prelude lacks body"))?;
+            let body = object
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("forced prelude lacks body"))?;
             let id = rig::message::ToolCallId::new_or_mint(call_id.to_owned());
             let provider = rig::message::ProviderCallId::new(call_id.to_owned());
-            leading.push(crate::engine::message::Message::Assistant { id: None, content: vec![crate::engine::message::AssistantContent::ToolCall(crate::engine::message::ToolCall { id: id.clone(), provider: provider.clone(), function: rig::message::ToolFunction { name: "skill".to_owned(), arguments: args }, signature: None, additional_params: None })] });
-            leading.push(crate::engine::message::Message::User { content: vec![UserContent::ToolResult(rig::message::ToolResult { call: id, provider, name: "skill".to_owned(), content: vec![rig::message::ToolResultContent::text(body)] })] });
+            leading.push(crate::engine::message::Message::Assistant {
+                id: None,
+                content: vec![crate::engine::message::AssistantContent::ToolCall(
+                    crate::engine::message::ToolCall {
+                        id: id.clone(),
+                        provider: provider.clone(),
+                        function: rig::message::ToolFunction {
+                            name: "skill".to_owned(),
+                            arguments: args,
+                        },
+                        signature: None,
+                        additional_params: None,
+                    },
+                )],
+            });
+            leading.push(crate::engine::message::Message::User {
+                content: vec![UserContent::ToolResult(rig::message::ToolResult {
+                    call: id,
+                    provider,
+                    name: "skill".to_owned(),
+                    content: vec![rig::message::ToolResultContent::text(body)],
+                })],
+            });
         }
     }
-    Ok(AcceptedUserComposition { leading, content: render_accepted_user_envelope(envelope_json, artifact_frame)? })
+    Ok(AcceptedUserComposition {
+        leading,
+        content: render_accepted_user_envelope(envelope_json, artifact_frame)?,
+    })
 }
 
 pub fn render_accepted_user_composition_with_redaction(
@@ -158,14 +208,24 @@ pub fn render_accepted_user_composition_with_redaction(
     redaction: &crate::redact::RedactionTable,
 ) -> Result<AcceptedUserComposition> {
     let mut composition = render_accepted_user_composition(envelope_json, artifact_frame)?;
-    composition.leading = composition.leading.iter().map(|message| {
-        crate::engine::model::redact::scrub_message(redaction, message)
-            .map_err(|error| anyhow!("accepted envelope prelude has unrenderable outbound content: {error}"))
-    }).collect::<Result<Vec<_>>>()?;
-    composition.content = composition.content.iter().map(|part| {
-        crate::engine::model::redact::scrub_user_content(redaction, part)
-            .map_err(|error| anyhow!("accepted user envelope has unrenderable outbound content: {error}"))
-    }).collect::<Result<Vec<_>>>()?;
+    composition.leading = composition
+        .leading
+        .iter()
+        .map(|message| {
+            crate::engine::model::redact::scrub_message(redaction, message).map_err(|error| {
+                anyhow!("accepted envelope prelude has unrenderable outbound content: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    composition.content = composition
+        .content
+        .iter()
+        .map(|part| {
+            crate::engine::model::redact::scrub_user_content(redaction, part).map_err(|error| {
+                anyhow!("accepted user envelope has unrenderable outbound content: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(composition)
 }
 
@@ -179,8 +239,9 @@ pub fn render_accepted_user_envelope_with_redaction(
     render_accepted_user_envelope(envelope_json, artifact_frame)?
         .iter()
         .map(|part| {
-            crate::engine::model::redact::scrub_user_content(redaction, part)
-                .map_err(|error| anyhow!("accepted user envelope has unrenderable outbound content: {error}"))
+            crate::engine::model::redact::scrub_user_content(redaction, part).map_err(|error| {
+                anyhow!("accepted user envelope has unrenderable outbound content: {error}")
+            })
         })
         .collect()
 }
@@ -192,14 +253,19 @@ pub fn accepted_user_envelope_with_guidance(guidance: &str) -> String {
     accepted_user_envelope_with_composition(None, guidance)
 }
 
-pub fn accepted_user_envelope_with_composition(prelude: Option<serde_json::Value>, guidance: &str) -> String {
+pub fn accepted_user_envelope_with_composition(
+    prelude: Option<serde_json::Value>,
+    guidance: &str,
+) -> String {
     let mut parts = Vec::new();
     if !guidance.is_empty() {
         parts.push(serde_json::json!({"type":"text","text":guidance}));
     }
     parts.push(serde_json::json!({"type":"authored_text_slot"}));
     let mut envelope = serde_json::json!({"version":3,"parts":parts});
-    if let Some(prelude) = prelude { envelope["prelude"] = serde_json::json!([prelude]); }
+    if let Some(prelude) = prelude {
+        envelope["prelude"] = serde_json::json!([prelude]);
+    }
     envelope.to_string()
 }
 
@@ -220,17 +286,30 @@ pub fn accepted_user_envelope_from_parts(
                 slots += 1;
                 encoded.push(serde_json::json!({"type":"authored_text_slot"}));
             }
-            UserContent::Text(text) => encoded.push(serde_json::json!({"type":"text","text":text.text})),
-            UserContent::Image(_) => encoded.push(serde_json::json!({"type":"image","payload":serde_json::to_value(part)?})),
-            UserContent::Audio(_) => encoded.push(serde_json::json!({"type":"audio","payload":serde_json::to_value(part)?})),
-            UserContent::Video(_) => encoded.push(serde_json::json!({"type":"video","payload":serde_json::to_value(part)?})),
-            UserContent::Document(_) => encoded.push(serde_json::json!({"type":"document","payload":serde_json::to_value(part)?})),
-            UserContent::ToolResult(_) => encoded.push(serde_json::json!({"type":"tool_result","payload":serde_json::to_value(part)?})),
+            UserContent::Text(text) => {
+                encoded.push(serde_json::json!({"type":"text","text":text.text}))
+            }
+            UserContent::Image(_) => encoded
+                .push(serde_json::json!({"type":"image","payload":serde_json::to_value(part)?})),
+            UserContent::Audio(_) => encoded
+                .push(serde_json::json!({"type":"audio","payload":serde_json::to_value(part)?})),
+            UserContent::Video(_) => encoded
+                .push(serde_json::json!({"type":"video","payload":serde_json::to_value(part)?})),
+            UserContent::Document(_) => encoded
+                .push(serde_json::json!({"type":"document","payload":serde_json::to_value(part)?})),
+            UserContent::ToolResult(_) => encoded.push(
+                serde_json::json!({"type":"tool_result","payload":serde_json::to_value(part)?}),
+            ),
         }
     }
-    ensure!(slots == 1, "accepted user composition must have exactly one authored text part");
+    ensure!(
+        slots == 1,
+        "accepted user composition must have exactly one authored text part"
+    );
     let mut envelope = serde_json::json!({"version":3,"parts":encoded});
-    if let Some(prelude) = prelude { envelope["prelude"] = serde_json::json!([prelude]); }
+    if let Some(prelude) = prelude {
+        envelope["prelude"] = serde_json::json!([prelude]);
+    }
     Ok(envelope.to_string())
 }
 
@@ -429,11 +508,8 @@ mod tests {
 
     #[test]
     fn accepted_envelope_preserves_guidance_and_closed_typed_parts_in_order() {
-        let image = UserContent::image_base64(
-            "YWJj",
-            Some(rig::message::ImageMediaType::PNG),
-            None,
-        );
+        let image =
+            UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = serde_json::json!({
             "version": 3,
             "parts": [
@@ -444,15 +520,21 @@ mod tests {
             ]
         });
         let rendered = render_accepted_user_envelope(&envelope.to_string(), "<frame>").unwrap();
-        assert_eq!(rendered, vec![
-            UserContent::text("auto skill\n"), image, UserContent::text("<frame>"),
-            UserContent::text("context tag")
-        ]);
+        assert_eq!(
+            rendered,
+            vec![
+                UserContent::text("auto skill\n"),
+                image,
+                UserContent::text("<frame>"),
+                UserContent::text("context tag")
+            ]
+        );
     }
 
     #[test]
     fn accepted_composition_keeps_forced_prelude_once_and_parts_ordered() {
-        let image = UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
+        let image =
+            UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
         let envelope = serde_json::json!({
             "version": 3,
             "prelude": [{"type":"forced_skill","call_id":"fc-skillslash-test","name":"skill","args":{"name":"skill"},"body":"FORCED","hard_fail":false}],
@@ -463,9 +545,18 @@ mod tests {
                 {"type":"text","text":"TAG"}
             ]
         });
-        let composition = render_accepted_user_composition(&envelope.to_string(), "<frame>").unwrap();
+        let composition =
+            render_accepted_user_composition(&envelope.to_string(), "<frame>").unwrap();
         assert_eq!(composition.leading.len(), 2);
-        assert_eq!(composition.content, vec![UserContent::text("AUTO"), image, UserContent::text("<frame>"), UserContent::text("TAG")]);
+        assert_eq!(
+            composition.content,
+            vec![
+                UserContent::text("AUTO"),
+                image,
+                UserContent::text("<frame>"),
+                UserContent::text("TAG")
+            ]
+        );
     }
 
     #[test]

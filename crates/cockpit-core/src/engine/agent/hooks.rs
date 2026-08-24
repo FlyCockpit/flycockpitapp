@@ -1536,6 +1536,10 @@ pub(crate) const STOP_HOOK_MAX_CONTINUATIONS: u8 = 8;
 pub struct StopGateState {
     pub stop_hook_active: bool,
     pub continuation_count: u8,
+    /// At least one configured handler was entered for this lifecycle gate.
+    /// Child teardown uses this to avoid emitting a second observe-only
+    /// `subagentStop` when cancellation races an in-flight consultation.
+    pub lifecycle_event_emitted: bool,
 }
 
 impl StopGateState {
@@ -1720,6 +1724,10 @@ pub(crate) async fn run_stop_hooks_cancellable(
         if cancel.is_cancelled() {
             break;
         }
+        // From this point the configured lifecycle handler owns the event,
+        // even when executable resolution or process launch subsequently
+        // fails (those failures are durably recorded below).
+        state.lifecycle_event_emitted = true;
         let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {

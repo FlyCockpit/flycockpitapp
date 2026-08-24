@@ -53,6 +53,10 @@ pub struct SwarmRunCtx {
     /// Driver command channel — the runner posts a child's own
     /// `spawn` back to main (the single authority) here.
     pub cmd_tx: mpsc::Sender<ScheduleCommand>,
+    /// Cooperative job cancellation. Unlike aborting the task, this lets an
+    /// in-flight stop hook settle its containment and publish one honest
+    /// aborted terminal event.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -162,6 +166,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         turn_tx,
         event_tx,
         cmd_tx,
+        cancel,
     } = run;
 
     // Announce the child START to the driver as this task's FIRST action, on the
@@ -213,7 +218,15 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         None
     };
 
-    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx).await;
+    let loop_outcome = run_swarm_loop(
+        &job_id,
+        &spec,
+        &ctx,
+        &turn_tx,
+        &cmd_tx,
+        cancel.clone(),
+    )
+    .await;
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -241,13 +254,21 @@ pub async fn run_swarm(run: SwarmRunCtx) {
             text
         }
         Err(e) => {
+            let cancelled = cancel.is_cancelled();
             let _ = event_tx
                 .send(ScheduleEvent::Completed {
                     job_id,
                     label,
                     kind: ScheduleKind::Swarm,
-                    result: format!("swarm subagent error: {e:#}"),
-                    failed: true,
+                    result: if cancelled {
+                        "swarm subagent cancelled".to_string()
+                    } else {
+                        format!("swarm subagent error: {e:#}")
+                    },
+                    // Cancellation is an aborted lifecycle, not a provider /
+                    // child failure. The driver maps this no-gate-completed
+                    // terminal to `endReason: aborted`.
+                    failed: !cancelled,
                     requests: Vec::new(),
                 })
                 .await;
@@ -280,6 +301,7 @@ async fn run_swarm_loop(
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     let SwarmChild {
         agent,
@@ -302,7 +324,6 @@ async fn run_swarm_loop(
     // native tools skip the boundary prompt (never deny); the loop guard is
     // inert without one.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
-    let cancel = tokio_util::sync::CancellationToken::new();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     // Per-turn backup-model fallback for the background `Swarm` child
@@ -401,6 +422,12 @@ async fn run_swarm_loop(
                 return Err(error);
             }
         };
+        // Cancellation may land after inference completed but before its
+        // structural outcome is handled. Do not route more child work or
+        // publish that raced result as a successful terminal completion.
+        if cancel.is_cancelled() {
+            anyhow::bail!("swarm subagent cancelled");
+        }
         match outcome {
             TurnOutcome::Continue => {
                 next_prompt = history
@@ -440,6 +467,9 @@ async fn run_swarm_loop(
                         additional_context,
                     );
                     continue;
+                }
+                if cancel.is_cancelled() {
+                    anyhow::bail!("swarm subagent cancelled");
                 }
                 return Ok(collect_final_text(&history));
             }
@@ -520,6 +550,9 @@ async fn run_swarm_loop(
                         additional_context,
                     );
                     continue;
+                }
+                if cancel.is_cancelled() {
+                    anyhow::bail!("swarm subagent cancelled");
                 }
                 return Ok(collect_final_text(&history));
             }
@@ -1146,7 +1179,14 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            run_swarm_loop("job-test", &spec, &ctx, &turn_tx, &cmd_tx),
+            run_swarm_loop(
+                "job-test",
+                &spec,
+                &ctx,
+                &turn_tx,
+                &cmd_tx,
+                tokio_util::sync::CancellationToken::new(),
+            ),
         )
         .await
         .expect("the swarm loop must finish against the local endpoint");

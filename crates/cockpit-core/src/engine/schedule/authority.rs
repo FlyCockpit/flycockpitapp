@@ -147,6 +147,9 @@ struct ScheduleEntry {
     /// Abort handle for the spawned task (background, ephemeral loop) or
     /// `None` for an in-context loop (driven by the driver, no task).
     abort: Option<AbortHandle>,
+    /// Cooperative cancellation for work that must settle lifecycle/process
+    /// ownership before returning. Present for Swarm jobs.
+    cancel: Option<tokio_util::sync::CancellationToken>,
     /// For in-context loops: the scheduler state needed to re-arm.
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
@@ -498,6 +501,7 @@ impl ScheduleAuthority {
         self.running_swarm += 1;
         self.emit_started(&job_id, &label, ScheduleKind::Swarm);
 
+        let cancel = tokio_util::sync::CancellationToken::new();
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -506,6 +510,7 @@ impl ScheduleAuthority {
             turn_tx: self.turn_tx.clone(),
             event_tx: self.event_tx.clone(),
             cmd_tx: self.cmd_tx.clone(),
+            cancel: cancel.clone(),
         };
         let handle = tokio::spawn(swarm::run_swarm(run_ctx));
         let entry = ScheduleEntry {
@@ -515,6 +520,7 @@ impl ScheduleAuthority {
             limit: None,
             iteration: 0,
             abort: Some(handle.abort_handle()),
+            cancel: Some(cancel),
             in_context: None,
             background: None,
         };
@@ -607,6 +613,7 @@ impl ScheduleAuthority {
             limit: args.limit,
             iteration: 0,
             abort: None,
+            cancel: None,
             in_context: Some(InContextLoop {
                 next_delay_secs: args.interval_secs,
                 args,
@@ -646,6 +653,7 @@ impl ScheduleAuthority {
             limit: args.limit,
             iteration: 0,
             abort: Some(handle.abort_handle()),
+            cancel: None,
             in_context: None,
             background: None,
         };
@@ -682,6 +690,7 @@ impl ScheduleAuthority {
             limit: None,
             iteration: 0,
             abort: Some(abort),
+            cancel: None,
             in_context: None,
             background: Some(Arc::new(handle)),
         };
@@ -705,11 +714,24 @@ impl ScheduleAuthority {
         {
             t.abort();
         }
-        if let Some(a) = entry.abort.take() {
+        let cooperative = if let Some(cancel) = entry.cancel.take() {
+            cancel.cancel();
+            true
+        } else if let Some(a) = entry.abort.take() {
             a.abort();
-        }
+            false
+        } else {
+            false
+        };
         if let Some(bg) = &entry.background {
             bg.kill();
+        }
+        // Cooperative jobs publish their own terminal event after any
+        // in-flight lifecycle hook and containment cleanup settle. Publishing
+        // a synthetic success here would race that honest aborted result and
+        // double-complete the registry slot.
+        if cooperative {
+            return true;
         }
         // In-context loops: the iterations already reached main; emit a
         // terminal completion so the strip clears and a marker shows.

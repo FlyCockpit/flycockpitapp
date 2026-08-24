@@ -2866,6 +2866,17 @@ impl Driver {
     ) -> Result<()> {
         use rig::message::ToolFunction;
 
+        // Restore the originating root turn's durable continuation latch
+        // before replay can park again. A daemon restart constructs a fresh
+        // Driver, so the in-memory copy cannot be authoritative here.
+        self.parked_root_stop_gate = payload.root_stop_gate.map(|memo| {
+            crate::engine::agent::hooks::StopGateState {
+                stop_hook_active: memo.stop_hook_active,
+                continuation_count: memo.continuation_count,
+                ..Default::default()
+            }
+        });
+
         let agent = self
             .stack
             .last()
@@ -3682,13 +3693,17 @@ impl Driver {
                         slot: self.cancel_current.clone(),
                     }
                 };
-                let result = match Box::pin(self.replay_parked_interrupt_call(
+                let replay_memo = payload.root_stop_gate.unwrap_or_default();
+                let result = match Box::pin(crate::engine::interrupt::with_root_stop_gate_memo(
+                    replay_memo,
+                    self.replay_parked_interrupt_call(
                     interrupt_id,
                     *payload,
                     response,
                     *question,
                     tx,
                     cancel.clone(),
+                    ),
                 ))
                 .await
                 {
@@ -3707,7 +3722,12 @@ impl Driver {
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         Ok(ParkedReplayOutcome::ParkedAgain)
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        // This originating turn is terminal. Do not let its
+                        // latch leak into a later replay or user submission.
+                        self.parked_root_stop_gate = None;
+                        Err(error)
+                    }
                 }
                 .map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
@@ -5096,8 +5116,8 @@ impl Driver {
             && frame.answering.as_ref().map(|pending| pending.call_id.as_str())
                 == child_id.as_deref()
         {
+            frame.stop_gate_consulted |= state.lifecycle_event_emitted;
             frame.stop_gate = state;
-            frame.stop_gate_consulted = true;
         }
         outcome
     }
@@ -7352,13 +7372,15 @@ impl Driver {
             // `endReason` is `aborted` (distinct from the success pop's
             // `completed`). Child-only; matcher / `subagentType` is the child
             // agent type, `subagentId` is the delegating `task` call id.
-            self.fire_subagent_hook(
-                crate::config::extended::hooks::HookEvent::SubagentStop,
-                &child.agent.name,
-                task_call_id,
-                Some("aborted"),
-            )
-            .await;
+            if !child.stop_gate_consulted {
+                self.fire_subagent_hook(
+                    crate::config::extended::hooks::HookEvent::SubagentStop,
+                    &child.agent.name,
+                    task_call_id,
+                    Some("aborted"),
+                )
+                .await;
+            }
             let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
                 &child.agent.model,
                 child.fallback_decision.as_ref(),

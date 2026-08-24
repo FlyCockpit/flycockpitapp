@@ -2212,6 +2212,7 @@ async fn stop_hook_continuation_state_machine() {
         let mut state = StopGateState {
             continuation_count: STOP_HOOK_MAX_CONTINUATIONS,
             stop_hook_active: false,
+            ..Default::default()
         };
         let outcome = run_stop_hooks(
             &runner,

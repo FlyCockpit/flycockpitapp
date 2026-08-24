@@ -354,11 +354,19 @@ impl ProcessContainmentActor {
     }
 
     pub fn shutdown(mut self) {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.handle.tx.blocking_send(Op::Shutdown { reply });
-        let _ = rx.blocking_recv();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let tx = self.handle.tx.clone();
+        let shutdown = move || shutdown_actor_thread(tx, join);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // `blocking_send` panics from an async runtime. Keep the complete
+            // synchronous shutdown protocol on an ordinary helper thread;
+            // joining that helper preserves this method's explicit-shutdown
+            // guarantee without entering Tokio's blocking APIs here.
+            let _ = std::thread::spawn(shutdown).join();
+        } else {
+            shutdown();
         }
     }
 }
@@ -374,19 +382,21 @@ impl Drop for ProcessContainmentActor {
             return;
         };
         let tx = self.handle.tx.clone();
-        let shutdown = move || {
-            let (reply, rx) = oneshot::channel();
-            if tx.blocking_send(Op::Shutdown { reply }).is_ok() {
-                let _ = rx.blocking_recv();
-            }
-            let _ = join.join();
-        };
+        let shutdown = move || shutdown_actor_thread(tx, join);
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::spawn(shutdown);
         } else {
             shutdown();
         }
     }
+}
+
+fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
+    let (reply, rx) = oneshot::channel();
+    if tx.blocking_send(Op::Shutdown { reply }).is_ok() {
+        let _ = rx.blocking_recv();
+    }
+    let _ = join.join();
 }
 
 fn wall_ms() -> i64 {
@@ -428,7 +438,6 @@ async fn actor_loop(
     loop {
         let op = if state.pending_reconciliation.is_empty() {
             tokio::select! {
-                biased;
                 op = rx.recv() => op,
                 lease = reconciliation_rx.recv() => {
                     if let Some(lease) = lease {
@@ -439,7 +448,6 @@ async fn actor_loop(
             }
         } else {
             tokio::select! {
-                biased;
                 op = rx.recv() => op,
                 lease = reconciliation_rx.recv() => {
                     if let Some(lease) = lease {
@@ -447,7 +455,11 @@ async fn actor_loop(
                     }
                     continue;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                // `yield_now` is immediately eligible and `select!` is
+                // unbiased, so a continuously-ready ordinary command queue
+                // cannot perpetually reset a reconciliation timer and starve
+                // actor-owned cleanup.
+                _ = tokio::task::yield_now() => {
                     reconcile_one_pending(&mut state).await;
                     continue;
                 }
@@ -456,11 +468,23 @@ async fn actor_loop(
         let Some(op) = op else { break };
         match op {
             Op::Shutdown { reply } => {
-                drain_shutdown_reconciliation(
-                    &mut state,
-                    &mut reconciliation_rx,
+                // Shutdown is bounded. If platform truth cannot be proven in
+                // time, the durable non-empty/stopping rows intentionally
+                // survive for the next startup recovery pass; we never rewrite
+                // uncertainty into a false Empty result merely to exit.
+                if tokio::time::timeout(
+                    Duration::from_secs(5),
+                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        pending = state.pending_reconciliation.len(),
+                        live = state.live.len(),
+                        "process containment shutdown drain timed out; durable recovery remains required"
+                    );
+                }
                 let _ = reply.send(());
                 break;
             }

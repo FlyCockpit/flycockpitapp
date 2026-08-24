@@ -1007,10 +1007,33 @@ fn migration_hash(sql: &str) -> String {
 }
 
 fn migration_definition_hash(migration: &Migration) -> String {
-    // A migration identifies the common lineage. Build-profile identity is a
-    // separate ledger field so local and remote v1 never masquerade as
-    // divergent definitions of the same migration.
-    migration_hash(migration.sql)
+    // The checksum identifies the exact SQL applied by this build profile.
+    // Omitting the extension made two materially different schemas share a
+    // migration checksum and allowed an edited profile extension to pass the
+    // ledger check.
+    let mut definition = String::with_capacity(migration.sql.len() + migration.profile_sql.len());
+    definition.push_str(migration.sql);
+    definition.push_str(migration.profile_sql);
+    migration_hash(&definition)
+}
+
+fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
+    let expected = Connection::open_in_memory().context("opening expected-schema database")?;
+    for migration in migrations {
+        expected.execute_batch(migration.sql)?;
+        expected.execute_batch(migration.profile_sql)?;
+    }
+    expected.execute_batch(
+        "CREATE TABLE schema_version (\
+            version INTEGER PRIMARY KEY CHECK (version > 0), \
+            name TEXT NOT NULL CHECK (length(name) > 0), \
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
+            schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
+            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+            applied_at TEXT NOT NULL\
+        );",
+    )?;
+    exact_ddl_fingerprint(&expected)
 }
 
 /// Hash the exact persisted DDL text for every application-owned table,
@@ -1120,7 +1143,23 @@ fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Resu
     if current == 0 {
         anyhow::bail!("database migration ledger is empty");
     }
-    verify_user_version(conn, current)
+    verify_user_version(conn, current)?;
+    if exact_ddl_fingerprint(conn)? != compiled_expected_fingerprint(migrations)? {
+        anyhow::bail!(
+            "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
+        );
+    }
+    Ok(())
+}
+
+fn database_has_application_objects(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .context("checking whether database is proven empty")
 }
 
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
@@ -1132,6 +1171,11 @@ fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Resu
 /// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     verify_supported_ledger_shape(conn)?;
+    if !table_exists(conn, "schema_version")? && database_has_application_objects(conn)? {
+        anyhow::bail!(
+            "unledgered prerelease database contains application schema objects; refusing to bootstrap over unproven data"
+        );
+    }
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock > migrations.len() as i64 {
         anyhow::bail!(
@@ -1193,6 +1237,13 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         conn.pragma_update(None, "user_version", migrations.len() as i64)?;
         verify_ledger(conn, migrations)?;
         verify_user_version(conn, migrations.len() as i64)?;
+        let actual = exact_ddl_fingerprint(conn)?;
+        let expected = compiled_expected_fingerprint(migrations)?;
+        if actual != expected {
+            anyhow::bail!(
+                "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
+            );
+        }
 
         if fk_was_on {
             foreign_key_check(conn).context("validating migration foreign keys")?;

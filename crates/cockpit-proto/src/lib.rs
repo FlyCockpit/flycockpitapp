@@ -95,7 +95,7 @@ pub struct ImageSpendPreflightView {
     pub epoch_sequence: Option<u64>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod owner_credential_bounds_tests {
     use super::*;
 

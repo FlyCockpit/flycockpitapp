@@ -6363,7 +6363,7 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::DebugBundle,
@@ -6372,7 +6372,6 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("local owner raw export succeeds");
@@ -6387,7 +6386,7 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::DebugBundle,
@@ -6396,7 +6395,6 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export succeeds");
@@ -6431,7 +6429,7 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let assembled = handle_concurrent_request_with_remote_operation(
+    let assembled = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6440,7 +6438,6 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted assemble");
@@ -6456,14 +6453,13 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
     loop {
         let state = owner_state();
         let shared = state.shared_snapshot();
-        let chunk_resp = handle_concurrent_request_with_remote_operation(
+        let chunk_resp = handle_concurrent_request(
             Request::ReadRedactedExportChunk {
                 transfer_id,
                 chunk_index,
             },
             shared,
             ctx.clone(),
-            None,
         )
         .await
         .expect("redacted chunk read");
@@ -6514,14 +6510,13 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let refused = handle_concurrent_request_with_remote_operation(
+    let refused = handle_concurrent_request(
         Request::ReadRedactedExportChunk {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect_err("redacted reader must reject a raw export id");
@@ -6566,14 +6561,13 @@ async fn redacted_export_reader_rejects_non_export_transfer() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let refused = handle_concurrent_request_with_remote_operation(
+    let refused = handle_concurrent_request(
         Request::ReadRedactedExportChunk {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect_err("redacted reader must reject a non-export transfer");
@@ -6623,7 +6617,7 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
     // RAW local export carries the secret verbatim (precondition + raw behavior).
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6632,7 +6626,6 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("raw export");
@@ -6650,7 +6643,7 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
     // REDACTED export omits the secret.
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6659,7 +6652,6 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export");
@@ -6723,7 +6715,7 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
     // RAW export carries it verbatim (precondition + raw behavior).
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6732,7 +6724,6 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("raw export");
@@ -6748,7 +6739,7 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
     // REDACTED export omits it — recovered ONLY from the folded journal.
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6757,7 +6748,6 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export");

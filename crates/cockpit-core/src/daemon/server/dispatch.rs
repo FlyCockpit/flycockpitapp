@@ -229,9 +229,20 @@ fn oauth_owner(state: &MutableClientState) -> String {
 /// the ledger path is exercised with an owner principal.
 fn is_local_owner_action(
     state: &MutableClientState,
+    #[cfg(feature = "remote")]
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> bool {
-    state.principal.is_owner() && remote_operation.is_none()
+    state.principal.is_owner()
+        && {
+            #[cfg(feature = "remote")]
+            {
+                remote_operation.is_none()
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                true
+            }
+        }
 }
 
 /// Concurrent-lane analogue of [`is_local_owner_action`] over a shared snapshot.
@@ -385,6 +396,7 @@ pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
 
@@ -406,6 +418,7 @@ pub(super) fn oversized_text_artifact_admission(
         display_text,
         tag_expansions,
         forced_skill,
+        #[cfg(feature = "remote")]
         remote_operation,
     } = request;
     if text.len() <= INLINE_USER_TEXT_BYTES {
@@ -481,6 +494,7 @@ pub(super) fn oversized_text_artifact_admission(
         code: ErrorCode::BadRequest,
         message: "message is not a valid bounded FCM2 submission".to_owned(),
     })?;
+    #[cfg(feature = "remote")]
     let (operation_id, actor, request_hash) = match remote_operation {
         Some(operation) => {
             if operation.operation_id == client_submission_id {
@@ -524,6 +538,23 @@ pub(super) fn oversized_text_artifact_admission(
             });
         }
     };
+    #[cfg(not(feature = "remote"))]
+    let (operation_id, actor, request_hash) = if principal.is_owner() {
+        let operation_id = Uuid::new_v5(
+            &session_id,
+            format!("typed-session-artifacts-v1:{client_submission_id}").as_bytes(),
+        );
+        (
+            operation_id,
+            crate::db::db::message_attachments::MessageActor::LocalOwner,
+            Sha256::digest(&canonical_message).into(),
+        )
+    } else {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "oversized user messages require the local owner".to_owned(),
+        });
+    };
     Ok(Some(
         crate::daemon::session_worker::OversizedTextArtifactAdmission {
             operation_id: *operation_id.as_bytes(),
@@ -566,6 +597,7 @@ async fn handle_send_user_message(
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
+    #[cfg(feature = "remote")]
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if ctx.shutdown.is_draining() {
@@ -627,6 +659,7 @@ async fn handle_send_user_message(
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                #[cfg(feature = "remote")]
                 remote_operation,
             },
         )?
@@ -1156,11 +1189,18 @@ async fn handle_send_user_message_bulk(
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
+    #[cfg(feature = "remote")]
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session_id = require_attached(state)?.handle.session_id;
+    #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
+    #[cfg(not(feature = "remote"))]
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id)?;
+    #[cfg(feature = "remote")]
     let replay_actor = bulk_user_message_replay_actor(&state.principal, remote_operation)?;
+    #[cfg(not(feature = "remote"))]
+    let replay_actor = bulk_user_message_replay_actor_local(&state.principal)?;
     let (text, display_text) = resolve_bulk_user_message_payload(
         ctx,
         BulkUserMessagePayloadRequest {
@@ -1188,6 +1228,7 @@ async fn handle_send_user_message_bulk(
         Vec::new(),
         forced_skill,
         run_invocation_options,
+        #[cfg(feature = "remote")]
         remote_operation,
     )
     .await
@@ -2448,6 +2489,7 @@ async fn handle_serialized_request_impl(
                 image_refs,
                 forced_skill,
                 run_invocation_options,
+                #[cfg(feature = "remote")]
                 remote_operation,
             ))
             .await
@@ -2476,6 +2518,7 @@ async fn handle_serialized_request_impl(
                 tag_expansions,
                 forced_skill,
                 run_invocation_options,
+                #[cfg(feature = "remote")]
                 remote_operation,
             ))
             .await
@@ -4617,7 +4660,11 @@ async fn handle_serialized_request_impl(
             include_generated_artifacts,
             include_sensitive,
         } => {
-            let local_owner_action = is_local_owner_action(state, remote_operation);
+            let local_owner_action = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             export_session_data(
                 ctx,
                 session_id,
@@ -7221,7 +7268,11 @@ async fn handle_serialized_request_impl(
             // listener); the remote client presents it and returns the callback
             // code over `CompleteMcpOAuth`. `is_local_owner_action` derives this
             // from daemon-assigned signals the caller cannot forge.
-            let local_display = is_local_owner_action(state, remote_operation);
+            let local_display = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             let (flow, authorize_url) =
                 crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
                     .await
@@ -7669,7 +7720,11 @@ async fn handle_serialized_request_impl(
             // GitHub token; any remote caller is failed closed inside
             // `setup_copilot_auth`. `is_local_owner` is derived only from
             // daemon-assigned signals — see `is_local_owner_action`.
-            let is_local_owner = is_local_owner_action(state, remote_operation);
+            let is_local_owner = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             let operation_result = setup_copilot_auth(
                 ctx,
                 &project_root,

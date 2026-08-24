@@ -1730,3 +1730,154 @@ async fn eligible_route_non_sensitive_turn_flushes_stream() {
         "the released turn's assistant_message must persist the flushed text"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Root stop-gate boundary wiring (increment 2B-ii-a). These drive the REAL
+// main-loop `TurnOutcome::Done` boundary through `run_user_input`. The stop
+// hook command is unresolvable, so it fails open (executable-not-found) WITHOUT
+// spawning a process; a `hook_run` row is still recorded whenever the gate is
+// ENTERED — the wiring signal. Absence of the row proves the gate was NOT
+// entered. On dead-code HEAD (no wiring) the genuine-Done row is missing, so
+// that test fails there.
+// ---------------------------------------------------------------------------
+
+/// A registry carrying one `stop`/`end_turn` hook and one `stopFailure`/`network`
+/// hook, both unresolvable (fail-open), so a test can assert which gate fired.
+fn stop_and_stop_failure_registry() -> crate::config::extended::hooks::HookRegistry {
+    use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+    let mk = |event: HookEvent, matcher: &str| ResolvedHook {
+        event,
+        matcher: Some([matcher.to_string()].into_iter().collect()),
+        command: vec!["cockpit-stop-hook-does-not-exist".to_string()],
+        timeout_secs: 5,
+        env: std::collections::BTreeMap::new(),
+        origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+        source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+        source_directory: std::path::PathBuf::from("/tmp/test"),
+    };
+    HookRegistry {
+        hooks: vec![
+            mk(HookEvent::Stop, "end_turn"),
+            mk(HookEvent::StopFailure, "network"),
+        ],
+        warnings: Vec::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn root_stop_gate_fires_on_genuine_done() {
+    tokio::time::resume();
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("all finished".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(crate::config::extended::hooks::HookEvent::Stop, "end_turn"),
+    );
+    let (queue, tx, _rx) = event_harness();
+
+    driver
+        .run_user_input(UserSubmission::text("do the thing"), &queue, &tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observe_hook_events(&driver, "stop").await,
+        vec!["failed".to_string()],
+        "a genuine root Done must consult the stop gate exactly once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn root_stop_gate_not_fired_for_lookalike_matcher() {
+    tokio::time::resume();
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("all finished".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    // The `stop` matcher is closed to `end_turn`; a hook matched only on a
+    // sibling value must NOT fire at the root Done boundary.
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(crate::config::extended::hooks::HookEvent::Stop, "cancelled"),
+    );
+    let (queue, tx, _rx) = event_harness();
+
+    driver
+        .run_user_input(UserSubmission::text("do the thing"), &queue, &tx)
+        .await
+        .unwrap();
+
+    assert!(
+        observe_hook_events(&driver, "stop").await.is_empty(),
+        "a lookalike-matcher stop hook must not fire on end_turn"
+    );
+}
+
+#[tokio::test]
+async fn root_stop_gate_not_entered_on_inference_error() {
+    // A terminal inference failure ends the attempt from the `Err(..)` arm
+    // BEFORE the `Done` match — so the stop gate is never entered. The
+    // `stopFailure` hook DOES fire on the same run, proving the turn genuinely
+    // reached the error path (non-vacuous contrast), while `stop` records
+    // nothing.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    driver
+        .session
+        .set_active_model("lmstudio", "local")
+        .unwrap();
+    inject_hooks(&mut driver, stop_and_stop_failure_registry());
+    let (queue, tx, _rx) = event_harness();
+
+    driver
+        .run_user_input(UserSubmission::text("will fail to connect"), &queue, &tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        observe_hook_events(&driver, "stopFailure").await,
+        vec!["failed".to_string()],
+        "an inference failure must fire stopFailure (proves the error path ran)"
+    );
+    assert!(
+        observe_hook_events(&driver, "stop").await.is_empty(),
+        "an inference error must never enter or reopen the root stop gate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn root_stop_gate_not_entered_on_cancellation() {
+    let mut provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Hang)
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(crate::config::extended::hooks::HookEvent::Stop, "end_turn"),
+    );
+    let cancel = driver.cancel_handle();
+    let (queue, tx, _rx) = event_harness();
+
+    let handle = tokio::spawn(async move {
+        driver
+            .run_user_input(UserSubmission::text("hang then cancel"), &queue, &tx)
+            .await
+            .unwrap();
+        driver
+    });
+    let _captured = provider.next_request().await;
+    cancel.cancel();
+    let driver = handle.await.unwrap();
+
+    assert!(
+        observe_hook_events(&driver, "stop").await.is_empty(),
+        "a cancelled turn must never enter or reopen the root stop gate"
+    );
+}

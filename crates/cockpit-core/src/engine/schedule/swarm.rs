@@ -164,6 +164,25 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         cmd_tx,
     } = run;
 
+    // Announce the child START to the driver as this task's FIRST action, on the
+    // same channel and by the same task that sends its terminal `Completed`
+    // below — so the driver drains the start before the paired completion (FIFO
+    // by program order) even under channel backpressure. The driver fires
+    // `subagentStart` and records the child so the paired `subagentStop` fires
+    // on completion. GENUINE swarm children (`bee` / `scout`) only: goal-
+    // supervision control workers (Planner/Evaluator/Gatekeeper/ColdSkeptic)
+    // share this runner but are never user-facing subagents (guidance L22), so
+    // the `is_goal_control` check is the single closed exclusion predicate and
+    // they emit neither lifecycle event.
+    if !spec.worker.is_goal_control() {
+        let _ = event_tx
+            .send(ScheduleEvent::SwarmChildStarted {
+                job_id: job_id.clone(),
+                subagent_type: spec.worker.agent_name().to_string(),
+            })
+            .await;
+    }
+
     // AC7: capability + execution-wide permit + containment are acquired here,
     // immediately BEFORE the child's first turn — i.e. before any native spawn
     // or container create/exec. A write-capable child receives exclusive
@@ -493,14 +512,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             "vNext definitions cannot enter the legacy Swarm fork path; use the effective-grant task delegation route"
         );
     }
-    let worker_agent = match spec.worker {
-        SpawnWorkerKind::Bee => "bee",
-        SpawnWorkerKind::Scout => "scout",
-        SpawnWorkerKind::GoalPlanner => "goal-planner",
-        SpawnWorkerKind::GoalEvaluator => "goal-evaluator",
-        SpawnWorkerKind::GoalGatekeeper => "goal-gatekeeper",
-        SpawnWorkerKind::GoalColdSkeptic => "goal-cold-skeptic",
-    };
+    let worker_agent = spec.worker.agent_name();
     // Pin the config to a held snapshot for THIS swarm child's build: model
     // selection AND the agent build below both read the same frozen generation,
     // so a concurrent refresh can never split the child's identity from its

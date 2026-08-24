@@ -697,6 +697,15 @@ pub struct Driver {
         std::collections::VecDeque<BackgroundNoninteractiveCompletion>,
     /// Backgrounded noninteractive delegation jobs keyed by task call id.
     noninteractive_jobs: std::collections::HashMap<String, BackgroundNoninteractiveJob>,
+    /// Live detached-`Swarm` child subagents that have fired `subagentStart`,
+    /// keyed by schedule `job_id` → child agent type (`subagentType`). Populated
+    /// when a [`ScheduleEvent::SwarmChildStarted`] is drained and drained back
+    /// out when the same `job_id`'s [`ScheduleEvent::Completed`] arrives (firing
+    /// the paired `subagentStop`), so every started swarm child pairs with
+    /// exactly one stop. Goal-supervision control workers never enter this map
+    /// (they never emit `SwarmChildStarted`; guidance L22). Any residual entries
+    /// at driver-loop teardown are drained as `aborted` (detach loss).
+    swarm_subagents: std::collections::HashMap<String, String>,
     /// Which cache-safe capability hints have already been appended to the
     /// active history (GOALS §22). A branch is enabled by two cache-safe
     /// moves: the dispatcher starts accepting the action (always, here),
@@ -1446,6 +1455,10 @@ impl Driver {
             noninteractive_complete_rx,
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
+            // A rebuild installs a fresh schedule authority + event channel, so
+            // it starts with no tracked swarm children (mirrors
+            // `noninteractive_jobs`).
+            swarm_subagents: std::collections::HashMap::new(),
             appended_hints: self.appended_hints.clone(),
             emitted_command_capability_notices: self.emitted_command_capability_notices.clone(),
             prune_watermark: self.prune_watermark.clone(),
@@ -1766,6 +1779,7 @@ impl Driver {
             noninteractive_complete_rx,
             pending_noninteractive_completions: std::collections::VecDeque::new(),
             noninteractive_jobs: std::collections::HashMap::new(),
+            swarm_subagents: std::collections::HashMap::new(),
             appended_hints: std::collections::HashSet::new(),
             emitted_command_capability_notices: HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
@@ -4648,6 +4662,160 @@ impl Driver {
         .await;
     }
 
+    /// Fire a `subagentStart` / `subagentStop` observe hook for a CHILD
+    /// subagent, against the turn-pinned hook registry. CHILD-ONLY by
+    /// construction: every call site is a genuine child spawn / child stop
+    /// (interactive stack push, inline noninteractive finish, detached Swarm
+    /// report) — never a root boundary. Matcher / `subagentType` is the child
+    /// agent type; `subagentId` identifies the delegating `task` call so the
+    /// downstream attention consumer can pair start/stop. `subagentStop`
+    /// additionally carries `endReason` (why the child stopped). Observe-only /
+    /// fail-open; this is the notification fire ONLY — the child stop-gate
+    /// continuation (`run_stop_hooks`) is deferred to a later increment.
+    async fn fire_subagent_hook(
+        &self,
+        event: crate::config::extended::hooks::HookEvent,
+        subagent_type: &str,
+        subagent_id: Option<&str>,
+        end_reason: Option<&str>,
+    ) {
+        let snapshot = self.config.snapshot();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
+            event,
+            // Matcher = child agent type (the `ChildAgentType` matcher policy).
+            subagent_type,
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
+            None,
+            None,
+            Some(subagent_type),
+            subagent_id,
+            crate::engine::agent::hooks::ObserveFields {
+                end_reason,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    /// Fire a paired `subagentStop` for every interactive child frame still on
+    /// the stack at driver-loop teardown.
+    ///
+    /// The normal child-teardown paths (`pop_child_with_envelope` on success,
+    /// `unwind_stack_to_root` on cancel / gate / interrupt / inference failure)
+    /// already fire `subagentStop` and return with the stack back at the root
+    /// frame. The one remaining escape is a driver-loop exit via a fatal error
+    /// (`Err` propagation) that abandons a still-active child frame WITHOUT
+    /// unwinding. Called once when the driver loop resolves (see
+    /// `run_main_loop`'s caller in `session_worker/run.rs`), this closes that
+    /// gap so no `subagentStart` is left unpaired: each abandoned child emits
+    /// exactly one `subagentStop` with `endReason` = `aborted`. On every clean
+    /// / already-unwound exit the stack is at root, so this fires nothing (no
+    /// double-stop). Deepest child first, mirroring an unwind.
+    pub(crate) async fn drain_orphaned_child_stop_hooks(&self) {
+        // Collect first so no borrow of `self.stack` is held across the await
+        // inside `fire_subagent_hook`.
+        let orphans: Vec<(String, Option<String>)> = self
+            .stack
+            .iter()
+            .skip(1)
+            .rev()
+            .map(|frame| {
+                (
+                    frame.agent.name.clone(),
+                    frame
+                        .answering
+                        .as_ref()
+                        .map(|pending| pending.call_id.clone()),
+                )
+            })
+            .collect();
+        for (subagent_type, subagent_id) in orphans {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &subagent_type,
+                subagent_id.as_deref(),
+                Some("aborted"),
+            )
+            .await;
+        }
+    }
+
+    /// Fire `subagentStart` for a detached-`Swarm` child that just started
+    /// (spawn mode 3 of 3), and record it so its paired `subagentStop` can fire
+    /// on completion. Driven by draining [`ScheduleEvent::SwarmChildStarted`],
+    /// which the schedule authority emits ONLY for genuine swarm children
+    /// (`bee` / `scout`) — never goal-supervision control workers (guidance
+    /// L22), so this only ever runs for real subagents. Child-only; matcher /
+    /// `subagentType` is the child agent type, `subagentId` is the schedule
+    /// `job_id` (the correlation the paired stop reuses).
+    async fn fire_swarm_subagent_start(&mut self, job_id: &str, subagent_type: &str) {
+        // Record before firing so a completion racing on the same turn boundary
+        // (it cannot: SwarmChildStarted is always drained first) still pairs.
+        self.swarm_subagents
+            .insert(job_id.to_string(), subagent_type.to_string());
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            subagent_type,
+            Some(job_id),
+            None,
+        )
+        .await;
+    }
+
+    /// Fire the paired `subagentStop` for a detached-`Swarm` child if — and only
+    /// if — its `job_id` was tracked by a prior [`Self::fire_swarm_subagent_start`].
+    /// Called when a swarm job's [`ScheduleEvent::Completed`] is drained (the
+    /// single terminal event per job — the runner sends it on success/failure,
+    /// and the authority synthesizes it on cancel), so every started child fires
+    /// exactly one stop and no path double-fires (the map removal is idempotent).
+    /// A `Completed` for a job never in the map — a goal-supervision worker, or a
+    /// loop/timer/background job — fires nothing. `endReason` is `completed` on a
+    /// non-failed terminal and `failed` otherwise (a cancel synthesizes a
+    /// non-failed terminal, so it settles as `completed`).
+    async fn fire_swarm_subagent_stop_if_tracked(&mut self, job_id: &str, failed: bool) {
+        let Some(subagent_type) = self.swarm_subagents.remove(job_id) else {
+            return;
+        };
+        let end_reason = if failed { "failed" } else { "completed" };
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            &subagent_type,
+            Some(job_id),
+            Some(end_reason),
+        )
+        .await;
+    }
+
+    /// Fire a paired `subagentStop` for every detached-`Swarm` child still
+    /// tracked at driver-loop teardown. The normal path pairs each start with a
+    /// stop when the child's `Completed` is drained; the one remaining escape is
+    /// a driver-loop exit that abandons a live child whose terminal `Completed`
+    /// will never be drained (detach loss / shutdown). Called once when the
+    /// driver loop resolves (alongside [`Self::drain_orphaned_child_stop_hooks`]),
+    /// this closes that gap: each residual child emits exactly one `subagentStop`
+    /// with `endReason` = `aborted`. On every clean exit the map is empty (each
+    /// child's `Completed` already removed it), so this fires nothing — no
+    /// double-stop.
+    pub(crate) async fn drain_orphaned_swarm_stop_hooks(&mut self) {
+        // Drain first so no borrow of `self.swarm_subagents` is held across the
+        // await inside `fire_subagent_hook`.
+        let orphans: Vec<(String, String)> = self.swarm_subagents.drain().collect();
+        for (job_id, subagent_type) in orphans {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &subagent_type,
+                Some(&job_id),
+                Some("aborted"),
+            )
+            .await;
+        }
+    }
+
     /// Fire `stopFailure` observe hooks on an inference/API error that ends the
     /// attempt without a normal stop gate. Matcher / `errorClass` are the stable
     /// per-variant token from [`error_class_match_value`]. Never fired on a
@@ -4665,6 +4833,95 @@ impl Driver {
             },
         )
         .await;
+    }
+
+    /// Consult the ROOT stop gate on a genuine normal end of the root turn.
+    ///
+    /// This is the ONE production caller of the root stop gate. It is reached
+    /// only from the `TurnOutcome::Done` arm of the main loop, with the stack at
+    /// the root frame and no queued user work left to fold — i.e. the point the
+    /// root turn would otherwise end normally. Every non-genuine boundary
+    /// (cancel, parked interrupt, daemon-drain gate, terminal inference/API
+    /// error) `return`s from the `Err(..)` arms BEFORE the `match outcome`, and
+    /// the primary-round ceiling returns from the `Continue` arm, so none of
+    /// them can enter the gate. Compaction never routes here.
+    ///
+    /// Runs the matching `stop` hooks (matcher `end_turn`) via [`run_stop_hooks`]
+    /// against the caller-owned per-turn [`StopGateState`] latch. The runner /
+    /// process-environment seams are injected so the production call passes the
+    /// shipped `TokioCommandRunner` / `DefaultProcessEnv` (exactly like every
+    /// other hook site) while tests can drive real `block` / `continue:false`
+    /// decisions through a fake runner.
+    ///
+    /// NEVER-REOPEN by construction: the latch is a LOCAL owned by the single
+    /// `run_user_input` invocation that runs this turn (`root_stop_gate`). It is
+    /// created fresh per turn (per originating user-turn id) and dropped on EVERY
+    /// exit path of that method — normal end, cancel, parked interrupt, drain
+    /// gate, and inference error alike — so no latch can outlive its turn, be
+    /// consulted after the turn's loop returns, or be resurrected by a
+    /// late/replayed boundary. The caller additionally re-checks the cancel token
+    /// AFTER this returns and before injecting any continuation, so a cancel that
+    /// races in DURING the hook cannot force another model round.
+    async fn consult_root_stop_gate(
+        &self,
+        runner: &dyn crate::engine::agent::hooks::CommandRunner,
+        process_env: &dyn crate::engine::agent::hooks::ProcessEnv,
+        state: &mut crate::engine::agent::hooks::StopGateState,
+    ) -> crate::engine::agent::hooks::StopHookOutcome {
+        let snapshot = self.config.snapshot();
+        crate::engine::agent::hooks::run_stop_hooks(
+            runner,
+            process_env,
+            snapshot.hooks(),
+            crate::config::extended::hooks::HookEvent::Stop,
+            "end_turn",
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
+            state,
+        )
+        .await
+    }
+
+    /// Build the host-generated continuation message injected into the ROOT
+    /// frame when a `stop` hook blocks the turn from ending.
+    ///
+    /// The aggregated block reason(s) and any `additionalContext` become a
+    /// single host-authored user message. It is built directly and threaded
+    /// back through the loop as the next prompt; it NEVER passes through
+    /// [`Self::record_user_message_event`], and its origin
+    /// ([`SubmissionOrigin::Internal`], whose `user_prompt_submit_source()` is
+    /// `None`) marks it as host-driven — so stop-continuation feedback can never
+    /// re-fire `userPromptSubmit`.
+    fn stop_continuation_prompt(reason: String, additional_context: Option<String>) -> Message {
+        let mut text = reason;
+        if let Some(ctx) = additional_context {
+            if !ctx.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&ctx);
+            }
+        }
+        crate::engine::message::build_user_message(UserSubmission {
+            expected_model_state_generation: None,
+            expected_model: None,
+            kind: UserSubmissionKind::User,
+            origin: crate::engine::message::SubmissionOrigin::Internal,
+            text,
+            display_text: None,
+            tag_expansions: Vec::new(),
+            images: Vec::new(),
+            forced_skill: None,
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: Vec::new(),
+            client_submissions: Vec::new(),
+            queue_target: None,
+            pending_terminal_disposition: None,
+            run_invocation_id: None,
+        })
     }
 
     async fn record_user_message_event(
@@ -6711,6 +6968,19 @@ impl Driver {
             .answering
             .as_ref()
             .and_then(|pending| pending.provider_item_id.as_deref());
+        // `subagentStop` observe hooks: the INTERACTIVE child completed and is
+        // being popped (spawn mode 1 of 3). Fire the notification BEFORE the
+        // parent report is recorded/emitted below. Child-only; matcher /
+        // `subagentType` is the child agent type, `subagentId` is the
+        // delegating `task` call id, `endReason` is `completed` (this is the
+        // normal success pop; the abort/teardown path is a separate site).
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            &child.agent.name,
+            task_call_id,
+            Some("completed"),
+        )
+        .await;
         let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
             &child.agent.model,
             child.fallback_decision.as_ref(),
@@ -6849,6 +7119,22 @@ impl Driver {
                 .answering
                 .as_ref()
                 .and_then(|pending| pending.provider_item_id.as_deref());
+            // `subagentStop` observe hooks: an INTERACTIVE child is being torn
+            // down on a cancelled / draining / terminally-failed parent turn
+            // (the abort counterpart of the success pop). Firing here keeps
+            // every `subagentStart` paired with exactly one `subagentStop` for
+            // the downstream attention consumer — a child that started must
+            // always emit a stop, whether it completed or was aborted.
+            // `endReason` is `aborted` (distinct from the success pop's
+            // `completed`). Child-only; matcher / `subagentType` is the child
+            // agent type, `subagentId` is the delegating `task` call id.
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &child.agent.name,
+                task_call_id,
+                Some("aborted"),
+            )
+            .await;
             let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
@@ -7882,6 +8168,15 @@ impl Driver {
         };
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
+        // ROOT stop-gate latch for THIS user turn (`tool-hooks-lifecycle-
+        // completion`, increment 2B-ii). Turn-scoped by construction: it is
+        // owned per this single `run_user_input` invocation — i.e. per
+        // `(session, root frame, originating user turn)` — accumulates the
+        // 8-continuation cap across the stop-hook rounds of this turn, and is
+        // DROPPED on every exit path (normal end, cancel, interrupt, drain,
+        // inference error), so it can never leak into, or reopen the gate for, a
+        // later turn. It is NOT a process-global counter.
+        let mut root_stop_gate = crate::engine::agent::hooks::StopGateState::default();
 
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
@@ -8390,6 +8685,52 @@ impl Driver {
                             }
                         }
                     }
+                    // Root turn reached a genuine normal `Done` and no queued
+                    // user work remains: consult the ROOT stop gate. This is the
+                    // ONLY entry to the gate — the cancel / parked-interrupt /
+                    // daemon-drain / inference-error branches all `return`ed from
+                    // the `Err(..)` arms above WITHOUT reaching this `match`, and
+                    // the primary-round ceiling returns from the `Continue` arm,
+                    // so no aborted/errored/capped turn can enter or reopen it.
+                    // Production uses the shipped runner / process-env, exactly
+                    // like every other hook site.
+                    match self
+                        .consult_root_stop_gate(
+                            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                            &crate::engine::agent::hooks::DefaultProcessEnv,
+                            &mut root_stop_gate,
+                        )
+                        .await
+                    {
+                        crate::engine::agent::hooks::StopHookOutcome::Continue {
+                            reason,
+                            additional_context,
+                        } if !cancel.is_cancelled() => {
+                            // A `stop` hook blocked the turn from ending. Inject
+                            // the aggregated feedback into the ROOT frame as
+                            // host-generated context and run another model round.
+                            // `stop_continuation_prompt` builds the message
+                            // directly (never via `record_user_message_event`),
+                            // so this cannot re-fire `userPromptSubmit`.
+                            //
+                            // The `!cancel.is_cancelled()` guard closes the race
+                            // where a user cancel (or run-deadline abort) arrives
+                            // AFTER `Done` but DURING the stop-hook consultation:
+                            // a cancelled turn must never be forced into another
+                            // model round, so a `Continue` decided under a
+                            // now-cancelled token is dropped and the turn ends.
+                            next_prompt =
+                                Self::stop_continuation_prompt(reason, additional_context);
+                            continue;
+                        }
+                        // `End` (no blocking stop hook), `ForcedEnd`
+                        // (`continue:false` won, or the per-turn 8-cap latched),
+                        // or a `Continue` superseded by a mid-consult cancel: the
+                        // root turn ends normally below.
+                        crate::engine::agent::hooks::StopHookOutcome::Continue { .. }
+                        | crate::engine::agent::hooks::StopHookOutcome::End
+                        | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd => {}
+                    }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq).await {
                             self.reset_goal_progress_tracking().await;
@@ -8659,6 +9000,17 @@ impl Driver {
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
                     });
+                    // `subagentStart` observe hooks: the INTERACTIVE child
+                    // session has just been pushed onto the stack (spawn mode 1
+                    // of 3). Child-only; matcher / `subagentType` is the child
+                    // agent type, `subagentId` is the delegating `task` call id.
+                    self.fire_subagent_hook(
+                        crate::config::extended::hooks::HookEvent::SubagentStart,
+                        &child_agent,
+                        Some(&task_call_id),
+                        None,
+                    )
+                    .await;
                     self.publish_active_tool_names().await;
                     self.emit_command_capability_notice_if_new(tx).await;
                     let _ = tx

@@ -1182,6 +1182,21 @@ impl Driver {
             task.child_agent.clone(),
             NoninteractiveDelegationSnapshot::empty(),
         );
+        // `subagentStart` observe hook: the NONINTERACTIVE (background delegation)
+        // child is now registered running — the durable job/payload persisted and
+        // every pre-spawn refusal (`preflight_single_delegation`, the payload
+        // upsert failure above) already returned WITHOUT reaching here, so this
+        // fires only for a child that actually starts. Child-only; matcher /
+        // `subagentType` is the child agent type, `subagentId` is the delegating
+        // `task` call id. Paired with exactly one `subagentStop` at delegation
+        // delivery (`finalize_background_noninteractive_completion`).
+        self.fire_subagent_hook(
+            crate::config::extended::hooks::HookEvent::SubagentStart,
+            &task.child_agent,
+            Some(&task_call_id),
+            None,
+        )
+        .await;
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
         let tx_for_task = tx.clone();
@@ -2265,6 +2280,70 @@ impl Driver {
         }
     }
 
+    /// Claim the one-time delivery of a background noninteractive job so both the
+    /// report delivery and the paired `subagentStop` fire exactly once. Returns:
+    /// - `First`: this call transitioned the job from undelivered → delivered;
+    ///   deliver the report AND fire the stops.
+    /// - `AlreadyDelivered`: a prior call already delivered; return `None`.
+    /// - `NoJob`: the job is absent (reaped after an earlier delivery, or removed
+    ///   by a whole-job cancel that already fired the stops). The report is still
+    ///   delivered for backward compatibility, but the stops are NOT re-fired.
+    fn claim_noninteractive_delivery(&mut self, task_call_id: &str) -> NoninteractiveDeliveryClaim {
+        match self.noninteractive_jobs.get_mut(task_call_id) {
+            Some(job) if job.delivered => NoninteractiveDeliveryClaim::AlreadyDelivered,
+            Some(job) => {
+                job.delivered = true;
+                NoninteractiveDeliveryClaim::First
+            }
+            None => NoninteractiveDeliveryClaim::NoJob,
+        }
+    }
+
+    /// Fire one `subagentStop` observe hook for every NONINTERACTIVE child
+    /// registered under `task_call_id`, at the delegation-complete / delivery
+    /// boundary. Pairs 1:1 with the `subagentStart` fired at `register_running`:
+    /// every started noninteractive child (a single delegation, or each entry of
+    /// a batch delegation) emits exactly one stop. Called only from the
+    /// delivered-transition arms of
+    /// [`Self::finalize_background_noninteractive_completion`] (guarded by
+    /// `job.delivered`), so it runs once per delivered job and cannot double-fire
+    /// across the inline-finish and background-delivery paths.
+    ///
+    /// `endReason` reflects each child's terminal registry status set by
+    /// `finalize_single_*` / `finalize_batch_*`; `fallback` covers a child whose
+    /// entry was never `complete()`d (a tokio-level `Err` / whole-batch abort of
+    /// a started child). Child-only; matcher / `subagentType` is the child agent
+    /// type and `subagentId` is the shared delegating `task` call id. Envelope
+    /// carries only camelCase `subagentId` / `subagentType` / `endReason` — no
+    /// child prompt text, report body, tool IO, or history.
+    async fn fire_noninteractive_subagent_stops(&self, task_call_id: &str, fallback: &'static str) {
+        // Collect first so no borrow of the registry is held across the await in
+        // `fire_subagent_hook`. Stable order (by label) for deterministic firing.
+        let mut children: Vec<(String, String, &'static str)> = self
+            .noninteractive_delegations
+            .entries
+            .iter()
+            .filter(|(key, _)| key.task_call_id == task_call_id)
+            .map(|(key, entry)| {
+                (
+                    key.label.clone(),
+                    entry.child_agent.clone(),
+                    noninteractive_end_reason(entry.status, fallback),
+                )
+            })
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_label, child_agent, end_reason) in children {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &child_agent,
+                Some(task_call_id),
+                Some(end_reason),
+            )
+            .await;
+        }
+    }
+
     pub(in crate::engine::driver) async fn finalize_background_noninteractive_completion(
         &mut self,
         completion: Option<BackgroundNoninteractiveCompletion>,
@@ -2284,15 +2363,27 @@ impl Driver {
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
-                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
-                        if job.delivered {
-                            return Ok(NoninteractiveCompletionDelivery::None);
-                        }
-                        job.delivered = true;
+                    let first_delivery = self.claim_noninteractive_delivery(&task_call_id);
+                    if first_delivery.already_delivered() {
+                        return Ok(NoninteractiveCompletionDelivery::None);
                     }
-                    let result = self
+                    let finalized = self
                         .finalize_single_noninteractive_task(completion, tx, !was_backgrounded)
-                        .await?;
+                        .await;
+                    // `subagentStop` observe hook for the delivered NONINTERACTIVE
+                    // child. Fired ONLY on the tracked first delivery (a job that
+                    // was cancelled+aborted fires its stop on the cancel path
+                    // instead, and a re-delivered completion never reaches here),
+                    // so it cannot double-fire across inline finish / background
+                    // delivery / cancel. Fired even if `finalize_single_*` errored,
+                    // so a scan/expand failure can't drop the stop; on that error
+                    // the entry is un-`complete()`d and falls back to `failed`.
+                    // Pairs the `subagentStart` fired at register-running.
+                    if first_delivery.fire_stops() {
+                        self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
+                            .await;
+                    }
+                    let result = finalized?;
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -2316,11 +2407,17 @@ impl Driver {
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
-                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
-                        if job.delivered {
-                            return Ok(NoninteractiveCompletionDelivery::None);
-                        }
-                        job.delivered = true;
+                    let first_delivery = self.claim_noninteractive_delivery(&task_call_id);
+                    if first_delivery.already_delivered() {
+                        return Ok(NoninteractiveCompletionDelivery::None);
+                    }
+                    // The started child failed at the delegation runtime level (the
+                    // spawned task itself returned `Err`), so its registry entry was
+                    // never `complete()`d; fall back to `failed`. Exactly one stop
+                    // per started child on the tracked first delivery.
+                    if first_delivery.fire_stops() {
+                        self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
+                            .await;
                     }
                     if was_backgrounded {
                         self.record_background_noninteractive_error(&task_call_id, &body)
@@ -2353,15 +2450,23 @@ impl Driver {
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
-                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
-                        if job.delivered {
-                            return Ok(NoninteractiveCompletionDelivery::None);
-                        }
-                        job.delivered = true;
+                    let first_delivery = self.claim_noninteractive_delivery(&task_call_id);
+                    if first_delivery.already_delivered() {
+                        return Ok(NoninteractiveCompletionDelivery::None);
                     }
                     let result = self
                         .finalize_batch_noninteractive_task(completion, tx)
                         .await;
+                    // One `subagentStop` per started NONINTERACTIVE batch child, on
+                    // the tracked first delivery. `finalize_batch_*` just set each
+                    // child's terminal registry status, so `endReason` is exact per
+                    // child (a whole-batch abort leaves them un-`complete()`d and
+                    // falls back to `failed`). Pairs the per-entry `subagentStart`
+                    // fired at register-running.
+                    if first_delivery.fire_stops() {
+                        self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
+                            .await;
+                    }
                     if was_backgrounded {
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -2402,11 +2507,17 @@ impl Driver {
                     let was_backgrounded = self
                         .noninteractive_delegations
                         .is_backgrounded_job(&task_call_id);
-                    if let Some(job) = self.noninteractive_jobs.get_mut(&task_call_id) {
-                        if job.delivered {
-                            return Ok(NoninteractiveCompletionDelivery::None);
-                        }
-                        job.delivered = true;
+                    let first_delivery = self.claim_noninteractive_delivery(&task_call_id);
+                    if first_delivery.already_delivered() {
+                        return Ok(NoninteractiveCompletionDelivery::None);
+                    }
+                    // Whole-batch runtime failure (the spawned task returned `Err`):
+                    // no child was `complete()`d, so every registered batch child
+                    // falls back to `failed`. One stop per started child on the
+                    // tracked first delivery, pairing the per-entry start.
+                    if first_delivery.fire_stops() {
+                        self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
+                            .await;
                     }
                     if was_backgrounded {
                         self.record_background_noninteractive_error(&task_call_id, &body)
@@ -2721,6 +2832,30 @@ impl Driver {
                 {
                     job.handle.abort();
                     self.release_noninteractive_child_locks(&selected).await;
+                    // `subagentStop` for each STARTED child of the aborted job. The
+                    // job was removed+aborted, so its completion never reaches
+                    // `finalize_background_noninteractive_completion` to fire the
+                    // paired stop — fire it here with `endReason: cancelled`. Only
+                    // live (still-running) entries are started-and-unpaired; an
+                    // already-delivered child has a terminal status and fired its
+                    // stop at delivery. This whole-job-abort path is the ONLY cancel
+                    // site that fires: a per-label cancel does NOT abort the job, so
+                    // that child's completion still flows through the delivery
+                    // funnel and is paired there (no double stop).
+                    for row in &selected {
+                        if self
+                            .noninteractive_delegations
+                            .is_live(&row.task_call_id, &row.label)
+                        {
+                            self.fire_subagent_hook(
+                                crate::config::extended::hooks::HookEvent::SubagentStop,
+                                &row.child_agent,
+                                Some(&row.task_call_id),
+                                Some("cancelled"),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 let mut changed = Vec::new();
                 let mut unchanged = Vec::new();
@@ -3139,6 +3274,20 @@ impl Driver {
                 entry.child_agent.clone(),
                 NoninteractiveDelegationSnapshot::empty(),
             );
+            // `subagentStart` observe hook per NONINTERACTIVE batch child, at the
+            // same register-running boundary as the single path: the durable job
+            // persisted and the pre-spawn payload-upsert refusal already returned
+            // above, so this fires once per child that actually starts. Child-only;
+            // matcher / `subagentType` is the child agent type, `subagentId` is the
+            // shared delegating `task` call id. Each is paired with exactly one
+            // `subagentStop` at delegation delivery.
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStart,
+                &entry.child_agent,
+                Some(&task_call_id),
+                None,
+            )
+            .await;
         }
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
@@ -4259,6 +4408,45 @@ impl Driver {
             );
         }
         result
+    }
+}
+
+/// Map a noninteractive child's terminal registry status to the `subagentStop`
+/// `endReason` matcher token. A child that has NOT reached a terminal status
+/// (`Running` / `Backgrounded` — e.g. a tokio-level `Err` delivered before
+/// `complete()` ran) uses the caller's `fallback`. Kept next to the fire site so
+/// the stop vocabulary is single-sourced and unit-testable without the async
+/// hook path (`completed` / `failed` mirror the interactive precedent's
+/// `completed` / `aborted`).
+/// Outcome of [`Driver::claim_noninteractive_delivery`]; see that method.
+enum NoninteractiveDeliveryClaim {
+    First,
+    AlreadyDelivered,
+    NoJob,
+}
+
+impl NoninteractiveDeliveryClaim {
+    fn already_delivered(&self) -> bool {
+        matches!(self, Self::AlreadyDelivered)
+    }
+
+    fn fire_stops(&self) -> bool {
+        matches!(self, Self::First)
+    }
+}
+
+pub(in crate::engine::driver) fn noninteractive_end_reason(
+    status: NoninteractiveDelegationStatus,
+    fallback: &'static str,
+) -> &'static str {
+    match status {
+        NoninteractiveDelegationStatus::Completed => "completed",
+        NoninteractiveDelegationStatus::Failed => "failed",
+        NoninteractiveDelegationStatus::Cancelled => "cancelled",
+        NoninteractiveDelegationStatus::Lost => "lost",
+        NoninteractiveDelegationStatus::Running | NoninteractiveDelegationStatus::Backgrounded => {
+            fallback
+        }
     }
 }
 

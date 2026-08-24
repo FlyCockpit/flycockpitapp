@@ -86,6 +86,31 @@ pub enum ScheduleEvent {
     /// main history. After the turn the driver posts
     /// [`ScheduleCommand::IterationFinished`].
     LoopIterationDue { job_id: String, prompt: String },
+    /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
+    /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
+    /// as its FIRST action — on the SAME authority→driver channel and by the
+    /// SAME task that later sends this child's terminal [`ScheduleEvent::Completed`],
+    /// both via `event_tx.send().await`. Because one task's sequential awaited
+    /// sends enqueue in program order, the driver always drains this start
+    /// before the paired completion — even under channel backpressure (unlike a
+    /// separate sync emitter, whose full-channel fallback could reorder).
+    ///
+    /// The driver fires the `subagentStart` observe hook for it and records the
+    /// child in its `job_id`→`subagentType` map so the paired `subagentStop`
+    /// can fire when the same `job_id`'s `Completed` is drained (GOALS §24;
+    /// hook-lifecycle detached-Swarm wiring).
+    ///
+    /// **Goal-supervision workers do NOT emit this.** Planner / Evaluator /
+    /// Gatekeeper / ColdSkeptic ([`SpawnWorkerKind::is_goal_control`]) share
+    /// this schedule/drain boundary but are internal control workers, never
+    /// user-facing subagents (guidance L22): they are excluded at the single
+    /// emission site so they fire NEITHER `subagentStart` nor `subagentStop`.
+    SwarmChildStarted {
+        job_id: String,
+        /// The child's built-in agent type ([`SpawnWorkerKind::agent_name`]);
+        /// the `subagentStart`/`subagentStop` matcher + `subagentType` field.
+        subagent_type: String,
+    },
     /// A job reached a terminal state and its result must be injected into
     /// main context as a late-arriving turn. `notes` are the fork's
     /// accumulated notes (ephemeral loops); empty otherwise.
@@ -226,6 +251,21 @@ impl SpawnWorkerKind {
             self,
             Self::GoalPlanner | Self::GoalEvaluator | Self::GoalGatekeeper | Self::GoalColdSkeptic
         )
+    }
+
+    /// The built-in agent type this worker loads as. Single-sourced so the
+    /// child's model-role resolution ([`super::swarm::build_swarm_child`]) and
+    /// the `subagentStart`/`subagentStop` matcher / `subagentType` envelope
+    /// field agree on one string.
+    pub fn agent_name(self) -> &'static str {
+        match self {
+            Self::Bee => "bee",
+            Self::Scout => "scout",
+            Self::GoalPlanner => "goal-planner",
+            Self::GoalEvaluator => "goal-evaluator",
+            Self::GoalGatekeeper => "goal-gatekeeper",
+            Self::GoalColdSkeptic => "goal-cold-skeptic",
+        }
     }
 }
 
@@ -1195,6 +1235,88 @@ mod tests {
             model_origin: Default::default(),
             depth,
             max_depth: 3,
+        }
+    }
+
+    /// A [`SpawnSpec`] for a goal-supervision control worker (never a
+    /// user-facing subagent; guidance L22).
+    fn goal_control_spec(worker: SpawnWorkerKind) -> SpawnSpec {
+        SpawnSpec {
+            worker,
+            ..swarm_spec(0)
+        }
+    }
+
+    /// L22 exclusion at its single emission site ([`super::swarm::run_swarm`]):
+    /// a genuine swarm child (`bee` / `scout`) emits a
+    /// [`ScheduleEvent::SwarmChildStarted`] carrying its agent type as the
+    /// runner's FIRST event, while every goal-supervision control worker
+    /// (Planner/Evaluator/Gatekeeper/ColdSkeptic) emits NONE — so the driver
+    /// fires `subagentStart`/`subagentStop` for real subagents only and never
+    /// for a supervision worker. This test FAILS if the `is_goal_control`
+    /// exclusion is removed (a goal worker would then lead with a
+    /// `SwarmChildStarted` instead of going straight to its terminal
+    /// `Completed`). The spawned children error out fast against the keyless
+    /// test endpoint, so each reaches a terminal `Completed`.
+    #[tokio::test]
+    async fn swarm_child_started_emitted_for_real_child_never_for_goal_supervision() {
+        // Genuine subagents (`bee`, `scout`) lead with a SwarmChildStarted
+        // carrying their agent type, before any terminal Completed.
+        for (worker, expected_type) in [
+            (SpawnWorkerKind::Bee, "bee"),
+            (SpawnWorkerKind::Scout, "scout"),
+        ] {
+            let (mut auth, mut events, _ui, _tmp) = test_authority(8);
+            auth.set_swarm_max_concurrency(8);
+            let mut spec = swarm_spec(1);
+            spec.worker = worker;
+            assert!(auth.spawn_swarm(spec).contains("scheduled"));
+            let first = tokio::time::timeout(Duration::from_secs(20), events.recv())
+                .await
+                .expect("a genuine swarm child must emit an event")
+                .expect("event channel open");
+            match first {
+                ScheduleEvent::SwarmChildStarted { subagent_type, .. } => {
+                    assert_eq!(
+                        subagent_type, expected_type,
+                        "the start event carries the child agent type"
+                    );
+                }
+                other => panic!("expected SwarmChildStarted for {worker:?}, got {other:?}"),
+            }
+        }
+
+        // Every goal-supervision control worker emits NO SwarmChildStarted —
+        // its first (and only) event is the terminal Completed.
+        for worker in [
+            SpawnWorkerKind::GoalPlanner,
+            SpawnWorkerKind::GoalEvaluator,
+            SpawnWorkerKind::GoalGatekeeper,
+            SpawnWorkerKind::GoalColdSkeptic,
+        ] {
+            let (mut auth, mut events, _ui, _tmp) = test_authority(8);
+            auth.set_swarm_max_concurrency(8);
+            assert!(
+                auth.spawn_swarm(goal_control_spec(worker))
+                    .contains("scheduled"),
+                "goal-control worker {worker:?} should schedule"
+            );
+            // Drain every event until the terminal Completed; NONE may be a
+            // SwarmChildStarted. If the exclusion were removed, the runner would
+            // lead with one here and this would panic.
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(20), events.recv())
+                    .await
+                    .expect("goal worker must reach a terminal Completed")
+                    .expect("event channel open");
+                match event {
+                    ScheduleEvent::SwarmChildStarted { .. } => {
+                        panic!("goal-supervision worker {worker:?} must not emit SwarmChildStarted")
+                    }
+                    ScheduleEvent::Completed { .. } => break,
+                    ScheduleEvent::LoopIterationDue { .. } => {}
+                }
+            }
         }
     }
 

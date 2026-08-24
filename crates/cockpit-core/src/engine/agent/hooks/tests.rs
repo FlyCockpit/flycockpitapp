@@ -1061,6 +1061,45 @@ async fn observe_once(
     (rows, stdin_json)
 }
 
+/// Like [`observe_once`] but for the child-subagent events: the matcher is the
+/// child agent type, and the envelope carries `subagentType` / `subagentId` /
+/// `endReason`. Drives the production `run_observe_hooks` dispatcher with an
+/// injected fake runner (captures stdin) + fake process env.
+async fn observe_subagent_once(
+    reg: &HookRegistry,
+    event: HookEvent,
+    subagent_type: &str,
+    subagent_id: Option<&str>,
+    fields: ObserveFields<'_>,
+) -> (Vec<(String, String)>, Option<Value>) {
+    let (db, sid) = db_session().await;
+    let env = FakeProcessEnv::with_default_resolution();
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+    run_observe_hooks(
+        &runner,
+        &env,
+        reg,
+        event,
+        // Matcher for `subagentStart` / `subagentStop` is the child agent type.
+        subagent_type,
+        sid,
+        workspace(),
+        &db,
+        None,
+        None,
+        Some(subagent_type),
+        subagent_id,
+        fields,
+    )
+    .await;
+    let rows = hook_run_events(&db, sid).await;
+    let stdin_json = runner
+        .invocations()
+        .first()
+        .map(|inv| serde_json::from_str::<Value>(&inv.stdin).expect("envelope is valid JSON"));
+    (rows, stdin_json)
+}
+
 /// A `ResolvedHook` matching `event` only on `matcher`.
 fn observe_hook(event: HookEvent, matcher: &str) -> ResolvedHook {
     test_hook(
@@ -1074,13 +1113,18 @@ fn observe_hook(event: HookEvent, matcher: &str) -> ResolvedHook {
 
 #[tokio::test]
 async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
-    // Scripted per-event harness. For each of the six wired observe events:
+    // Scripted per-event harness. For each wired observe event
+    // (sessionStart / userPromptSubmit / permissionDenied / preCompact /
+    // postCompact / stopFailure from increment 2A, plus subagentStart /
+    // subagentStop / sessionEnd wired in this increment 2B-i):
     //   1. a hook whose matcher equals the boundary vocabulary fires exactly
     //      one `hook_run` row and receives its first-class typed envelope field
     //      on stdin, and
     //   2. a hook whose matcher is a *lookalike* (a sibling value the boundary
     //      never uses) fires nothing — proving exact-matcher selection, not a
     //      blanket "any hook for this event" dispatch.
+    // The still-unwired `stop` root-continuation event (2B-ii) is deliberately
+    // NOT asserted reachable here.
     // The typed-field assertions fail to compile against dead-code HEAD (the
     // `startSource`/`promptSource`/`permissionKind`/`errorClass`/`compactSource`
     // envelope fields and `ObserveFields` do not exist there), and the row/no-row
@@ -1282,6 +1326,136 @@ async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
     assert!(
         rows.is_empty(),
         "a timeout_ttft-only hook must not fire on a network failure"
+    );
+
+    // --- Increment 2B-i events -------------------------------------------
+
+    // subagentStart: CHILD-only; matcher = child agent type; envelope carries
+    // `subagentType` + `subagentId` (no `endReason`).
+    let (rows, stdin) = observe_subagent_once(
+        &registry(vec![observe_hook(HookEvent::SubagentStart, "explore")]),
+        HookEvent::SubagentStart,
+        "explore",
+        Some("task-call-7"),
+        ObserveFields::default(),
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("subagentStart".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("subagentStart hook invoked");
+    assert_eq!(stdin["hookEventName"], "subagentStart");
+    assert_eq!(stdin["subagentType"], "explore");
+    assert_eq!(stdin["subagentId"], "task-call-7");
+    // `endReason` is a subagentStop-only field; it must be absent on start.
+    assert!(stdin.get("endReason").is_none());
+    // A different-agent-type hook must not fire (exact matcher on agent type).
+    let (rows, _) = observe_subagent_once(
+        &registry(vec![observe_hook(HookEvent::SubagentStart, "builder")]),
+        HookEvent::SubagentStart,
+        "explore",
+        Some("task-call-7"),
+        ObserveFields::default(),
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "a builder-only hook must not fire on an explore child start"
+    );
+
+    // subagentStop: CHILD-only; matcher = child agent type; envelope carries
+    // `subagentType` + `subagentId` + `endReason` (the child-stop reason).
+    let (rows, stdin) = observe_subagent_once(
+        &registry(vec![observe_hook(HookEvent::SubagentStop, "explore")]),
+        HookEvent::SubagentStop,
+        "explore",
+        Some("task-call-7"),
+        ObserveFields {
+            end_reason: Some("completed"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("subagentStop".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("subagentStop hook invoked");
+    assert_eq!(stdin["subagentType"], "explore");
+    assert_eq!(stdin["subagentId"], "task-call-7");
+    assert_eq!(stdin["endReason"], "completed");
+    // The abort counterpart carries a distinct `endReason` (proving the field
+    // is the real stop reason, not a constant).
+    let (_rows, stdin) = observe_subagent_once(
+        &registry(vec![observe_hook(HookEvent::SubagentStop, "explore")]),
+        HookEvent::SubagentStop,
+        "explore",
+        Some("task-call-7"),
+        ObserveFields {
+            end_reason: Some("aborted"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        stdin.expect("subagentStop hook invoked")["endReason"],
+        "aborted"
+    );
+    // A different-agent-type hook must not fire on an explore child stop.
+    let (rows, _) = observe_subagent_once(
+        &registry(vec![observe_hook(HookEvent::SubagentStop, "builder")]),
+        HookEvent::SubagentStop,
+        "explore",
+        Some("task-call-7"),
+        ObserveFields {
+            end_reason: Some("completed"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "a builder-only hook must not fire on an explore child stop"
+    );
+
+    // sessionEnd: matcher = closed WorkerStop-derived token; typed field
+    // `endReason`. `completed` fires a `completed`-matched hook; an `error`-only
+    // hook does NOT fire on a clean completion (exact matcher).
+    let (rows, stdin) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::SessionEnd, "completed")]),
+        HookEvent::SessionEnd,
+        "completed",
+        None,
+        ObserveFields {
+            end_reason: Some("completed"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![("sessionEnd".to_string(), "success".to_string())]
+    );
+    let stdin = stdin.expect("sessionEnd hook invoked");
+    assert_eq!(stdin["hookEventName"], "sessionEnd");
+    assert_eq!(stdin["endReason"], "completed");
+    let (rows, _) = observe_once(
+        &env,
+        &registry(vec![observe_hook(HookEvent::SessionEnd, "error")]),
+        HookEvent::SessionEnd,
+        "completed",
+        None,
+        ObserveFields {
+            end_reason: Some("completed"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "an error-only sessionEnd hook must not fire on a clean completion"
     );
 }
 
@@ -1987,6 +2161,109 @@ async fn stop_hook_continuation_state_machine() {
             vec!["failed".to_string()]
         );
     }
+}
+
+/// The 8-cap grants EXACTLY `STOP_HOOK_MAX_CONTINUATIONS` continuations for one
+/// latch, then force-ends the turn WITHOUT reconsulting (or recording) any stop
+/// hook — the cap is enforced solely at the entry check. Driven by threading ONE
+/// `StopGateState` (as the driver does per key) across repeated consultations of
+/// a block hook.
+#[tokio::test]
+async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting() {
+    let env = FakeProcessEnv::with_default_resolution();
+    let (db, sid) = db_session().await;
+    // A distinct, independently-derived expected count so the assertions do not
+    // re-derive from the constant under test's own arithmetic.
+    let expected_grants: usize = 8;
+    assert_eq!(
+        STOP_HOOK_MAX_CONTINUATIONS as usize, expected_grants,
+        "test literal pinned to the production cap"
+    );
+
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"block","reason":"keep going"}"#,
+    ));
+    let hook = test_hook(
+        HookEvent::Stop,
+        vec!["s".to_string()],
+        Some(vec!["end_turn".to_string()]),
+        BTreeMap::new(),
+        5,
+    );
+    let reg = registry(vec![hook]);
+    let mut state = StopGateState::default();
+
+    // The first `expected_grants` consultations each grant a continuation and
+    // run the hook once.
+    for round in 1..=expected_grants {
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &reg,
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            StopHookOutcome::Continue {
+                reason: "keep going".to_string(),
+                additional_context: None,
+            },
+            "round {round} must still grant a continuation"
+        );
+        assert_eq!(state.continuation_count as usize, round);
+        assert_eq!(
+            runner.invocations().len(),
+            round,
+            "each granted round consults the hook exactly once"
+        );
+    }
+
+    // The `stop` envelope carries first-class camelCase `stopReason` /
+    // `stopHookActive`: the first consultation is not yet inside a continuation
+    // loop (`false`); by the second the latch is active (`true`).
+    let invocations = runner.invocations();
+    let first: serde_json::Value = serde_json::from_str(&invocations[0].stdin).unwrap();
+    assert_eq!(first["hookEventName"], "stop");
+    assert_eq!(first["stopReason"], "end_turn");
+    assert_eq!(first["stopHookActive"], false);
+    assert!(
+        first.get("source").is_none() && first.get("reason").is_none(),
+        "the matcher token must not be overloaded onto generic source/reason"
+    );
+    let second: serde_json::Value = serde_json::from_str(&invocations[1].stdin).unwrap();
+    assert_eq!(second["stopHookActive"], true);
+
+    // The next consultation is capped: force-end, hook NOT reconsulted, and no
+    // additional ledger row beyond the `expected_grants` already recorded.
+    let outcome = run_stop_hooks(
+        &runner,
+        &env,
+        &reg,
+        HookEvent::Stop,
+        "end_turn",
+        sid,
+        workspace(),
+        &db,
+        &mut state,
+    )
+    .await;
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        runner.invocations().len(),
+        expected_grants,
+        "a capped latch must not reconsult its stop hooks"
+    );
+    assert_eq!(
+        hook_run_statuses(&db, sid).await.len(),
+        expected_grants,
+        "the forced end records no new ledger row"
+    );
 }
 
 #[test]

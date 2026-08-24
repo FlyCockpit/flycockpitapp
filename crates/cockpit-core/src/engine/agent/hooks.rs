@@ -119,6 +119,24 @@ pub struct HookEnvelope {
     /// | `manual`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_source: Option<String>,
+    /// End-reason discriminator (Decision 8) — a first-class typed field, not
+    /// overloaded onto the generic `reason` key. Carries the `subagentStop`
+    /// child-stop reason (e.g. `completed`, `aborted`) and, for `sessionEnd`,
+    /// the same closed `WorkerStop`-derived token used as the matcher
+    /// (`completed` | `interrupted` | `cancelled` | `shutdown` | `error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    /// `stop` discriminator (Decision 8): the reason the root turn is stopping
+    /// — the same closed matcher token (`end_turn`). A first-class typed field,
+    /// deliberately NOT overloaded onto the generic `source`/`reason` keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// `stop` re-entrancy flag (Decision 8): `true` while the turn is already
+    /// inside a stop-hook continuation loop for this `(session, root frame,
+    /// originating user turn)`, so a stop hook can detect and avoid looping
+    /// forever. `false`/absent on the first consultation of a turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_hook_active: Option<bool>,
 }
 
 /// Typed, camelCase observe-envelope discriminators (Decision 8 / F1).
@@ -134,6 +152,14 @@ pub(crate) struct ObserveFields<'a> {
     pub permission_kind: Option<&'a str>,
     pub error_class: Option<&'a str>,
     pub compact_source: Option<&'a str>,
+    /// `subagentStop` child-stop reason (envelope `endReason`).
+    pub end_reason: Option<&'a str>,
+    /// `stop` reason (envelope `stopReason`) — the closed matcher token
+    /// (`end_turn`).
+    pub stop_reason: Option<&'a str>,
+    /// `stop` re-entrancy flag (envelope `stopHookActive`) — `true` while
+    /// inside an ongoing stop-hook continuation loop for this turn.
+    pub stop_hook_active: Option<bool>,
 }
 
 impl HookEnvelope {
@@ -169,6 +195,9 @@ impl HookEnvelope {
             permission_kind: None,
             error_class: None,
             compact_source: None,
+            end_reason: None,
+            stop_reason: None,
+            stop_hook_active: None,
         }
     }
 
@@ -210,6 +239,9 @@ impl HookEnvelope {
             permission_kind: None,
             error_class: None,
             compact_source: None,
+            end_reason: None,
+            stop_reason: None,
+            stop_hook_active: None,
         }
     }
 
@@ -252,6 +284,9 @@ impl HookEnvelope {
             permission_kind: fields.permission_kind.map(str::to_string),
             error_class: fields.error_class.map(str::to_string),
             compact_source: fields.compact_source.map(str::to_string),
+            end_reason: fields.end_reason.map(str::to_string),
+            stop_reason: fields.stop_reason.map(str::to_string),
+            stop_hook_active: fields.stop_hook_active,
         }
     }
 
@@ -275,13 +310,11 @@ pub enum HookDecision {
     Deny { reason: String },
     /// The hook produced a stop-gate block with aggregated feedback for
     /// another model round.
-    #[allow(dead_code)]
     Block {
         reason: String,
         additional_context: Option<String>,
     },
     /// The hook produced a stop-gate continue that ends the turn.
-    #[allow(dead_code)]
     Continue { stop_reason: String },
     /// The hook run failed (fail-open). The reason is recorded in the ledger.
     Failed { reason: String },
@@ -393,7 +426,6 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
 }
 
 /// Parse stdout as a hook decision for a stop-gate event.
-#[allow(dead_code)]
 fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -1215,19 +1247,16 @@ async fn record_hook_run(
 
 /// Maximum number of stop-hook continuations per `(session, frame-or-job,
 /// originating user turn)`.
-#[allow(dead_code)]
 pub(crate) const STOP_HOOK_MAX_CONTINUATIONS: u8 = 8;
 
 /// Per-frame/job stop-gate latch tracking continuation count.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct StopGateState {
     pub stop_hook_active: bool,
     pub continuation_count: u8,
 }
 
 impl StopGateState {
-    #[allow(dead_code)]
     pub fn capped(&self) -> bool {
         self.continuation_count >= STOP_HOOK_MAX_CONTINUATIONS
     }
@@ -1235,7 +1264,6 @@ impl StopGateState {
 
 /// Aggregated stop-gate feedback from all matching stop hooks.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct StopGateFeedback {
     pub blocks: Vec<String>,
     pub additional_contexts: Vec<String>,
@@ -1243,17 +1271,14 @@ pub struct StopGateFeedback {
 }
 
 impl StopGateFeedback {
-    #[allow(dead_code)]
     pub fn should_continue_round(&self) -> bool {
         !self.forced_end && (!self.blocks.is_empty() || !self.additional_contexts.is_empty())
     }
 
-    #[allow(dead_code)]
     pub fn combined_reason(&self) -> String {
         self.blocks.join("\n")
     }
 
-    #[allow(dead_code)]
     pub fn combined_additional_context(&self) -> Option<String> {
         if self.additional_contexts.is_empty() {
             None
@@ -1265,7 +1290,6 @@ impl StopGateFeedback {
 
 /// The outcome of running all matching stop hooks for one completion event.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum StopHookOutcome {
     /// No matching stop hooks, or all hooks allowed/failed fail-open. The
     /// turn ends normally.
@@ -1289,10 +1313,13 @@ pub enum StopHookOutcome {
 /// `hookSpecificOutput.additionalContext` aggregate bounded feedback for
 /// another model round, while `{"continue":false,"stopReason":"..."}` wins and
 /// ends the turn. All matching stop hooks run sequentially despite earlier
-/// failures. The per-frame/job continuation cap is enforced: on cap, the
-/// affected frame emits an auditable forced end and does not reconsult its
-/// stop hooks.
-#[allow(clippy::too_many_arguments, dead_code)]
+/// failures. The per-frame/job continuation cap is enforced at the SINGLE entry
+/// check below: once the latch has already granted [`STOP_HOOK_MAX_CONTINUATIONS`]
+/// continuations for its `(session, frame-or-job, originating user turn)`, the
+/// next consultation force-ends the turn WITHOUT reconsulting (or recording) any
+/// stop hook. The rows for the hooks already run on prior rounds remain the
+/// audit trail of the forced end.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stop_hooks(
     runner: &dyn CommandRunner,
     process_env: &dyn ProcessEnv,
@@ -1315,6 +1342,11 @@ pub(crate) async fn run_stop_hooks(
     }
 
     let timestamp = chrono::Utc::now().to_rfc3339();
+    // First-class typed `stop` envelope fields (Decision 8): `stopReason`
+    // carries the closed matcher token, and `stopHookActive` reflects whether
+    // this consultation is already inside a continuation loop (set by a prior
+    // round of THIS turn). Neither is overloaded onto the generic `source` /
+    // `reason` keys, and neither carries any secret.
     let envelope = HookEnvelope::for_observe(
         event,
         session_id,
@@ -1322,11 +1354,15 @@ pub(crate) async fn run_stop_hooks(
         &timestamp,
         None,
         None,
-        Some("end_turn"),
         None,
         None,
         None,
-        ObserveFields::default(),
+        None,
+        ObserveFields {
+            stop_reason: Some(match_value),
+            stop_hook_active: Some(state.stop_hook_active),
+            ..ObserveFields::default()
+        },
     );
     let stdin = envelope.to_json_string();
 
@@ -1445,14 +1481,15 @@ pub(crate) async fn run_stop_hooks(
     }
 
     if feedback.should_continue_round() {
-        // Increment the continuation count for this frame/job.
+        // Grant a continuation and count it against this frame/job's latch.
+        // The cap is enforced solely at the entry check above: once the count
+        // reaches STOP_HOOK_MAX_CONTINUATIONS, the NEXT consultation force-ends
+        // without reconsulting hooks. That gives exactly `STOP_HOOK_MAX_
+        // CONTINUATIONS` granted rounds before the forced end (rather than one
+        // fewer), and keeps the "force-end WITHOUT reconsulting" semantics in a
+        // single place.
         state.continuation_count = state.continuation_count.saturating_add(1);
         state.stop_hook_active = true;
-        if state.capped() {
-            // Reached the cap: forced end, no more stop-hook rounds.
-            state.stop_hook_active = false;
-            return StopHookOutcome::ForcedEnd;
-        }
         return StopHookOutcome::Continue {
             reason: feedback.combined_reason(),
             additional_context: feedback.combined_additional_context(),
@@ -1466,9 +1503,11 @@ pub(crate) async fn run_stop_hooks(
 ///
 /// Observe-only hooks (`sessionStart`, `userPromptSubmit`, `permissionDenied`,
 /// `subagentStart`, `preCompact`, `postCompact`, `stopFailure`, and
-/// `sessionEnd`) never block. All matching hooks run sequentially even if an
-/// earlier observer fails. Each failed run is recorded; a nonmatching handler
-/// produces no row.
+/// `sessionEnd`) never block. `subagentStop`'s observe NOTIFICATION (a child
+/// stopped, with its `endReason`) is also emitted through here; its stop-gate
+/// continuation is a separate concern. All matching hooks run sequentially even
+/// if an earlier observer fails. Each failed run is recorded; a nonmatching
+/// handler produces no row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_observe_hooks(
     runner: &dyn CommandRunner,

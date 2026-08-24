@@ -20,6 +20,18 @@ impl Driver {
                 // The iteration's turn finished — advance the schedule.
                 self.schedule.iteration_finished(&job_id);
             }
+            ScheduleEvent::SwarmChildStarted {
+                job_id,
+                subagent_type,
+            } => {
+                // A genuine detached-`Swarm` child (`bee` / `scout`) started
+                // (spawn mode 3 of 3). Fire `subagentStart` and track it so the
+                // paired `subagentStop` fires when its `Completed` is drained.
+                // The authority never emits this for goal-supervision workers
+                // (guidance L22), so this boundary is child-only by construction.
+                self.fire_swarm_subagent_start(&job_id, &subagent_type)
+                    .await;
+            }
             ScheduleEvent::Completed {
                 job_id,
                 label,
@@ -36,6 +48,14 @@ impl Driver {
                 // main thread — the authority is the single scheduler.
                 if matches!(kind, crate::engine::schedule::ScheduleKind::Swarm) {
                     self.schedule.swarm_completed();
+                    // Fire the paired `subagentStop` for a genuine swarm child.
+                    // No-op for a goal-supervision worker (never in the map;
+                    // guidance L22) — its dedicated completion handling runs
+                    // below. Exactly one `Completed` is drained per job (runner
+                    // on success/failure, authority on cancel), so this fires at
+                    // most once per started child.
+                    self.fire_swarm_subagent_stop_if_tracked(&job_id, failed)
+                        .await;
                 }
                 if self
                     .handle_goal_supervision_completion(&job_id, &result, failed, input_rx, tx)

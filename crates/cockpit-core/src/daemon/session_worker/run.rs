@@ -1965,7 +1965,21 @@ pub(super) async fn run_worker(
                 driver_control_rx,
                 &engine_event_tx,
             ));
-            match driver_loop.await {
+            let outcome = driver_loop.await;
+            // Pairing teardown: a driver-loop exit that still holds interactive
+            // child frames (only reachable via a fatal `Err` — every clean /
+            // cancel / gate / interrupt / inference-failure path already
+            // unwinds to root) emits one paired `subagentStop` per abandoned
+            // child so no `subagentStart` is left unpaired. No-op when the stack
+            // is already at root.
+            driver.drain_orphaned_child_stop_hooks().await;
+            // Same pairing teardown for detached-`Swarm` children: any child
+            // still tracked (its terminal `Completed` was never drained — detach
+            // loss / shutdown) emits one paired `subagentStop` (`aborted`) so no
+            // `subagentStart` is left unpaired. No-op when every child already
+            // completed (each `Completed` removed it from the map).
+            driver.drain_orphaned_swarm_stop_hooks().await;
+            match outcome {
                 Ok(()) => DriverOutcome::Ok,
                 Err(e) => {
                     let error = format!("{e:#}");
@@ -4253,6 +4267,42 @@ pub(super) async fn run_worker(
     drop(engine_event_notice_tx);
     let _ = forward.await;
     let _ = queue_forward.await;
+
+    // `sessionEnd` observe hooks: fire once per worker teardown, at the same
+    // boundary that emits `SessionEnded` below. Fired here — after the driver
+    // has drained but BEFORE the DB teardown in the `match stop` arms — so the
+    // `session.db` ledger write is guaranteed live. The matcher / `endReason`
+    // comes from the CLOSED [`WorkerStop::session_end_matcher`] map (never the
+    // human-readable proto reason text). Observe-only / fail-open; the registry
+    // is cloned from the current snapshot so no lock guard is held across the
+    // hook run.
+    {
+        let end_matcher = stop.session_end_matcher();
+        let registry = config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hooks()
+            .clone();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            &registry,
+            crate::config::extended::hooks::HookEvent::SessionEnd,
+            end_matcher,
+            session.id,
+            &project_root,
+            &session.db,
+            None,
+            None,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                end_reason: Some(end_matcher),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
 
     match stop {
         WorkerStop::Shutdown {

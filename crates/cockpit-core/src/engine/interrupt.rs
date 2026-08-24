@@ -59,6 +59,10 @@ tokio::task_local! {
     static CURRENT_PRE_RESOLVED_INTERRUPTS: RefCell<PreResolvedInterrupts>;
 }
 
+tokio::task_local! {
+    static CURRENT_ROOT_STOP_GATE: crate::db::needs_attention::InterruptStopGateMemo;
+}
+
 #[derive(Debug, Clone)]
 pub struct PreResolvedInterruptQuestion {
     pub agent: String,
@@ -99,6 +103,21 @@ pub fn set_current_interrupt_gate_memo(gate: crate::db::needs_attention::Interru
     let _ = CURRENT_INTERRUPT_PARK_PAYLOAD.try_with(|payload| {
         payload.borrow_mut().gate = Some(gate);
     });
+}
+
+pub async fn with_root_stop_gate_memo<F>(
+    memo: crate::db::needs_attention::InterruptStopGateMemo,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_ROOT_STOP_GATE.scope(memo, fut).await
+}
+
+pub fn current_root_stop_gate_memo(
+) -> Option<crate::db::needs_attention::InterruptStopGateMemo> {
+    CURRENT_ROOT_STOP_GATE.try_with(|memo| *memo).ok()
 }
 
 pub async fn with_pre_resolved_interrupt<F>(

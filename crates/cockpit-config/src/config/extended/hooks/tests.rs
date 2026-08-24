@@ -184,6 +184,24 @@ fn hooks_config_event_table_and_defaults() {
 }
 
 #[test]
+fn stop_failure_matcher_uses_closed_error_class_vocabulary() {
+    assert_eq!(HOOK_ERROR_CLASS_MATCH_VALUES.len(), 13);
+    for value in HOOK_ERROR_CLASS_MATCH_VALUES {
+        assert!(
+            validate_matcher(HookMatcherPolicy::ErrorClass, Some(vec![(*value).into()])).is_ok(),
+            "documented error class `{value}` must load"
+        );
+    }
+    assert_eq!(
+        validate_matcher(
+            HookMatcherPolicy::ErrorClass,
+            Some(vec!["provider_specific_future_value".into()]),
+        ),
+        Err("matcher value is not a recognized inference error class")
+    );
+}
+
+#[test]
 fn hooks_config_origin_index_follows_document_handler_order() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("config.json");

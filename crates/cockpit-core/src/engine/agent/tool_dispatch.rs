@@ -461,6 +461,7 @@ pub(crate) async fn execute_ordinary_call(
             call_origin: env.ctx.skill_write_origin,
         },
         gate: replay_gate_memo,
+        root_stop_gate: crate::engine::interrupt::current_root_stop_gate_memo(),
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
@@ -724,6 +725,7 @@ pub(crate) async fn execute_ordinary_call(
                 call_origin: env.ctx.skill_write_origin,
             },
             gate: gate_memo,
+            root_stop_gate: crate::engine::interrupt::current_root_stop_gate_memo(),
         };
         // Pre-tool hook gate: runs after name/argument/path repair and after
         // existing loop/safety/review/btw decisions permit dispatch, but

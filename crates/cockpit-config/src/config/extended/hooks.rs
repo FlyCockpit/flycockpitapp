@@ -18,6 +18,39 @@ use crate::config::dirs::{
     discover_config_dirs,
 };
 
+pub const ERROR_CLASS_TIMEOUT_TTFT: &str = "timeout_ttft";
+pub const ERROR_CLASS_TIMEOUT_IDLE: &str = "timeout_idle";
+pub const ERROR_CLASS_NETWORK: &str = "network";
+pub const ERROR_CLASS_HTTP: &str = "http";
+pub const ERROR_CLASS_UTILITY_TIMEOUT: &str = "utility_timeout";
+pub const ERROR_CLASS_MISSING_TOOL_ENTITLEMENT: &str = "missing_tool_entitlement";
+pub const ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported";
+pub const ERROR_CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
+pub const ERROR_CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
+pub const ERROR_CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
+pub const ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED: &str = "billing_or_quota_exhausted";
+pub const ERROR_CLASS_UNRENDERABLE_WIRE_FIELD: &str = "unrenderable_wire_field";
+pub const ERROR_CLASS_OTHER: &str = "other";
+
+/// Closed matcher vocabulary for `stopFailure`. Data-bearing runtime errors
+/// (`http` status and provider-specific `other` text) deliberately map to
+/// coarse stable tokens so config never embeds volatile diagnostics.
+pub const HOOK_ERROR_CLASS_MATCH_VALUES: &[&str] = &[
+    ERROR_CLASS_TIMEOUT_TTFT,
+    ERROR_CLASS_TIMEOUT_IDLE,
+    ERROR_CLASS_NETWORK,
+    ERROR_CLASS_HTTP,
+    ERROR_CLASS_UTILITY_TIMEOUT,
+    ERROR_CLASS_MISSING_TOOL_ENTITLEMENT,
+    ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED,
+    ERROR_CLASS_RESPONSES_TOOL_IDENTITY,
+    ERROR_CLASS_PROVIDER_NOT_CONFIGURED,
+    ERROR_CLASS_PROVIDER_RATE_LIMIT,
+    ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED,
+    ERROR_CLASS_UNRENDERABLE_WIRE_FIELD,
+    ERROR_CLASS_OTHER,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HookEvent {
@@ -542,9 +575,14 @@ fn validate_matcher(
         {
             return Err("matcher value is not valid for this event");
         }
-        HookMatcherPolicy::CanonicalToolName
-        | HookMatcherPolicy::ChildAgentType
-        | HookMatcherPolicy::ErrorClass
+        HookMatcherPolicy::ErrorClass
+            if values
+                .iter()
+                .any(|value| !HOOK_ERROR_CLASS_MATCH_VALUES.contains(&value.as_str())) =>
+        {
+            return Err("matcher value is not a recognized inference error class");
+        }
+        HookMatcherPolicy::CanonicalToolName | HookMatcherPolicy::ChildAgentType
             if values.iter().any(|value| !canonical_match_value(value)) =>
         {
             return Err("matcher value is not canonical");

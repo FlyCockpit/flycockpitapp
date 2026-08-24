@@ -829,6 +829,11 @@ pub struct Driver {
     pending_monty_tool_nudge: Option<String>,
     active_model_state_generation: u64,
     current_lifecycle_turn_id: Option<String>,
+    /// Root stop-gate state for a foreground turn paused by a parked
+    /// interrupt. Child state already lives on its retained stack frame; the
+    /// root latch is otherwise local to `run_user_input`, so it must ride on
+    /// the driver until replay resumes the same originating turn.
+    parked_root_stop_gate: Option<crate::engine::agent::hooks::StopGateState>,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
     /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
     /// [`CancellationToken`] here at the start of each run and clears it on
@@ -1515,6 +1520,7 @@ impl Driver {
             pending_monty_tool_nudge: self.pending_monty_tool_nudge.clone(),
             active_model_state_generation: self.active_model_state_generation,
             current_lifecycle_turn_id: self.current_lifecycle_turn_id.clone(),
+            parked_root_stop_gate: self.parked_root_stop_gate.clone(),
             cancel_current: self.cancel_current.clone(),
             approver: self.approver.clone(),
             lsp: self.lsp.clone(),
@@ -1837,6 +1843,7 @@ impl Driver {
             pending_monty_tool_nudge: None,
             active_model_state_generation: 0,
             current_lifecycle_turn_id: None,
+            parked_root_stop_gate: None,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
             lsp: None,
@@ -2855,6 +2862,7 @@ impl Driver {
         response: crate::daemon::proto::ResolveResponse,
         question: crate::engine::interrupt::PreResolvedInterruptQuestion,
         tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         use rig::message::ToolFunction;
 
@@ -2897,7 +2905,7 @@ impl Driver {
             cwd: self.cwd.clone(),
             redact: self.redact.clone(),
             interrupts: self.interrupts.clone(),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel,
             shutdown_gate: agent.model.shutdown_gate(),
             approver: self.approver.clone(),
             deferred_log: self
@@ -2987,6 +2995,7 @@ impl Driver {
         &mut self,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let mut next_prompt = {
             let frame = self.stack.last_mut().context("driver stack is empty")?;
@@ -3006,13 +3015,7 @@ impl Driver {
         self.refresh_redaction_table_for_turn(tx).await;
         self.refresh_active_frame_for_turn(tx).await;
         self.refresh_wire_api_for_turn();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let _cancel_guard = {
-            *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
-            CancelSlotGuard {
-                slot: self.cancel_current.clone(),
-            }
-        };
+        let mut root_stop_gate = self.parked_root_stop_gate.take().unwrap_or_default();
         let max_primary_rounds = self.max_primary_rounds;
         let mut primary_rounds_in_chunk: u32 = 0;
 
@@ -3036,9 +3039,15 @@ impl Driver {
                 .then(|| self.tandem_set.clone());
             let mut turn_metadata = BackupTurnMetadata::default();
             let turn_result = {
+                let stop_gate_memo = crate::db::needs_attention::InterruptStopGateMemo {
+                    stop_hook_active: root_stop_gate.stop_hook_active,
+                    continuation_count: root_stop_gate.continuation_count,
+                };
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
-                turn_with_backup(
+                crate::engine::interrupt::with_root_stop_gate_memo(
+                    stop_gate_memo,
+                    turn_with_backup(
                     &agent,
                     backup_model.as_ref(),
                     &fallback_models,
@@ -3067,6 +3076,7 @@ impl Driver {
                     Some(lifecycle_turn_id.clone()),
                     tx,
                     Some(&mut turn_metadata),
+                    ),
                 )
                 .await
             };
@@ -3078,6 +3088,7 @@ impl Driver {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
                     tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                    self.parked_root_stop_gate = Some(root_stop_gate);
                     if let Some((goal_id, generation, turn_id)) = self.goal_root_turn.take() {
                         let _ = self
                             .session
@@ -3179,17 +3190,87 @@ impl Driver {
                         .context("Continue with empty history after parked replay")?;
                 }
                 TurnOutcome::Done => {
-                    if self.stack.len() > 1
-                        && let Some(np) = self.pop_child_with_envelope(None, tx).await
-                    {
-                        next_prompt = np;
-                        continue;
+                    if self.stack.len() > 1 {
+                        let gate_outcome = self.consult_active_child_stop_gate(&cancel).await;
+                        if cancel.is_cancelled() {
+                            self.unwind_stack_to_root_and_discard_pending_input(
+                                StackUnwindReason::Cancelled,
+                                input_rx,
+                                tx,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                            reason,
+                            additional_context,
+                        } = gate_outcome
+                        {
+                            next_prompt =
+                                Self::stop_continuation_prompt(reason, additional_context);
+                            continue;
+                        }
+                        if let Some(np) = self.pop_child_with_envelope(None, tx).await {
+                            next_prompt = np;
+                            continue;
+                        }
+                    } else {
+                        let runner = self.hook_runner();
+                        if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                            reason,
+                            additional_context,
+                        } = self
+                            .consult_root_stop_gate(
+                                &runner,
+                                &crate::engine::agent::hooks::DefaultProcessEnv,
+                                &mut root_stop_gate,
+                                &cancel,
+                            )
+                            .await
+                            && !cancel.is_cancelled()
+                        {
+                            next_prompt =
+                                Self::stop_continuation_prompt(reason, additional_context);
+                            continue;
+                        }
+                        if cancel.is_cancelled() {
+                            self.pending_idle_reason =
+                                Some(crate::engine::IdleReason::Interrupted);
+                            self.unwind_stack_to_root_and_discard_pending_input(
+                                StackUnwindReason::Cancelled,
+                                input_rx,
+                                tx,
+                            )
+                            .await;
+                            return Ok(());
+                        }
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
                     return Ok(());
                 }
                 TurnOutcome::Return { fields } => {
+                    if self.stack.len() > 1 {
+                        let gate_outcome = self.consult_active_child_stop_gate(&cancel).await;
+                        if cancel.is_cancelled() {
+                            self.unwind_stack_to_root_and_discard_pending_input(
+                                StackUnwindReason::Cancelled,
+                                input_rx,
+                                tx,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                            reason,
+                            additional_context,
+                        } = gate_outcome
+                        {
+                            next_prompt =
+                                Self::stop_continuation_prompt(reason, additional_context);
+                            continue;
+                        }
+                    }
                     if let Some(np) = self.pop_child_with_envelope(Some(&fields), tx).await {
                         next_prompt = np;
                         continue;
@@ -3590,18 +3671,34 @@ impl Driver {
                 question,
                 respond_to,
             } => {
+                // Replay and every model/stop-hook round it unlocks share one
+                // cancellation authority. This makes ctrl+c cancel the tool,
+                // a child stop gate, or the root stop gate without a gap
+                // between replay and continuation.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let _cancel_guard = {
+                    *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel.clone());
+                    CancelSlotGuard {
+                        slot: self.cancel_current.clone(),
+                    }
+                };
                 let result = match Box::pin(self.replay_parked_interrupt_call(
                     interrupt_id,
                     *payload,
                     response,
                     *question,
                     tx,
+                    cancel.clone(),
                 ))
                 .await
                 {
                     Ok(()) => {
                         async {
-                            self.continue_after_parked_interrupt_replay(input_queue, tx)
+                            self.continue_after_parked_interrupt_replay(
+                                input_queue,
+                                tx,
+                                cancel,
+                            )
                                 .await?;
                             Ok(ParkedReplayOutcome::Completed)
                         }
@@ -4885,11 +4982,27 @@ impl Driver {
     /// normal `TurnOutcome::Done`.
     async fn run_stop_failure_hooks(&self, class: &crate::engine::model::InferenceErrorClass) {
         let match_value = crate::engine::agent::hooks::error_class_match_value(class);
-        self.fire_observe_hook(
+        let child = self.stack.last().filter(|_| self.stack.len() > 1).map(|frame| {
+            (
+                frame.agent.name.as_str(),
+                frame.answering.as_ref().map(|pending| pending.call_id.as_str()),
+            )
+        });
+        let snapshot = self.config.snapshot();
+        let runner = self.hook_runner();
+        crate::engine::agent::hooks::run_observe_hooks(
+            &runner,
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
             crate::config::extended::hooks::HookEvent::StopFailure,
             match_value,
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
             None,
             None,
+            child.map(|(subagent_type, _)| subagent_type),
+            child.and_then(|(_, subagent_id)| subagent_id),
             crate::engine::agent::hooks::ObserveFields {
                 error_class: Some(match_value),
                 ..Default::default()
@@ -4916,15 +5029,13 @@ impl Driver {
     /// other hook site) while tests can drive real `block` / `continue:false`
     /// decisions through a fake runner.
     ///
-    /// NEVER-REOPEN by construction: the latch is a LOCAL owned by the single
-    /// `run_user_input` invocation that runs this turn (`root_stop_gate`). It is
-    /// created fresh per turn (per originating user-turn id) and dropped on EVERY
-    /// exit path of that method — normal end, cancel, parked interrupt, drain
-    /// gate, and inference error alike — so no latch can outlive its turn, be
-    /// consulted after the turn's loop returns, or be resurrected by a
-    /// late/replayed boundary. The caller additionally re-checks the cancel token
-    /// AFTER this returns and before injecting any continuation, so a cancel that
-    /// races in DURING the hook cannot force another model round.
+    /// The latch belongs to one originating user turn. It is local during the
+    /// ordinary loop and moves into `parked_root_stop_gate` only while that
+    /// same turn is paused for human intervention; replay takes it back before
+    /// continuing. Every terminal/cancel/error path drops it, and every new
+    /// user turn starts from the default. The caller additionally re-checks the
+    /// cancel token after consultation, so a cancel racing the hook cannot
+    /// force another model round.
     async fn consult_root_stop_gate(
         &self,
         runner: &dyn crate::engine::agent::hooks::CommandRunner,
@@ -8503,6 +8614,7 @@ impl Driver {
                 Ok(outcome) => outcome,
                 Err(e) if crate::engine::interrupt::is_parked(&e) => {
                     tracing::info!(agent = %agent.name, "turn paused on parked interrupt");
+                    self.parked_root_stop_gate = Some(root_stop_gate);
                     self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                         code: "parked_interrupt".to_string(),
                     });

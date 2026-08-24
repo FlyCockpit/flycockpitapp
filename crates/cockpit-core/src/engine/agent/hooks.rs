@@ -63,6 +63,8 @@ pub(crate) const REASON_NONZERO_EXIT_PREFIX: &str = "hook exited with non-zero s
 pub(crate) const REASON_NO_EXIT_STATUS: &str = "hook exited without status";
 pub(crate) const REASON_PIPE_IO_FAILED: &str = "hook pipe I/O failed";
 pub(crate) const REASON_HOOK_CANCELLED: &str = "hook cancelled";
+pub(crate) const REASON_CONTAINMENT_ACTOR_UNAVAILABLE: &str =
+    "containment cleanup authority unavailable";
 pub(crate) const REASON_OUTPUT_NOT_JSON_OBJECT: &str = "output is not a JSON object";
 pub(crate) const REASON_MALFORMED_HOOK_OUTPUT: &str = "malformed hook output";
 pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
@@ -779,22 +781,22 @@ impl HookContainmentDropGuard {
 async fn terminate_and_prove_empty(
     handle: &crate::process_containment::ProcessContainmentHandle,
     lease: &crate::process_containment::ContainmentLease,
-) {
+) -> Result<(), crate::process_containment::ContainmentError> {
     // A hook execution is not settled while the containment oracle can still
     // see descendants. `Uncertain` is deliberately not converted into a hook
     // failure: doing so would return control while an untrusted descendant may
     // still be alive. Reconciliation remains cancellation-safe through the
     // drop guard and is retried here until the same generation is proven empty.
     loop {
-        let _ = handle.terminate(lease.clone()).await;
+        handle.terminate(lease.clone()).await?;
         if matches!(
-            handle.await_empty(lease.clone()).await,
-            Ok(crate::process_containment::EmptyOutcome::ProvenEmpty { generation })
+            handle.await_empty(lease.clone()).await?,
+            crate::process_containment::EmptyOutcome::ProvenEmpty { generation }
                 if generation == lease.generation()
         ) {
-            return;
+            return Ok(());
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -803,15 +805,11 @@ impl Drop for HookContainmentDropGuard {
         let Some(lease) = self.lease.take() else {
             return;
         };
-        let handle = self.handle.clone();
-        // Drop/cancellation cannot await, so transfer reconciliation to a
-        // short delivery task. Once the bounded actor accepts the lease, the
-        // actor owns all retries; this task does not run a cleanup loop.
-        // Normal timeout/completion paths await the barrier inline and disarm
-        // this guard before returning.
-        tokio::spawn(async move {
-            let _ = handle.reconcile_lease(lease).await;
-        });
+        // This synchronous unbounded ownership channel is consumed only by
+        // the containment actor. Drop never starts a detached task and never
+        // loses a lease merely because the ordinary bounded command queue is
+        // full. A closed channel honestly means the actor has already stopped.
+        let _ = self.handle.enqueue_reconciliation(lease);
     }
 }
 
@@ -828,6 +826,21 @@ impl CommandRunner for TokioCommandRunner {
         session_id: Uuid,
     ) -> HookRawOutput {
         let start = std::time::Instant::now();
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return HookRawOutput {
+                stdout: String::new(),
+                exit_code: None,
+                duration_ms: 0,
+                spawn_failed: false,
+                timeout: false,
+                failure_reason: Some(REASON_HOOK_CANCELLED),
+                output_truncated: false,
+            };
+        }
         let Some(containment) = self.containment.as_ref() else {
             return HookRawOutput {
                 stdout: String::new(),
@@ -883,15 +896,21 @@ impl CommandRunner for TokioCommandRunner {
             lease: Some(lease.clone()),
         };
         if lease.guarantee() != crate::process_containment::ContainmentGuarantee::Proven {
-            terminate_and_prove_empty(containment, &lease).await;
-            drop_guard.disarm();
+            let cleanup_owned = terminate_and_prove_empty(containment, &lease).await.is_ok();
+            if cleanup_owned {
+                drop_guard.disarm();
+            }
             return HookRawOutput {
                 stdout: String::new(),
                 exit_code: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 spawn_failed: true,
                 timeout: false,
-                failure_reason: Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+                failure_reason: Some(if cleanup_owned {
+                    REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED
+                } else {
+                    REASON_CONTAINMENT_ACTOR_UNAVAILABLE
+                }),
                 output_truncated: false,
             };
         }
@@ -972,7 +991,7 @@ impl CommandRunner for TokioCommandRunner {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled(), if cancellation_enabled => (false, None, false, false, false, None, false, false, true),
-                _ = overflow_rx.recv() => (false, None, false, false, false, None, false, true, false),
+                Some(()) = overflow_rx.recv() => (false, None, false, false, false, None, false, true, false),
                 completed = tokio::time::timeout(timeout, operation) => match completed {
                 Ok((stdin_result, (stdout_result, stdout_pipe_failed), (stderr_truncated, stderr_pipe_failed), wait_result)) => (
                     stdin_result.is_err(),
@@ -989,8 +1008,10 @@ impl CommandRunner for TokioCommandRunner {
                 }
             };
 
-        terminate_and_prove_empty(containment, &lease).await;
-        drop_guard.disarm();
+        let cleanup_owned = terminate_and_prove_empty(containment, &lease).await.is_ok();
+        if cleanup_owned {
+            drop_guard.disarm();
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let (stdout_bytes, stdout_truncated) = stdout_result.unwrap_or_default();
@@ -1002,7 +1023,9 @@ impl CommandRunner for TokioCommandRunner {
             duration_ms,
             spawn_failed: stdin_failed,
             timeout: timed_out,
-            failure_reason: if cancelled {
+            failure_reason: if !cleanup_owned {
+                Some(REASON_CONTAINMENT_ACTOR_UNAVAILABLE)
+            } else if cancelled {
                 Some(REASON_HOOK_CANCELLED)
             } else if timed_out {
                 Some(REASON_HOOK_TIMED_OUT)
@@ -1627,6 +1650,11 @@ pub(crate) async fn run_stop_hooks_cancellable(
     state: &mut StopGateState,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> StopHookOutcome {
+    // A stop consultation cancelled before entry is not a lifecycle boundary:
+    // do not resolve commands, spawn handlers, or write misleading hook rows.
+    if cancel.is_cancelled() {
+        return StopHookOutcome::End;
+    }
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
         if let Err(error) = db
@@ -1686,6 +1714,12 @@ pub(crate) async fn run_stop_hooks_cancellable(
     let mut feedback = StopGateFeedback::default();
 
     for hook in hooks {
+        // Cancellation ends the consultation between handlers. A handler that
+        // was already running is cancelled by `run_cancellable`; later
+        // handlers must never be spawned for an ended turn.
+        if cancel.is_cancelled() {
+            break;
+        }
         let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
@@ -1779,6 +1813,10 @@ pub(crate) async fn run_stop_hooks_cancellable(
             subagent_id,
         )
         .await;
+
+        if cancel.is_cancelled() {
+            break;
+        }
 
         match decision {
             HookDecision::Continue { .. } => {
@@ -1986,29 +2024,29 @@ pub(crate) async fn run_observe_hooks(
 
 /// Stable, per-variant `&'static str` match value for a `stopFailure` hook.
 ///
-/// Reuses the inference error-class vocabulary
-/// ([`InferenceErrorClass::as_str`]) so config matchers and tests share ONE
-/// token set rather than a second parallel enum (F3). The two data-bearing
-/// variants (`Http`, `Other`) collapse to a stable coarse token because the
-/// helper must return `&'static str`.
+/// Maps the runtime enum onto the constants owned by hook configuration, so
+/// config validation, runtime dispatch, docs, and tests share one closed token
+/// vocabulary. The two data-bearing variants (`Http`, `Other`) collapse to
+/// stable coarse tokens rather than exposing volatile diagnostics.
 pub(crate) fn error_class_match_value(
     class: &crate::engine::model::InferenceErrorClass,
 ) -> &'static str {
+    use crate::config::extended::hooks as vocabulary;
     use crate::engine::model::InferenceErrorClass as C;
     match class {
-        C::TimeoutTtft => "timeout_ttft",
-        C::TimeoutIdle => "timeout_idle",
-        C::Network => "network",
-        C::Http(_) => "http",
-        C::UtilityTimeout => "utility_timeout",
-        C::MissingToolEntitlement { .. } => "missing_tool_entitlement",
-        C::ClientSideToolsUnsupported => "client_side_tools_unsupported",
-        C::ResponsesToolIdentity => "responses_tool_identity",
-        C::ProviderNotConfigured => "provider_not_configured",
-        C::ProviderRateLimit => "provider_rate_limit",
-        C::BillingOrQuotaExhausted => "billing_or_quota_exhausted",
-        C::UnrenderableWireField => "unrenderable_wire_field",
-        C::Other(_) => "other",
+        C::TimeoutTtft => vocabulary::ERROR_CLASS_TIMEOUT_TTFT,
+        C::TimeoutIdle => vocabulary::ERROR_CLASS_TIMEOUT_IDLE,
+        C::Network => vocabulary::ERROR_CLASS_NETWORK,
+        C::Http(_) => vocabulary::ERROR_CLASS_HTTP,
+        C::UtilityTimeout => vocabulary::ERROR_CLASS_UTILITY_TIMEOUT,
+        C::MissingToolEntitlement { .. } => vocabulary::ERROR_CLASS_MISSING_TOOL_ENTITLEMENT,
+        C::ClientSideToolsUnsupported => vocabulary::ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED,
+        C::ResponsesToolIdentity => vocabulary::ERROR_CLASS_RESPONSES_TOOL_IDENTITY,
+        C::ProviderNotConfigured => vocabulary::ERROR_CLASS_PROVIDER_NOT_CONFIGURED,
+        C::ProviderRateLimit => vocabulary::ERROR_CLASS_PROVIDER_RATE_LIMIT,
+        C::BillingOrQuotaExhausted => vocabulary::ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED,
+        C::UnrenderableWireField => vocabulary::ERROR_CLASS_UNRENDERABLE_WIRE_FIELD,
+        C::Other(_) => vocabulary::ERROR_CLASS_OTHER,
     }
 }
 

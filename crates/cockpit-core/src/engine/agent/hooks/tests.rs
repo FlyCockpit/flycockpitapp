@@ -1469,19 +1469,26 @@ async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
 #[test]
 fn error_class_match_value_is_stable_per_variant() {
     use crate::engine::model::InferenceErrorClass as C;
-    // Fixed variants reuse the class's own snake_case vocabulary; the two
-    // data-bearing variants collapse to a stable coarse `&'static str` token.
-    assert_eq!(error_class_match_value(&C::TimeoutTtft), "timeout_ttft");
-    assert_eq!(error_class_match_value(&C::TimeoutIdle), "timeout_idle");
-    assert_eq!(error_class_match_value(&C::Network), "network");
-    assert_eq!(error_class_match_value(&C::Http(503)), "http");
-    assert_eq!(
+    let runtime_values = [
+        error_class_match_value(&C::TimeoutTtft),
+        error_class_match_value(&C::TimeoutIdle),
+        error_class_match_value(&C::Network),
+        error_class_match_value(&C::Http(503)),
+        error_class_match_value(&C::UtilityTimeout),
+        error_class_match_value(&C::MissingToolEntitlement {
+            feature: "client_side_tools".to_string(),
+        }),
+        error_class_match_value(&C::ClientSideToolsUnsupported),
+        error_class_match_value(&C::ResponsesToolIdentity),
+        error_class_match_value(&C::ProviderNotConfigured),
+        error_class_match_value(&C::ProviderRateLimit),
         error_class_match_value(&C::BillingOrQuotaExhausted),
-        "billing_or_quota_exhausted"
-    );
-    assert_eq!(
+        error_class_match_value(&C::UnrenderableWireField),
         error_class_match_value(&C::Other("weird".to_string())),
-        "other"
+    ];
+    assert_eq!(
+        runtime_values.as_slice(),
+        crate::config::extended::hooks::HOOK_ERROR_CLASS_MATCH_VALUES
     );
 }
 
@@ -2292,6 +2299,42 @@ async fn stop_hook_continuation_state_machine() {
     }
 }
 
+#[tokio::test]
+async fn cancelled_stop_gate_does_not_spawn_or_record_handlers() {
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"block","reason":"must not run"}"#,
+    ));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let mut state = StopGateState::default();
+    let outcome = run_stop_hooks_cancellable(
+        &runner,
+        &FakeProcessEnv::with_default_resolution(),
+        &registry(vec![test_hook(
+            HookEvent::Stop,
+            vec!["s".to_string()],
+            Some(vec!["end_turn".to_string()]),
+            BTreeMap::new(),
+            5,
+        )]),
+        HookEvent::Stop,
+        "end_turn",
+        sid,
+        workspace(),
+        &db,
+        None,
+        &mut state,
+        &cancel,
+    )
+    .await;
+    assert_eq!(outcome, StopHookOutcome::End);
+    assert!(runner.invocations().is_empty());
+    assert!(hook_run_statuses(&db, sid).await.is_empty());
+    assert_eq!(state.continuation_count, 0);
+    assert!(!state.stop_hook_active);
+}
+
 /// The 8-cap grants EXACTLY `STOP_HOOK_MAX_CONTINUATIONS` continuations for one
 /// latch, then force-ends the turn WITHOUT reconsulting (or recording) any stop
 /// hook — the cap is enforced solely at the entry check. Driven by threading ONE
@@ -2711,7 +2754,10 @@ impl HookDocumentationContract {
                     HookMatcherPolicy::Closed(values) => ("closed", values.to_vec()),
                     HookMatcherPolicy::CanonicalToolName => ("canonicalToolName", Vec::new()),
                     HookMatcherPolicy::ChildAgentType => ("childAgentType", Vec::new()),
-                    HookMatcherPolicy::ErrorClass => ("errorClass", Vec::new()),
+                    HookMatcherPolicy::ErrorClass => (
+                        "errorClass",
+                        crate::config::extended::hooks::HOOK_ERROR_CLASS_MATCH_VALUES.to_vec(),
+                    ),
                 };
                 let gate = match policy.gate {
                     HookGate::Observe => "observe",
@@ -2777,6 +2823,8 @@ impl HookDocumentationContract {
                 REASON_SPAWN_FAILED,
                 REASON_EXECUTABLE_NOT_FOUND,
                 REASON_MALFORMED_JSON_OUTPUT,
+                REASON_OUTPUT_NOT_JSON_OBJECT,
+                REASON_MALFORMED_HOOK_OUTPUT,
                 REASON_HOOK_TIMED_OUT,
                 REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
                 REASON_OUTPUT_LIMIT_EXCEEDED,
@@ -2784,6 +2832,10 @@ impl HookDocumentationContract {
                 REASON_NO_EXIT_STATUS,
                 REASON_HOOK_CANCELLED,
                 REASON_PIPE_IO_FAILED,
+                REASON_CONTAINMENT_ACTOR_UNAVAILABLE,
+                REASON_UNEXPECTED_PRE_TOOL_BLOCK,
+                REASON_UNEXPECTED_STOP_DENY,
+                REASON_UNKNOWN_OR_MISSING_DECISION,
             ],
             unsupported_formats: vec![
                 "toml",

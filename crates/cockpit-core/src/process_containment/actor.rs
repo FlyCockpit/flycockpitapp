@@ -71,9 +71,6 @@ enum Op {
         lease: ContainmentLease,
         reply: Reply<Result<EmptyOutcome, ContainmentError>>,
     },
-    ReconcileLease {
-        lease: ContainmentLease,
-    },
     Recover {
         reply: Reply<Result<Vec<(Uuid, EmptyOutcome)>, ContainmentError>>,
     },
@@ -116,6 +113,7 @@ struct LiveEntry {
 #[derive(Clone)]
 pub struct ProcessContainmentHandle {
     tx: mpsc::Sender<Op>,
+    reconciliation_tx: mpsc::UnboundedSender<ContainmentLease>,
 }
 
 impl ProcessContainmentHandle {
@@ -237,14 +235,19 @@ impl ProcessContainmentHandle {
         Self::await_reply(rx).await?
     }
 
-    /// Transfer cleanup ownership back to the actor after a caller future is
-    /// dropped. Delivery is backpressured; once accepted, no external retry
-    /// task owns the lease.
-    pub(crate) async fn reconcile_lease(
+    /// Transfer cleanup ownership back to the actor from a caller's `Drop`.
+    ///
+    /// This deliberately bypasses the bounded request queue: cleanup
+    /// ownership must not be rejected during queue saturation, and `Drop`
+    /// cannot await backpressure. The receiver is actor-owned and is drained
+    /// before actor shutdown completes.
+    pub(crate) fn enqueue_reconciliation(
         &self,
         lease: ContainmentLease,
     ) -> Result<(), ContainmentError> {
-        self.send_owned(Op::ReconcileLease { lease }).await
+        self.reconciliation_tx
+            .send(lease)
+            .map_err(|_| ContainmentError::ActorStopped)
     }
 
     /// Startup recovery for durable rows.
@@ -322,7 +325,11 @@ impl ProcessContainmentActor {
     /// Start with an injected adapter (tests / composition).
     pub fn start(db: Db, adapter: SharedAdapter) -> Self {
         let (tx, rx) = mpsc::channel(CONTAINMENT_QUEUE_CAPACITY);
-        let handle = ProcessContainmentHandle { tx: tx.clone() };
+        let (reconciliation_tx, reconciliation_rx) = mpsc::unbounded_channel();
+        let handle = ProcessContainmentHandle {
+            tx: tx.clone(),
+            reconciliation_tx,
+        };
         let join = thread::Builder::new()
             .name("process-containment".into())
             .spawn(move || {
@@ -335,7 +342,7 @@ impl ProcessContainmentActor {
                     .enable_all()
                     .build()
                     .expect("containment runtime");
-                rt.block_on(actor_loop(db, adapter, rx));
+                rt.block_on(actor_loop(db, adapter, rx, reconciliation_rx));
                 // Drop runtime without blocking forever on stray tasks.
                 rt.shutdown_background();
             })
@@ -358,20 +365,26 @@ impl ProcessContainmentActor {
 
 impl Drop for ProcessContainmentActor {
     fn drop(&mut self) {
-        // Best-effort shutdown: never block the daemon exit path on a full
-        // queue or a wedged actor. try_send + detach join when inside Tokio.
-        let (reply, rx) = oneshot::channel();
-        let _ = self.handle.tx.try_send(Op::Shutdown { reply });
-        if let Some(join) = self.join.take() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                std::thread::spawn(move || {
-                    let _ = rx.blocking_recv();
-                    let _ = join.join();
-                });
-            } else {
+        // The explicit daemon shutdown path closes intake and proves all
+        // containments empty before dropping this owner. This fallback asks
+        // the actor to drain actor-owned reconciliation/live leases as well;
+        // inside Tokio the blocking join rides on a plain thread so the async
+        // executor itself is not blocked.
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let tx = self.handle.tx.clone();
+        let shutdown = move || {
+            let (reply, rx) = oneshot::channel();
+            if tx.blocking_send(Op::Shutdown { reply }).is_ok() {
                 let _ = rx.blocking_recv();
-                let _ = join.join();
             }
+            let _ = join.join();
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(shutdown);
+        } else {
+            shutdown();
         }
     }
 }
@@ -401,6 +414,7 @@ async fn actor_loop(
     db: Db,
     adapter: SharedAdapter,
     mut rx: mpsc::Receiver<Op>,
+    mut reconciliation_rx: mpsc::UnboundedReceiver<ContainmentLease>,
 ) {
     let mut state = ActorState {
         db,
@@ -413,10 +427,26 @@ async fn actor_loop(
     };
     loop {
         let op = if state.pending_reconciliation.is_empty() {
-            rx.recv().await
+            tokio::select! {
+                biased;
+                op = rx.recv() => op,
+                lease = reconciliation_rx.recv() => {
+                    if let Some(lease) = lease {
+                        enqueue_pending_reconciliation(&mut state, lease);
+                    }
+                    continue;
+                }
+            }
         } else {
             tokio::select! {
+                biased;
                 op = rx.recv() => op,
+                lease = reconciliation_rx.recv() => {
+                    if let Some(lease) = lease {
+                        enqueue_pending_reconciliation(&mut state, lease);
+                    }
+                    continue;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
                     reconcile_one_pending(&mut state).await;
                     continue;
@@ -426,6 +456,11 @@ async fn actor_loop(
         let Some(op) = op else { break };
         match op {
             Op::Shutdown { reply } => {
+                drain_shutdown_reconciliation(
+                    &mut state,
+                    &mut reconciliation_rx,
+                )
+                .await;
                 let _ = reply.send(());
                 break;
             }
@@ -471,7 +506,7 @@ async fn actor_loop(
                 )
                 .await;
                 if let Err(Ok(lease)) = reply.send(result) {
-                    state.pending_reconciliation.push(lease);
+                    enqueue_pending_reconciliation(&mut state, lease);
                 }
             }
             Op::CreateAndSpawnWithIo {
@@ -499,7 +534,7 @@ async fn actor_loop(
                     // The requester was cancelled after allocation. Ownership
                     // stays with the actor, so reclaim the unpublished lease
                     // instead of leaving a live group with no external owner.
-                    state.pending_reconciliation.push(lease);
+                    enqueue_pending_reconciliation(&mut state, lease);
                 }
             }
             Op::CreateContainerAndExec {
@@ -532,9 +567,6 @@ async fn actor_loop(
             Op::AwaitEmpty { lease, reply } => {
                 let result = await_empty_one(&mut state, lease).await;
                 let _ = reply.send(result);
-            }
-            Op::ReconcileLease { lease } => {
-                state.pending_reconciliation.push(lease);
             }
             Op::Recover { reply } => {
                 let result = recover_all(&mut state).await;
@@ -569,6 +601,46 @@ async fn actor_loop(
                 }
                 let _ = reply.send(());
             }
+        }
+    }
+}
+
+fn enqueue_pending_reconciliation(state: &mut ActorState, lease: ContainmentLease) {
+    let duplicate = state.pending_reconciliation.iter().any(|pending| {
+        pending.containment_id == lease.containment_id && pending.generation == lease.generation
+    });
+    if !duplicate {
+        state.pending_reconciliation.push(lease);
+    }
+}
+
+async fn drain_shutdown_reconciliation(
+    state: &mut ActorState,
+    reconciliation_rx: &mut mpsc::UnboundedReceiver<ContainmentLease>,
+) {
+    state.intake_closed = true;
+    while let Ok(lease) = reconciliation_rx.try_recv() {
+        enqueue_pending_reconciliation(state, lease);
+    }
+    let live: Vec<_> = state
+        .live
+        .iter()
+        .filter(|(_, entry)| entry.record.state.is_nonempty())
+        .map(|(containment_id, entry)| ContainmentLease {
+            containment_id: *containment_id,
+            session_id: entry.record.session_id,
+            generation: entry.record.generation,
+            guarantee: entry.record.guarantee,
+            token: entry.lease_token.clone(),
+        })
+        .collect();
+    for lease in live {
+        enqueue_pending_reconciliation(state, lease);
+    }
+    while !state.pending_reconciliation.is_empty() {
+        reconcile_one_pending(state).await;
+        if !state.pending_reconciliation.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

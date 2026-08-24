@@ -355,7 +355,13 @@ Matcher policies:
 - **canonicalToolName** — a canonical tool name (ASCII alphanumeric plus
   `_`, `-`, `.`, `:`, `/`). Used by the tool-applicable events.
 - **childAgentType** — a canonical child-agent type identifier.
-- **errorClass** — a canonical inference error class identifier.
+- **errorClass** — one of `timeout_ttft`, `timeout_idle`, `network`, `http`,
+  `utility_timeout`, `missing_tool_entitlement`,
+  `client_side_tools_unsupported`, `responses_tool_identity`,
+  `provider_not_configured`, `provider_rate_limit`,
+  `billing_or_quota_exhausted`, `unrenderable_wire_field`, or `other`.
+  Numeric HTTP statuses and provider-specific diagnostics intentionally map to
+  the stable coarse `http` and `other` tokens.
 
 A normal root-turn `stop` and a child-only `subagentStop` are distinct events:
 `stop` fires for the root turn's normal completion; `subagentStop` fires only
@@ -498,12 +504,14 @@ it is not a gate failure. Failed conditions are:
 - `hook exited with non-zero status` (followed by the numeric exit status)
 - `hook exited without status` (the process crashed or its wait handle failed)
 - `hook pipe I/O failed` (stdin delivery or stdout/stderr capture failed)
-- `unexpected decision 'block' for pre-tool event`, `unexpected decision
-  'deny' for stop event`, or `unknown or missing decision` when a gate uses the
-  wrong decision vocabulary
+- `unexpected decision 'block' for pre-tool event`, `unexpected decision 'deny' for stop event`,
+  or `unknown or missing decision` when a gate uses the wrong decision vocabulary
 - `hook cancelled` (the owning turn was cancelled; Cockpit terminates the
   containment and waits for the same-generation ProvenEmpty result before the
   runner returns)
+- `containment cleanup authority unavailable` (the containment actor stopped
+  before it could prove the hook's process tree empty; the drop path still
+  attempts to transfer ownership through the actor-owned reconciliation queue)
 
 Native hook execution additionally requires the host containment adapter to
 support atomic process placement with retained stdin/stdout/stderr endpoints.

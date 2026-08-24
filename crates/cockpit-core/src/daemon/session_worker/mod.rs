@@ -504,7 +504,7 @@ mod effective_sandbox;
 mod handle;
 mod helpers;
 mod lifecycle;
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 mod remote;
 mod run;
 #[cfg(test)]
@@ -522,7 +522,7 @@ pub use handle::{
     ReplaceConfigSnapshotResult, SessionConfigHandle, SessionConfigSnapshot, SessionWork,
     SessionWorkerHandle, TurnOutcome, UserMessageProbeResult, spawn,
 };
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 pub use remote::{
     RemoteQueueMutationReceiptV1, RemoteQueueOperation, RemoteSendDecision,
     reserve_remote_send_operation,

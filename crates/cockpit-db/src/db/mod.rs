@@ -3112,6 +3112,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "remote")]
     async fn session_delete_cascades_to_all_tables() {
         let db = Db::open_in_memory().unwrap();
         let session_id = Uuid::new_v4();

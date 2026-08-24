@@ -3672,7 +3672,7 @@ mod proto_fixture_tests {
     }
 }
 
-#[cfg(all(test, feature = "remote"))]
+#[cfg(test)]
 mod golden_wire_fixtures {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};

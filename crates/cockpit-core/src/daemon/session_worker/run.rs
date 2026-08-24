@@ -399,7 +399,7 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
     }
 }
 
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 pub(super) fn remote_queue_mutation_response(
     receipt: RemoteQueueMutationReceiptV1,
 ) -> proto::RemoveQueuedUserMessageResult {
@@ -456,7 +456,7 @@ pub(super) fn remote_queue_mutation_response(
 /// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
 /// the ledger row; the marker is unchanged from main; the cross-record atomicity
 /// is the V2 cutover's job.
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 pub(super) async fn reserve_remote_send_operation_impl(
     db: &crate::db::Db,
     remote: &crate::daemon::session_worker::RemoteQueueOperation,
@@ -873,7 +873,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     Ok(replayed)
 }
 
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 struct RemoteQueueMutationCommit<'a> {
     session: &'a Session,
     queue: &'a crate::engine::message::UserSubmissionQueue,
@@ -885,7 +885,7 @@ struct RemoteQueueMutationCommit<'a> {
     redaction: &'a SharedRedactionTable,
 }
 
-#[cfg(any(feature = "remote", test))]
+#[cfg(feature = "remote")]
 async fn commit_remote_queue_mutation(
     input: RemoteQueueMutationCommit<'_>,
 ) -> std::result::Result<RemoteQueueMutationReceiptV1, proto::ErrorPayload> {

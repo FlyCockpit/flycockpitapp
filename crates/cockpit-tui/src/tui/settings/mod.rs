@@ -252,6 +252,7 @@ fn apply_settings_patch_via_daemon(
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
         candidate: desired.clone(),
         fields,
+        materialize: false,
         denylist,
     };
     let (project_root, layer) = config_layer_request(path, project_root)?;
@@ -287,7 +288,35 @@ pub(super) fn apply_typed_settings_document_edit(
     apply_json_merge_patch_local(&mut document, patch);
     let desired: ExtendedConfig = serde_json::from_value(document)
         .map_err(|error| format!("invalid typed settings edit: {error}"))?;
-    apply_settings_patch_via_daemon(path, project_root, &authority_base, &desired, &revision)
+    let desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+    let fields = changed_extended_fields(&authority_base, &desired_value)?;
+    let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
+    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        candidate: desired,
+        fields,
+        materialize: true,
+        denylist,
+    };
+    let (project_root, layer) = config_layer_request(path, project_root)?;
+    run_settings_daemon(async move {
+        let client = settings_daemon_client()
+            .await
+            .map_err(|error| error.to_string())?;
+        match client
+            .request(Request::ApplyExtendedConfigPatch {
+                project_root,
+                layer,
+                patch,
+                expected_revision: revision,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
+            Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
+            Err(error) => Err(error.to_string()),
+        }
+    })
 }
 
 fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_json::Value) {
@@ -295,9 +324,10 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
         *target = patch;
         return;
     };
-    let Some(target) = target.as_object_mut() else {
-        return;
-    };
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target.as_object_mut().expect("normalized object");
     for (key, value) in patch {
         if value.is_null() {
             target.remove(&key);

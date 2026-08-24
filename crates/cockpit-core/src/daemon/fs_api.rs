@@ -317,11 +317,14 @@ pub async fn apply_extended_config_patch(
             let target = settings_layer_target(&root, layer)?;
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-            let raw = match std::fs::read(&target) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}\n".to_vec(),
+            let (raw, existed) = match std::fs::read(&target) {
+                Ok(bytes) => (bytes, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (b"{}\n".to_vec(), false)
+                }
                 Err(error) => return Err(internal(error)),
             };
+            let materialize = patch.materialize;
             let current_hash = content_hash(&raw);
             if current_hash != expected_revision {
                 return Err(ErrorPayload {
@@ -371,7 +374,7 @@ pub async fn apply_extended_config_patch(
             )
             .map_err(bad_request_config)?;
             let desired_hash = content_hash(&merged);
-            let config_generation = if desired_hash != current_hash {
+            let config_generation = if desired_hash != current_hash || (materialize && !existed) {
                 cockpit_config::config::write_config_bytes_atomic(&target, &merged)
                     .map_err(internal)?;
                 crate::daemon::server::inventory::publish_committed_config_generation()

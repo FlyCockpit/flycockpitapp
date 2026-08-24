@@ -19,6 +19,9 @@ pub enum CockpitConfigLayer {
 pub struct ExtendedConfigPatch {
     pub candidate: cockpit_config::config::extended::ExtendedConfig,
     pub fields: Vec<ExtendedConfigField>,
+    /// Create the selected layer even when typed values are unchanged.
+    #[serde(default)]
+    pub materialize: bool,
     #[serde(default)]
     pub denylist: Vec<DenylistMutation>,
 }

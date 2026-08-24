@@ -123,12 +123,14 @@ fn tui_agent_authority_is_daemon_owned() {
     ] {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }
+    assert!(!production.contains("std::fs::write("));
     assert_eq!(
-        production.matches("std::fs::write(").count(),
+        production
+            .matches("cockpit_config::config::write_config_bytes_atomic(&staging.path")
+            .count(),
         1,
-        "agent UI may write only its isolated external-editor staging file"
+        "agent UI may seed only its isolated private editor staging file"
     );
-    assert!(production.contains("std::fs::write(&staging.path, text)"));
 }
 
 #[test]
@@ -184,12 +186,20 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "std::fs::remove_file",
         "std::fs::remove_dir",
         "std::fs::rename",
+        "std::fs::copy",
+        "std::fs::hard_link",
+        "std::os::unix::fs::symlink",
+        "std::os::windows::fs::symlink_file",
+        "std::os::windows::fs::symlink_dir",
         "std::fs::create_dir",
         "std::fs::create_dir_all",
         "std::fs::set_permissions",
         "std::fs::File::create",
         "File::create",
         "std::fs::OpenOptions",
+        "std::fs::File::options",
+        ".set_len(",
+        ".write(",
         "tokio::fs::write",
         "tokio::fs::remove_file",
         "tokio::fs::create_dir_all",
@@ -200,10 +210,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
     // exemption. Adding a second mutation in an allowed host-integration file
     // must therefore update this inventory explicitly.
     const ALLOWED_LINES: &[(&str, &str)] = &[
-        (
-            "crates/cockpit-tui/src/tui/settings/agents_page.rs",
-            "std::fs::write(&staging.path, text)",
-        ),
         (
             "crates/cockpit-tui/src/tui/app/panes.rs",
             "if let Err(error) = std::fs::write(&path, effect.text_before_launch) {",
@@ -281,11 +287,15 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             "lock.write_all(&bytes)?;",
         ),
     ];
-    fn visit(path: &Path, findings: &mut Vec<String>) {
+    fn visit(
+        path: &Path,
+        findings: &mut Vec<String>,
+        allowed_hits: &mut std::collections::HashMap<(&'static str, &'static str), usize>,
+    ) {
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                visit(&path, findings);
+                visit(&path, findings, allowed_hits);
                 continue;
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
@@ -314,8 +324,11 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                     }
                     let allowed = ALLOWED_LINES
                         .iter()
-                        .any(|(file, exact)| relative == *file && line.trim() == *exact);
-                    if !allowed {
+                        .find(|(file, exact)| relative == *file && line.trim() == *exact);
+                    if let Some(allowed) = allowed {
+                        *allowed_hits.entry(*allowed).or_default() += 1;
+                    }
+                    if allowed.is_none() {
                         findings.push(format!("{relative}:{}: {mutation}", line_number + 1));
                     }
                 }
@@ -350,7 +363,21 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         }
     }
     let mut findings = Vec::new();
-    visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    let mut allowed_hits = std::collections::HashMap::new();
+    visit(
+        &repo_root().join("crates/cockpit-tui/src"),
+        &mut findings,
+        &mut allowed_hits,
+    );
+    for allowed in ALLOWED_LINES {
+        let count = allowed_hits.get(allowed).copied().unwrap_or_default();
+        if count != 1 {
+            findings.push(format!(
+                "allowlisted mutation must occur exactly once: {}: {:?} (found {count})",
+                allowed.0, allowed.1
+            ));
+        }
+    }
     assert!(
         findings.is_empty(),
         "unowned TUI filesystem mutations:\n{}",

@@ -289,6 +289,7 @@ pub async fn get_extended_config_snapshot(
     owner: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
+    let redaction = ctx.current_global_redaction();
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
@@ -320,6 +321,7 @@ pub async fn get_extended_config_snapshot(
                     .collect();
                 config.redact.denylist.clear();
                 config.image_generation = config.image_generation.redacted_for_snapshot();
+                config = redact_extended_config_projection(config, &redaction)?;
                 let id = Uuid::new_v4();
                 drop(guard);
                 settings_capabilities()
@@ -355,6 +357,40 @@ pub async fn get_extended_config_snapshot(
         }),
     )
     .await
+}
+
+fn redact_extended_config_projection(
+    config: cockpit_config::config::extended::ExtendedConfig,
+    redaction: &crate::redact::RedactionTable,
+) -> Result<cockpit_config::config::extended::ExtendedConfig, ErrorPayload> {
+    fn scrub_value(value: &mut serde_json::Value, redaction: &crate::redact::RedactionTable) {
+        match value {
+            serde_json::Value::String(text) => *text = redaction.scrub(text),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    scrub_value(value, redaction);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    scrub_value(value, redaction);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    let mut value = serde_json::to_value(config).map_err(internal)?;
+    scrub_value(&mut value, redaction);
+    // Type-preserving deserialization is the fail-closed boundary: if a
+    // secret literal occupied an enum/discriminator or otherwise made the
+    // projection invalid, do not emit a subtly altered authority document.
+    serde_json::from_value(value).map_err(|error| {
+        internal(format!(
+            "redacted settings projection no longer satisfies its typed schema: {error}"
+        ))
+    })
 }
 
 /// Apply a client-generated JSON merge patch under the daemon's config lock.

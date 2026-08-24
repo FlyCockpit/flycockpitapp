@@ -1513,10 +1513,9 @@ async fn resolve_assistant_agent_from_db(
     db: &crate::db::Db,
     name: &str,
 ) -> Result<Option<AgentDef>> {
-    let Some(row) = db.get_assistant(name).await? else {
-        return Ok(None);
-    };
-    Ok(Some(crate::assistants::load_from_row(&row)?.agent))
+    Ok(crate::assistants::load_verified(db, name)
+        .await?
+        .map(|assistant| assistant.agent))
 }
 
 /// Discover every agent visible at `cwd`: each built-in (overridden when

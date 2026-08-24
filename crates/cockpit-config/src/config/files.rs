@@ -1695,6 +1695,11 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
+        let Some((held_source, _, expected_identity)) =
+            read_file_nofollow_with_identity(source, false, false)?
+        else {
+            anyhow::bail!("rename source disappeared: {}", source.display());
+        };
         let (source_parent, source_name) = open_parent_directory_nofollow(source)?;
         let (destination_parent, destination_name) = open_parent_directory_nofollow(destination)?;
         let source_name_c = path_component_cstring(&source_name)?;
@@ -1789,6 +1794,26 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
         }
         source_parent.sync_all()?;
         destination_parent.sync_all()?;
+        let Some((destination_file, _, actual_identity)) =
+            read_file_nofollow_with_identity(destination, false, false)?
+        else {
+            anyhow::bail!(
+                "rename destination disappeared before identity verification: {}",
+                destination.display()
+            );
+        };
+        if actual_identity != expected_identity {
+            anyhow::bail!(
+                "rename source identity changed during no-replace move from {} to {}",
+                source.display(),
+                destination.display()
+            );
+        }
+        // Keep both handles alive through the post-move identity proof. This
+        // binds the accepted destination to the exact regular file validated
+        // before any namespace operation.
+        drop(destination_file);
+        drop(held_source);
         return Ok(());
     }
     #[cfg(windows)]
@@ -1812,6 +1837,17 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
         let _ = (source, destination);
         anyhow::bail!("identity-bound config rename is unsupported on this platform")
     }
+}
+
+pub(crate) fn same_file_identity_nofollow(left: &Path, right: &Path) -> Result<bool> {
+    let Some((_, _, left_identity)) = read_file_nofollow_with_identity(left, false, false)? else {
+        return Ok(false);
+    };
+    let Some((_, _, right_identity)) = read_file_nofollow_with_identity(right, false, false)?
+    else {
+        return Ok(false);
+    };
+    Ok(left_identity == right_identity)
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {

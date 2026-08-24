@@ -2194,6 +2194,11 @@ pub struct AssistantSummary {
     pub home_dir: String,
     pub config_json: String,
     pub content_hash: String,
+    /// Opaque CAS token for the registry binding itself. Unlike the editable
+    /// definition revision this remains available when definition bytes are
+    /// missing or corrupt, so the user can still unregister a damaged row.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub registration_revision: String,
     /// Daemon-read exact authored definition; absent when the registered file
     /// cannot be safely opened or parsed.
     pub definition_markdown: Option<String>,

@@ -25,6 +25,21 @@ pub(super) enum GenerationNodeId {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentId(pub String);
+impl AgentId {
+    pub(super) fn workspace(name: &str) -> Self {
+        Self(format!("workspace:{name}"))
+    }
+
+    pub(super) fn assistant(name: &str) -> Self {
+        Self(format!("assistant:{name}"))
+    }
+
+    pub(super) fn name(&self) -> &str {
+        self.0
+            .split_once(':')
+            .map_or(self.0.as_str(), |(_, name)| name)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProviderId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

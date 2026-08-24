@@ -136,31 +136,38 @@ pub fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
     })
 }
 
-pub fn load_from_row(row: &AssistantRow) -> Result<AssistantDef> {
-    validate_row_home(row)?;
-    let config: AssistantConfig = serde_json::from_str(&row.config_json)
-        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
-    if config.installation_id.is_nil() {
-        bail!(
-            "assistant `{}` has no daemon-owned installation ID",
-            row.name
-        );
-    }
-    let definition = load_from_home(&row.name, Path::new(&row.home_dir))?;
-    let expected_agent_id = format!("local/{}", config.installation_id);
-    if definition
-        .agent
-        .vnext
-        .as_ref()
-        .map(|vnext| vnext.agent_id.as_str())
-        != Some(expected_agent_id.as_str())
+/// Load an authority-bearing assistant definition through the one daemon
+/// coordinator.  Callers must never combine a registry row obtained at one
+/// instant with an uncoordinated pathname read at another.
+pub async fn load_verified(db: &Db, name: &str) -> Result<Option<AssistantDef>> {
+    let Some(snapshot) = snapshot(db, name).await? else {
+        return Ok(None);
+    };
+    let markdown = snapshot.definition_markdown.with_context(|| {
+        format!(
+            "assistant `{name}` definition is unavailable: {}",
+            snapshot
+                .definition_diagnostic
+                .as_deref()
+                .unwrap_or("definition snapshot is incoherent")
+        )
+    })?;
+    if snapshot
+        .definition_revision
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || snapshot.definition_diagnostic.is_some()
     {
-        bail!(
-            "assistant `{}` definition identity does not match its daemon-owned installation ID",
-            row.name
-        );
+        bail!("assistant `{name}` definition snapshot is incoherent");
     }
-    Ok(definition)
+    let agent = crate::agents::parse_daemon_local_markdown(&markdown, name)?;
+    validate_definition_identity(&snapshot.row, &agent)?;
+    Ok(Some(AssistantDef {
+        name: name.to_string(),
+        description: agent.description.clone(),
+        home_dir: validate_row_home(&snapshot.row)?,
+        agent,
+    }))
 }
 
 /// Prove that a persisted assistant is bound to the only daemon-owned home
@@ -320,7 +327,8 @@ pub async fn local_installation_resolver(
     db: &Db,
 ) -> Result<crate::agents::LocalInstallationResolver> {
     let mut definitions = std::collections::BTreeMap::new();
-    for row in db.list_assistants().await? {
+    for snapshot in snapshots(db).await? {
+        let row = snapshot.row;
         let config: AssistantConfig = serde_json::from_str(&row.config_json)
             .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
         if config.installation_id.is_nil() {
@@ -329,7 +337,26 @@ pub async fn local_installation_resolver(
                 row.name
             );
         }
-        let definition = load_from_row(&row)?.agent;
+        let markdown = snapshot.definition_markdown.with_context(|| {
+            format!(
+                "assistant `{}` definition is unavailable: {}",
+                row.name,
+                snapshot
+                    .definition_diagnostic
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            )
+        })?;
+        if snapshot
+            .definition_revision
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || snapshot.definition_diagnostic.is_some()
+        {
+            bail!("assistant `{}` definition snapshot is incoherent", row.name);
+        }
+        let definition = crate::agents::parse_daemon_local_markdown(&markdown, &row.name)?;
+        validate_definition_identity(&row, &definition)?;
         if definitions
             .insert(config.installation_id, definition)
             .is_some()
@@ -447,6 +474,22 @@ pub fn definition_revision(row: &AssistantRow, markdown: &str) -> String {
     }
     digest.update((markdown.len() as u64).to_le_bytes());
     digest.update(markdown.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+pub fn registration_revision(row: &AssistantRow) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-assistant-registration-revision-v1\0");
+    digest.update(row.created_at.to_le_bytes());
+    for value in [
+        &row.name,
+        &row.home_dir,
+        &row.config_json,
+        &row.content_hash,
+    ] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -775,7 +818,14 @@ fn save_definition_cas_sync(
     let home = validate_row_home(&row)?;
     let target = assistant_definition_path(&home);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+    recover_creation_journal_locked(db, &home)?;
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during creation recovery")?;
+    validate_row_home(&row)?;
     recover_definition_journal_locked(db, &row)?;
+    let row = get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during definition recovery")?;
+    validate_row_home(&row)?;
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition is missing")?;
     let current = String::from_utf8(current).context("assistant definition is not valid UTF-8")?;
@@ -855,13 +905,8 @@ fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Res
         .context("assistant disappeared during delete recovery")?;
     validate_row_home(&row)?;
     recover_definition_journal_locked(db, &row)?;
-    let markdown = cockpit_config::config::read_config_file_nofollow(&target)?
-        .context("assistant definition is missing during delete")?;
-    let markdown = String::from_utf8(markdown).context("assistant definition is not UTF-8")?;
-    if definition_revision(&row, &markdown) != expected_revision
-        || markdown_content_hash(&markdown) != row.content_hash
-    {
-        bail!("assistant changed since delete confirmation");
+    if registration_revision(&row) != expected_revision {
+        bail!("assistant registration changed since delete confirmation");
     }
     db.write_blocking(move |conn| {
         let changed = conn.execute(

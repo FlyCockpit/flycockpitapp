@@ -92,7 +92,8 @@ pub(super) struct AgentExternalEdit {
     pub(super) agent: super::pointer_actions::AgentId,
     /// Host-owned staging file. The authoritative agent path never leaves the
     /// daemon; completion returns the edited bytes under this lease.
-    staging: tempfile::TempPath,
+    staging_dir: tempfile::TempDir,
+    staging_path: PathBuf,
     lease_id: String,
     /// Buffer write owned by the injected host effect.
     pub(super) text_before_launch: String,
@@ -112,25 +113,42 @@ pub(crate) struct AgentExternalEditEffect {
 }
 
 struct AgentExternalEditStaging {
-    path: tempfile::TempPath,
+    directory: tempfile::TempDir,
+    path: PathBuf,
 }
 
 fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
-    let path = tempfile::Builder::new()
+    let directory = tempfile::Builder::new()
         .prefix("cockpit-agent-edit-")
-        .suffix(".md")
-        .tempfile()
-        .map(|file| file.into_temp_path())
-        .map_err(|error| format!("failed to create external-edit staging file: {error}"))?;
-    Ok(AgentExternalEditStaging { path })
+        .tempdir()
+        .map_err(|error| format!("failed to create private external-edit directory: {error}"))?;
+    cockpit_core::private_fs::ensure_private_dir(directory.path())
+        .map_err(|error| format!("failed to secure external-edit directory: {error:#}"))?;
+    let path = directory.path().join("assistant.md");
+    Ok(AgentExternalEditStaging { directory, path })
 }
 
 fn seed_agent_external_edit_staging(
     staging: &AgentExternalEditStaging,
     text: &str,
 ) -> Result<(), String> {
-    std::fs::write(&staging.path, text)
-        .map_err(|error| format!("failed to seed external-edit recovery draft: {error}"))
+    cockpit_config::config::write_config_bytes_atomic(&staging.path, text.as_bytes())
+        .map_err(|error| format!("failed to seed external-edit recovery draft: {error:#}"))
+}
+
+fn read_agent_external_edit_staging(pending: &AgentExternalEdit) -> Result<String, String> {
+    if pending.staging_path.parent() != Some(pending.staging_dir.path()) {
+        return Err("external-edit staging path escaped its private directory".into());
+    }
+    let metadata = std::fs::symlink_metadata(pending.staging_dir.path())
+        .map_err(|error| format!("external-edit directory disappeared: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("external-edit staging directory identity is invalid".into());
+    }
+    let bytes = cockpit_config::config::read_config_file_nofollow(&pending.staging_path)
+        .map_err(|error| format!("failed to validate editor staging file: {error:#}"))?
+        .ok_or_else(|| "external editor removed its staging file".to_string())?;
+    String::from_utf8(bytes).map_err(|_| "external editor produced non-UTF-8 content".into())
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -152,8 +170,23 @@ pub(super) struct AgentRow {
 #[derive(Clone)]
 enum AgentRowSource {
     Agent,
-    Assistant { markdown: String, revision: String },
-    AssistantUnavailable,
+    Assistant {
+        markdown: String,
+        revision: String,
+        registration_revision: String,
+    },
+    AssistantUnavailable {
+        registration_revision: String,
+    },
+}
+
+fn row_agent_id(name: &str, source: &AgentRowSource) -> super::pointer_actions::AgentId {
+    match source {
+        AgentRowSource::Agent => super::pointer_actions::AgentId::workspace(name),
+        AgentRowSource::Assistant { .. } | AgentRowSource::AssistantUnavailable { .. } => {
+            super::pointer_actions::AgentId::assistant(name)
+        }
+    }
 }
 
 pub(super) struct AgentDetail {
@@ -193,7 +226,15 @@ impl AgentsPage {
     pub(super) fn help_text(&self) -> &'static str {
         if self.editing.is_some() {
             // The in-TUI editor draws its own hint; this is the footer.
-            return "editing agent — ctrl+s: save  esc: cancel";
+            return if self
+                .editing
+                .as_ref()
+                .is_some_and(AgentEditor::is_assistant_definition)
+            {
+                "editing assistant — ctrl+s: save  esc: cancel"
+            } else {
+                "editing agent — ctrl+s: save  e: $EDITOR  esc: cancel"
+            };
         }
         if self.detail.is_some() {
             return "↑/↓  space: grant  t: tier  ctrl+s: save  e: raw editor  esc: list";
@@ -209,7 +250,7 @@ impl AgentsPage {
                 "↑/↓  enter: tools  e: edit definition  d: unregister (×2)  R: reset all  esc/h: back  q: close"
             }
             Some(AgentRow {
-                source: AgentRowSource::AssistantUnavailable,
+                source: AgentRowSource::AssistantUnavailable { .. },
                 ..
             }) => "↑/↓  enter: diagnostic  R: reset all  esc/h: back  q: close",
             Some(AgentRow {
@@ -243,7 +284,7 @@ impl AgentsPage {
         pending.servicing = true;
         Some(AgentExternalEditEffect {
             operation_id: pending.id,
-            path: pending.staging.to_path_buf(),
+            path: pending.staging_path.clone(),
             text_before_launch: pending.text_before_launch.clone(),
         })
     }
@@ -301,7 +342,7 @@ impl AgentsPage {
         };
         match outcome {
             super::pointer_actions::ExternalEditOutcome::Saved => {
-                let edited_markdown = std::fs::read_to_string(&pending.staging);
+                let edited_markdown = read_agent_external_edit_staging(&pending);
                 let mut draft = pending.draft.take();
                 let commit = (|| -> Result<(), String> {
                     let markdown = edited_markdown
@@ -322,7 +363,7 @@ impl AgentsPage {
                 })();
                 match commit {
                     Ok(_) => {
-                        self.refresh_after_edit(cwd, Some(&agent.0));
+                        self.refresh_after_edit(cwd, Some(&agent));
                         if let Some(detail) = detail {
                             self.status = Some(format!("saved `{}`; {detail}", agent.0));
                         }
@@ -367,7 +408,7 @@ impl AgentsPage {
                         markdown: None,
                     },
                 );
-                let edited_markdown = std::fs::read_to_string(&pending.staging).ok();
+                let edited_markdown = read_agent_external_edit_staging(&pending).ok();
                 let mut draft = pending.draft.take();
                 if let (Some(editor), Some(markdown)) = (&mut draft, edited_markdown) {
                     editor.replace_with_recovery_text(&markdown);
@@ -530,20 +571,35 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
         .into_iter()
         .map(|row| {
             let source = match (row.definition_markdown, row.definition_revision) {
-                (Some(markdown), Some(revision)) => {
-                    AgentRowSource::Assistant { markdown, revision }
+                (Some(markdown), Some(revision))
+                    if !revision.is_empty()
+                        && row.definition_diagnostic.is_none()
+                        && !row.registration_revision.is_empty() =>
+                {
+                    AgentRowSource::Assistant {
+                        markdown,
+                        revision,
+                        registration_revision: row.registration_revision.clone(),
+                    }
                 }
-                (None, None) if row.definition_diagnostic.is_some() => {
-                    AgentRowSource::AssistantUnavailable
+                (None, None)
+                    if row.definition_diagnostic.is_some()
+                        && !row.registration_revision.is_empty() =>
+                {
+                    AgentRowSource::AssistantUnavailable {
+                        registration_revision: row.registration_revision.clone(),
+                    }
                 }
-                _ => AgentRowSource::AssistantUnavailable,
+                _ => AgentRowSource::AssistantUnavailable {
+                    registration_revision: row.registration_revision.clone(),
+                },
             };
             let definition = match &source {
                 AgentRowSource::Assistant { markdown, .. } => {
                     cockpit_core::agents::parse_daemon_local_markdown(markdown, &row.name)
                         .map_err(|error| error.to_string())
                 }
-                AgentRowSource::AssistantUnavailable => {
+                AgentRowSource::AssistantUnavailable { .. } => {
                     Err(row.definition_diagnostic.clone().unwrap_or_else(|| {
                         "daemon returned an incoherent assistant definition snapshot".into()
                     }))
@@ -563,6 +619,19 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
             }
         })
         .collect())
+}
+
+fn coherent_assistant_save_revision(
+    assistant: &cockpit_core::daemon::proto::AssistantSummary,
+) -> Result<String, String> {
+    match (
+        assistant.definition_markdown.as_ref(),
+        assistant.definition_revision.as_ref(),
+        assistant.definition_diagnostic.as_ref(),
+    ) {
+        (Some(_), Some(revision), None) if !revision.is_empty() => Ok(revision.clone()),
+        _ => Err("daemon returned an incoherent assistant save snapshot".into()),
+    }
 }
 
 /// Present the effective-model display value in canonical `provider/model`
@@ -652,7 +721,9 @@ impl SettingsCx {
                                     expected_revision: revision,
                                 },
                             ) {
-                                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { .. }) => Ok(()),
+                                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { assistant }) => {
+                                    coherent_assistant_save_revision(&assistant).map(|_| ())
+                                }
                                 Ok(other) => Err(format!("unexpected assistant save response: {other:?}")),
                                 Err(error) => Err(error),
                             }
@@ -674,7 +745,12 @@ impl SettingsCx {
                     match saved {
                         Ok(()) => {
                             p.editing = None;
-                            p.refresh_after_edit(&cwd, Some(&name));
+                            let id = if assistant_definition {
+                                super::pointer_actions::AgentId::assistant(&name)
+                            } else {
+                                super::pointer_actions::AgentId::workspace(&name)
+                            };
+                            p.refresh_after_edit(&cwd, Some(&id));
                         }
                         Err(e) => {
                             p.status = Some(format!("write failed: {e}"));
@@ -682,11 +758,16 @@ impl SettingsCx {
                     }
                 }
                 EditorOutcome::ExternalEdit => {
-                    if std::env::var_os("EDITOR").is_none() {
+                    if editor.is_assistant_definition() {
+                        p.status = Some(
+                            "external editing is unavailable for assistant definitions; use the in-TUI editor"
+                                .into(),
+                        );
+                    } else if std::env::var_os("EDITOR").is_none() {
                         p.status = Some("No $EDITOR environment variable".into());
                     } else {
                         p.external_edit_confirmation =
-                            Some(super::pointer_actions::AgentId(editor.name.clone()));
+                            Some(super::pointer_actions::AgentId::workspace(&editor.name));
                         p.status = Some(format!("Open agent {} in $EDITOR?", editor.name));
                     }
                 }
@@ -760,12 +841,6 @@ impl SettingsCx {
             KeyCode::Char('d') => self.delete_selected(p),
             KeyCode::Char('r') => self.reset_one_selected(p),
             KeyCode::Char('e') => {
-                if detail.revision.is_none() {
-                    detail.status = Some(
-                        "assistant raw editing is unavailable from the agent-file editor".into(),
-                    );
-                    return Nav::Stay;
-                }
                 p.disarm_guards();
                 self.edit_selected(p);
             }
@@ -794,7 +869,7 @@ impl SettingsCx {
             );
             return;
         }
-        if editor.name != expected.0 || p.pending_external_edit.is_some() {
+        if editor.name != expected.name() || p.pending_external_edit.is_some() {
             return;
         }
         let Some(revision) = editor.revision.clone() else {
@@ -826,7 +901,8 @@ impl SettingsCx {
         p.pending_external_edit = Some(AgentExternalEdit {
             id,
             agent: expected,
-            staging: staging.path,
+            staging_path: staging.path,
+            staging_dir: staging.directory,
             lease_id: lease.lease_id,
             text_before_launch: text,
             draft,
@@ -895,7 +971,7 @@ impl SettingsCx {
         };
         if let Err(error) = &row.detail {
             p.status = Some(
-                if matches!(&row.source, AgentRowSource::AssistantUnavailable) {
+                if matches!(&row.source, AgentRowSource::AssistantUnavailable { .. }) {
                     format!(
                         "assistant `{}` is unavailable and cannot be edited or deleted: {error}",
                         row.name
@@ -924,12 +1000,14 @@ impl SettingsCx {
                     return;
                 }
             },
-            AgentRowSource::Assistant { markdown, revision } => (
+            AgentRowSource::Assistant {
+                markdown, revision, ..
+            } => (
                 PathBuf::from("<daemon-assistant-definition>"),
                 markdown.clone(),
                 Some(revision.clone()),
             ),
-            AgentRowSource::AssistantUnavailable => {
+            AgentRowSource::AssistantUnavailable { .. } => {
                 p.status = Some("assistant definition is unavailable; run cockpit doctor".into());
                 return;
             }
@@ -943,7 +1021,7 @@ impl SettingsCx {
             AgentRowSource::Assistant { .. } => {
                 cockpit_core::agents::parse_daemon_local_markdown(&original_text, &name)
             }
-            AgentRowSource::AssistantUnavailable => unreachable!("handled above"),
+            AgentRowSource::AssistantUnavailable { .. } => unreachable!("handled above"),
         };
         let def = match load_result {
             Ok(def) => def,
@@ -1014,7 +1092,13 @@ impl SettingsCx {
             match response {
                 Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
                     assistant,
-                }) => detail.revision = assistant.definition_revision,
+                }) => match coherent_assistant_save_revision(&assistant) {
+                    Ok(revision) => detail.revision = Some(revision),
+                    Err(error) => {
+                        detail.status = Some(error);
+                        return;
+                    }
+                },
                 Ok(other) => {
                     detail.status = Some(format!("unexpected assistant save response: {other:?}"));
                     return;
@@ -1034,7 +1118,17 @@ impl SettingsCx {
                 Some(revision),
             ) {
                 Ok(result) => {
-                    detail.revision = result.snapshot.map(|snapshot| snapshot.revision);
+                    let Some(revision) = result
+                        .snapshot
+                        .map(|snapshot| snapshot.revision)
+                        .filter(|revision| !revision.is_empty())
+                    else {
+                        detail.status = Some(
+                            "daemon returned a save result without a coherent revision".into(),
+                        );
+                        return;
+                    };
+                    detail.revision = Some(revision);
                 }
                 Err(error) => {
                     detail.status = Some(format!("save failed: {error}"));
@@ -1068,7 +1162,9 @@ impl SettingsCx {
         };
         let name = row.name.clone();
         match &row.source {
-            AgentRowSource::Assistant { markdown, revision } => {
+            AgentRowSource::Assistant {
+                markdown, revision, ..
+            } => {
                 p.editing = Some(AgentEditor::new_assistant(
                     name,
                     PathBuf::from("<daemon-assistant-definition>"),
@@ -1079,7 +1175,7 @@ impl SettingsCx {
                 p.status = None;
                 return;
             }
-            AgentRowSource::AssistantUnavailable => {
+            AgentRowSource::AssistantUnavailable { .. } => {
                 p.status = Some(
                     "assistant definition is unavailable; editing requires a valid daemon revision"
                         .into(),
@@ -1140,8 +1236,9 @@ impl SettingsCx {
             let id = p.external_edit_ops.begin();
             p.pending_external_edit = Some(AgentExternalEdit {
                 id,
-                agent: super::pointer_actions::AgentId(name.clone()),
-                staging: staging.path,
+                agent: super::pointer_actions::AgentId::workspace(&name),
+                staging_path: staging.path,
+                staging_dir: staging.directory,
                 lease_id: lease.lease_id,
                 text_before_launch: text,
                 draft: Some(draft),
@@ -1175,7 +1272,9 @@ impl SettingsCx {
         };
         let name = row.name.clone();
         match &row.source {
-            AgentRowSource::Assistant { markdown, revision } => {
+            AgentRowSource::Assistant {
+                markdown, revision, ..
+            } => {
                 p.editing = Some(AgentEditor::new_assistant(
                     name,
                     PathBuf::from("<daemon-assistant-definition>"),
@@ -1186,7 +1285,7 @@ impl SettingsCx {
                 p.status = None;
                 return;
             }
-            AgentRowSource::AssistantUnavailable => {
+            AgentRowSource::AssistantUnavailable { .. } => {
                 p.status = Some(
                     "assistant definition is unavailable; editing requires a valid daemon revision"
                         .into(),
@@ -1228,13 +1327,6 @@ impl SettingsCx {
             p.status = Some("built-in agents cannot be deleted (use r/R to reset)".into());
             return;
         }
-        if matches!(&row.source, AgentRowSource::AssistantUnavailable) {
-            p.status = Some(
-                "assistant definition is unavailable; deletion requires a valid daemon revision"
-                    .into(),
-            );
-            return;
-        }
         let name = row.name.clone();
         if p.delete.activate() == ResetOutcome::Armed {
             p.status = Some(format!("delete `{name}`? press d again to confirm"));
@@ -1242,23 +1334,22 @@ impl SettingsCx {
         }
         let cwd = self.agents_cwd();
         let result = match &row.source {
-            AgentRowSource::Assistant { revision, .. } => {
-                crate::tui::agent_runner::daemon_request_blocking(
-                    cockpit_core::daemon::proto::Request::DeleteAssistant {
-                        name: name.clone(),
-                        expected_revision: revision.clone(),
-                    },
-                )
-                .and_then(|response| match response {
-                    cockpit_core::daemon::proto::Response::AssistantDeleted { deleted: true } => {
-                        Ok(())
-                    }
-                    other => Err(format!("unexpected assistant delete response: {other:?}")),
-                })
+            AgentRowSource::Assistant {
+                registration_revision,
+                ..
             }
-            AgentRowSource::AssistantUnavailable => Err(
-                "assistant definition is unavailable; deletion requires a valid revision".into(),
-            ),
+            | AgentRowSource::AssistantUnavailable {
+                registration_revision,
+            } => crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::DeleteAssistant {
+                    name: name.clone(),
+                    expected_revision: registration_revision.clone(),
+                },
+            )
+            .and_then(|response| match response {
+                cockpit_core::daemon::proto::Response::AssistantDeleted { deleted: true } => Ok(()),
+                other => Err(format!("unexpected assistant delete response: {other:?}")),
+            }),
             AgentRowSource::Agent => agent_snapshot(&cwd, &name).and_then(|snapshot| {
                 mutate_agent(
                     &cwd,
@@ -1268,7 +1359,7 @@ impl SettingsCx {
                 .map(|_| ())
             }),
         };
-        let is_assistant = matches!(&row.source, AgentRowSource::Assistant { .. });
+        let is_assistant = !matches!(&row.source, AgentRowSource::Agent);
         match result {
             Ok(_) if is_assistant => {
                 p.status = Some(format!(
@@ -1322,7 +1413,11 @@ impl SettingsCx {
         if let Some(editor) = &p.editing {
             editor.render(frame, area);
             let action_y = area.bottom().saturating_sub(1);
-            let agent = super::pointer_actions::AgentId(editor.name.clone());
+            let agent = if editor.is_assistant_definition() {
+                super::pointer_actions::AgentId::assistant(&editor.name)
+            } else {
+                super::pointer_actions::AgentId::workspace(&editor.name)
+            };
             let confirming = p.external_edit_confirmation.as_ref() == Some(&agent);
             if !confirming && area.width > 4 && area.height > 3 {
                 let editor_body = Rect::new(
@@ -1344,7 +1439,8 @@ impl SettingsCx {
                         disabled_reason: None,
                     });
             }
-            let actions = if confirming {
+            let assistant_editor = editor.is_assistant_definition();
+            let actions = if confirming && !assistant_editor {
                 vec![
                     (
                         super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
@@ -1355,6 +1451,19 @@ impl SettingsCx {
                         super::pointer_actions::AgentsAction::Cancel(agent.clone()),
                         19,
                         8,
+                    ),
+                ]
+            } else if assistant_editor {
+                vec![
+                    (
+                        super::pointer_actions::AgentsAction::Save(agent.clone()),
+                        0,
+                        6u16,
+                    ),
+                    (
+                        super::pointer_actions::AgentsAction::Cancel(agent.clone()),
+                        8u16,
+                        8u16,
                     ),
                 ]
             } else {
@@ -1391,8 +1500,10 @@ impl SettingsCx {
                     });
             }
             frame.render_widget(
-                if confirming {
+                if confirming && !assistant_editor {
                     Line::from("[Open in $EDITOR]  [Cancel]")
+                } else if assistant_editor {
+                    Line::from("[Save]  [Cancel]")
                 } else {
                     Line::from("[Save]  [Cancel]  [Open in $EDITOR]")
                 },
@@ -1404,7 +1515,7 @@ impl SettingsCx {
             let action_y = area.bottom().saturating_sub(1);
             let detail_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
             self.render_agent_detail(frame, detail_area, detail);
-            let agent = super::pointer_actions::AgentId(detail.name.clone());
+            let agent = row_agent_id(&detail.name, &detail.source);
             for (action, x, width) in [
                 (
                     super::pointer_actions::AgentsAction::OpenRawEditor(agent.clone()),
@@ -1479,7 +1590,8 @@ impl SettingsCx {
                 AgentKind::Custom
                     if matches!(
                         &row.source,
-                        AgentRowSource::Assistant { .. } | AgentRowSource::AssistantUnavailable
+                        AgentRowSource::Assistant { .. }
+                            | AgentRowSource::AssistantUnavailable { .. }
                     ) =>
                 {
                     " (assistant)"
@@ -1501,10 +1613,9 @@ impl SettingsCx {
                 spans.push(Span::styled(format!("  ⚠ {e}"), red));
             }
             lines.push(Line::from(spans));
+            let id = row_agent_id(&row.name, &row.source);
             let open = super::pointer_actions::SettingsPointerAction::Agents(
-                super::pointer_actions::AgentsAction::Open(super::pointer_actions::AgentId(
-                    row.name.clone(),
-                )),
+                super::pointer_actions::AgentsAction::Open(id.clone()),
             );
             controls.push(Some((open.clone(), true, None)));
             if let Ok(desc) = &row.detail {
@@ -1516,7 +1627,6 @@ impl SettingsCx {
             }
             if on_cursor && !p.confirm_reset && !p.delete.is_pending() && !p.reset_one.is_pending()
             {
-                let id = super::pointer_actions::AgentId(row.name.clone());
                 lines.push(Line::from("[Open]"));
                 controls.push(Some((
                     super::pointer_actions::SettingsPointerAction::Agents(
@@ -1525,7 +1635,7 @@ impl SettingsCx {
                     true,
                     None,
                 )));
-                if !matches!(&row.source, AgentRowSource::AssistantUnavailable) {
+                if !matches!(&row.source, AgentRowSource::AssistantUnavailable { .. }) {
                     let label = if matches!(&row.source, AgentRowSource::Assistant { .. }) {
                         "[Edit definition]"
                     } else {
@@ -1546,7 +1656,10 @@ impl SettingsCx {
                         "[Unregister]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
                     )),
-                    (AgentRowSource::AssistantUnavailable, _) => None,
+                    (AgentRowSource::AssistantUnavailable { .. }, _) => Some((
+                        "[Unregister]",
+                        super::pointer_actions::AgentsAction::Delete(id.clone()),
+                    )),
                     (AgentRowSource::Agent, AgentKind::Custom) => Some((
                         "[Delete]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
@@ -1610,20 +1723,21 @@ impl SettingsCx {
             } else {
                 "Reset"
             };
-            let name = p
-                .rows
-                .get(p.cursor)
-                .map_or("agent", |row| row.name.as_str());
+            let selected_row = p.rows.get(p.cursor);
+            let name = selected_row.map_or("agent", |row| row.name.as_str());
             lines.push(Line::default());
             controls.push(None);
             lines.push(Line::from(format!("{verb} {name}?")));
             controls.push(None);
             lines.push(Line::from(format!("[{verb}]")));
-            let id = super::pointer_actions::AgentId(name.to_string());
+            let id = selected_row.map_or_else(
+                || super::pointer_actions::AgentId::workspace(name),
+                |row| row_agent_id(&row.name, &row.source),
+            );
             let action = if p.delete.is_pending() {
-                super::pointer_actions::AgentsAction::Delete(id)
+                super::pointer_actions::AgentsAction::Delete(id.clone())
             } else {
-                super::pointer_actions::AgentsAction::Reset(id)
+                super::pointer_actions::AgentsAction::Reset(id.clone())
             };
             controls.push(Some((
                 super::pointer_actions::SettingsPointerAction::Agents(action),
@@ -1634,9 +1748,7 @@ impl SettingsCx {
             lines.push(Line::from("[Cancel]"));
             controls.push(Some((
                 super::pointer_actions::SettingsPointerAction::Agents(
-                    super::pointer_actions::AgentsAction::Cancel(super::pointer_actions::AgentId(
-                        name.to_string(),
-                    )),
+                    super::pointer_actions::AgentsAction::Cancel(id),
                 ),
                 true,
                 None,
@@ -1686,7 +1798,7 @@ impl SettingsCx {
                         *line,
                         super::pointer_actions::SettingsPointerAction::Agents(
                             super::pointer_actions::AgentsAction::ToggleTool(
-                                super::pointer_actions::AgentId(detail.name.clone()),
+                                row_agent_id(&detail.name, &detail.source),
                                 super::pointer_actions::AgentToolId(
                                     cockpit_core::agents::tool_surface_catalog()[*index]
                                         .name
@@ -1723,7 +1835,7 @@ impl SettingsCx {
                     action: super::shell::SettingsPointerAction::Page(
                         super::pointer_actions::SettingsPointerAction::Agents(
                             super::pointer_actions::AgentsAction::CycleTier(
-                                super::pointer_actions::AgentId(detail.name.clone()),
+                                row_agent_id(&detail.name, &detail.source),
                                 super::pointer_actions::AgentToolId(tool.into()),
                             ),
                         ),
@@ -1738,10 +1850,19 @@ impl SettingsCx {
 /// Internal helper on the page: re-discover agents and (when a name is
 /// given) move the cursor onto that row + re-surface a parse error inline.
 impl AgentsPage {
-    fn refresh_after_edit(&mut self, cwd: &std::path::Path, name: Option<&str>) {
+    fn refresh_after_edit(
+        &mut self,
+        cwd: &std::path::Path,
+        identity: Option<&super::pointer_actions::AgentId>,
+    ) {
         self.rows = rows_for(cwd).0;
-        if let Some(name) = name {
-            if let Some(idx) = self.rows.iter().position(|r| r.name == name) {
+        if let Some(identity) = identity {
+            let name = identity.name();
+            if let Some(idx) = self
+                .rows
+                .iter()
+                .position(|row| row_agent_id(&row.name, &row.source) == *identity)
+            {
                 self.cursor = idx;
             }
             // Surface a parse error from the just-edited file rather than
@@ -1822,7 +1943,7 @@ impl SettingsPage for AgentsPage {
                     if self
                         .editing
                         .as_ref()
-                        .is_some_and(|editor| editor.name == agent.0) =>
+                        .is_some_and(|editor| editor.name == agent.name()) =>
                 {
                     if self.external_edit_confirmation.as_ref() == Some(agent) {
                         cx.handle_agents_page_key(
@@ -1834,7 +1955,7 @@ impl SettingsPage for AgentsPage {
                         Nav::Stay
                     } else {
                         self.external_edit_confirmation = Some(agent.clone());
-                        self.status = Some(format!("Open agent {} in $EDITOR?", agent.0));
+                        self.status = Some(format!("Open agent {} in $EDITOR?", agent.name()));
                         Nav::Stay
                     }
                 }
@@ -1889,7 +2010,11 @@ impl SettingsPage for AgentsPage {
             _ => None,
         };
         if let Some(id) = row_identity {
-            let Some(index) = self.rows.iter().position(|row| row.name == id.0) else {
+            let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| row_agent_id(&row.name, &row.source) == *id)
+            else {
                 return Nav::Stay;
             };
             // A pending destructive action is valid only for the row that
@@ -2030,8 +2155,10 @@ impl SettingsPage for AgentsPage {
         self.confirm_reset = false;
         self.disarm_guards();
         self.external_edit_confirmation = None;
-        self.external_edit_ops.cancel();
-        self.pending_external_edit = None;
+        // Geometry invalidation cancels only pointer-owned confirmations. An
+        // editor effect owns a daemon lease, recovery draft and correlation
+        // ID; it must survive resize/redraw and settle through its explicit
+        // completion callback.
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

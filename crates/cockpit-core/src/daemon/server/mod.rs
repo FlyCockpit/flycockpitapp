@@ -1554,6 +1554,7 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         home_dir,
         config_json,
         content_hash: _,
+        registration_revision: _,
         definition_markdown,
         definition_revision: _,
         definition_diagnostic,
@@ -2211,6 +2212,9 @@ pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
 }
 
 impl DaemonContext {
+    pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
+        current_redaction(&self.global_redaction)
+    }
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
         proto::Event::CaffeinateState {
@@ -3952,12 +3956,11 @@ impl MutableClientState {
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
-            capability_owner: format!(
-                "{}:{}:{}",
-                run_invocation::principal_digest(&self.principal),
-                self.terminal_context.client_instance_id,
-                self.terminal_context.connection_epoch,
-            ),
+            // Capabilities survive the settings client's short transport
+            // reconnects. Root, layer, identity and revision remain bound in
+            // the capability itself; the owner is the stable authenticated
+            // principal used by the serialized Apply path.
+            capability_owner: run_invocation::principal_digest(&self.principal),
             upload_accounting: self.upload_accounting.clone(),
             terminal_host: self.terminal_host.clone(),
             terminal_views: self.terminal_views.clone(),

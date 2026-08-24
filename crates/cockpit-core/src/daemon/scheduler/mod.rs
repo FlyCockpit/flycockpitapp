@@ -734,12 +734,9 @@ impl ProductionJobExecutor {
                 job.owner
             );
         }
-        let row = self
-            .db
-            .get_assistant(&assistant)
+        crate::assistants::load_verified(&self.db, &assistant)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("assistant `{assistant}` not found"))?;
-        crate::assistants::load_from_row(&row)
+            .ok_or_else(|| anyhow::anyhow!("assistant `{assistant}` not found"))
             .with_context(|| format!("validating assistant `{assistant}`"))?;
 
         let root = PathBuf::from(project_root);

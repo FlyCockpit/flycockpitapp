@@ -902,13 +902,9 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
         crate::assistants::validate_assistant_name(assistant_name)?;
-        let row = self
-            .inner
-            .db
-            .get_assistant(assistant_name)
+        crate::assistants::load_verified(&self.inner.db, assistant_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
-        crate::assistants::load_from_row(&row)?;
 
         let trust_policy =
             resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root).await?;

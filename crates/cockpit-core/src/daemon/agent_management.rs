@@ -21,6 +21,7 @@ struct EditorLeaseState {
     name: String,
     revision: String,
     expires_at: Instant,
+    completing: bool,
 }
 
 const EDITOR_LEASE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -118,6 +119,7 @@ pub async fn begin_editor_lease(
             name,
             revision: expected_revision,
             expires_at: now + EDITOR_LEASE_TTL,
+            completing: false,
         },
     );
     drop(leases);
@@ -138,23 +140,28 @@ pub async fn complete_editor_lease(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     let id = Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    // Claim by removal while holding the registry mutex. Save and cancel are
-    // therefore mutually exclusive and a duplicated completion cannot run a
-    // second filesystem mutation concurrently.
+    // Reserve in place while holding the registry mutex. It continues to
+    // consume capacity until completion reaches a terminal state, so a failed
+    // save can always restore the same retryable token.
     let lease = {
         let mut leases = editor_leases().lock().map_err(lock_poison)?;
         let now = Instant::now();
         leases.retain(|_, lease| lease.expires_at > now);
-        leases
-            .remove(&id)
-            .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?
+        let lease = leases
+            .get_mut(&id)
+            .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?;
+        if lease.completing {
+            return Err(conflict("editor lease completion is already in flight"));
+        }
+        lease.completing = true;
+        lease.clone()
     };
     if lease.root != root {
-        reinsert_editor_lease(id, lease)?;
+        release_editor_lease_reservation(id)?;
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     if lease.principal_digest != principal_digest {
-        reinsert_editor_lease(id, lease)?;
+        release_editor_lease_reservation(id)?;
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "agent editor lease belongs to another client principal".into(),
@@ -162,7 +169,6 @@ pub async fn complete_editor_lease(
     }
     let result = match markdown {
         Some(markdown) => {
-            let retry = lease.clone();
             match tokio::task::spawn_blocking(move || {
                 mutate_sync(
                     &root,
@@ -179,9 +185,7 @@ pub async fn complete_editor_lease(
             {
                 Ok(result) => result,
                 Err(error) => {
-                    // Validation, CAS and retryable I/O failures retain the
-                    // same token only when no newer lease reused the ID.
-                    reinsert_editor_lease(id, retry)?;
+                    release_editor_lease_reservation(id)?;
                     return Err(error);
                 }
             }
@@ -196,27 +200,16 @@ pub async fn complete_editor_lease(
     let Response::AgentMutated(result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
     };
+    editor_leases().lock().map_err(lock_poison)?.remove(&id);
     Ok(Response::AgentEditorLeaseCompleted(result))
 }
 
-fn reinsert_editor_lease(id: Uuid, lease: EditorLeaseState) -> Result<(), ErrorPayload> {
-    if lease.expires_at <= Instant::now() {
-        return Ok(());
-    }
+fn release_editor_lease_reservation(id: Uuid) -> Result<(), ErrorPayload> {
     let mut leases = editor_leases().lock().map_err(lock_poison)?;
-    let now = Instant::now();
-    leases.retain(|_, existing| existing.expires_at > now);
-    if leases.contains_key(&id) {
-        return Err(conflict(
-            "editor lease retry token was concurrently replaced; reload before retrying",
-        ));
-    }
-    if leases.len() >= MAX_EDITOR_LEASES {
-        return Err(conflict(
-            "editor lease could not be retained after a failed completion because capacity was exhausted; reload before retrying",
-        ));
-    }
-    leases.insert(id, lease);
+    let lease = leases
+        .get_mut(&id)
+        .ok_or_else(|| conflict("editor lease reservation disappeared during completion"))?;
+    lease.completing = false;
     Ok(())
 }
 
@@ -730,9 +723,23 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                     // pass already restored it.
                     (false, true) => {}
                     (true, true) => {
-                        return Err(conflict(
-                            "agent reset rollback found both staged and authoritative files",
-                        ));
+                        if cockpit_config::config::same_config_file_identity_nofollow(
+                            &staged, &target,
+                        )
+                        .map_err(internal)?
+                        {
+                            // Portable link/unlink no-replace can durably
+                            // publish the second name before unlinking the
+                            // first. Prepared recovery treats identical names
+                            // as a recoverable rollback state and retains the
+                            // authoritative target.
+                            cockpit_config::config::remove_config_file_atomic(&staged)
+                                .map_err(internal)?;
+                        } else {
+                            return Err(conflict(
+                                "agent reset rollback found different staged and authoritative files",
+                            ));
+                        }
                     }
                     (false, false) => {
                         return Err(conflict(

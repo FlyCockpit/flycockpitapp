@@ -190,6 +190,16 @@ pub fn rename_config_file_nofollow(
     files::rename_file_nofollow(source, destination)
 }
 
+/// Compare two regular no-follow entries by stable filesystem identity.
+/// Used only to reconcile the recoverable two-name state of a link/unlink
+/// no-replace fallback.
+pub fn same_config_file_identity_nofollow(
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> anyhow::Result<bool> {
+    files::same_file_identity_nofollow(left, right)
+}
+
 #[cfg(all(test, unix))]
 mod terminal_ingress_cleanup_tests {
     use super::*;

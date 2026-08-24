@@ -4159,16 +4159,18 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            crate::assistants::load_verified(&ctx.db, &assistant_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request(format!("assistant `{assistant_id}` not found")))?;
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
-                    let assistant = crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("assistant `{assistant_for_db}` not found")
-                        })?;
-                    crate::assistants::load_from_row(&assistant)?;
+                    crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?.ok_or_else(
+                        || anyhow::anyhow!("assistant `{assistant_for_db}` not found"),
+                    )?;
                     let (row, created) =
                         match crate::db::Db::most_recent_session_for_assistant_conn(
                             conn,
@@ -13743,6 +13745,7 @@ pub(super) fn assistant_to_proto(
     row: crate::db::assistants::AssistantRow,
 ) -> proto::AssistantSummary {
     proto::AssistantSummary {
+        registration_revision: crate::assistants::registration_revision(&row),
         name: row.name,
         created_at: row.created_at,
         home_dir: row.home_dir,

@@ -1,253 +1,250 @@
-# Authoritative ownership classification for every durable table in the
-# prerelease launch schema. The release-contract gate requires exact coverage.
-# local-launch is created by the default build. remote is created only when
-# the single Cargo capability named remote is enabled.
+# Authoritative per-table launch ownership. Every executed table must have one
+# complete entry; the SQLite-backed contract rejects missing fields and stale objects.
 [table]
-"agent_binding_receipts" = "local-launch"
-"agent_installations" = "local-launch"
-"agent_instances" = "local-launch"
-"agent_model_bindings" = "local-launch"
-"agent_profile_snapshots" = "local-launch"
-"agent_session_preparation_claims" = "local-launch"
-"agent_session_preparations" = "local-launch"
-"agent_transition_receipts" = "local-launch"
-"app_flags" = "local-launch"
-"approval_grants" = "local-launch"
-"assistants" = "local-launch"
-"client_submission_terminal_receipts" = "local-launch"
-"compaction_handoffs" = "local-launch"
-"compaction_shadows" = "local-launch"
-"connector_state" = "remote"
-"decision_attention_mutation_guards" = "local-launch"
-"decision_receipts" = "local-launch"
-"decision_requests" = "local-launch"
-"execution_containments" = "local-launch"
-"external_journal_events" = "local-launch"
-"external_journal_integrity_faults" = "local-launch"
-"external_journal_operations" = "local-launch"
-"external_journal_queue_entries" = "local-launch"
-"external_journal_session_tombstones" = "local-launch"
-"external_journal_spool_capsules" = "local-launch"
-"goal_control_jobs" = "local-launch"
-"goal_root_turns" = "local-launch"
-"guidance_contents" = "local-launch"
-"image_generation_artifact_authorization_facts" = "local-launch"
-"image_generation_artifact_cleanup_intents" = "local-launch"
-"image_generation_artifact_components" = "local-launch"
-"image_generation_artifact_leases" = "local-launch"
-"image_generation_artifact_references" = "local-launch"
-"image_generation_artifacts" = "local-launch"
-"image_generation_artifact_security_recovery_attempts" = "local-launch"
-"image_generation_artifact_security_recovery_audits" = "local-launch"
-"image_generation_artifact_security_recovery_components" = "local-launch"
-"image_generation_artifact_transitions" = "local-launch"
-"image_generation_attempt_activation_facts" = "local-launch"
-"image_generation_attempt_media_snapshots" = "local-launch"
-"image_generation_attempts" = "local-launch"
-"image_generation_attempt_transitions" = "local-launch"
-"image_generation_cancellation_facts" = "local-launch"
-"image_generation_cancelled_result_facts" = "local-launch"
-"image_generation_cleanup_transitions" = "local-launch"
-"image_generation_component_release_facts" = "local-launch"
-"image_generation_component_transitions" = "local-launch"
-"image_generation_deadline_expiry_facts" = "local-launch"
-"image_generation_handoff_evidence" = "local-launch"
-"image_generation_jobs" = "local-launch"
-"image_generation_job_transitions" = "local-launch"
-"image_generation_late_publication_authorization_facts" = "local-launch"
-"image_generation_late_publication_leases" = "local-launch"
-"image_generation_late_publication_transitions" = "local-launch"
-"image_generation_plans" = "local-launch"
-"image_generation_provider_cancel_claims" = "local-launch"
-"image_generation_provider_cancel_evidence" = "local-launch"
-"image_generation_publication_right_facts" = "local-launch"
-"image_generation_reconciliation_claim_completions" = "local-launch"
-"image_generation_reconciliation_claims" = "local-launch"
-"image_generation_reconciliation_evidence" = "local-launch"
-"image_generation_response_fetches" = "local-launch"
-"image_generation_response_fetch_outcomes" = "local-launch"
-"image_generation_response_publication_intents" = "local-launch"
-"image_generation_response_reconciliation_claims" = "local-launch"
-"image_generation_response_reconciliations" = "local-launch"
-"image_generation_scheduler_claim_consumptions" = "local-launch"
-"image_generation_scheduler_claims" = "local-launch"
-"image_generation_scheduler_error_counts" = "local-launch"
-"image_generation_slots" = "local-launch"
-"image_generation_slot_transitions" = "local-launch"
-"image_generation_terminal_events" = "local-launch"
-"image_generation_user_published_outputs" = "local-launch"
-"image_spend_attempt_dispatches" = "local-launch"
-"image_spend_attempts" = "local-launch"
-"image_spend_cost_events" = "local-launch"
-"image_spend_debt_resolutions" = "local-launch"
-"image_spend_epoch_heads" = "local-launch"
-"image_spend_policy_versions" = "local-launch"
-"image_spend_reservations" = "local-launch"
-"image_spend_scope_usage" = "local-launch"
-"inference_calls" = "local-launch"
-"inference_requests" = "local-launch"
-"installation_continuations" = "local-launch"
-"installation_identity" = "local-launch"
-"installation_journals" = "local-launch"
-"installation_observations" = "local-launch"
-"installation_operations" = "local-launch"
-"intel_callsites" = "local-launch"
-"intel_centrality" = "local-launch"
-"intel_deps" = "local-launch"
-"intel_files" = "local-launch"
-"intel_identifiers" = "local-launch"
-"intel_imports" = "local-launch"
-"intel_meta" = "local-launch"
-"intel_symbols" = "local-launch"
-"local_media_operation_audit" = "local-launch"
-"local_media_operations" = "local-launch"
-"lock_reads" = "local-launch"
-"lock_state" = "local-launch"
-"loop_guard_rules" = "local-launch"
-"mcp_config_journals" = "local-launch"
-"media_accounting_blocks" = "local-launch"
-"media_accounting_corruption_facts" = "local-launch"
-"media_artifact_facts" = "local-launch"
-"media_attachment_cleanup_intents" = "local-launch"
-"media_attachment_component_leases" = "local-launch"
-"media_attachment_components" = "local-launch"
-"media_attachment_failure_reasons" = "local-launch"
-"media_attachment_processing_cleanup_evidence" = "local-launch"
-"media_attachment_processing_failure_evidence" = "local-launch"
-"media_attachment_processing_jobs" = "local-launch"
-"media_attachment_processing_output_security_evidence" = "local-launch"
-"media_attachment_processing_publication_intents" = "local-launch"
-"media_attachment_processing_security_evidence" = "local-launch"
-"media_attachment_references" = "local-launch"
-"media_attachments" = "local-launch"
-"media_attachment_transition_evidence" = "local-launch"
-"media_attachment_upload_origins" = "local-launch"
-"media_av_normalization_evidence" = "local-launch"
-"media_cleanup_attestations" = "local-launch"
-"media_cleanup_security_evidence" = "local-launch"
-"media_component_deletion_evidence" = "local-launch"
-"media_component_deletion_intents" = "local-launch"
-"media_component_lease_reconciliation_evidence" = "local-launch"
-"media_component_security_evidence" = "local-launch"
-"media_counter_shadow" = "local-launch"
-"media_creation_sequence" = "local-launch"
-"media_downstream_ownership" = "local-launch"
-"media_execution_ready" = "local-launch"
-"media_image_component_dimensions" = "local-launch"
-"media_local_path_registration_audit" = "local-launch"
-"media_local_path_registration_evidence" = "local-launch"
-"media_local_path_registration_operations" = "local-launch"
-"media_queue_sequence" = "local-launch"
-"media_repair_attempts" = "local-launch"
-"media_reservation_deltas" = "local-launch"
-"media_reservation_plan_facts" = "local-launch"
-"media_reservations" = "local-launch"
-"media_reservation_versions" = "local-launch"
-"media_resource_counters" = "local-launch"
-"media_retained_https_audit" = "local-launch"
-"media_retained_https_evidence" = "local-launch"
-"media_retained_https_operations" = "local-launch"
-"media_retained_https_orphan_cleanup_evidence" = "local-launch"
-"media_retained_https_publication_intents" = "local-launch"
-"media_scheduler_cursor" = "local-launch"
-"media_security_recovery_operations" = "local-launch"
-"media_storage_publication_intents" = "local-launch"
-"media_upload_chunks" = "local-launch"
-"media_uploads" = "local-launch"
-"message_attachment_references" = "local-launch"
-"message_operation_receipts" = "local-launch"
-"message_queue_items" = "local-launch"
-"message_submission_receipts" = "local-launch"
-"needs_attention" = "local-launch"
-"packages" = "local-launch"
-"paused_session_work" = "local-launch"
-"pins" = "local-launch"
-"project_notes" = "local-launch"
-"protected_leak_records" = "local-launch"
-"protected_redaction_artifact_refs" = "local-launch"
-"protected_redaction_history" = "local-launch"
-"provider_config_journals" = "local-launch"
-"prune_ledger" = "local-launch"
-"remote_attachment_lifecycle" = "remote"
-"remote_attachment_operations" = "remote"
-"remote_attachment_outbox" = "remote"
-"remote_attachment_outbox_deliveries" = "remote"
-"remote_attachment_outbox_snapshots" = "remote"
-"remote_audit_upload_state" = "remote"
-"remote_daemon_custody_generation_seq" = "remote"
-"remote_daemon_custody_records" = "remote"
-"remote_principal_audit" = "remote"
-"remote_rename_artifact_cleanup_intents" = "remote"
-"remote_rename_journal" = "remote"
-"retention_meta" = "local-launch"
-"run_invocations" = "local-launch"
-"run_invocation_tombstones" = "local-launch"
-"scheduled_jobs" = "local-launch"
-"sealed_action_grants" = "local-launch"
-"sealed_action_instances" = "local-launch"
-"sealed_global_project_grants" = "local-launch"
-"sealed_recovery_audit" = "local-launch"
-"sealed_state_sagas" = "local-launch"
-"sealed_value_name_tombstones" = "local-launch"
-"sealed_value_records" = "local-launch"
-"sealed_values" = "local-launch"
-"sealed_value_sagas" = "local-launch"
-"secret_credential_ownership" = "local-launch"
-"secret_named_ownership" = "local-launch"
-"secret_vault_authority" = "local-launch"
-"secret_vault_inventory_state" = "local-launch"
-"secret_vault_item_revisions" = "local-launch"
-"secret_vault_items" = "local-launch"
-"secret_vault_keys" = "local-launch"
-"secret_vault_sagas" = "local-launch"
-"secure_key_consumer_refs" = "local-launch"
-"secure_key_namespaces" = "local-launch"
-"secure_key_sagas" = "local-launch"
-"secure_key_versions" = "local-launch"
-"session_events" = "local-launch"
-"session_fts_docs" = "local-launch"
-"session_goals" = "local-launch"
-"session_plan_docs" = "local-launch"
-"sessions" = "local-launch"
-"session_text_artifact_archive_imports" = "local-launch"
-"session_text_artifact_event_refs" = "local-launch"
-"session_text_artifact_projection_pending_sentinel" = "local-launch"
-"session_text_artifact_projection_pending_slots" = "local-launch"
-"session_text_artifact_quota_reservations" = "local-launch"
-"session_text_artifact_run_invocation_bindings" = "local-launch"
-"session_text_artifacts" = "local-launch"
-"session_user_message_model_envelopes" = "local-launch"
-"skill_curator_snapshots" = "local-launch"
-"skill_pairs" = "local-launch"
-"skill_usage" = "local-launch"
-"subagent_handles" = "local-launch"
-"sync_state" = "remote"
-"tandem_inference" = "local-launch"
-"task_artifact_integration_receipts" = "local-launch"
-"task_artifacts" = "local-launch"
-"task_delegation_children" = "local-launch"
-"task_delegation_jobs" = "local-launch"
-"task_delegation_payloads" = "local-launch"
-"task_delegation_steers" = "local-launch"
-"task_todo_assignments" = "local-launch"
-"task_todo_notes" = "local-launch"
-"task_todos" = "local-launch"
-"tokenizer_calibration" = "local-launch"
-"tool_call_events" = "local-launch"
-"usage_events" = "local-launch"
-"verification_candidate_artifacts" = "local-launch"
-"verification_candidates" = "local-launch"
-"verification_dispatch_attempts" = "local-launch"
-"verification_late_results" = "local-launch"
-"verification_operations" = "local-launch"
-"verification_projection_envelopes" = "local-launch"
-"verification_projection_events" = "local-launch"
-"verification_projections" = "local-launch"
-"verification_syntheses" = "local-launch"
-"verification_synthesis_artifacts" = "local-launch"
-"workspace_leases" = "local-launch"
-"workspace_trust" = "local-launch"
-"write_scope_leases" = "local-launch"
-"write_scope_permits" = "local-launch"
-"write_scope_transfers" = "local-launch"
-
+"agent_binding_receipts" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_installations" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_instances" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_model_bindings" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_profile_snapshots" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_session_preparation_claims" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_session_preparations" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"agent_transition_receipts" = { domain = "agent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"app_flags" = { domain = "app", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"approval_grants" = { domain = "approval", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"assistants" = { domain = "assistants", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"client_submission_terminal_receipts" = { domain = "client", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"compaction_handoffs" = { domain = "compaction", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"compaction_shadows" = { domain = "compaction", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"connector_state" = { domain = "connector", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"decision_attention_mutation_guards" = { domain = "decision", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"decision_receipts" = { domain = "decision", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"decision_requests" = { domain = "decision", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"execution_containments" = { domain = "execution", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_events" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_integrity_faults" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_operations" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_queue_entries" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_session_tombstones" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"external_journal_spool_capsules" = { domain = "external", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"goal_control_jobs" = { domain = "goal", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"goal_root_turns" = { domain = "goal", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"guidance_contents" = { domain = "guidance", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_authorization_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_cleanup_intents" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_components" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_leases" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_references" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifacts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_security_recovery_attempts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_security_recovery_audits" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_security_recovery_components" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_artifact_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_attempt_activation_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_attempt_media_snapshots" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_attempts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_attempt_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_cancellation_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_cancelled_result_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_cleanup_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_component_release_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_component_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_deadline_expiry_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_handoff_evidence" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_jobs" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_job_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_late_publication_authorization_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_late_publication_leases" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_late_publication_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_plans" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_provider_cancel_claims" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_provider_cancel_evidence" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_publication_right_facts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_reconciliation_claim_completions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_reconciliation_claims" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_reconciliation_evidence" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_response_fetches" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_response_fetch_outcomes" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_response_publication_intents" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_response_reconciliation_claims" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_response_reconciliations" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_scheduler_claim_consumptions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_scheduler_claims" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_scheduler_error_counts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_slots" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_slot_transitions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_terminal_events" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_generation_user_published_outputs" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_attempt_dispatches" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_attempts" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_cost_events" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_debt_resolutions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_epoch_heads" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_policy_versions" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_reservations" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"image_spend_scope_usage" = { domain = "image", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"inference_calls" = { domain = "inference", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"inference_requests" = { domain = "inference", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"installation_continuations" = { domain = "installation", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"installation_identity" = { domain = "installation", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"installation_journals" = { domain = "installation", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"installation_observations" = { domain = "installation", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"installation_operations" = { domain = "installation", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_callsites" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_centrality" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_deps" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_files" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_identifiers" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_imports" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_meta" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"intel_symbols" = { domain = "intel", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"local_media_operation_audit" = { domain = "local", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"local_media_operations" = { domain = "local", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"lock_reads" = { domain = "lock", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"lock_state" = { domain = "lock", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"loop_guard_rules" = { domain = "loop", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"mcp_config_journals" = { domain = "mcp", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_accounting_blocks" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_accounting_corruption_facts" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_artifact_facts" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_cleanup_intents" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_component_leases" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_components" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_failure_reasons" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_cleanup_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_failure_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_jobs" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_output_security_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_publication_intents" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_processing_security_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_references" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachments" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_transition_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_attachment_upload_origins" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_av_normalization_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_cleanup_attestations" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_cleanup_security_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_component_deletion_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_component_deletion_intents" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_component_lease_reconciliation_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_component_security_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_counter_shadow" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_creation_sequence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_downstream_ownership" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_execution_ready" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_image_component_dimensions" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_local_path_registration_audit" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_local_path_registration_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_local_path_registration_operations" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_queue_sequence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_repair_attempts" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_reservation_deltas" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_reservation_plan_facts" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_reservations" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_reservation_versions" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_resource_counters" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_retained_https_audit" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_retained_https_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_retained_https_operations" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_retained_https_orphan_cleanup_evidence" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_retained_https_publication_intents" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_scheduler_cursor" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_security_recovery_operations" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_storage_publication_intents" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_upload_chunks" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"media_uploads" = { domain = "media", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"message_attachment_references" = { domain = "message", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"message_operation_receipts" = { domain = "message", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"message_queue_items" = { domain = "message", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"message_submission_receipts" = { domain = "message", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"needs_attention" = { domain = "needs", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"packages" = { domain = "packages", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"paused_session_work" = { domain = "paused", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"pins" = { domain = "pins", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"project_notes" = { domain = "project", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"protected_leak_records" = { domain = "protected", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"protected_redaction_artifact_refs" = { domain = "protected", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"protected_redaction_history" = { domain = "protected", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"provider_config_journals" = { domain = "provider", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"prune_ledger" = { domain = "prune", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_attachment_lifecycle" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_attachment_operations" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_attachment_outbox" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_attachment_outbox_deliveries" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_attachment_outbox_snapshots" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_audit_upload_state" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_daemon_custody_generation_seq" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_daemon_custody_records" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_principal_audit" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_rename_artifact_cleanup_intents" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"remote_rename_journal" = { domain = "remote", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"retention_meta" = { domain = "retention", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"run_invocations" = { domain = "run", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"run_invocation_tombstones" = { domain = "run", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"scheduled_jobs" = { domain = "scheduled", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_action_grants" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_action_instances" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_global_project_grants" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_recovery_audit" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_state_sagas" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_value_name_tombstones" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_value_records" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_values" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sealed_value_sagas" = { domain = "sealed", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_credential_ownership" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_named_ownership" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_authority" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_inventory_state" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_item_revisions" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_items" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_keys" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secret_vault_sagas" = { domain = "secret", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secure_key_consumer_refs" = { domain = "secure", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secure_key_namespaces" = { domain = "secure", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secure_key_sagas" = { domain = "secure", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"secure_key_versions" = { domain = "secure", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_events" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_fts_docs" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_goals" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_plan_docs" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sessions" = { domain = "sessions", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_archive_imports" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_event_refs" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_projection_pending_sentinel" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_projection_pending_slots" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_quota_reservations" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifact_run_invocation_bindings" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_text_artifacts" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"session_user_message_model_envelopes" = { domain = "session", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"skill_curator_snapshots" = { domain = "skill", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"skill_pairs" = { domain = "skill", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"skill_usage" = { domain = "skill", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"subagent_handles" = { domain = "subagent", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"sync_state" = { domain = "sync", rust_owner = "cockpit-db::db", status = "remove-from-v0.1", recovery_entrypoint = "not present in local-v0.1; opt-in remote daemon recovery", retention_policy = "not retained by local-v0.1", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"tandem_inference" = { domain = "tandem", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_artifact_integration_receipts" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_artifacts" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_delegation_children" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_delegation_jobs" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_delegation_payloads" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_delegation_steers" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_todo_assignments" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_todo_notes" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"task_todos" = { domain = "task", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"tokenizer_calibration" = { domain = "tokenizer", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"tool_call_events" = { domain = "tool", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"usage_events" = { domain = "usage", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_candidate_artifacts" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_candidates" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_dispatch_attempts" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_late_results" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_operations" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_projection_envelopes" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_projection_events" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_projections" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_syntheses" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"verification_synthesis_artifacts" = { domain = "verification", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"workspace_leases" = { domain = "workspace", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"workspace_trust" = { domain = "workspace", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"write_scope_leases" = { domain = "write", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"write_scope_permits" = { domain = "write", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }
+"write_scope_transfers" = { domain = "write", rust_owner = "cockpit-db::db", status = "launch-required", recovery_entrypoint = "daemon boot recovery and cockpit doctor inspection", retention_policy = "daemon-owned domain retention policy", state_machine = "rust-and-sql", invariant_owner = "cockpit-db::db plus 0001_initial.sql" }

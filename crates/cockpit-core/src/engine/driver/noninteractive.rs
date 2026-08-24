@@ -2299,26 +2299,28 @@ impl Driver {
         }
     }
 
-    /// Fire one `subagentStop` observe hook for every NONINTERACTIVE child
-    /// registered under `task_call_id`, at the delegation-complete / delivery
-    /// boundary. Pairs 1:1 with the `subagentStart` fired at `register_running`:
-    /// every started noninteractive child (a single delegation, or each entry of
-    /// a batch delegation) emits exactly one stop. Called only from the
-    /// delivered-transition arms of
-    /// [`Self::finalize_background_noninteractive_completion`] (guarded by
-    /// `job.delivered`), so it runs once per delivered job and cannot double-fire
-    /// across the inline-finish and background-delivery paths.
+    /// Fire the `subagentStop` for every NONINTERACTIVE child under
+    /// `task_call_id`, at the delegation-complete / delivery boundary — the
+    /// single exactly-once firing per started child, paired 1:1 with the
+    /// `subagentStart` fired at `register_running`. Routed through the unified
+    /// [`Driver::fire_terminal_subagent_stop`] G::Stop dispatcher rather than an
+    /// observe fire: a delivered noninteractive child has already terminated (its
+    /// `run_noninteractive_resumable` task returned), so its stop can carry no
+    /// continuation — honoring block/continue for noninteractive children is a
+    /// deferred follow-up. Fires for EVERY child (including the `docs` pipeline
+    /// child and any pre-loop synthetic-failed completion, which never run a
+    /// gate) — this boundary is the sole firing, so there is no double.
     ///
-    /// `endReason` reflects each child's terminal registry status set by
-    /// `finalize_single_*` / `finalize_batch_*`; `fallback` covers a child whose
-    /// entry was never `complete()`d (a tokio-level `Err` / whole-batch abort of
-    /// a started child). Child-only; matcher / `subagentType` is the child agent
-    /// type and `subagentId` is the shared delegating `task` call id. Envelope
-    /// carries only camelCase `subagentId` / `subagentType` / `endReason` — no
-    /// child prompt text, report body, tool IO, or history.
+    /// Called only from the delivered-transition arms of
+    /// [`Self::finalize_background_noninteractive_completion`] (guarded by
+    /// `first_delivery.fire_stops()`), so it runs once per delivered job.
+    /// `endReason` reflects each child's terminal registry status;
+    /// `subagentType` is the child agent type, `subagentId` is the shared
+    /// delegating `task` call id.
     async fn fire_noninteractive_subagent_stops(&self, task_call_id: &str, fallback: &'static str) {
         // Collect first so no borrow of the registry is held across the await in
-        // `fire_subagent_hook`. Stable order (by label) for deterministic firing.
+        // `fire_terminal_subagent_stop`. Stable order (by label) for
+        // deterministic firing.
         let mut children: Vec<(String, String, &'static str)> = self
             .noninteractive_delegations
             .entries
@@ -2334,13 +2336,8 @@ impl Driver {
             .collect();
         children.sort_by(|a, b| a.0.cmp(&b.0));
         for (_label, child_agent, end_reason) in children {
-            self.fire_subagent_hook(
-                crate::config::extended::hooks::HookEvent::SubagentStop,
-                &child_agent,
-                Some(task_call_id),
-                Some(end_reason),
-            )
-            .await;
+            self.fire_terminal_subagent_stop(&child_agent, Some(task_call_id), end_reason)
+                .await;
         }
     }
 
@@ -2370,15 +2367,14 @@ impl Driver {
                     let finalized = self
                         .finalize_single_noninteractive_task(completion, tx, !was_backgrounded)
                         .await;
-                    // `subagentStop` observe hook for the delivered NONINTERACTIVE
-                    // child. Fired ONLY on the tracked first delivery (a job that
-                    // was cancelled+aborted fires its stop on the cancel path
-                    // instead, and a re-delivered completion never reaches here),
-                    // so it cannot double-fire across inline finish / background
-                    // delivery / cancel. Fired even if `finalize_single_*` errored,
-                    // so a scan/expand failure can't drop the stop; on that error
-                    // the entry is un-`complete()`d and falls back to `failed`.
-                    // Pairs the `subagentStart` fired at register-running.
+                    // `subagentStop` for the delivered NONINTERACTIVE child — the
+                    // single exactly-once firing, on the tracked first delivery
+                    // (a cancelled+aborted job fires its stop on the cancel path
+                    // instead, and a re-delivered completion never reaches here).
+                    // Fired even if `finalize_single_*` errored, so a scan/expand
+                    // failure can't drop the stop; on that error the entry is
+                    // un-`complete()`d and falls back to `failed`. Pairs the
+                    // `subagentStart` fired at register-running.
                     if first_delivery.fire_stops() {
                         self.fire_noninteractive_subagent_stops(&task_call_id, "failed")
                             .await;
@@ -2847,11 +2843,13 @@ impl Driver {
                             .noninteractive_delegations
                             .is_live(&row.task_call_id, &row.label)
                         {
-                            self.fire_subagent_hook(
-                                crate::config::extended::hooks::HookEvent::SubagentStop,
+                            // A live (aborted) child never completed, so its loop
+                            // gate never ran; fire the TERMINAL `subagentStop`
+                            // (`cancelled`) through the unified G::Stop dispatcher.
+                            self.fire_terminal_subagent_stop(
                                 &row.child_agent,
                                 Some(&row.task_call_id),
-                                Some("cancelled"),
+                                "cancelled",
                             )
                             .await;
                         }

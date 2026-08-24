@@ -213,7 +213,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         None
     };
 
-    let loop_outcome = run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx).await;
+    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx).await;
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -230,8 +230,26 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     }
 
     let result = match loop_outcome {
-        Ok(text) => text,
+        Ok(text) => {
+            // The child ran its controlling `subagentStop` gate inside
+            // `run_swarm_loop` on EVERY normal-return path (Done / structural
+            // finish / primary-turn ceiling), firing exactly one gated stop.
+            // Announce that (FIFO, before `Completed`) so the driver skips the
+            // terminal `subagentStop` at the `Completed` drain for a normally
+            // gated success — no double. Goal-supervision workers never gate and
+            // never track a subagent, so they never announce it (guidance L22).
+            if !spec.worker.is_goal_control() {
+                let _ = event_tx
+                    .send(ScheduleEvent::SwarmChildStopGateCompleted {
+                        job_id: job_id.clone(),
+                    })
+                    .await;
+            }
+            text
+        }
         Err(e) => {
+            // A failure bypasses the loop gate; the driver fires the terminal
+            // `subagentStop` (`failed`) at the `Completed` drain instead.
             let _ = event_tx
                 .send(ScheduleEvent::Completed {
                     job_id,
@@ -266,6 +284,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
 /// Run the child's `Swarm` agent loop, intercepting its own
 /// `spawn` calls and routing them back to main.
 async fn run_swarm_loop(
+    job_id: &str,
     spec: &SpawnSpec,
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -294,6 +313,13 @@ async fn run_swarm_loop(
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
     let cancel = tokio_util::sync::CancellationToken::new();
     let deferred_log = crate::engine::deferred::DeferredLog::new();
+
+    // This detached child owns its `subagentStop` continuation budget for its
+    // whole job lifetime (a LOOP-LOCAL latch). It is dropped when this function
+    // returns on ANY path, and a nested job receives its OWN `run_swarm_loop`
+    // invocation with a fresh latch — so it can never leak, be reconsulted after
+    // the loop returns, or be reopened (never-reopen airtight by construction).
+    let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
 
     // Per-turn backup-model fallback for the background `Swarm` child
     // (implementation note): `Swarm` is in scope, so the
@@ -359,7 +385,27 @@ async fn run_swarm_loop(
                     .pop()
                     .expect("Continue with empty history is unreachable");
             }
-            TurnOutcome::Done => return Ok(collect_final_text(&history)),
+            TurnOutcome::Done => {
+                // Genuine detached-`Swarm` child completion: consult its
+                // loop-local `subagentStop` gate (the single gated firing for
+                // this stop). Goal-supervision workers never gate — enforced
+                // inside `swarm_child_stop_continuation` (guidance L22). A
+                // blocking stop hook re-runs the child with host feedback.
+                if let Some(prompt) = swarm_child_stop_continuation(
+                    job_id,
+                    spec,
+                    ctx,
+                    &pinned,
+                    &cancel,
+                    &mut stop_gate,
+                )
+                .await
+                {
+                    next_prompt = prompt;
+                    continue;
+                }
+                return Ok(collect_final_text(&history));
+            }
             // The child fanned out further. Route the spawn back to main (the
             // single authority) — or refuse it at the ceiling (clamp, don't
             // crash) — and feed the resulting pointer back as this call's
@@ -405,11 +451,92 @@ async fn run_swarm_loop(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
+                // A structural end-of-run for a genuine swarm child: gate its
+                // `subagentStop` exactly like the `Done` arm (single gated
+                // firing; goal-supervision excluded inside the funnel per L22).
+                if let Some(prompt) = swarm_child_stop_continuation(
+                    job_id,
+                    spec,
+                    ctx,
+                    &pinned,
+                    &cancel,
+                    &mut stop_gate,
+                )
+                .await
+                {
+                    next_prompt = prompt;
+                    continue;
+                }
                 return Ok(collect_final_text(&history));
             }
         }
     }
+    // Primary-turn ceiling reached without a normal stop boundary. The child
+    // cannot re-run, so the continuation is not honored — but the single gated
+    // `subagentStop` must still fire (else the success marker sent by `run_swarm`
+    // would skip the stop at the drain, dropping it). Goal-supervision workers
+    // never gate (enforced inside the funnel per L22).
+    let _ =
+        swarm_child_stop_continuation(job_id, spec, ctx, &pinned, &cancel, &mut stop_gate).await;
     Ok(collect_final_text(&history))
+}
+
+/// Consult a genuine detached-`Swarm` child's controlling `subagentStop` gate on
+/// a normal completion, through the unified [`crate::engine::agent::hooks::run_stop_hooks`]
+/// G::Stop dispatcher (`endReason = completed`). Returns `Some(prompt)` when a
+/// blocking stop hook grants a continuation the caller should re-run the child
+/// with (host feedback via `SubmissionOrigin::Internal`, so it never re-fires
+/// `userPromptSubmit`), and the run is not cancelled; otherwise `None` (end).
+///
+/// The L22 goal-supervision exclusion is enforced at THIS single funnel (not at
+/// each of the three `run_swarm_loop` call sites): a goal-control worker
+/// (Planner/Evaluator/Gatekeeper/ColdSkeptic) returns `None` immediately WITHOUT
+/// dispatching any hook, so it can never fire `subagentStop`. Enforcing it here
+/// once means no call site can drift into firing it, and one test
+/// (`swarm_stop_gate_never_fires_for_goal_control_workers`) covers every gate
+/// site. The `stop_gate` latch is loop-local and dropped when `run_swarm_loop`
+/// returns, so it is never-reopen airtight.
+async fn swarm_child_stop_continuation(
+    job_id: &str,
+    spec: &SpawnSpec,
+    ctx: &ScheduleContext,
+    pinned: &crate::daemon::session_worker::SessionConfigHandle,
+    cancel: &tokio_util::sync::CancellationToken,
+    stop_gate: &mut crate::engine::agent::hooks::StopGateState,
+) -> Option<Message> {
+    // L22: goal-supervision control workers are never user-facing subagents and
+    // fire NEITHER lifecycle event. Fail closed at the funnel.
+    if spec.worker.is_goal_control() {
+        return None;
+    }
+    let snapshot = pinned.snapshot();
+    let outcome = crate::engine::agent::hooks::run_stop_hooks(
+        &crate::engine::agent::hooks::TokioCommandRunner::new(),
+        &crate::engine::agent::hooks::DefaultProcessEnv,
+        snapshot.hooks(),
+        crate::config::extended::hooks::HookEvent::SubagentStop,
+        spec.worker.agent_name(),
+        ctx.session.id,
+        &ctx.cwd,
+        &ctx.session.db,
+        Some(spec.worker.agent_name()),
+        Some(job_id),
+        Some("completed"),
+        stop_gate,
+    )
+    .await;
+    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+        reason,
+        additional_context,
+    } = outcome
+        && !cancel.is_cancelled()
+    {
+        return Some(crate::engine::driver::Driver::stop_continuation_prompt(
+            reason,
+            additional_context,
+        ));
+    }
+    None
 }
 
 /// Route a running child's own `spawn` to main, or refuse it at the
@@ -1029,7 +1156,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx),
+            run_swarm_loop("job-test", &spec, &ctx, &turn_tx, &cmd_tx),
         )
         .await
         .expect("the swarm loop must finish against the local endpoint");
@@ -1051,6 +1178,349 @@ mod tests {
         assert!(
             body.contains("/tmp/state-ca"),
             "the child's output-dir instruction must be on the wire: {body}"
+        );
+    }
+
+    /// Fix-2: `run_swarm` EMITS the ordered `SwarmChildStopGateCompleted` marker
+    /// on a genuine (non-goal-control) child's `Ok` success, FIFO after
+    /// `SwarmChildStarted` and before the terminal `Completed`. This drives a real
+    /// `run_swarm` for a `scout` (read-only → no write-scope transfer) against a
+    /// local one-token endpoint so the child reaches `Done`/`Ok`. If the
+    /// `event_tx.send(SwarmChildStopGateCompleted)` were dropped, a gated success
+    /// would double at the driver drain (completed + aborted) — this test fails
+    /// (the marker would be absent from the event order).
+    #[tokio::test]
+    async fn run_swarm_emits_stop_gate_marker_before_completed_on_success() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // A provider that answers with a one-token, finish_reason=stop completion
+        // so the child loop ends after one turn.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut tmp).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buf.len() >= body_start + content_len {
+                        break;
+                    }
+                }
+                let payload = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+                               data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":2}}\n\n\
+                               data: [DONE]\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        let base_url = format!("http://{addr}/v1");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+        let config_path = tmp.path().join(".cockpit/config.json");
+        std::fs::write(&config_path, r#"{"llm_mode":"normal"}"#).unwrap();
+        let mut providers = crate::config::providers::ProvidersConfig::default();
+        providers.providers.insert(
+            "cloud".into(),
+            crate::config::providers::ProviderEntry {
+                url: base_url.clone(),
+                trust: Some(crate::config::providers::ModelTrust::Untrusted),
+                timeout: crate::config::providers::TimeoutConfig {
+                    ttft_secs: 10,
+                    idle_secs: 10,
+                },
+                models: vec![crate::config::providers::ModelEntry {
+                    id: "worker".into(),
+                    subagent_invokable: Some(true),
+                    can_delegate: Some(true),
+                    ..crate::config::providers::ModelEntry::default()
+                }],
+                ..crate::config::providers::ProviderEntry::default()
+            },
+        );
+        let mut doc = crate::config::providers::ConfigDoc::load(&config_path).unwrap();
+        doc.write(&providers).unwrap();
+
+        let table = Arc::new(crate::redact::RedactionTable::empty());
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let (_extended, effective_providers) =
+            crate::engine::model_roles::load_model_role_config(&config);
+        let parent_model = Arc::new(
+            crate::engine::model::Model::for_provider(
+                &effective_providers,
+                "cloud",
+                "worker",
+                table.clone(),
+            )
+            .unwrap(),
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db,
+                tmp.path().to_path_buf(),
+                "Swarm",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        let locks = Arc::new(crate::locks::LockManager::in_memory(
+            crate::db::Db::open_in_memory().unwrap(),
+        ));
+        let parent = Agent {
+            name: "Swarm".to_string(),
+            system: "s".to_string(),
+            role_prompt: "s".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model: parent_model,
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: true,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Swarm".to_string(),
+            write_scope: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
+        };
+        let ctx = ScheduleContext {
+            session,
+            locks,
+            redact: table.clone(),
+            cwd: tmp.path().to_path_buf(),
+            config,
+            agent: Arc::new(parent),
+            write_scope: None,
+        };
+
+        let mut spec = spec(1, 3);
+        // A read-only `scout` takes NO write-scope transfer, so `run_swarm`
+        // proceeds straight into the loop against the local endpoint.
+        spec.worker = SpawnWorkerKind::Scout;
+
+        let (turn_tx, mut turn_rx) = mpsc::channel(256);
+        tokio::spawn(async move { while turn_rx.recv().await.is_some() {} });
+        let (event_tx, mut event_rx) = mpsc::channel::<ScheduleEvent>(64);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_swarm(SwarmRunCtx {
+                job_id: "job-marker".to_string(),
+                label: "scout".to_string(),
+                spec,
+                ctx,
+                turn_tx,
+                event_tx,
+                cmd_tx,
+            }),
+        )
+        .await
+        .expect("run_swarm must finish against the local endpoint");
+
+        // The ordered event stream for a genuine gated success.
+        let mut order = Vec::new();
+        let mut saw_completed = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv()).await
+        {
+            match ev {
+                ScheduleEvent::SwarmChildStarted { .. } => order.push("started"),
+                ScheduleEvent::SwarmChildStopGateCompleted { .. } => order.push("gate"),
+                ScheduleEvent::Completed { failed, .. } => {
+                    assert!(!failed, "a scout success must be a non-failed Completed");
+                    saw_completed = true;
+                    break;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(saw_completed, "run_swarm must emit a terminal Completed");
+        assert_eq!(
+            order,
+            vec!["started", "gate"],
+            "run_swarm must emit SwarmChildStopGateCompleted (FIFO) after the start \
+             and before Completed; a dropped marker fails here"
+        );
+    }
+
+    /// Fix-3: L22 at the SINGLE swarm gate funnel. Every gate site in
+    /// `run_swarm_loop` routes through `swarm_child_stop_continuation`, which fails
+    /// closed for a goal-supervision worker BEFORE dispatching any hook. Driving
+    /// that funnel directly for each goal-control worker (with a MATCHING
+    /// `subagentStop` hook configured) fires nothing; a genuine `scout` fires
+    /// exactly one through the same funnel. Removing the `is_goal_control` guard
+    /// inside the funnel makes the goal-control assertion fail (a `hook_run` row
+    /// would appear) — covering all three gate sites via the one funnel.
+    #[tokio::test]
+    async fn swarm_stop_gate_never_fires_for_goal_control_workers() {
+        use crate::config::extended::ExtendedConfig;
+        use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+        use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
+        use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create_for_test(
+                db.clone(),
+                root.clone(),
+                "Swarm",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let locks = Arc::new(crate::locks::LockManager::in_memory(db));
+        let redact = Arc::new(crate::redact::RedactionTable::empty());
+
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                ..ProviderEntry::default()
+            },
+        );
+        let pcfg = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                reasoning_effort: None,
+                thinking_mode: None,
+                prompt_cache_retention: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        let model = Arc::new(
+            crate::engine::model::Model::from_config(
+                &pcfg,
+                Arc::new(crate::redact::RedactionTable::empty()),
+            )
+            .unwrap(),
+        );
+        let agent = Arc::new(Agent {
+            name: "Swarm".to_string(),
+            system: "s".to_string(),
+            role_prompt: "s".to_string(),
+            tools: crate::engine::tool::ToolBox::new(),
+            model,
+            params: crate::engine::model::ModelParams::default(),
+            scan_tool_results: true,
+            llm_mode: crate::config::extended::LlmMode::Normal,
+            lock_identity: "Swarm".to_string(),
+            write_scope: None,
+            delegated: false,
+            delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
+        });
+        let ctx = ScheduleContext {
+            session,
+            locks,
+            redact,
+            cwd: root,
+            config: SessionConfigHandle::detached_default(),
+            agent,
+            write_scope: None,
+        };
+
+        let pinned_with_stop_hook = |matcher: &str| -> SessionConfigHandle {
+            let reg = HookRegistry {
+                hooks: vec![ResolvedHook {
+                    event: HookEvent::SubagentStop,
+                    matcher: Some([matcher.to_string()].into_iter().collect()),
+                    command: vec!["cockpit-swarm-hook-does-not-exist".to_string()],
+                    timeout_secs: 5,
+                    env: std::collections::BTreeMap::new(),
+                    origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+                    source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+                    source_directory: std::path::PathBuf::from("/tmp/test"),
+                }],
+                warnings: Vec::new(),
+            };
+            SessionConfigHandle::detached(SessionConfigSnapshot::with_hooks(
+                1,
+                ProvidersConfig::default(),
+                ExtendedConfig::default(),
+                reg,
+            ))
+        };
+
+        async fn subagent_stop_rows(db: &crate::db::Db, sid: uuid::Uuid) -> usize {
+            db.list_session_events(sid)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "hook_run" && e.data["event"] == "subagentStop")
+                .count()
+        }
+
+        // Every goal-supervision worker: the funnel returns None and fires
+        // nothing, even with a matching subagentStop hook configured.
+        for worker in [
+            SpawnWorkerKind::GoalPlanner,
+            SpawnWorkerKind::GoalEvaluator,
+            SpawnWorkerKind::GoalGatekeeper,
+            SpawnWorkerKind::GoalColdSkeptic,
+        ] {
+            let mut s = spec(0, 3);
+            s.worker = worker;
+            let pinned = pinned_with_stop_hook(worker.agent_name());
+            let mut state = crate::engine::agent::hooks::StopGateState::default();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let out =
+                swarm_child_stop_continuation("job-gc", &s, &ctx, &pinned, &cancel, &mut state)
+                    .await;
+            assert!(out.is_none(), "{worker:?} must not gate (L22)");
+        }
+        assert_eq!(
+            subagent_stop_rows(&ctx.session.db, ctx.session.id).await,
+            0,
+            "L22: no goal-supervision worker fires subagentStop at the gate funnel"
+        );
+
+        // Positive control: a genuine `scout` DOES fire exactly one subagentStop
+        // through the SAME funnel — so the zero above is a real guard, not a
+        // config where the hook could never match.
+        let mut scout = spec(0, 3);
+        scout.worker = SpawnWorkerKind::Scout;
+        let pinned = pinned_with_stop_hook("scout");
+        let mut state = crate::engine::agent::hooks::StopGateState::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _ =
+            swarm_child_stop_continuation("job-scout", &scout, &ctx, &pinned, &cancel, &mut state)
+                .await;
+        assert_eq!(
+            subagent_stop_rows(&ctx.session.db, ctx.session.id).await,
+            1,
+            "a non-goal worker fires exactly one subagentStop through the same funnel"
         );
     }
 

@@ -32,6 +32,14 @@ impl Driver {
                 self.fire_swarm_subagent_start(&job_id, &subagent_type)
                     .await;
             }
+            ScheduleEvent::SwarmChildStopGateCompleted { job_id } => {
+                // A genuine detached-`Swarm` child ran its own controlling
+                // `subagentStop` gate inside `run_swarm_loop` before publishing
+                // its terminal result. Mark it so the paired `Completed` drain
+                // does not fire a second (terminal) `subagentStop`. FIFO: this
+                // ordered marker is always drained before that job's `Completed`.
+                self.mark_swarm_subagent_stop_gate_completed(&job_id);
+            }
             ScheduleEvent::Completed {
                 job_id,
                 label,

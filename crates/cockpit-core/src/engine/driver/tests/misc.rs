@@ -395,9 +395,14 @@ async fn stop_failure_hook_fires_on_inference_error_class() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
-    // Drive the real success-pop boundary: a `subagentStop` hook matched on the
-    // child agent type fires exactly once when the child frame is popped.
+async fn subagent_stop_gate_fires_once_at_interactive_child_completion_not_at_pop() {
+    use crate::engine::agent::hooks::StopHookOutcome;
+    // UNIFIED dispatch: a genuine interactive child completion fires its
+    // `subagentStop` through the frame-owned stop gate
+    // (`consult_active_child_stop_gate`, the SINGLE firing), and the subsequent
+    // `pop_child_with_envelope` fires NOTHING (no observe double). An unresolvable
+    // hook fails open (executable-not-found → `End`), still recording the one row
+    // that is the wiring signal.
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     inject_hooks(
@@ -408,18 +413,34 @@ async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
         ),
     );
     push_answering_child(&mut driver, "task-pop-1", "fn-pop-1");
+    let outcome = driver
+        .consult_active_child_stop_gate(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        StopHookOutcome::End,
+        "an unresolvable child stop hook fails open (the turn ends)"
+    );
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "the child stop gate fires exactly one subagentStop at completion"
+    );
+    // The pop that publishes the child envelope must NOT fire a second stop.
     let _ = driver.pop_child_with_envelope(None, &tx).await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStop").await,
         vec!["failed".to_string()],
-        "popping an interactive child must fire exactly one subagentStop hook"
+        "popping the child after the gate must not fire a second subagentStop"
     );
     drop(tx);
     while rx.recv().await.is_some() {}
 
-    // A different-agent-type hook must NOT fire on a builder child pop.
+    // A different-agent-type hook must NOT fire on a builder child completion.
     let (mut driver, _tmp) = test_driver_without_network(8);
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
     inject_hooks(
         &mut driver,
         observe_boundary_registry(
@@ -428,12 +449,112 @@ async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
         ),
     );
     push_answering_child(&mut driver, "task-pop-2", "fn-pop-2");
-    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    let _ = driver
+        .consult_active_child_stop_gate(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+        )
+        .await;
     assert!(
         observe_hook_events(&driver, "subagentStop")
             .await
             .is_empty(),
-        "an explore-only hook must not fire on a builder child pop"
+        "an explore-only hook must not fire on a builder child completion"
+    );
+}
+
+#[tokio::test]
+async fn interactive_child_stop_gate_block_continues_against_per_child_frame_latch() {
+    use crate::engine::agent::hooks::{STOP_HOOK_MAX_CONTINUATIONS, StopHookOutcome};
+    // A blocking `subagentStop` hook re-runs the CHILD: the gate returns
+    // `Continue` and counts the grant against the CHILD FRAME's own latch (an
+    // independent per-child budget), up to the 8-cap, then force-ends WITHOUT
+    // reconsulting (a `PanicRunner` proves no hook runs at the cap). This drives
+    // the real `consult_active_child_stop_gate` against the frame-owned
+    // `StopGateState`.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    push_answering_child(&mut driver, "task-block", "fn-block");
+    let env = ResolveEnv;
+    let block = StopScriptRunner::new(r#"{"decision":"block","reason":"finish the sweep"}"#);
+    let expected_grants: usize = 8;
+    assert_eq!(
+        STOP_HOOK_MAX_CONTINUATIONS as usize, expected_grants,
+        "independent pin of the cap"
+    );
+    for round in 1..=expected_grants {
+        let outcome = driver.consult_active_child_stop_gate(&block, &env).await;
+        assert_eq!(
+            outcome,
+            StopHookOutcome::Continue {
+                reason: "finish the sweep".to_string(),
+                additional_context: None,
+            },
+            "round {round} still open"
+        );
+        // The latch lives ON the child frame (per-child budget), not a global.
+        assert_eq!(
+            driver.stack.last().unwrap().stop_gate.continuation_count as usize,
+            round
+        );
+        assert_eq!(
+            block.calls.load(std::sync::atomic::Ordering::SeqCst),
+            round,
+            "each granted round consults the hook once"
+        );
+    }
+    // Capped: force-end without reconsulting the stop hook.
+    let outcome = driver
+        .consult_active_child_stop_gate(&PanicRunner, &env)
+        .await;
+    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+}
+
+#[tokio::test]
+async fn interactive_child_stop_latch_is_per_frame_and_drops_on_unwind() {
+    use crate::engine::agent::hooks::StopHookOutcome;
+    // NEVER-REOPEN by construction: the continuation latch is owned by the child
+    // FRAME, so an aborting unwind (cancel / parent-cancel) drops it. A brand-new
+    // child then starts from a FRESH latch — the aborted child's budget can never
+    // be reopened or inherited.
+    let (mut driver, _tmp) = test_driver_without_network(8);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "builder",
+        ),
+    );
+    let env = ResolveEnv;
+    let block = StopScriptRunner::new(r#"{"decision":"block","reason":"keep going"}"#);
+
+    push_answering_child(&mut driver, "task-latch-1", "fn-latch-1");
+    let outcome = driver.consult_active_child_stop_gate(&block, &env).await;
+    assert!(matches!(outcome, StopHookOutcome::Continue { .. }));
+    assert_eq!(driver.stack.last().unwrap().stop_gate.continuation_count, 1);
+
+    // Abort the child: the frame (and its latch) is dropped on unwind.
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver
+        .unwind_stack_to_root(StackUnwindReason::Cancelled, &tx)
+        .await;
+    assert_eq!(driver.stack.len(), 1, "unwind returns to the root frame");
+
+    // A NEW child starts from a fresh latch — count is 1 again after one grant,
+    // NOT 2 (the aborted child's budget did not carry over / reopen).
+    push_answering_child(&mut driver, "task-latch-2", "fn-latch-2");
+    let outcome = driver.consult_active_child_stop_gate(&block, &env).await;
+    assert!(matches!(outcome, StopHookOutcome::Continue { .. }));
+    assert_eq!(
+        driver.stack.last().unwrap().stop_gate.continuation_count,
+        1,
+        "a fresh child frame starts from a fresh latch (never-reopen)"
     );
     drop(tx);
     while rx.recv().await.is_some() {}
@@ -583,10 +704,14 @@ async fn orphaned_child_teardown_fires_paired_subagent_stop() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn swarm_subagent_start_and_stop_pair_for_child_agent_type_matcher() {
-    // A genuine swarm child (`bee`) that starts then completes fires exactly one
-    // `subagentStart` and exactly one paired `subagentStop`, both matched on the
-    // child agent type. A different-agent-type hook fires neither.
+async fn swarm_gated_success_skips_terminal_stop_while_failure_fires_one() {
+    // UNIFIED dispatch for detached-`Swarm`: a genuine `bee` child runs its OWN
+    // controlling `subagentStop` gate inside `run_swarm_loop` and announces it via
+    // the ordered `SwarmChildStopGateCompleted` marker
+    // (`mark_swarm_subagent_stop_gate_completed`). The terminal `Completed` drain
+    // must then SKIP the terminal stop for that normally-gated success — else it
+    // would double. A FAILURE bypasses the loop gate, so the drain fires exactly
+    // one terminal `subagentStop`.
     let (mut driver, _tmp) = test_driver_without_network(1);
     let mut reg = observe_boundary_registry(
         crate::config::extended::hooks::HookEvent::SubagentStart,
@@ -607,46 +732,119 @@ async fn swarm_subagent_start_and_stop_pair_for_child_agent_type_matcher() {
         vec!["failed".to_string()],
         "a bee swarm child start must fire exactly one subagentStart hook"
     );
-    // Its terminal `Completed` (failed = false → success) fires the paired stop.
+    // Normally-gated success: mark the loop gate as completed, then the terminal
+    // drain skips (no second stop).
+    driver.mark_swarm_subagent_stop_gate_completed("sched-bee-1");
     driver
         .fire_swarm_subagent_stop_if_tracked("sched-bee-1", false)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a normally-gated swarm success must fire NO terminal subagentStop at the drain"
+    );
+
+    // A FAILURE (gate bypassed) fires exactly one terminal subagentStop.
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        ),
+    );
+    driver
+        .fire_swarm_subagent_start("sched-bee-fail", "bee")
+        .await;
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-fail", true)
         .await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStop").await,
         vec!["failed".to_string()],
-        "the same bee child's completion must fire exactly one paired subagentStop"
+        "a failed swarm child fires exactly one terminal subagentStop"
     );
 
-    // A `scout`-only hook fires nothing for a `bee` child — proving the matcher
-    // is the child agent type, not an unconditional fire.
+    // A `scout`-only hook fires nothing for a `bee` child — the matcher is the
+    // child agent type, not an unconditional fire.
     let (mut driver, _tmp) = test_driver_without_network(1);
-    let mut reg = observe_boundary_registry(
-        crate::config::extended::hooks::HookEvent::SubagentStart,
-        "scout",
-    );
-    reg.hooks.extend(
+    inject_hooks(
+        &mut driver,
         observe_boundary_registry(
             crate::config::extended::hooks::HookEvent::SubagentStop,
             "scout",
-        )
-        .hooks,
+        ),
     );
-    inject_hooks(&mut driver, reg);
     driver.fire_swarm_subagent_start("sched-bee-2", "bee").await;
     driver
-        .fire_swarm_subagent_stop_if_tracked("sched-bee-2", false)
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-2", true)
         .await;
-    assert!(
-        observe_hook_events(&driver, "subagentStart")
-            .await
-            .is_empty(),
-        "a scout-only hook must not fire on a bee child start"
-    );
     assert!(
         observe_hook_events(&driver, "subagentStop")
             .await
             .is_empty(),
         "a scout-only hook must not fire on a bee child stop"
+    );
+}
+
+#[tokio::test]
+async fn swarm_gated_child_fires_no_terminal_stop_on_any_abnormal_drain() {
+    // Fix-1: once a child's in-loop gate has fired its single `subagentStop`
+    // (`stop_gate_fired`), NO later terminal fire may follow on ANY drained path —
+    // else it would double the stop. Covers the two narrow swarm abnormal-
+    // termination doubles: (a) a `failed=true` `Completed` racing a gated child,
+    // and (b) the orphan-drain teardown of a gated child (detach loss between its
+    // marker and a never-drained `Completed`).
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    inject_hooks(
+        &mut driver,
+        observe_boundary_registry(
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            "bee",
+        ),
+    );
+
+    // (a) A gated child whose drained `Completed` reports `failed=true` still
+    // fires nothing — the in-loop `completed` already fired.
+    driver
+        .fire_swarm_subagent_start("sched-gated-fail", "bee")
+        .await;
+    driver.mark_swarm_subagent_stop_gate_completed("sched-gated-fail");
+    driver
+        .fire_swarm_subagent_stop_if_tracked("sched-gated-fail", true)
+        .await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a gated child fires no terminal stop even when its drained Completed is failed"
+    );
+
+    // (b) A gated child still tracked at driver-loop teardown (its `Completed`
+    // was never drained) fires nothing at the orphan drain.
+    driver
+        .fire_swarm_subagent_start("sched-gated-orphan", "bee")
+        .await;
+    driver.mark_swarm_subagent_stop_gate_completed("sched-gated-orphan");
+    driver.drain_orphaned_swarm_stop_hooks().await;
+    assert!(
+        observe_hook_events(&driver, "subagentStop")
+            .await
+            .is_empty(),
+        "a gated child fires no terminal stop at the orphan-drain teardown"
+    );
+
+    // Control: an UN-gated child at the orphan drain DOES fire one `aborted`
+    // terminal stop (so the two zeros above are real skips, not a dead drain).
+    driver
+        .fire_swarm_subagent_start("sched-ungated-orphan", "bee")
+        .await;
+    driver.drain_orphaned_swarm_stop_hooks().await;
+    assert_eq!(
+        observe_hook_events(&driver, "subagentStop").await,
+        vec!["failed".to_string()],
+        "an un-gated orphaned swarm child fires exactly one terminal subagentStop"
     );
 }
 
@@ -676,15 +874,15 @@ async fn swarm_subagent_stop_only_fires_for_a_tracked_started_child() {
         "a completion for an untracked job must fire no subagentStop"
     );
 
-    // Start then stop fires exactly once; a SECOND stop for the same job fires
-    // nothing (the map removal makes the pairing exactly-once — no double-fire
-    // on a duplicate/late completion).
+    // Start then a (failed) stop fires exactly once; a SECOND stop for the same
+    // job fires nothing (the map removal makes the pairing exactly-once — no
+    // double-fire on a duplicate/late completion).
     driver.fire_swarm_subagent_start("sched-bee-3", "bee").await;
     driver
-        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", false)
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", true)
         .await;
     driver
-        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", false)
+        .fire_swarm_subagent_stop_if_tracked("sched-bee-3", true)
         .await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStop").await,

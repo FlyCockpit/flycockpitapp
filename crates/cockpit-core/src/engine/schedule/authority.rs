@@ -111,6 +111,16 @@ pub enum ScheduleEvent {
         /// the `subagentStart`/`subagentStop` matcher + `subagentType` field.
         subagent_type: String,
     },
+    /// A genuine detached-`Swarm` child (`bee` / `scout`) ran its own
+    /// controlling `subagentStop` gate inside `run_swarm_loop` before publishing
+    /// its terminal result. Emitted (FIFO, ordered before the same job's
+    /// `Completed`) ONLY for non-goal-control children, so the driver can
+    /// distinguish a normally-gated success (whose stop already fired inside the
+    /// loop) from a failure / detach-loss (whose terminal stop fires at the
+    /// `Completed` drain) — without inferring lifecycle state from `failed`.
+    /// Goal-supervision workers ([`SpawnWorkerKind::is_goal_control`]) never emit
+    /// this (guidance L22).
+    SwarmChildStopGateCompleted { job_id: String },
     /// A job reached a terminal state and its result must be injected into
     /// main context as a late-arriving turn. `notes` are the fork's
     /// accumulated notes (ephemeral loops); empty otherwise.
@@ -1312,6 +1322,17 @@ mod tests {
                 match event {
                     ScheduleEvent::SwarmChildStarted { .. } => {
                         panic!("goal-supervision worker {worker:?} must not emit SwarmChildStarted")
+                    }
+                    // A goal-supervision worker must fire NEITHER `subagentStart`
+                    // NOR `subagentStop` (guidance L22). The stop-gate-completed
+                    // marker is the drive for the paired `subagentStop`, so it too
+                    // must never appear for a goal-control worker — if the
+                    // `is_goal_control` guard were removed in `run_swarm`, this
+                    // would fire and panic here.
+                    ScheduleEvent::SwarmChildStopGateCompleted { .. } => {
+                        panic!(
+                            "goal-supervision worker {worker:?} must not emit SwarmChildStopGateCompleted"
+                        )
                     }
                     ScheduleEvent::Completed { .. } => break,
                     ScheduleEvent::LoopIterationDue { .. } => {}

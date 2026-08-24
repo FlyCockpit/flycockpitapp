@@ -2041,6 +2041,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2066,6 +2069,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2100,6 +2106,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2125,6 +2134,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2151,6 +2163,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2205,6 +2220,9 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
             sid,
             workspace(),
             &db,
+            None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2250,6 +2268,9 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         sid,
         workspace(),
         &db,
+        None,
+        None,
+        None,
         &mut state,
     )
     .await;
@@ -2264,6 +2285,104 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         expected_grants,
         "the forced end records no new ledger row"
     );
+}
+
+#[tokio::test]
+async fn subagent_stop_dispatch_carries_child_envelope_and_honors_continuation() {
+    // The UNIFIED `subagentStop` dispatch runs through the SAME `run_stop_hooks`
+    // G::Stop dispatcher as root `stop`, but its envelope describes the CHILD
+    // (camelCase `subagentType` / `subagentId` / `endReason` + the gate
+    // re-entrancy flag `stopHookActive`) and carries NO `stopReason` (that is a
+    // root-`stop` field; the subagent matcher token is already `subagentType`).
+    // A blocking hook returns `Continue` and counts against the caller's latch.
+    let env = FakeProcessEnv::with_default_resolution();
+    let subagent_stop_hook = || {
+        test_hook(
+            HookEvent::SubagentStop,
+            vec!["s".to_string()],
+            Some(vec!["builder".to_string()]),
+            BTreeMap::new(),
+            5,
+        )
+    };
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"block","reason":"tests still red"}"#,
+    ));
+    let mut state = StopGateState::default();
+    let outcome = run_stop_hooks(
+        &runner,
+        &env,
+        &registry(vec![subagent_stop_hook()]),
+        HookEvent::SubagentStop,
+        "builder",
+        sid,
+        workspace(),
+        &db,
+        Some("builder"),
+        Some("task-42"),
+        Some("completed"),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        StopHookOutcome::Continue {
+            reason: "tests still red".to_string(),
+            additional_context: None,
+        },
+        "a blocking subagentStop hook grants a continuation to re-run the child"
+    );
+    assert_eq!(state.continuation_count, 1);
+
+    let invocations = runner.invocations();
+    assert_eq!(invocations.len(), 1);
+    let env_json: serde_json::Value = serde_json::from_str(&invocations[0].stdin).unwrap();
+    assert_eq!(env_json["hookEventName"], "subagentStop");
+    assert_eq!(env_json["subagentType"], "builder");
+    assert_eq!(env_json["subagentId"], "task-42");
+    assert_eq!(env_json["endReason"], "completed");
+    assert_eq!(
+        env_json["stopHookActive"], false,
+        "the first consultation is not yet inside a continuation loop"
+    );
+    assert!(
+        env_json.get("stopReason").is_none(),
+        "subagentStop carries no stopReason (that is a root-stop field)"
+    );
+    assert!(
+        env_json.get("source").is_none() && env_json.get("reason").is_none(),
+        "child identity must not be overloaded onto generic source/reason"
+    );
+    assert_eq!(
+        hook_run_statuses(&db, sid).await,
+        vec!["blocked".to_string()]
+    );
+
+    // A TERMINAL subagentStop (abort/fail): a fresh discarded state, block ignored
+    // by the caller. Here we still observe the envelope carries the terminal
+    // `endReason`, and the dispatch records the row.
+    let (db, sid) = db_session().await;
+    let runner = FakeCommandRunner::new(successful_output(""));
+    let mut discarded = StopGateState::default();
+    let _ = run_stop_hooks(
+        &runner,
+        &env,
+        &registry(vec![subagent_stop_hook()]),
+        HookEvent::SubagentStop,
+        "builder",
+        sid,
+        workspace(),
+        &db,
+        Some("builder"),
+        Some("task-99"),
+        Some("aborted"),
+        &mut discarded,
+    )
+    .await;
+    let env_json: serde_json::Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
+    assert_eq!(env_json["endReason"], "aborted");
+    assert_eq!(env_json["subagentId"], "task-99");
 }
 
 #[test]

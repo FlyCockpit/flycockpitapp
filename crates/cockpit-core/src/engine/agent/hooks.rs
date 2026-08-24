@@ -1306,7 +1306,16 @@ pub enum StopHookOutcome {
     ForcedEnd,
 }
 
-/// Run all matching stop hooks and aggregate their feedback.
+/// Run all matching stop-gate hooks and aggregate their feedback.
+///
+/// This is the SINGLE G::Stop dispatcher for both the root `stop` event and the
+/// unified `subagentStop` event (all three child modes — interactive stack,
+/// noninteractive job, detached Swarm — route their child stop through here, so
+/// there is no separate `subagentStop` observe fire). A genuine completion the
+/// caller can re-run passes `end_reason = Some("completed")` and honors a
+/// returned [`StopHookOutcome::Continue`]; a terminal child stop (abort / fail /
+/// cancel) passes the terminal `end_reason`, a fresh `state`, and ignores the
+/// outcome (a dead child cannot continue).
 ///
 /// On genuine normal `end_turn` only, all matching `stop` hooks run;
 /// `{"decision":"block","reason":"..."}` and
@@ -1329,6 +1338,15 @@ pub(crate) async fn run_stop_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    // Child-stop identity for the unified `subagentStop` dispatch (all three
+    // modes route through this ONE G::Stop dispatcher). Root `stop` passes all
+    // three `None`. `end_reason` populates the camelCase `endReason` envelope
+    // field (`completed` for a genuine child completion the gate can re-run,
+    // `aborted` / `failed` / `cancelled` for a terminal fire the caller runs
+    // with a fresh discarded `state` and ignores the outcome of).
+    subagent_type: Option<&str>,
+    subagent_id: Option<&str>,
+    end_reason: Option<&str>,
     state: &mut StopGateState,
 ) -> StopHookOutcome {
     // If already at the continuation cap, force end without reconsulting hooks.
@@ -1342,11 +1360,16 @@ pub(crate) async fn run_stop_hooks(
     }
 
     let timestamp = chrono::Utc::now().to_rfc3339();
-    // First-class typed `stop` envelope fields (Decision 8): `stopReason`
-    // carries the closed matcher token, and `stopHookActive` reflects whether
-    // this consultation is already inside a continuation loop (set by a prior
-    // round of THIS turn). Neither is overloaded onto the generic `source` /
-    // `reason` keys, and neither carries any secret.
+    // First-class typed stop-gate envelope fields (Decision 8): `stopHookActive`
+    // reflects whether this consultation is already inside a continuation loop
+    // (set by a prior round of THIS turn/frame/job). For the root `stop` event
+    // `stopReason` carries the closed matcher token (`end_turn`); for
+    // `subagentStop` the closed matcher token IS the child agent type, which is
+    // already carried by `subagentType`, so `stopReason` stays `None` there and
+    // the child fields (`subagentType` / `subagentId` / `endReason`) describe
+    // the stop instead. Nothing is overloaded onto the generic `source` /
+    // `reason` keys, and nothing carries a secret.
+    let stop_reason = matches!(event, HookEvent::Stop).then_some(match_value);
     let envelope = HookEnvelope::for_observe(
         event,
         session_id,
@@ -1356,11 +1379,12 @@ pub(crate) async fn run_stop_hooks(
         None,
         None,
         None,
-        None,
-        None,
+        subagent_type,
+        subagent_id,
         ObserveFields {
-            stop_reason: Some(match_value),
+            stop_reason,
             stop_hook_active: Some(state.stop_hook_active),
+            end_reason,
             ..ObserveFields::default()
         },
     );
@@ -1384,7 +1408,7 @@ pub(crate) async fn run_stop_hooks(
                     None,
                     None,
                     None,
-                    None,
+                    subagent_id,
                 )
                 .await;
                 continue;
@@ -1412,7 +1436,7 @@ pub(crate) async fn run_stop_hooks(
                     None,
                     None,
                     None,
-                    None,
+                    subagent_id,
                 )
                 .await;
                 continue;
@@ -1453,7 +1477,7 @@ pub(crate) async fn run_stop_hooks(
             None,
             None,
             None,
-            None,
+            subagent_id,
         )
         .await;
 
@@ -1503,11 +1527,10 @@ pub(crate) async fn run_stop_hooks(
 ///
 /// Observe-only hooks (`sessionStart`, `userPromptSubmit`, `permissionDenied`,
 /// `subagentStart`, `preCompact`, `postCompact`, `stopFailure`, and
-/// `sessionEnd`) never block. `subagentStop`'s observe NOTIFICATION (a child
-/// stopped, with its `endReason`) is also emitted through here; its stop-gate
-/// continuation is a separate concern. All matching hooks run sequentially even
-/// if an earlier observer fails. Each failed run is recorded; a nonmatching
-/// handler produces no row.
+/// `sessionEnd`) never block. `subagentStop` is NOT emitted through here — it is
+/// a G::Stop event dispatched (in every mode) through [`run_stop_hooks`]. All
+/// matching hooks run sequentially even if an earlier observer fails. Each
+/// failed run is recorded; a nonmatching handler produces no row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_observe_hooks(
     runner: &dyn CommandRunner,

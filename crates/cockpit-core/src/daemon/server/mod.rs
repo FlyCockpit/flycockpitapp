@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+#[cfg(feature = "remote")]
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -2024,7 +2026,16 @@ pub struct DaemonContext {
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
+    #[cfg(feature = "remote")]
     connector_wake: watch::Sender<u64>,
+    /// Serializes a remote operation identity from admission through every
+    /// external side effect and its transactional replay commit. Different
+    /// request hashes intentionally share the same key: the conflict loser
+    /// must learn that it lost before it can stop workers or touch media.
+    #[cfg(feature = "remote")]
+    remote_operation_locks: tokio::sync::Mutex<
+        HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>,
+    >,
     pub scheduler: Option<DaemonSchedulerHandle>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
@@ -2210,6 +2221,7 @@ impl DaemonContext {
             Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
         > = None;
         let (client_count, _) = tokio::sync::watch::channel(0usize);
+        #[cfg(feature = "remote")]
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
         let secret_vault = crate::secure_key::open_for_db(&db)
@@ -2365,7 +2377,10 @@ impl DaemonContext {
                 EnvSnapshotSource::DaemonStart,
             ))),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            #[cfg(feature = "remote")]
             connector_wake,
+            #[cfg(feature = "remote")]
+            remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
             scheduler,
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
@@ -3027,10 +3042,12 @@ impl DaemonContext {
     /// Subscribe to connector wakeups. Credential store/clear requests use
     /// this to interrupt the connector's fallback polling sleep and any active
     /// relay socket so credential changes take effect immediately.
+    #[cfg(feature = "remote")]
     pub fn connector_wake_rx(&self) -> watch::Receiver<u64> {
         self.connector_wake.subscribe()
     }
 
+    #[cfg(feature = "remote")]
     pub fn wake_connector(&self) {
         self.connector_wake.send_modify(|version| {
             *version = version.wrapping_add(1);

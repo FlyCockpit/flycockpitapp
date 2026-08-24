@@ -27,6 +27,33 @@ impl RemoteSessionLedger {
         }
     }
 
+    /// Acquire the daemon-wide reservation for this operation identity.
+    ///
+    /// This is deliberately an in-memory serialization guard, not the durable
+    /// ledger reservation. The durable reservation and domain mutation remain
+    /// one SQLite transaction; this guard closes the earlier window in which
+    /// two same-identity requests could both perform irreversible side effects
+    /// before one discovered the other's hash conflict.
+    async fn reserve(&self, ctx: &DaemonContext) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = (
+            Uuid::parse_str(&self.logical_attachment_id)
+                .expect("admitted logical attachment id is a UUID"),
+            Uuid::parse_str(&self.operation_id).expect("admitted operation id is a UUID"),
+        );
+        let lock = {
+            let mut locks = ctx.remote_operation_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
     async fn committed_replay(
         &self,
         ctx: &DaemonContext,
@@ -138,6 +165,10 @@ pub(super) async fn fork_session(
     ephemeral: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
+    if let Some(cached) = ledger.committed_replay(ctx).await? {
+        return Ok(cached);
+    }
     require_session(ctx, parent_session_id).await?;
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
@@ -172,6 +203,10 @@ pub(super) async fn create_btw_fork(
     tangent: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
+    if let Some(cached) = ledger.committed_replay(ctx).await? {
+        return Ok(cached);
+    }
     require_session(ctx, parent_session_id).await?;
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
@@ -201,6 +236,7 @@ pub(super) async fn end_btw_fork(
     parent_session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -228,13 +264,12 @@ pub(super) async fn discard_session(
     session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
-    // Worker stop is deliberately before the row deletion and is idempotent.
-    // The client-local detach is delayed until AFTER the ledger transaction so
-    // even a concurrently committed conflicting operation cannot detach this
-    // connection before its hash/actor conflict is known.
+    // The reservation above makes this worker stop exclusive with every
+    // same-identity contender. The client-local detach remains post-commit.
     ctx.registry
         .interrupt_and_stop(session_id)
         .await
@@ -260,14 +295,13 @@ pub(super) async fn archive_session(
     cascade: bool,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
     require_session(ctx, session_id).await?;
-    // Stop occurs only after exact-replay/conflict lookup and target
-    // resolution. A same-identity concurrent request may also issue this stop
-    // before either commits, but stopping a worker is idempotent and required
-    // before either archive transaction is allowed to win.
+    // Stop occurs only after the exclusive identity reservation, replay/hash
+    // conflict lookup, and target resolution.
     stop_subtree(ctx, session_id, cascade).await?;
     commit_session_remote_mutation(ctx, ledger, "archive_session", move |conn| {
         crate::db::Db::archive_session_conn(
@@ -286,6 +320,7 @@ pub(super) async fn unarchive_session(
     session_id: Uuid,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -303,6 +338,7 @@ pub(super) async fn rename_session(
     title: String,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -320,6 +356,7 @@ pub(super) async fn record_session_note(
     text: String,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
@@ -348,6 +385,7 @@ pub(super) async fn delete_session(
     negotiated_protocol_version: u32,
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
+    let _reservation = ledger.reserve(ctx).await;
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }

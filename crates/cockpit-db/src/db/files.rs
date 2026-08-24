@@ -25,8 +25,12 @@ impl DatabaseOwnerLock {
             .open(&lock_path)
             .with_context(|| format!("opening database boot lock {}", lock_path.display()))?;
         repair_private_file(&lock_path, "database boot lock")?;
-        file.lock()
-            .with_context(|| format!("locking database boot at {}", lock_path.display()))?;
+        file.try_lock().with_context(|| {
+            format!(
+                "database already has a live exclusive owner at {}",
+                lock_path.display()
+            )
+        })?;
         Ok(Self { _file: file })
     }
 }

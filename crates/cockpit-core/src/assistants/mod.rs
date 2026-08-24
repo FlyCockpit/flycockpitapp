@@ -81,9 +81,10 @@ pub struct CreateAssistantSpec {
 
 /// A daemon-coordinated registry/definition snapshot.  A row-local damaged
 /// definition is represented diagnostically so one bad assistant does not
-/// hide the rest of the inventory.  Authority violations (for example a
-/// non-canonical home or a definition claiming another installation identity)
-/// remain hard errors.
+/// hide the rest of the inventory. A non-canonical name/home remains a hard
+/// containment error. Malformed config, definition identity conflicts, and
+/// damaged recovery journals are registration-local diagnostics: normal loads
+/// still fail closed, while the owner can unregister by registry CAS.
 #[derive(Debug, Clone)]
 pub struct AssistantSnapshot {
     pub row: AssistantRow,
@@ -712,9 +713,15 @@ pub async fn snapshots(db: &Db) -> Result<Vec<AssistantSnapshot>> {
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
         let rows = db.write_blocking(crate::db::Db::list_assistants_conn)?;
-        rows.into_iter()
-            .map(|row| snapshot_from_row_sync(&db, row))
-            .collect()
+        let mut names = std::collections::HashSet::new();
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !names.insert(row.name.clone()) {
+                bail!("duplicate assistant registry name `{}`", row.name);
+            }
+            snapshots.push(snapshot_from_row_sync(&db, row)?);
+        }
+        Ok(snapshots)
     })
     .await
     .context("assistant snapshot coordinator joined")?
@@ -768,14 +775,16 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
         return Ok(unavailable(row, "assistant definition is missing".into()));
     };
     if sha256_hex(&bytes) != row.content_hash {
-        return Ok(unavailable(row,
+        return Ok(unavailable(
+            row,
             "assistant definition does not match the registry content hash".into(),
         ));
     }
     let markdown = match String::from_utf8(bytes) {
         Ok(markdown) => markdown,
         Err(_) => {
-            return Ok(unavailable(row,
+            return Ok(unavailable(
+                row,
                 "assistant definition is not valid UTF-8".into(),
             ));
         }
@@ -783,9 +792,10 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
     let definition = match crate::agents::parse_daemon_local_markdown(&markdown, &row.name) {
         Ok(definition) => definition,
         Err(error) => {
-            return Ok(unavailable(row, format!(
-                "assistant definition is invalid: {error:#}"
-            )));
+            return Ok(unavailable(
+                row,
+                format!("assistant definition is invalid: {error:#}"),
+            ));
         }
     };
     // A valid document claiming a different installation identity is an
@@ -956,10 +966,15 @@ fn quarantine_unregister_journals(
     crate::private_fs::ensure_private_dir(&root)?;
     let operation = root.join(Uuid::new_v4().to_string());
     crate::private_fs::ensure_private_dir(&operation)?;
+    cockpit_config::config::sync_directory_nofollow(&root)?;
+    cockpit_config::config::sync_directory_nofollow(&operation)?;
     let mut quarantined = Vec::new();
     for (active, retained_name) in [
         (creation_journal_path(home), "creation.journal.json"),
-        (definition_journal_path(home), "definition-save.journal.json"),
+        (
+            definition_journal_path(home),
+            "definition-save.journal.json",
+        ),
     ] {
         if cockpit_config::config::read_config_file_nofollow(&active)?.is_none() {
             continue;

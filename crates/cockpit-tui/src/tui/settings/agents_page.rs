@@ -376,10 +376,11 @@ impl AgentsPage {
                             result,
                         ) => validate_agent_mutation_result(
                             &result,
-                            Some(agent.name()),
-                            Some(markdown),
-                            true,
-                            false,
+                            &cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                                name: agent.name().to_string(),
+                                markdown: markdown.clone(),
+                            },
+                            None,
                         ),
                         other => Err(format!("unexpected editor completion response: {other:?}")),
                     }
@@ -454,6 +455,7 @@ fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
         Ok(cockpit_core::daemon::proto::Response::AgentInventory {
             entries,
             inventory_revision,
+            ..
         }) if valid_agent_inventory(&entries, &inventory_revision) => (
             entries
                 .into_iter()
@@ -507,9 +509,24 @@ fn valid_agent_inventory(
 ) -> bool {
     let mut names = std::collections::HashSet::new();
     !revision.is_empty()
-        && entries
-            .iter()
-            .all(|entry| !entry.name.is_empty() && names.insert(entry.name.as_str()))
+        && entries.iter().all(|entry| {
+            let builtin = cockpit_core::agents::is_builtin_agent(&entry.name);
+            !entry.name.is_empty()
+                && entry.name.len() <= cockpit_core::daemon::proto::MAX_AGENT_NAME_BYTES
+                && names.insert(entry.name.as_str())
+                && (entry.kind == cockpit_core::daemon::proto::AgentEntryKind::Builtin) == builtin
+                && (!entry.overridden || builtin)
+                && if entry.valid {
+                    entry.diagnostic.is_none() && entry.description.is_some()
+                } else {
+                    entry.description.is_none()
+                        && entry.model.is_none()
+                        && entry
+                            .diagnostic
+                            .as_deref()
+                            .is_some_and(|diagnostic| !diagnostic.trim().is_empty())
+                }
+        })
 }
 
 fn agent_snapshot(
@@ -548,36 +565,8 @@ fn mutate_agent(
     mutation: cockpit_core::daemon::proto::AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<cockpit_core::daemon::proto::AgentMutationResult, String> {
-    let expected_name = match &mutation {
-        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin { name }
-        | cockpit_core::daemon::proto::AgentMutation::SaveDefinition { name, .. }
-        | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { name, .. }
-        | cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name }
-        | cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name }
-        | cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision { name, .. } => {
-            Some(name.clone())
-        }
-        cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins => None,
-    };
-    let expected_markdown = match &mutation {
-        cockpit_core::daemon::proto::AgentMutation::SaveDefinition { markdown, .. }
-        | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { markdown, .. } => {
-            Some(markdown.clone())
-        }
-        _ => None,
-    };
-    let requires_snapshot = matches!(
-        &mutation,
-        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin { .. }
-            | cockpit_core::daemon::proto::AgentMutation::SaveDefinition { .. }
-            | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { .. }
-            | cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { .. }
-            | cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision { .. }
-    );
-    let is_delete = matches!(
-        &mutation,
-        cockpit_core::daemon::proto::AgentMutation::DeleteCustom { .. }
-    );
+    let validation_mutation = mutation.clone();
+    let validation_revision = expected_revision.clone();
     match crate::tui::agent_runner::daemon_request_blocking(
         cockpit_core::daemon::proto::Request::MutateAgent {
             project_root: cwd.to_string_lossy().into_owned(),
@@ -588,10 +577,8 @@ fn mutate_agent(
         cockpit_core::daemon::proto::Response::AgentMutated(result) => {
             validate_agent_mutation_result(
                 &result,
-                expected_name.as_deref(),
-                expected_markdown.as_deref(),
-                requires_snapshot,
-                is_delete,
+                &validation_mutation,
+                validation_revision.as_deref(),
             )?;
             Ok(result)
         }
@@ -661,69 +648,66 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
     let cockpit_core::daemon::proto::Response::Assistants { assistants } = response else {
         return Err(format!("unexpected assistants response: {response:?}"));
     };
-    Ok(assistants
-        .into_iter()
-        .map(|row| {
-            if row.name.is_empty() {
-                return AgentRow {
-                    name: "<invalid-assistant>".into(),
-                    kind: AgentKind::Custom,
-                    detail: Err("daemon returned an assistant without a name".into()),
-                    model: None,
-                    source: AgentRowSource::AssistantUnavailable {
-                        registration_revision: String::new(),
-                    },
-                };
-            }
-            let source = match (row.definition_markdown, row.definition_revision) {
-                (Some(markdown), Some(revision))
-                    if !revision.is_empty()
-                        && row.definition_diagnostic.is_none()
-                        && !row.registration_revision.is_empty() =>
-                {
-                    AgentRowSource::Assistant {
-                        markdown,
-                        revision,
-                        registration_revision: row.registration_revision.clone(),
-                    }
-                }
-                (None, None)
-                    if row.definition_diagnostic.is_some()
-                        && !row.registration_revision.is_empty() =>
-                {
-                    AgentRowSource::AssistantUnavailable {
-                        registration_revision: row.registration_revision.clone(),
-                    }
-                }
-                _ => AgentRowSource::AssistantUnavailable {
+    let mut names = std::collections::HashSet::new();
+    let mut rows = Vec::with_capacity(assistants.len());
+    for row in assistants {
+        if !names.insert(row.name.clone()) {
+            return Err(format!(
+                "daemon returned duplicate assistant name `{}`",
+                row.name
+            ));
+        }
+        let summary_validation = cockpit_proto::validate_assistant_summary(&row);
+        let source = match (row.definition_markdown, row.definition_revision) {
+            (Some(markdown), Some(revision))
+                if !revision.is_empty()
+                    && row.definition_diagnostic.is_none()
+                    && summary_validation.is_ok() =>
+            {
+                AgentRowSource::Assistant {
+                    markdown,
+                    revision,
                     registration_revision: row.registration_revision.clone(),
-                },
-            };
-            let definition = match &source {
-                AgentRowSource::Assistant { markdown, .. } => {
-                    cockpit_core::agents::parse_daemon_local_markdown(markdown, &row.name)
-                        .map_err(|error| error.to_string())
                 }
-                AgentRowSource::AssistantUnavailable { .. } => {
-                    Err(row.definition_diagnostic.clone().unwrap_or_else(|| {
-                        "daemon returned an incoherent assistant definition snapshot".into()
-                    }))
-                }
-                AgentRowSource::Agent => unreachable!(),
-            };
-            let (detail, model) = match definition {
-                Ok(def) => (Ok(def.description), normalize_model(def.model)),
-                Err(error) => (Err(error), None),
-            };
-            AgentRow {
-                name: row.name,
-                kind: AgentKind::Custom,
-                detail,
-                model,
-                source,
             }
-        })
-        .collect())
+            (None, None)
+                if row.definition_diagnostic.is_some() && !row.registration_revision.is_empty() =>
+            {
+                AgentRowSource::AssistantUnavailable {
+                    registration_revision: row.registration_revision.clone(),
+                }
+            }
+            _ => AgentRowSource::AssistantUnavailable {
+                registration_revision: row.registration_revision.clone(),
+            },
+        };
+        let definition = match &source {
+            AgentRowSource::Assistant { markdown, .. } => {
+                cockpit_core::agents::parse_daemon_local_markdown(markdown, &row.name)
+                    .map_err(|error| error.to_string())
+            }
+            AgentRowSource::AssistantUnavailable { .. } => Err(summary_validation
+                .err()
+                .map(str::to_string)
+                .or(row.definition_diagnostic.clone())
+                .unwrap_or_else(|| {
+                    "daemon returned an incoherent assistant definition snapshot".into()
+                })),
+            AgentRowSource::Agent => unreachable!(),
+        };
+        let (detail, model) = match definition {
+            Ok(def) => (Ok(def.description), normalize_model(def.model)),
+            Err(error) => (Err(error), None),
+        };
+        rows.push(AgentRow {
+            name: row.name,
+            kind: AgentKind::Custom,
+            detail,
+            model,
+            source,
+        });
+    }
+    Ok(rows)
 }
 
 fn coherent_assistant_save_revision(
@@ -731,11 +715,8 @@ fn coherent_assistant_save_revision(
     expected_name: &str,
     expected_markdown: &str,
 ) -> Result<String, String> {
-    if assistant.name != expected_name
-        || assistant.registration_revision.is_empty()
-        || assistant.content_hash
-            != cockpit_core::assistants::markdown_content_hash(expected_markdown)
-    {
+    cockpit_proto::validate_assistant_summary(assistant).map_err(str::to_string)?;
+    if assistant.name != expected_name {
         return Err("daemon returned a misrouted assistant save snapshot".into());
     }
     match (
@@ -757,41 +738,123 @@ fn validate_agent_snapshot(
     expected_name: &str,
     expected_markdown: Option<&str>,
 ) -> Result<(), String> {
-    if snapshot.name != expected_name || snapshot.revision.is_empty() {
+    if snapshot.name != expected_name
+        || snapshot.name.is_empty()
+        || snapshot.name.len() > cockpit_core::daemon::proto::MAX_AGENT_NAME_BYTES
+        || snapshot.revision.is_empty()
+        || snapshot.source_identity.is_empty()
+        || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+        || snapshot.canonical_preview.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+    {
         return Err("daemon returned a misrouted or revisionless agent snapshot".into());
     }
     if expected_markdown.is_some_and(|markdown| snapshot.markdown != markdown) {
         return Err("daemon returned an agent snapshot with unexpected content".into());
     }
-    if snapshot.source_identity.is_empty() {
-        return Err("daemon returned an agent snapshot without source identity".into());
+    let workspace =
+        snapshot.source_layer == cockpit_core::daemon::proto::AgentSourceLayer::Workspace;
+    let embedded = snapshot.source_layer == cockpit_core::daemon::proto::AgentSourceLayer::Embedded;
+    if snapshot.editable != workspace
+        || snapshot.overridden != !embedded
+        || (snapshot.kind == cockpit_core::daemon::proto::AgentEntryKind::Custom && embedded)
+    {
+        return Err("daemon returned incoherent agent source metadata".into());
+    }
+    if let Some(goal) = &snapshot.goal_supervision_json {
+        serde_json::from_str::<serde_json::Value>(goal)
+            .map_err(|_| "daemon returned invalid goal supervision JSON".to_string())?;
     }
     Ok(())
 }
 
 fn validate_agent_mutation_result(
     result: &cockpit_core::daemon::proto::AgentMutationResult,
-    expected_name: Option<&str>,
-    expected_markdown: Option<&str>,
-    requires_snapshot: bool,
-    is_delete: bool,
+    mutation: &cockpit_core::daemon::proto::AgentMutation,
+    prior_revision: Option<&str>,
 ) -> Result<(), String> {
-    if let Some(snapshot) = &result.snapshot {
-        let expected_name = expected_name
-            .ok_or_else(|| "daemon returned a snapshot for a global mutation".to_string())?;
-        validate_agent_snapshot(snapshot, expected_name, expected_markdown)?;
-        if expected_markdown.is_some()
-            && (!snapshot.editable
-                || snapshot.source_layer
-                    != cockpit_core::daemon::proto::AgentSourceLayer::Workspace)
-        {
-            return Err("daemon returned saved content from a non-workspace source".into());
+    use cockpit_core::daemon::proto::{
+        AgentEntryKind as K, AgentMutation as M, AgentSourceLayer as L,
+    };
+    let coherent_count = result.affected == u32::from(result.changed);
+    let require_snapshot = |name: &str, markdown: Option<&str>| {
+        let snapshot = result
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| "daemon omitted the mutation target snapshot".to_string())?;
+        validate_agent_snapshot(snapshot, name, markdown)?;
+        if result.changed && prior_revision.is_some_and(|prior| snapshot.revision == prior) {
+            return Err("daemon reported a changed mutation with the prior revision".into());
         }
-    } else if requires_snapshot {
-        return Err("daemon omitted the mutation's target snapshot".into());
-    }
-    if is_delete && (!result.changed || result.affected != 1 || result.snapshot.is_some()) {
-        return Err("daemon returned an incoherent custom-agent deletion result".into());
+        Ok(snapshot)
+    };
+    match mutation {
+        M::EjectBuiltin { name } => {
+            if !coherent_count {
+                return Err("incoherent eject mutation count".into());
+            }
+            let s = require_snapshot(name, None)?;
+            if s.kind != K::Builtin
+                || !s.overridden
+                || !s.editable
+                || s.source_layer != L::Workspace
+            {
+                return Err("daemon returned incoherent ejected-agent ownership".into());
+            }
+        }
+        M::SaveDefinition { name, markdown } => {
+            if !coherent_count {
+                return Err("incoherent save mutation count".into());
+            }
+            let s = require_snapshot(name, Some(markdown))?;
+            if !s.editable || s.source_layer != L::Workspace {
+                return Err("daemon returned saved content from a non-workspace source".into());
+            }
+        }
+        M::CreateDefinition { name, markdown } => {
+            if !result.changed || result.affected != 1 {
+                return Err("agent creation was not a single committed change".into());
+            }
+            let s = require_snapshot(name, Some(markdown))?;
+            if s.kind != K::Custom || !s.editable || s.source_layer != L::Workspace {
+                return Err("daemon returned incoherent created-agent ownership".into());
+            }
+        }
+        M::DeleteCustom { .. } => {
+            if !result.changed || result.affected != 1 || result.snapshot.is_some() {
+                return Err("daemon returned an incoherent custom-agent deletion result".into());
+            }
+        }
+        M::ResetBuiltin { name } => {
+            if !result.changed || result.affected != 1 {
+                return Err("built-in reset was not a single committed change".into());
+            }
+            let s = require_snapshot(name, None)?;
+            if s.kind != K::Builtin || s.overridden || s.editable || s.source_layer != L::Embedded {
+                return Err("daemon returned incoherent reset built-in ownership".into());
+            }
+        }
+        M::ResetAllBuiltins => {
+            if result.snapshot.is_some()
+                || result.changed != (result.affected != 0)
+                || result.affected as usize > cockpit_core::agents::BUILTIN_AGENT_NAMES.len()
+            {
+                return Err("daemon returned an incoherent reset-all result".into());
+            }
+        }
+        M::SaveGoalSupervision { name, .. } => {
+            if !coherent_count {
+                return Err("incoherent goal-settings mutation count".into());
+            }
+            let s = require_snapshot(name, None)?;
+            if result.changed && (!s.editable || s.source_layer != L::Workspace) {
+                return Err(
+                    "changed goal settings were not published to the workspace layer".into(),
+                );
+            }
+            if !s.supports_goal_supervision {
+                return Err("daemon returned goal settings for an unsupported agent".into());
+            }
+        }
     }
     Ok(())
 }
@@ -1030,7 +1093,9 @@ impl SettingsCx {
             );
             return;
         }
-        if editor.name != expected.name() || p.pending_external_edit.is_some() {
+        if expected != super::pointer_actions::AgentId::workspace(&editor.name)
+            || p.pending_external_edit.is_some()
+        {
             return;
         }
         let Some(revision) = editor.revision.clone() else {
@@ -2107,6 +2172,23 @@ impl SettingsPage for AgentsPage {
             return Nav::Stay;
         };
         if self.editing.is_some() {
+            let expected_editor = self.editing.as_ref().map(|editor| {
+                if editor.is_assistant_definition() {
+                    super::pointer_actions::AgentId::assistant(&editor.name)
+                } else {
+                    super::pointer_actions::AgentId::workspace(&editor.name)
+                }
+            });
+            let action_editor = match &action {
+                super::pointer_actions::AgentsAction::EditText(id)
+                | super::pointer_actions::AgentsAction::Save(id)
+                | super::pointer_actions::AgentsAction::Cancel(id)
+                | super::pointer_actions::AgentsAction::ExternalEditBegin(id) => Some(id),
+                _ => None,
+            };
+            if action_editor.is_some_and(|id| Some(id) != expected_editor.as_ref()) {
+                return Nav::Stay;
+            }
             if let Some(confirming) = self.external_edit_confirmation.as_ref()
                 && !matches!(
                     &action,
@@ -2150,6 +2232,20 @@ impl SettingsPage for AgentsPage {
                 }
                 _ => Nav::Stay,
             };
+        }
+        if let Some(detail) = self.detail.as_ref() {
+            let expected = row_agent_id(&detail.name, &detail.source);
+            let detail_id = match &action {
+                super::pointer_actions::AgentsAction::OpenRawEditor(id)
+                | super::pointer_actions::AgentsAction::Save(id)
+                | super::pointer_actions::AgentsAction::Cancel(id)
+                | super::pointer_actions::AgentsAction::ToggleTool(id, _)
+                | super::pointer_actions::AgentsAction::CycleTier(id, _) => Some(id),
+                _ => None,
+            };
+            if detail_id.is_some_and(|id| *id != expected) {
+                return Nav::Stay;
+            }
         }
         if self.detail.is_some()
             && matches!(
@@ -2213,6 +2309,12 @@ impl SettingsPage for AgentsPage {
             }
             self.cursor = index;
         }
+        if self.confirm_reset
+            && matches!(action, super::pointer_actions::AgentsAction::Cancel(ref id)
+                if *id != super::pointer_actions::AgentId::reset_all())
+        {
+            return Nav::Stay;
+        }
         match &action {
             super::pointer_actions::AgentsAction::ResetAll if self.confirm_reset => {
                 return cx.handle_agents_page_key(
@@ -2220,7 +2322,9 @@ impl SettingsPage for AgentsPage {
                     self,
                 );
             }
-            super::pointer_actions::AgentsAction::Cancel(_) if self.confirm_reset => {
+            super::pointer_actions::AgentsAction::Cancel(id)
+                if self.confirm_reset && *id == super::pointer_actions::AgentId::reset_all() =>
+            {
                 self.confirm_reset = false;
                 self.status = Some("reset cancelled".into());
                 return Nav::Stay;

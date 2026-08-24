@@ -2206,6 +2206,33 @@ pub struct AssistantSummary {
     pub definition_diagnostic: Option<String>,
 }
 
+/// Validate the self-contained invariants of a daemon assistant snapshot.
+/// Parsing the agent markdown remains an application-layer responsibility,
+/// but every client can enforce revision/diagnostic coherence and the exact
+/// content hash without depending on `cockpit-core`.
+pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'static str> {
+    use sha2::Digest as _;
+
+    if summary.name.is_empty() || summary.registration_revision.is_empty() {
+        return Err("assistant summary has no name or registration revision");
+    }
+    match (
+        summary.definition_markdown.as_deref(),
+        summary.definition_revision.as_deref(),
+        summary.definition_diagnostic.as_deref(),
+    ) {
+        (Some(markdown), Some(revision), None) if !revision.is_empty() => {
+            let hash = format!("{:x}", sha2::Sha256::digest(markdown.as_bytes()));
+            if hash != summary.content_hash {
+                return Err("assistant definition does not match its content hash");
+            }
+        }
+        (None, None, Some(diagnostic)) if !diagnostic.trim().is_empty() => {}
+        _ => return Err("assistant definition snapshot is incoherent"),
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinnedMessage {
     pub seq: i64,

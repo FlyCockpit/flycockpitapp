@@ -289,9 +289,8 @@ async fn show(name: &str) -> Result<()> {
 fn verified_assistant_definition(
     assistant: &crate::daemon::proto::AssistantSummary,
 ) -> Result<cockpit_core::agents::AgentDef> {
-    if assistant.registration_revision.is_empty() {
-        bail!("assistant `{}` has no registry revision", assistant.name);
-    }
+    cockpit_proto::validate_assistant_summary(assistant)
+        .map_err(|error| anyhow::anyhow!("assistant `{}`: {error}", assistant.name))?;
     let markdown = assistant.definition_markdown.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "assistant `{}` definition is unavailable: {}",
@@ -341,9 +340,11 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
         .client
         .request(delete_assistant_request(
             &args.name,
-            assistant.definition_revision.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("assistant definition cannot be safely read; refusing delete")
-            })?,
+            (!assistant.registration_revision.is_empty())
+                .then_some(assistant.registration_revision.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("assistant registration has no deletion revision")
+                })?,
         ))
         .await
         .context("requesting assistant delete from daemon")?

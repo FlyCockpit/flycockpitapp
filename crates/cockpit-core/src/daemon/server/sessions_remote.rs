@@ -171,12 +171,14 @@ pub(super) async fn fork_session(
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
-    require_session(ctx, parent_session_id).await?;
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
     let now = chrono::Utc::now().timestamp();
     let fork_point = fork_point_turn_id.clone();
     commit_session_remote_mutation(ctx, ledger, "fork_session", move |conn| {
+        if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
+            return Err(UnknownRemoteSession(parent_session_id).into());
+        }
         let row = crate::db::Db::create_fork_row_conn(
             conn,
             parent_session_id,
@@ -208,11 +210,13 @@ pub(super) async fn create_btw_fork(
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
-    require_session(ctx, parent_session_id).await?;
     let created_by = principal.tag();
     let session_id = Uuid::new_v4();
     let now = chrono::Utc::now().timestamp();
     commit_session_remote_mutation(ctx, ledger, "btw_create", move |conn| {
+        if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
+            return Err(UnknownRemoteSession(parent_session_id).into());
+        }
         let result =
             crate::db::Db::create_btw_fork_conn(conn, parent_session_id, tangent, session_id, now)?;
         if result.created
@@ -252,7 +256,10 @@ pub(super) async fn end_btw_fork(
             .map_err(internal)?;
     }
     commit_session_remote_mutation(ctx, ledger, "btw_end", move |conn| {
-        crate::db::Db::end_btw_fork_conn(conn, parent_session_id)?;
+        if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
+            return Err(UnknownRemoteSession(parent_session_id).into());
+        }
+        let _ = crate::db::Db::end_btw_fork_conn(conn, parent_session_id)?;
         Ok(Response::Ack)
     })
     .await
@@ -284,7 +291,8 @@ pub(super) async fn discard_session(
         .await
         .map_err(internal)?;
     let response = commit_session_remote_mutation(ctx, ledger, "discard_session", move |conn| {
-        crate::db::Db::discard_ephemeral_session_conn(conn, session_id)?;
+        let existed = crate::db::Db::discard_ephemeral_session_conn(conn, session_id)?;
+        require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await?;
@@ -368,10 +376,12 @@ pub(super) async fn record_session_note(
     if let Some(cached) = ledger.committed_replay(ctx).await? {
         return Ok(cached);
     }
-    let agent = require_session(ctx, session_id).await?.active_agent;
     let data_json =
         serde_json::to_string(&serde_json::json!({ "text": text })).map_err(internal)?;
     commit_session_remote_mutation(ctx, ledger, "record_session_note", move |conn| {
+        let agent = crate::db::Db::get_session_conn(conn, session_id)?
+            .ok_or_else(|| UnknownRemoteSession(session_id))?
+            .active_agent;
         let seq = crate::db::Db::insert_session_event_json_conn(
             conn,
             session_id,

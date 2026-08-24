@@ -1962,8 +1962,14 @@ impl Db {
     pub async fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
         // `transaction` so the guard read, the tombstone, and the deletion are
         // one atomic step.
-        self.transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
-            .await
+        let removed = self
+            .transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
+            .await?;
+        if removed {
+            self.reconcile_delegation_sidecar_cleanup_intents()
+                .await?;
+        }
+        Ok(removed)
     }
 
     /// Discard-ephemeral body without an owning transaction. The caller
@@ -1975,6 +1981,13 @@ impl Db {
             Some(row) if row.ephemeral => {}
             _ => return Ok(false),
         }
+        // Capture sidecar deletion authority in this same transaction before
+        // the session cascade removes the only rows which name those files.
+        Self::enqueue_delegation_sidecar_cleanup_conn(
+            conn,
+            session_id,
+            Utc::now().timestamp_millis(),
+        )?;
         delete_session_conn(conn, session_id)?;
         Ok(true)
     }

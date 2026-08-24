@@ -71,28 +71,6 @@ pub(crate) struct PreparedTaskDelegationPayload {
     cleanup_abs_path: Option<PathBuf>,
 }
 
-pub(crate) struct CommittedTaskDelegationPayload {
-    pub(crate) row: TaskDelegationPayloadRow,
-    cleanup_abs_path: Option<PathBuf>,
-}
-
-impl CommittedTaskDelegationPayload {
-    pub(crate) fn confirm_outer_commit(mut self) -> TaskDelegationPayloadRow {
-        self.cleanup_abs_path = None;
-        self.row
-    }
-}
-
-impl Drop for CommittedTaskDelegationPayload {
-    fn drop(&mut self) {
-        if let Some(path) = self.cleanup_abs_path.take()
-            && let Err(error) = std::fs::remove_file(&path)
-        {
-            tracing::warn!(%error, path=%path.display(), "failed to clean uncommitted delegation sidecar");
-        }
-    }
-}
-
 impl Drop for PreparedTaskDelegationPayload {
     fn drop(&mut self) {
         if let Some(path) = self.cleanup_abs_path.take()
@@ -125,10 +103,27 @@ impl Db {
         payload: NewTaskDelegationPayload<'_>,
     ) -> Result<TaskDelegationPayloadRow> {
         let prepared = self.prepare_task_delegation_payload(payload).await?;
-        let committed = self
-            .write(move |conn| Self::insert_prepared_task_delegation_payload_conn(conn, prepared))
-            .await?;
-        let row = committed.confirm_outer_commit();
+        // The row and prepare-intent removal are one transaction. The conn
+        // helper disarms in-memory deletion once it has installed the row:
+        // after that point a rollback is recovered from the still-durable
+        // prepare intent, while a committed row protects the file even if the
+        // async reply receiver is dropped.
+        let result = self
+            .transaction(move |conn| {
+                Self::insert_prepared_task_delegation_payload_conn(conn, prepared)
+            })
+            .await;
+        let row = match result {
+            Ok(row) => row,
+            Err(error) => {
+                if let Err(reconcile_error) =
+                    self.reconcile_delegation_sidecar_prepare_intents().await
+                {
+                    tracing::warn!(%reconcile_error, "delegation sidecar prepare recovery remains pending after insert failure");
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
             tracing::warn!(%error, "replaced delegation sidecar cleanup remains durable and pending");
         }
@@ -139,6 +134,19 @@ impl Db {
         &self,
         payload: NewTaskDelegationPayload<'_>,
     ) -> Result<PreparedTaskDelegationPayload> {
+        // Windows deliberately has no durable reparse-safe sidecar unlink
+        // implementation yet. Refuse a replacement which would orphan the
+        // old pathname before publishing any new bytes or changing SQLite.
+        #[cfg(windows)]
+        if self
+            .task_delegation_payload(payload.task_call_id, payload.label)
+            .await?
+            .is_some_and(|row| row.sidecar_path.is_some())
+        {
+            bail!(
+                "replacing a file-backed delegation payload is unavailable on Windows until durable reparse-safe cleanup is supported"
+            );
+        }
         let hash = delegation_payload_hash(payload.prompt);
         let byte_len = payload.prompt.len();
         let created_at = Utc::now().timestamp();
@@ -164,7 +172,7 @@ impl Db {
     pub(crate) fn insert_prepared_task_delegation_payload_conn(
         conn: &Connection,
         mut payload: PreparedTaskDelegationPayload,
-    ) -> Result<CommittedTaskDelegationPayload> {
+    ) -> Result<TaskDelegationPayloadRow> {
         // A replacement must retain deletion authority for the old unique
         // pathname in the same transaction that removes its last reference.
         conn.execute(
@@ -216,11 +224,14 @@ impl Db {
             )?;
             anyhow::ensure!(removed == 1, "published sidecar prepare intent is missing");
         }
-        let cleanup_abs_path = payload.cleanup_abs_path.take();
-        Ok(CommittedTaskDelegationPayload {
-            row,
-            cleanup_abs_path,
-        })
+        // From here onward the filesystem entry is governed only by durable
+        // database evidence. If the outer transaction commits, `row` protects
+        // it. If it rolls back, the prepare-intent deletion rolls back too and
+        // startup/failure reconciliation owns cleanup. Never leave an armed
+        // Drop guard in a value sent across the writer reply channel: a
+        // cancelled receiver may drop that value after COMMIT.
+        payload.cleanup_abs_path.take();
+        Ok(row)
     }
 
     pub async fn task_delegation_payload(
@@ -389,6 +400,15 @@ impl Db {
         hash: &str,
         body: &str,
     ) -> Result<(Option<String>, Option<String>, Option<PathBuf>)> {
+        // Until Windows has a durable reparse-safe unlink primitive, keep new
+        // payloads transactionally inline. This prevents successful writes
+        // from creating filesystem state which can never be reclaimed.
+        #[cfg(windows)]
+        {
+            let _ = (session_id, hash);
+            return Ok((Some(body.to_string()), None, None));
+        }
+        #[cfg(not(windows))]
         let Some(_db_path) = self.path() else {
             return Ok((Some(body.to_string()), None, None));
         };
@@ -688,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outer_commit_failure_keeps_cleanup_armed() {
+    async fn outer_commit_failure_keeps_durable_prepare_intent() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
         let session = db.create_session("p", "/proj", "Build").await.unwrap();
@@ -725,20 +745,28 @@ mod tests {
         let published = prepared.cleanup_abs_path.clone().unwrap();
         let result: Result<()> = db
             .transaction(move |conn| {
-                let committed =
-                    Db::insert_prepared_task_delegation_payload_conn(conn, prepared)?;
-                drop(committed);
+                let _row = Db::insert_prepared_task_delegation_payload_conn(conn, prepared)?;
                 bail!("injected outer transaction failure")
             })
             .await;
         assert!(result.is_err());
-        assert!(!published.exists());
+        assert!(
+            published.exists(),
+            "rollback recovery must be driven by durable evidence, not a reply-value Drop guard"
+        );
         assert!(
             db.task_delegation_payload("rollback", "default")
                 .await
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            db.reconcile_delegation_sidecar_prepare_intents()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!published.exists());
     }
 
     #[tokio::test]

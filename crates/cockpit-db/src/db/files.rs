@@ -298,19 +298,39 @@ pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> 
     file.sync_all()
         .with_context(|| format!("syncing {}", temporary.display()))?;
     drop(file);
-    anyhow::ensure!(
-        !destination.exists(),
-        "refusing to replace existing durable sidecar {}",
-        destination.display()
-    );
-    std::fs::rename(&temporary, destination).with_context(|| {
-        format!(
-            "publishing durable sidecar {} as {}",
-            temporary.display(),
+    #[cfg(unix)]
+    {
+        // `hard_link` is the portable Unix no-replace publication primitive:
+        // destination creation is atomic and fails with AlreadyExists under a
+        // racing publisher. Both paths are in the same private directory, so
+        // this cannot cross filesystems. Removing the temporary name leaves
+        // the fully synced inode reachable at exactly one final pathname.
+        std::fs::hard_link(&temporary, destination).with_context(|| {
+            format!(
+                "publishing durable sidecar {} as {} without replacement",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        std::fs::remove_file(&temporary)
+            .with_context(|| format!("removing published temporary {}", temporary.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::ensure!(
+            !destination.exists(),
+            "refusing to replace existing durable sidecar {}",
             destination.display()
-        )
-    })?;
-    std::mem::forget(guard);
+        );
+        std::fs::rename(&temporary, destination).with_context(|| {
+            format!(
+                "publishing durable sidecar {} as {}",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        std::mem::forget(guard);
+    }
     #[cfg(windows)]
     let directory = {
         use std::os::windows::fs::OpenOptionsExt;

@@ -3292,6 +3292,12 @@ CREATE UNIQUE INDEX idx_task_delegation_payloads_session_hash_label
 CREATE INDEX idx_task_delegation_payloads_session_created
     ON task_delegation_payloads(parent_session_id, created_at ASC);
 
+-- A durable pathname has exactly one live payload owner. Recovery may use
+-- this as row-reference proof before retiring a prepare/cleanup intent.
+CREATE UNIQUE INDEX idx_task_delegation_payloads_sidecar_path
+    ON task_delegation_payloads(sidecar_path)
+    WHERE sidecar_path IS NOT NULL;
+
 -- Filesystem deletion cannot participate in the session-row transaction.
 -- Copy the relative sidecar identity here before cascading payload rows so a
 -- crash after commit leaves durable, boot-replayable cleanup work.

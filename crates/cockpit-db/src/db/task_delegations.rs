@@ -258,7 +258,7 @@ impl Db {
         // Keep the owner check, job, children, and payload rows under the
         // same immediate transaction.  `upsert_task_delegation_job_conn` is a
         // connection helper specifically so this does not nest transactions.
-        let committed = self.transaction(move |conn| {
+        let result = self.transaction(move |conn| {
             Self::upsert_task_delegation_job_conn(conn, job, now)?;
             let mut rows = Vec::with_capacity(prepared_payloads.len());
             for prepared_payload in prepared_payloads {
@@ -269,11 +269,18 @@ impl Db {
             }
             Ok(rows)
         })
-        .await?;
-        let rows = committed
-            .into_iter()
-            .map(|payload| payload.confirm_outer_commit())
-            .collect();
+        .await;
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                if let Err(reconcile_error) =
+                    self.reconcile_delegation_sidecar_prepare_intents().await
+                {
+                    tracing::warn!(%reconcile_error, "delegation sidecar prepare recovery remains pending after transaction failure");
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
             tracing::warn!(%error, "replaced delegation sidecar cleanup remains durable and pending");
         }

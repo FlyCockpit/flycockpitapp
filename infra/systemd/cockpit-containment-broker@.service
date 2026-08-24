@@ -30,7 +30,6 @@ ProtectKernelTunables=yes
 ProtectSystem=strict
 ReadWritePaths=/run/flycockpit /var/lib/flycockpit/containment-broker-%i -/sys/fs/cgroup/flycockpit
 ProtectProc=invisible
-ProcSubset=pid
 LockPersonality=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX

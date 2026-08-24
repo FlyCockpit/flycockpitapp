@@ -1,7 +1,7 @@
 [Unit]
 Description=FlyCockpit daemon for UID %i
 Documentation=https://docs.flycockpit.com/
-BindsTo=cockpit-containment-broker@%i.service
+Wants=cockpit-containment-broker@%i.service
 After=cockpit-containment-broker@%i.service
 
 [Service]

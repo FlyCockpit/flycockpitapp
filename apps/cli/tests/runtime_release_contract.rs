@@ -6,6 +6,10 @@ const README: &str = include_str!("../README.md");
 const DOCS: &str = include_str!("../../docs/src/content/docs/reference/runtime-prerequisites.md");
 const CATALOG: &str = include_str!("../../../crates/cockpit-core/src/external_runtime/adapters.rs");
 const GENERATOR: &str = include_str!("../scripts/generate-release-assets.sh");
+const CONTAINMENT_INSTALLER: &str = include_str!("../scripts/install-linux-containment-broker.sh");
+const CONTAINMENT_ARCHIVE_CHECK: &str = include_str!("../scripts/verify-linux-containment-archive.py");
+const BROKER_UNIT: &str = include_str!("../../../infra/systemd/cockpit-containment-broker@.service");
+const DAEMON_UNIT: &str = include_str!("../../../infra/systemd/cockpit-daemon@.service");
 const SHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.sh");
 const POWERSHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.ps1");
 const CARGO_DIST_SHELL_TEMPLATE: &str = include_str!("fixtures/cargo-dist-0.32-installer.sh.j2");
@@ -87,6 +91,26 @@ fn runtime_release_contract_tests() {
     }
     assert!(DIST.contains("installers = [\"shell\", \"powershell\", \"homebrew\"]"));
     assert!(README.contains("SHA-256 checksum"));
+}
+
+#[test]
+fn containment_installer_is_transactional_and_units_support_reconnect() {
+    for needle in [
+        "broker_was_enabled",
+        "daemon_was_enabled",
+        "detached_was_active",
+        "daemon status --json",
+        "containment broker did not publish the authenticated socket contract",
+    ] {
+        assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
+    }
+    assert!(DAEMON_UNIT.contains("Wants=cockpit-containment-broker@%i.service"));
+    assert!(!DAEMON_UNIT.contains("BindsTo=cockpit-containment-broker@%i.service"));
+    assert!(!BROKER_UNIT.contains("ProcSubset=pid"));
+    assert!(WORKFLOW.contains("Verify Linux containment archive topology"));
+    for payload in ["cockpit", "cockpit-containment-broker", "install-linux-containment-broker.sh"] {
+        assert!(CONTAINMENT_ARCHIVE_CHECK.contains(payload));
+    }
 }
 
 #[test]

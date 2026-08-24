@@ -39,8 +39,18 @@ broker_unit="cockpit-containment-broker@$daemon_uid.service"
 daemon_unit="cockpit-daemon@$daemon_uid.service"
 broker_was_active=0
 daemon_was_active=0
+broker_was_enabled=0
+daemon_was_enabled=0
+detached_was_active=0
 if systemctl is-active --quiet "$broker_unit"; then broker_was_active=1; fi
 if systemctl is-active --quiet "$daemon_unit"; then daemon_was_active=1; fi
+if systemctl is-enabled --quiet "$broker_unit"; then broker_was_enabled=1; fi
+if systemctl is-enabled --quiet "$daemon_unit"; then daemon_was_enabled=1; fi
+if [ "$daemon_was_active" -eq 0 ] && [ -x /usr/bin/cockpit ] \
+  && runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null 2>&1
+then
+  detached_was_active=1
+fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
 committed=0
 
@@ -62,6 +72,16 @@ rollback() {
       fi
     done
     systemctl daemon-reload 2>/dev/null || true
+    if [ "$broker_was_enabled" -eq 1 ]; then
+      systemctl enable "$broker_unit" 2>/dev/null || true
+    else
+      systemctl disable "$broker_unit" 2>/dev/null || true
+    fi
+    if [ "$daemon_was_enabled" -eq 1 ]; then
+      systemctl enable "$daemon_unit" 2>/dev/null || true
+    else
+      systemctl disable "$daemon_unit" 2>/dev/null || true
+    fi
     if [ -f "$transaction/capability.created" ]; then
       rm -f "/etc/flycockpit/containment-capability-$daemon_uid"
     fi
@@ -70,6 +90,8 @@ rollback() {
     fi
     if [ "$daemon_was_active" -eq 1 ]; then
       systemctl start "$daemon_unit" 2>/dev/null || true
+    elif [ "$detached_was_active" -eq 1 ] && [ -x /usr/bin/cockpit ]; then
+      runuser -u "$daemon_user" -- /usr/bin/cockpit daemon start 2>/dev/null || true
     fi
   fi
   rm -rf "$transaction"
@@ -128,8 +150,14 @@ systemctl daemon-reload
 systemctl enable "$broker_unit" "$daemon_unit"
 systemctl start "$broker_unit"
 systemctl is-active --quiet "$broker_unit"
+socket="/run/flycockpit/containment-broker-$daemon_uid.sock"
+if [ "$(stat -c '%F:%u:%g:%a' "$socket")" != "socket:0:$daemon_gid:660" ]; then
+  echo "containment broker did not publish the authenticated socket contract" >&2
+  exit 1
+fi
 systemctl start "$daemon_unit"
 systemctl is-active --quiet "$daemon_unit"
+runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null
 
 committed=1
 trap - EXIT HUP INT TERM

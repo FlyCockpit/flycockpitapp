@@ -406,9 +406,18 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
                 program: req.program,
                 args: req.args,
                 cwd: req.cwd,
-                env: std::env::vars().collect(),
+                env: std::collections::BTreeMap::new(),
+                inherited_env: Some(
+                    std::env::vars_os()
+                        .map(|(key, value)| {
+                            use std::os::unix::ffi::OsStringExt;
+                            (key.into_vec(), value.into_vec())
+                        })
+                        .collect(),
+                ),
                 capture_io: false,
                 require_proven: req.require_proven,
+                cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await?;
         Ok(spawned.allocation)

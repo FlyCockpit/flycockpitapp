@@ -46,11 +46,18 @@ pub struct NativeIoSpawnRequest {
     pub(crate) args: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) env: BTreeMap<String, String>,
+    /// Byte-preserving ambient environment used only by the inherited-stdio
+    /// native path on Unix. Hook I/O requests always leave this `None` and use
+    /// the deliberately clean UTF-8 map above.
+    pub(crate) inherited_env: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     /// Capture returns private pipes to the caller. The non-I/O containment
     /// API sets this false to preserve the native command contract: inherited
     /// environment and the daemon's exact stdio descriptors.
     pub(crate) capture_io: bool,
     pub(crate) require_proven: bool,
+    /// Cancellation remains attached through the privileged prepare/commit
+    /// transaction; it is not merely checked after allocation returns.
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl std::fmt::Debug for NativeIoSpawnRequest {

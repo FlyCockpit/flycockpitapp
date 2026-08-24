@@ -8,10 +8,16 @@
 fn main() -> std::io::Result<()> {
     use std::path::PathBuf;
 
+    // Do this before argument parsing, allocation, account lookup, or opening
+    // the service-manager capability. Root broker memory and descriptors must
+    // never become ptrace/core-dump material during partial startup.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
     let mut uid = None;
     let mut gid = None;
     let mut socket = None;
-    let mut cgroup_root = None;
     let mut capability_fd = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
@@ -19,7 +25,6 @@ fn main() -> std::io::Result<()> {
             Some("--allowed-uid") => uid = Some(parse_id(args.next(), "--allowed-uid")?),
             Some("--allowed-gid") => gid = Some(parse_id(args.next(), "--allowed-gid")?),
             Some("--socket") => socket = args.next().map(PathBuf::from),
-            Some("--cgroup-root") => cgroup_root = args.next().map(PathBuf::from),
             Some("--capability-fd") => capability_fd = Some(parse_id(args.next(), "--capability-fd")? as i32),
             _ => return Err(invalid("unknown or non-UTF-8 argument")),
         }
@@ -32,9 +37,6 @@ fn main() -> std::io::Result<()> {
     let mut config = cockpit_core::process_containment::LinuxBrokerServerConfig::production(uid, gid);
     if let Some(path) = socket {
         config.socket_path = path;
-    }
-    if let Some(path) = cgroup_root {
-        config.cgroup_root = path;
     }
     config.capability_fd = capability_fd
         .or_else(|| cockpit_core::process_containment::inherited_linux_broker_capability_fd())

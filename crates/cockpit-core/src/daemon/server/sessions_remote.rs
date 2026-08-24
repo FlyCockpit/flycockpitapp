@@ -8,6 +8,29 @@ use super::authz::ClientPrincipal;
 use super::sessions::{btw_info_to_proto, internal, stop_subtree};
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+#[error("unknown session {0}")]
+struct UnknownRemoteSession(Uuid);
+
+fn require_mutated(existed: bool, session_id: Uuid) -> anyhow::Result<()> {
+    if existed {
+        Ok(())
+    } else {
+        Err(UnknownRemoteSession(session_id).into())
+    }
+}
+
+fn remote_mutation_error(error: anyhow::Error) -> ErrorPayload {
+    if let Some(unknown) = error.downcast_ref::<UnknownRemoteSession>() {
+        ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: unknown.to_string(),
+        }
+    } else {
+        internal(error)
+    }
+}
+
 pub(super) struct RemoteSessionLedger {
     logical_attachment_id: String,
     operation_id: String,
@@ -125,7 +148,7 @@ where
             },
         )
         .await
-        .map_err(internal)?;
+        .map_err(remote_mutation_error)?;
     match outcome {
         TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
         TransactionalRemoteOperationOutcome::Replay(bytes) => {
@@ -304,12 +327,13 @@ pub(super) async fn archive_session(
     // conflict lookup, and target resolution.
     stop_subtree(ctx, session_id, cascade).await?;
     commit_session_remote_mutation(ctx, ledger, "archive_session", move |conn| {
-        crate::db::Db::archive_session_conn(
+        let existed = crate::db::Db::archive_existing_session_conn(
             conn,
             session_id,
             cascade,
             chrono::Utc::now().timestamp(),
         )?;
+        require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await
@@ -326,7 +350,8 @@ pub(super) async fn unarchive_session(
     }
     require_session(ctx, session_id).await?;
     commit_session_remote_mutation(ctx, ledger, "unarchive_session", move |conn| {
-        crate::db::Db::unarchive_session_conn(conn, session_id)?;
+        let existed = crate::db::Db::unarchive_existing_session_conn(conn, session_id)?;
+        require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await
@@ -344,7 +369,8 @@ pub(super) async fn rename_session(
     }
     require_session(ctx, session_id).await?;
     commit_session_remote_mutation(ctx, ledger, "rename_session", move |conn| {
-        crate::db::Db::rename_session_conn(conn, session_id, &title)?;
+        let existed = crate::db::Db::rename_existing_session_conn(conn, session_id, &title)?;
+        require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await
@@ -405,7 +431,8 @@ pub(super) async fn delete_session(
         .map_err(internal)?;
     let response = commit_session_remote_mutation(ctx, ledger, "delete_session", move |conn| {
         crate::db::Db::terminalize_session_run_invocations_conn(conn, session_id, now_wall_ms)?;
-        crate::db::Db::delete_session_row_conn(conn, session_id)?;
+        let existed = crate::db::Db::delete_existing_session_row_conn(conn, session_id)?;
+        require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await?;

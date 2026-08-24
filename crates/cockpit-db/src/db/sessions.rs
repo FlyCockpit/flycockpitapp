@@ -1521,6 +1521,23 @@ impl Db {
         Ok(())
     }
 
+    /// Transaction-composable rename which reports whether the authoritative
+    /// root row still existed at the instant of mutation.
+    pub fn rename_existing_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        title: &str,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET title = ?1, user_renamed = 1, title_recovery_nudge_state = 0
+                 WHERE session_id = ?2",
+                params![title, session_id.to_string()],
+            )
+            .context("renaming existing session")?;
+        Ok(affected == 1)
+    }
+
     pub async fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
         self.write(move |conn| Self::rename_session_conn(conn, session_id, &title))
@@ -1829,6 +1846,19 @@ impl Db {
         delete_session_conn(conn, session_id)
     }
 
+    /// Transaction-composable deletion which refuses to treat a concurrently
+    /// removed root as a successful remote mutation.
+    pub fn delete_existing_session_row_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<bool> {
+        if get_session_inner(conn, session_id)?.is_none() {
+            return Ok(false);
+        }
+        delete_session_conn(conn, session_id)?;
+        Ok(true)
+    }
+
     /// Discard a single ephemeral side-conversation session (`/side`),
     /// cascading to its descendant forks. No-op (returns `Ok(false)`) when
     /// the id is unknown or the row is **not** ephemeral — a guard so a
@@ -1982,6 +2012,35 @@ impl Db {
         Ok(())
     }
 
+
+    /// Transaction-composable archive which validates the root in the same
+    /// transaction as the subtree update.
+    pub fn archive_existing_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        cascade: bool,
+        now: i64,
+    ) -> Result<bool> {
+        let targets = if cascade {
+            collect_subtree(conn, session_id)?
+        } else if get_session_inner(conn, session_id)?.is_some() {
+            vec![session_id]
+        } else {
+            Vec::new()
+        };
+        if targets.is_empty() {
+            return Ok(false);
+        }
+        for id in targets {
+            conn.execute(
+                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
+                params![now, id.to_string()],
+            )
+            .context("archiving existing session")?;
+        }
+        Ok(true)
+    }
+
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
     pub async fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
@@ -1996,6 +2055,21 @@ impl Db {
         )
         .context("unarchiving session")?;
         Ok(())
+    }
+
+
+    /// Transaction-composable unarchive which reports concurrent removal.
+    pub fn unarchive_existing_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+                [session_id.to_string()],
+            )
+            .context("unarchiving existing session")?;
+        Ok(affected == 1)
     }
 
     /// Count the descendant forks of a session (depth-unbounded, not

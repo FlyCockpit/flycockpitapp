@@ -1819,6 +1819,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn persisted_nonterminal_transaction_is_not_fresh_after_reopen_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000019";
+        let request = reserve(operation, [9; 32]);
+        assert!(matches!(
+            db.lookup_committed_transactional_operation(request.clone())
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::Absent
+        ));
+        assert!(matches!(
+            db.reserve_remote_attachment_operation(request.clone())
+                .await
+                .unwrap(),
+            ReserveRemoteOperationOutcome::Reserved(_)
+        ));
+        assert!(matches!(
+            db.lookup_committed_transactional_operation(request.clone())
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::ExistingIndeterminate
+        ));
+
+        let mut conflicting = reserve(operation, [10; 32]);
+        conflicting.operation_class = RemoteOperationClass::IdempotentAdapterMutation;
+        assert!(matches!(
+            db.reserve_remote_attachment_operation(conflicting)
+                .await
+                .unwrap(),
+            ReserveRemoteOperationOutcome::OperationConflict
+        ));
+    }
+
     #[test]
     fn exact_capacity_boundaries_are_inclusive_without_large_allocations() {
         assert!(!operation_reservation_at_capacity(99_999, 536_870_911));

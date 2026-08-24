@@ -3238,6 +3238,35 @@ mod tests {
         assert!(!sidecar.exists());
     }
 
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_intent_survives_delete_commit() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        let relative = format!("delegation_payloads/{id}/recovery.txt");
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "payload").unwrap();
+        db.write({
+            let id = id.clone();
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
+                Db::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, 2)?;
+                Db::delete_existing_session_row_conn(conn, session_id)?;
+                Ok(())
+            }
+        }).await.unwrap();
+        assert!(sidecar.exists(), "commit precedes external cleanup");
+        let pending = db.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",[],|row|row.get::<_,i64>(0))?)).await.unwrap();
+        assert_eq!(pending, 1);
+        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+        assert!(!sidecar.exists());
+    }
+
     #[test]
     fn migration_files_on_disk_match_expected_set() {
         // Pre-release: the directory contains the local base plus the opt-in

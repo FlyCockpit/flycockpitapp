@@ -239,7 +239,8 @@ pub struct HookConfigSource {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct HookOrigin(String);
 
 impl HookOrigin {
@@ -263,7 +264,7 @@ impl HookOrigin {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedHook {
     pub event: HookEvent,
     pub matcher: Option<BTreeSet<String>>,

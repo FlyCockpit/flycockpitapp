@@ -374,16 +374,18 @@ restart-stable `compactionId`. Delivery uses a durable
 pending/leased/completed outbox and is at least once for both edges. Hook
 handlers must use `(compactionId, event)` as their idempotency key: a crash
 after a command performs an external effect but before Cockpit records its
-receipt can repeat either hook. A prepared compaction commits its durable
-successor before either lifecycle edge becomes deliverable; commit failure
-therefore fires neither hook. Cockpit then durably enqueues and delivers
-`preCompact` immediately before projecting that committed successor into live
-history, and delivers `postCompact` after projection. Recovery blocks new work
-and retries with backoff until pending intents, outbox receipts, and projection
-converge. Both edges remain bound to the immutable handler-plan identity and
-configuration generation captured when the compaction was admitted; config
-drift cannot substitute a different handler. Cockpit does not claim
-exactly-once external effects.
+receipt can repeat either hook. Cockpit first persists a non-visible prepared
+successor and the exact executable hook plan selected at admission. It then
+delivers `preCompact` immediately before the visible `session_compacted`
+commit. Failure before the pre receipt leaves history unchanged and is an
+ordinary compact failure. Once the pre receipt is durable, the commit is
+retry-pending: it is never reported as a failed compaction and recovery keeps
+new work gated until the same identity commits, projects into live history,
+and delivers `postCompact`. Recovery uses bounded backoff while continuing to
+service control and teardown traffic. The owner-only session database retains
+the immutable argv, environment, timeout, origin, and configuration generation
+selected at admission, so config drift cannot substitute a different handler
+or wedge recovery. Cockpit does not claim exactly-once external effects.
 
 #### Source ordering, argv, and trust
 

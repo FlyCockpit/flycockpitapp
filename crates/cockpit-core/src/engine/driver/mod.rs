@@ -2270,10 +2270,13 @@ impl Driver {
     }
 
     fn hook_runner(&self) -> crate::engine::agent::hooks::TokioCommandRunner {
-        self.process_containment.clone().map_or_else(
+        let runner = self.process_containment.clone().map_or_else(
             crate::engine::agent::hooks::TokioCommandRunner::new,
             crate::engine::agent::hooks::TokioCommandRunner::with_containment,
-        )
+        );
+        crate::sync::lock_or_recover(&self.cancel_current)
+            .clone()
+            .map_or(runner.clone(), |cancel| runner.with_cancellation(cancel))
     }
 
     /// Refresh the driver's config handle from the layered config on disk for
@@ -3415,12 +3418,12 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
-        // Durable compaction recovery is an admission gate, not a best-effort
-        // startup task. No user/control/job work is observed until a committed
-        // successor, both lifecycle receipts, and live projection converge.
-        // Retrying also re-pins configuration so an operator can restore the
-        // exact admitted hook plan without restarting the daemon again.
-        self.reconcile_compaction_before_admission(tx).await;
+        // Load recovery state before admission. Convergence itself is driven
+        // by the select loop below so shutdown/cancel/control traffic remains
+        // serviceable while user and background work stay gated.
+        if self.compaction_recovery_blocked {
+            let _ = self.load_compaction_shadow_from_store().await;
+        }
         self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
@@ -3445,7 +3448,61 @@ impl Driver {
         }
 
         let mut goal_watchdog: Option<Pin<Box<Sleep>>> = None;
+        let mut compaction_recovery_backoff = std::time::Duration::from_millis(25);
         loop {
+            if self.compaction_recovery_blocked || self.recovered_compaction_intent.is_some() {
+                self.config = self.config.repin();
+                let recovery_cancel = tokio_util::sync::CancellationToken::new();
+                let recovery_guard = {
+                    *crate::sync::lock_or_recover(&self.cancel_current) = Some(recovery_cancel);
+                    CancelSlotGuard { slot: self.cancel_current.clone() }
+                };
+                let converged = !self.compaction_recovery_blocked
+                    && self.recover_compaction_intent(tx).await;
+                drop(recovery_guard);
+                if converged {
+                    compaction_recovery_backoff = std::time::Duration::from_millis(25);
+                    continue;
+                }
+                if let Err(error) = self
+                    .session
+                    .db
+                    .release_compaction_hook_leases(self.session.id)
+                    .await
+                {
+                    tracing::warn!(%error, "compaction recovery could not release hook leases");
+                    self.compaction_recovery_blocked = true;
+                }
+                tracing::warn!(
+                    retry_millis = compaction_recovery_backoff.as_millis() as u64,
+                    "compaction recovery is gating new work"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(compaction_recovery_backoff) => {
+                        if self.compaction_recovery_blocked {
+                            let _ = self.load_compaction_shadow_from_store().await;
+                        }
+                    }
+                    ctl = control_rx.recv() => match ctl {
+                        #[cfg(test)]
+                        Some(DriverControl::AbortForTest) => anyhow::bail!("driver abort requested for test"),
+                        Some(control) => self.run_control_with_input_queue(control, &input_queue, tx).await,
+                        None => break,
+                    },
+                    cmd = self.job_cmd_rx.recv() => match cmd {
+                        Some(cmd) => self.schedule.handle_command(cmd),
+                        None => {
+                            self.schedule.settle_swarm_for_teardown().await;
+                            self.drain_orphaned_swarm_stop_hooks().await;
+                            break;
+                        }
+                    },
+                }
+                compaction_recovery_backoff = compaction_recovery_backoff
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+                continue;
+            }
             let active_target_id = self.active_queue_target_id();
             if !self.pending_noninteractive_completions.is_empty()
                 && !input_queue.has_pending_for(Some(&active_target_id)).await
@@ -3695,6 +3752,11 @@ impl Driver {
                 self.do_prune(false, tx).await;
             }
             DriverControl::Compact => {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let _cancel_guard = {
+                    *crate::sync::lock_or_recover(&self.cancel_current) = Some(cancel);
+                    CancelSlotGuard { slot: self.cancel_current.clone() }
+                };
                 self.do_compact(tx).await;
             }
             DriverControl::Pin { text } => {

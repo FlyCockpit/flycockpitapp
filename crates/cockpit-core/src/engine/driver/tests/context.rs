@@ -3054,7 +3054,7 @@ async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
 }
 
 #[tokio::test]
-async fn compact_successor_commit_failure_fires_neither_and_blocks_admission() {
+async fn compact_successor_commit_failure_after_pre_is_retry_pending() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     inject_hooks(&mut driver, compact_manual_registry());
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
@@ -3085,7 +3085,7 @@ async fn compact_successor_commit_failure_fires_neither_and_blocks_admission() {
         "a missing durable successor must keep admission closed"
     );
     assert!(driver.recovered_compaction_intent.is_some());
-    assert!(compact_hook_event_order(&driver).await.is_empty());
+    assert_eq!(compact_hook_event_order(&driver).await, vec!["preCompact"]);
 
     driver.test_compact_force_failure = None;
     assert!(driver.recover_compaction_intent(&tx).await);
@@ -3098,7 +3098,7 @@ async fn compact_successor_commit_failure_fires_neither_and_blocks_admission() {
 }
 
 #[tokio::test]
-async fn compact_recovery_rejects_handler_plan_drift_until_exact_plan_returns() {
+async fn compact_recovery_executes_pinned_plan_despite_current_config_drift() {
     let (mut driver, _tmp) = prepare_apply_fixture().await;
     let admitted = compact_manual_registry();
     inject_hooks(&mut driver, admitted.clone());
@@ -3120,14 +3120,10 @@ async fn compact_recovery_rejects_handler_plan_drift_until_exact_plan_returns() 
     drifted.hooks[0].command.push("changed-after-admission".to_string());
     inject_hooks(&mut driver, drifted);
     let _ = driver.load_compaction_shadow_from_store().await;
-    assert!(!driver.recover_compaction_intent(&tx).await);
-    assert!(compact_hook_event_order(&driver).await.is_empty());
-
-    inject_hooks(&mut driver, admitted);
     assert!(driver.recover_compaction_intent(&tx).await);
     assert_eq!(
         compact_hook_event_order(&driver).await,
-        vec!["preCompact".to_string(), "postCompact".to_string()]
+        vec!["postCompact".to_string()]
     );
     drop(tx);
     while rx.recv().await.is_some() {}
@@ -3139,7 +3135,8 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
 
     for (phase, expected_hooks) in [
         (Phase::Prepared, vec!["preCompact", "postCompact"]),
-        (Phase::SuccessorCommitted, vec!["preCompact", "postCompact"]),
+        (Phase::PreCompleted, vec!["postCompact"]),
+        (Phase::SuccessorCommitted, vec!["postCompact"]),
         (Phase::Projected, vec!["postCompact"]),
         (Phase::PostCompleted, vec![]),
     ] {
@@ -3152,7 +3149,7 @@ async fn compact_transaction_recovers_every_durable_crash_cut_without_replaying_
             .expect("prepare succeeds");
         let expected_history = prepared.history.clone();
 
-        if phase != Phase::Prepared {
+        if !matches!(phase, Phase::Prepared | Phase::PreCompleted) {
             driver
                 .stage_prepared_compaction(&prepared)
                 .await

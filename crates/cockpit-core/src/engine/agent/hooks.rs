@@ -786,7 +786,10 @@ impl TokioCommandRunner {
         }
     }
 
-    fn with_cancellation(mut self, cancellation: tokio_util::sync::CancellationToken) -> Self {
+    pub(crate) fn with_cancellation(
+        mut self,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
         self.cancellation = Some(cancellation);
         self
     }

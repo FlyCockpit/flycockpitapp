@@ -24,6 +24,7 @@ const TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL: std::time::Duration =
 /// Single production-owned dispatch seam for the two Worker lifecycle edges.
 /// Keeping the matcher-to-envelope projection here lets the aggregate hook
 /// harness exercise the exact code called by Worker startup and teardown.
+#[derive(Clone, Copy)]
 pub(crate) enum WorkerLifecycleHook<'a> {
     Start(&'a str),
     End(&'a str),
@@ -35,6 +36,7 @@ pub(crate) async fn fire_worker_lifecycle_hook(
     boundary: WorkerLifecycleHook<'_>,
     session: &Session,
     project_root: &std::path::Path,
+    shutdown: &crate::daemon::shutdown::ShutdownSignal,
 ) {
     use crate::config::extended::hooks::HookEvent;
 
@@ -56,8 +58,28 @@ pub(crate) async fn fire_worker_lifecycle_hook(
             },
         ),
     };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_on_drain = matches!(boundary, WorkerLifecycleHook::Start(_));
+    let mut shutdown_rx = shutdown.subscribe();
+    let cancellation = cancel.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            let phase = *shutdown_rx.borrow_and_update();
+            if matches!(phase, crate::daemon::shutdown::ShutdownPhase::Forced)
+                || (cancel_on_drain
+                    && matches!(phase, crate::daemon::shutdown::ShutdownPhase::Draining))
+            {
+                cancellation.cancel();
+                return;
+            }
+            if shutdown_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    let runner = runner.clone().with_cancellation(cancel);
     crate::engine::agent::hooks::run_observe_hooks(
-        runner,
+        &runner,
         &crate::engine::agent::hooks::DefaultProcessEnv,
         registry,
         event,
@@ -72,6 +94,7 @@ pub(crate) async fn fire_worker_lifecycle_hook(
         fields,
     )
     .await;
+    watcher.abort();
 }
 
 pub(super) fn persistent_llm_mode_control(
@@ -1918,6 +1941,7 @@ pub(super) async fn run_worker(
             WorkerLifecycleHook::Start(start_source),
             &session,
             &project_root,
+            &shutdown_gate,
         )
         .await;
     }
@@ -4459,6 +4483,7 @@ pub(super) async fn run_worker(
             WorkerLifecycleHook::End(end_matcher),
             &session,
             &project_root,
+            &shutdown_gate,
         )
         .await;
     }

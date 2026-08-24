@@ -1,20 +1,25 @@
 #!/bin/sh
 set -eu
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "install-linux-containment-broker.sh must run as root" >&2
-  exit 1
-fi
 if [ "$#" -ne 1 ]; then
   echo "usage: install-linux-containment-broker.sh DAEMON_USER" >&2
   exit 2
 fi
-for tool in getent awk sed stat readlink tr cut grep; do
+# Resolve every external prerequisite before its first use. In particular,
+# `id`, systemd tooling, and bundle-verification tooling cannot be deferred
+# until after they have already influenced privileged control flow.
+for tool in id getent awk sed stat readlink tr cut grep sha256sum readelf uname \
+  systemctl systemd-analyze systemd-run systemd-tmpfiles dirname sort mktemp cp \
+  find basename mkdir ln rm sleep rmdir runuser env install chown mv dd chmod; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "required containment installer tool is unavailable: $tool" >&2
     exit 1
   fi
 done
+if [ "$(id -u)" -ne 0 ]; then
+  echo "install-linux-containment-broker.sh must run as root" >&2
+  exit 1
+fi
 
 daemon_user=$1
 payload_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
@@ -50,12 +55,6 @@ done
 # Authenticate and identify the complete extracted bundle before stopping a
 # daemon or writing any privileged path. This installer is Linux-only, so its
 # verification tools are explicit prerequisites, never weaker fallbacks.
-for tool in sha256sum readelf uname; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "required bundle verification tool is unavailable: $tool" >&2
-    exit 1
-  fi
-done
 bundle_target=$(sed -n '1p' "$payload_root/TARGET" 2>/dev/null || true)
 case "$(uname -m):$bundle_target" in
   x86_64:x86_64-unknown-linux-gnu|aarch64:aarch64-unknown-linux-gnu) ;;

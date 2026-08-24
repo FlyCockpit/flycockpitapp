@@ -507,7 +507,7 @@ async fn run_swarm_loop(
                     let hook_runner = ctx.process_containment.clone().map_or_else(
                         crate::engine::agent::hooks::TokioCommandRunner::new,
                         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
-                    );
+                    ).with_cancellation(cancel.clone());
                     crate::engine::agent::hooks::run_observe_hooks(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,

@@ -17,7 +17,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ use super::types::{
     ContainmentError, ContainmentGuarantee, SafeLocator,
 };
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup/flycockpit";
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRIES: usize = 4096;
@@ -44,8 +44,9 @@ const AUTH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 const MAX_PREAUTH_CONNECTIONS: usize = 16;
 const MAX_AUTHENTICATED_CONNECTIONS: usize = 8;
 const MAX_LIVE_OPERATION_RECORDS: usize = 65_536;
-const REPLAY_IDENTITY_PREFIX: &str = ".replay-identities-";
-const REPLAY_IDENTITIES_PER_SEGMENT: usize = 16_384;
+const TERMINAL_REPLAY_WINDOW: u64 = 16_384;
+const MAX_AUTHORITY_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
+const AUTHORITY_LEDGER_NAME: &str = "authority-ledger.json";
 const BROKER_DIRECTORY: &str = "/run/flycockpit";
 const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -143,8 +144,11 @@ impl LinuxBrokerServerConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Request {
     Authenticate { version: u32 },
+    Probe { version: u32 },
+    IssueOperationTicket { version: u32, session_id: String, operation_id: String },
     PrepareSpawn {
         version: u32,
+        operation_ticket: u64,
         containment_id: String,
         session_id: String,
         generation: u64,
@@ -159,9 +163,9 @@ enum Request {
         /// never be replayed with different executable inputs.
         request_digest: String,
     },
-    CommitSpawn { version: u32, session_id: String, operation_id: String },
-    CancelOperation { version: u32, session_id: String, operation_id: String },
-    OperationStatus { version: u32, session_id: String, operation_id: String },
+    CommitSpawn { version: u32, operation_ticket: u64, session_id: String, operation_id: String },
+    CancelOperation { version: u32, operation_ticket: u64, session_id: String, operation_id: String },
+    OperationStatus { version: u32, operation_ticket: u64, session_id: String, operation_id: String },
     Kill { version: u32, key: String, generation: u64 },
     Populated { version: u32, key: String, generation: u64 },
     ExitStatus { version: u32, key: String, generation: u64 },
@@ -171,6 +175,7 @@ enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Response {
     Ready { version: u32, exclusive_delegation: bool },
+    OperationTicket { version: u32, operation_ticket: u64 },
     Prepared { version: u32, key: String, guard: GuardAttestation },
     Committed { version: u32, key: String },
     Cancelled { version: u32 },
@@ -246,7 +251,6 @@ pub(crate) struct LinuxBrokerClient {
     // installer supplies a root-delivered capability fd to both endpoints.
     stream: Arc<Mutex<Option<UnixStream>>>,
     capability: Arc<OwnedFd>,
-    ready: Arc<AtomicBool>,
 }
 
 impl LinuxBrokerClient {
@@ -266,12 +270,10 @@ impl LinuxBrokerClient {
         // ownership transferred to the first adapter constructed. Keep the
         // CLOEXEC original valid so later public diagnostics can duplicate
         // and authenticate it; this client retains its own independent fd.
-        let ready = stream.is_some();
         Ok(Self {
             config,
             stream: Arc::new(Mutex::new(stream)),
             capability: Arc::new(capability),
-            ready: Arc::new(AtomicBool::new(ready)),
         })
     }
 
@@ -289,10 +291,8 @@ impl LinuxBrokerClient {
             match connect_authenticated_stream(&self.config, self.capability.as_fd()) {
                 Ok(stream) => {
                     *stream_slot = Some(stream);
-                    self.ready.store(true, Ordering::Release);
                 }
                 Err(error) => {
-                    self.ready.store(false, Ordering::Release);
                     return Err(error);
                 }
             }
@@ -304,16 +304,26 @@ impl LinuxBrokerClient {
         if result.is_err() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             *stream_slot = None;
-            self.ready.store(false, Ordering::Release);
         }
         result
     }
 
-    async fn cancel_and_prove(&self, session_id: &str, operation_id: &str) -> Result<(), ContainmentError> {
+    fn issue_operation_ticket(&self, session_id: &str, operation_id: &str) -> std::io::Result<u64> {
+        let request = Request::IssueOperationTicket { version: PROTOCOL_VERSION,
+            session_id: session_id.to_owned(), operation_id: operation_id.to_owned() };
+        match self.transact(&request)? {
+            (Response::OperationTicket { version: PROTOCOL_VERSION, operation_ticket }, fds) if fds.is_empty() => Ok(operation_ticket),
+            (Response::Error { code, .. }, fds) if fds.is_empty() => Err(std::io::Error::other(code)),
+            _ => Err(std::io::Error::other("invalid broker ticket response")),
+        }
+    }
+
+    async fn cancel_and_prove(&self, operation_ticket: u64, session_id: &str, operation_id: &str) -> Result<(), ContainmentError> {
         let deadline = std::time::Instant::now() + REAP_TIMEOUT + FRAME_TIMEOUT;
         loop {
             let request = Request::CancelOperation {
                 version: PROTOCOL_VERSION,
+                operation_ticket,
                 session_id: session_id.to_owned(),
                 operation_id: operation_id.to_owned(),
             };
@@ -327,6 +337,7 @@ impl LinuxBrokerClient {
             }
             let status = Request::OperationStatus {
                 version: PROTOCOL_VERSION,
+                operation_ticket,
                 session_id: session_id.to_owned(),
                 operation_id: operation_id.to_owned(),
             };
@@ -368,17 +379,8 @@ impl ManagementBroker for LinuxBrokerClient {
     }
 
     fn exclusive_delegation(&self) -> bool {
-        if self.ready.load(Ordering::Acquire) {
-            return true;
-        }
-        let Ok(mut slot) = self.stream.lock() else { return false };
-        if slot.is_none() {
-            if let Ok(stream) = connect_authenticated_stream(&self.config, self.capability.as_fd()) {
-                *slot = Some(stream);
-                self.ready.store(true, Ordering::Release);
-            }
-        }
-        self.ready.load(Ordering::Acquire)
+        matches!(self.transact(&Request::Probe { version: PROTOCOL_VERSION }),
+            Ok((Response::Ready { version: PROTOCOL_VERSION, exclusive_delegation: true }, fds)) if fds.is_empty())
     }
 
     async fn authenticate(&self, _: &str, _: &str, _: u64) -> bool {
@@ -397,6 +399,13 @@ impl ManagementBroker for LinuxBrokerClient {
         let containment_id = request.containment_id;
         let session_id = request.session_id.to_string();
         let operation_id = request.operation_id.clone();
+        let ticket_client = self.clone();
+        let ticket_session = session_id.clone();
+        let ticket_operation = operation_id.clone();
+        let operation_ticket = tokio::task::spawn_blocking(move || {
+            ticket_client.issue_operation_ticket(&ticket_session, &ticket_operation)
+        }).await.map_err(|error| ContainmentError::Internal(error.to_string()))?
+            .map_err(|_| unavailable())?;
         let program = request.program.as_os_str().as_bytes().to_vec();
         let cwd = request.cwd.as_os_str().as_bytes().to_vec();
         let mut environment = request.inherited_env.unwrap_or_else(|| {
@@ -423,6 +432,7 @@ impl ManagementBroker for LinuxBrokerClient {
         );
         let wire = Request::PrepareSpawn {
             version: PROTOCOL_VERSION,
+            operation_ticket,
             containment_id: containment_id.to_string(),
             session_id: session_id.clone(),
             generation,
@@ -470,7 +480,7 @@ impl ManagementBroker for LinuxBrokerClient {
             _ => return Err(unavailable()),
         };
         if cancellation.is_cancelled() {
-            self.cancel_and_prove(&session_id, &operation_id).await?;
+            self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
             return Err(ContainmentError::Internal("allocation request cancelled".into()));
         }
         let expected_fd_count = if capture_io { 4 } else { 1 };
@@ -482,7 +492,7 @@ impl ManagementBroker for LinuxBrokerClient {
                 fds.last().expect("checked descriptor count").as_fd(),
             )
         {
-            self.cancel_and_prove(&session_id, &operation_id).await?;
+            self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
             return Err(unavailable());
         }
         let pidfd = fds.pop().expect("checked fd count");
@@ -496,11 +506,12 @@ impl ManagementBroker for LinuxBrokerClient {
         };
         let commit = Request::CommitSpawn {
             version: PROTOCOL_VERSION,
+            operation_ticket,
             session_id: session_id.clone(),
             operation_id: operation_id.clone(),
         };
         if cancellation.is_cancelled() {
-            self.cancel_and_prove(&session_id, &operation_id).await?;
+            self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
             return Err(ContainmentError::Internal("allocation request cancelled".into()));
         }
         let commit_client = self.clone();
@@ -510,7 +521,7 @@ impl ManagementBroker for LinuxBrokerClient {
                 // A replacement transport cannot adopt another connection's
                 // commit. Request abort and wait for a terminal/ProvenEmpty
                 // state after the old owner's disconnect has linearized.
-                self.cancel_and_prove(&session_id, &operation_id).await?;
+                self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
                 return Err(unavailable());
             }
         };
@@ -520,11 +531,11 @@ impl ManagementBroker for LinuxBrokerClient {
                 if committed_key == &key && extra.is_empty()
         );
         if !commit_valid {
-            self.cancel_and_prove(&session_id, &operation_id).await?;
+            self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
             return Err(unavailable());
         }
         if cancellation.is_cancelled() {
-            self.cancel_and_prove(&session_id, &operation_id).await?;
+            self.cancel_and_prove(operation_ticket, &session_id, &operation_id).await?;
             return Err(ContainmentError::Internal("allocation request cancelled".into()));
         }
         let async_pidfd = tokio::io::unix::AsyncFd::new(pidfd)
@@ -621,9 +632,10 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     unsafe { libc::close(config.capability_fd) };
     let recovered_empty = verify_server_installation(&config)?;
     verify_socket_location(&config)?;
-    let mut tombstones = ReplayIdentityStore::load(&config)?;
+    let mut authority = AuthorityLedger::load(&config)?;
     let mut operations = recover_operation_records(&config, &recovered_empty)?;
-    gc_terminal_operations(&config, &mut operations, &mut tombstones)?;
+    reconcile_authority_ledger(&config, &mut authority, &mut operations)?;
+    gc_terminal_operations(&config, &mut operations, &mut authority)?;
     let mut durable_empty = recovered_empty;
     durable_empty.extend(
         operations.values()
@@ -644,7 +656,8 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
         operation_keys: Mutex::new(operation_keys),
         emptied: Mutex::new(durable_empty),
         exit_statuses: Mutex::new(recovered_exit_statuses),
-        tombstones: Mutex::new(tombstones),
+        authority: Mutex::new(authority),
+        gc: Mutex::new(()),
     });
     // Cleanup/reap progress must not depend on request traffic. Each pass is
     // independently bounded and never owns the listener, so idle cleanup does
@@ -815,7 +828,8 @@ struct BrokerState {
     operation_keys: Mutex<BTreeMap<String, (String, String)>>,
     emptied: Mutex<BTreeSet<String>>,
     exit_statuses: Mutex<BTreeMap<String, Option<i32>>>,
-    tombstones: Mutex<ReplayIdentityStore>,
+    authority: Mutex<AuthorityLedger>,
+    gc: Mutex<()>,
 }
 
 struct BrokerOperation {
@@ -838,86 +852,77 @@ fn owned_by_other_connection(owner: Option<u64>, connection_id: u64) -> bool {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ReplayIdentitySegment {
+struct DurableAuthorityLedger {
     version: u32,
-    sequence: u64,
-    identities: Vec<(String, String)>,
-    checksum: String,
+    next_ticket: u64,
+    retired_through: u64,
+    issued: BTreeMap<u64, (String, String)>,
+    completed: BTreeSet<u64>,
+    retired_unlinks: BTreeSet<(String, String)>,
 }
 
-struct ReplayIdentityStore {
-    identities: BTreeSet<(String, String)>,
-    next_sequence: u64,
+#[derive(Clone)]
+struct AuthorityLedger {
+    next_ticket: u64,
+    retired_through: u64,
+    issued: BTreeMap<u64, (String, String)>,
+    completed: BTreeSet<u64>,
+    retired_unlinks: BTreeSet<(String, String)>,
+    ticket_owners: BTreeMap<u64, u64>,
 }
 
-impl ReplayIdentityStore {
+impl AuthorityLedger {
     fn load(config: &LinuxBrokerServerConfig) -> std::io::Result<Self> {
-        let mut identities = BTreeSet::new();
-        let mut next_sequence = 0_u64;
-        for entry in fs::read_dir(&config.state_root)? {
-            let entry = entry?;
-            let Some(sequence) = replay_segment_sequence(entry.file_name().as_bytes()) else { continue };
-            let metadata = entry.metadata()?;
-            if !entry.file_type()?.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid replay identity segment"));
+        let path = config.state_root.join(AUTHORITY_LEDGER_NAME);
+        let durable = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path) {
+            Ok(mut file) => {
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0
+                    || metadata.len() > MAX_AUTHORITY_LEDGER_BYTES { return Err(invalid("unsafe broker authority ledger")); }
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                serde_json::from_slice::<DurableAuthorityLedger>(&bytes).map_err(invalid)?
             }
-            let bytes = fs::read(entry.path())?;
-            if bytes.len() > MAX_FRAME * 4 { return Err(invalid("replay identity segment exceeds size limit")); }
-            let segment: ReplayIdentitySegment = serde_json::from_slice(&bytes).map_err(invalid)?;
-            if segment.version != 1 || segment.sequence != sequence || segment.identities.len() > REPLAY_IDENTITIES_PER_SEGMENT {
-                return Err(invalid("invalid replay identity segment envelope"));
-            }
-            if segment.checksum != replay_segment_checksum(sequence, &segment.identities)? {
-                return Err(invalid("replay identity segment checksum mismatch"));
-            }
-            for identity in segment.identities {
-                if uuid::Uuid::parse_str(&identity.0).is_err() || !valid_operation_id(&identity.1) || !identities.insert(identity) {
-                    return Err(invalid("duplicate or invalid retired operation identity"));
-                }
-            }
-            next_sequence = next_sequence.max(sequence.checked_add(1).ok_or_else(|| invalid("replay segment sequence overflow"))?);
-        }
-        Ok(Self { identities, next_sequence })
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DurableAuthorityLedger {
+                version: 1, next_ticket: 1, retired_through: 0, issued: BTreeMap::new(),
+                completed: BTreeSet::new(), retired_unlinks: BTreeSet::new(),
+            },
+            Err(error) => return Err(error),
+        };
+        if durable.version != 1 || durable.next_ticket == 0 || durable.retired_through >= durable.next_ticket
+            || durable.issued.len() > MAX_LIVE_OPERATION_RECORDS
+            || durable.issued.keys().any(|ticket| *ticket <= durable.retired_through || *ticket >= durable.next_ticket)
+            || durable.completed.iter().any(|ticket| !durable.issued.contains_key(ticket))
+            || durable.issued.values().collect::<BTreeSet<_>>().len() != durable.issued.len()
+            || durable.issued.values().any(|identity| uuid::Uuid::parse_str(&identity.0).is_err()
+                || !valid_operation_id(&identity.1))
+            || durable.retired_unlinks.iter().any(|identity| uuid::Uuid::parse_str(&identity.0).is_err()
+                || !valid_operation_id(&identity.1))
+            || durable.retired_unlinks.iter().any(|identity| durable.issued.values().any(|issued| issued == identity))
+        { return Err(invalid("invalid broker authority ledger")); }
+        Ok(Self { next_ticket: durable.next_ticket, retired_through: durable.retired_through,
+            issued: durable.issued, completed: durable.completed,
+            retired_unlinks: durable.retired_unlinks, ticket_owners: BTreeMap::new() })
     }
 
-    fn contains(&self, session_id: &str, operation_id: &str) -> bool {
-        self.identities.contains(&(session_id.to_owned(), operation_id.to_owned()))
+    fn persist(&self, config: &LinuxBrokerServerConfig) -> std::io::Result<()> {
+        let durable = DurableAuthorityLedger { version: 1, next_ticket: self.next_ticket,
+            retired_through: self.retired_through, issued: self.issued.clone(), completed: self.completed.clone(),
+            retired_unlinks: self.retired_unlinks.clone() };
+        atomic_replace_named_state(config, &config.state_root.join(AUTHORITY_LEDGER_NAME),
+            &serde_json::to_vec(&durable).map_err(invalid)?, ".authority-ledger")
     }
 
-    fn append(&mut self, config: &LinuxBrokerServerConfig, retired: &[(String, String)]) -> std::io::Result<()> {
-        for chunk in retired.chunks(REPLAY_IDENTITIES_PER_SEGMENT) {
-            let identities = chunk.to_vec();
-            let sequence = self.next_sequence;
-            let segment = ReplayIdentitySegment { version: 1, sequence, checksum: replay_segment_checksum(sequence, &identities)?, identities: identities.clone() };
-            let bytes = serde_json::to_vec(&segment).map_err(invalid)?;
-            let destination = config.state_root.join(format!("{REPLAY_IDENTITY_PREFIX}{sequence:020}.json"));
-            atomic_replace_named_state(config, &destination, &bytes, ".replay-identities")?;
-            for identity in identities { self.identities.insert(identity); }
-            self.next_sequence = sequence.checked_add(1).ok_or_else(|| invalid("replay segment sequence overflow"))?;
-        }
-        Ok(())
+    fn verify(&self, ticket: u64, identity: &(String, String)) -> bool {
+        ticket > self.retired_through && self.issued.get(&ticket) == Some(identity)
     }
-}
-
-fn replay_segment_sequence(name: &[u8]) -> Option<u64> {
-    let suffix = name.strip_prefix(REPLAY_IDENTITY_PREFIX.as_bytes())?.strip_suffix(b".json")?;
-    if suffix.len() != 20 { return None; }
-    std::str::from_utf8(suffix).ok()?.parse().ok()
-}
-
-fn replay_segment_checksum(sequence: u64, identities: &[(String, String)]) -> std::io::Result<String> {
-    let mut hash = Sha256::new();
-    hash.update(b"flycockpit-replay-identity-segment-v1\0");
-    hash.update(sequence.to_be_bytes());
-    hash.update(serde_json::to_vec(identities).map_err(invalid)?);
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 #[derive(Serialize, Deserialize)]
 struct DurableOperation {
-    /// Linux boot ID. Identities are immutable for this entire epoch; records
-    /// from retired boots can be compacted because their processes and pidfds
-    /// can no longer exist.
+    /// Linux boot ID used to conservatively reconcile an interrupted kernel
+    /// transaction. Replay authority is owned separately by the durable
+    /// monotonic ticket ledger.
     broker_epoch: String,
     session_id: String,
     operation_id: String,
@@ -968,8 +973,46 @@ fn serve_one(
     restore?;
     let request: Request = serde_json::from_slice(&body).map_err(invalid)?;
     match request {
+        Request::Probe { version } if version == PROTOCOL_VERSION => send_response(stream,
+            &Response::Ready { version: PROTOCOL_VERSION, exclusive_delegation: true }, &[]),
+        Request::IssueOperationTicket { version, session_id, operation_id }
+            if version == PROTOCOL_VERSION => {
+            if uuid::Uuid::parse_str(&session_id).is_err() || !valid_operation_id(&operation_id) {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION,
+                    code: "invalid_operation_identity".into() }, &[]);
+            }
+            let identity = (session_id, operation_id);
+            gc_runtime_terminal_operations(config, state)?;
+            let has_operation = state.operation(&identity).is_some();
+            let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+            let operation_ticket = if let Some((ticket, _)) = authority.issued.iter()
+                .find(|(_, existing)| **existing == identity) {
+                if authority.ticket_owners.get(ticket).is_some_and(|owner| *owner != connection_id) {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION,
+                        code: "operation_owner_active".into() }, &[]);
+                }
+                *ticket
+            } else {
+                if authority.issued.len() >= MAX_LIVE_OPERATION_RECORDS {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION,
+                        code: "broker_active_operation_limit_reached".into() }, &[]);
+                }
+                let ticket = authority.next_ticket;
+                authority.next_ticket = ticket.checked_add(1).ok_or_else(|| invalid("operation ticket overflow"))?;
+                authority.issued.insert(ticket, identity);
+                if let Err(error) = authority.persist(config) {
+                    authority.issued.remove(&ticket);
+                    authority.next_ticket = ticket;
+                    return Err(error);
+                }
+                ticket
+            };
+            if !has_operation { authority.ticket_owners.insert(operation_ticket, connection_id); }
+            send_response(stream, &Response::OperationTicket { version: PROTOCOL_VERSION, operation_ticket }, &[])
+        }
         Request::PrepareSpawn {
             version,
+            operation_ticket,
             containment_id,
             session_id,
             generation,
@@ -997,6 +1040,15 @@ fn serve_one(
                 );
             }
             let operation_key = (session_id.clone(), operation_id.clone());
+            {
+                let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+                if operation_ticket <= authority.retired_through
+                    || authority.issued.get(&operation_ticket) != Some(&operation_key)
+                {
+                    return send_response(stream, &Response::Error { version: PROTOCOL_VERSION,
+                        code: "operation_ticket_invalid_or_retired".into() }, &[]);
+                }
+            }
             let expected_digest = canonical_spawn_digest(
                 &containment_id,
                 &session_id,
@@ -1011,7 +1063,8 @@ fn serve_one(
             if request_digest != expected_digest {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "request_digest_mismatch".into() }, &[]);
             }
-            let requested_key = containment_key(&containment_id, generation)?;
+            let broker_containment_id = ticket_containment_id(operation_ticket);
+            let requested_key = containment_key(&broker_containment_id, generation)?;
             if let Some(existing) = state.operation(&operation_key) {
                 let mut existing = existing.lock().expect("operation lock poisoned");
                 if existing.key != requested_key
@@ -1047,15 +1100,6 @@ fn serve_one(
                         send_response(stream, &response, &[])
                     }
                 };
-            }
-            // Exact durable state is authoritative. GC deliberately publishes
-            // the Bloom filter before unlinking exact rows, so a crash may
-            // leave both representations behind.
-            if state.tombstones.lock().expect("replay-state lock poisoned").contains(&session_id, &operation_id) {
-                return send_response(stream, &Response::Error {
-                    version: PROTOCOL_VERSION,
-                    code: "operation_identity_retired".into(),
-                }, &[]);
             }
             let locator_bound = state.operation_keys.lock().expect("operation-key lock poisoned")
                 .get(&requested_key).is_some_and(|identity| identity != &operation_key);
@@ -1114,9 +1158,11 @@ fn serve_one(
                 keys.insert(requested_key.clone(), operation_key.clone());
                 operations.insert(operation_key.clone(), operation.clone());
             }
+            state.authority.lock().expect("authority-ledger lock poisoned")
+                .ticket_owners.remove(&operation_ticket);
             let spawned = spawn_atomic(
                 config,
-                &containment_id,
+                &broker_containment_id,
                 generation,
                 &program,
                 &args,
@@ -1188,6 +1234,7 @@ fn serve_one(
                         state.operation_keys.lock().expect("operation-key lock poisoned").remove(&requested_key);
                     }
                     drop(operations);
+                    retire_ticket_without_operation(config, state, operation_ticket)?;
                     send_response(&stream, &Response::Error {
                         version: PROTOCOL_VERSION,
                         code: broker_error_code(&error).into(),
@@ -1195,9 +1242,12 @@ fn serve_one(
                 }
             }
         }
-        Request::CommitSpawn { version, session_id, operation_id }
+        Request::CommitSpawn { version, operation_ticket, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
             let identity = (session_id.clone(), operation_id.clone());
+            if !state.authority.lock().expect("authority-ledger lock poisoned").verify(operation_ticket, &identity) {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_ticket_invalid_or_retired".into() }, &[]);
+            }
             let operation = state.operation(&identity)
                     .ok_or_else(|| invalid("unknown spawn operation"))?;
             let (key, generation, digest, decision, mut spawned) = {
@@ -1316,13 +1366,16 @@ fn serve_one(
             }
             send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key }, &[])
         }
-        Request::CancelOperation { version, session_id, operation_id }
+        Request::CancelOperation { version, operation_ticket, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
             let identity = (session_id.clone(), operation_id.clone());
+            if !state.authority.lock().expect("authority-ledger lock poisoned").verify(operation_ticket, &identity) {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_ticket_invalid_or_retired".into() }, &[]);
+            }
             let Some(operation) = state.operation(&identity) else {
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_not_found".into() }, &[]);
             };
-            let (key, generation, digest, mut prepared) = {
+            let (key, generation, digest, pending, terminal, mut prepared) = {
                 let mut operation = operation.lock().expect("operation lock poisoned");
                 if matches!(operation.status, OperationStatus::Cancelled) {
                     drop(operation);
@@ -1337,21 +1390,30 @@ fn serve_one(
                     drop(operation);
                     return send_response(stream, &response, &[]);
                 }
+                let crossed_release = matches!(operation.status,
+                    OperationStatus::CommitDecided | OperationStatus::Released | OperationStatus::Committed
+                        | OperationStatus::DisconnectCleanupRequired);
+                let pending = if crossed_release { OperationStatus::DisconnectCleanupRequired }
+                    else { OperationStatus::CleanupRequired };
+                let terminal = if crossed_release { OperationStatus::DisconnectAborted }
+                    else { OperationStatus::Cancelled };
                 let values = (
                     operation.key.clone(),
                     operation.generation,
                     operation.request_digest.clone(),
+                    pending,
+                    terminal,
                     operation.prepared.take(),
                 );
                 // Cancellation authority follows the durable operation ID,
                 // not the lifetime of the peer that prepared it. The
                 // per-operation lock linearizes replacement cancel vs commit.
-                operation.status = OperationStatus::CleanupRequired;
+                operation.status = pending;
                 operation.owner_connection = Some(connection_id);
                 operation.cleanup_in_progress = true;
                 values
             };
-            if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &key, generation, &digest) {
+            if let Err(error) = persist_operation(config, &session_id, &operation_id, pending, &key, generation, &digest) {
                 // Ownership is deliberately retained. The old durable state
                 // remains authoritative and a retry can make progress.
                 operation.lock().expect("operation lock poisoned").prepared = prepared.take();
@@ -1372,8 +1434,8 @@ fn serve_one(
                     return Err(error);
                 }
             };
-            if let Err(error) = persist_pending_exit_for_key(config, state, &key, OperationStatus::CleanupRequired, cleanup_exit)
-                .and_then(|()| persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled))
+            if let Err(error) = persist_pending_exit_for_key(config, state, &key, pending, cleanup_exit)
+                .and_then(|()| persist_terminal_for_key(config, state, &key, terminal))
             {
                 operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
                 return Err(error);
@@ -1382,11 +1444,20 @@ fn serve_one(
             state.exit_statuses.lock().expect("exit-state lock poisoned").insert(key.clone(), cleanup_exit);
             state.remember_empty(key.clone());
             operation.lock().expect("operation lock poisoned").cleanup_in_progress = false;
-            send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
+            if matches!(terminal, OperationStatus::Cancelled) {
+                send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
+            } else {
+                send_response(stream, &Response::Operation { version: PROTOCOL_VERSION,
+                    state: OperationStatus::DisconnectAborted, key: Some(key) }, &[])
+            }
         }
-        Request::OperationStatus { version, session_id, operation_id }
+        Request::OperationStatus { version, operation_ticket, session_id, operation_id }
             if version == PROTOCOL_VERSION => {
-            let operation = state.operation(&(session_id, operation_id));
+            let identity = (session_id, operation_id);
+            if !state.authority.lock().expect("authority-ledger lock poisoned").verify(operation_ticket, &identity) {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_ticket_invalid_or_retired".into() }, &[]);
+            }
+            let operation = state.operation(&identity);
             match operation {
                 Some(operation) => {
                     let operation = operation.lock().expect("operation lock poisoned");
@@ -1493,6 +1564,29 @@ fn serve_one(
             &[],
         ),
     }
+}
+
+fn retire_ticket_without_operation(
+    config: &LinuxBrokerServerConfig,
+    state: &BrokerState,
+    ticket: u64,
+) -> std::io::Result<()> {
+    let operation_identities = state.operations.lock().expect("operation-map lock poisoned")
+        .keys().cloned().collect::<BTreeSet<_>>();
+    let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+    let before = authority.clone();
+    authority.ticket_owners.remove(&ticket);
+    authority.completed.insert(ticket);
+    loop {
+        let next = authority.retired_through + 1;
+        if !authority.completed.remove(&next) { break; }
+        authority.retired_through = next;
+        if let Some(identity) = authority.issued.remove(&next) {
+            if operation_identities.contains(&identity) { authority.retired_unlinks.insert(identity); }
+        }
+    }
+    if let Err(error) = authority.persist(config) { *authority = before; return Err(error); }
+    Ok(())
 }
 
 struct Spawned {
@@ -1761,6 +1855,13 @@ fn containment_key(containment_id: &str, generation: u64) -> std::io::Result<Str
         return Err(invalid("invalid generation"));
     }
     Ok(format!("fc-{}-g{}", id.simple(), generation))
+}
+
+fn ticket_containment_id(operation_ticket: u64) -> String {
+    const BROKER_LOCATOR_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(
+        0x73e0_0999_4cf7_4b65_916e_bdd5c20a50b6,
+    );
+    uuid::Uuid::new_v5(&BROKER_LOCATOR_NAMESPACE, &operation_ticket.to_be_bytes()).to_string()
 }
 
 unsafe fn child_exec(
@@ -2068,6 +2169,31 @@ fn cleanup_connection_children(
     state: &Arc<BrokerState>,
     connection_id: u64,
 ) {
+    // Tickets which never reached Prepare have no kernel resource or exact
+    // operation row. Retire them on owner disconnect so a lost Issue response
+    // cannot consume durable broker capacity forever.
+    {
+        let operation_identities = state.operations.lock().expect("operation-map lock poisoned")
+            .keys().cloned().collect::<BTreeSet<_>>();
+        let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+        let authority_before = authority.clone();
+        let abandoned = authority.ticket_owners.iter()
+            .filter_map(|(ticket, owner)| (*owner == connection_id).then_some(*ticket))
+            .collect::<Vec<_>>();
+        for ticket in abandoned {
+            authority.ticket_owners.remove(&ticket);
+            authority.completed.insert(ticket);
+        }
+        loop {
+            let next = authority.retired_through + 1;
+            if !authority.completed.remove(&next) { break; }
+            authority.retired_through = next;
+            if let Some(identity) = authority.issued.remove(&next) {
+                if operation_identities.contains(&identity) { authority.retired_unlinks.insert(identity); }
+            }
+        }
+        if authority.persist(config).is_err() { *authority = authority_before; }
+    }
     let operations = state.operations.lock().expect("operation-map lock poisoned")
         .iter().map(|(identity, operation)| (identity.clone(), operation.clone())).collect::<Vec<_>>();
     for ((session_id, operation_id), operation) in operations {
@@ -2810,7 +2936,7 @@ fn recover_operation_records(
     let mut locator_bindings = BTreeMap::<String, (String, String, String)>::new();
     for entry in fs::read_dir(&config.state_root)? {
         let entry = entry?;
-        if replay_segment_sequence(entry.file_name().as_bytes()).is_some() {
+        if entry.file_name().as_bytes() == AUTHORITY_LEDGER_NAME.as_bytes() {
             continue;
         }
         if is_owned_state_temporary(&entry)? {
@@ -2904,11 +3030,9 @@ fn is_owned_state_temporary(entry: &fs::DirEntry) -> std::io::Result<bool> {
     if !owned_state_temporary_name(name.as_bytes()) {
         return Ok(false);
     }
-    let max_len = if name.as_bytes().starts_with(b".replay-identities-") {
-        (MAX_FRAME * 4) as u64
-    } else {
-        MAX_FRAME as u64
-    };
+    let max_len = if name.as_bytes().starts_with(b".authority-ledger-") {
+        MAX_AUTHORITY_LEDGER_BYTES
+    } else { MAX_FRAME as u64 };
     let metadata = entry.metadata()?;
     if !entry.file_type()?.is_file()
         || metadata.uid() != 0
@@ -2924,7 +3048,7 @@ fn is_owned_state_temporary(entry: &fs::DirEntry) -> std::io::Result<bool> {
 }
 
 fn owned_state_temporary_name(bytes: &[u8]) -> bool {
-    [b".operation-".as_slice(), b".replay-identities-".as_slice()]
+    [b".operation-".as_slice(), b".authority-ledger-".as_slice()]
         .into_iter()
         .find_map(|prefix| bytes.strip_prefix(prefix).and_then(|value| value.strip_suffix(b".tmp")))
         .and_then(|uuid_bytes| std::str::from_utf8(uuid_bytes).ok())
@@ -2934,42 +3058,125 @@ fn owned_state_temporary_name(bytes: &[u8]) -> bool {
 fn gc_terminal_operations(
     config: &LinuxBrokerServerConfig,
     operations: &mut BTreeMap<(String, String), BrokerOperation>,
-    tombstones: &mut ReplayIdentityStore,
+    authority: &mut AuthorityLedger,
 ) -> std::io::Result<()> {
     if operations.len() < MAX_LIVE_OPERATION_RECORDS {
         return Ok(());
     }
     let target = MAX_LIVE_OPERATION_RECORDS * 3 / 4;
+    let retire_before = authority.next_ticket.saturating_sub(TERMINAL_REPLAY_WINDOW);
     let retired: Vec<_> = operations.iter()
-        .filter(|(_, operation)| matches!(operation.status,
-            OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited))
+        .filter(|(identity, operation)| matches!(operation.status,
+            OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited)
+            && authority.issued.iter().any(|(ticket, issued)| *ticket <= retire_before && issued == *identity))
         .take(operations.len().saturating_sub(target))
         .map(|(identity, _)| identity.clone())
         .collect();
     if retired.is_empty() {
         return Ok(());
     }
-    // Exact identities grow in bounded immutable segments. Segment retirement
-    // requires an explicit durable client-watermark protocol; reboot is never
-    // treated as permission to forget idempotency authority.
-    let newly_retired = retired.iter()
-        .filter(|identity| !tombstones.identities.contains(*identity))
-        .cloned()
-        .collect::<Vec<_>>();
-    tombstones.append(config, &newly_retired)?;
-    for identity in retired {
+    let authority_before = authority.clone();
+    for identity in &retired {
+        let ticket = authority.issued.iter().find_map(|(ticket, issued)| (issued == identity).then_some(*ticket))
+            .ok_or_else(|| invalid("terminal operation has no durable ticket"))?;
+        authority.completed.insert(ticket);
+    }
+    let mut retired_identities = Vec::new();
+    loop {
+        let next = authority.retired_through + 1;
+        if !authority.completed.remove(&next) { break; }
+        authority.retired_through = next;
+        if let Some(identity) = authority.issued.remove(&next) {
+            authority.retired_unlinks.insert(identity.clone());
+            retired_identities.push(identity);
+        }
+    }
+    if let Err(error) = authority.persist(config) { *authority = authority_before; return Err(error); }
+    for identity in &retired_identities {
         let path = operation_record_path(config, &identity.0, &identity.1)?;
-        fs::remove_file(path)?;
-        operations.remove(&identity);
+        match fs::remove_file(path) { Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}, Err(error) => return Err(error) }
+        operations.remove(identity);
     }
     File::open(&config.state_root)?.sync_all()?;
+    for identity in &retired_identities { authority.retired_unlinks.remove(identity); }
+    authority.persist(config)?;
     Ok(())
+}
+
+fn reconcile_authority_ledger(
+    config: &LinuxBrokerServerConfig,
+    authority: &mut AuthorityLedger,
+    operations: &mut BTreeMap<(String, String), BrokerOperation>,
+) -> std::io::Result<()> {
+    for (ticket, identity) in &authority.issued {
+        if !operations.contains_key(identity) { authority.completed.insert(*ticket); }
+    }
+    let stale = operations.keys()
+        .filter(|identity| !authority.issued.values().any(|candidate| candidate == *identity))
+        .cloned().collect::<Vec<_>>();
+    for identity in &stale {
+        let operation = operations.get(identity).expect("stale operation exists");
+        if !matches!(operation.status,
+            OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited) {
+            return Err(invalid("live operation has no durable broker ticket"));
+        }
+    }
+    loop {
+        let next = authority.retired_through + 1;
+        if !authority.completed.remove(&next) { break; }
+        authority.retired_through = next;
+        if let Some(identity) = authority.issued.remove(&next) { authority.retired_unlinks.insert(identity); }
+    }
+    authority.persist(config)?;
+    for identity in authority.retired_unlinks.clone() {
+        match fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?) {
+            Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}, Err(error) => return Err(error),
+        }
+        operations.remove(&identity);
+        authority.retired_unlinks.remove(&identity);
+    }
+    authority.persist(config)?;
+    for identity in stale {
+        match fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?) {
+            Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}, Err(error) => return Err(error),
+        }
+        operations.remove(&identity);
+    }
+    File::open(&config.state_root)?.sync_all()
 }
 
 fn gc_runtime_terminal_operations(
     config: &LinuxBrokerServerConfig,
     state: &BrokerState,
 ) -> std::io::Result<()> {
+    let _gc = state.gc.lock().expect("broker-gc lock poisoned");
+    let pending_unlinks = state.authority.lock().expect("authority-ledger lock poisoned")
+        .retired_unlinks.iter().cloned().collect::<Vec<_>>();
+    if !pending_unlinks.is_empty() {
+        for identity in &pending_unlinks {
+            match fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?) {
+                Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}, Err(error) => return Err(error),
+            }
+        }
+        File::open(&config.state_root)?.sync_all()?;
+        let removed = {
+            let mut operations = state.operations.lock().expect("operation-map lock poisoned");
+            pending_unlinks.iter().filter_map(|identity| operations.remove(identity)).collect::<Vec<_>>()
+        };
+        let removed_keys = removed.into_iter().map(|operation|
+            operation.lock().expect("operation lock poisoned").key.clone()).collect::<Vec<_>>();
+        let mut keys = state.operation_keys.lock().expect("operation-key lock poisoned");
+        for key in removed_keys { keys.remove(&key); }
+        drop(keys);
+        let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+        for identity in pending_unlinks { authority.retired_unlinks.remove(&identity); }
+        authority.persist(config)?;
+    }
+    let (retire_before, ticket_by_identity) = {
+        let authority = state.authority.lock().expect("authority-ledger lock poisoned");
+        (authority.next_ticket.saturating_sub(TERMINAL_REPLAY_WINDOW), authority.issued.iter()
+            .map(|(ticket, identity)| (identity.clone(), *ticket)).collect::<BTreeMap<_, _>>())
+    };
     let retired = {
         let operations = state.operations.lock().expect("operation-map lock poisoned");
         if operations.len() < MAX_LIVE_OPERATION_RECORDS {
@@ -2978,31 +3185,51 @@ fn gc_runtime_terminal_operations(
         let target = MAX_LIVE_OPERATION_RECORDS * 3 / 4;
         operations.iter().filter_map(|(identity, operation)| {
             let operation = operation.try_lock().ok()?;
-            matches!(operation.status,
+            (matches!(operation.status,
                 OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited)
+                && ticket_by_identity.get(identity).is_some_and(|ticket| *ticket <= retire_before))
                 .then(|| (identity.clone(), operation.key.clone()))
         }).take(operations.len().saturating_sub(target)).collect::<Vec<_>>()
     };
     if retired.is_empty() {
         return Ok(());
     }
-    {
-        let mut tombstones = state.tombstones.lock().expect("replay-state lock poisoned");
-        let newly_retired = retired.iter()
-            .map(|(identity, _)| identity)
-            .filter(|identity| !tombstones.identities.contains(*identity))
-            .cloned().collect::<Vec<_>>();
-        tombstones.append(config, &newly_retired)?;
-    }
+    let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+    let authority_before = authority.clone();
     for (identity, _) in &retired {
-        fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?)?;
+        let ticket = authority.issued.iter().find_map(|(ticket, issued)| (issued == identity).then_some(*ticket))
+            .ok_or_else(|| invalid("terminal operation has no durable ticket"))?;
+        authority.completed.insert(ticket);
+    }
+    let mut retired_identities = Vec::new();
+    loop {
+        let next = authority.retired_through + 1;
+        if !authority.completed.remove(&next) { break; }
+        authority.retired_through = next;
+        if let Some(identity) = authority.issued.remove(&next) {
+            authority.retired_unlinks.insert(identity.clone());
+            retired_identities.push(identity);
+        }
+    }
+    if let Err(error) = authority.persist(config) { *authority = authority_before; return Err(error); }
+    drop(authority);
+    for identity in &retired_identities {
+        match fs::remove_file(operation_record_path(config, &identity.0, &identity.1)?) {
+            Ok(()) => {}, Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}, Err(error) => return Err(error),
+        }
     }
     File::open(&config.state_root)?.sync_all()?;
+    {
+        let mut authority = state.authority.lock().expect("authority-ledger lock poisoned");
+        for identity in &retired_identities { authority.retired_unlinks.remove(identity); }
+        authority.persist(config)?;
+    }
     let mut operations = state.operations.lock().expect("operation-map lock poisoned");
     let mut keys = state.operation_keys.lock().expect("operation-key lock poisoned");
-    for (identity, key) in retired {
+    for identity in retired_identities {
+        let Some((_, key)) = retired.iter().find(|(candidate, _)| candidate == &identity) else { continue };
         operations.remove(&identity);
-        keys.remove(&key);
+        keys.remove(key);
     }
     Ok(())
 }
@@ -3510,33 +3737,26 @@ mod tests {
     fn owned_temporary_names_are_exact_and_unambiguous() {
         let id = uuid::Uuid::nil();
         assert!(owned_state_temporary_name(format!(".operation-{id}.tmp").as_bytes()));
-        assert!(owned_state_temporary_name(format!(".replay-identities-{id}.tmp").as_bytes()));
+        assert!(owned_state_temporary_name(format!(".authority-ledger-{id}.tmp").as_bytes()));
         assert!(!owned_state_temporary_name(format!("operation-{id}.tmp").as_bytes()));
         assert!(!owned_state_temporary_name(b".operation-not-a-uuid.tmp"));
         assert!(!owned_state_temporary_name(format!(".operation-{id}.tmp.extra").as_bytes()));
     }
 
     #[test]
-    fn replay_identity_store_is_exact() {
-        let mut tombstones = ReplayIdentityStore {
-            identities: BTreeSet::new(),
-            next_sequence: 0,
+    fn authority_ledger_binds_exact_tickets_and_identities() {
+        let mut authority = AuthorityLedger {
+            next_ticket: 2,
+            retired_through: 0,
+            issued: BTreeMap::from([(1, ("session".into(), "operation".into()))]),
+            completed: BTreeSet::new(),
+            retired_unlinks: BTreeSet::new(),
+            ticket_owners: BTreeMap::new(),
         };
-        assert!(!tombstones.contains("session", "operation"));
-        tombstones.identities.insert(("session".into(), "operation".into()));
-        assert!(tombstones.contains("session", "operation"));
-        assert!(!tombstones.contains("session", "different-operation"));
-    }
-
-    #[test]
-    fn replay_identity_segment_checksum_binds_sequence_and_contents() {
-        let identities = [(uuid::Uuid::nil().to_string(), "operation".to_owned())];
-        assert_ne!(
-            replay_segment_checksum(1, &identities).unwrap(),
-            replay_segment_checksum(2, &identities).unwrap()
-        );
-        assert_eq!(replay_segment_sequence(b".replay-identities-00000000000000000042.json"), Some(42));
-        assert_eq!(replay_segment_sequence(b".replay-identities-42.json"), None);
+        assert!(authority.verify(1, &("session".into(), "operation".into())));
+        assert!(!authority.verify(1, &("session".into(), "other".into())));
+        authority.retired_through = 1;
+        assert!(!authority.verify(1, &("session".into(), "operation".into())));
     }
 
     #[test]

@@ -5402,6 +5402,7 @@ async fn fire_recursive_child_abnormal_stop(
     cwd: &std::path::Path,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    cancel: &tokio_util::sync::CancellationToken,
     end_reason: &'static str,
 ) {
     let Some(lifecycle) = lifecycle.filter(|lifecycle| lifecycle.started() && !lifecycle.emitted()) else {
@@ -5411,7 +5412,7 @@ async fn fire_recursive_child_abnormal_stop(
     let hook_runner = process_containment.map_or_else(
         crate::engine::agent::hooks::TokioCommandRunner::new,
         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
-    );
+    ).with_cancellation(cancel.clone());
     let mut discarded = crate::engine::agent::hooks::StopGateState::default();
     let _ = crate::engine::agent::hooks::run_stop_hooks(
         &hook_runner,
@@ -5471,7 +5472,7 @@ pub(crate) async fn run_noninteractive_resumable(
         let hook_runner = process_containment.clone().map_or_else(
             crate::engine::agent::hooks::TokioCommandRunner::new,
             crate::engine::agent::hooks::TokioCommandRunner::with_containment,
-        );
+        ).with_cancellation(cancel.clone());
         crate::engine::agent::hooks::run_observe_hooks(
             &hook_runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
@@ -5633,7 +5634,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     let hook_runner = process_containment.clone().map_or_else(
                         crate::engine::agent::hooks::TokioCommandRunner::new,
                         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
-                    );
+                    ).with_cancellation(cancel.clone());
                     crate::engine::agent::hooks::run_observe_hooks(
                         &hook_runner,
                         &crate::engine::agent::hooks::DefaultProcessEnv,
@@ -5661,6 +5662,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     &cwd,
                     &config,
                     process_containment.clone(),
+                    &cancel,
                     "failed",
                 )
                 .await;
@@ -5717,7 +5719,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 if cancel.is_cancelled() {
                     fire_recursive_child_abnormal_stop(
                         child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
-                        process_containment.clone(), "aborted",
+                        process_containment.clone(), &cancel, "aborted",
                     ).await;
                     drop(child_tx);
                     let _ = forwarder.await;
@@ -5777,7 +5779,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 if cancel.is_cancelled() {
                     fire_recursive_child_abnormal_stop(
                         child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
-                        process_containment.clone(), "aborted",
+                        process_containment.clone(), &cancel, "aborted",
                     ).await;
                     drop(child_tx);
                     let _ = forwarder.await;
@@ -6185,7 +6187,7 @@ pub(crate) async fn run_noninteractive_resumable(
                 // subagent — §22 anti-runaway).
                 fire_recursive_child_abnormal_stop(
                     child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
-                    process_containment.clone(), "failed",
+                    process_containment.clone(), &cancel, "failed",
                 ).await;
                 drop(child_tx);
                 let _ = forwarder.await;
@@ -6203,7 +6205,7 @@ pub(crate) async fn run_noninteractive_resumable(
     }
     fire_recursive_child_abnormal_stop(
         child_lifecycle.as_ref(), &agent, &session, &cwd, &config,
-        process_containment, "failed",
+        process_containment, &cancel, "failed",
     ).await;
     drop(child_tx);
     let _ = forwarder.await;

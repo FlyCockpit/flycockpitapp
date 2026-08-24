@@ -31,7 +31,7 @@ fn hook_runner(env: &DispatchEnv<'_>) -> super::hooks::TokioCommandRunner {
     env.ctx.config.process_containment().map_or_else(
         super::hooks::TokioCommandRunner::new,
         super::hooks::TokioCommandRunner::with_containment,
-    )
+    ).with_cancellation(env.ctx.cancel.clone())
 }
 
 async fn fire_monty_permission_denied_hook(
@@ -43,7 +43,7 @@ async fn fire_monty_permission_denied_hook(
     let runner = ctx.config.process_containment().map_or_else(
         super::hooks::TokioCommandRunner::new,
         super::hooks::TokioCommandRunner::with_containment,
-    );
+    ).with_cancellation(ctx.cancel.clone());
     super::hooks::run_observe_hooks(
         &runner,
         &super::hooks::DefaultProcessEnv,

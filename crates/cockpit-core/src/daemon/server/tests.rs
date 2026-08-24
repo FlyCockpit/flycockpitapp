@@ -825,6 +825,7 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn list_packages_rejects_non_owner_principal() {
     // AC4: owner-remoted reads reject a non-owner principal.
     let ctx = test_ctx();
@@ -841,30 +842,18 @@ async fn list_packages_rejects_non_owner_principal() {
 #[tokio::test]
 async fn list_packages_response_carries_no_planted_secret() {
     // AC3: a `list_*` response contains no secret bytes. Plant a unique
-    // credential secret in the daemon vault; the package list must never echo
+    // local named secret in the daemon vault; the package list must never echo
     // it. Precondition-assert the secret is really stored first (L7/L8).
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
-    let mut credential = flycockpit_credential();
-    credential.instance_token = "fci_planted_list_packages_secret".into();
-    let token = credential.instance_token.clone();
-    handle_request(
-        Request::StoreFlycockpitCredential {
-            credential: credential.clone(),
-            force: true,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .unwrap();
+    let token = "sk-planted-list-packages-local-secret".to_owned();
+    let mut store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .expect("local credential store");
+    store.set_named_secret("list-packages-redaction-probe", token.clone());
     // Precondition: the secret really lives in the daemon vault.
     assert_eq!(
-        ctx.load_flycockpit_credential()
-            .unwrap()
-            .unwrap()
-            .instance_token,
-        token
+        store.named_secret("list-packages-redaction-probe"),
+        Some(token.clone())
     );
     crate::packages::add_local(&ctx.db, "fixture-pkg", std::env::temp_dir().as_path())
         .await

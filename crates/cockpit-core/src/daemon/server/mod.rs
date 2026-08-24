@@ -5394,8 +5394,10 @@ mod host_capabilities_tests;
 pub(crate) mod inventory;
 #[cfg(test)]
 mod leaks_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod secret_store_boot_tests;
+#[cfg(test)]
+mod secret_store_local_tests;
 mod sessions;
 #[cfg(test)]
 mod tests;

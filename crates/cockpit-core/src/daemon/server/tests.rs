@@ -15085,7 +15085,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("prune"),
         authz_session_writer("compact"),
         authz_session_writer("pin"),
+        #[cfg(feature = "remote")]
         authz_owner_only("store_flycockpit_credential"),
+        #[cfg(feature = "remote")]
         authz_owner_only("clear_flycockpit_credential"),
         // v10 owner-remoted CLI-surface RPCs.
         authz_owner_only("list_packages"),
@@ -15093,7 +15095,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("import_package"),
         authz_owner_only("prune_packages"),
         authz_owner_only("import_kcl_packages"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_connector_state"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_org_sync_status"),
         authz_owner_only("list_failed_tool_calls"),
         authz_owner_only("get_session_compactions"),
@@ -15117,6 +15121,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_named_secret"),
         authz_owner_only("put_provider_credential"),
         authz_owner_only("delete_provider_credential"),
+        #[cfg(feature = "remote")]
         authz_owner_only("get_flycockpit_account"),
         authz_owner_only("begin_provider_oauth"),
         authz_owner_only("complete_provider_oauth"),
@@ -15154,8 +15159,11 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("image_workflow_upload"),
         authz_owner_only("image_workflow_bind"),
         authz_owner_only("image_workflow_delete"),
+        #[cfg(feature = "remote")]
         authz_owner_only("set_flycockpit_connector_enabled"),
+        #[cfg(feature = "remote")]
         authz_owner_only("sync_flycockpit_org_policy"),
+        #[cfg(feature = "remote")]
         authz_owner_only("enroll_flycockpit_org_sync"),
         authz_owner_only("refresh_host_capabilities"),
         authz_owner_only("migrate_kek_placement"),
@@ -15603,6 +15611,58 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     }
 }
 
+// Keep an owner-principal traversal in the default local profile. The full
+// remote role matrix below is feature-gated because its principals do not
+// exist in a local build, but every default controlled command must still pass
+// through the same socket transport and central authorization path. The
+// readonly/mutating matrix tests above retain the corresponding malformed and
+// invalid-state traversal for every dispatchable command.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
+    assert_dispatch_matrix_coverage_complete();
+    for case in authz_dispatch_cases() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "local owner authz matrix"}),
+            )
+            .await
+            .unwrap();
+
+        let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
+        let prelude = if needs_attached {
+            vec![attach_existing_request(session_id, tmp.path())]
+        } else {
+            Vec::new()
+        };
+        let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
+        let result = dispatch_authz_request_after(
+            &ctx,
+            ClientPrincipal::owner(),
+            prelude,
+            None,
+            worker_rx_to_drop_after_prelude,
+            authz_matrix_request(case.kind, session_id, tmp.path()),
+        )
+        .await;
+        let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
+            panic!("{} must authorize the local owner", case.kind);
+        };
+        assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
+    }
+}
+
 #[cfg(all(unix, feature = "remote"))]
 struct AuthzSocketScenario {
     ctx: Arc<DaemonContext>,
@@ -15646,7 +15706,7 @@ fn assert_authz_matrix_result(
     }
 }
 
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(unix)]
 fn assert_authz_allowed_outcome(
     kind: &str,
     level: AuthzLevel,
@@ -21712,7 +21772,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
             (*ordering == principal::RequestOrdering::Concurrent).then_some(*kind)
         })
         .collect();
-    let expected = BTreeSet::from([
+    let mut expected = BTreeSet::from([
         "agent_installation_inspect",
         "agent_installation_list",
         "daemon_status",
@@ -21758,14 +21818,17 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "subagent_transcript",
         "terminal_ingress_status",
         "list_packages",
-        "get_connector_state",
-        "get_org_sync_status",
         "list_failed_tool_calls",
         "get_session_compactions",
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
     ]);
+    #[cfg(feature = "remote")]
+    {
+        expected.insert("get_connector_state");
+        expected.insert("get_org_sync_status");
+    }
     assert_eq!(actual, expected);
     for serialized in [
         "attach",

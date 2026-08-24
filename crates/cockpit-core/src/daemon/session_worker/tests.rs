@@ -2958,7 +2958,12 @@ async fn roster_trim_removed_default_primary_notice_is_one_time() {
 async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    db.upsert_assistant("helper-bot", "/tmp/helper-bot", "{}", "hash")
+    db.upsert_assistant(
+        "helper-bot",
+        "/tmp/helper-bot",
+        "{}",
+        crate::assistants::VALID_ASSISTANT_CONTENT_HASH_FIXTURE,
+    )
         .await
         .unwrap();
     let row = db

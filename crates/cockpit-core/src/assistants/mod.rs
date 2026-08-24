@@ -21,6 +21,9 @@ use crate::wizard::{
 };
 
 pub const ASSISTANT_WIZARD_ID: &str = "assistant";
+#[cfg(test)]
+pub(crate) const VALID_ASSISTANT_CONTENT_HASH_FIXTURE: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 pub mod identity;
 pub mod self_improvement;

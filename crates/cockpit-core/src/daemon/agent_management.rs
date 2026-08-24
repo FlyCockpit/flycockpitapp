@@ -23,7 +23,7 @@ struct EditorLeaseState {
     expires_at: Instant,
 }
 
-const EDITOR_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+const EDITOR_LEASE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const MAX_EDITOR_LEASES: usize = 64;
 
 fn editor_leases() -> &'static Mutex<HashMap<Uuid, EditorLeaseState>> {
@@ -36,9 +36,14 @@ pub async fn inventory(
     project_root: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
-    tokio::task::spawn_blocking(move || inventory_sync(&root))
-        .await
-        .map_err(join_error)?
+    tokio::task::spawn_blocking(move || {
+        let _guard =
+            cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
+                .map_err(internal)?;
+        inventory_sync(&root)
+    })
+    .await
+    .map_err(join_error)?
 }
 
 pub async fn edit_snapshot(
@@ -48,6 +53,10 @@ pub async fn edit_snapshot(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     tokio::task::spawn_blocking(move || {
+        let _guard =
+            cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
+                .map_err(internal)?;
+        recover_reset_all(&root)?;
         snapshot_sync(&root, &name).map(Response::AgentEditSnapshot)
     })
     .await
@@ -102,6 +111,8 @@ pub async fn begin_editor_lease(
     drop(leases);
     Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
         lease_id: lease_id.to_string(),
+        expires_at_unix_ms: chrono::Utc::now().timestamp_millis()
+            + i64::try_from(EDITOR_LEASE_TTL.as_millis()).unwrap_or(i64::MAX),
         snapshot,
     }))
 }
@@ -282,6 +293,7 @@ fn mutate_sync(
     let lock_target = root.join(".cockpit/config.json");
     let _guard =
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
+    recover_reset_all(root)?;
     let generation_before = crate::daemon::server::inventory::current_config_generation();
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
@@ -608,12 +620,32 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
     Ok(())
 }
 
+pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), ErrorPayload> {
+    let sessions = ctx
+        .db
+        .list_sessions(false, 100_000)
+        .await
+        .map_err(internal)?;
+    let mut roots = std::collections::BTreeSet::new();
+    roots.extend(sessions.into_iter().map(|session| session.project_root));
+    tokio::task::spawn_blocking(move || {
+        for root in roots {
+            let root = PathBuf::from(root);
+            let lock_target = root.join(".cockpit/config.json");
+            let _guard = cockpit_config::config::hold_config_mutation_lock(&lock_target)
+                .map_err(internal)?;
+            recover_reset_all(&root)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(join_error)?
+}
+
 fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     recover_reset_all(root)?;
     let operation_id = Uuid::new_v4().to_string();
-    let trash = root
-        .join(".cockpit/.agent-reset-trash")
-        .join(&operation_id);
+    let trash = root.join(".cockpit/.agent-reset-trash").join(&operation_id);
     let mut entries = Vec::new();
     for name in crate::agents::BUILTIN_AGENT_NAMES {
         let target = project_agent_path(root, name)?;

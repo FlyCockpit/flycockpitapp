@@ -3570,6 +3570,11 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
         if let Err(error) = crate::assistants::recover_definition_journals(&ctx.db).await {
             tracing::error!(%error, "startup assistant-definition journal recovery failed; assistant saves will retry it");
         }
+        if let Err(error) =
+            crate::daemon::agent_management::recover_known_workspace_resets(&ctx).await
+        {
+            tracing::error!(message=%error.message, "startup agent reset journal recovery failed; agent requests will retry it");
+        }
         match crate::daemon::effective_default_recovery::recover_effective_default_journals(
             &ctx.db, &cwd, None,
         )

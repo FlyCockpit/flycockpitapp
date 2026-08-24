@@ -117,5 +117,6 @@ pub struct AgentMutationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditorLease {
     pub lease_id: String,
+    pub expires_at_unix_ms: i64,
     pub snapshot: AgentEditSnapshot,
 }

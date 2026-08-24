@@ -174,7 +174,7 @@ pub async fn create_assistant_with_installation_id(
     if spec.home_dir != canonical_home {
         bail!("assistant creation requires the daemon-owned canonical home");
     }
-    std::fs::create_dir_all(&spec.home_dir)
+    crate::private_fs::ensure_private_dir(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;

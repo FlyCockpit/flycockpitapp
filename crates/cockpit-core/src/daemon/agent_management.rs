@@ -20,6 +20,7 @@ struct EditorLeaseState {
     root: PathBuf,
     name: String,
     revision: String,
+    created_at: Instant,
     expires_at: Instant,
 }
 
@@ -102,8 +103,13 @@ pub async fn begin_editor_lease(
     let mut leases = editor_leases().lock().map_err(lock_poison)?;
     let now = Instant::now();
     leases.retain(|_, lease| lease.expires_at > now);
-    if leases.len() >= MAX_EDITOR_LEASES {
-        return Err(conflict("too many active agent editor leases"));
+    if leases.len() >= MAX_EDITOR_LEASES
+        && let Some(oldest) = leases
+            .iter()
+            .min_by_key(|(_, lease)| lease.created_at)
+            .map(|(id, _)| *id)
+    {
+        leases.remove(&oldest);
     }
     leases.insert(
         lease_id,
@@ -112,6 +118,7 @@ pub async fn begin_editor_lease(
             root,
             name,
             revision: expected_revision,
+            created_at: now,
             expires_at: now + EDITOR_LEASE_TTL,
         },
     );
@@ -133,37 +140,54 @@ pub async fn complete_editor_lease(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     let id = Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
+    // Claim by removal while holding the registry mutex. Save and cancel are
+    // therefore mutually exclusive and a duplicated completion cannot run a
+    // second filesystem mutation concurrently.
     let lease = {
         let mut leases = editor_leases().lock().map_err(lock_poison)?;
         let now = Instant::now();
         leases.retain(|_, lease| lease.expires_at > now);
         leases
-            .get(&id)
-            .cloned()
+            .remove(&id)
             .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?
     };
     if lease.root != root {
+        reinsert_editor_lease(id, lease)?;
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     if lease.principal_digest != principal_digest {
+        reinsert_editor_lease(id, lease)?;
         return Err(ErrorPayload {
             code: ErrorCode::PermissionDenied,
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
     let result = match markdown {
-        Some(markdown) => tokio::task::spawn_blocking(move || {
-            mutate_sync(
-                &root,
-                AgentMutation::SaveDefinition {
-                    name: lease.name,
-                    markdown,
-                },
-                Some(lease.revision),
-            )
-        })
-        .await
-        .map_err(join_error)??,
+        Some(markdown) => {
+            let retry = lease.clone();
+            match tokio::task::spawn_blocking(move || {
+                mutate_sync(
+                    &root,
+                    AgentMutation::SaveDefinition {
+                        name: lease.name,
+                        markdown,
+                    },
+                    Some(lease.revision),
+                )
+            })
+            .await
+            .map_err(join_error)
+            .and_then(|result| result)
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    // Validation, CAS and retryable I/O failures retain the
+                    // same token only when no newer lease reused the ID.
+                    reinsert_editor_lease(id, retry)?;
+                    return Err(error);
+                }
+            }
+        }
         None => Response::AgentMutated(AgentMutationResult {
             changed: false,
             affected: 0,
@@ -174,10 +198,16 @@ pub async fn complete_editor_lease(
     let Response::AgentMutated(result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
     };
-    // A validation/CAS/write error returns above and deliberately retains the
-    // lease for retry. Success and explicit cancellation consume it.
-    editor_leases().lock().map_err(lock_poison)?.remove(&id);
     Ok(Response::AgentEditorLeaseCompleted(result))
+}
+
+fn reinsert_editor_lease(id: Uuid, lease: EditorLeaseState) -> Result<(), ErrorPayload> {
+    if lease.expires_at <= Instant::now() {
+        return Ok(());
+    }
+    let mut leases = editor_leases().lock().map_err(lock_poison)?;
+    leases.entry(id).or_insert(lease);
+    Ok(())
 }
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -538,10 +568,23 @@ fn classify_source_layer(root: &Path, source: &Path, target: &Path) -> AgentSour
     if source == target {
         return AgentSourceLayer::Workspace;
     }
-    let configured = crate::agents::agent_search_dirs(root);
-    let ordinary_count = crate::config::dirs::discover_config_dirs(root).len();
-    let index = configured.iter().position(|dir| source.starts_with(dir));
-    if index.is_some_and(|index| index >= ordinary_count) {
+    // Flat definitions are owned by their exact parent directory. Prefix
+    // matching misclassified nested configured directories according to the
+    // first broader layer rather than the effective, most-specific owner.
+    let Some(owner) = source.parent() else {
+        return AgentSourceLayer::OtherConfigLayer;
+    };
+    let ordinary: std::collections::HashSet<PathBuf> =
+        crate::config::dirs::discover_config_dirs(root)
+            .into_iter()
+            .map(|dir| dir.path.join("agents"))
+            .collect();
+    if ordinary.contains(owner) {
+        AgentSourceLayer::OtherConfigLayer
+    } else if crate::agents::agent_search_dirs(root)
+        .into_iter()
+        .any(|dir| dir == owner)
+    {
         AgentSourceLayer::ConfiguredDirectory
     } else {
         AgentSourceLayer::OtherConfigLayer
@@ -668,8 +711,15 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                 let target_exists = nofollow_read(&target)?.is_some();
                 match (staged_exists, target_exists) {
                     (true, false) => std::fs::rename(&staged, &target).map_err(internal)?,
-                    (true, true) => return Err(conflict("agent reset rollback found both staged and authoritative files")),
-                    _ => {}
+                    // This entry was not staged yet, or an earlier recovery
+                    // pass already restored it.
+                    (false, true) => {}
+                    (true, true) => return Err(conflict(
+                        "agent reset rollback found both staged and authoritative files",
+                    )),
+                    (false, false) => return Err(conflict(
+                        "agent reset rollback found neither staged nor authoritative file",
+                    )),
                 }
             }
             if agents_dir.is_dir() { sync_dir(&agents_dir)?; }
@@ -678,8 +728,19 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
         ResetAllPhase::Committed => {
             for name in &journal.entries {
                 let staged = staged_agent_path(&trash, name)?;
-                if nofollow_read(&staged)?.is_some() {
-                    cockpit_config::config::remove_config_file_atomic(&staged).map_err(internal)?;
+                let target = project_agent_path(root, name)?;
+                let staged_exists = nofollow_read(&staged)?.is_some();
+                let target_exists = nofollow_read(&target)?.is_some();
+                match (staged_exists, target_exists) {
+                    (true, false) => cockpit_config::config::remove_config_file_atomic(&staged)
+                        .map_err(internal)?,
+                    // A previous committed recovery already deleted it.
+                    (false, false) => {}
+                    // Once committed, an authoritative target is unexpected;
+                    // never bless or delete it because it may be newer data.
+                    (_, true) => return Err(conflict(
+                        "committed agent reset found an unexpected authoritative file",
+                    )),
                 }
             }
             if trash.is_dir() { sync_dir(&trash)?; }

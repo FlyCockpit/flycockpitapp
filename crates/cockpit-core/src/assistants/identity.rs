@@ -73,18 +73,26 @@ pub fn seed_identity_files(home_dir: &Path) -> Result<()> {
 }
 
 fn seed_file(path: &Path, body: &str) -> Result<()> {
-    if path.exists() {
+    if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() {
         return Ok(());
     }
-    std::fs::write(path, body).with_context(|| format!("seeding {}", path.display()))
+    match crate::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
+        Ok(()) => Ok(()),
+        // Another creator may have won the exclusive publish. Accept only an
+        // audited no-follow re-open of the resulting private regular file.
+        Err(error)
+            if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() =>
+        {
+            tracing::debug!(path = %path.display(), %error, "identity seed already published");
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("seeding {}", path.display())),
+    }
 }
 
 pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(crate::assistants::sha256_hex(&bytes))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("hashing {}", path.display())),
-    }
+    Ok(crate::private_fs::read_private_file(path, "assistant identity")?
+        .map(|bytes| crate::assistants::sha256_hex(&bytes)))
 }
 
 pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
@@ -174,11 +182,8 @@ struct IdentityPiece {
 }
 
 fn load_piece(path: &Path, label: &'static str, max_tokens: usize) -> Result<IdentityPiece> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
-    };
+    let bytes = crate::private_fs::read_private_file(path, "assistant identity")?
+        .unwrap_or_default();
     let hash = if bytes.is_empty() {
         None
     } else {

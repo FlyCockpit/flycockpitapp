@@ -83,6 +83,45 @@ fn tui_db_surface_behavior_matrix() {
 }
 
 #[test]
+fn tui_agent_authority_is_daemon_owned() {
+    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
+    let goals = read("crates/cockpit-tui/src/tui/goal_settings_pane.rs");
+    let production = format!("{agents}\n{goals}");
+    for forbidden in [
+        "cockpit_core::agents::resolve(",
+        "cockpit_core::agents::list_all(",
+        "cockpit_core::agents::eject_builtin(",
+        "cockpit_core::agents::find_override(",
+        "cockpit_core::agents::reset_all_builtins(",
+        "std::fs::write(",
+        "std::fs::remove_file(",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "TUI retained mutation-capable agent authority: {forbidden}"
+        );
+    }
+    for rpc in [
+        "GetAgentInventory",
+        "GetAgentEditSnapshot",
+        "MutateAgent",
+        "BeginAgentEditorLease",
+        "CompleteAgentEditorLease",
+    ] {
+        assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
+    }
+}
+
+#[test]
+fn tui_settings_use_revisioned_typed_mutation() {
+    let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
+    assert!(settings.contains("GetExtendedConfigSnapshot"));
+    assert!(settings.contains("ApplyExtendedConfigPatch"));
+    assert!(!settings.contains("Request::SaveExtendedConfig"));
+    assert!(!settings.contains("base_hash = None"));
+}
+
+#[test]
 fn tui_db_boundary_gate_first_has_real_negative_alias_fixtures() {
     for fixture in ["direct_alias.rs", "core_alias.rs"] {
         let source = read(&format!("scripts/fixtures/tui-db-boundary/{fixture}"));

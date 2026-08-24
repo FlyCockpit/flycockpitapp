@@ -1662,6 +1662,33 @@ async fn record_hook_run(
 /// originating user turn)`.
 pub(crate) const STOP_HOOK_MAX_CONTINUATIONS: u8 = 8;
 
+/// `source` tag on the user-facing Notice emitted when the stop gate forcibly
+/// ends a turn (either cause). Lets a UI attribute the Notice to the stop gate.
+pub(crate) const STOP_HOOK_FORCED_END_SOURCE: &str = "stop_hook_forced_end";
+
+/// Why the stop gate forcibly ended a turn instead of continuing it. Both
+/// causes end the turn; the distinction is audit/notice-only (the caller
+/// ignores the payload — see [`StopHookOutcome::ForcedEnd`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedEndCause {
+    /// The per-frame/job continuation cap ([`STOP_HOOK_MAX_CONTINUATIONS`]) was
+    /// already reached, so this consultation force-ended without reconsulting.
+    ContinuationCap,
+    /// A stop hook returned `{"continue":false,"stopReason":"..."}`, explicitly
+    /// ending the turn.
+    HookRequested,
+}
+
+impl ForcedEndCause {
+    /// Stable camelCase token for the Notice `forcedEndCause` field.
+    const fn wire_tag(self) -> &'static str {
+        match self {
+            Self::ContinuationCap => "continuation_cap",
+            Self::HookRequested => "hook_requested",
+        }
+    }
+}
+
 /// Per-frame/job stop-gate latch tracking continuation count.
 #[derive(Debug, Clone, Default)]
 pub struct StopGateState {
@@ -1715,8 +1742,9 @@ pub enum StopHookOutcome {
         additional_context: Option<String>,
     },
     /// A stop hook produced `{"continue":false,"stopReason":"..."}` which wins
-    /// and ends the turn, or the continuation cap was reached (forced end).
-    ForcedEnd,
+    /// and ends the turn, or the continuation cap was reached (forced end). The
+    /// payload records which cause; the caller ends the turn either way.
+    ForcedEnd(ForcedEndCause),
 }
 
 /// Run all matching stop-gate hooks and aggregate their feedback.
@@ -1764,7 +1792,16 @@ pub(crate) async fn run_stop_hooks(
 ) -> StopHookOutcome {
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
-        return StopHookOutcome::ForcedEnd;
+        emit_forced_end_notice(
+            db,
+            session_id,
+            event,
+            ForcedEndCause::ContinuationCap,
+            state.continuation_count,
+            subagent_id,
+        )
+        .await;
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap);
     }
 
     let hooks = matching_hooks(registry, event, match_value);
@@ -1919,7 +1956,16 @@ pub(crate) async fn run_stop_hooks(
     }
 
     if feedback.forced_end {
-        return StopHookOutcome::ForcedEnd;
+        emit_forced_end_notice(
+            db,
+            session_id,
+            event,
+            ForcedEndCause::HookRequested,
+            state.continuation_count,
+            subagent_id,
+        )
+        .await;
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested);
     }
 
     if feedback.should_continue_round() {
@@ -1939,6 +1985,47 @@ pub(crate) async fn run_stop_hooks(
     }
 
     StopHookOutcome::End
+}
+
+/// Emit a fail-open, user-facing Notice recording that the stop gate forcibly
+/// ended a turn. Persistence failures are logged and swallowed — the forced end
+/// stands regardless of whether the Notice was recorded.
+async fn emit_forced_end_notice(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    event: HookEvent,
+    cause: ForcedEndCause,
+    continuations_granted: u8,
+    subagent_id: Option<&str>,
+) {
+    let (text, severity) = match cause {
+        ForcedEndCause::ContinuationCap => (
+            "Stop-hook continuation cap reached; ending without reconsulting hooks.",
+            "warning",
+        ),
+        ForcedEndCause::HookRequested => ("A stop hook explicitly ended the turn.", "info"),
+    };
+    let data = serde_json::json!({
+        "text": text,
+        "severity": severity,
+        "source": STOP_HOOK_FORCED_END_SOURCE,
+        "hookEvent": event.key(),
+        "forcedEndCause": cause.wire_tag(),
+        "continuationsGranted": continuations_granted,
+        "subagentId": subagent_id,
+    });
+    if let Err(error) = db
+        .insert_session_event(
+            session_id,
+            crate::db::session_log::SessionEventKind::Notice,
+            None,
+            None,
+            &data,
+        )
+        .await
+    {
+        tracing::warn!(?error, "failed to persist stop-hook forced-end notice");
+    }
 }
 
 /// Run all matching observe-only lifecycle hooks sequentially.
@@ -2092,21 +2179,25 @@ pub(crate) async fn run_observe_hooks(
 pub(crate) fn error_class_match_value(
     class: &crate::engine::model::InferenceErrorClass,
 ) -> &'static str {
+    use crate::config::extended::hooks as vocabulary;
     use crate::engine::model::InferenceErrorClass as C;
+    // Wire spelling is owned by the config crate's closed `errorClass` matcher
+    // vocabulary ([`HOOK_ERROR_CLASS_MATCH_VALUES`]); returning those constants
+    // keeps the classifier and the matcher validator from drifting apart.
     match class {
-        C::TimeoutTtft => "timeout_ttft",
-        C::TimeoutIdle => "timeout_idle",
-        C::Network => "network",
-        C::Http(_) => "http",
-        C::UtilityTimeout => "utility_timeout",
-        C::MissingToolEntitlement { .. } => "missing_tool_entitlement",
-        C::ClientSideToolsUnsupported => "client_side_tools_unsupported",
-        C::ResponsesToolIdentity => "responses_tool_identity",
-        C::ProviderNotConfigured => "provider_not_configured",
-        C::ProviderRateLimit => "provider_rate_limit",
-        C::BillingOrQuotaExhausted => "billing_or_quota_exhausted",
-        C::UnrenderableWireField => "unrenderable_wire_field",
-        C::Other(_) => "other",
+        C::TimeoutTtft => vocabulary::ERROR_CLASS_TIMEOUT_TTFT,
+        C::TimeoutIdle => vocabulary::ERROR_CLASS_TIMEOUT_IDLE,
+        C::Network => vocabulary::ERROR_CLASS_NETWORK,
+        C::Http(_) => vocabulary::ERROR_CLASS_HTTP,
+        C::UtilityTimeout => vocabulary::ERROR_CLASS_UTILITY_TIMEOUT,
+        C::MissingToolEntitlement { .. } => vocabulary::ERROR_CLASS_MISSING_TOOL_ENTITLEMENT,
+        C::ClientSideToolsUnsupported => vocabulary::ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED,
+        C::ResponsesToolIdentity => vocabulary::ERROR_CLASS_RESPONSES_TOOL_IDENTITY,
+        C::ProviderNotConfigured => vocabulary::ERROR_CLASS_PROVIDER_NOT_CONFIGURED,
+        C::ProviderRateLimit => vocabulary::ERROR_CLASS_PROVIDER_RATE_LIMIT,
+        C::BillingOrQuotaExhausted => vocabulary::ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED,
+        C::UnrenderableWireField => vocabulary::ERROR_CLASS_UNRENDERABLE_WIRE_FIELD,
+        C::Other(_) => vocabulary::ERROR_CLASS_OTHER,
     }
 }
 

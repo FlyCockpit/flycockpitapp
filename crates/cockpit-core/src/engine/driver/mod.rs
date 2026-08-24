@@ -8962,7 +8962,7 @@ impl Driver {
                         // root turn ends normally below.
                         crate::engine::agent::hooks::StopHookOutcome::Continue { .. }
                         | crate::engine::agent::hooks::StopHookOutcome::End
-                        | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd => {}
+                        | crate::engine::agent::hooks::StopHookOutcome::ForcedEnd(_) => {}
                     }
                     if let Some(anchor_seq) = goal_continue_anchor_seq {
                         if self.goal_continue_progress_since(anchor_seq).await {

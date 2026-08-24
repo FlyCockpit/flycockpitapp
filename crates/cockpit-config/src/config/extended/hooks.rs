@@ -18,6 +18,47 @@ use crate::config::dirs::{
     discover_config_dirs,
 };
 
+// Closed matcher vocabulary for the `stopFailure` event's `errorClass` matcher.
+// These tokens are the wire spelling of each `InferenceErrorClass` variant
+// (`cockpit-proto`); the runtime classifier in `cockpit-core` maps a failure to
+// exactly one of these strings. Keeping the vocabulary here — beside matcher
+// validation — lets us reject an authored matcher that names a class the engine
+// can never emit, instead of silently configuring a hook that never fires.
+pub const ERROR_CLASS_TIMEOUT_TTFT: &str = "timeout_ttft";
+pub const ERROR_CLASS_TIMEOUT_IDLE: &str = "timeout_idle";
+pub const ERROR_CLASS_NETWORK: &str = "network";
+pub const ERROR_CLASS_HTTP: &str = "http";
+pub const ERROR_CLASS_UTILITY_TIMEOUT: &str = "utility_timeout";
+pub const ERROR_CLASS_MISSING_TOOL_ENTITLEMENT: &str = "missing_tool_entitlement";
+pub const ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported";
+pub const ERROR_CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
+pub const ERROR_CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
+pub const ERROR_CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
+pub const ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED: &str = "billing_or_quota_exhausted";
+pub const ERROR_CLASS_UNRENDERABLE_WIRE_FIELD: &str = "unrenderable_wire_field";
+pub const ERROR_CLASS_OTHER: &str = "other";
+
+/// Closed set of recognized `errorClass` matcher tokens for `stopFailure`.
+///
+/// One entry per `InferenceErrorClass` variant; data-bearing variants
+/// (`Http`, `Other`) collapse to their coarse token. An authored matcher value
+/// outside this set is rejected at config-validation time.
+pub const HOOK_ERROR_CLASS_MATCH_VALUES: &[&str] = &[
+    ERROR_CLASS_TIMEOUT_TTFT,
+    ERROR_CLASS_TIMEOUT_IDLE,
+    ERROR_CLASS_NETWORK,
+    ERROR_CLASS_HTTP,
+    ERROR_CLASS_UTILITY_TIMEOUT,
+    ERROR_CLASS_MISSING_TOOL_ENTITLEMENT,
+    ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED,
+    ERROR_CLASS_RESPONSES_TOOL_IDENTITY,
+    ERROR_CLASS_PROVIDER_NOT_CONFIGURED,
+    ERROR_CLASS_PROVIDER_RATE_LIMIT,
+    ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED,
+    ERROR_CLASS_UNRENDERABLE_WIRE_FIELD,
+    ERROR_CLASS_OTHER,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HookEvent {
@@ -535,9 +576,14 @@ fn validate_matcher(
         {
             return Err("matcher value is not valid for this event");
         }
-        HookMatcherPolicy::CanonicalToolName
-        | HookMatcherPolicy::ChildAgentType
-        | HookMatcherPolicy::ErrorClass
+        HookMatcherPolicy::ErrorClass
+            if values
+                .iter()
+                .any(|value| !HOOK_ERROR_CLASS_MATCH_VALUES.contains(&value.as_str())) =>
+        {
+            return Err("matcher value is not a recognized inference error class");
+        }
+        HookMatcherPolicy::CanonicalToolName | HookMatcherPolicy::ChildAgentType
             if values.iter().any(|value| !canonical_match_value(value)) =>
         {
             return Err("matcher value is not canonical");

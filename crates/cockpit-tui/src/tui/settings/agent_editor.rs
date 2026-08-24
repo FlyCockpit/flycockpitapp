@@ -21,6 +21,7 @@ pub(super) struct AgentEditor {
     /// Opaque daemon revision captured with the editable snapshot. `None` is
     /// reserved for daemon-local assistant definitions on their separate RPC.
     pub(super) revision: Option<String>,
+    assistant_definition: bool,
     vim_enabled: bool,
     editor: VimEditor,
 }
@@ -54,9 +55,26 @@ impl AgentEditor {
             name,
             path,
             revision,
+            assistant_definition: false,
             vim_enabled,
             editor: VimEditor::new(text, vim_enabled),
         }
+    }
+
+    pub(super) fn new_assistant(
+        name: String,
+        path: std::path::PathBuf,
+        text: &str,
+        vim_enabled: bool,
+        revision: String,
+    ) -> Self {
+        let mut editor = Self::new(name, path, text, vim_enabled, Some(revision));
+        editor.assistant_definition = true;
+        editor
+    }
+
+    pub(super) fn is_assistant_definition(&self) -> bool {
+        self.assistant_definition
     }
 
     pub(super) fn text(&self) -> &str {

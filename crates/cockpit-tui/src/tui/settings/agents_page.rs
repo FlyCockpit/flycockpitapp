@@ -354,7 +354,12 @@ impl AgentsPage {
                         markdown: None,
                     },
                 );
-                self.editing = pending.draft.take();
+                let edited_markdown = std::fs::read_to_string(&pending.staging).ok();
+                let mut draft = pending.draft.take();
+                if let (Some(editor), Some(markdown)) = (&mut draft, edited_markdown) {
+                    editor.replace_with_recovery_text(&markdown);
+                }
+                self.editing = draft;
                 self.status = Some(detail.unwrap_or_else(|| "external edit failed".into()));
             }
         }
@@ -616,17 +621,31 @@ impl SettingsCx {
                     // Ensure a single trailing newline like a real editor.
                     let text = format!("{}\n", text.trim_end_matches('\n'));
                     let name = editor.name.clone();
+                    let assistant_definition = editor.is_assistant_definition();
                     let cwd = self.agents_cwd();
                     let saved = match revision {
+                        Some(revision) if assistant_definition => {
+                            match crate::tui::agent_runner::daemon_request_blocking(
+                                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                                    name: name.clone(),
+                                    markdown: text,
+                                    expected_revision: revision,
+                                },
+                            ) {
+                                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved { .. }) => Ok(()),
+                                Ok(other) => Err(format!("unexpected assistant save response: {other:?}")),
+                                Err(error) => Err(error),
+                            }
+                        }
                         Some(revision) => mutate_agent(
-                            &cwd,
-                            cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                                name: name.clone(),
-                                markdown: text,
-                            },
-                            Some(revision),
-                        )
-                        .map(|_| ()),
+                                &cwd,
+                                cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                                    name: name.clone(),
+                                    markdown: text,
+                                },
+                                Some(revision),
+                            )
+                            .map(|_| ()),
                         None => Err(
                             "assistant definitions must be edited through their daemon-owned settings flow"
                                 .to_string(),
@@ -822,9 +841,22 @@ impl SettingsCx {
                 let path = detail.path.clone();
                 let name = detail.name.clone();
                 let text = detail.original_text.clone();
+                let revision = detail.revision.clone();
+                let assistant_definition = matches!(detail.source, AgentRowSource::Assistant { .. });
                 p.detail = None;
                 let vim = self.extended.tui.vim_mode.vim_enabled();
-                p.editing = Some(AgentEditor::new(name, path, &text, vim, None));
+                p.editing = match (assistant_definition, revision) {
+                    (true, Some(revision)) => Some(AgentEditor::new_assistant(
+                        name, path, &text, vim, revision,
+                    )),
+                    (false, revision) => Some(AgentEditor::new(
+                        name, path, &text, vim, revision,
+                    )),
+                    (true, None) => {
+                        p.status = Some("raw edit failed: missing assistant revision".into());
+                        None
+                    }
+                };
             }
             _ => {}
         }

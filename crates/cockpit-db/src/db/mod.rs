@@ -891,6 +891,18 @@ const SCHEMA_PROFILE: &str = "remote-v0.1";
 #[cfg(not(feature = "remote"))]
 const SCHEMA_PROFILE: &str = "local-v0.1";
 
+/// Stable diagnostic identifier for attempting to open one prerelease build
+/// profile's database with the other profile. Profile transitions are not an
+/// in-place migration in v0.1: opt-in remote builds must use a separate data
+/// directory (or an explicit supported export/import flow).
+pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
+
+fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{SCHEMA_PROFILE_MISMATCH_CODE}: database schema profile is {database_profile}, binary requires {SCHEMA_PROFILE}; in-place local/remote profile transitions are unsupported in v0.1; use a separate data directory or a supported export/import flow"
+    )
+}
+
 /// All schema migrations in version order. Pre-release: fold schema changes
 /// into `0001_initial.sql`. Do not append `0002_*`.
 const MIGRATIONS: &[Migration] = &[Migration {
@@ -1200,9 +1212,7 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             );
         }
         if profile != SCHEMA_PROFILE {
-            anyhow::bail!(
-                "database schema profile mismatch: database is {profile}, binary requires {SCHEMA_PROFILE}"
-            );
+            return Err(schema_profile_mismatch(&profile));
         }
         if version == current_schema_version(conn)? && fingerprint != exact_ddl_fingerprint(conn)? {
             anyhow::bail!(

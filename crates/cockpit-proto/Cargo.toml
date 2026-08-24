@@ -9,6 +9,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Remote signaling, tenant authority, continuity, and transport wire contracts
+# are opt-in and propagate the same capability to their persistence DTOs.
+default = []
+remote = ["cockpit-db/remote"]
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }

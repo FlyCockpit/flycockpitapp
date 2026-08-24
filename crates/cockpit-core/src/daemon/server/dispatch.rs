@@ -2168,6 +2168,24 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     effects: &mut ClientRequestEffects,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    #[cfg(not(feature = "remote"))]
+    if matches!(
+        &request,
+        Request::StoreFlycockpitCredential { .. }
+            | Request::ClearFlycockpitCredential
+            | Request::SetFlycockpitConnectorEnabled { .. }
+            | Request::SyncFlycockpitOrgPolicy
+            | Request::EnrollFlycockpitOrgSync { .. }
+            | Request::GetFlycockpitAccount
+            | Request::GetConnectorState
+            | Request::GetOrgSyncStatus
+    ) {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"
+                .into(),
+        });
+    }
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
             code: ErrorCode::Internal,
@@ -3863,6 +3881,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             })
         }
         Request::GetStartupDisclosures { project_root: _ } => {
+            #[cfg(not(feature = "remote"))]
+            return Ok(Response::StartupDisclosures {
+                org_sync: None,
+                connector: None,
+                config_generation: inventory::current_config_generation(),
+            });
+            #[cfg(feature = "remote")]
             let (org_sync, connector) =
                 if let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? {
                     let org = ctx
@@ -3881,11 +3906,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 } else {
                     (None, None)
                 };
-            Ok(Response::StartupDisclosures {
+            #[cfg(feature = "remote")]
+            return Ok(Response::StartupDisclosures {
                 org_sync,
                 connector,
                 config_generation: inventory::current_config_generation(),
-            })
+            });
         }
         Request::GetAppFlag { key } => {
             let db_key = app_flag_db_key(key);
@@ -9026,6 +9052,17 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     ctx: Arc<DaemonContext>,
     remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    #[cfg(not(feature = "remote"))]
+    if matches!(
+        &request,
+        Request::GetFlycockpitAccount | Request::GetConnectorState | Request::GetOrgSyncStatus
+    ) {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"
+                .into(),
+        });
+    }
     if let Some(operation) = &remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,

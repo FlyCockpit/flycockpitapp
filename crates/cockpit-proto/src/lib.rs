@@ -41,21 +41,31 @@ pub use host_capabilities::{
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
+#[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
+#[cfg(feature = "remote")]
 pub mod remote_device_identity_enrollment;
+#[cfg(feature = "remote")]
 pub mod remote_enterprise_connection_policy;
 pub mod remote_identity_protocol;
+#[cfg(feature = "remote")]
 pub mod remote_ip_consent;
 pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
 pub mod remote_public_service_policy;
+#[cfg(feature = "remote")]
 pub mod remote_session_continuity;
+#[cfg(feature = "remote")]
 pub mod remote_signaling_attempt_store;
+#[cfg(feature = "remote")]
 pub mod remote_tenant_authority_protocol;
 pub mod remote_transport;
+#[cfg(feature = "remote")]
 pub mod remote_transport_selection;
+#[cfg(feature = "remote")]
 pub mod remote_turn_ice_policy;
 pub mod remote_version;
+#[cfg(feature = "remote")]
 pub mod remote_wire_magic_registry;
 pub mod send_user_message_v2;
 pub mod terminal;

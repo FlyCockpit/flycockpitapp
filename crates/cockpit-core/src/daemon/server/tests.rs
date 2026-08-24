@@ -805,7 +805,7 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
             name: "reviewer".into(),
             home_dir: "/tmp/reviewer".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         &mut state,
         &ctx,
@@ -818,7 +818,7 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
     assert_eq!(assistant.name, "reviewer");
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
-        "hash"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
 }
 
@@ -979,7 +979,7 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
             name: "helper-bot".into(),
             home_dir: "/tmp/helper".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
     ];
     for request in mutations {
@@ -1408,7 +1408,7 @@ async fn upsert_assistant_rejects_non_owner_principal() {
             name: "reviewer".into(),
             home_dir: "/tmp/reviewer".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         &mut state,
         &ctx,
@@ -15896,7 +15896,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "a".into(),
             home_dir: root,
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         "resolve_assistant_session" => Request::ResolveAssistantSession {
             assistant_id: "missing-assistant".into(),
@@ -20218,7 +20218,7 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
             name: "a".into(),
             home_dir: "/repo".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         _ => unreachable!(),
     };
@@ -20264,7 +20264,7 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
             name: "a".into(),
             home_dir: "/repo".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         _ => unreachable!(),
     };
@@ -23100,7 +23100,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 name: "a".into(),
                 home_dir: "/tmp".into(),
                 config_json: "{}".into(),
-                content_hash: "h".into(),
+                content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             },
             kind: "upsert_assistant",
             session_id: None,

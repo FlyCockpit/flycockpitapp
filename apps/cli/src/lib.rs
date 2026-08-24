@@ -751,6 +751,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Assistant(sub)) => {
             commands::assistant::run(sub, cli.no_sandbox, Some(launch_start)).await
         }
+        #[cfg(feature = "remote")]
         Some(Command::Account(sub)) => match sub {
             crate::cli::AccountCommand::Login(args) => commands::flycockpit::login(args).await,
             crate::cli::AccountCommand::Logout => commands::flycockpit::logout().await,
@@ -779,7 +780,9 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Login(_)) => Err(commands::RemovedCommandError::new("login").into()),
         Some(Command::Logout) => Err(commands::RemovedCommandError::new("logout").into()),
         Some(Command::Whoami) => Err(commands::RemovedCommandError::new("whoami").into()),
+        #[cfg(feature = "remote")]
         Some(Command::Sync(sub)) => commands::sync::run(sub).await,
+        #[cfg(feature = "remote")]
         Some(Command::Connect(args)) => commands::connect::run(args).await,
         Some(Command::Packages(sub)) => commands::packages::run(sub).await,
         Some(Command::Kcl(sub)) => commands::kcl::run(sub).await,

@@ -30,6 +30,12 @@ name: CLI CI
       - ".github/workflows/cli-ci.yml"
       - ".github/workflows/ci-runners.yml"
   workflow_dispatch:
+    inputs:
+      remote_conformance:
+        description: Run opt-in FlyCockpit remote/TURN/custody conformance jobs
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: cli-ci-${{ github.ref }}
@@ -160,6 +166,7 @@ jobs:
 
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)
+    if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance
     needs: runners
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:
@@ -207,6 +214,7 @@ jobs:
 
   turn-coturn-conformance:
     name: TURN client conformance (coturn)
+    if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance
     needs: runners
     runs-on: ${{ needs.runners.outputs.ubuntu }}
     steps:

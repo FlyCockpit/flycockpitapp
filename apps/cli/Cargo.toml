@@ -20,6 +20,20 @@ dist = true
 [lints]
 workspace = true
 
+[features]
+# The public v0.1 artifact is local-only. FlyCockpit account, organization
+# synchronization, and relay-control commands must be deliberately enabled by
+# internal/remote builds; they are absent from the default help and dispatch
+# surface.
+default = []
+remote = [
+    "cockpit-core/remote",
+    "cockpit-db/remote",
+    "cockpit-proto/remote",
+    "dep:tokio-tungstenite",
+    "dep:flycockpit-relay-protocol",
+]
+
 [[bin]]
 name = "cockpit"
 path = "src/main.rs"
@@ -80,7 +94,7 @@ reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 # Workspace pin is `package = "rig-core"` under the `rig` dep name (see root
 # Cargo.toml); Cockpit never enables Rig agent/companion features.
 rig = { workspace = true }
-tokio-tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 # Storage
 cockpit-core = { path = "../../crates/cockpit-core" }
@@ -110,7 +124,7 @@ tokio-util = { workspace = true }
 lsp-types = { workspace = true }
 
 # Serialization
-flycockpit-relay-protocol = { path = "../../crates/relay-protocol" }
+flycockpit-relay-protocol = { path = "../../crates/relay-protocol", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # YAML syntax validation for native write tools. `serde_yaml` 0.9 is archived,

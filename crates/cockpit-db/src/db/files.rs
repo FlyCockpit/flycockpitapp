@@ -5,6 +5,32 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+/// Process-independent guard for database boot, backup, and migration.
+///
+/// The lock file is persistent, but ownership is held by the kernel on this
+/// open file description. A crashed process therefore cannot leave stale
+/// ownership behind (unlike a create-new or PID-file protocol).
+pub(crate) struct DatabaseBootLock {
+    _file: std::fs::File,
+}
+
+impl DatabaseBootLock {
+    pub(crate) fn acquire(database: &Path) -> Result<Self> {
+        let lock_path = database.with_extension("boot.lock");
+        ensure_parent_dir_private(&lock_path)?;
+        create_private_file_if_missing(&lock_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening database boot lock {}", lock_path.display()))?;
+        repair_private_file(&lock_path, "database boot lock")?;
+        file.lock()
+            .with_context(|| format!("locking database boot at {}", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
 pub(crate) fn cockpit_data_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_DATA_HOME")
         && !s.trim().is_empty()

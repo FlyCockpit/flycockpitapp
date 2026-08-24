@@ -340,9 +340,13 @@ impl Db {
     /// Open a database at an arbitrary path.
     pub fn open(path: &Path) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
-        let existed_before_open = path.exists();
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
+        // Both the normal daemon and the diagnostic SQLite owner enter through
+        // Db::open, so this kernel-backed RAII lock covers the complete
+        // create/open/backup/migrate interval for either owner.
+        let _boot_lock = files::DatabaseBootLock::acquire(path)?;
+        let existed_before_open = path.exists();
         files::create_private_file_if_missing(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
@@ -733,6 +737,28 @@ struct Migration {
     profile_sql: &'static str,
 }
 
+#[cfg(feature = "remote")]
+const SCHEMA_PROFILE: &str = "remote-v0.1";
+#[cfg(not(feature = "remote"))]
+const SCHEMA_PROFILE: &str = "local-v0.1";
+const LOCAL_SCHEMA_PROFILE: &str = "local-v0.1";
+const REMOTE_SCHEMA_PROFILE: &str = "remote-v0.1";
+const REMOTE_TABLES: &[&str] = &[
+    "connector_state",
+    "sync_state",
+    "remote_audit_upload_state",
+    "remote_principal_audit",
+    "remote_attachment_operations",
+    "remote_attachment_lifecycle",
+    "remote_rename_journal",
+    "remote_rename_artifact_cleanup_intents",
+    "remote_attachment_outbox",
+    "remote_attachment_outbox_deliveries",
+    "remote_attachment_outbox_snapshots",
+    "remote_daemon_custody_generation_seq",
+    "remote_daemon_custody_records",
+];
+
 /// All schema migrations in version order. Pre-release: fold schema changes
 /// into `0001_initial.sql`. Do not append `0002_*`.
 const MIGRATIONS: &[Migration] = &[Migration {
@@ -755,10 +781,32 @@ fn backup_before_pending_migration(
     path: &Path,
     migration_count: usize,
 ) -> Result<()> {
-    let backup_reason = prerelease_backup_reason(conn, migration_count)?;
+    let backup_reason = match prerelease_backup_reason(conn, migration_count) {
+        Ok(reason) => reason,
+        Err(assessment_error) => {
+            create_migration_backup(
+                conn,
+                path,
+                0,
+                "rejecting an unproven or malformed prerelease schema ledger",
+            )?;
+            return Err(assessment_error).context(
+                "database schema could not be proven compatible; a validated backup was created before rejection",
+            );
+        }
+    };
     let Some((schema_version, reason)) = backup_reason else {
         return Ok(());
     };
+    create_migration_backup(conn, path, schema_version, reason)
+}
+
+fn create_migration_backup(
+    conn: &Connection,
+    path: &Path,
+    schema_version: i64,
+    reason: &str,
+) -> Result<()> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -795,8 +843,21 @@ fn prerelease_backup_reason(
         return Ok(Some((version, "rejecting a legacy prerelease schema ledger")));
     }
     let version = current_schema_version(conn)?;
+    if version > migration_count as i64 {
+        return Ok(Some((version, "rejecting a future prerelease schema")));
+    }
     if version < migration_count as i64 {
         return Ok(Some((version, "applying a pending migration")));
+    }
+    let profile: String = conn
+        .query_row(
+            "SELECT schema_profile FROM schema_version ORDER BY version DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("reading prerelease schema profile")?;
+    if profile != SCHEMA_PROFILE {
+        return Ok(Some((version, "migrating the database schema profile")));
     }
     if version == 1 {
         let recorded: String = conn
@@ -880,10 +941,10 @@ fn migration_hash(sql: &str) -> String {
 }
 
 fn migration_definition_hash(migration: &Migration) -> String {
-    let mut definition = String::with_capacity(migration.sql.len() + migration.profile_sql.len());
-    definition.push_str(migration.sql);
-    definition.push_str(migration.profile_sql);
-    migration_hash(&definition)
+    // A migration identifies the common lineage. Build-profile identity is a
+    // separate ledger field so local and remote v1 never masquerade as
+    // divergent definitions of the same migration.
+    migration_hash(migration.sql)
 }
 
 /// Hash the exact persisted DDL text for every application-owned table,
@@ -923,7 +984,7 @@ fn is_lower_hex_64(value: &str) -> bool {
 fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let mut stmt =
         conn.prepare(
-            "SELECT version, name, sha256, schema_fingerprint \
+            "SELECT version, name, sha256, schema_fingerprint, schema_profile \
              FROM schema_version ORDER BY version",
         )?;
     let mut expected_version = 1_i64;
@@ -933,9 +994,10 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })? {
-        let (version, name, hash, fingerprint) = row?;
+        let (version, name, hash, fingerprint, profile) = row?;
         if version != expected_version {
             anyhow::bail!(
                 "database migration ledger is corrupt: expected version {expected_version}, found {version}"
@@ -960,6 +1022,11 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 "migration checksum mismatch for {expected_name}: applied migration was amended"
             );
         }
+        if profile != SCHEMA_PROFILE {
+            anyhow::bail!(
+                "database schema profile mismatch: database is {profile}, binary requires {SCHEMA_PROFILE}"
+            );
+        }
         if version == current_schema_version(conn)? && fingerprint != exact_ddl_fingerprint(conn)? {
             anyhow::bail!(
                 "database schema fingerprint mismatch at migration {version}: schema objects were altered or are missing"
@@ -977,6 +1044,74 @@ fn verify_user_version(conn: &Connection, ledger_version: i64) -> Result<()> {
             "database schema version is inconsistent: migration ledger is {ledger_version}, SQLite user_version is {user_version}"
         );
     }
+    Ok(())
+}
+
+fn recorded_schema_profile(conn: &Connection) -> Result<Option<String>> {
+    if current_schema_version(conn)? == 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT schema_profile FROM schema_version ORDER BY version DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .context("reading database schema profile")
+}
+
+/// Move an existing prerelease v1 database along the explicit local/remote
+/// profile lineage. This runs inside the migration transaction and updates the
+/// profile and fingerprint atomically. The common migration checksum remains
+/// unchanged because both profiles descend from the same squashed v1.
+fn migrate_schema_profile(conn: &Connection) -> Result<()> {
+    let Some(current) = recorded_schema_profile(conn)? else {
+        return Ok(());
+    };
+    if current == SCHEMA_PROFILE {
+        return Ok(());
+    }
+    match (current.as_str(), SCHEMA_PROFILE) {
+        (REMOTE_SCHEMA_PROFILE, LOCAL_SCHEMA_PROFILE) => conn
+            .execute_batch(include_str!("migrations/0001_local_profile.sql"))
+            .context("migrating remote-v0.1 schema profile to local-v0.1")?,
+        (LOCAL_SCHEMA_PROFILE, REMOTE_SCHEMA_PROFILE) => {
+            // Reconstruct only the remote-owned objects from the authoritative
+            // squashed migration. sqlite_schema row order preserves table
+            // creation order; secondary indexes and triggers follow tables.
+            let seed = Connection::open_in_memory().context("opening remote profile seed")?;
+            seed.execute_batch(MIGRATIONS[0].sql)
+                .context("materializing authoritative remote profile schema")?;
+            for kind in ["table", "index", "trigger", "view"] {
+                let mut stmt = seed.prepare(
+                    "SELECT tbl_name, sql FROM sqlite_schema \
+                     WHERE type = ?1 AND sql IS NOT NULL ORDER BY rowid",
+                )?;
+                let statements = stmt
+                    .query_map([kind], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (table, sql) in statements {
+                    let owned = REMOTE_TABLES.contains(&table.as_str());
+                    if owned {
+                        conn.execute_batch(&sql).with_context(|| {
+                            format!("restoring {kind} for remote-v0.1 schema profile")
+                        })?;
+                    }
+                }
+            }
+        }
+        _ => anyhow::bail!(
+            "unsupported database schema profile transition: {current} -> {SCHEMA_PROFILE}"
+        ),
+    }
+    let fingerprint = exact_ddl_fingerprint(conn)?;
+    conn.execute(
+        "UPDATE schema_version SET schema_profile = ?1, schema_fingerprint = ?2 \
+         WHERE version = (SELECT MAX(version) FROM schema_version)",
+        rusqlite::params![SCHEMA_PROFILE, fingerprint],
+    )?;
     Ok(())
 }
 
@@ -1010,11 +1145,13 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 name TEXT NOT NULL CHECK (length(name) > 0), \
                 sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
                 schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
+                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
                 applied_at TEXT NOT NULL\
             );",
         )
         .context("creating schema_version table")?;
 
+        migrate_schema_profile(conn)?;
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
         if current > 0 {
@@ -1034,12 +1171,13 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             let fingerprint = exact_ddl_fingerprint(conn)?;
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
                 rusqlite::params![
                     version,
                     migration.name,
                     migration_definition_hash(migration),
-                    fingerprint
+                    fingerprint,
+                    SCHEMA_PROFILE
                 ],
             )
             .with_context(|| format!("recording migration {version}"))?;
@@ -1111,6 +1249,7 @@ fn verify_supported_ledger_shape(conn: &Connection) -> Result<()> {
         "name",
         "sha256",
         "schema_fingerprint",
+        "schema_profile",
         "applied_at",
     ];
     let missing = REQUIRED
@@ -1497,8 +1636,8 @@ mod tests {
         let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
         let future_hash = migration_hash("future");
         conn.execute(
-            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (2, 'future', ?1, ?2, 'now')",
-            rusqlite::params![future_hash, fingerprint],
+            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (2, 'future', ?1, ?2, ?3, 'now')",
+            rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
         )
         .unwrap();
         assert!(
@@ -1519,9 +1658,9 @@ mod tests {
             let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
             let future_hash = migration_hash("future");
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at)
-                 VALUES (2, 'future', ?1, ?2, 'now')",
-                rusqlite::params![future_hash, fingerprint],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
+                 VALUES (2, 'future', ?1, ?2, ?3, 'now')",
+                rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
             )
             .unwrap();
         }
@@ -2184,10 +2323,10 @@ mod tests {
             .execute_batch(&format!(
                 r#"
                 BEGIN IMMEDIATE;
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, schema_fingerprint TEXT, applied_at TEXT);
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, schema_fingerprint TEXT, schema_profile TEXT, applied_at TEXT);
                 CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);
-                INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at)
-                    VALUES (1, '0001_test.sql', '{probe_hash}', '', CURRENT_TIMESTAMP);
+                INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
+                    VALUES (1, '0001_test.sql', '{probe_hash}', '', '{SCHEMA_PROFILE}', CURRENT_TIMESTAMP);
                 PRAGMA user_version = 1;
                 "#,
             ))

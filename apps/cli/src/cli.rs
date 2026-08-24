@@ -79,6 +79,7 @@ pub enum Command {
     Assistant(AssistantCommand),
 
     /// Manage the FlyCockpit account used for SaaS sync and relay access.
+    #[cfg(feature = "remote")]
     #[command(subcommand)]
     Account(AccountCommand),
 
@@ -165,10 +166,12 @@ pub enum Command {
     Whoami,
 
     /// Inspect enterprise org-policy synchronization.
+    #[cfg(feature = "remote")]
     #[command(subcommand)]
     Sync(SyncCommand),
 
     /// Toggle outbound relay access for remote control on this instance; requires `cockpit account login`.
+    #[cfg(feature = "remote")]
     Connect(ConnectArgs),
 
     /// Manage the package registry the `docs` agent reads from.
@@ -1686,6 +1689,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn account_tree_parses() {
         let cli = Cli::try_parse_from([
@@ -1719,6 +1723,17 @@ mod tests {
             cli.command,
             Some(Command::Account(AccountCommand::Whoami))
         ));
+    }
+
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn local_release_rejects_remote_command_surface() {
+        for command in ["account", "sync", "connect"] {
+            assert!(
+                Cli::try_parse_from(["cockpit", command]).is_err(),
+                "local release unexpectedly exposed `{command}`"
+            );
+        }
     }
 
     #[test]

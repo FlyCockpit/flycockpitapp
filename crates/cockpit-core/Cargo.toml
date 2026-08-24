@@ -11,17 +11,31 @@ publish = false
 
 [features]
 test-support = ["dep:cockpit-test-support"]
+# Starts FlyCockpit-owned account/sync/relay background work. The public v0.1
+# CLI leaves this off; provider network access remains available independently.
+remote = [
+    "cockpit-db/remote",
+    "cockpit-proto/remote",
+    "dep:flycockpit-relay-protocol",
+    "dep:tokio-tungstenite",
+    "dep:p256",
+    "dep:str0m",
+    "dep:str0m-rust-crypto",
+    "dep:turn-client-proto",
+    "dep:turn-client-rustls",
+    "dep:rustls-native-certs",
+]
 # Compiles the real Linux/WSL PKCS#11 daemon custody adapter (cryptoki). OFF by
 # default so the serialized local gate stays green and lock-stable without a
 # PKCS#11 module present; the SoftHSM CI job enables it. macOS/Windows adapters
 # are target-gated instead (they compile only on their CI matrix legs).
-daemon-custody-pkcs11 = ["dep:cryptoki"]
+daemon-custody-pkcs11 = ["remote", "dep:cryptoki"]
 # Compiles the real Tokio + turn-client-proto/turn-client-rustls TURN allocation
 # driver (`daemon::turn_socket_provider::io`) and the ignored coturn conformance
 # test. OFF by default so the serialized gate never depends on live TURN
 # infrastructure and stays lock-stable; the Linux coturn CI leg enables it. No
 # new crates — it cfg-gates code over deps already present.
-turn-coturn-conformance = []
+turn-coturn-conformance = ["remote"]
 
 [lints]
 workspace = true
@@ -39,7 +53,7 @@ reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 # Workspace: `rig-core` aliased as `rig` — portable contracts + transport only.
 rig = { workspace = true }
 httpdate = "1"
-tokio-tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-proto = { path = "../cockpit-proto" }
@@ -50,7 +64,7 @@ sqlite-vec = { workspace = true }
 zip = { workspace = true }
 tokio-util = { workspace = true }
 lsp-types = { workspace = true }
-flycockpit-relay-protocol = { path = "../relay-protocol" }
+flycockpit-relay-protocol = { path = "../relay-protocol", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -80,7 +94,7 @@ rand = { workspace = true }
 # Features: ecdsa (sign+verify) + arithmetic + pem (enables ecdsa DER parsing for
 # der_signature_to_low_s_p1363) + digest (hazmat PrehashSigner). All transitive
 # crates (rfc6979/primeorder/pem-rfc7468/digest) are already in Cargo.lock.
-p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "arithmetic", "pem", "digest"] }
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "arithmetic", "pem", "digest"], optional = true }
 urlencoding = { workspace = true }
 which = { workspace = true }
 monty = { workspace = true }
@@ -132,12 +146,12 @@ chacha20poly1305 = { version = "=0.10.1", default-features = false, features = [
 # rust-crypto only (remote-webrtc-daemon-endpoint). No AWS-LC, OpenSSL,
 # platform TLS, or alternate WebRTC stack. The RustCrypto provider is
 # configured explicitly per Rtc instance; no process-wide default.
-str0m = { version = "=0.21.0", default-features = false, features = ["rust-crypto"] }
+str0m = { version = "=0.21.0", default-features = false, features = ["rust-crypto"], optional = true }
 # Direct dependency for the RustCrypto provider: str0m-rust-crypto is the
 # backend crate for the "rust-crypto" feature. We depend on it directly so
 # we can call default_provider() and install it per-Rtc. Exact 0.5.0 pin
 # matches str0m 0.21.0's transitive dependency.
-str0m-rust-crypto = { version = "=0.5.0", default-features = false }
+str0m-rust-crypto = { version = "=0.5.0", default-features = false, optional = true }
 
 # TURN relay socket provider (`remote-rust-turn-socket-provider` /
 # `turn-socket-provider-real-io`).
@@ -152,11 +166,11 @@ str0m-rust-crypto = { version = "=0.5.0", default-features = false }
 # `turn-client-rustls` selects no crypto provider; the process installs
 # `aws_lc_rs` (only — never `ring`) once via `crate::tls_crypto_provider`
 # before any TLS client config is built.
-turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"] }
-turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"] }
+turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"], optional = true }
+turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"], optional = true }
 # System roots for TLS-to-TURN-server verification (rustls-native-certs). Exact
 # pin (no caret) matching the audited lock version.
-rustls-native-certs = { version = "=0.8.4", default-features = false }
+rustls-native-certs = { version = "=0.8.4", default-features = false, optional = true }
 # Process-global rustls provider install (`aws_lc_rs`) shared by TURN TLS and
 # media HTTPS. Default features keep the `aws_lc_rs` provider available; `ring`
 # is never installed as the process default. Already resolved in Cargo.lock at
@@ -237,6 +251,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
 libc = { workspace = true }
 
 [dev-dependencies]
+flycockpit-relay-protocol = { path = "../relay-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 assert_cmd = { workspace = true }

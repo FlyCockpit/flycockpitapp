@@ -25,7 +25,18 @@ pub struct RemotePrincipal {
     /// is present and never widens an attempt-grant ceiling through the legacy
     /// scope helpers.
     pub authorization: RemoteAuthorization,
-    pub actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+    pub actor_binding: Option<ClientActorBindingV1>,
+}
+
+/// Transport-neutral copy of the authenticated device binding. Keeping this
+/// DTO in the daemon authority layer prevents the local build from depending
+/// on or compiling the legacy relay envelope crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientActorBindingV1 {
+    pub schema_version: u8,
+    pub device_id: uuid::Uuid,
+    pub device_generation: u64,
+    pub logical_attachment_id: uuid::Uuid,
 }
 
 /// The kind of authorization a remote principal carries.
@@ -158,7 +169,7 @@ impl ClientPrincipal {
     pub fn from_verified_remote(
         user_id: String,
         grants: Vec<PrincipalGrant>,
-        actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+        actor_binding: Option<ClientActorBindingV1>,
     ) -> Self {
         Self::Remote(RemotePrincipal {
             user_id,
@@ -174,7 +185,7 @@ impl ClientPrincipal {
     pub fn from_attempt_grant(
         user_id: String,
         authorization: AttemptGrantAuthorization,
-        actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+        actor_binding: Option<ClientActorBindingV1>,
     ) -> Self {
         Self::Remote(RemotePrincipal {
             user_id,

@@ -4710,7 +4710,7 @@ mod tests {
             name: "a".into(),
             home_dir: "/a".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         };
         assert_eq!(request.wire_tag(), "upsert_assistant");
         assert!(crate::command!(command_tags).contains(&request.wire_tag()));

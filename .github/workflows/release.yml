@@ -15,6 +15,11 @@ concurrency:
   group: release-${{ inputs.version }}
   cancel-in-progress: false
 
+env:
+  # cargo-dist builds the default feature set. The cockpit binary's default is
+  # intentionally the local-only profile; remote is never selected here.
+  FLYCOCKPIT_RELEASE_PROFILE: local-v0.1
+
 jobs:
   runners:
     name: Select CI runners

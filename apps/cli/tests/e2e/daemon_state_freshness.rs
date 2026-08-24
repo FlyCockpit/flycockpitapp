@@ -232,8 +232,8 @@ fn daemon_refuses_newer_migration_ledger() {
         )
         .expect("read current schema fingerprint");
     conn.execute(
-        "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) \
-         VALUES (?1, 'future', ?2, ?3, CURRENT_TIMESTAMP)",
+        "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) \
+         VALUES (?1, 'future', ?2, ?3, 'local-v0.1', CURRENT_TIMESTAMP)",
         rusqlite::params![
             cockpit_cli::db::EXPECTED_SCHEMA_VERSION + 1,
             "0".repeat(64),

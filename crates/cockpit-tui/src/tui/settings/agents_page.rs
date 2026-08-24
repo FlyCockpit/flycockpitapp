@@ -11,14 +11,10 @@
 //! Actions:
 //!   - `enter` — open the structured tool surface editor for the highlighted
 //!     agent.
-//!   - `e` — **raw edit** the highlighted agent's on-disk
-//!     `.cockpit/agents/<name>.md`. A non-overridden built-in is
-//!     auto-ejected first through the daemon-owned agent mutation RPC.
-//!     The editor is chosen by precedence: `$EDITOR` (external, the event
-//!     loop suspends/restores the TUI) → in-TUI vim editor (when vim mode
-//!     is on) → in-TUI plain editor. On return the file is re-read from
-//!     disk + re-parsed; a parse error is shown inline and the user stays
-//!     on the page.
+//!   - `e` — **raw edit** a daemon-returned definition snapshot. Workspace
+//!     agents may use `$EDITOR` through a daemon editor lease and host-owned
+//!     staging file; assistant definitions use the in-TUI editor and their
+//!     typed revisioned RPC. The TUI never writes either authoritative file.
 //!   - `d` — **delete** a custom agent (arm→confirm via [`ResetButton`]).
 //!     Built-ins can never be deleted.
 //!   - `r` — **reset** the highlighted *overridden* built-in to its
@@ -157,6 +153,7 @@ pub(super) struct AgentRow {
 enum AgentRowSource {
     Agent,
     Assistant { markdown: String, revision: String },
+    AssistantUnavailable,
 }
 
 pub(super) struct AgentDetail {
@@ -204,11 +201,27 @@ impl AgentsPage {
         if self.confirm_reset {
             return "y: confirm reset-all  n/esc: cancel";
         }
-        match self.rows.get(self.cursor).map(|r| &r.kind) {
-            Some(AgentKind::Custom) => {
+        match self.rows.get(self.cursor) {
+            Some(AgentRow {
+                source: AgentRowSource::Assistant { .. },
+                ..
+            }) => {
+                "↑/↓  enter: tools  e: edit definition  d: unregister (×2)  R: reset all  esc/h: back  q: close"
+            }
+            Some(AgentRow {
+                source: AgentRowSource::AssistantUnavailable,
+                ..
+            }) => "↑/↓  enter: diagnostic  R: reset all  esc/h: back  q: close",
+            Some(AgentRow {
+                kind: AgentKind::Custom,
+                ..
+            }) => {
                 "↑/↓  enter: tools  e: raw edit  d: delete (×2)  R: reset all  esc/h: back  q: close"
             }
-            Some(AgentKind::Builtin { overridden: true }) => {
+            Some(AgentRow {
+                kind: AgentKind::Builtin { overridden: true },
+                ..
+            }) => {
                 "↑/↓  enter: tools  e: raw edit  r: reset (×2)  R: reset all  esc/h: back  q: close"
             }
             _ => "↑/↓  enter: tools  e: raw edit  R: reset all  esc/h: back  q: close",
@@ -516,30 +529,37 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
     Ok(assistants
         .into_iter()
         .map(|row| {
-            let definition = row
-                .definition_markdown
-                .as_deref()
-                .ok_or_else(|| {
-                    row.definition_diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "assistant definition unavailable".into())
-                })
-                .and_then(|markdown| {
+            let source = match (row.definition_markdown, row.definition_revision) {
+                (Some(markdown), Some(revision)) => {
+                    AgentRowSource::Assistant { markdown, revision }
+                }
+                (None, None) if row.definition_diagnostic.is_some() => {
+                    AgentRowSource::AssistantUnavailable
+                }
+                _ => AgentRowSource::AssistantUnavailable,
+            };
+            let definition = match &source {
+                AgentRowSource::Assistant { markdown, .. } => {
                     cockpit_core::agents::parse_daemon_local_markdown(markdown, &row.name)
                         .map_err(|error| error.to_string())
-                });
+                }
+                AgentRowSource::AssistantUnavailable => {
+                    Err(row.definition_diagnostic.clone().unwrap_or_else(|| {
+                        "daemon returned an incoherent assistant definition snapshot".into()
+                    }))
+                }
+                AgentRowSource::Agent => unreachable!(),
+            };
             let (detail, model) = match definition {
                 Ok(def) => (Ok(def.description), normalize_model(def.model)),
                 Err(error) => (Err(error), None),
             };
-            let markdown = row.definition_markdown.unwrap_or_default();
-            let revision = row.definition_revision.unwrap_or_default();
             AgentRow {
                 name: row.name,
                 kind: AgentKind::Custom,
                 detail,
                 model,
-                source: AgentRowSource::Assistant { markdown, revision },
+                source,
             }
         })
         .collect())
@@ -850,7 +870,7 @@ impl SettingsCx {
                 let text = detail.original_text.clone();
                 let revision = detail.revision.clone();
                 let assistant_definition =
-                    matches!(detail.source, AgentRowSource::Assistant { .. });
+                    matches!(&detail.source, AgentRowSource::Assistant { .. });
                 p.detail = None;
                 let vim = self.extended.tui.vim_mode.vim_enabled();
                 p.editing = match (assistant_definition, revision) {
@@ -874,10 +894,19 @@ impl SettingsCx {
             return;
         };
         if let Err(error) = &row.detail {
-            p.status = Some(format!(
-                "`{}` has a parse error; use the raw editor to repair it: {error}",
-                row.name
-            ));
+            p.status = Some(
+                if matches!(&row.source, AgentRowSource::AssistantUnavailable) {
+                    format!(
+                        "assistant `{}` is unavailable and cannot be edited or deleted: {error}",
+                        row.name
+                    )
+                } else {
+                    format!(
+                        "`{}` has a parse error; use the raw editor to repair it: {error}",
+                        row.name
+                    )
+                },
+            );
             return;
         }
         let name = row.name.clone();
@@ -900,6 +929,10 @@ impl SettingsCx {
                 markdown.clone(),
                 Some(revision.clone()),
             ),
+            AgentRowSource::AssistantUnavailable => {
+                p.status = Some("assistant definition is unavailable; run cockpit doctor".into());
+                return;
+            }
         };
         let load_result = match &source {
             AgentRowSource::Agent => cockpit_core::agents::parse_agent(
@@ -910,6 +943,7 @@ impl SettingsCx {
             AgentRowSource::Assistant { .. } => {
                 cockpit_core::agents::parse_daemon_local_markdown(&original_text, &name)
             }
+            AgentRowSource::AssistantUnavailable => unreachable!("handled above"),
         };
         let def = match load_result {
             Ok(def) => def,
@@ -1033,10 +1067,26 @@ impl SettingsCx {
             return;
         };
         let name = row.name.clone();
-        if matches!(&row.source, AgentRowSource::Assistant { .. }) {
-            p.status =
-                Some("assistant raw editing is unavailable from the agent-file editor".into());
-            return;
+        match &row.source {
+            AgentRowSource::Assistant { markdown, revision } => {
+                p.editing = Some(AgentEditor::new_assistant(
+                    name,
+                    PathBuf::from("<daemon-assistant-definition>"),
+                    markdown,
+                    self.extended.tui.vim_mode.vim_enabled(),
+                    revision.clone(),
+                ));
+                p.status = None;
+                return;
+            }
+            AgentRowSource::AssistantUnavailable => {
+                p.status = Some(
+                    "assistant definition is unavailable; editing requires a valid daemon revision"
+                        .into(),
+                );
+                return;
+            }
+            AgentRowSource::Agent => {}
         }
         let cwd = self.agents_cwd();
 
@@ -1124,10 +1174,26 @@ impl SettingsCx {
             return;
         };
         let name = row.name.clone();
-        if matches!(&row.source, AgentRowSource::Assistant { .. }) {
-            p.status =
-                Some("assistant raw editing is unavailable from the agent-file editor".into());
-            return;
+        match &row.source {
+            AgentRowSource::Assistant { markdown, revision } => {
+                p.editing = Some(AgentEditor::new_assistant(
+                    name,
+                    PathBuf::from("<daemon-assistant-definition>"),
+                    markdown,
+                    self.extended.tui.vim_mode.vim_enabled(),
+                    revision.clone(),
+                ));
+                p.status = None;
+                return;
+            }
+            AgentRowSource::AssistantUnavailable => {
+                p.status = Some(
+                    "assistant definition is unavailable; editing requires a valid daemon revision"
+                        .into(),
+                );
+                return;
+            }
+            AgentRowSource::Agent => {}
         }
         let cwd = self.agents_cwd();
         let snapshot = match editable_agent_snapshot(&cwd, &name) {
@@ -1162,19 +1228,53 @@ impl SettingsCx {
             p.status = Some("built-in agents cannot be deleted (use r/R to reset)".into());
             return;
         }
+        if matches!(&row.source, AgentRowSource::AssistantUnavailable) {
+            p.status = Some(
+                "assistant definition is unavailable; deletion requires a valid daemon revision"
+                    .into(),
+            );
+            return;
+        }
         let name = row.name.clone();
         if p.delete.activate() == ResetOutcome::Armed {
             p.status = Some(format!("delete `{name}`? press d again to confirm"));
             return;
         }
         let cwd = self.agents_cwd();
-        match agent_snapshot(&cwd, &name).and_then(|snapshot| {
-            mutate_agent(
-                &cwd,
-                cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name: name.clone() },
-                Some(snapshot.revision),
-            )
-        }) {
+        let result = match &row.source {
+            AgentRowSource::Assistant { revision, .. } => {
+                crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                        name: name.clone(),
+                        expected_revision: revision.clone(),
+                    },
+                )
+                .and_then(|response| match response {
+                    cockpit_core::daemon::proto::Response::AssistantDeleted { deleted: true } => {
+                        Ok(())
+                    }
+                    other => Err(format!("unexpected assistant delete response: {other:?}")),
+                })
+            }
+            AgentRowSource::AssistantUnavailable => Err(
+                "assistant definition is unavailable; deletion requires a valid revision".into(),
+            ),
+            AgentRowSource::Agent => agent_snapshot(&cwd, &name).and_then(|snapshot| {
+                mutate_agent(
+                    &cwd,
+                    cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name: name.clone() },
+                    Some(snapshot.revision),
+                )
+                .map(|_| ())
+            }),
+        };
+        let is_assistant = matches!(&row.source, AgentRowSource::Assistant { .. });
+        match result {
+            Ok(_) if is_assistant => {
+                p.status = Some(format!(
+                    "unregistered assistant `{name}`; its home was retained"
+                ))
+            }
             Ok(_) => p.status = Some(format!("deleted custom agent `{name}`")),
             Err(error) => p.status = Some(format!("delete failed: {error}")),
         }
@@ -1355,10 +1455,9 @@ impl SettingsCx {
         push_wrapped_text(
             &mut lines,
             area.width,
-            "Enter opens a structured tool editor; e opens the raw \
-             .cockpit/agents/<name>.md file ($EDITOR, else in-TUI). Editing a built-in ejects its default first. The model is \
-             the `model:` frontmatter field (provider/model). Delete removes a \
-             custom agent; reset reverts an overridden built-in.",
+            "Enter opens a structured tool editor; e edits a daemon snapshot. \
+             Workspace agents can use $EDITOR through a leased staging file; assistants use the in-TUI editor. Editing a built-in ejects its default first. The model is \
+             the `model:` frontmatter field (provider/model). Delete uses the source-specific daemon authority; reset reverts an overridden built-in.",
             muted,
         );
         controls.resize(lines.len(), None);
@@ -1377,7 +1476,12 @@ impl SettingsCx {
             let tag = match row.kind {
                 AgentKind::Builtin { overridden: true } => " (built-in, overridden)",
                 AgentKind::Builtin { overridden: false } => " (built-in)",
-                AgentKind::Custom if matches!(row.source, AgentRowSource::Assistant { .. }) => {
+                AgentKind::Custom
+                    if matches!(
+                        &row.source,
+                        AgentRowSource::Assistant { .. } | AgentRowSource::AssistantUnavailable
+                    ) =>
+                {
                     " (assistant)"
                 }
                 AgentKind::Custom => " (custom)",
@@ -1421,24 +1525,36 @@ impl SettingsCx {
                     true,
                     None,
                 )));
-                lines.push(Line::from("[Edit raw file]"));
-                controls.push(Some((
-                    super::pointer_actions::SettingsPointerAction::Agents(
-                        super::pointer_actions::AgentsAction::Edit(id.clone()),
-                    ),
-                    true,
-                    None,
-                )));
-                selected_action_line = Some(lines.len() - 1);
-                let row_action = match &row.kind {
-                    AgentKind::Custom => Some((
+                if !matches!(&row.source, AgentRowSource::AssistantUnavailable) {
+                    let label = if matches!(&row.source, AgentRowSource::Assistant { .. }) {
+                        "[Edit definition]"
+                    } else {
+                        "[Edit raw file]"
+                    };
+                    lines.push(Line::from(label));
+                    controls.push(Some((
+                        super::pointer_actions::SettingsPointerAction::Agents(
+                            super::pointer_actions::AgentsAction::Edit(id.clone()),
+                        ),
+                        true,
+                        None,
+                    )));
+                    selected_action_line = Some(lines.len() - 1);
+                }
+                let row_action = match (&row.source, &row.kind) {
+                    (AgentRowSource::Assistant { .. }, _) => Some((
+                        "[Unregister]",
+                        super::pointer_actions::AgentsAction::Delete(id.clone()),
+                    )),
+                    (AgentRowSource::AssistantUnavailable, _) => None,
+                    (AgentRowSource::Agent, AgentKind::Custom) => Some((
                         "[Delete]",
                         super::pointer_actions::AgentsAction::Delete(id.clone()),
                     )),
-                    AgentKind::Builtin { overridden: true } => {
+                    (AgentRowSource::Agent, AgentKind::Builtin { overridden: true }) => {
                         Some(("[Reset]", super::pointer_actions::AgentsAction::Reset(id)))
                     }
-                    AgentKind::Builtin { overridden: false } => None,
+                    (AgentRowSource::Agent, AgentKind::Builtin { overridden: false }) => None,
                 };
                 if let Some((label, action)) = row_action {
                     lines.push(Line::from(label));

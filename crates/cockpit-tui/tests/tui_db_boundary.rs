@@ -119,6 +119,7 @@ fn tui_agent_authority_is_daemon_owned() {
         "BeginAgentEditorLease",
         "CompleteAgentEditorLease",
         "SaveAssistantDefinition",
+        "DeleteAssistant",
     ] {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }
@@ -179,15 +180,21 @@ fn full_production_tree_rejects_agent_and_config_authority() {
 #[test]
 fn production_filesystem_mutations_have_device_ui_owners() {
     const MUTATIONS: &[&str] = &[
-        "std::fs::write(",
-        "std::fs::remove_file(",
-        "std::fs::remove_dir(",
-        "std::fs::rename(",
-        "std::fs::create_dir(",
-        "std::fs::create_dir_all(",
+        "std::fs::write",
+        "std::fs::remove_file",
+        "std::fs::remove_dir",
+        "std::fs::rename",
+        "std::fs::create_dir",
+        "std::fs::create_dir_all",
+        "std::fs::set_permissions",
+        "std::fs::File::create",
+        "File::create",
         "std::fs::OpenOptions",
-        "tokio::fs::write(",
-        "tokio::fs::remove_file(",
+        "tokio::fs::write",
+        "tokio::fs::remove_file",
+        "tokio::fs::create_dir_all",
+        "tokio::fs::set_permissions",
+        ".write_all(",
     ];
     // Every exception is a single reviewed source line, not a whole-file
     // exemption. Adding a second mutation in an allowed host-integration file
@@ -199,7 +206,7 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         (
             "crates/cockpit-tui/src/tui/app/panes.rs",
-            "std::fs::write(&path, effect.text_before_launch)",
+            "if let Err(error) = std::fs::write(&path, effect.text_before_launch) {",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -207,7 +214,15 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
+            "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
             "let mut file = std::fs::OpenOptions::new()",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -218,12 +233,52 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             "let _ = tokio::fs::remove_file(entry.path()).await",
         ),
         (
+            "crates/cockpit-tui/src/tui/app/export_actions.rs",
+            "tokio::fs::create_dir_all(exports_dir)",
+        ),
+        (
             "crates/cockpit-tui/src/clipboard/recovery/unix.rs",
-            "std::fs::create_dir_all(parent).map_err",
+            "std::fs::create_dir_all(parent).map_err(|e| io_err(\"creating state directory\", e))?;",
         ),
         (
             "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
             "std::fs::create_dir_all(parent)?",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/settings/category.rs",
+            "temp.write_all(text.as_bytes())",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/panes.rs",
+            "if let Err(e) = temp.write_all(editor_text.as_bytes()) {",
+        ),
+        (
+            "crates/cockpit-tui/src/clipboard/service.rs",
+            "let _ = stdin.write_all(text.as_bytes());",
+        ),
+        (
+            "crates/cockpit-tui/src/clipboard/executable.rs",
+            "let _ = stdin.write_all(bytes);",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/mod.rs",
+            "let _ = out.write_all(sequence.as_bytes());",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/mod.rs",
+            "let _ = out.write_all(b\"\\x07\");",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/mod.rs",
+            "let _ = out.write_all(escapes.as_bytes());",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/pty.rs",
+            "let _ = self.writer.write_all(bytes);",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/links.rs",
+            "lock.write_all(&bytes)?;",
         ),
     ];
     fn visit(path: &Path, findings: &mut Vec<String>) {
@@ -249,13 +304,17 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                 .unwrap_or(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
             for (line_number, line) in production.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
                 for mutation in MUTATIONS {
                     if !line.contains(mutation) {
                         continue;
                     }
                     let allowed = ALLOWED_LINES
                         .iter()
-                        .any(|(file, exact)| relative == *file && line.contains(exact));
+                        .any(|(file, exact)| relative == *file && line.trim() == *exact);
                     if !allowed {
                         findings.push(format!("{relative}:{}: {mutation}", line_number + 1));
                     }
@@ -265,6 +324,28 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                 findings.push(format!(
                     "{relative}: filesystem alias obscures authority audit"
                 ));
+            }
+            for line in production.lines().map(str::trim) {
+                let imports_mutation = (line.starts_with("use std::fs::")
+                    || line.starts_with("use tokio::fs::"))
+                    && [
+                        "write",
+                        "remove_file",
+                        "remove_dir",
+                        "rename",
+                        "create_dir",
+                        "create_dir_all",
+                        "set_permissions",
+                    ]
+                    .iter()
+                    .any(|name| line.contains(name));
+                if imports_mutation
+                    || (line.starts_with("use ") && line.contains(" as ") && line.contains("fs::"))
+                {
+                    findings.push(format!(
+                        "{relative}: filesystem mutation import/alias obscures authority audit: {line}"
+                    ));
+                }
             }
         }
     }

@@ -2586,20 +2586,27 @@ BEGIN
            AND json_type(NEW.data_json, '$.artifact_projection.host_dropped_bytes') = 'integer'
            AND json_extract(NEW.data_json, '$.artifact_projection.host_dropped_bytes') = json_extract(NEW.data_json, '$.artifact_projection.host_original_bytes') - json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
            AND json_type(NEW.data_json, '$.artifact_projection.stored_source_bytes') = 'integer'
-           AND json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes') BETWEEN 1 AND json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
-	           AND json_type(NEW.data_json, '$.artifact_projection.content_bytes') = 'integer'
-	           AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') = json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes')
-	           -- `artifact_limit` means this exact candidate exceeded the per-artifact
-	           -- cap; `session_quota` is only meaningful for a candidate that could
-	           -- otherwise fit.  Keep that closed durable meaning true even when a
-	           -- direct SQL caller writes an unavailable-only projection with no ref.
-	           AND (json_extract(NEW.data_json, '$.artifact_projection.status') = 'available'
-	                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'artifact_limit'
-	                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') > 8388608)
-	                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'session_quota'
-	                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') <= 8388608))
-	           AND json_type(NEW.data_json, '$.artifact_projection.line_count') = 'integer'
-           AND json_extract(NEW.data_json, '$.artifact_projection.line_count') >= 1
+           AND (json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes') BETWEEN 1 AND json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
+                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'persistence_unavailable'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes') = 0))
+           AND json_type(NEW.data_json, '$.artifact_projection.content_bytes') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') = json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes')
+           -- `artifact_limit` means this exact candidate exceeded the per-artifact
+           -- cap; `session_quota` is only meaningful for a candidate that could
+           -- otherwise fit; `persistence_unavailable` owns no stored body at all.
+           -- Keep that closed durable meaning true even when a direct SQL caller
+           -- writes an unavailable-only projection with no ref.
+           AND (json_extract(NEW.data_json, '$.artifact_projection.status') = 'available'
+                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'artifact_limit'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') > 8388608)
+                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'session_quota'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') <= 8388608)
+                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'persistence_unavailable'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') = 0))
+           AND json_type(NEW.data_json, '$.artifact_projection.line_count') = 'integer'
+           AND (json_extract(NEW.data_json, '$.artifact_projection.line_count') >= 1
+                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'persistence_unavailable'
+                    AND json_extract(NEW.data_json, '$.artifact_projection.line_count') = 0))
            AND json_type(NEW.data_json, '$.artifact_projection.preview_head') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.preview_tail') = 'text'
            AND json_type(NEW.data_json, '$.artifact_projection.provenance') = 'object'

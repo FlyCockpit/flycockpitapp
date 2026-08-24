@@ -704,7 +704,7 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
 /// — which is exactly why 90 (body 86) still failed the exhaustiveness
 /// assertions. Render these fixtures tall enough that every page fits on
 /// screen (offset stays 0) and every control target is registered.
-const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 98;
+const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 120;
 
 /// Real rendered/reducer regressions reused by the named pointer acceptance
 /// suites. Keeping these here lets them share the same concrete page fixtures

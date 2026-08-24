@@ -3470,6 +3470,8 @@ mod tests {
         .history;
 
         assert_eq!(history.len(), 3);
+        eprintln!("DEBUG live_prelude = {live_prelude:?}");
+        eprintln!("DEBUG history = {history:?}");
         assert_eq!(&history[..2], live_prelude.as_slice());
         assert!(matches!(
             &history[0],
@@ -4053,7 +4055,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let calls = assistant_calls(&r.history[1]);
+        // Skill-slash rebuilds the seed pair before the retained user
+        // envelope, so the assistant is at index 0 and the result at 1.
+        let calls = assistant_calls(&r.history[0]);
         assert_eq!(calls[0].id, call_id);
         assert_eq!(
             calls[0]
@@ -4062,7 +4066,7 @@ mod tests {
                 .map(|provider| provider.call_id.as_str()),
             Some(call_id)
         );
-        let results = tool_results(&r.history[2]);
+        let results = tool_results(&r.history[1]);
         assert_eq!(results[0].call, call_id);
         assert_eq!(
             results[0]
@@ -4251,7 +4255,13 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let calls = assistant_calls(&r.history[1]);
+            // Skill-slash events rebuild the seed pair (assistant call +
+            // result) before the retained user envelope, so the assistant
+            // is at index 0 and the result at index 1. Non-skill events
+            // keep the user message first, so the assistant is at index 1
+            // and the result at index 2.
+            let (assistant_idx, results_idx) = if is_skill { (0, 1) } else { (1, 2) };
+            let calls = assistant_calls(&r.history[assistant_idx]);
             assert_eq!(calls[0].id, call_id);
             assert_eq!(
                 calls[0]
@@ -4260,7 +4270,7 @@ mod tests {
                     .map(|provider| provider.call_id.as_str()),
                 Some(call_id)
             );
-            let results = tool_results(&r.history[2]);
+            let results = tool_results(&r.history[results_idx]);
             assert_eq!(results[0].call, call_id);
             assert_eq!(
                 results[0]

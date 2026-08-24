@@ -3250,7 +3250,10 @@ mod tests {
     async fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
         db.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET last_active_at = last_active_at - ?1 WHERE session_id = ?2",
+                "UPDATE sessions
+                    SET started_at = started_at - ?1,
+                        last_active_at = last_active_at - ?1
+                  WHERE session_id = ?2",
                 params![seconds, session_id.to_string()],
             )
             .context("backdating session")?;

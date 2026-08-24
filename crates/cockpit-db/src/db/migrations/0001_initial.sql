@@ -19,8 +19,12 @@ CREATE TABLE assistants (
     name         TEXT    PRIMARY KEY,
     created_at   INTEGER NOT NULL,
     home_dir     TEXT    NOT NULL,
-    config_json  TEXT    NOT NULL DEFAULT '{}',
-    content_hash TEXT    NOT NULL
+    config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(config_json)),
+    content_hash TEXT    NOT NULL CHECK (
+        length(content_hash) = 64
+        AND content_hash = lower(content_hash)
+        AND content_hash NOT GLOB '*[^0-9a-f]*'
+    )
 );
 
 -- ---- scheduled_jobs --------------------------------------------------------
@@ -28,16 +32,16 @@ CREATE TABLE assistants (
 CREATE TABLE scheduled_jobs (
     id                TEXT    PRIMARY KEY,
     owner             TEXT    NOT NULL,
-    schedule_json     TEXT    NOT NULL,
-    payload_json      TEXT    NOT NULL,
+    schedule_json     TEXT    NOT NULL CHECK (json_valid(schedule_json)),
+    payload_json      TEXT    NOT NULL CHECK (json_valid(payload_json)),
     enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
     created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
     last_run_at       INTEGER,
     next_run_at       INTEGER,
-    last_result_json  TEXT,
-    failure_count     INTEGER NOT NULL DEFAULT 0,
+    last_result_json  TEXT CHECK (last_result_json IS NULL OR json_valid(last_result_json)),
+    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
     backoff_until     INTEGER,
     disabled_notice   TEXT
 );
@@ -55,16 +59,22 @@ CREATE TABLE sessions (
     project_id      TEXT    NOT NULL,
     project_root    TEXT    NOT NULL,
     started_at      INTEGER NOT NULL,            -- epoch seconds
-    last_active_at  INTEGER NOT NULL,
-    ended_at        INTEGER,
+    last_active_at  INTEGER NOT NULL CHECK (last_active_at >= started_at),
+    ended_at        INTEGER CHECK (ended_at IS NULL OR ended_at >= started_at),
     provider        TEXT,
     model           TEXT,
-    model_selection_json TEXT,
+    model_selection_json TEXT CHECK (
+        model_selection_json IS NULL OR json_valid(model_selection_json)
+    ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0,
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
-    tool_surface_override_json TEXT,
-    goal_settings_override_json TEXT,
+    tool_surface_override_json TEXT CHECK (
+        tool_surface_override_json IS NULL OR json_valid(tool_surface_override_json)
+    ),
+    goal_settings_override_json TEXT CHECK (
+        goal_settings_override_json IS NULL OR json_valid(goal_settings_override_json)
+    ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
     assistant_name  TEXT,
 

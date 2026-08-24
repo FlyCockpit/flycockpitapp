@@ -704,6 +704,11 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .context("enabling foreign_keys")?;
     if on_disk {
+        // Durable daemon acknowledgements mean the WAL commit has crossed the
+        // operating-system durability boundary. Do not inherit SQLite build or
+        // environment defaults for this contract.
+        conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 1000;")
+            .context("setting SQLite durability policy")?;
         // `pragma_update` doesn't accept the kind of literal that
         // `journal_mode = WAL` needs; the query-row form does. The
         // return value is the resolved mode — we don't use it but a
@@ -725,6 +730,7 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
+    profile_sql: &'static str,
 }
 
 /// All schema migrations in version order. Pre-release: fold schema changes
@@ -732,6 +738,10 @@ struct Migration {
 const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
+    #[cfg(not(feature = "remote"))]
+    profile_sql: include_str!("migrations/0001_local_profile.sql"),
+    #[cfg(feature = "remote")]
+    profile_sql: "",
 }];
 
 /// Latest schema version understood by this build.
@@ -745,25 +755,88 @@ fn backup_before_pending_migration(
     path: &Path,
     migration_count: usize,
 ) -> Result<()> {
-    if current_schema_version(conn)? >= migration_count as i64 {
+    let backup_reason = prerelease_backup_reason(conn, migration_count)?;
+    let Some((schema_version, reason)) = backup_reason else {
         return Ok(());
-    }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .context("checkpointing database before migration backup")?;
+    };
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let backup = path.with_extension(format!("backup-{stamp}.sqlite"));
-    std::fs::copy(path, &backup).with_context(|| {
+    let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
+    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        .with_context(|| {
         format!(
-            "backing up {} before migration to {}",
+            "creating SQLite online backup of {} at {} before {reason}",
             path.display(),
             backup.display()
         )
     })?;
     files::repair_private_file(&backup, "database backup")?;
+    validate_migration_backup(&backup)?;
+    fsync_file_and_parent(&backup)?;
     prune_migration_backups(path)?;
+    Ok(())
+}
+
+/// Decide whether opening an existing prerelease database must first preserve
+/// a consistent recovery snapshot. This check intentionally understands the
+/// legacy ledger shape so we never select a column that an older v1 lacks.
+fn prerelease_backup_reason(
+    conn: &Connection,
+    migration_count: usize,
+) -> Result<Option<(i64, &'static str)>> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(None);
+    }
+    let columns = table_columns(conn, "schema_version")?;
+    if !columns.iter().any(|column| column == "schema_fingerprint") {
+        let version = legacy_schema_version(conn)?;
+        return Ok(Some((version, "rejecting a legacy prerelease schema ledger")));
+    }
+    let version = current_schema_version(conn)?;
+    if version < migration_count as i64 {
+        return Ok(Some((version, "applying a pending migration")));
+    }
+    if version == 1 {
+        let recorded: String = conn
+            .query_row("SELECT sha256 FROM schema_version WHERE version = 1", [], |row| {
+                row.get(0)
+            })
+            .context("reading prerelease v1 migration checksum")?;
+        if recorded != migration_definition_hash(&MIGRATIONS[0]) {
+            return Ok(Some((version, "rejecting an amended prerelease v1")));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_migration_backup(path: &Path) -> Result<()> {
+    let backup = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening migration backup {}", path.display()))?;
+    let result: String = backup
+        .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+        .context("validating migration backup with quick_check")?;
+    if result != "ok" {
+        anyhow::bail!(
+            "migration backup {} failed SQLite quick_check: {result}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn fsync_file_and_parent(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("opening migration backup {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("fsyncing migration backup {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -774,7 +847,7 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
     let prefix = format!(
         "{}{}",
         path.file_stem().unwrap_or_default().to_string_lossy(),
-        ".backup-"
+        "."
     );
     let mut backups = std::fs::read_dir(parent)?
         .flatten()
@@ -782,7 +855,10 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
         .filter(|candidate| {
             candidate
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                .is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(&prefix) && name.contains(".backup-") && name.ends_with(".sqlite")
+                })
         })
         .collect::<Vec<_>>();
     backups.sort();
@@ -803,28 +879,103 @@ fn migration_hash(sql: &str) -> String {
         .collect()
 }
 
+fn migration_definition_hash(migration: &Migration) -> String {
+    let mut definition = String::with_capacity(migration.sql.len() + migration.profile_sql.len());
+    definition.push_str(migration.sql);
+    definition.push_str(migration.profile_sql);
+    migration_hash(&definition)
+}
+
+/// Hash the exact persisted DDL text for every application-owned table,
+/// index, trigger, and view. This is deliberately an exact-DDL fingerprint,
+/// not a semantic schema hash: formatting or equivalent rewritten SQL is an
+/// amended prerelease schema and requires controlled recovery.
+fn exact_ddl_fingerprint(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') \
+         FROM sqlite_schema \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name, tbl_name",
+    )?;
+    let mut canonical = String::new();
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (kind, name, table, sql) = row?;
+        use std::fmt::Write as _;
+        writeln!(&mut canonical, "{kind}\0{name}\0{table}\0{sql}")?;
+    }
+    Ok(migration_hash(&canonical))
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     let mut stmt =
-        conn.prepare("SELECT version, name, sha256 FROM schema_version ORDER BY version")?;
+        conn.prepare(
+            "SELECT version, name, sha256, schema_fingerprint \
+             FROM schema_version ORDER BY version",
+        )?;
+    let mut expected_version = 1_i64;
     for row in stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })? {
-        let (version, name, hash) = row?;
+        let (version, name, hash, fingerprint) = row?;
+        if version != expected_version {
+            anyhow::bail!(
+                "database migration ledger is corrupt: expected version {expected_version}, found {version}"
+            );
+        }
         if version > migrations.len() as i64 {
-            anyhow::bail!("database migration ledger is newer than this binary");
+            anyhow::bail!(
+                "incompatible prerelease database schema v{version}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+                migrations.len()
+            );
+        }
+        if !is_lower_hex_64(&hash) || !is_lower_hex_64(&fingerprint) {
+            anyhow::bail!(
+                "database migration ledger is corrupt at version {version}: hashes must be 64 lowercase hexadecimal characters"
+            );
         }
         let expected = &migrations[(version - 1) as usize];
         let expected_name = expected.name;
-        let expected_hash = migration_hash(expected.sql);
+        let expected_hash = migration_definition_hash(expected);
         if name != expected_name || hash != expected_hash {
             anyhow::bail!(
                 "migration checksum mismatch for {expected_name}: applied migration was amended"
             );
         }
+        if version == current_schema_version(conn)? && fingerprint != exact_ddl_fingerprint(conn)? {
+            anyhow::bail!(
+                "database schema fingerprint mismatch at migration {version}: schema objects were altered or are missing"
+            );
+        }
+        expected_version += 1;
+    }
+    Ok(())
+}
+
+fn verify_user_version(conn: &Connection, ledger_version: i64) -> Result<()> {
+    let user_version = sqlite_schema_version(conn)?;
+    if user_version != ledger_version {
+        anyhow::bail!(
+            "database schema version is inconsistent: migration ledger is {ledger_version}, SQLite user_version is {user_version}"
+        );
     }
     Ok(())
 }
@@ -837,9 +988,13 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
 /// migrations; migration SQL must not emit `PRAGMA foreign_keys` itself
 /// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
+    verify_supported_ledger_shape(conn)?;
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock > migrations.len() as i64 {
-        anyhow::bail!("database migration ledger is newer than this binary");
+        anyhow::bail!(
+            "incompatible prerelease database schema v{current_before_lock}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+            migrations.len()
+        );
     }
 
     let fk_was_on = foreign_keys_enabled(conn).context("reading foreign_keys pragma")?;
@@ -850,12 +1005,21 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             .context("database is busy applying migrations")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);",
+            "CREATE TABLE IF NOT EXISTS schema_version (\
+                version INTEGER PRIMARY KEY CHECK (version > 0), \
+                name TEXT NOT NULL CHECK (length(name) > 0), \
+                sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
+                schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
+                applied_at TEXT NOT NULL\
+            );",
         )
         .context("creating schema_version table")?;
 
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
+        if current > 0 {
+            verify_user_version(conn, current)?;
+        }
 
         for (i, migration) in migrations.iter().enumerate() {
             let version = (i as i64) + 1;
@@ -864,14 +1028,26 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
+            if !migration.profile_sql.is_empty() {
+                conn.execute_batch(migration.profile_sql)
+                    .with_context(|| format!("applying migration {version} build profile"))?;
+            }
+            let fingerprint = exact_ddl_fingerprint(conn)?;
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
-                rusqlite::params![version, migration.name, migration_hash(migration.sql)],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+                rusqlite::params![
+                    version,
+                    migration.name,
+                    migration_definition_hash(migration),
+                    fingerprint
+                ],
             )
             .with_context(|| format!("recording migration {version}"))?;
         }
 
         conn.pragma_update(None, "user_version", migrations.len() as i64)?;
+        verify_ledger(conn, migrations)?;
+        verify_user_version(conn, migrations.len() as i64)?;
 
         if fk_was_on {
             foreign_key_check(conn).context("validating migration foreign keys")?;
@@ -906,16 +1082,74 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(exists != 0)
 }
 
-fn current_schema_version(conn: &Connection) -> Result<i64> {
-    if !table_exists(conn, "schema_version")? {
-        return Ok(0);
-    }
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let quoted = table.replace('"', "\"\"");
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info(\"{quoted}\");"))
+        .with_context(|| format!("inspecting `{table}` columns"))?;
+    stmt.query_map([], |row| row.get(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("decoding `{table}` columns"))
+}
+
+fn legacy_schema_version(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
         |row| row.get(0),
     )
-    .context("reading current schema version")
+    .context("reading legacy prerelease schema version")
+}
+
+fn verify_supported_ledger_shape(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(());
+    }
+    let columns = table_columns(conn, "schema_version")?;
+    const REQUIRED: &[&str] = &[
+        "version",
+        "name",
+        "sha256",
+        "schema_fingerprint",
+        "applied_at",
+    ];
+    let missing = REQUIRED
+        .iter()
+        .copied()
+        .filter(|required| !columns.iter().any(|column| column == required))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let version = legacy_schema_version(conn)?;
+        anyhow::bail!(
+            "incompatible legacy prerelease database schema v{version}: migration ledger is missing {}. A validated backup was created; move the database aside and restart to create the local v0.1 schema, or restore it with a compatible older binary",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn current_schema_version(conn: &Connection) -> Result<i64> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(0);
+    }
+    let (count, minimum, maximum): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(version), MAX(version) FROM schema_version",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .context("reading current schema version")?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let minimum = minimum.context("migration ledger has no minimum version")?;
+    let maximum = maximum.context("migration ledger has no maximum version")?;
+    if minimum != 1 || maximum != count {
+        anyhow::bail!(
+            "database migration ledger is corrupt: expected contiguous versions 1 through {count}, found {minimum} through {maximum}"
+        );
+    }
+    Ok(maximum)
 }
 
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
@@ -985,6 +1219,7 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
+                profile_sql: "",
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
@@ -1165,6 +1400,28 @@ mod tests {
     }
 
     #[test]
+    fn user_version_drift_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(error.contains("user_version"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn altered_schema_fingerprint_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn.execute_batch("DROP INDEX idx_scheduled_jobs_owner;")
+            .unwrap();
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(
+            error.contains("schema fingerprint mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn amended_migration_is_refused() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ledger.db");
@@ -1237,12 +1494,18 @@ mod tests {
     fn newer_database_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
-        conn.execute("INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (99, \"future\", \"future\", \"now\")", []).unwrap();
+        let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+        let future_hash = migration_hash("future");
+        conn.execute(
+            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at) VALUES (2, 'future', ?1, ?2, 'now')",
+            rusqlite::params![future_hash, fingerprint],
+        )
+        .unwrap();
         assert!(
             migrate_with(&conn, MIGRATIONS)
                 .unwrap_err()
                 .to_string()
-                .contains("newer")
+                .contains("incompatible prerelease database schema v2")
         );
     }
 
@@ -1253,16 +1516,18 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             migrate_with(&conn, MIGRATIONS).unwrap();
+            let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+            let future_hash = migration_hash("future");
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, applied_at)
-                 VALUES (2, 'future', 'future', 'now')",
-                [],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at)
+                 VALUES (2, 'future', ?1, ?2, 'now')",
+                rusqlite::params![future_hash, fingerprint],
             )
             .unwrap();
         }
         let err = Db::open(&path).unwrap_err().to_string();
         assert!(
-            err.contains("newer than this binary"),
+            err.contains("incompatible prerelease database schema v2"),
             "future v2 must fail closed, not recreate: {err}"
         );
         assert!(
@@ -1919,12 +2184,20 @@ mod tests {
             .execute_batch(&format!(
                 r#"
                 BEGIN IMMEDIATE;
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, schema_fingerprint TEXT, applied_at TEXT);
                 CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);
-                INSERT INTO schema_version (version, name, sha256, applied_at)
-                    VALUES (1, '0001_test.sql', '{probe_hash}', CURRENT_TIMESTAMP);
+                INSERT INTO schema_version (version, name, sha256, schema_fingerprint, applied_at)
+                    VALUES (1, '0001_test.sql', '{probe_hash}', '', CURRENT_TIMESTAMP);
+                PRAGMA user_version = 1;
                 "#,
             ))
+            .unwrap();
+        let fingerprint = exact_ddl_fingerprint(&conn_a).unwrap();
+        conn_a
+            .execute(
+                "UPDATE schema_version SET schema_fingerprint = ?1 WHERE version = 1",
+                [fingerprint],
+            )
             .unwrap();
 
         let path_for_thread = path.clone();

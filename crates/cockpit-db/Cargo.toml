@@ -9,6 +9,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# FlyCockpit service synchronization, remote principals, and remote attachment
+# ledgers are excluded from the public local v0.1 dependency surface.
+default = []
+remote = []
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }

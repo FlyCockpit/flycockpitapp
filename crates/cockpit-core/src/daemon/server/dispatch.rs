@@ -1516,6 +1516,8 @@ async fn begin_remote_idempotent_adapter(
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict
         | crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation has an indeterminate persisted outcome; it will not be retried".into() }),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::AttachmentLedgerCapacity =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
     }
@@ -2512,7 +2514,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         (result, None, false)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -2792,7 +2795,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         Ok(response)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -2859,7 +2863,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         Ok(response)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3009,7 +3014,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let receipt = match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3140,7 +3146,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let receipt = match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3252,7 +3259,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         }
                         Ok(response)
                     }
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3315,7 +3323,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3360,7 +3369,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -3405,7 +3415,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -5851,7 +5862,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
@@ -5931,7 +5943,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
                     | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };

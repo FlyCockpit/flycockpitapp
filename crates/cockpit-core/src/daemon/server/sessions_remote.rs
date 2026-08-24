@@ -134,7 +134,8 @@ where
             serde_json::from_slice(&bytes).map_err(internal)
         }
         TransactionalRemoteOperationOutcome::OperationConflict
-        | TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload {
+        | TransactionalRemoteOperationOutcome::OperationActorConflict
+        | TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "remote operation conflict".into(),
         }),

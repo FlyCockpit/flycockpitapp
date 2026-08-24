@@ -498,7 +498,7 @@ pub(super) async fn reserve_remote_send_operation_impl(
             RemoteSendDecision::Replayed
         }
         Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict)
-        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
             RemoteSendDecision::Rejected(proto::ErrorPayload {
                 code: proto::ErrorCode::Conflict,
                 message: "remote operation conflict".into(),
@@ -977,7 +977,7 @@ async fn commit_remote_queue_mutation(
             send_terminal_receipts_event(event_tx, redaction, session_id, &receipts, disposition);
             Ok(receipt)
         }
-        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
             if let Some(staged) = staged.as_ref() { queue.abort_staged_removal(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })
         }
@@ -2978,7 +2978,7 @@ pub(super) async fn run_worker(
                                 }
                                 Err(error) => { let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() })); continue; }
                             },
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.abort_staged_removal(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })); continue;
                             }

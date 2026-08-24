@@ -124,6 +124,7 @@ pub enum TransactionalRemoteOperationOutcome<T> {
     Replay(Vec<u8>),
     OperationConflict,
     OperationActorConflict,
+    ExistingIndeterminate,
     AttachmentLedgerCapacity,
     AttachmentOutboxCapacity,
 }
@@ -150,6 +151,7 @@ pub enum BeginIdempotentAdapterRemoteOperationOutcome {
     Replay(Vec<u8>),
     OperationConflict,
     OperationActorConflict,
+    ExistingIndeterminate,
     AttachmentLedgerCapacity,
 }
 
@@ -498,25 +500,9 @@ impl Db {
                         .context("committed operation missing safe response")?,
                 ))
             }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
-                let generation: i64 = conn.query_row(
-                    "UPDATE remote_attachment_operations
-                     SET dispatch_generation=dispatch_generation+1, updated_at_ms=?3
-                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='dispatched'
-                     RETURNING dispatch_generation",
-                    params![
-                        owned.logical_attachment_id,
-                        owned.operation_id,
-                        owned.now_ms
-                    ],
-                    |row| row.get(0),
-                )?;
-                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
-                    operation_seq: replay.operation_seq,
-                    dispatch_generation: generation.try_into()?,
-                })
+            ReserveRemoteOperationOutcome::Replay(_) => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate)
             }
-            ReserveRemoteOperationOutcome::Replay(_) => bail!("invalid adapter replay state"),
             ReserveRemoteOperationOutcome::OperationConflict => {
                 Ok(BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict)
             }
@@ -961,7 +947,7 @@ impl Db {
                 ))
             }
             ReserveRemoteOperationOutcome::Replay(_) => {
-                bail!("transactional remote operation is indeterminate")
+                Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
             }
             ReserveRemoteOperationOutcome::OperationConflict => {
                 Ok(TransactionalRemoteOperationOutcome::OperationConflict)
@@ -1106,10 +1092,10 @@ impl Db {
                         Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
                     }
                     CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        bail!("adapter operation ledger capacity")
+                        Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
                     }
                     CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        bail!("adapter operation outbox capacity")
+                        Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
                     }
                 }
             }
@@ -1120,7 +1106,9 @@ impl Db {
                         .context("committed adapter operation missing safe response")?,
                 ))
             }
-            ReserveRemoteOperationOutcome::Replay(_) => bail!("adapter operation is indeterminate"),
+            ReserveRemoteOperationOutcome::Replay(_) => {
+                Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
+            }
             ReserveRemoteOperationOutcome::OperationConflict => {
                 Ok(TransactionalRemoteOperationOutcome::OperationConflict)
             }
@@ -2548,7 +2536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_dispatch_generation_advances_for_reconciliation_then_replays_commit() {
+    async fn adapter_dispatch_is_indeterminate_until_durable_commit_then_replays() {
         let db = Db::open_in_memory().unwrap();
         let operation = "01890f3e-4c00-7000-8000-00000000009d";
         let request = || ReserveRemoteOperation {
@@ -2568,10 +2556,7 @@ mod tests {
             db.begin_idempotent_adapter_remote_operation(request())
                 .await
                 .unwrap(),
-            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
-                dispatch_generation: 2,
-                ..
-            }
+            BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate
         ));
         db.commit_remote_attachment_operation(CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,

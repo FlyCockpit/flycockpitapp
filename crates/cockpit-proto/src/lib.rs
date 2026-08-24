@@ -1017,12 +1017,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 ///
 /// Current wire schema version. v12 adds daemon-owned agent installation RPCs.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 12.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 13.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Oldest wire schema version this binary accepts. v12 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 12;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 13;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3361,7 +3361,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[12];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[13];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -3443,6 +3444,7 @@ mod proto_fixture_tests {
     fn frozen_fixture_supported_version_list_matches_directories() {
         let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
+            .chain(ARCHIVED_PROTOCOL_VERSIONS)
             .copied()
             .collect::<BTreeSet<_>>();
         assert!(
@@ -6775,8 +6777,8 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
         let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -6796,8 +6798,8 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
         let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

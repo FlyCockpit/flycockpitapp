@@ -61,6 +61,7 @@ tokio::task_local! {
 
 tokio::task_local! {
     static CURRENT_ROOT_STOP_GATE: crate::db::needs_attention::InterruptStopGateMemo;
+    static CURRENT_LIFECYCLE_TURN_ID: String;
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,17 @@ where
 pub fn current_root_stop_gate_memo(
 ) -> Option<crate::db::needs_attention::InterruptStopGateMemo> {
     CURRENT_ROOT_STOP_GATE.try_with(|memo| *memo).ok()
+}
+
+pub async fn with_lifecycle_turn_id<F>(turn_id: String, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_LIFECYCLE_TURN_ID.scope(turn_id, fut).await
+}
+
+pub fn current_lifecycle_turn_id() -> Option<String> {
+    CURRENT_LIFECYCLE_TURN_ID.try_with(Clone::clone).ok()
 }
 
 pub async fn with_pre_resolved_interrupt<F>(

@@ -462,6 +462,7 @@ pub(crate) async fn execute_ordinary_call(
         },
         gate: replay_gate_memo,
         root_stop_gate: crate::engine::interrupt::current_root_stop_gate_memo(),
+        lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
     };
     let mut recheck_result = false;
     let mut gate_memo = replay_gate_memo;
@@ -726,6 +727,7 @@ pub(crate) async fn execute_ordinary_call(
             },
             gate: gate_memo,
             root_stop_gate: crate::engine::interrupt::current_root_stop_gate_memo(),
+            lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
         };
         // Pre-tool hook gate: runs after name/argument/path repair and after
         // existing loop/safety/review/btw decisions permit dispatch, but

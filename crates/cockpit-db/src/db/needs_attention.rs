@@ -114,6 +114,11 @@ pub struct InterruptParkPayload {
     pub gate: Option<InterruptGateMemo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_stop_gate: Option<InterruptStopGateMemo>,
+    /// Stable identity of the originating lifecycle turn. A parked tool call
+    /// pauses that turn; resolving it must not manufacture a second turn just
+    /// because the daemon crossed a process boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_turn_id: Option<String>,
 }
 
 // Full hydrated mirror of the `needs_attention` row; its fields back the
@@ -231,6 +236,7 @@ impl Db {
             .map(serde_json::to_string)
             .transpose()
             .context("serializing parked root stop-gate memo")?;
+        let parked_lifecycle_turn_id = parked.and_then(|payload| payload.lifecycle_turn_id.clone());
         let agent_id = agent_id.to_owned();
         let description = description.to_owned();
         self.write(move |conn| {
@@ -238,8 +244,8 @@ impl Db {
                 "INSERT INTO needs_attention
                  (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
                   state, parked_tool, parked_args_json, parked_call_id, parked_resume_json,
-                  parked_gate_json, parked_root_stop_gate_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11, ?12)",
+                  parked_gate_json, parked_root_stop_gate_json, parked_lifecycle_turn_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -253,6 +259,7 @@ impl Db {
                     parked_resume_json,
                     parked_gate_json,
                     parked_root_stop_gate_json,
+                    parked_lifecycle_turn_id,
                 ],
             )
             .context("inserting needs_attention (questions)")?;
@@ -295,7 +302,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json
+                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json,
+                            parked_lifecycle_turn_id
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND decision_request_id IS NULL
@@ -325,7 +333,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json
+                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json,
+                            parked_lifecycle_turn_id
                        FROM needs_attention
                       WHERE session_id = ?1
                         AND decision_request_id IS NULL
@@ -352,7 +361,8 @@ impl Db {
                     "SELECT interrupt_id, session_id, agent_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
-                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json
+                            parked_resume_json, parked_gate_json, parked_root_stop_gate_json,
+                            parked_lifecycle_turn_id
                        FROM needs_attention
                       WHERE interrupt_id = ?1 AND decision_request_id IS NULL",
                 )
@@ -662,6 +672,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let parked_resume_json: Option<String> = row.get("parked_resume_json")?;
     let parked_gate_json: Option<String> = row.get("parked_gate_json")?;
     let parked_root_stop_gate_json: Option<String> = row.get("parked_root_stop_gate_json")?;
+    let parked_lifecycle_turn_id: Option<String> = row.get("parked_lifecycle_turn_id")?;
     let parked = match (
         parked_tool,
         parked_args_json,
@@ -712,6 +723,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
                 resume,
                 gate,
                 root_stop_gate,
+                lifecycle_turn_id: parked_lifecycle_turn_id,
             })
         }
         _ => None,
@@ -815,6 +827,7 @@ mod tests {
                 recheck_result: true,
             }),
             root_stop_gate: None,
+            lifecycle_turn_id: None,
         };
 
         let interrupt_id = db
@@ -1022,6 +1035,7 @@ mod tests {
                 stop_hook_active: true,
                 continuation_count: 3,
             }),
+            lifecycle_turn_id: Some("turn-original".into()),
         };
         let iid = db
             .raise_interrupt_questions_with_payload(
@@ -1102,6 +1116,7 @@ mod tests {
             },
             gate: None,
             root_stop_gate: None,
+            lifecycle_turn_id: None,
         };
         let iid = db
             .raise_interrupt_questions_with_payload(

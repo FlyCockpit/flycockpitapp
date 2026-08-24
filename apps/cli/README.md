@@ -529,19 +529,21 @@ broker compares its root-owned inode before accepting any request. A manually
 or detach-launched daemon intentionally has no capability descriptor and
 rejects hooks before spawn with `descendant_containment_unsupported`.
 The broker keeps its root-owned listener for its full service lifetime and
-re-authenticates replacement daemon connections; the daemon refreshes broker
-readiness lazily after a broker restart. A lost authenticated connection kills
-and proves empty every generation owned by that connection before another
-daemon is accepted.
+serves a bounded set of independently authenticated connections, so readiness
+diagnostics cannot deadlock behind the daemon's idle long-lived connection.
+The daemon refreshes broker readiness lazily after a broker restart. Each
+operation records its owning connection in broker memory; losing that
+connection kills and proves empty only its generations.
 
 The broker creates each cgroup and uses `clone3(CLONE_INTO_CGROUP)`. The child
 completes its private mount/cgroup namespace, read-only cgroup view,
 capability-drop, `no_new_privs`, and seccomp setup while held on a broker pipe.
 Only after the daemon validates the broker attestation and received I/O/pidfd
 set does it commit the operation and release `execve`. Disconnects and
-cancelled prepared operations are killed and proven empty. Operation status
-and terminal tombstones live in root-private broker state so restart recovery
-does not turn an ambiguous prepare or commit into a second launch.
+cancelled prepared operations are killed and proven empty. Operation status,
+exact identity bindings, and terminal tombstones live in root-private broker
+state across reboots so restart recovery does not turn an ambiguous prepare or
+commit into a second launch.
 For the older containment API that does not request captured pipes, the daemon
 passes its exact stdin/stdout/stderr descriptors and inherited environment to
 the broker instead of silently substituting broker-service pipes or an empty
@@ -565,7 +567,9 @@ with atomic renames, validates the installed unit set before starting it, stops
 legacy detached daemons, and runs the authenticated broker readiness probe as
 the configured daemon UID. A bounded readiness window must establish both the
 broker's Proven state and daemon availability. On failure, the installer
-restores prior files, exact enablement state, and prior service activity.
+restores prior files, exact enablement state, prior service activity, and only
+the instance-specific state/directories proven to have been created by that
+failed transaction.
 The installer rejects root as the daemon account, rejects a bundle for another
 host architecture, and verifies every extracted member before stopping any
 existing service or mutating system paths. `cockpit doctor` exposes the managed

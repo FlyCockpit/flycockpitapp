@@ -809,6 +809,17 @@ impl Db {
         session_id: Uuid,
         payload_json: &str,
     ) -> Result<()> {
+        if let Some(existing) = Self::compaction_payload_conn(
+            conn,
+            session_id,
+            &handoff_id.to_string(),
+        )? {
+            anyhow::ensure!(
+                existing == payload_json,
+                "compaction payload identity reused with different content"
+            );
+            return Ok(());
+        }
         conn.execute(
             "INSERT INTO compaction_handoffs (handoff_id, session_id, payload_json, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1858,6 +1869,34 @@ mod tests {
         let events = db.list_session_events(session.session_id).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "tool_call_scheduling");
+    }
+
+    #[tokio::test]
+    async fn compaction_payload_retry_is_content_checked_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let handoff_id = Uuid::new_v4();
+
+        db.store_compaction_payload(handoff_id, session.session_id, r#"{"brief":"same"}"#)
+            .await
+            .unwrap();
+        db.store_compaction_payload(handoff_id, session.session_id, r#"{"brief":"same"}"#)
+            .await
+            .expect("an exact crash retry converges on the existing handoff");
+
+        let error = db
+            .store_compaction_payload(
+                handoff_id,
+                session.session_id,
+                r#"{"brief":"different"}"#,
+            )
+            .await
+            .expect_err("one compaction identity cannot be rebound to new content");
+        assert!(
+            error
+                .to_string()
+                .contains("identity reused with different content")
+        );
     }
 
     #[tokio::test]

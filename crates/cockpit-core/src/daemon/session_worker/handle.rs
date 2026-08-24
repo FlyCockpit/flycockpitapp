@@ -228,7 +228,8 @@ pub(super) enum WorkerStop {
     DriverExited,
     /// Explicit terminal user/session cancellation (not a daemon drain).
     Cancelled,
-    /// An interrupt-park abandonment that terminally closes the session.
+    /// A true interrupt-park abandonment that terminally closes the session.
+    /// Destructive archive/delete/discard requests use `Cancelled` instead.
     Interrupted,
     WorkerStopped,
 }

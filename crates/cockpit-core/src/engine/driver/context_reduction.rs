@@ -145,11 +145,12 @@ pub enum DurableCompactionShadow {
 }
 
 /// Durable progress of a compaction across its two observe boundaries and the
-/// successor timeline commit. `PreDispatched` is persisted before the pre hook
-/// (so recovery never duplicates it); `PostDispatched` is persisted after the
-/// post hook (so recovery can repeat but never lose it). Both hook payloads
-/// carry `compaction_id`, allowing handlers to collapse the unavoidable
-/// process-crash ambiguity around an external command.
+/// successor timeline commit. Each dispatched phase is a durable outbox
+/// receipt: it is persisted before handing the matching boundary to the hook
+/// runner, and both hook payloads carry `compaction_id`. Recovery therefore
+/// applies one policy consistently at both boundaries and never duplicates a
+/// boundary whose dispatch receipt committed. Hook commands that externalize
+/// effects use the stable id as their idempotency key across process failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTransactionPhase {
@@ -1377,6 +1378,16 @@ impl Driver {
         }
         self.commit_prepared_compaction(transaction.prepared.clone(), tx)
             .await;
+        if !self
+            .advance_compaction_transaction(
+                &mut transaction,
+                CompactionTransactionPhase::PostDispatched,
+            )
+            .await
+        {
+            self.recovered_compaction_intent = Some(transaction);
+            return;
+        }
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PostCompact,
             source,
@@ -1389,16 +1400,6 @@ impl Driver {
             },
         )
         .await;
-        if !self
-            .advance_compaction_transaction(
-                &mut transaction,
-                CompactionTransactionPhase::PostDispatched,
-            )
-            .await
-        {
-            self.recovered_compaction_intent = Some(transaction);
-            return;
-        }
         self.delete_durable_shadow_brief().await;
     }
 
@@ -1463,6 +1464,16 @@ impl Driver {
         if transaction.phase == CompactionTransactionPhase::SuccessorCommitted {
             self.commit_prepared_compaction(transaction.prepared.clone(), tx)
                 .await;
+            if !self
+                .advance_compaction_transaction(
+                    &mut transaction,
+                    CompactionTransactionPhase::PostDispatched,
+                )
+                .await
+            {
+                self.recovered_compaction_intent = Some(transaction);
+                return;
+            }
             self.fire_observe_hook(
                 crate::config::extended::hooks::HookEvent::PostCompact,
                 &source,
@@ -1475,16 +1486,6 @@ impl Driver {
                 },
             )
             .await;
-            if !self
-                .advance_compaction_transaction(
-                    &mut transaction,
-                    CompactionTransactionPhase::PostDispatched,
-                )
-                .await
-            {
-                self.recovered_compaction_intent = Some(transaction);
-                return;
-            }
         }
         self.delete_durable_shadow_brief().await;
     }

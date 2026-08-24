@@ -235,6 +235,7 @@ mod parked_call_tests {
             },
             gate: None,
             root_stop_gate: None,
+            lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
         };
         let encoded = serde_json::to_string(&payload).unwrap();
         let restored: InterruptParkPayload = serde_json::from_str(&encoded).unwrap();

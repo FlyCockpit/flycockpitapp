@@ -348,6 +348,7 @@ mod tests {
             },
             gate: None,
             root_stop_gate: None,
+            lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
         };
         let task_ctx = ctx.clone();
         let task = tokio::spawn(async move {
@@ -955,6 +956,7 @@ mod tests {
                 },
                 gate: None,
                 root_stop_gate: None,
+                lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
             };
             let task_ctx = ctx.clone();
             let task_args = args.clone();

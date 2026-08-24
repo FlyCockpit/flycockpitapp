@@ -116,6 +116,9 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         "does not match host architecture",
         "snapshot_unit_links",
         "cp -a --preserve=all",
+        "remember_missing_directory",
+        "dir_var_lib_flycockpit_containment-broker-$daemon_uid.created",
+        "rmdir -- \"$path\"",
     ] {
         assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
     }

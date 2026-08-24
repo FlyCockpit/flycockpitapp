@@ -280,13 +280,13 @@ fn submission_origin_user_prompt_source_only_fires_for_external_user() {
 }
 
 pub(crate) async fn probe_user_prompt_submit_boundary() -> String {
-    // Drive the record boundary directly with each resolved source. `user`
-    // fires one row; a `queued`-only hook does not fire for `user` (exact
-    // matcher); and `None` (a host/goal/scheduled origin) fires ZERO rows even
-    // with a `user`-matched hook registered — the regression the reviewer
-    // flagged (goal/scheduled auto-turns hitting the hardcoded `"user"`).
-    let (tx, _rx) = mpsc::channel(8);
-    let data = serde_json::json!({ "text": "hello" });
+    // Drive the actual foreground acceptance boundary. Persistence and hook
+    // dispatch must be reached through `run_user_input`, never by invoking the
+    // bookkeeping helper that this integration probe is meant to protect.
+    let queue = crate::engine::message::UserSubmissionQueue::new(
+        tokio::sync::watch::channel(Vec::new()).0,
+    );
+    let (tx, _rx) = mpsc::channel(64);
 
     // `Some("user")` → one row.
     let (mut driver, _tmp) = test_driver_without_network(1);
@@ -297,9 +297,10 @@ pub(crate) async fn probe_user_prompt_submit_boundary() -> String {
             "user",
         ),
     );
-    let _ = driver
-        .record_user_message_event(Some("Build"), None, &data, &[], &tx, Some("user"))
-        .await;
+    driver
+        .run_user_input(UserSubmission::text("hello"), &queue, &tx)
+        .await
+        .unwrap();
     assert_eq!(
         observe_hook_events(&driver, "userPromptSubmit").await,
         vec!["failed".to_string()],
@@ -325,9 +326,10 @@ pub(crate) async fn probe_user_prompt_submit_boundary() -> String {
             "queued",
         ),
     );
-    let _ = driver
-        .record_user_message_event(Some("Build"), None, &data, &[], &tx, Some("user"))
-        .await;
+    driver
+        .run_user_input(UserSubmission::text("hello"), &queue, &tx)
+        .await
+        .unwrap();
     assert!(
         observe_hook_events(&driver, "userPromptSubmit")
             .await
@@ -345,9 +347,9 @@ pub(crate) async fn probe_user_prompt_submit_boundary() -> String {
             "user",
         ),
     );
-    let _ = driver
-        .record_user_message_event(Some("Build"), None, &data, &[], &tx, None)
-        .await;
+    let mut internal = UserSubmission::text("host continuation");
+    internal.origin = crate::engine::message::SubmissionOrigin::Internal;
+    driver.run_user_input(internal, &queue, &tx).await.unwrap();
     assert!(
         observe_hook_events(&driver, "userPromptSubmit")
             .await
@@ -363,9 +365,7 @@ async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
 }
 
 pub(crate) async fn probe_stop_failure_boundary() -> String {
-    // The production `run_stop_failure_hooks` helper (the exact call the two
-    // inference-failure arms make before unwinding) fires a `stopFailure` hook
-    // matched on the error-class token, and does not fire on a lookalike class.
+    // Reach the terminal inference-failure arm through a real foreground run.
     let (mut driver, _tmp) = test_driver_without_network(1);
     inject_hooks(
         &mut driver,
@@ -374,9 +374,12 @@ pub(crate) async fn probe_stop_failure_boundary() -> String {
             "network",
         ),
     );
-    driver
-        .run_stop_failure_hooks(&crate::engine::model::InferenceErrorClass::Network)
-        .await;
+    driver.session.set_active_model("lmstudio", "local").unwrap();
+    let queue = crate::engine::message::UserSubmissionQueue::new(
+        tokio::sync::watch::channel(Vec::new()).0,
+    );
+    let (tx, _rx) = mpsc::channel(64);
+    driver.run_user_input(UserSubmission::text("fail"), &queue, &tx).await.unwrap();
     assert_eq!(
         observe_hook_events(&driver, "stopFailure").await,
         vec!["failed".to_string()],
@@ -402,9 +405,8 @@ pub(crate) async fn probe_stop_failure_boundary() -> String {
             "timeout_ttft",
         ),
     );
-    driver
-        .run_stop_failure_hooks(&crate::engine::model::InferenceErrorClass::Network)
-        .await;
+    driver.session.set_active_model("lmstudio", "local").unwrap();
+    driver.run_user_input(UserSubmission::text("fail"), &queue, &tx).await.unwrap();
     assert!(
         observe_hook_events(&driver, "stopFailure").await.is_empty(),
         "a timeout_ttft-only hook must not fire on a network failure"
@@ -521,10 +523,23 @@ async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
 }
 
 pub(crate) async fn probe_subagent_start_boundary() -> String {
-    // The production `fire_subagent_hook` helper (the exact call the interactive
-    // spawn boundary makes) fires a `subagentStart` hook matched on the child
-    // agent type, and does not fire on a different-agent-type lookalike.
-    let (mut driver, _tmp) = test_driver_without_network(1);
+    // Drive the model/tool/driver boundary that pushes an interactive child.
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::ToolCall {
+            id: "task-start-1".into(),
+            name: "task".into(),
+            arguments: serde_json::json!({
+                "intent": "delegate",
+                "delegate": { "agent": "builder", "prompt": "do the work" }
+            }),
+        })
+        .turn(Turn::Text("child report".into()))
+        .turn(Turn::Text("parent complete".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver.session.set_active_model("lmstudio", "local").unwrap();
     inject_hooks(
         &mut driver,
         observe_boundary_registry(
@@ -532,9 +547,11 @@ pub(crate) async fn probe_subagent_start_boundary() -> String {
             "builder",
         ),
     );
-    driver
-        .fire_subagent_hook("builder", Some("task-start-1"))
-        .await;
+    let queue = crate::engine::message::UserSubmissionQueue::new(
+        tokio::sync::watch::channel(Vec::new()).0,
+    );
+    let (tx, _rx) = mpsc::channel(128);
+    driver.run_user_input(UserSubmission::text("delegate"), &queue, &tx).await.unwrap();
     assert_eq!(
         observe_hook_events(&driver, "subagentStart").await,
         vec!["failed".to_string()],
@@ -551,7 +568,22 @@ pub(crate) async fn probe_subagent_start_boundary() -> String {
         .and_then(|row| row.data["event"].as_str().map(str::to_owned))
         .expect("production child-start boundary persisted its hook event");
 
-    let (mut driver, _tmp) = test_driver_without_network(1);
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::ToolCall {
+            id: "task-start-2".into(),
+            name: "task".into(),
+            arguments: serde_json::json!({
+                "intent": "delegate",
+                "delegate": { "agent": "builder", "prompt": "do the work" }
+            }),
+        })
+        .turn(Turn::Text("child report".into()))
+        .turn(Turn::Text("parent complete".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+    driver.session.set_active_model("lmstudio", "local").unwrap();
     inject_hooks(
         &mut driver,
         observe_boundary_registry(
@@ -559,9 +591,7 @@ pub(crate) async fn probe_subagent_start_boundary() -> String {
             "explore",
         ),
     );
-    driver
-        .fire_subagent_hook("builder", Some("task-start-2"))
-        .await;
+    driver.run_user_input(UserSubmission::text("delegate"), &queue, &tx).await.unwrap();
     assert!(
         observe_hook_events(&driver, "subagentStart")
             .await
@@ -574,6 +604,41 @@ pub(crate) async fn probe_subagent_start_boundary() -> String {
 #[tokio::test]
 async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
     probe_subagent_start_boundary().await;
+}
+
+#[test]
+fn aggregate_lifecycle_probes_cannot_bypass_production_boundaries() {
+    let source = include_str!("misc.rs");
+    let cases = [
+        (
+            "pub(crate) async fn probe_user_prompt_submit_boundary",
+            "#[tokio::test]\nasync fn user_prompt_submit_hook_fires_only_for_external_user_source",
+            "record_user_message_event(",
+        ),
+        (
+            "pub(crate) async fn probe_stop_failure_boundary",
+            "#[tokio::test]\nasync fn stop_failure_hook_fires_on_inference_error_class",
+            "run_stop_failure_hooks(",
+        ),
+        (
+            "pub(crate) async fn probe_subagent_start_boundary",
+            "#[tokio::test]\nasync fn subagent_start_hook_fires_for_child_agent_type_matcher",
+            "fire_subagent_hook(",
+        ),
+    ];
+    for (start, end, forbidden) in cases {
+        let body = source
+            .split_once(start)
+            .expect("probe start remains present")
+            .1
+            .split_once(end)
+            .expect("probe end remains present")
+            .0;
+        assert!(
+            !body.contains(forbidden),
+            "aggregate probe `{start}` bypasses its production boundary via `{forbidden}`"
+        );
+    }
 }
 
 #[tokio::test]

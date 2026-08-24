@@ -1649,7 +1649,7 @@ impl SessionRegistry {
     }
 
     /// Stop a live session before archive/delete/discard. This is fail-closed:
-    /// it cancels the in-flight turn, sends shutdown, then awaits the worker
+    /// it cancels the in-flight turn with a `cancelled` terminal cause, then awaits the worker
     /// task with a bounded timeout. The caller must not mutate/delete DB rows
     /// unless this returns `Ok`.
     pub async fn interrupt_and_stop(&self, session_id: Uuid) -> Result<bool> {
@@ -1678,7 +1678,7 @@ impl SessionRegistry {
         };
         let Some(mut join) = join else {
             let _ = handle
-                .send_work(crate::daemon::session_worker::SessionWork::InterruptAndStop)
+                .send_work(crate::daemon::session_worker::SessionWork::CancelAndStop)
                 .await;
             return self
                 .wait_for_missing_join_shutdown(session_id, generation, &handle, timeout)
@@ -1686,7 +1686,7 @@ impl SessionRegistry {
         };
 
         let _ = handle
-            .send_work(crate::daemon::session_worker::SessionWork::InterruptAndStop)
+            .send_work(crate::daemon::session_worker::SessionWork::CancelAndStop)
             .await;
 
         match tokio::time::timeout(timeout, &mut join).await {

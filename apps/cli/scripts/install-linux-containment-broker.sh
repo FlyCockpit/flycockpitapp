@@ -111,6 +111,28 @@ fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
 committed=0
 
+# Record directory ownership before any service or tmpfiles action. Rollback
+# removes only paths proven absent at transaction start; pre-existing shared
+# directories and their contents are never claimed by this installer.
+remember_missing_directory() {
+  path=$1
+  marker=$(printf '%s' "$path" | tr '/' '_')
+  if [ ! -e "$path" ]; then : >"$transaction/dir$marker.created"; fi
+}
+for path in \
+  /etc/flycockpit \
+  /usr/libexec/flycockpit \
+  /usr/lib/systemd/system \
+  /usr/lib/tmpfiles.d \
+  /run/flycockpit \
+  /var/lib/flycockpit \
+  "/var/lib/flycockpit/containment-broker-$daemon_uid" \
+  /sys/fs/cgroup/flycockpit \
+  "/sys/fs/cgroup/flycockpit/u$daemon_uid"
+do
+  remember_missing_directory "$path"
+done
+
 # Preserve actual enablement topology; `is-enabled` alone loses custom wants,
 # aliases, runtime links, and masks.
 snapshot_unit_links() {
@@ -215,6 +237,25 @@ rollback() {
     if [ -f "$transaction/capability.created" ]; then
       rm -f "/etc/flycockpit/containment-capability-$daemon_uid"
     fi
+    # StateDirectory and tmpfiles may have materialized these after the file
+    # transaction began. Remove only transaction-created, instance-exact
+    # state; shared parents are removed only when empty.
+    if [ -f "$transaction/dir_var_lib_flycockpit_containment-broker-$daemon_uid.created" ]; then
+      rm -rf -- "/var/lib/flycockpit/containment-broker-$daemon_uid"
+    fi
+    for path in \
+      "/sys/fs/cgroup/flycockpit/u$daemon_uid" \
+      /sys/fs/cgroup/flycockpit \
+      /run/flycockpit \
+      /var/lib/flycockpit \
+      /etc/flycockpit \
+      /usr/libexec/flycockpit \
+      /usr/lib/systemd/system \
+      /usr/lib/tmpfiles.d
+    do
+      marker=$(printf '%s' "$path" | tr '/' '_')
+      if [ -f "$transaction/dir$marker.created" ]; then rmdir -- "$path" 2>/dev/null || true; fi
+    done
     if [ "$broker_was_active" -eq 1 ]; then
       systemctl start "$broker_unit" 2>/dev/null || true
     fi

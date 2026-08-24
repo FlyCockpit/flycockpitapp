@@ -17,7 +17,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -42,12 +42,21 @@ const SPAWN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const AUTH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_PREAUTH_CONNECTIONS: usize = 16;
+const MAX_AUTHENTICATED_CONNECTIONS: usize = 8;
 const MAX_LIVE_OPERATION_RECORDS: usize = 65_536;
 const REPLAY_TOMBSTONE_BYTES: usize = 8 * 1024 * 1024;
 const REPLAY_TOMBSTONE_HASHES: usize = 7;
 const REPLAY_TOMBSTONE_FILE: &str = ".replay-tombstones.bin";
 const BROKER_DIRECTORY: &str = "/run/flycockpit";
 const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct ConnectionCountGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LinuxBrokerConfig {
@@ -250,7 +259,10 @@ impl LinuxBrokerClient {
         // still bringing up (or restarting) the broker without permanently
         // pinning this adapter to AbsentBroker for its entire lifetime.
         let stream = connect_authenticated_stream(&config, capability.as_fd()).ok();
-        unsafe { libc::close(capability_raw) };
+        // The service-manager descriptor is process-wide inherited state, not
+        // ownership transferred to the first adapter constructed. Keep the
+        // CLOEXEC original valid so later public diagnostics can duplicate
+        // and authenticate it; this client retains its own independent fd.
         let ready = stream.is_some();
         Ok(Self {
             config,
@@ -609,13 +621,13 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     let recovered_exit_statuses = operations.values()
         .filter_map(|operation| operation.exit_code.map(|code| (operation.key.clone(), Some(code))))
         .collect();
-    let mut state = BrokerState {
+    let state = Arc::new(Mutex::new(BrokerState {
         children: BTreeMap::new(),
         operations,
         emptied: durable_empty,
         exit_statuses: recovered_exit_statuses,
         tombstones,
-    };
+    }));
     // Publish the socket only after cgroup and durable-state recovery has
     // completed. A visible endpoint is a readiness promise to the daemon.
     remove_owned_socket(&config.socket_path)?;
@@ -627,44 +639,64 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     // privileged broker, and every replacement connection is independently
     // peer-credential and capability authenticated before it can issue a
     // request.
+    let next_connection_id = AtomicU64::new(1);
+    let authenticated_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         let mut stream = accept_authenticated_connection(
             &listener,
             config.allowed_uid,
             &broker_capability,
         )?;
+        if authenticated_connections.fetch_add(1, Ordering::AcqRel)
+            >= MAX_AUTHENTICATED_CONNECTIONS
+        {
+            authenticated_connections.fetch_sub(1, Ordering::AcqRel);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            continue;
+        }
         // An authenticated daemon may legitimately have no containment work
         // for an arbitrary period. A frame timeout here would turn ordinary
         // idleness into a disconnect and kill every active generation.
-        stream.set_read_timeout(None)?;
-        stream.set_write_timeout(Some(FRAME_TIMEOUT))?;
-        loop {
-            retry_pending_cleanups(&config, &mut state);
-            retry_pending_exits(&config, &mut state);
-            match serve_one(&mut stream, &config, &mut state) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    cleanup_connection_children(&config, &mut state);
+        let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let connection_state = state.clone();
+        let connection_config = config.clone();
+        let connection_count = authenticated_connections.clone();
+        std::thread::spawn(move || {
+            let _connection_count = ConnectionCountGuard(connection_count);
+            let _ = stream.set_read_timeout(None);
+            let _ = stream.set_write_timeout(Some(FRAME_TIMEOUT));
+            loop {
+                // Wait without holding the state lock. Idle daemon and doctor
+                // connections therefore cannot block acceptance or progress
+                // on another authenticated connection.
+                if let Err(error) = wait_for_frame_start(stream.as_raw_fd()) {
+                    if let Ok(mut state) = connection_state.lock() {
+                        cleanup_connection_children(&connection_config, &mut state, connection_id);
+                    }
+                    if !matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) {
+                        eprintln!("containment broker connection closed: {error}");
+                    }
                     break;
                 }
-                Err(error) => {
-                    cleanup_connection_children(&config, &mut state);
-                    // Malformed and unauthorized client traffic is scoped to
-                    // that connection. The service remains available for a
-                    // freshly authenticated daemon.
-                    eprintln!("containment broker connection closed: {error}");
+                let result = match connection_state.lock() {
+                    Ok(mut state) => {
+                        retry_pending_cleanups(&connection_config, &mut state);
+                        retry_pending_exits(&connection_config, &mut state);
+                        serve_one(&mut stream, &connection_config, &mut state, connection_id)
+                    }
+                    Err(_) => Err(std::io::Error::other("broker state lock poisoned")),
+                };
+                if let Err(error) = result {
+                    if let Ok(mut state) = connection_state.lock() {
+                        cleanup_connection_children(&connection_config, &mut state, connection_id);
+                    }
+                    if !matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut) {
+                        eprintln!("containment broker connection closed: {error}");
+                    }
                     break;
                 }
             }
-        }
+        });
     }
 }
 
@@ -760,6 +792,9 @@ struct BrokerOperation {
     request_digest: String,
     prepared: Option<Spawned>,
     exit_code: Option<i32>,
+    /// Runtime connection that owns disconnect cleanup. Durable recovery has
+    /// no live owner; a matching retry adopts the operation explicitly.
+    owner_connection: Option<u64>,
 }
 
 struct ReplayTombstones {
@@ -796,15 +831,11 @@ impl ReplayTombstones {
                 if checksum.finalize().as_slice() != &stored[payload_end..] {
                     return Err(invalid("replay tombstone checksum mismatch"));
                 }
-                if stored_epoch == epoch {
-                    stored[37..payload_end].to_vec()
-                } else {
-                    // A boot boundary is the explicit replay horizon: no pid,
-                    // pidfd, or cgroup generation can survive the recovery
-                    // sweep across it, so the retired-identity filter can be
-                    // renewed without permitting unsafe generation reuse.
-                    vec![0; REPLAY_TOMBSTONE_BYTES]
-                }
+                // Operation identities are protocol idempotency keys, not PID
+                // aliases. Their retirement therefore survives reboot even
+                // though process/cgroup recovery is boot-scoped. The epoch in
+                // the envelope records the last writer; it never resets bits.
+                stored[37..payload_end].to_vec()
             }
             Ok(_) => return Err(invalid("invalid replay tombstone store")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -900,11 +931,11 @@ fn serve_one(
     stream: &mut UnixStream,
     config: &LinuxBrokerServerConfig,
     state: &mut BrokerState,
+    connection_id: u64,
 ) -> std::io::Result<()> {
     // Idle authenticated connections are allowed indefinitely. Once the first
     // frame byte is readable, however, the complete bounded frame must arrive
     // within FRAME_TIMEOUT so a partial writer cannot monopolize the broker.
-    wait_for_frame_start(stream.as_raw_fd())?;
     stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
     let received = recv_with_fds(stream.as_raw_fd(), 4);
     let restore = stream.set_read_timeout(None);
@@ -956,12 +987,15 @@ fn serve_one(
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "request_digest_mismatch".into() }, &[]);
             }
             let requested_key = containment_key(&containment_id, generation)?;
-            if let Some(existing) = state.operations.get(&operation_key) {
+            if let Some(existing) = state.operations.get_mut(&operation_key) {
                 if existing.key != requested_key
                     || existing.generation != generation
                     || existing.request_digest != request_digest
                 {
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_identity_conflict".into() }, &[]);
+                }
+                if matches!(existing.status, OperationStatus::Prepared) {
+                    existing.owner_connection = Some(connection_id);
                 }
                 return match (&existing.status, &existing.prepared) {
                     (OperationStatus::Prepared, Some(spawned)) => {
@@ -1037,6 +1071,7 @@ fn serve_one(
                         request_digest: request_digest.clone(),
                         prepared: Some(spawned),
                         exit_code: None,
+                        owner_connection: Some(connection_id),
                     });
                     if let Err(error) = persist_operation(
                         config,
@@ -1102,6 +1137,7 @@ fn serve_one(
                 if !matches!(operation.status, OperationStatus::Prepared) {
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_cancelled".into() }, &[]);
                 }
+                operation.owner_connection = Some(connection_id);
                 operation.status = OperationStatus::CommitDecided;
                 (
                     operation.key.clone(),
@@ -1895,11 +1931,19 @@ fn wait_cgroup_empty(group: &Path, timeout: std::time::Duration) -> std::io::Res
     }
 }
 
-fn cleanup_connection_children(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
+fn cleanup_connection_children(
+    config: &LinuxBrokerServerConfig,
+    state: &mut BrokerState,
+    connection_id: u64,
+) {
     let identities = state.operations.keys().cloned().collect::<Vec<_>>();
     for (session_id, operation_id) in identities {
         let identity = (session_id.clone(), operation_id.clone());
         let Some(operation) = state.operations.get_mut(&identity) else { continue };
+        if operation.owner_connection != Some(connection_id) {
+            continue;
+        }
+        operation.owner_connection = None;
         let prepared = operation.prepared.take();
         let key = operation.key.clone();
         let generation = operation.generation;
@@ -2640,10 +2684,11 @@ fn recover_operation_records(
         if !valid_key(&record.key, record.generation) {
             return Err(invalid("invalid durable containment locator"));
         }
-        if record.broker_epoch != current_epoch {
-            fs::remove_file(entry.path())?;
-            continue;
-        }
+        // Keep the exact identity binding across reboot. Kernel resources are
+        // reconciled against the current cgroup tree below, but a previously
+        // used operation ID must never become fresh authority merely because
+        // the machine restarted.
+        let crossed_boot = record.broker_epoch != current_epoch;
         let identity = (record.session_id.clone(), record.operation_id.clone());
         if let Some(previous) = locator_bindings.insert(
             record.key.clone(),
@@ -2667,7 +2712,9 @@ fn recover_operation_records(
             }
             status => status,
         };
-        if !matches!(record.status, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited) {
+        if crossed_boot
+            || !matches!(record.status, OperationStatus::Cancelled | OperationStatus::DisconnectAborted | OperationStatus::Exited)
+        {
             persist_operation_with_exit(
                 config,
                 &record.session_id,
@@ -2686,6 +2733,7 @@ fn recover_operation_records(
             request_digest: record.request_digest,
             prepared: None,
             exit_code: record.exit_code,
+            owner_connection: None,
         }).is_some() {
             return Err(invalid("duplicate durable operation identity"));
         }
@@ -3091,6 +3139,13 @@ fn recv_with_fds_until(
     let body_len = u32::from_be_bytes(frame[..4].try_into().expect("four byte length")) as usize;
     if body_len > MAX_FRAME { return Err(invalid("frame too large")); }
     let total = body_len + 4;
+    // This protocol deliberately permits only one outstanding request on a
+    // stream. recvmsg may coalesce adjacent writes on SOCK_STREAM; accepting
+    // the first frame while discarding the surplus would desynchronize both
+    // request bytes and SCM_RIGHTS association. Fail the connection closed.
+    if received > total {
+        return Err(invalid("multiple broker frames received without a response boundary"));
+    }
     while received < total {
         let count = recv_retry_until(socket, &mut frame[received..total], frame_deadline)?;
         if count <= 0 { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short broker frame")); }

@@ -2206,6 +2206,12 @@ impl Session {
         let journal_result = self
             .db
             .transaction(move |conn| {
+                let already_stored = Db::compaction_payload_conn(
+                    conn,
+                    session_id,
+                    &handoff_id.to_string(),
+                )?
+                .is_some();
                 Db::store_compaction_payload_conn(conn, handoff_id, session_id, &payload_json)?;
                 // Mid-transaction failure seam (AC9): force an error after the
                 // payload-row write and before the journal attach.
@@ -2213,10 +2219,12 @@ impl Session {
                 if journal_fault::should_fail_after_artifact_row() {
                     anyhow::bail!("injected mid-transaction compaction journal fault (test seam)");
                 }
-                for prepared in &prepared {
-                    crate::redact::protected_redaction_history::append_and_attach_conn(
-                        conn, prepared, &refs,
-                    )?;
+                if !already_stored {
+                    for prepared in &prepared {
+                        crate::redact::protected_redaction_history::append_and_attach_conn(
+                            conn, prepared, &refs,
+                        )?;
+                    }
                 }
                 Ok(())
             })

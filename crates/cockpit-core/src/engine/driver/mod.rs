@@ -3031,7 +3031,10 @@ impl Driver {
                 .pop()
                 .context("parked interrupt replay produced no tool result")?
         };
-        let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
+        let lifecycle_turn_id = payload
+            .lifecycle_turn_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
         // Pin the session config snapshot for this turn's duration: a
         // re-resolution that lands mid-turn is observed only at the next turn
@@ -3072,7 +3075,9 @@ impl Driver {
                 };
                 let top = self.stack.last_mut().expect("stack never empty");
                 let deferred_log = top.deferred_log.clone();
-                crate::engine::interrupt::with_root_stop_gate_memo(
+                crate::engine::interrupt::with_lifecycle_turn_id(
+                    lifecycle_turn_id.clone(),
+                    crate::engine::interrupt::with_root_stop_gate_memo(
                     stop_gate_memo,
                     turn_with_backup(
                     &agent,
@@ -3103,6 +3108,7 @@ impl Driver {
                     Some(lifecycle_turn_id.clone()),
                     tx,
                     Some(&mut turn_metadata),
+                    ),
                     ),
                 )
                 .await
@@ -8527,7 +8533,9 @@ impl Driver {
                 // a subagent's `defer_to_orchestrator` calls land here, and
                 // the driver folds them into the report when the frame pops.
                 let deferred_log = top.deferred_log.clone();
-                turn_with_backup(
+                crate::engine::interrupt::with_lifecycle_turn_id(
+                    lifecycle_turn_id.clone(),
+                    turn_with_backup(
                     &agent,
                     backup_model.as_ref(),
                     &fallback_models,
@@ -8560,6 +8568,7 @@ impl Driver {
                     Some(lifecycle_turn_id.clone()),
                     tx,
                     Some(&mut turn_metadata),
+                    ),
                 )
                 .await
             };

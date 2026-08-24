@@ -1081,6 +1081,7 @@ CREATE TABLE needs_attention (
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
     parked_root_stop_gate_json TEXT,                -- serialized originating root stop-gate memo, or NULL
+    parked_lifecycle_turn_id TEXT,                  -- stable originating lifecycle turn identity, or NULL
     -- Recursive-agent decisions use this typed ownership edge. Legacy
     -- interrupts leave it NULL; a decision row never carries legacy question
     -- or parked-call authority.
@@ -1106,7 +1107,8 @@ CREATE TABLE needs_attention (
          AND parked_tool IS NULL AND parked_args_json IS NULL
          AND parked_call_id IS NULL AND parked_resume_json IS NULL
          AND parked_gate_json IS NULL
-         AND parked_root_stop_gate_json IS NULL)
+         AND parked_root_stop_gate_json IS NULL
+         AND parked_lifecycle_turn_id IS NULL)
     ),
     FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
@@ -1169,6 +1171,7 @@ WHEN OLD.decision_request_id IS NOT NULL
     OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
     OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
     OR NEW.parked_root_stop_gate_json IS NOT OLD.parked_root_stop_gate_json
+    OR NEW.parked_lifecycle_turn_id IS NOT OLD.parked_lifecycle_turn_id
     OR NEW.decision_request_id IS NOT OLD.decision_request_id
     OR NEW.state <> 'resolved'
     OR NEW.resolved_at IS NULL

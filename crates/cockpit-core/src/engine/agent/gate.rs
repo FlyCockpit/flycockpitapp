@@ -978,6 +978,7 @@ mod safety_gate_tests {
                 recheck_result: true,
             }),
             root_stop_gate: None,
+            lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
         };
 
         reset_safety_gate_evaluate_calls();
@@ -1469,6 +1470,7 @@ mod safety_gate_tests {
                 recheck_result: true,
             }),
             root_stop_gate: None,
+            lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
         };
 
         let outcome = crate::engine::interrupt::with_interrupt_park_payload(payload, async {
@@ -1503,6 +1505,7 @@ mod safety_gate_tests {
                 },
                 gate: None,
                 root_stop_gate: None,
+                lifecycle_turn_id: crate::engine::interrupt::current_lifecycle_turn_id(),
             };
             let first_ctx = ctx.clone();
             let first_tx = tx.clone();

@@ -2600,8 +2600,53 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
-        // Dedup check: duplicate/replayed calls return the prior sanitized
-        // outcome and never touch input again.
+        // Build the backend action list + action identity BEFORE any dedup, so
+        // the identity check is the PRIMARY dedup key. A reused (session,
+        // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
+        // an identity_conflict with zero dispatch — it must NOT be masked by the
+        // call-id convenience dedup below as a stale DuplicateReplay (AC14).
+        let mut backend_actions = Vec::new();
+        for action in actions {
+            backend_actions.extend(action.to_backend_actions());
+        }
+        let action_label = format!("openai_call:{}", actions.len());
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay. Return the
+                // prior sanitized outcome (call-id keyed). A lease-denied replay
+                // recorded its identity but no call-id outcome, so it replays as
+                // `CancelledBeforeDispatch`, exactly as before.
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                // identity_conflict — same identity, different payload.
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity (a human Deny outranks a payload), so a
+        // replay of one returns its prior sanitized outcome here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2613,7 +2658,7 @@ impl ComputerActionCoordinator {
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
         // later invalidated or the backend died. This runs AFTER the dedup
-        // guard (replayed call IDs keep their prior outcome) but BEFORE the
+        // guards (replayed calls keep their prior outcome) but BEFORE the
         // invalidated/backend_dead checks, because a human deny is a decision
         // that outranks a subsequent state transition. A new delegation gets a
         // new coordinator, which starts clean.
@@ -2641,49 +2686,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        // Build the backend action list.
-        let mut backend_actions = Vec::new();
-        for action in actions {
-            backend_actions.extend(action.to_backend_actions());
-        }
-        let action_label = format!("openai_call:{}", actions.len());
-
-        // Action identity check: a duplicate (session, delegation,
-        // provider_call_id, batch_index) with a different payload is
-        // identity_conflict with zero dispatch.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {} // New identity — proceed.
-            Ok(false) => {
-                // Same identity + same digest — duplicate replay (should have
-                // been caught by the call-id dedup above, but handle it).
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                // identity_conflict — different payload, same identity.
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement: TypeText and KeyChord require a
@@ -2730,7 +2732,45 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Dedup check.
+        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
+        // call id with a DIFFERENT payload is an identity_conflict with zero
+        // dispatch rather than a stale DuplicateReplay (AC14).
+        let backend_actions = action.to_backend_actions();
+        let action_label = "anthropic_20251124_call".to_string();
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay (a lease-denied
+                // replay has no call-id outcome and replays as
+                // `CancelledBeforeDispatch`, as before).
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity, so a replay of one returns here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2741,7 +2781,7 @@ impl ComputerActionCoordinator {
         // transition: after one human Deny, every subsequent computer action on
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guard but
+        // later invalidated or the backend died. Runs AFTER the dedup guards but
         // BEFORE the invalidated/backend_dead checks. A new delegation gets a
         // new coordinator, which starts clean.
         if let Some(reason) = &self.denied {
@@ -2766,40 +2806,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20251124_call".to_string();
-
-        // Action identity check.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {}
-            Ok(false) => {
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement for type/key actions.
@@ -2840,7 +2846,45 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Dedup check.
+        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
+        // call id with a DIFFERENT payload is an identity_conflict with zero
+        // dispatch rather than a stale DuplicateReplay (AC14).
+        let backend_actions = action.to_backend_actions();
+        let action_label = "anthropic_20250124_call".to_string();
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay (a lease-denied
+                // replay has no call-id outcome and replays as
+                // `CancelledBeforeDispatch`, as before).
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity, so a replay of one returns here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2851,7 +2895,7 @@ impl ComputerActionCoordinator {
         // transition: after one human Deny, every subsequent computer action on
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guard but
+        // later invalidated or the backend died. Runs AFTER the dedup guards but
         // BEFORE the invalidated/backend_dead checks. A new delegation gets a
         // new coordinator, which starts clean.
         if let Some(reason) = &self.denied {
@@ -2876,40 +2920,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20250124_call".to_string();
-
-        // Action identity check.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {}
-            Ok(false) => {
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement for type/key actions.
@@ -6395,45 +6405,29 @@ mod tests {
             .await;
         assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
 
-        // The call_id is the same but the payload is different — this is
-        // caught by the call-id dedup first (returns DuplicateReplay). The
-        // identity_conflict check is for the same (session, delegation,
-        // provider_call_id, batch_index) with a different payload digest,
-        // which would happen if the journal was accessed by identity rather
-        // than call_id. Since the call-id dedup catches it first, we verify
-        // the identity_conflict path through the journal directly.
-        let identity = ActionIdentity {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            provider_call_id: "call-conflict".to_string(),
-            batch_index: 0,
-        };
-        let digest1 = ActionPayloadDigest::from_actions(&[ComputerAction::MoveCursor {
-            to: Point {
-                x: 4.0,
-                y: 5.0,
-                space: CoordinateSpace::Physical,
-            },
-            duration: Duration::from_millis(0),
-            easing: Easing::Linear,
-        }]);
-        let digest2 = ActionPayloadDigest::from_actions(&[ComputerAction::MoveCursor {
+        // Same call_id, DIFFERENT payload: identity is the PRIMARY dedup key, so
+        // this is an identity_conflict with ZERO additional dispatch through the
+        // coordinator — NOT a stale DuplicateReplay of the first outcome (AC14).
+        let dispatched_after_first = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        let actions2 = vec![OpenAiComputerAction::Move {
             to: Point {
                 x: 100.0,
                 y: 200.0,
                 space: CoordinateSpace::Physical,
             },
-            duration: Duration::from_millis(0),
-            easing: Easing::Linear,
-        }]);
-
-        // Different payloads produce different digests.
-        assert_ne!(digest1, digest2);
-
-        // The journal check_identity returns Err for a different payload.
-        let mut journal = OutcomeJournal::new();
-        journal.record_identity(identity.clone(), digest1);
-        assert_eq!(journal.check_identity(&identity, &digest2), Err(()));
+        }];
+        let outcome2 = coordinator
+            .execute_openai_call("call-conflict", &actions2)
+            .await;
+        assert!(
+            matches!(outcome2, CoordinatedOutcome::IdentityConflict { .. }),
+            "same call id + different payload must be an identity_conflict, got {outcome2:?}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            dispatched_after_first,
+            "an identity_conflict must dispatch zero backend actions"
+        );
     }
 
     // =====================================================================

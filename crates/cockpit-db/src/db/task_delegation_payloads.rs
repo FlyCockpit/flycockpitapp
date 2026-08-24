@@ -150,9 +150,9 @@ impl Db {
         let hash = delegation_payload_hash(payload.prompt);
         let byte_len = payload.prompt.len();
         let created_at = Utc::now().timestamp();
-        let (body_inline, sidecar_path, cleanup_abs_path) =
-            self.persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)
-                .await?;
+        let (body_inline, sidecar_path, cleanup_abs_path) = self
+            .persist_delegation_payload_body(payload.parent_session_id, &hash, payload.prompt)
+            .await?;
         Ok(PreparedTaskDelegationPayload {
             task_call_id: payload.task_call_id.to_owned(),
             label: payload.label.to_owned(),
@@ -181,8 +181,14 @@ impl Db {
              SELECT sidecar_path,parent_session_id,?3 FROM task_delegation_payloads
               WHERE task_call_id=?1 AND label=?2 AND sidecar_path IS NOT NULL
                 AND sidecar_path IS NOT ?4",
-            params![payload.task_call_id, payload.label, Utc::now().timestamp_millis(), payload.sidecar_path],
-        ).context("recording replaced delegation sidecar cleanup intent")?;
+            params![
+                payload.task_call_id,
+                payload.label,
+                Utc::now().timestamp_millis(),
+                payload.sidecar_path
+            ],
+        )
+        .context("recording replaced delegation sidecar cleanup intent")?;
         conn.execute(
             "INSERT INTO task_delegation_payloads (
                     task_call_id, label, payload_hash, parent_session_id, parent_agent,
@@ -801,12 +807,18 @@ mod tests {
             child_agent: "explore",
             prompt,
         };
-        let first = db.insert_task_delegation_payload(make("first")).await.unwrap();
+        let first = db
+            .insert_task_delegation_payload(make("first"))
+            .await
+            .unwrap();
         let first_path = db
             .task_delegation_payload_sidecar_abs_path(&first)
             .unwrap()
             .unwrap();
-        let second = db.insert_task_delegation_payload(make("second")).await.unwrap();
+        let second = db
+            .insert_task_delegation_payload(make("second"))
+            .await
+            .unwrap();
         let second_path = db
             .task_delegation_payload_sidecar_abs_path(&second)
             .unwrap()

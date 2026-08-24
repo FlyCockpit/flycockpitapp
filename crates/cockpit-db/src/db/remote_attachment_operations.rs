@@ -481,7 +481,10 @@ impl Db {
             request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
             "adapter dispatcher requires idempotent_adapter_mutation class"
         );
-        ensure!(lease_duration_ms > 0, "adapter lease duration must be positive");
+        ensure!(
+            lease_duration_ms > 0,
+            "adapter lease duration must be positive"
+        );
         let lease_owner = daemon_incarnation_id.hyphenated().to_string();
         let lease_expires_at_ms = request
             .now_ms
@@ -525,8 +528,9 @@ impl Db {
                 ))
             }
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
-                let reclaimed = conn.query_row(
-                    "UPDATE remote_attachment_operations
+                let reclaimed = conn
+                    .query_row(
+                        "UPDATE remote_attachment_operations
                      SET dispatch_generation=dispatch_generation+1,
                          dispatch_lease_owner=?3, dispatch_lease_expires_at_ms=?4,
                          updated_at_ms=?5
@@ -534,14 +538,23 @@ impl Db {
                        AND state='dispatched' AND operation_class='idempotent_adapter_mutation'
                        AND dispatch_lease_expires_at_ms <= ?5
                      RETURNING operation_seq,dispatch_generation",
-                    params![owned.logical_attachment_id, owned.operation_id, lease_owner, lease_expires_at_ms, owned.now_ms],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                ).optional()?;
+                        params![
+                            owned.logical_attachment_id,
+                            owned.operation_id,
+                            lease_owner,
+                            lease_expires_at_ms,
+                            owned.now_ms
+                        ],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
                 match reclaimed {
-                    Some((operation_seq, dispatch_generation)) => Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
-                        operation_seq: operation_seq.try_into()?,
-                        dispatch_generation: dispatch_generation.try_into()?,
-                    }),
+                    Some((operation_seq, dispatch_generation)) => {
+                        Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                            operation_seq: operation_seq.try_into()?,
+                            dispatch_generation: dispatch_generation.try_into()?,
+                        })
+                    }
                     None => Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate),
                 }
             }
@@ -956,63 +969,69 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        let outcome = self.transaction(move |conn| match reserve_conn(conn, &owned)? {
-            ReserveRemoteOperationOutcome::Reserved(_) => {
-                let result = mutation(conn)?;
-                let delivery_id = Uuid::now_v7().to_string();
-                let committed = commit_conn(
-                    conn,
-                    &OwnedCommitRemoteOperation {
-                        logical_attachment_id: owned.logical_attachment_id.clone(),
-                        operation_id: owned.operation_id.clone(),
-                        safe_response: result.safe_response,
-                        outbox_delivery_id: delivery_id,
-                        outbox_kind: result.outbox_kind,
-                        outbox_payload: result.outbox_payload,
-                        now_ms: owned.now_ms,
-                    },
-                )?;
-                match committed {
-                    CommitRemoteOperationOutcome::Committed { .. } => {
-                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
-                    }
-                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        Err(RemoteOperationCapacityAbort::Ledger.into())
-                    }
-                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        Err(RemoteOperationCapacityAbort::Outbox.into())
+        let outcome = self
+            .transaction(move |conn| match reserve_conn(conn, &owned)? {
+                ReserveRemoteOperationOutcome::Reserved(_) => {
+                    let result = mutation(conn)?;
+                    let delivery_id = Uuid::now_v7().to_string();
+                    let committed = commit_conn(
+                        conn,
+                        &OwnedCommitRemoteOperation {
+                            logical_attachment_id: owned.logical_attachment_id.clone(),
+                            operation_id: owned.operation_id.clone(),
+                            safe_response: result.safe_response,
+                            outbox_delivery_id: delivery_id,
+                            outbox_kind: result.outbox_kind,
+                            outbox_payload: result.outbox_payload,
+                            now_ms: owned.now_ms,
+                        },
+                    )?;
+                    match committed {
+                        CommitRemoteOperationOutcome::Committed { .. } => {
+                            Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                        }
+                        CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                            Err(RemoteOperationCapacityAbort::Ledger.into())
+                        }
+                        CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                            Err(RemoteOperationCapacityAbort::Outbox.into())
+                        }
                     }
                 }
-            }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
-                Ok(TransactionalRemoteOperationOutcome::Replay(
-                    replay
-                        .safe_response
-                        .context("committed operation missing safe response")?,
-                ))
-            }
-            ReserveRemoteOperationOutcome::Replay(_) => {
-                Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
-            }
-            ReserveRemoteOperationOutcome::OperationConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
-            }
-            ReserveRemoteOperationOutcome::OperationActorConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
-            }
-            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
-            }
-        }).await;
+                ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                    Ok(TransactionalRemoteOperationOutcome::Replay(
+                        replay
+                            .safe_response
+                            .context("committed operation missing safe response")?,
+                    ))
+                }
+                ReserveRemoteOperationOutcome::Replay(_) => {
+                    Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
+                }
+                ReserveRemoteOperationOutcome::OperationConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+                }
+                ReserveRemoteOperationOutcome::OperationActorConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+                }
+                ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                    Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                }
+            })
+            .await;
         match outcome {
             Ok(outcome) => Ok(outcome),
-            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
-                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
             {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
-                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
             {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
             }
@@ -1130,62 +1149,68 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        let outcome = self.transaction(move |conn| match reserve_conn(conn, &owned)? {
-            ReserveRemoteOperationOutcome::Reserved(_) => {
-                let result = mutation(conn)?;
-                let delivery_id = Uuid::now_v7().to_string();
-                match commit_conn(
-                    conn,
-                    &OwnedCommitRemoteOperation {
-                        logical_attachment_id: owned.logical_attachment_id.clone(),
-                        operation_id: owned.operation_id.clone(),
-                        safe_response: result.safe_response,
-                        outbox_delivery_id: delivery_id,
-                        outbox_kind: result.outbox_kind,
-                        outbox_payload: result.outbox_payload,
-                        now_ms: owned.now_ms,
-                    },
-                )? {
-                    CommitRemoteOperationOutcome::Committed { .. } => {
-                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
-                    }
-                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        Err(RemoteOperationCapacityAbort::Ledger.into())
-                    }
-                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        Err(RemoteOperationCapacityAbort::Outbox.into())
+        let outcome = self
+            .transaction(move |conn| match reserve_conn(conn, &owned)? {
+                ReserveRemoteOperationOutcome::Reserved(_) => {
+                    let result = mutation(conn)?;
+                    let delivery_id = Uuid::now_v7().to_string();
+                    match commit_conn(
+                        conn,
+                        &OwnedCommitRemoteOperation {
+                            logical_attachment_id: owned.logical_attachment_id.clone(),
+                            operation_id: owned.operation_id.clone(),
+                            safe_response: result.safe_response,
+                            outbox_delivery_id: delivery_id,
+                            outbox_kind: result.outbox_kind,
+                            outbox_payload: result.outbox_payload,
+                            now_ms: owned.now_ms,
+                        },
+                    )? {
+                        CommitRemoteOperationOutcome::Committed { .. } => {
+                            Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                        }
+                        CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                            Err(RemoteOperationCapacityAbort::Ledger.into())
+                        }
+                        CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                            Err(RemoteOperationCapacityAbort::Outbox.into())
+                        }
                     }
                 }
-            }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
-                Ok(TransactionalRemoteOperationOutcome::Replay(
-                    replay
-                        .safe_response
-                        .context("committed adapter operation missing safe response")?,
-                ))
-            }
-            ReserveRemoteOperationOutcome::Replay(_) => {
-                Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
-            }
-            ReserveRemoteOperationOutcome::OperationConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
-            }
-            ReserveRemoteOperationOutcome::OperationActorConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
-            }
-            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
-            }
-        }).await;
+                ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                    Ok(TransactionalRemoteOperationOutcome::Replay(
+                        replay
+                            .safe_response
+                            .context("committed adapter operation missing safe response")?,
+                    ))
+                }
+                ReserveRemoteOperationOutcome::Replay(_) => {
+                    Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
+                }
+                ReserveRemoteOperationOutcome::OperationConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+                }
+                ReserveRemoteOperationOutcome::OperationActorConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+                }
+                ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                    Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                }
+            })
+            .await;
         match outcome {
             Ok(outcome) => Ok(outcome),
-            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
-                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
             {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
-                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
             {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
             }
@@ -1221,7 +1246,10 @@ impl Db {
         expected_dispatch_owner: Uuid,
         expected_dispatch_generation: u64,
     ) -> Result<CommitRemoteOperationOutcome> {
-        ensure!(expected_dispatch_generation > 0, "adapter generation must be positive");
+        ensure!(
+            expected_dispatch_generation > 0,
+            "adapter generation must be positive"
+        );
         let owned = OwnedCommitRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.to_owned(),
             operation_id: request.operation_id.to_owned(),
@@ -1255,7 +1283,8 @@ impl Db {
                 "adapter commit lost live dispatch owner/generation authority"
             );
             commit_conn_with_policy(conn, &owned, false)
-        }).await
+        })
+        .await
     }
 
     /// Commits a staged rename only after its exact dispatch generation has
@@ -2700,24 +2729,16 @@ mod tests {
         // A generation alone is not authority: the exact daemon incarnation
         // that owns the live lease must present it.
         assert!(
-            db.commit_idempotent_adapter_remote_operation(
-                commit(111),
-                first_incarnation,
-                2
-            )
-            .await
-            .is_err()
+            db.commit_idempotent_adapter_remote_operation(commit(111), first_incarnation, 2)
+                .await
+                .is_err()
         );
         // Lease validity is a strict interval. At the expiry boundary the
         // unreclaimed owner may no longer publish a response or outbox row.
         assert!(
-            db.commit_idempotent_adapter_remote_operation(
-                commit(210),
-                second_incarnation,
-                2
-            )
-            .await
-            .is_err()
+            db.commit_idempotent_adapter_remote_operation(commit(210), second_incarnation, 2)
+                .await
+                .is_err()
         );
         assert!(matches!(
             db.begin_idempotent_adapter_remote_operation(request(210), first_incarnation, 100)
@@ -2730,21 +2751,17 @@ mod tests {
         ));
         // Reclaiming permanently fences the former owner and generation.
         assert!(
-            db.commit_idempotent_adapter_remote_operation(
-                commit(211),
-                second_incarnation,
-                2
-            )
-            .await
-            .is_err()
+            db.commit_idempotent_adapter_remote_operation(commit(211), second_incarnation, 2)
+                .await
+                .is_err()
         );
         let outbox_before_commit = db
             .read(|conn| {
-                Ok(conn.query_row(
-                    "SELECT COUNT(*) FROM remote_attachment_outbox",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?)
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM remote_attachment_outbox", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
             })
             .await
             .unwrap();

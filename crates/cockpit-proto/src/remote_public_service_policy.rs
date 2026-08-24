@@ -101,8 +101,8 @@ fn ceiling_err<T>(s: impl Into<String>) -> Result<T> {
 // Neutral capability DTOs/codecs are always compiled for local daemon
 // authorization. This remote module adds only signed service-policy concerns.
 pub use crate::capability_ceiling::{
-    RemoteAttachmentCapabilityV1, RemotePermissionCeilingDigestV1,
-    RemotePermissionCeilingV1, RemoteProjectCapabilityV1, permission_ceiling_digest,
+    RemoteAttachmentCapabilityV1, RemotePermissionCeilingDigestV1, RemotePermissionCeilingV1,
+    RemoteProjectCapabilityV1, permission_ceiling_digest,
 };
 
 impl From<crate::capability_ceiling::CapabilityCeilingError> for RemotePublicPolicyError {

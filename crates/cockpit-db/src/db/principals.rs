@@ -218,7 +218,6 @@ mod tests {
                 .unwrap(),
             Some(true)
         );
-
     }
 
     #[cfg(feature = "remote")]

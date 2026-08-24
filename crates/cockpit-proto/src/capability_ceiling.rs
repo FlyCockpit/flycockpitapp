@@ -436,5 +436,3 @@ pub fn permission_ceiling_digest(
         bytes: digest.into(),
     })
 }
-
-

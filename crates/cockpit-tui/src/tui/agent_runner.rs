@@ -853,9 +853,13 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
             | TurnEvent::InterruptQueueChanged { .. }
     ) || {
         #[cfg(feature = "remote")]
-        { matches!(event, TurnEvent::ConnectorStatus { .. }) }
+        {
+            matches!(event, TurnEvent::ConnectorStatus { .. })
+        }
         #[cfg(not(feature = "remote"))]
-        { false }
+        {
+            false
+        }
     }
 }
 
@@ -2000,9 +2004,13 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::ImageControlConfigChanged { .. }
     ) || {
         #[cfg(feature = "remote")]
-        { matches!(event, proto::Event::ConnectorStatus { .. }) }
+        {
+            matches!(event, proto::Event::ConnectorStatus { .. })
+        }
         #[cfg(not(feature = "remote"))]
-        { false }
+        {
+            false
+        }
     }
 }
 

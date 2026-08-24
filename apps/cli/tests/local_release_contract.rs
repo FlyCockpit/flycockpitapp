@@ -33,7 +33,10 @@ fn local_release_has_one_opt_in_remote_capability() {
             .as_table()
             .unwrap_or_else(|| panic!("{manifest} must declare [features]"));
         assert_eq!(features["default"].as_array().map(Vec::len), Some(0));
-        assert!(features.contains_key("remote"), "{manifest} lacks remote feature");
+        assert!(
+            features.contains_key("remote"),
+            "{manifest} lacks remote feature"
+        );
     }
 
     let cli: toml::Value = toml::from_str(&source("apps/cli/Cargo.toml")).unwrap();
@@ -63,7 +66,10 @@ fn local_release_cfg_gates_commands_modules_workers_and_protocol() {
     let daemon = source("crates/cockpit-core/src/daemon/mod.rs");
     for module in ["connector", "remote_attempt", "remote_audit_upload"] {
         let marker = format!("#[cfg(feature = \"remote\")]\npub mod {module};");
-        assert!(daemon.contains(&marker), "daemon module {module} is reachable locally");
+        assert!(
+            daemon.contains(&marker),
+            "daemon module {module} is reachable locally"
+        );
     }
     for worker in [
         "org_sync::spawn_background",
@@ -71,7 +77,9 @@ fn local_release_cfg_gates_commands_modules_workers_and_protocol() {
         "connector::spawn_background",
         "remote_outbox_worker::spawn_background",
     ] {
-        let offset = daemon.find(worker).unwrap_or_else(|| panic!("missing worker {worker}"));
+        let offset = daemon
+            .find(worker)
+            .unwrap_or_else(|| panic!("missing worker {worker}"));
         let prefix = &daemon[offset.saturating_sub(80)..offset];
         assert!(prefix.contains("#[cfg(feature = \"remote\")]"));
     }
@@ -92,7 +100,10 @@ fn local_release_cfg_gates_commands_modules_workers_and_protocol() {
         "remote_wire_magic_registry",
     ] {
         let marker = format!("#[cfg(feature = \"remote\")]\npub mod {module};");
-        assert!(protocol.contains(&marker), "protocol module {module} is reachable locally");
+        assert!(
+            protocol.contains(&marker),
+            "protocol module {module} is reachable locally"
+        );
     }
     let dispatch = source("crates/cockpit-core/src/daemon/server/dispatch.rs");
     assert!(!dispatch.contains("requires_remote_feature"));

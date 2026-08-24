@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "remote")]
-use cockpit_proto::capability_ceiling::{
-    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
-};
+use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1};
 
 use crate::daemon::proto::{self, Request};
 

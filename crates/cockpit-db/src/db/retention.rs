@@ -80,8 +80,15 @@ impl Db {
         // side-effect tombstone before deleting, and the pair must commit or
         // roll back together. One transaction for the pass also means a
         // failure part-way cannot leave the sweep half-applied.
-        self.transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
-            .await
+        let removed = self
+            .transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
+            .await?;
+        if removed > 0
+            && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
+        {
+            tracing::warn!(%error, "retention sidecar cleanup remains durably pending");
+        }
+        Ok(removed)
     }
 
     /// Decide whether retention should vacuum after a pass.

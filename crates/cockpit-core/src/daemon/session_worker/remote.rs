@@ -23,10 +23,19 @@ pub struct RemoteQueueMutationReceiptV1 {
 impl RemoteQueueMutationReceiptV1 {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.schema_version == 1, "unsupported queue receipt schema");
-        anyhow::ensure!(self.removed_count <= 10_000, "queue receipt removed_count exceeds bound");
+        anyhow::ensure!(
+            self.removed_count <= 10_000,
+            "queue receipt removed_count exceeds bound"
+        );
         let removed = matches!(self.reason, proto::RemoveQueuedUserMessageReason::Removed);
-        anyhow::ensure!(self.applied == removed, "queue receipt applied/reason mismatch");
-        anyhow::ensure!(removed == (self.removed_count > 0), "queue receipt count mismatch");
+        anyhow::ensure!(
+            self.applied == removed,
+            "queue receipt applied/reason mismatch"
+        );
+        anyhow::ensure!(
+            removed == (self.removed_count > 0),
+            "queue receipt count mismatch"
+        );
         Ok(())
     }
 }

@@ -788,8 +788,8 @@ impl Db {
                 )
                 .optional()
                 .context("loading local-owner canonical FCM2 replay bytes"),
-            crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation } => conn
-                .query_row(
+            crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation } => {
+                conn.query_row(
                     "SELECT q.canonical_message
                        FROM message_queue_items q
                        JOIN message_submission_receipts s
@@ -809,7 +809,8 @@ impl Db {
                     |row| row.get(0),
                 )
                 .optional()
-                .context("loading remote-device canonical FCM2 replay bytes"),
+                .context("loading remote-device canonical FCM2 replay bytes")
+            }
         })
         .await
     }

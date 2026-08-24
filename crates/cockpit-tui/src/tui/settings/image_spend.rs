@@ -843,8 +843,8 @@ mod tests {
         reopened.draft.session = BudgetPolicy::Unconfigured;
         reopened.save();
         assert!(reopened.save.lock().unwrap().is_none());
-        let store = cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&path)
-            .unwrap();
+        let store =
+            cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&path).unwrap();
         let persisted = image_spend_runtime()
             .unwrap()
             .block_on(store.current("project".into()))

@@ -31,9 +31,7 @@ impl RemoteOperationContext {
         authenticated_device_id: Uuid,
         authenticated_device_generation: u64,
     ) -> Self {
-        let identity_guard = Arc::new(tokio::sync::Mutex::new(()))
-            .lock_owned()
-            .await;
+        let identity_guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         Self {
             request_id,
             logical_attachment_id,

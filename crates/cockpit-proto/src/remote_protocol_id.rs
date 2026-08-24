@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 // `wire_scalar` directly so its source-level dependency inventory stays free
 // of remote-service modules.
 pub use crate::wire_scalar::{
-    CanonicalU64DecimalStringV1, decode_u64_be, encode_u64_be,
-    format_canonical_u64_decimal_string, parse_canonical_u64_decimal_string,
+    CanonicalU64DecimalStringV1, decode_u64_be, encode_u64_be, format_canonical_u64_decimal_string,
+    parse_canonical_u64_decimal_string,
 };
 
 pub const REMOTE_PROTOCOL_ID_BYTES: usize = 16;

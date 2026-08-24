@@ -64,6 +64,7 @@ static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 static SECRET_OWNER_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Credential clear must never wait indefinitely on a best-effort remote
 /// instance revoke. Local vault ownership is cleared independently below.
+#[cfg(feature = "remote")]
 const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Serialize daemon-side provider/config read-modify-write operations. The
 /// ConfigDoc writer also takes the shared cross-process lock, so this closes
@@ -9123,7 +9124,6 @@ async fn handle_concurrent_request_impl(
         );
     }
     validate_request_semantics(&request)?;
-    #[cfg(feature = "remote")]
     let request_kind = principal::request_kind(&request);
     #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);

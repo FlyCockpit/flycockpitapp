@@ -1481,9 +1481,10 @@ fn remote_principal() -> ClientPrincipal {
     })
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "remote")]
-fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+async fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+    let ctx = test_ctx();
     let request_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
     let device_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
@@ -1611,8 +1612,21 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         ),
     ];
     for (case, principal, operation, request, allowed) in cases {
-        let admitted = admit_remote_operation(&principal, request_id, operation, request);
+        let admitted =
+            remote_dispatch::admit(&ctx, &principal, request_id, operation, request).await;
         assert_eq!(admitted.is_ok(), allowed, "admission case {case}");
+        if let Err(error) = &admitted {
+            assert_eq!(
+                error.code,
+                ErrorCode::Authorization,
+                "denial code for {case}"
+            );
+            assert_eq!(
+                error.message,
+                "remote operations require a valid server-authenticated actor binding and operation identity",
+                "safe denial text for {case}"
+            );
+        }
         if let Ok(context) = admitted {
             reached_dispatch += 1;
             if let Some(context) = context {
@@ -6524,7 +6538,8 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
 
     // AC6/AC8: a remote principal is denied the generic local-only reader before
     // dispatch — no chunk bytes ever cross the boundary.
-    let denied = admit_remote_operation(
+    let denied = remote_dispatch::admit(
+        &ctx,
         &remote_principal(),
         Uuid::new_v4(),
         None,
@@ -6532,10 +6547,17 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
-    );
+    )
+    .await;
     assert!(
         denied.is_err(),
         "a remote principal must be denied the local-only generic reader"
+    );
+    let denied = denied.unwrap_err();
+    assert_eq!(denied.code, ErrorCode::Authorization);
+    assert_eq!(
+        denied.message,
+        "remote operations require a valid server-authenticated actor binding and operation identity"
     );
 
     // The raw bytes are untouched and still served to the local owner.
@@ -11865,10 +11887,7 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
     );
 }
 
-#[cfg(all(
-    feature = "remote",
-    any(target_os = "linux", target_os = "macos")
-))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation_or_reservation() {
@@ -12291,18 +12310,9 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
         };
         let operation = RemoteOperationContext::for_test(
             Uuid::new_v4(),
-            Uuid::parse_str(&format!(
-                "22222222-2222-4222-8222-{:012x}",
-                0x230 + index
-            ))
-            .unwrap(),
-            Uuid::parse_str(&format!(
-                "018f3f24-7a10-7cc2-8f55-{:012x}",
-                0x120 + index
-            ))
-            .unwrap(),
-            Uuid::parse_str("33333333-3333-4333-8333-333333333337")
-                .unwrap(),
+            Uuid::parse_str(&format!("22222222-2222-4222-8222-{:012x}", 0x230 + index)).unwrap(),
+            Uuid::parse_str(&format!("018f3f24-7a10-7cc2-8f55-{:012x}", 0x120 + index)).unwrap(),
+            Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
             1,
         )
         .await;
@@ -12385,13 +12395,12 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 let ClientPrincipal::Remote(principal) = &mut remote_state.principal else {
                     panic!("remote")
                 };
-                principal.actor_binding =
-                    Some(crate::daemon::principal::ClientActorBindingV1 {
-                        schema_version: 1,
-                        device_id: operation.authenticated_device_id,
-                        device_generation: operation.authenticated_device_generation,
-                        logical_attachment_id: operation.logical_attachment_id,
-                    });
+                principal.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
+                    schema_version: 1,
+                    device_id: operation.authenticated_device_id,
+                    device_generation: operation.authenticated_device_generation,
+                    logical_attachment_id: operation.logical_attachment_id,
+                });
                 let mut remote_shared = remote_state.shared_snapshot();
                 let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
                 let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -18490,7 +18499,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     SessionWork::RemoveNewestQueuedUserMessage {
                         target_id,
                         #[cfg(feature = "remote")]
-                        remote_operation: _,
+                            remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -18509,7 +18518,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     SessionWork::RemoveEditableQueuedUserMessages {
                         target_id,
                         #[cfg(feature = "remote")]
-                        remote_operation: _,
+                            remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -18790,7 +18799,7 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
             let SessionWork::RemoveQueuedUserMessage {
                 queue_item_id: delivered_id,
                 #[cfg(feature = "remote")]
-                remote_operation: _,
+                    remote_operation: _,
                 respond_to,
             } = work
             else {

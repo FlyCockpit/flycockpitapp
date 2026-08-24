@@ -57,9 +57,7 @@ fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempD
 /// vNext/legacy delegation boundary check.  The test "Build" agent is created
 /// directly (not via `agent_from_def`), so `vnext_reachable_subagents` is not
 /// called and the broad list cannot cause a resolution bail.
-fn test_vnext_build_grant(
-    root: &std::path::Path,
-) -> crate::agents::EffectiveVnextGrant {
+fn test_vnext_build_grant(root: &std::path::Path) -> crate::agents::EffectiveVnextGrant {
     use crate::agents::{
         AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
         ModelLocality, ModelSlot, VnextAgentDef,

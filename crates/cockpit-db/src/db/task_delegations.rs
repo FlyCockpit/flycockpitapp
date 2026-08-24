@@ -258,18 +258,19 @@ impl Db {
         // Keep the owner check, job, children, and payload rows under the
         // same immediate transaction.  `upsert_task_delegation_job_conn` is a
         // connection helper specifically so this does not nest transactions.
-        let result = self.transaction(move |conn| {
-            Self::upsert_task_delegation_job_conn(conn, job, now)?;
-            let mut rows = Vec::with_capacity(prepared_payloads.len());
-            for prepared_payload in prepared_payloads {
-                rows.push(Self::insert_prepared_task_delegation_payload_conn(
-                    conn,
-                    prepared_payload,
-                )?);
-            }
-            Ok(rows)
-        })
-        .await;
+        let result = self
+            .transaction(move |conn| {
+                Self::upsert_task_delegation_job_conn(conn, job, now)?;
+                let mut rows = Vec::with_capacity(prepared_payloads.len());
+                for prepared_payload in prepared_payloads {
+                    rows.push(Self::insert_prepared_task_delegation_payload_conn(
+                        conn,
+                        prepared_payload,
+                    )?);
+                }
+                Ok(rows)
+            })
+            .await;
         let rows = match result {
             Ok(rows) => rows,
             Err(error) => {

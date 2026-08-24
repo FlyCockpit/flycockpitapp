@@ -261,14 +261,18 @@ pub(super) async fn end_btw_fork(
             .await
             .map_err(internal)?;
     }
-    commit_session_remote_mutation(ctx, ledger, "btw_end", move |conn| {
+    let response = commit_session_remote_mutation(ctx, ledger, "btw_end", move |conn| {
         if crate::db::Db::get_session_conn(conn, parent_session_id)?.is_none() {
             return Err(UnknownRemoteSession(parent_session_id).into());
         }
         let _ = crate::db::Db::end_btw_fork_conn(conn, parent_session_id)?;
         Ok(Response::Ack)
     })
-    .await
+    .await?;
+    if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
+        tracing::warn!(%error, %parent_session_id, "ledgered btw sidecar cleanup remains durably pending");
+    }
+    Ok(response)
 }
 
 pub(super) async fn discard_session(
@@ -302,6 +306,9 @@ pub(super) async fn discard_session(
         Ok(Response::Ack)
     })
     .await?;
+    if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
+        tracing::warn!(%error, %session_id, "ledgered discard sidecar cleanup remains durably pending");
+    }
     if state
         .attached
         .as_ref()
@@ -423,11 +430,6 @@ pub(super) async fn delete_session(
     let now_wall_ms = super::run_invocation::wall_ms_now();
     let response = commit_session_remote_mutation(ctx, ledger, "delete_session", move |conn| {
         crate::db::Db::terminalize_session_run_invocations_conn(conn, session_id, now_wall_ms)?;
-        crate::db::Db::enqueue_delegation_sidecar_cleanup_conn(
-            conn,
-            session_id,
-            now_wall_ms,
-        )?;
         let existed = crate::db::Db::delete_existing_session_row_conn(conn, session_id)?;
         require_mutated(existed, session_id)?;
         Ok(Response::Ack)

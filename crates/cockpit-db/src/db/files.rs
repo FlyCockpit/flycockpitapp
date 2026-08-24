@@ -6,8 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 #[cfg(test)]
-static SIDECAR_SYNC_FAILURE_PATH: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+static SIDECAR_SYNC_FAILURE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) fn force_sidecar_parent_sync_failure_for_test(path: Option<PathBuf>) {
@@ -342,8 +341,8 @@ pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> 
     };
     #[cfg(not(windows))]
     let directory = std::fs::File::open(parent);
-    let directory = directory
-        .with_context(|| format!("opening sidecar parent {}", parent.display()))?;
+    let directory =
+        directory.with_context(|| format!("opening sidecar parent {}", parent.display()))?;
     directory
         .sync_all()
         .with_context(|| format!("syncing sidecar parent {}", parent.display()))
@@ -391,7 +390,10 @@ pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!("opening sidecar cleanup directory beneath {}", base.display())
+                format!(
+                    "opening sidecar cleanup directory beneath {}",
+                    base.display()
+                )
             });
         }
         // SAFETY: successful `openat` returned a newly owned descriptor.

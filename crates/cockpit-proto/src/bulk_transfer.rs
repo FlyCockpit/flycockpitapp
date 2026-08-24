@@ -34,7 +34,9 @@ impl<'de> Deserialize<'de> for BulkTransferId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         if text.len() != 22 || text.contains('=') {
-            return Err(serde::de::Error::custom("bulk transfer id is not canonical"));
+            return Err(serde::de::Error::custom(
+                "bulk transfer id is not canonical",
+            ));
         }
         let decoded = URL_SAFE_NO_PAD
             .decode(text.as_bytes())
@@ -44,7 +46,9 @@ impl<'de> Deserialize<'de> for BulkTransferId {
             .map_err(|_| serde::de::Error::custom("bulk transfer id length mismatch"))?;
         let id = Self::from_bytes(bytes).map_err(serde::de::Error::custom)?;
         if URL_SAFE_NO_PAD.encode(id.0) != text {
-            return Err(serde::de::Error::custom("bulk transfer id is not canonical"));
+            return Err(serde::de::Error::custom(
+                "bulk transfer id is not canonical",
+            ));
         }
         Ok(id)
     }
@@ -142,7 +146,9 @@ mod hex32 {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(serde::de::Error::custom("SHA-256 must be lowercase hexadecimal"));
+            return Err(serde::de::Error::custom(
+                "SHA-256 must be lowercase hexadecimal",
+            ));
         }
         let mut bytes = [0_u8; 32];
         for (index, output) in bytes.iter_mut().enumerate() {

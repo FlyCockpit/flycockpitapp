@@ -790,14 +790,15 @@ fn principal_from_relay_wire(principal: RelayPrincipal) -> ClientPrincipal {
             })
         })
         .collect();
-    let actor_binding = principal.actor_binding.map(|binding| {
-        crate::daemon::principal::ClientActorBindingV1 {
-            schema_version: binding.schema_version,
-            device_id: binding.device_id,
-            device_generation: binding.device_generation,
-            logical_attachment_id: binding.logical_attachment_id,
-        }
-    });
+    let actor_binding =
+        principal
+            .actor_binding
+            .map(|binding| crate::daemon::principal::ClientActorBindingV1 {
+                schema_version: binding.schema_version,
+                device_id: binding.device_id,
+                device_generation: binding.device_generation,
+                logical_attachment_id: binding.logical_attachment_id,
+            });
     ClientPrincipal::from_verified_remote(principal.user_id, grants, actor_binding)
 }
 

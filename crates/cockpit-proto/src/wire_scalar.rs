@@ -91,8 +91,20 @@ mod tests {
 
     #[test]
     fn canonical_decimal_rejects_noncanonical_spellings() {
-        for invalid in ["", "00", "01", "+1", "-1", " 1", "1 ", "18446744073709551616"] {
-            assert!(parse_canonical_u64_decimal_string(invalid).is_err(), "{invalid}");
+        for invalid in [
+            "",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse_canonical_u64_decimal_string(invalid).is_err(),
+                "{invalid}"
+            );
         }
         assert_eq!(parse_canonical_u64_decimal_string("0").unwrap(), 0);
         assert_eq!(

@@ -148,9 +148,7 @@ fn render_capped_payload_range(
         output.push('\n');
     }
     if let Some(next) = next {
-        let marker = format!(
-            "... [{tool_name} continuation start_line={next} hash={hash}]\n"
-        );
+        let marker = format!("... [{tool_name} continuation start_line={next} hash={hash}]\n");
         debug_assert!(marker.len() <= CONTINUATION_RESERVE_BYTES);
         while output.len().saturating_add(marker.len()) > cap {
             output.pop();

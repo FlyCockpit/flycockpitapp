@@ -33,10 +33,7 @@ impl FilesystemIdentityV1 {
             matches!(self.kind, 1 | 2),
             "invalid filesystem identity kind"
         );
-        ensure!(
-            self.link_count > 0,
-            "filesystem identity has no links"
-        );
+        ensure!(self.link_count > 0, "filesystem identity has no links");
         let mode_kind = self.mode & 0o170000;
         ensure!(
             (self.kind == 1 && mode_kind == 0o100000) || (self.kind == 2 && mode_kind == 0o040000),
@@ -64,5 +61,3 @@ impl FilesystemIdentityV1 {
         Ok(decoded)
     }
 }
-
-

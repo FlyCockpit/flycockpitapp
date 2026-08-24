@@ -21,9 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 #[cfg(feature = "remote")]
 use tokio::sync::watch;
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -2033,9 +2033,7 @@ pub struct DaemonContext {
     /// request hashes intentionally share the same key: the conflict loser
     /// must learn that it lost before it can stop workers or touch media.
     #[cfg(feature = "remote")]
-    remote_operation_locks: tokio::sync::Mutex<
-        HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>,
-    >,
+    remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
     pub scheduler: Option<DaemonSchedulerHandle>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
@@ -3548,6 +3546,7 @@ async fn run_boot_housekeeping(db: &Db) {
 pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
     // Wiring invariant (debug/CI): the transactional ledger-site registry must
     // exactly cover the remotely-admissible transactional_mutation commands.
+    #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
     // Startup recovery: converge any effective-default journal left behind by
     // an unclean shutdown before the first client can read a config snapshot.
@@ -4870,15 +4869,22 @@ async fn handle_envelope(
             request,
         } => {
             #[cfg(feature = "remote")]
-            let remote_operation =
-                match remote_dispatch::admit(ctx, &state.principal, id, operation, &request).await {
-                    Ok(context) => context,
-                    Err(error) => {
-                        let envelope = Envelope::error(Some(id), error);
-                        let _ = send_writer_envelope(writer_tx, envelope).await;
-                        return Ok(());
-                    }
-                };
+            let remote_operation = match remote_dispatch::admit(
+                ctx,
+                &state.principal,
+                id,
+                operation,
+                &request,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    let envelope = Envelope::error(Some(id), error);
+                    let _ = send_writer_envelope(writer_tx, envelope).await;
+                    return Ok(());
+                }
+            };
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -4892,12 +4898,15 @@ async fn handle_envelope(
                     let response_ctx = ctx.clone();
                     #[cfg(feature = "remote")]
                     let result = run_concurrent_request_catching_panic_with_remote_operation(
-                        request, request_shared, ctx, remote_operation,
-                    ).await;
+                        request,
+                        request_shared,
+                        ctx,
+                        remote_operation,
+                    )
+                    .await;
                     #[cfg(not(feature = "remote"))]
-                    let result = run_concurrent_request_catching_panic(
-                        request, request_shared, ctx,
-                    ).await;
+                    let result =
+                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
                     let envelope =
                         response_envelope_for_shared(id, result, &response_shared, &response_ctx);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
@@ -4908,12 +4917,23 @@ async fn handle_envelope(
             let mut effects = ClientRequestEffects::default();
             #[cfg(feature = "remote")]
             let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
-                request, state, shared, ctx, &mut effects, remote_operation.as_ref(),
-            )).await;
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
+                remote_operation.as_ref(),
+            ))
+            .await;
             #[cfg(not(feature = "remote"))]
             let result = Box::pin(dispatch::handle_serialized_request(
-                request, state, shared, ctx, &mut effects,
-            )).await;
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
+            ))
+            .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();

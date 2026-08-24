@@ -2976,8 +2976,8 @@ async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
         "{}",
         crate::assistants::VALID_ASSISTANT_CONTENT_HASH_FIXTURE,
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let row = db
         .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
         .await

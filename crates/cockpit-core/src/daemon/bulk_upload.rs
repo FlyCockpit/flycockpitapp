@@ -70,10 +70,9 @@ pub async fn stage_opaque_user_text(
     if transfer_id_bytes.iter().all(|byte| *byte == 0) {
         transfer_id_bytes[0] = 1;
     }
-    let transfer_id =
-        transfer_id_from_bytes(transfer_id_bytes).map_err(|error| {
-            BulkUserMessageUploadError::Daemon(format!("building bulk transfer id: {error}"))
-        })?;
+    let transfer_id = transfer_id_from_bytes(transfer_id_bytes).map_err(|error| {
+        BulkUserMessageUploadError::Daemon(format!("building bulk transfer id: {error}"))
+    })?;
     let transfer = RemoteBulkTransferRef::new(
         transfer_id,
         bytes.len() as u64,

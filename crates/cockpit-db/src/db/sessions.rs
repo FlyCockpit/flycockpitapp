@@ -893,6 +893,14 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         unsafe_media == 0,
         "session media cleanup must complete before session deletion"
     );
+    // Capture every delegation sidecar path before the session cascade removes
+    // its owning payload row. Keeping this at the universal delete boundary
+    // covers local, remote-ledgered, retention, and recovery callers alike.
+    Db::enqueue_delegation_sidecar_cleanup_conn(
+        conn,
+        session_id,
+        crate::db::session_log::now_ms().max(0),
+    )?;
     // The delete cascades to descendant forks and `/btw` rows, so every member
     // of the cascade set needs a tombstone — not just the requested root. A
     // descendant deleted without one loses the owner-visible marker for its
@@ -1246,8 +1254,13 @@ impl Db {
         // each statement autocommits separately — a failure between them would
         // leave a tombstone for a session that still exists, or a deleted
         // session with no owner-visible marker for its unresolved operations.
-        self.transaction(move |conn| Self::end_btw_fork_conn(conn, parent_session_id))
-            .await
+        let removed = self
+            .transaction(move |conn| Self::end_btw_fork_conn(conn, parent_session_id))
+            .await?;
+        if removed && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, %parent_session_id, "btw sidecar cleanup remains durably pending");
+        }
+        Ok(removed)
     }
 
     /// End-`/btw` body without an owning transaction. The caller supplies a
@@ -1809,16 +1822,14 @@ impl Db {
     }
 
     /// Delete a session and its complete fork subtree. SQLite owns the
-    /// cascading relationship; the pre-delete walk only discovers sidecar
-    /// files that must be removed after the transaction commits.
+    /// cascading relationship; durable cleanup intents retain sidecar
+    /// identities across the commit and are reconciled afterward.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<()> {
-        let now_ms = Utc::now().timestamp_millis();
-        self.transaction(move |conn| {
-            Self::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, now_ms)?;
-            delete_session_conn(conn, session_id)
-        })
-        .await?;
-        self.reconcile_delegation_sidecar_cleanup_intents().await?;
+        self.transaction(move |conn| delete_session_conn(conn, session_id))
+            .await?;
+        if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, %session_id, "session sidecar cleanup remains durably pending");
+        }
         Ok(())
     }
 
@@ -1829,7 +1840,10 @@ impl Db {
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<()> {
-        ensure!(now_unix_ms >= 0, "cleanup intent timestamp must be nonnegative");
+        ensure!(
+            now_unix_ms >= 0,
+            "cleanup intent timestamp must be nonnegative"
+        );
         for member in collect_subtree(conn, session_id)? {
             conn.execute(
                 "INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)
@@ -1935,18 +1949,16 @@ impl Db {
 
     /// Connection-direct session deletion for the transactional
     /// remote-operation ledger writer (already inside a transaction). Writes
-    /// the external tombstone and deletes the row + fork subtree. Sidecar file
-    /// removal is the caller's post-commit responsibility.
+    /// the external tombstone, captures durable sidecar cleanup intents, and
+    /// deletes the row + fork subtree. Intent reconciliation remains the
+    /// caller's post-commit responsibility.
     pub fn delete_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         delete_session_conn(conn, session_id)
     }
 
     /// Transaction-composable deletion which refuses to treat a concurrently
     /// removed root as a successful remote mutation.
-    pub fn delete_existing_session_row_conn(
-        conn: &Connection,
-        session_id: Uuid,
-    ) -> Result<bool> {
+    pub fn delete_existing_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
         if get_session_inner(conn, session_id)?.is_none() {
             return Ok(false);
         }
@@ -1966,8 +1978,9 @@ impl Db {
             .transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
             .await?;
         if removed {
-            self.reconcile_delegation_sidecar_cleanup_intents()
-                .await?;
+            if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+                tracing::warn!(%error, %session_id, "discarded-session sidecar cleanup remains durably pending");
+            }
         }
         Ok(removed)
     }
@@ -1981,13 +1994,6 @@ impl Db {
             Some(row) if row.ephemeral => {}
             _ => return Ok(false),
         }
-        // Capture sidecar deletion authority in this same transaction before
-        // the session cascade removes the only rows which name those files.
-        Self::enqueue_delegation_sidecar_cleanup_conn(
-            conn,
-            session_id,
-            Utc::now().timestamp_millis(),
-        )?;
         delete_session_conn(conn, session_id)?;
         Ok(true)
     }
@@ -2120,7 +2126,6 @@ impl Db {
         Ok(())
     }
 
-
     /// Transaction-composable archive which validates the root in the same
     /// transaction as the subtree update.
     pub fn archive_existing_session_conn(
@@ -2165,12 +2170,8 @@ impl Db {
         Ok(())
     }
 
-
     /// Transaction-composable unarchive which reports concurrent removal.
-    pub fn unarchive_existing_session_conn(
-        conn: &Connection,
-        session_id: Uuid,
-    ) -> Result<bool> {
+    pub fn unarchive_existing_session_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
         let affected = conn
             .execute(
                 "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
@@ -2202,7 +2203,7 @@ impl Db {
     /// which live workers to interrupt before a cascading archive/delete.
     pub async fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
         self.read(move |conn| Ok(collect_subtree(conn, root)?.contains(&node)))
-        .await
+            .await
     }
 
     /// Move `last_active_at` to now. Called by the daemon on every

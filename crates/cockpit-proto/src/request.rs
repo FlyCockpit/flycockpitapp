@@ -2270,10 +2270,8 @@ impl Request {
                     );
                 }
                 let is_opaque_text_transfer =
-                    |reference: &crate::bulk_transfer::BulkTransferRef,
-                     minimum_length: u64| {
-                        reference.mime_class
-                            == crate::bulk_transfer::BulkMimeClass::Opaque
+                    |reference: &crate::bulk_transfer::BulkTransferRef, minimum_length: u64| {
+                        reference.mime_class == crate::bulk_transfer::BulkMimeClass::Opaque
                             && (minimum_length
                                 ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
                                 .contains(&reference.total_length_value())
@@ -3713,10 +3711,10 @@ mod tests {
     /// offers nowhere to put the bytes.
     #[test]
     fn import_session_archive_rejects_inline_bytes() {
+        use crate::MAX_NDJSON_FRAME_BYTES;
         use crate::bulk_transfer::{
             BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
         };
-        use crate::MAX_NDJSON_FRAME_BYTES;
 
         // The retired inline shape fails to parse. This is the assertion the
         // pre-migration production code could not satisfy.

@@ -45,8 +45,8 @@ pub mod assistants;
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
-pub mod filesystem_identity;
 mod files;
+pub mod filesystem_identity;
 pub mod guidance;
 pub mod image_generation;
 pub mod image_generation_plan;
@@ -147,8 +147,7 @@ struct TransactionRollbackFailed {
 }
 
 #[cfg(test)]
-static FORCED_ROLLBACK_FAILURE_DB: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+static FORCED_ROLLBACK_FAILURE_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn force_rollback_failure_for_test(database: Option<String>) {
@@ -236,14 +235,18 @@ impl Writer {
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
                         .and_then(|result| result);
                     let poison = result.as_ref().err().is_some_and(|error| {
-                        error.chain().any(|cause| cause.is::<TransactionRollbackFailed>())
+                        error
+                            .chain()
+                            .any(|cause| cause.is::<TransactionRollbackFailed>())
                     });
                     let _ = request.reply.send(result);
                     if poison {
                         // The connection may still own an unknown transaction.
                         // Drop it and close the queue rather than serving a
                         // later write from an unprovable state.
-                        return Err(anyhow::anyhow!("database writer poisoned after rollback failure"));
+                        return Err(anyhow::anyhow!(
+                            "database writer poisoned after rollback failure"
+                        ));
                     }
                 }
                 // The last database owner performs an explicit truncating
@@ -466,7 +469,9 @@ impl Db {
         let existed_before_open = path.exists();
         if existed_before_open {
             let incoming = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("opening existing SQLite read-only at {}", path.display()))?;
+                .with_context(|| {
+                    format!("opening existing SQLite read-only at {}", path.display())
+                })?;
             // Preserve a recovery copy for every rejected/unproven prerelease
             // database, then prove ledger checksum, exact DDL fingerprint,
             // profile, and user_version before any source-database mutation.
@@ -536,7 +541,11 @@ impl Db {
     /// canonical database path, a copied database has no ownership sidecar;
     /// the caller must opt into this API and the file is opened read-only.
     pub fn open_read_only_diagnostic_snapshot(path: &Path) -> Result<Self> {
-        anyhow::ensure!(path.is_file(), "database snapshot does not exist at {}", path.display());
+        anyhow::ensure!(
+            path.is_file(),
+            "database snapshot does not exist at {}",
+            path.display()
+        );
         Self::open_read_only_diagnostic_impl(path.to_path_buf(), None)
     }
 
@@ -849,12 +858,14 @@ where
                 Ok(value)
             }
         }
-        Ok(Err(error)) => {
-            match rollback_transaction(conn) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(TransactionRollbackFailed { primary: error, rollback }.into()),
+        Ok(Err(error)) => match rollback_transaction(conn) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(TransactionRollbackFailed {
+                primary: error,
+                rollback,
             }
-        }
+            .into()),
+        },
         Err(_) => {
             let primary = anyhow::anyhow!("db transaction job panicked");
             match rollback_transaction(conn) {
@@ -913,7 +924,7 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
              PRAGMA wal_autocheckpoint = 1000;
              PRAGMA journal_size_limit = 67108864;",
         )
-            .context("setting SQLite durability policy")?;
+        .context("setting SQLite durability policy")?;
         // `pragma_update` doesn't accept the kind of literal that
         // `journal_mode = WAL` needs; the query-row form does. The
         // return value is the resolved mode. A non-WAL result fails closed:
@@ -1012,12 +1023,12 @@ fn create_migration_backup(
     let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
     conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
         .with_context(|| {
-        format!(
-            "creating SQLite online backup of {} at {} before {reason}",
-            path.display(),
-            backup.display()
-        )
-    })?;
+            format!(
+                "creating SQLite online backup of {} at {} before {reason}",
+                path.display(),
+                backup.display()
+            )
+        })?;
     files::repair_private_file(&backup, "database backup")?;
     validate_migration_backup(&backup)?;
     fsync_file_and_parent(&backup)?;
@@ -1038,7 +1049,10 @@ fn prerelease_backup_reason(
     let columns = table_columns(conn, "schema_version")?;
     if !columns.iter().any(|column| column == "schema_fingerprint") {
         let version = legacy_schema_version(conn)?;
-        return Ok(Some((version, "rejecting a legacy prerelease schema ledger")));
+        return Ok(Some((
+            version,
+            "rejecting a legacy prerelease schema ledger",
+        )));
     }
     let version = current_schema_version(conn)?;
     if version > migration_count as i64 {
@@ -1055,13 +1069,18 @@ fn prerelease_backup_reason(
         )
         .context("reading prerelease schema profile")?;
     if profile != SCHEMA_PROFILE {
-        return Ok(Some((version, "rejecting a different database schema profile")));
+        return Ok(Some((
+            version,
+            "rejecting a different database schema profile",
+        )));
     }
     if version == 1 {
         let recorded: String = conn
-            .query_row("SELECT sha256 FROM schema_version WHERE version = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT sha256 FROM schema_version WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
             .context("reading prerelease v1 migration checksum")?;
         if recorded != migration_definition_hash(&MIGRATIONS[0]) {
             return Ok(Some((version, "rejecting an amended prerelease v1")));
@@ -1125,13 +1144,10 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
         .flatten()
         .filter_map(|entry| {
             let candidate = entry.path();
-            let owned =
-            candidate
-                .file_name()
-                .is_some_and(|name| {
-                    let name = name.to_string_lossy();
-                    name.starts_with(&prefix) && name.contains(".backup-") && name.ends_with(".sqlite")
-                });
+            let owned = candidate.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.contains(".backup-") && name.ends_with(".sqlite")
+            });
             owned.then(|| {
                 let modified = entry
                     .metadata()
@@ -1164,8 +1180,7 @@ fn migration_definition_hash(migration: &Migration) -> String {
     // Omitting the extension made two materially different schemas share a
     // migration checksum and allowed an edited profile extension to pass the
     // ledger check.
-    let mut definition =
-        String::with_capacity(migration.sql.len() + migration.extension_sql.len());
+    let mut definition = String::with_capacity(migration.sql.len() + migration.extension_sql.len());
     definition.push_str(migration.sql);
     definition.push_str(migration.extension_sql);
     migration_hash(&definition)
@@ -1225,11 +1240,10 @@ fn is_lower_hex_64(value: &str) -> bool {
 }
 
 fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    let mut stmt =
-        conn.prepare(
-            "SELECT version, name, sha256, schema_fingerprint, schema_profile \
+    let mut stmt = conn.prepare(
+        "SELECT version, name, sha256, schema_fingerprint, schema_profile \
              FROM schema_version ORDER BY version",
-        )?;
+    )?;
     let mut expected_version = 1_i64;
     for row in stmt.query_map([], |row| {
         Ok((
@@ -3347,9 +3361,23 @@ mod tests {
             }
         }).await.unwrap();
         assert!(sidecar.exists(), "commit precedes external cleanup");
-        let pending = db.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",[],|row|row.get::<_,i64>(0))?)).await.unwrap();
+        let pending = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
         assert_eq!(pending, 1);
-        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
         assert!(!sidecar.exists());
     }
 
@@ -3375,13 +3403,31 @@ mod tests {
             }
         }).await.unwrap();
 
-        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 0);
-        assert!(sidecar.exists(), "a current payload reference protects its sidecar");
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            sidecar.exists(),
+            "a current payload reference protects its sidecar"
+        );
         db.write(move |conn| {
-            conn.execute("DELETE FROM task_delegation_payloads WHERE sidecar_path=?1",[relative])?;
+            conn.execute(
+                "DELETE FROM task_delegation_payloads WHERE sidecar_path=?1",
+                [relative],
+            )?;
             Ok(())
-        }).await.unwrap();
-        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
         assert!(!sidecar.exists());
     }
 
@@ -3410,15 +3456,34 @@ mod tests {
         }).await.unwrap();
 
         let _reset = ResetSyncFailure;
-        crate::db::files::force_sidecar_parent_sync_failure_for_test(
-            Some(sidecar.parent().unwrap().to_path_buf()),
+        crate::db::files::force_sidecar_parent_sync_failure_for_test(Some(
+            sidecar.parent().unwrap().to_path_buf(),
+        ));
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            0
         );
-        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 0);
-        let pending = db.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",[],|row|row.get::<_,i64>(0))?)).await.unwrap();
+        let pending = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
         assert_eq!(pending, 1, "uncertain unlink durability retains the intent");
 
         crate::db::files::force_sidecar_parent_sync_failure_for_test(None);
-        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

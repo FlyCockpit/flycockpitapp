@@ -36,8 +36,8 @@ pub use agent_installation::{
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
-pub mod host_capabilities;
 pub mod bulk_transfer;
+pub mod host_capabilities;
 pub mod image_control;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,

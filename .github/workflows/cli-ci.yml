@@ -165,8 +165,9 @@ jobs:
         run: cargo fmt --all -- --check
 
   remote-workspace-static:
-    name: Opt-in remote workspace compile contract
-    if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance
+    # Compile-time coverage is automatic on every Rust PR/push. Jobs which
+    # require external SoftHSM/coturn services remain explicitly opt-in below.
+    name: Remote profile compile contract
     needs: runners
     runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     steps:
@@ -179,10 +180,10 @@ jobs:
         with:
           shared-key: remote-workspace
           workspaces: . -> target
-      - name: Check full remote CLI and workspace
-        run: >
-          cargo check --locked --workspace --all-targets
-          --features cockpit-cli/remote,tenant-authority/remote
+      - name: Check opt-in remote CLI profile
+        run: cargo check --locked -p cockpit-cli --all-targets --features remote
+      - name: Check opt-in tenant-authority profile
+        run: cargo check --locked -p tenant-authority --all-targets --features remote
 
   daemon-custody-pkcs11-softhsm:
     name: Daemon custody PKCS#11 (SoftHSM2)

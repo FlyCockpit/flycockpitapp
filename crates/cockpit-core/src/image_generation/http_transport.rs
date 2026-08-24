@@ -437,7 +437,7 @@ mod tests {
     fn response_peer_missing_addr_fails_closed_ambiguous() {
         let vetted: Vec<SocketAddr> = vec!["93.184.216.34:443".parse().unwrap()];
         assert_eq!(
-            verify_response_peer(None, AddressClass::PublicRemote, &vetted),
+            verify_response_peer(None, AddressClass::PublicNetwork, &vetted),
             Err(ProviderTransportError::AmbiguousAcceptance)
         );
     }
@@ -446,9 +446,9 @@ mod tests {
     fn response_peer_outside_vetted_set_is_ambiguous() {
         let vetted: Vec<SocketAddr> = vec!["93.184.216.34:443".parse().unwrap()];
         let rogue: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        assert_eq!(classify_address(rogue.ip()), AddressClass::PublicRemote);
+        assert_eq!(classify_address(rogue.ip()), AddressClass::PublicNetwork);
         assert_eq!(
-            verify_response_peer(Some(rogue), AddressClass::PublicRemote, &vetted),
+            verify_response_peer(Some(rogue), AddressClass::PublicNetwork, &vetted),
             Err(ProviderTransportError::AmbiguousAcceptance)
         );
     }
@@ -456,10 +456,10 @@ mod tests {
     #[test]
     fn response_peer_in_vetted_public_set_is_accepted() {
         let good: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        assert_eq!(classify_address(good.ip()), AddressClass::PublicRemote);
+        assert_eq!(classify_address(good.ip()), AddressClass::PublicNetwork);
         let vetted = vec![good];
         assert_eq!(
-            verify_response_peer(Some(good), AddressClass::PublicRemote, &vetted),
+            verify_response_peer(Some(good), AddressClass::PublicNetwork, &vetted),
             Ok(())
         );
     }

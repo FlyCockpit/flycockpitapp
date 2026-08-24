@@ -172,9 +172,11 @@ impl App {
             },
         );
 
+        #[cfg(feature = "remote")]
         self.start_startup_disclosures_fetch();
     }
 
+    #[cfg(feature = "remote")]
     pub(super) fn start_startup_disclosures_fetch(&mut self) {
         self.startup_disclosures_generation = self.startup_disclosures_generation.wrapping_add(1);
         let request_generation = self.startup_disclosures_generation;

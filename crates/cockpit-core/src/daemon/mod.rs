@@ -30,10 +30,13 @@ pub mod client;
 pub(crate) mod config_refresh;
 pub mod config_source;
 pub(crate) mod config_watch;
+#[cfg(feature = "remote")]
 pub mod connector;
+#[cfg(feature = "remote")]
 pub mod control_replay;
 pub(crate) mod diagnostics_probe;
 pub mod effective_default_recovery;
+#[cfg(feature = "remote")]
 pub mod egress;
 pub mod ephemeral_guard;
 pub mod fs_api;
@@ -45,17 +48,24 @@ pub mod leak_reveal_frame;
 #[cfg(unix)]
 pub mod leak_reveal_socket;
 pub mod lsp;
+#[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod principal;
 pub mod proto;
 pub mod registry;
+#[cfg(feature = "remote")]
 pub mod relay_envelope;
+#[cfg(feature = "remote")]
 pub mod remote_attempt;
+#[cfg(feature = "remote")]
 pub mod remote_audit_upload;
+#[cfg(feature = "remote")]
 pub(crate) mod remote_outbox_worker;
+#[cfg(feature = "remote")]
 pub mod remote_project_resolver;
 pub mod scheduler;
 pub mod server;
+#[cfg(feature = "remote")]
 pub mod session_continuity;
 pub mod session_worker;
 pub mod shutdown;
@@ -63,7 +73,9 @@ pub mod skew_restart;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_harness;
+#[cfg(feature = "remote")]
 pub mod transport_selection;
+#[cfg(feature = "remote")]
 pub mod turn_socket_provider;
 
 #[cfg(unix)]
@@ -1142,9 +1154,13 @@ pub(crate) async fn boot_in_process(
     #[cfg(not(test))]
     {
         server::spawn_lock_sweeper(ctx.clone());
+        #[cfg(feature = "remote")]
         let _org_sync_task = org_sync::spawn_background(ctx.clone());
+        #[cfg(feature = "remote")]
         let _remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
+        #[cfg(feature = "remote")]
         let _connector_task = connector::spawn_background(ctx.clone());
+        #[cfg(feature = "remote")]
         let _remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
     }
     server::register_in_process_context(ctx.clone());
@@ -1432,9 +1448,13 @@ async fn run_foreground_inner_with_boot_db(
     // gone idle past the 5-minute threshold, so a hung/abandoned holder
     // can't block a waiting `read` forever.
     server::spawn_lock_sweeper(ctx.clone());
+    #[cfg(feature = "remote")]
     let org_sync_task = org_sync::spawn_background(ctx.clone());
+    #[cfg(feature = "remote")]
     let remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
+    #[cfg(feature = "remote")]
     let connector_task = connector::spawn_background(ctx.clone());
+    #[cfg(feature = "remote")]
     let remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
 
     // Dedicated Unix peer-authenticated leak-reveal socket (sibling of the
@@ -1593,9 +1613,13 @@ async fn run_foreground_inner_with_boot_db(
     if let Some(watchdog) = watchdog_task {
         watchdog.abort();
     }
+    #[cfg(feature = "remote")]
     org_sync_task.abort();
+    #[cfg(feature = "remote")]
     remote_audit_upload_task.abort();
+    #[cfg(feature = "remote")]
     connector_task.abort();
+    #[cfg(feature = "remote")]
     remote_outbox_task.abort();
     #[cfg(unix)]
     if let Some(task) = leak_reveal_task {

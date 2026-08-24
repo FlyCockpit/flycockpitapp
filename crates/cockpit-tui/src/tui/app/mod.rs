@@ -1728,7 +1728,9 @@ pub struct App {
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
     /// retry the RPC rather than silently entering the session.
+    #[cfg(feature = "remote")]
     pub(super) startup_disclosures_ready: bool,
+    #[cfg(feature = "remote")]
     pub(super) startup_disclosures_generation: u64,
     /// True only after this attach epoch receives authoritative model state
     /// from the daemon. Config-derived display defaults must never fence a
@@ -2564,9 +2566,11 @@ pub struct App {
     pub(super) pending_tandem_options: Vec<(String, String)>,
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
+    #[cfg(feature = "remote")]
     pub(super) org_sync_disclosure: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
+    #[cfg(feature = "remote")]
     pub(super) connector_disclosure: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
@@ -3320,7 +3324,9 @@ impl App {
         // first frame.
         let daemon_state = startup_daemon_state(extended.daemon.autostart);
         timer.phase("daemon_probe");
+        #[cfg(feature = "remote")]
         let org_sync_disclosure = None;
+        #[cfg(feature = "remote")]
         let connector_disclosure = None;
         timer.phase("remote_disclosures_deferred");
         timer.done();
@@ -3367,7 +3373,9 @@ impl App {
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
+            #[cfg(feature = "remote")]
             startup_disclosures_ready: cfg!(test),
+            #[cfg(feature = "remote")]
             startup_disclosures_generation: 0,
             active_model_state_confirmed: false,
             active_model_selection,
@@ -3628,7 +3636,9 @@ impl App {
             gitignore_session_allow: Vec::new(),
             tandem_models: Vec::new(),
             pending_tandem_options: Vec::new(),
+            #[cfg(feature = "remote")]
             org_sync_disclosure,
+            #[cfg(feature = "remote")]
             connector_disclosure,
             has_no_providers_at_startup,
             first_run_flow: if has_no_providers_at_startup {

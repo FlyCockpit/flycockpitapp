@@ -124,7 +124,7 @@ impl OpenaiImagesHttpTransport {
             authorization,
             dns,
             body_limit,
-            required_location: AddressClass::PublicRemote,
+            required_location: AddressClass::PublicNetwork,
         })
     }
 

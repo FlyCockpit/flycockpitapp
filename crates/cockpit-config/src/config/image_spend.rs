@@ -35,41 +35,18 @@ pub async fn activate_saved_policy(
     Ok(current)
 }
 
-/// Persist a reviewed policy through the application-owned database without
-/// exposing the database crate to UI layers.
-pub async fn activate_saved_policy_default(
-    project_key: String,
-    saved: ImageSpendSettings,
-    expected_current_version: Option<u64>,
-    saved_at_ms: i64,
-) -> anyhow::Result<CurrentImageSpendPolicy> {
-    let db = cockpit_db::Db::open_default()?;
-    activate_saved_policy(
-        &db,
-        project_key,
-        saved,
-        expected_current_version,
-        saved_at_ms,
-    )
-    .await
-}
-
-pub async fn current_saved_policy_default(
-    project_key: String,
-) -> anyhow::Result<Option<CurrentImageSpendPolicy>> {
-    cockpit_db::Db::open_default()?
-        .current_image_spend_policy(project_key)
-        .await
-}
-
-/// Application-layer image spend policy persistence with the database
-/// implementation kept behind the config crate boundary.
+/// Test-only direct persistence seam. Production callers must receive the
+/// daemon-owned database handle (inside `cockpit-core`) or use a daemon RPC;
+/// exposing a path-opening store in a production dependency would let a UI
+/// process become a second SQLite owner.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
-pub struct ImageSpendPolicyStore {
+pub struct TestImageSpendPolicyStore {
     db: cockpit_db::Db,
 }
 
-impl ImageSpendPolicyStore {
+#[cfg(any(test, feature = "test-support"))]
+impl TestImageSpendPolicyStore {
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
         Ok(Self {
             db: cockpit_db::Db::open(path)?,

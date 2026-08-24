@@ -184,6 +184,7 @@ pub enum Response {
     },
 
     /// Deterministic secret-free terminal projection for remote goal mutations.
+    #[cfg(feature = "remote")]
     RemoteGoalOutcome {
         outcome: RemoteGoalOutcomeV1,
     },
@@ -302,15 +303,20 @@ pub enum Response {
         mode: Option<WorkspaceTrustMode>,
         config_generation: u64,
     },
+    #[cfg(feature = "remote")]
     FlycockpitStored,
+    #[cfg(feature = "remote")]
     FlycockpitAlreadyLoggedIn {
         email: String,
         server_url: String,
     },
+    #[cfg(feature = "remote")]
     FlycockpitCleared {
         server_url: String,
     },
+    #[cfg(feature = "remote")]
     FlycockpitNotLoggedIn,
+    #[cfg(feature = "remote")]
     FlycockpitOrgSync {
         outcome: crate::FlycockpitOrgSyncOutcome,
     },
@@ -319,6 +325,7 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
+    #[cfg(feature = "remote")]
     FlycockpitAccount {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<FlycockpitAccountView>,
@@ -437,7 +444,7 @@ pub enum Response {
     /// Acknowledgement for [`crate::Request::WriteBulkTransferChunk`].
     BulkTransferChunkAccepted {
         next_chunk_index: u32,
-        received_bytes: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+        received_bytes: crate::wire_scalar::CanonicalU64DecimalStringV1,
         /// True once the staged bytes match the reference's length and digest.
         complete: bool,
         /// How long the daemon will hold this transfer without further
@@ -729,6 +736,7 @@ pub enum Response {
     RunInvocationStatus {
         status: RunInvocationStatusV1,
     },
+    #[cfg(feature = "remote")]
     RemoteOperationStatus {
         status: Option<RemoteOperationStatusV1>,
     },
@@ -768,10 +776,12 @@ pub enum Response {
         result_json: String,
     },
     /// FlyCockpit connector state for the current account (JSON, or `null`).
+    #[cfg(feature = "remote")]
     ConnectorState {
         connector_json: String,
     },
     /// Org-sync and remote-audit-upload state lists as JSON.
+    #[cfg(feature = "remote")]
     OrgSyncStatus {
         org_states_json: String,
         audit_states_json: String,
@@ -994,6 +1004,7 @@ impl RunInvocationCancelOutcome {
 
 /// Versioned, content-free response for a remote goal mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "remote")]
 pub struct RemoteGoalOutcomeV1 {
     pub schema_version: u8,
     pub session_id: Uuid,
@@ -1003,6 +1014,7 @@ pub struct RemoteGoalOutcomeV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "remote")]
 pub struct RemoteOperationStatusV1 {
     pub schema_version: u8,
     pub operation_id: Uuid,
@@ -1014,6 +1026,7 @@ pub struct RemoteOperationStatusV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(feature = "remote")]
 pub enum RemoteOperationStateV1 {
     Reserved,
     Committed,
@@ -1066,6 +1079,7 @@ macro_rules! response_variants {
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
+            #[cfg(feature = "remote")]
             (Response::RemoteGoalOutcome { .. }, "remote_goal_outcome");
             (Response::GoalCleared { .. }, "goal_cleared");
             (Response::PinChanged { .. }, "pin_changed");
@@ -1092,12 +1106,18 @@ macro_rules! response_variants {
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
             (Response::WorkspaceTrustSet { .. }, "workspace_trust_set");
             (Response::WorkspaceTrust { .. }, "workspace_trust");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitStored, "flycockpit_stored");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitAlreadyLoggedIn { .. }, "flycockpit_already_logged_in");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitCleared { .. }, "flycockpit_cleared");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitNotLoggedIn, "flycockpit_not_logged_in");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitOrgSync { .. }, "flycockpit_org_sync");
             (Response::SecretInventory { .. }, "secret_inventory");
+            #[cfg(feature = "remote")]
             (Response::FlycockpitAccount { .. }, "flycockpit_account");
             (Response::ProviderOAuthStarted { .. }, "provider_oauth_started");
             (Response::ProviderOAuthCompleted { .. }, "provider_oauth_completed");
@@ -1163,6 +1183,7 @@ macro_rules! response_variants {
             (Response::CaffeinateState { .. }, "caffeinate_state");
             (Response::PausedWork { .. }, "paused_work");
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
+            #[cfg(feature = "remote")]
             (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::HostCapabilities { .. }, "host_capabilities");
@@ -1171,7 +1192,9 @@ macro_rules! response_variants {
             (Response::PackageImported { .. }, "package_imported");
             (Response::PackagesPruned { .. }, "packages_pruned");
             (Response::KclPackagesImported { .. }, "kcl_packages_imported");
+            #[cfg(feature = "remote")]
             (Response::ConnectorState { .. }, "connector_state");
+            #[cfg(feature = "remote")]
             (Response::OrgSyncStatus { .. }, "org_sync_status");
             (Response::FailedToolCalls { .. }, "failed_tool_calls");
             (Response::SessionCompactions { .. }, "session_compactions");
@@ -1191,9 +1214,9 @@ macro_rules! response_variants {
 impl Response {
     pub fn wire_tag(&self) -> &'static str {
         macro_rules! wire_tag {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {
                 match self {
-                    $($pattern => $tag,)+
+                    $($(#[$row_attr])* $pattern => $tag,)+
                 }
             };
         }
@@ -1256,8 +1279,10 @@ mod tests {
     /// regardless of export size.
     #[test]
     fn export_session_data_uses_bulk_transfer() {
-        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::bulk_transfer::{
+            BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
+        };
 
         // The retired inline shape fails to parse.
         let legacy = json!({
@@ -1277,10 +1302,7 @@ mod tests {
             "inline content_base64 must no longer be accepted"
         );
 
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([7u8; 16])
-        .unwrap();
+        let transfer_id = transfer_id_from_bytes([7u8; 16]).unwrap();
         // A 300 MiB debug bundle: far beyond anything an 8 MiB frame allowed.
         let total_length = 300 * 1024 * 1024;
         let response = Response::ExportSessionData {
@@ -1308,7 +1330,7 @@ mod tests {
             "an export reference must stay small, got {} bytes",
             encoded.len()
         );
-        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < crate::MAX_NDJSON_FRAME_BYTES);
         assert!(!encoded.contains("content_base64"));
 
         let round_tripped: Response = serde_json::from_str(&encoded).unwrap();

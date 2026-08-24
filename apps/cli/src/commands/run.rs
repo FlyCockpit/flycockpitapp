@@ -1825,9 +1825,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events (no session_id) — irrelevant to a headless
         // one-shot run, so they're filtered out by the session check.
-        CaffeinateState { .. }
-        | ConnectorStatus { .. }
-        | DaemonDraining { .. }
+        CaffeinateState { .. } | DaemonDraining { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -1845,6 +1843,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Unknown => {
             return None;
         }
+        #[cfg(feature = "remote")]
+        ConnectorStatus { .. } => return None,
     })
 }
 

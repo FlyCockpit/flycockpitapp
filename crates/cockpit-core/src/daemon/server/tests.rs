@@ -30,8 +30,10 @@ fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::Workspac
 }
 
 macro_rules! pin_registration_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        vec![$(($kind, stringify!($authz), stringify!($ordering))),+]
+    (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        let mut rows = Vec::new();
+        $($(#[$row_attr])* rows.push(($kind, stringify!($authz), stringify!($ordering)));)+
+        rows
     }};
 }
 
@@ -231,6 +233,7 @@ fn sealed_owner_channel_requests() -> Vec<Request> {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn non_owner_rejected() {
     // AC4: every sealed-owner RPC fails closed with an Authorization error for a
     // remote (non-owner) principal, before any handler logic runs.
@@ -248,6 +251,7 @@ async fn non_owner_rejected() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn sealed_owner_rpcs_are_owner_remoted_and_never_leak() {
     // AC3: an authenticated owner request TRAVERSES dispatch (it is NOT rejected
     // at authorization). The value-channel arms (begin/apply/cancel/inventory)
@@ -497,6 +501,7 @@ async fn pin_rpc_rejects_seq_not_in_session() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn pin_rpcs_reject_non_owner_principal() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -533,6 +538,7 @@ async fn pin_rpcs_reject_non_owner_principal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn pin_reader_principal_can_read_but_not_write() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -701,6 +707,7 @@ async fn project_note_rejects_id_from_another_project_root() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn project_note_rpcs_reject_unauthorized_project_root() {
     let ctx = test_ctx();
     let note = ctx.db.create_project_note("/repo", "todo").await.unwrap();
@@ -805,7 +812,7 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
             name: "reviewer".into(),
             home_dir: "/tmp/reviewer".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         &mut state,
         &ctx,
@@ -818,11 +825,12 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
     assert_eq!(assistant.name, "reviewer");
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
-        "hash"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn list_packages_rejects_non_owner_principal() {
     // AC4: owner-remoted reads reject a non-owner principal.
     let ctx = test_ctx();
@@ -839,30 +847,18 @@ async fn list_packages_rejects_non_owner_principal() {
 #[tokio::test]
 async fn list_packages_response_carries_no_planted_secret() {
     // AC3: a `list_*` response contains no secret bytes. Plant a unique
-    // credential secret in the daemon vault; the package list must never echo
+    // local named secret in the daemon vault; the package list must never echo
     // it. Precondition-assert the secret is really stored first (L7/L8).
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
-    let mut credential = flycockpit_credential();
-    credential.instance_token = "fci_planted_list_packages_secret".into();
-    let token = credential.instance_token.clone();
-    handle_request(
-        Request::StoreFlycockpitCredential {
-            credential: credential.clone(),
-            force: true,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .unwrap();
+    let token = "sk-planted-list-packages-local-secret".to_owned();
+    let mut store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone())
+        .expect("local credential store");
+    store.set_named_secret("list-packages-redaction-probe", token.clone());
     // Precondition: the secret really lives in the daemon vault.
     assert_eq!(
-        ctx.load_flycockpit_credential()
-            .unwrap()
-            .unwrap()
-            .instance_token,
-        token
+        store.named_secret("list-packages-redaction-probe"),
+        Some(token.clone())
     );
     crate::packages::add_local(&ctx.db, "fixture-pkg", std::env::temp_dir().as_path())
         .await
@@ -888,6 +884,7 @@ async fn list_packages_response_carries_no_planted_secret() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn get_connector_state_omits_credential_secret() {
     // AC3: the connector snapshot carries no secret bytes.
     let tmp = tempfile::tempdir().unwrap();
@@ -979,7 +976,7 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
             name: "helper-bot".into(),
             home_dir: "/tmp/helper".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
     ];
     for request in mutations {
@@ -1397,6 +1394,7 @@ async fn docs_ask_uses_docs_agent_session() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn upsert_assistant_rejects_non_owner_principal() {
     let ctx = test_ctx();
     let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
@@ -1408,7 +1406,7 @@ async fn upsert_assistant_rejects_non_owner_principal() {
             name: "reviewer".into(),
             home_dir: "/tmp/reviewer".into(),
             config_json: "{}".into(),
-            content_hash: "hash".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         &mut state,
         &ctx,
@@ -1469,6 +1467,7 @@ fn invalid_response_metrics_tokenizer_dispatch_error_is_exact_and_safe() {
     assert_eq!(error.message, "configuration value is invalid");
 }
 
+#[cfg(feature = "remote")]
 fn remote_principal() -> ClientPrincipal {
     ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-user".to_string(),
@@ -1482,15 +1481,17 @@ fn remote_principal() -> ClientPrincipal {
     })
 }
 
-#[test]
-fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+    let ctx = test_ctx();
     let request_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
     let device_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
     let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
     let operation =
         proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
-    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+    let actor = crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id,
         device_generation: 9,
@@ -1556,7 +1557,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         ),
         (
             "zero_generation",
-            principal(Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            principal(Some(crate::daemon::principal::ClientActorBindingV1 {
                 device_generation: 0,
                 ..actor.clone()
             })),
@@ -1611,8 +1612,21 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         ),
     ];
     for (case, principal, operation, request, allowed) in cases {
-        let admitted = admit_remote_operation(&principal, request_id, operation, request);
+        let admitted =
+            remote_dispatch::admit(&ctx, &principal, request_id, operation, request).await;
         assert_eq!(admitted.is_ok(), allowed, "admission case {case}");
+        if let Err(error) = &admitted {
+            assert_eq!(
+                error.code,
+                ErrorCode::Authorization,
+                "denial code for {case}"
+            );
+            assert_eq!(
+                error.message,
+                "remote operations require a valid server-authenticated actor binding and operation identity",
+                "safe denial text for {case}"
+            );
+        }
         if let Ok(context) = admitted {
             reached_dispatch += 1;
             if let Some(context) = context {
@@ -1627,6 +1641,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
     use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
     let ctx = test_ctx();
@@ -1889,6 +1904,7 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_replay_identity_is_keyed_and_preserves_replay_conflicts() {
     use crate::db::remote_attachment_operations::{
         RemoteOperationClass, ReserveRemoteOperation, ReserveRemoteOperationOutcome,
@@ -1962,11 +1978,12 @@ async fn remote_replay_identity_is_keyed_and_preserves_replay_conflicts() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let ctx = test_ctx();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
     let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
-    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+    let actor = crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
         device_generation: 9,
@@ -2187,6 +2204,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -2211,7 +2229,7 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
                 ),
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
             device_generation: 7,
@@ -2287,6 +2305,7 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -2311,7 +2330,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
                 ),
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
             device_generation: 1,
@@ -2470,7 +2489,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
                 ),
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333338").unwrap(),
             device_generation: 1,
@@ -2496,6 +2515,7 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_session_note_applies_replays_and_conflicts_before_second_event() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -2519,7 +2539,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
                 ),
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
             device_generation: 1,
@@ -2948,6 +2968,7 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();
@@ -2992,7 +3013,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
                 project_root: Some(root_text),
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
             device_generation: 1,
@@ -3655,6 +3676,7 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
     let ctx = test_ctx();
     ctx.db
@@ -3681,7 +3703,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
                 project_root: None,
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
             device_generation: 1,
@@ -3743,6 +3765,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     let ctx = test_ctx();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222229").unwrap();
@@ -3754,7 +3777,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
                 project_root: None,
             },
         ]),
-        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333339").unwrap(),
             device_generation: 1,
@@ -3920,6 +3943,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let ctx = test_ctx();
     let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222230").unwrap();
@@ -3948,7 +3972,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "replay-user".into(),
             authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![]),
-            actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
                 schema_version: 1,
                 device_id: Uuid::parse_str(device).unwrap(),
                 device_generation: 1,
@@ -4128,6 +4152,7 @@ async fn detached_client_cannot_remove_editable_queued_messages() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_session_messages_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4188,6 +4213,7 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4251,6 +4277,7 @@ async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_history_page_denied_without_session_read_access() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4694,6 +4721,7 @@ async fn new_session_state_requests_are_classified() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn new_session_state_requests_enforce_authorization() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4743,6 +4771,7 @@ async fn new_session_state_requests_enforce_authorization() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_session_writer_cannot_persist_active_model_as_default() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = test_ctx();
@@ -4782,6 +4811,7 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn media_security_recovery_denial_precedes_operation_table() {
     let ctx = test_ctx();
     let state = MutableClientState::detached_with_principal(
@@ -5483,6 +5513,7 @@ async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_au
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
     for live in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
@@ -5623,6 +5654,7 @@ async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn attach_update_daemon_environment_policy_requires_owner() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -5666,6 +5698,7 @@ async fn attach_update_daemon_environment_policy_requires_owner() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
     for live in [true, false] {
         let ctx = test_ctx();
@@ -6344,7 +6377,7 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::DebugBundle,
@@ -6353,7 +6386,6 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("local owner raw export succeeds");
@@ -6368,7 +6400,7 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::DebugBundle,
@@ -6377,7 +6409,6 @@ async fn daemon_export_rpc_has_no_raw_bypass() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export succeeds");
@@ -6412,7 +6443,7 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let assembled = handle_concurrent_request_with_remote_operation(
+    let assembled = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6421,7 +6452,6 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted assemble");
@@ -6437,14 +6467,13 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
     loop {
         let state = owner_state();
         let shared = state.shared_snapshot();
-        let chunk_resp = handle_concurrent_request_with_remote_operation(
+        let chunk_resp = handle_concurrent_request(
             Request::ReadRedactedExportChunk {
                 transfer_id,
                 chunk_index,
             },
             shared,
             ctx.clone(),
-            None,
         )
         .await
         .expect("redacted chunk read");
@@ -6477,6 +6506,7 @@ async fn owner_assembles_and_reads_redacted_export_via_type_bound_reader() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
     // AC6/AC8: even for the LOCAL owner, the type-bound redacted reader refuses a
     // raw `Export` transfer (wrong kind, no bytes) — the reader is bound to the
@@ -6487,21 +6517,20 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
     let raw_id = [0x71u8; 16];
     let transfer = crate::daemon::bulk_staging::stage(
         b"raw archive with s3cr3t",
-        proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        proto::bulk_transfer::BulkMimeClass::Export,
         raw_id,
     )
     .expect("stage raw export");
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let refused = handle_concurrent_request_with_remote_operation(
+    let refused = handle_concurrent_request(
         Request::ReadRedactedExportChunk {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect_err("redacted reader must reject a raw export id");
@@ -6509,7 +6538,8 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
 
     // AC6/AC8: a remote principal is denied the generic local-only reader before
     // dispatch — no chunk bytes ever cross the boundary.
-    let denied = admit_remote_operation(
+    let denied = remote_dispatch::admit(
+        &ctx,
         &remote_principal(),
         Uuid::new_v4(),
         None,
@@ -6517,10 +6547,17 @@ async fn raw_export_chunks_are_owner_local_and_off_the_redacted_reader() {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
-    );
+    )
+    .await;
     assert!(
         denied.is_err(),
         "a remote principal must be denied the local-only generic reader"
+    );
+    let denied = denied.unwrap_err();
+    assert_eq!(denied.code, ErrorCode::Authorization);
+    assert_eq!(
+        denied.message,
+        "remote operations require a valid server-authenticated actor binding and operation identity"
     );
 
     // The raw bytes are untouched and still served to the local owner.
@@ -6539,21 +6576,20 @@ async fn redacted_export_reader_rejects_non_export_transfer() {
     let archive_id = [0x72u8; 16];
     let transfer = crate::daemon::bulk_staging::stage(
         b"PK\x03\x04 import archive",
-        proto::remote_transport::bulk::RemoteBulkMimeClass::Archive,
+        proto::bulk_transfer::BulkMimeClass::Archive,
         archive_id,
     )
     .expect("stage archive");
 
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let refused = handle_concurrent_request_with_remote_operation(
+    let refused = handle_concurrent_request(
         Request::ReadRedactedExportChunk {
             transfer_id: transfer.transfer_id,
             chunk_index: 0,
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect_err("redacted reader must reject a non-export transfer");
@@ -6603,7 +6639,7 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
     // RAW local export carries the secret verbatim (precondition + raw behavior).
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6612,7 +6648,6 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("raw export");
@@ -6630,7 +6665,7 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
     // REDACTED export omits the secret.
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6639,7 +6674,6 @@ async fn planted_secret_present_in_raw_export_and_absent_from_redacted_export() 
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export");
@@ -6703,7 +6737,7 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
     // RAW export carries it verbatim (precondition + raw behavior).
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let raw = handle_concurrent_request_with_remote_operation(
+    let raw = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6712,7 +6746,6 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("raw export");
@@ -6728,7 +6761,7 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
     // REDACTED export omits it — recovered ONLY from the folded journal.
     let state = owner_state();
     let shared = state.shared_snapshot();
-    let redacted = handle_concurrent_request_with_remote_operation(
+    let redacted = handle_concurrent_request(
         Request::ExportSessionData {
             session_id: session.session_id,
             kind: proto::ExportSessionKind::TranscriptJson,
@@ -6737,7 +6770,6 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
         },
         shared,
         ctx.clone(),
-        None,
     )
     .await
     .expect("redacted export");
@@ -6754,6 +6786,7 @@ async fn rotated_disk_secret_is_scrubbed_from_redacted_export_via_journal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn export_and_redacted_reader_reject_a_real_remote_principal() {
     // #5 / honest authz model: a GENUINE `ClientPrincipal::Remote` (the only
     // principal a real remote envelope can produce — a remote connection never
@@ -6969,6 +7002,7 @@ async fn curator_rpc_failure_leaves_skills_unchanged() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
     let table = table_for("client-boundary-secret");
     let event = proto::Event::AssistantText {
@@ -6998,6 +7032,7 @@ async fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn boundary_scrubs_streaming_deltas_for_non_owner() {
     let table = table_for("stream-secret");
     for event in [
@@ -7027,6 +7062,7 @@ async fn boundary_scrubs_streaming_deltas_for_non_owner() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn boundary_scrubs_nested_json_text_for_non_owner() {
     let table = table_for("nested-secret");
     let event = proto::Event::ToolStart {
@@ -7050,6 +7086,7 @@ async fn boundary_scrubs_nested_json_text_for_non_owner() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn boundary_uses_emit_time_table_not_later_table() {
     let emit_table = table_for("emit-secret");
     let _later_table = table_for("later-secret");
@@ -7073,6 +7110,7 @@ async fn boundary_uses_emit_time_table_not_later_table() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn session_and_global_events_use_their_own_tables() {
     let session_id = Uuid::new_v4();
     let session_event = proto::Event::Notice {
@@ -7111,6 +7149,7 @@ async fn session_and_global_events_use_their_own_tables() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn attach_history_is_scrubbed_only_for_non_owner() {
     let table = table_for("history-secret");
     let history = vec![proto::HistoryEntry::ToolCall {
@@ -7437,6 +7476,7 @@ fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext>
     )
 }
 
+#[cfg(feature = "remote")]
 fn remote_state_with_grants(
     grants: Vec<crate::daemon::principal::PrincipalGrant>,
 ) -> MutableClientState {
@@ -7463,6 +7503,7 @@ fn remote_state_with_grants(
     }
 }
 
+#[cfg(feature = "remote")]
 fn project_files_grant(root: &Path) -> crate::daemon::principal::PrincipalGrant {
     crate::daemon::principal::PrincipalGrant {
         scope: crate::daemon::principal::PrincipalScope::ProjectFiles,
@@ -7470,6 +7511,7 @@ fn project_files_grant(root: &Path) -> crate::daemon::principal::PrincipalGrant 
     }
 }
 
+#[cfg(feature = "remote")]
 fn terminal_grant() -> crate::daemon::principal::PrincipalGrant {
     crate::daemon::principal::PrincipalGrant {
         scope: crate::daemon::principal::PrincipalScope::Terminal,
@@ -7518,6 +7560,7 @@ async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
         .unwrap();
 }
 
+#[cfg(feature = "remote")]
 fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredential {
     crate::auth::flycockpit::StoredFlycockpitCredential {
         server_url: "https://app.example.test".to_string(),
@@ -7533,6 +7576,7 @@ fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredentia
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -7588,6 +7632,7 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -7642,6 +7687,7 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_projections() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -7800,7 +7846,7 @@ fn provider_responses_over_interactive_limit_fail_without_partial_payload() {
             display_name: "Provider".into(),
             fetched_at: chrono::Utc::now(),
             availability: crate::daemon::proto::ProviderUsageAvailabilityView::Error {
-                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+                message: "x".repeat(proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES),
             },
         }],
     };
@@ -7818,7 +7864,7 @@ fn oversized_provider_model_fetch_response_is_rejected_before_persistence() {
         results: vec![crate::daemon::proto::ProviderModelFetchResult {
             provider_id: "provider".into(),
             outcome: crate::daemon::proto::ProviderModelFetchOutcome::Error {
-                message: "x".repeat(proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES),
+                message: "x".repeat(proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES),
             },
         }],
         config: crate::daemon::proto::ProviderConfigView::default(),
@@ -9096,6 +9142,7 @@ async fn owner_provider_rpc_rejects_subscription_ack_namespace_before_failure_in
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9255,6 +9302,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -9320,6 +9368,7 @@ async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_credential_finishes_when_local_revoke_server_stalls() {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -9371,6 +9420,7 @@ async fn clear_credential_finishes_when_local_revoke_server_stalls() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_credential_noops_commit_and_replay() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9378,12 +9428,14 @@ async fn remote_owner_credential_noops_commit_and_replay() {
     let credential = flycockpit_credential();
     crate::auth::flycockpit::store_credential_in_vault(ctx.secret_vault.clone(), &credential)
         .unwrap();
-    let operation = |operation_id| RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id,
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
+    let operation = |operation_id| {
+        RemoteOperationContext::for_test(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            operation_id,
+            Uuid::new_v4(),
+            1,
+        )
     };
 
     let mut state = owner_state();
@@ -9392,7 +9444,7 @@ async fn remote_owner_credential_noops_commit_and_replay() {
         credential: credential.clone(),
         force: false,
     };
-    let store_operation = operation(Uuid::now_v7());
+    let store_operation = operation(Uuid::now_v7()).await;
     let mut effects = ClientRequestEffects::default();
     // The dispatcher is intentionally a very large async state machine. The
     // production remote path heap-pins it before polling; do the same here so
@@ -9426,7 +9478,7 @@ async fn remote_owner_credential_noops_commit_and_replay() {
 
     crate::auth::flycockpit::clear_credential_in_vault(ctx.secret_vault.clone()).unwrap();
     let clear_request = Request::ClearFlycockpitCredential;
-    let clear_operation = operation(Uuid::now_v7());
+    let clear_operation = operation(Uuid::now_v7()).await;
     let first = Box::pin(handle_serialized_request_with_remote_operation(
         clear_request,
         &mut state,
@@ -9455,15 +9507,17 @@ async fn remote_owner_credential_noops_commit_and_replay() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_provider_mutation_error_closes_the_durable_replay_record_unknown() {
     let ctx = persistent_test_ctx();
-    let operation = RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id: Uuid::now_v7(),
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
-    };
+    let operation = RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::now_v7(),
+        Uuid::new_v4(),
+        1,
+    )
+    .await;
     let attachment = operation.logical_attachment_id.to_string();
     let operation_id = operation.operation_id.to_string();
     let device_id = operation.authenticated_device_id.to_string();
@@ -9512,6 +9566,7 @@ async fn remote_provider_mutation_error_closes_the_durable_replay_record_unknown
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger_together() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9519,16 +9574,18 @@ async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let mut effects = ClientRequestEffects::default();
-    let operation = |operation_id| RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id,
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
+    let operation = |operation_id| {
+        RemoteOperationContext::for_test(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            operation_id,
+            Uuid::new_v4(),
+            1,
+        )
     };
 
     let credential = flycockpit_credential();
-    let store = operation(Uuid::now_v7());
+    let store = operation(Uuid::now_v7()).await;
     assert!(matches!(
         Box::pin(handle_serialized_request_with_remote_operation(
             Request::StoreFlycockpitCredential {
@@ -9570,7 +9627,7 @@ async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger
         )
         .await
         .unwrap();
-    let clear = operation(Uuid::now_v7());
+    let clear = operation(Uuid::now_v7()).await;
     assert!(matches!(
         Box::pin(handle_serialized_request_with_remote_operation(
             Request::ClearFlycockpitCredential,
@@ -9606,17 +9663,19 @@ async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_named_secret_commits_vault_and_replay_ledger_together() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
     );
-    let operation = RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id: Uuid::now_v7(),
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
-    };
+    let operation = RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::now_v7(),
+        Uuid::new_v4(),
+        1,
+    )
+    .await;
     let request = Request::PutNamedSecret {
         name: "atomic-remote-name".into(),
         value: "atomic-remote-value".into(),
@@ -9671,6 +9730,7 @@ async fn remote_owner_named_secret_commits_vault_and_replay_ledger_together() {
 /// Drive a session request through the real dispatch entry point as an
 /// authenticated remote operation, injecting the admitted operation identity
 /// exactly as `admit_remote_operation` would produce it on the live path.
+#[cfg(feature = "remote")]
 async fn dispatch_remote_session(
     ctx: &Arc<DaemonContext>,
     state: &mut MutableClientState,
@@ -9693,6 +9753,7 @@ async fn dispatch_remote_session(
 /// Read the durable transactional-ledger state for an operation identity, or
 /// `None` when no row exists (proves a missing ledger site rather than passing
 /// vacuously).
+#[cfg(feature = "remote")]
 async fn remote_ledger_state(
     ctx: &Arc<DaemonContext>,
     operation: &RemoteOperationContext,
@@ -9708,12 +9769,84 @@ async fn remote_ledger_state(
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
+async fn remote_archive_unarchive_and_rename_reject_unknown_session_before_ledger_commit() {
+    let ctx = persistent_test_ctx();
+    let missing = Uuid::new_v4();
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+
+    for request in [
+        Request::ArchiveSession {
+            session_id: missing,
+            cascade: true,
+        },
+        Request::UnarchiveSession {
+            session_id: missing,
+        },
+        Request::RenameSession {
+            session_id: missing,
+            title: "missing".into(),
+        },
+    ] {
+        let operation = remote_owner_operation().await;
+        let error = dispatch_remote_session(&ctx, &mut state, &shared, request, &operation)
+            .await
+            .expect_err("unknown remote session mutation must fail closed");
+        assert_eq!(error.code, ErrorCode::UnknownSession);
+        assert_eq!(
+            remote_ledger_state(&ctx, &operation).await,
+            None,
+            "target resolution failure must not consume a remote operation id"
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
+async fn remote_archive_stops_worker_before_committing_archive() {
+    let ctx = persistent_test_ctx();
+    let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
+    insert_hung_worker(&ctx, session.session_id);
+    let mut state = owner_state();
+    let shared = state.shared_snapshot();
+    let operation = remote_owner_operation().await;
+
+    let error = dispatch_remote_session(
+        &ctx,
+        &mut state,
+        &shared,
+        Request::ArchiveSession {
+            session_id: session.session_id,
+            cascade: false,
+        },
+        &operation,
+    )
+    .await
+    .expect_err("a hung worker must block remote archive");
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(
+        ctx.db
+            .get_session(session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none(),
+        "archive transaction must not commit when worker stop fails"
+    );
+    assert_eq!(remote_ledger_state(&ctx, &operation).await, None);
+}
+
+#[tokio::test]
+#[cfg(feature = "remote")]
 async fn fork_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::ForkSession {
         parent_session_id: parent.session_id,
         fork_point_turn_id: None,
@@ -9755,6 +9888,7 @@ async fn fork_session_remote_path_commits_transactional_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn discard_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
@@ -9765,7 +9899,7 @@ async fn discard_session_remote_path_commits_transactional_ledger() {
         .unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::DiscardSession {
         session_id: side.session_id,
     };
@@ -9792,6 +9926,7 @@ async fn discard_session_remote_path_commits_transactional_ledger() {
 /// ledger lookup BEFORE detaching the client or stopping any worker — no side
 /// effect on a rejected op.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn discard_session_reused_operation_conflict_rejects_before_detach() {
     let ctx = persistent_test_ctx();
     let project = tempfile::tempdir().unwrap();
@@ -9804,7 +9939,7 @@ async fn discard_session_reused_operation_conflict_rejects_before_detach() {
         .await
         .unwrap();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     // First discard commits the ledger for this operation identity, with a
     // request hash bound to `other` (not the attached session).
     let first = dispatch_remote_session(
@@ -9846,12 +9981,13 @@ async fn discard_session_reused_operation_conflict_rejects_before_detach() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn create_btw_fork_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::CreateBtwFork {
         parent_session_id: parent.session_id,
         tangent: false,
@@ -9881,6 +10017,7 @@ async fn create_btw_fork_remote_path_commits_transactional_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn end_btw_fork_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let parent = ctx.db.create_session("p", "/x", "Build").await.unwrap();
@@ -9892,7 +10029,7 @@ async fn end_btw_fork_remote_path_commits_transactional_ledger() {
     assert!(created.created);
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::EndBtwFork {
         parent_session_id: parent.session_id,
     };
@@ -9919,13 +10056,14 @@ async fn end_btw_fork_remote_path_commits_transactional_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn delete_session_remote_path_commits_transactional_ledger() {
     let ctx = persistent_test_ctx();
     let session = ctx.db.create_session("p", "/x", "Build").await.unwrap();
     ctx.db.end_session(session.session_id).await.unwrap();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::DeleteSession {
         session_id: session.session_id,
     };
@@ -9952,6 +10090,7 @@ async fn delete_session_remote_path_commits_transactional_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
     // `mark_app_flag_seen` is classified `local_only`. Even if an operation
     // identity is injected (which `admit_remote_operation` never produces for a
@@ -9960,7 +10099,7 @@ async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let request = Request::MarkAppFlagSeen {
         key: proto::AppFlagKey::DaemonAutostartNotice,
         expected_version: 0,
@@ -9984,6 +10123,7 @@ async fn mark_app_flag_seen_is_local_only_and_does_not_call_remote_ledger() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn transactional_mutation_inventory_has_ledger_site() {
     // Every `transactional_mutation` classification row that a remote actor can
     // be admitted for must have a real daemon ledger site. Owner-only rows are
@@ -9991,8 +10131,10 @@ async fn transactional_mutation_inventory_has_ledger_site() {
     // authorization layer denies a remote non-owner before dispatch, so they
     // never reserve a transactional remote-operation ledger row.
     macro_rules! transactional_inventory_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($tag, stringify!($authz), stringify!($remote_class)));)+
+            rows
         }};
     }
     let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_inventory_rows);
@@ -10064,6 +10206,7 @@ async fn transactional_mutation_inventory_has_ledger_site() {
 /// one operation identity carrying a different submission would be mistaken for
 /// a ledger replay and silently double-enqueued.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "remote")]
 async fn send_user_message_ledger_hash_binds_client_submission_id() {
     async fn worker_request_hash(
         ctx: &Arc<DaemonContext>,
@@ -10139,7 +10282,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
     let shared = state.shared_snapshot();
     // The SAME operation identity for both sends, differing only in the
     // client_submission_id.
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let (state, hash_a) = worker_request_hash(
         &ctx,
         state,
@@ -10199,6 +10342,7 @@ async fn send_user_message_ledger_hash_binds_client_submission_id() {
 /// refs). It must still reserve the operation through the SAME transactional
 /// ledger, so no remote send returns accepted without a ledger operation row.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "remote")]
 async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
     let mut ctx = test_ctx();
     let media_dir = tempfile::tempdir().unwrap();
@@ -10215,7 +10359,7 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let shared = state.shared_snapshot();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let client_submission_id = Uuid::new_v4();
     let request = Request::SendUserMessage {
         expected_model_state_generation: None,
@@ -10285,14 +10429,16 @@ async fn send_user_message_image_duplicate_remote_send_reserves_ledger() {
 /// A fresh, well-formed remote-operation identity for the owner-remoted
 /// settings/setup/OAuth dispatch tests below. Mirrors the fields
 /// `admit_remote_operation` validates on a live remote actor binding.
-fn remote_owner_operation() -> RemoteOperationContext {
-    RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id: Uuid::now_v7(),
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
-    }
+#[cfg(feature = "remote")]
+async fn remote_owner_operation() -> RemoteOperationContext {
+    RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::now_v7(),
+        Uuid::new_v4(),
+        1,
+    )
+    .await
 }
 
 /// SECURITY (High): `setup_copilot_auth` adopts the daemon HOST's ambient
@@ -10303,6 +10449,7 @@ fn remote_owner_operation() -> RemoteOperationContext {
 /// (same ambient token) proceeds past the token read, proving the gate is
 /// remote-specific and not a blanket failure.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
     let ctx = persistent_test_ctx();
     // Plant an ambient host GitHub token so a broken gate WOULD read and inject
@@ -10330,7 +10477,7 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
     // REMOTE dispatch: failed closed with the local-only refusal, BEFORE the
     // ambient token is read.
     let (request, _) = build(true);
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let mut state = owner_state();
     let shared = state.shared_snapshot();
     let mut effects = ClientRequestEffects::default();
@@ -10384,9 +10531,10 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
 /// the DB write once, commits the durable replay record, and a same-operation
 /// replay returns the cached response without a second write.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     let ctx = persistent_test_ctx();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let project_key = "remote-image-project";
     // A valid, minimal policy: all three budgets `unlimited` so
     // `ImageSpendSettings::validate` passes and the dispatch reaches the DB
@@ -10460,6 +10608,7 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
 /// config to disk once, commits the durable replay record, and a same-operation
 /// replay returns the cached response without rewriting the file.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_save_extended_config_commits_and_replays() {
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.json");
@@ -10483,7 +10632,7 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
         |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
     );
     let ctx = test_ctx_with_config_source(source);
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
 
     let marker = "REMOTE-SAVE-MARKER-4d5e6f70";
     let mut extended = crate::config::extended::ExtendedConfig::default();
@@ -10666,9 +10815,10 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
 /// before anything is written to config, and the reserved remote operation is
 /// closed `outcome_unknown` so a retry cannot re-run the partial import.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger() {
     let ctx = persistent_test_ctx();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let tmp = tempfile::tempdir().unwrap();
     let literal_key = "LITERAL-REMOTE-APIKEY-8f7e6d5c";
     // A hand-crafted bundle carrying a literal `Authorization` header — the same
@@ -10747,6 +10897,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
 /// drives the reachable failure edge, which the dispatch wiring — not the domain
 /// outcome — determines.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
     for request in [
         Request::ApplySetupWizard {
@@ -10777,7 +10928,7 @@ async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
         },
     ] {
         let ctx = persistent_test_ctx();
-        let operation = remote_owner_operation();
+        let operation = remote_owner_operation().await;
         let mut state = owner_state();
         let shared = state.shared_snapshot();
         let mut effects = ClientRequestEffects::default();
@@ -10908,17 +11059,19 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then_poisons_daemon() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
     );
-    let operation = RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::new_v4(),
-        operation_id: Uuid::now_v7(),
-        authenticated_device_id: Uuid::new_v4(),
-        authenticated_device_generation: 1,
-    };
+    let operation = RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::now_v7(),
+        Uuid::new_v4(),
+        1,
+    )
+    .await;
     let request = Request::PutNamedSecret {
         name: "poisoned-remote-name".into(),
         value: "poisoned-remote-value".into(),
@@ -10965,6 +11118,7 @@ async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -10991,6 +11145,7 @@ async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn ephemeral_daemon_rejects_persistent_secret_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -11040,6 +11195,7 @@ async fn ephemeral_daemon_rejects_persistent_secret_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_rpcs_reject_non_owner_principal() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -11078,6 +11234,7 @@ async fn owner_secret_rpcs_reject_non_owner_principal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn store_without_force_returns_already_logged_in_without_token() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
@@ -11121,6 +11278,7 @@ async fn store_without_force_returns_already_logged_in_without_token() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn store_with_force_replaces_vault_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
@@ -11153,6 +11311,7 @@ async fn store_with_force_replaces_vault_credential() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_revokes_from_daemon_vault() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -11234,6 +11393,7 @@ async fn clear_revokes_from_daemon_vault() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn credentials_json_is_not_read_or_written() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
@@ -11362,6 +11522,7 @@ async fn get_workspace_trust_reads_persisted_mode() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn fs_requests_require_project_files_scope_for_matching_root() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11432,6 +11593,7 @@ async fn fs_requests_require_project_files_scope_for_matching_root() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn terminal_requests_require_terminal_scope_and_audit_open_close() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11487,6 +11649,7 @@ async fn terminal_requests_require_terminal_scope_and_audit_open_close() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_write_hash_mismatch_and_lock_conflict_are_typed() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11535,6 +11698,7 @@ async fn remote_fs_write_hash_mismatch_and_lock_conflict_are_typed() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_mutations_are_audited_with_path() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11564,13 +11728,14 @@ async fn remote_fs_mutations_are_audited_with_path() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_changed_bytes() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
     let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111114").unwrap();
-    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+    let actor = crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
         device_generation: 4,
@@ -11666,6 +11831,7 @@ async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_chan
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is_available() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11676,7 +11842,7 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
     let ClientPrincipal::Remote(principal) = &mut state.principal else {
         panic!("remote")
     };
-    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    principal.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
         device_generation: 1,
@@ -11721,8 +11887,9 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation_or_reservation() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -11738,7 +11905,7 @@ async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation
     let ClientPrincipal::Remote(principal) = &mut state.principal else {
         panic!("remote")
     };
-    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    principal.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bc").unwrap(),
         device_generation: 1,
@@ -11798,6 +11965,7 @@ async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_second_effect() {
     let tmp = tempfile::tempdir().unwrap();
     let durable = tempfile::tempdir().unwrap();
@@ -11812,7 +11980,7 @@ async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_sec
     let ClientPrincipal::Remote(principal) = &mut state.principal else {
         panic!("remote")
     };
-    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    principal.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bb").unwrap(),
         device_generation: 1,
@@ -11891,6 +12059,7 @@ async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_sec
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn staged_rename_executor_applies_commits_and_replays_without_second_effect() {
     let tmp = tempfile::tempdir().unwrap();
     let spool = tempfile::tempdir().unwrap();
@@ -11937,13 +12106,14 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
             },
         ],
     };
-    let operation = RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap(),
-        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111116").unwrap(),
-        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
-        authenticated_device_generation: 1,
-    };
+    let operation = RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap(),
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111116").unwrap(),
+        Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+        1,
+    )
+    .await;
     assert!(matches!(
         execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
             .await
@@ -11974,6 +12144,7 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let durable = tempfile::tempdir().unwrap();
@@ -12013,13 +12184,14 @@ async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen()
             },
         ],
     };
-    let operation = RemoteOperationContext {
-        request_id: Uuid::new_v4(),
-        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-2222222222aa").unwrap(),
-        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111aa").unwrap(),
-        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333aa").unwrap(),
-        authenticated_device_generation: 1,
-    };
+    let operation = RemoteOperationContext::for_test(
+        Uuid::new_v4(),
+        Uuid::parse_str("22222222-2222-4222-8222-2222222222aa").unwrap(),
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111aa").unwrap(),
+        Uuid::parse_str("33333333-3333-4333-8333-3333333333aa").unwrap(),
+        1,
+    )
+    .await;
     assert!(matches!(
         execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
             .await
@@ -12092,6 +12264,7 @@ async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen()
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
     for (index, cut) in [
         "artifact_durable",
@@ -12135,22 +12308,14 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 },
             ],
         };
-        let operation = RemoteOperationContext {
-            request_id: Uuid::new_v4(),
-            logical_attachment_id: Uuid::parse_str(&format!(
-                "22222222-2222-4222-8222-{:012x}",
-                0x230 + index
-            ))
-            .unwrap(),
-            operation_id: Uuid::parse_str(&format!(
-                "018f3f24-7a10-7cc2-8f55-{:012x}",
-                0x120 + index
-            ))
-            .unwrap(),
-            authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337")
-                .unwrap(),
-            authenticated_device_generation: 1,
-        };
+        let operation = RemoteOperationContext::for_test(
+            Uuid::new_v4(),
+            Uuid::parse_str(&format!("22222222-2222-4222-8222-{:012x}", 0x230 + index)).unwrap(),
+            Uuid::parse_str(&format!("018f3f24-7a10-7cc2-8f55-{:012x}", 0x120 + index)).unwrap(),
+            Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
+            1,
+        )
+        .await;
         let mut fired = false;
         assert!(
             execute_remote_staged_rename_with_hook(
@@ -12230,13 +12395,12 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 let ClientPrincipal::Remote(principal) = &mut remote_state.principal else {
                     panic!("remote")
                 };
-                principal.actor_binding =
-                    Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
-                        schema_version: 1,
-                        device_id: operation.authenticated_device_id,
-                        device_generation: operation.authenticated_device_generation,
-                        logical_attachment_id: operation.logical_attachment_id,
-                    });
+                principal.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
+                    schema_version: 1,
+                    device_id: operation.authenticated_device_id,
+                    device_generation: operation.authenticated_device_generation,
+                    logical_attachment_id: operation.logical_attachment_id,
+                });
                 let mut remote_shared = remote_state.shared_snapshot();
                 let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
                 let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -12607,9 +12771,8 @@ async fn attached_state_with_worker_receiver(
     )
 }
 
-fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
-    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
-    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
+    use proto::bulk_transfer::{BulkMimeClass, BulkTransferRef, transfer_id_from_bytes};
     use rand::RngExt as _;
     use sha2::{Digest as _, Sha256};
 
@@ -12620,11 +12783,11 @@ fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::Remo
     if id.iter().all(|byte| *byte == 0) {
         id[0] = 1;
     }
-    RemoteBulkTransferRef::new(
-        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+    BulkTransferRef::new(
+        transfer_id_from_bytes(id).expect("nonzero transfer id"),
         bytes.len() as u64,
         digest,
-        RemoteBulkMimeClass::Opaque,
+        BulkMimeClass::Opaque,
     )
     .expect("opaque user transfer reference")
 }
@@ -12632,7 +12795,7 @@ fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::Remo
 fn stage_opaque_user_transfer(
     bytes: &[u8],
     owner: &crate::daemon::bulk_staging::BulkTransferOwner,
-) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+) -> proto::bulk_transfer::BulkTransferRef {
     let reference = opaque_user_transfer_ref(bytes);
     for (index, chunk) in bytes
         .chunks(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES)
@@ -12811,7 +12974,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let source = "s".repeat(1024 * 1024 + 17);
     let display = "d".repeat(64 * 1024 + 23);
-    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
     let source_transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
     let display_transfer = stage_opaque_user_transfer(display.as_bytes(), &owner);
     let source_replay = source_transfer.clone();
@@ -12870,6 +13033,7 @@ async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically(
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
@@ -12879,7 +13043,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
         .set_session_shared_with_collaborators(session_id, true)
         .await
         .unwrap();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let mut remote = remote_principal();
     let ClientPrincipal::Remote(remote_identity) = &mut remote else {
         panic!("remote fixture must remain remote");
@@ -12901,7 +13065,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
             ),
         },
     ]);
-    remote_identity.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    remote_identity.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,
         device_generation: operation.authenticated_device_generation,
@@ -12964,7 +13128,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     assert_eq!(admission.operation_id, expected_operation_id);
     assert!(matches!(
         admission.actor,
-        crate::db::message_attachments::MessageActor::RemoteDevice { id, generation }
+        crate::db::message_attachments::MessageActor::ExternalPrincipal { id, generation }
             if id == expected_device_id && generation == expected_device_generation
     ));
     let item = proto::QueueItem {
@@ -13044,8 +13208,8 @@ async fn large_user_message_ingress_bulk_replays_consumed_references_from_durabl
         &ctx,
         BulkUserMessagePayloadRequest {
             session_id,
-            owner: &bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap(),
-            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            owner: &bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap(),
+            replay_actor: bulk_user_message_replay_actor_local(&state.principal).unwrap(),
             client_submission_id,
             transfer: &source_reference,
             display_text: &None,
@@ -13068,7 +13232,7 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let source = "owner-bound source\n".repeat(4_000);
     let display = "owner-bound display\n".repeat(4_000);
-    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
     let foreign = crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
         Uuid::new_v4(),
         b"another authenticated principal",
@@ -13080,7 +13244,7 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
         BulkUserMessagePayloadRequest {
             session_id,
             owner: &foreign,
-            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            replay_actor: bulk_user_message_replay_actor_local(&state.principal).unwrap(),
             client_submission_id: Uuid::new_v4(),
             transfer: &source_transfer,
             display_text: &None,
@@ -13096,7 +13260,7 @@ async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic()
         BulkUserMessagePayloadRequest {
             session_id,
             owner: &foreign,
-            replay_actor: bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+            replay_actor: bulk_user_message_replay_actor_local(&state.principal).unwrap(),
             client_submission_id: Uuid::new_v4(),
             transfer: &opaque_user_transfer_ref(source.as_bytes()),
             display_text: &None,
@@ -13131,7 +13295,7 @@ async fn opaque_user_message_transfers_cannot_be_read_through_the_generic_export
     let (state, session_id, _work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let source = "opaque user body\n".repeat(4_000);
-    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id).unwrap();
     let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
 
     let error = read_bulk_transfer_chunk(&transfer.transfer_id, 0)
@@ -13146,6 +13310,7 @@ async fn opaque_user_message_transfers_cannot_be_read_through_the_generic_export
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
     let ctx = test_ctx();
     let project = tempfile::tempdir().unwrap();
@@ -13153,12 +13318,12 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
         attached_state_with_worker_receiver(&ctx, project.path()).await;
     let source = "remote bulk replay source\n".repeat(4_000);
     let client_submission_id = Uuid::new_v4();
-    let operation = remote_owner_operation();
+    let operation = remote_owner_operation().await;
     let mut remote = remote_principal();
     let ClientPrincipal::Remote(remote_client) = &mut remote else {
         panic!("remote fixture must remain remote");
     };
-    remote_client.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    remote_client.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,
         device_generation: operation.authenticated_device_generation,
@@ -13237,13 +13402,13 @@ async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
     assert_eq!(replayed, source);
     assert_eq!(display, None);
 
-    let other_operation = remote_owner_operation();
+    let other_operation = remote_owner_operation().await;
     let mut other_principal = remote_principal();
     let ClientPrincipal::Remote(other_remote) = &mut other_principal else {
         panic!("remote fixture must remain remote");
     };
     other_remote.user_id = "different-remote-user".to_owned();
-    other_remote.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+    other_remote.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: other_operation.authenticated_device_id,
         device_generation: other_operation.authenticated_device_generation,
@@ -13320,6 +13485,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -13352,6 +13518,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -13408,6 +13575,7 @@ async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_
             display_text: None,
             tag_expansions: &[],
             forced_skill: None,
+            #[cfg(feature = "remote")]
             remote_operation: None,
         },
     )
@@ -13451,6 +13619,7 @@ async fn client_state_split_snapshot_republishes_on_attach_and_detach() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -13487,6 +13656,7 @@ async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
     let ctx = test_ctx();
     let state = MutableClientState::detached_with_principal(
@@ -13525,14 +13695,16 @@ struct DispatchMatrixRow {
 }
 
 macro_rules! dispatch_matrix_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(
                 DispatchMatrixRow {
                     kind: $kind,
                     class: dispatch_matrix_class_for_command($kind, stringify!($authz), $mutating),
                     authz: stringify!($authz),
                 },
-            )+]
+            );)+
+            rows
         }};
     }
 
@@ -13604,6 +13776,7 @@ fn characterized_operation_id() -> Uuid {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
     let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = characterized_operation_id();
@@ -13618,6 +13791,7 @@ async fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_operation_same_operation_different_bytes_conflicts() {
     let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = characterized_operation_id();
@@ -13633,6 +13807,7 @@ async fn remote_operation_same_operation_different_bytes_conflicts() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
     let db = crate::db::Db::open_in_memory().unwrap();
     let operation_id = characterized_operation_id();
@@ -15394,7 +15569,7 @@ async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     assert_dispatch_matrix_coverage_complete();
@@ -15917,7 +16092,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "a".into(),
             home_dir: root,
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         "resolve_assistant_session" => Request::ResolveAssistantSession {
             assistant_id: "missing-assistant".into(),
@@ -17073,7 +17248,7 @@ impl ReadonlyDispatchCaseKind {
                 let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
                     user_id: "operation-status-reader".into(),
                     authorization: principal::RemoteAuthorization::LegacyRelayScopes(Vec::new()),
-                    actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                    actor_binding: Some(crate::daemon::principal::ClientActorBindingV1 {
                         schema_version: 1,
                         device_id: Uuid::now_v7(),
                         device_generation: 1,
@@ -18158,7 +18333,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let bulk_text = "bulk worker payload\n".repeat(4_000);
     let bulk_transfer = (kind == "send_user_message_bulk").then(|| {
-        let owner = bulk_user_message_transfer_owner(&ClientPrincipal::owner(), session_id, None)
+        let owner = bulk_user_message_transfer_owner_local(&ClientPrincipal::owner(), session_id)
             .expect("local owner has an attached opaque-transfer binding");
         stage_opaque_user_transfer(bulk_text.as_bytes(), &owner)
     });
@@ -18344,7 +18519,8 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_newest_queued_user_message",
                     SessionWork::RemoveNewestQueuedUserMessage {
                         target_id,
-                        remote_operation: _,
+                        #[cfg(feature = "remote")]
+                            remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -18362,7 +18538,8 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_editable_queued_user_messages",
                     SessionWork::RemoveEditableQueuedUserMessages {
                         target_id,
-                        remote_operation: _,
+                        #[cfg(feature = "remote")]
+                            remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -18642,7 +18819,8 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
         |work| {
             let SessionWork::RemoveQueuedUserMessage {
                 queue_item_id: delivered_id,
-                remote_operation: _,
+                #[cfg(feature = "remote")]
+                    remote_operation: _,
                 respond_to,
             } = work
             else {
@@ -20239,7 +20417,7 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
             name: "a".into(),
             home_dir: "/repo".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         _ => unreachable!(),
     };
@@ -20285,7 +20463,7 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
             name: "a".into(),
             home_dir: "/repo".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         },
         _ => unreachable!(),
     };
@@ -20414,7 +20592,7 @@ fn minimal_import_archive_base64() -> (Uuid, String) {
 
 /// Build a bulk transfer reference for `bytes` and stage them, as a peer would
 /// via `WriteBulkTransferChunk` before sending `ImportSessionArchive`.
-fn stage_archive_transfer(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+fn stage_archive_transfer(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
     let reference = archive_transfer_ref(bytes);
     let chunk_size = crate::daemon::bulk_staging::STAGED_CHUNK_BYTES;
     if bytes.is_empty() {
@@ -20429,9 +20607,8 @@ fn stage_archive_transfer(bytes: &[u8]) -> proto::remote_transport::bulk::Remote
 }
 
 /// A reference whose bytes were never staged: the daemon must reject it.
-fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
-    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
-    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+fn archive_transfer_ref(bytes: &[u8]) -> proto::bulk_transfer::BulkTransferRef {
+    use proto::bulk_transfer::{BulkMimeClass, BulkTransferRef, transfer_id_from_bytes};
     use rand::RngExt as _;
     use sha2::{Digest as _, Sha256};
 
@@ -20444,11 +20621,11 @@ fn archive_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBu
     if id.iter().all(|b| *b == 0) {
         id[0] = 1;
     }
-    RemoteBulkTransferRef::new(
-        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+    BulkTransferRef::new(
+        transfer_id_from_bytes(id).expect("nonzero transfer id"),
         bytes.len() as u64,
         digest,
-        RemoteBulkMimeClass::Archive,
+        BulkMimeClass::Archive,
     )
     .expect("archive transfer reference")
 }
@@ -21489,8 +21666,10 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! request_ordering_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        vec![$(($kind, command_request_ordering_value!($ordering))),+]
+    (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        let mut rows = Vec::new();
+        $($(#[$row_attr])* rows.push(($kind, command_request_ordering_value!($ordering)));)+
+        rows
     }};
 }
 
@@ -21608,6 +21787,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     }
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
@@ -23121,7 +23301,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 name: "a".into(),
                 home_dir: "/tmp".into(),
                 config_json: "{}".into(),
-                content_hash: "h".into(),
+                content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             },
             kind: "upsert_assistant",
             session_id: None,
@@ -27400,6 +27580,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
 /// STALE table and disclose the secret. This drives the real
 /// `Request::SaveExtendedConfig` dispatch over a file-backed config source.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn save_extended_config_denylist_refreshes_broadcast_redaction() {
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.json");
@@ -29615,6 +29796,7 @@ fn attempt_grant_principal(
 /// through the production `authorize_request` entry point, while a write-capable
 /// ceiling permits the same requests; a resolver miss fails closed.
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_attempt_readonly_ceiling_denies_write() {
     use cockpit_proto::remote_public_service_policy::{
         RemoteAttachmentCapabilityV1 as Att, RemotePermissionCeilingV1,
@@ -29754,15 +29936,7 @@ async fn dispatch_sealed_owner(
 ) -> std::result::Result<Response, ErrorPayload> {
     let shared = state.shared_snapshot();
     let mut effects = ClientRequestEffects::default();
-    handle_serialized_request_with_remote_operation(
-        request,
-        state,
-        &shared,
-        ctx,
-        &mut effects,
-        None,
-    )
-    .await
+    handle_serialized_request(request, state, &shared, ctx, &mut effects).await
 }
 
 /// Create a project-scoped sealed value end-to-end and return its record id.

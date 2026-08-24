@@ -25,6 +25,8 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod agent_installation;
+pub mod capability_ceiling;
+#[cfg(feature = "remote")]
 pub mod es256;
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -34,6 +36,7 @@ pub use agent_installation::{
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
+pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
 pub use host_capabilities::{
@@ -41,24 +44,44 @@ pub use host_capabilities::{
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
+#[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
+#[cfg(feature = "remote")]
 pub mod remote_device_identity_enrollment;
+#[cfg(feature = "remote")]
 pub mod remote_enterprise_connection_policy;
+#[cfg(feature = "remote")]
 pub mod remote_identity_protocol;
+#[cfg(feature = "remote")]
 pub mod remote_ip_consent;
+#[cfg(feature = "remote")]
 pub mod remote_operation_fcor;
+#[cfg(feature = "remote")]
 pub mod remote_protocol_id;
+#[cfg(feature = "remote")]
 pub mod remote_public_service_policy;
+#[cfg(feature = "remote")]
 pub mod remote_session_continuity;
+#[cfg(feature = "remote")]
 pub mod remote_signaling_attempt_store;
+#[cfg(feature = "remote")]
 pub mod remote_tenant_authority_protocol;
+#[cfg(feature = "remote")]
 pub mod remote_transport;
+#[cfg(feature = "remote")]
 pub mod remote_transport_selection;
+#[cfg(feature = "remote")]
 pub mod remote_turn_ice_policy;
+#[cfg(feature = "remote")]
 pub mod remote_version;
+#[cfg(feature = "remote")]
 pub mod remote_wire_magic_registry;
 pub mod send_user_message_v2;
 pub mod terminal;
+pub mod wire_scalar;
+
+/// Payload ceiling for latency-sensitive local daemon RPC responses.
+pub const MAX_INTERACTIVE_RPC_PAYLOAD_BYTES: usize = 512 * 1024;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -85,7 +108,7 @@ pub struct ImageSpendPreflightView {
     pub epoch_sequence: Option<u64>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod owner_credential_bounds_tests {
     use super::*;
 
@@ -1179,12 +1202,14 @@ impl Envelope {
             v,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request,
             },
         }
     }
 
+    #[cfg(feature = "remote")]
     pub fn remote_request(
         id: Uuid,
         operation: RemoteOperationIdentityV1,
@@ -1249,6 +1274,7 @@ pub enum Body {
     #[serde(rename = "req")]
     Request {
         id: Uuid,
+        #[cfg(feature = "remote")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation: Option<RemoteOperationIdentityV1>,
         #[serde(flatten)]
@@ -1273,18 +1299,23 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_req")]
     RemoteReplayRequest(RemoteReplayRequestV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_res")]
     RemoteReplayResponse(RemoteReplayResponseV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack")]
     RemoteReplayAck(RemoteReplayAckV2),
+    #[cfg(feature = "remote")]
     #[serde(rename = "replay_ack_res")]
     RemoteReplayAckResponse(RemoteReplayAckResponseV2),
     #[serde(other)]
     Unknown,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayRequestV2 {
@@ -1294,6 +1325,7 @@ pub struct RemoteReplayRequestV2 {
     pub limit: RemoteReplayLimit,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayResponseV2 {
@@ -1302,6 +1334,7 @@ pub struct RemoteReplayResponseV2 {
     pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckV2 {
@@ -1310,6 +1343,7 @@ pub struct RemoteReplayAckV2 {
     pub lease_token: CanonicalRfcUuidV1,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckResponseV2 {
@@ -1317,6 +1351,7 @@ pub struct RemoteReplayAckResponseV2 {
     pub acked: bool,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOutboxDeliveryV1 {
@@ -1328,9 +1363,11 @@ pub struct RemoteOutboxDeliveryV1 {
     pub lease_expires_at_ms: i64,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalRfcUuidV1(Uuid);
 
+#[cfg(feature = "remote")]
 impl CanonicalRfcUuidV1 {
     pub fn new(value: Uuid) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -1344,6 +1381,7 @@ impl CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl Serialize for CanonicalRfcUuidV1 {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -1353,6 +1391,7 @@ impl Serialize for CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -1368,9 +1407,11 @@ impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RemoteReplayLimit(u16);
 
+#[cfg(feature = "remote")]
 impl RemoteReplayLimit {
     pub fn new(value: u16) -> anyhow::Result<Self> {
         anyhow::ensure!((1..=256).contains(&value), "replay limit must be 1..=256");
@@ -1381,6 +1422,7 @@ impl RemoteReplayLimit {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for RemoteReplayLimit {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -1389,6 +1431,7 @@ impl<'de> Deserialize<'de> for RemoteReplayLimit {
     }
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOperationIdentityV1 {
@@ -1397,6 +1440,7 @@ pub struct RemoteOperationIdentityV1 {
     pub operation_id: Uuid,
 }
 
+#[cfg(feature = "remote")]
 impl RemoteOperationIdentityV1 {
     pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
         anyhow::ensure!(
@@ -1420,6 +1464,7 @@ impl RemoteOperationIdentityV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -1460,9 +1505,13 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, MAX_UUID_V7_UNIX_MS,
-    RemoteAdapterEvidenceV1, RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy,
-    RemoteOperationClass, Request, RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
+    UsageKind,
+};
+#[cfg(feature = "remote")]
+pub use request::{
+    MAX_UUID_V7_UNIX_MS, RemoteAdapterEvidenceV1, RemoteAdapterRecoveryContractV1,
+    RemoteAdapterRecoveryStrategy, RemoteOperationClass, UnknownRemoteOperationClass,
     canonical_remote_operation_fcor_schema_for_tag, remote_adapter_recovery_contract_for_tag,
     remote_adapter_recovery_strategy_for_tag, remote_operation_class_for_tag,
     remote_operation_fcor_schema_for_tag, remote_operation_uuid_v7_from_parts,
@@ -1619,11 +1668,12 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteGoalOutcomeV1,
-    RemoteOperationStateV1, RemoteOperationStatusV1, Response, RunInvocationCancelOutcome,
-    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
-    RunInvocationTerminalReason,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
+    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
+    RunInvocationStatusV1, RunInvocationTerminalReason,
 };
+#[cfg(feature = "remote")]
+pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {
@@ -2367,6 +2417,7 @@ const SEALED_LITERAL_FCOR_PLACEHOLDER: &[u8] = b"[sealed-literal-redacted-from-f
 // frees without zeroizing). This keeps the zeroization guarantee intact end to
 // end; the redacted disposition is reflected in the `option<redacted>` canonical
 // codec (see `canonical_fcor_codec_for_rust_type`).
+#[cfg(feature = "remote")]
 impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWireLiteral {
     fn encode_fcor_value_v1(
         &self,
@@ -2579,7 +2630,7 @@ pub struct ExportSessionData {
     pub filename_extension: String,
     pub mime: String,
     /// Typed bulk transfer reference; carries the length and SHA-256 digest.
-    pub transfer: remote_transport::bulk::RemoteBulkTransferRef,
+    pub transfer: bulk_transfer::BulkTransferRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_count: Option<usize>,
     #[serde(default)]
@@ -2984,12 +3035,13 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
             (version, tag)
         }
         Body::Event { event } => (9, event.wire_tag()),
-        Body::Error { .. }
-        | Body::RemoteReplayRequest(_)
+        Body::Error { .. } => (9, "unknown"),
+        #[cfg(feature = "remote")]
+        Body::RemoteReplayRequest(_)
         | Body::RemoteReplayResponse(_)
         | Body::RemoteReplayAck(_)
-        | Body::RemoteReplayAckResponse(_)
-        | Body::Unknown => (9, "unknown"),
+        | Body::RemoteReplayAckResponse(_) => (9, "unknown"),
+        Body::Unknown => (9, "unknown"),
     }
 }
 
@@ -3252,6 +3304,7 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(_)
         | Body::RemoteReplayResponse(_)
         | Body::RemoteReplayAck(_)
@@ -3270,7 +3323,7 @@ fn codec_error(err: LinesCodecError) -> io::Error {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod proto_fixture_tests {
     //! Protocol fixtures cover every version accepted by this build. When the
     //! supported range changes, add or remove the corresponding `vN/`
@@ -3494,27 +3547,33 @@ mod proto_fixture_tests {
 
     fn request_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::request_variants!(collect_tags)
     }
 
     fn response_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::response_variants!(collect_tags)
     }
 
     fn event_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::event_variants!(collect_tags)
     }
@@ -4495,9 +4554,11 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     fn event_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::event_variants!(collect_tags)
     }
@@ -4717,6 +4778,7 @@ mod errorcode_forward_tests {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -5058,6 +5120,7 @@ mod tests {
     /// have caught the behaviour this prompt exists to fix. The corrected
     /// expectation is the lane cap itself, and the pre-migration constants fail
     /// it.
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_transport_correct_legacy_frame_tests_first() {
         use remote_transport::lane::{MAX_LOGICAL_PAYLOAD_BYTES, RemoteLane};
@@ -6110,6 +6173,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSessions {
                     project_id: None,
@@ -6124,6 +6188,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSessions {
                     project_id: None,
@@ -6151,6 +6216,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: default_export,
             })
@@ -6160,15 +6226,13 @@ mod tests {
         );
 
         let reader = Request::ReadRedactedExportChunk {
-            transfer_id: crate::remote_protocol_id::tag_protocol_id_bytes::<
-                crate::remote_protocol_id::kind::Transfer,
-            >([3u8; 16])
-            .unwrap(),
+            transfer_id: crate::bulk_transfer::transfer_id_from_bytes([3u8; 16]).unwrap(),
             chunk_index: 0,
         };
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: reader,
             })
@@ -6176,21 +6240,18 @@ mod tests {
             10
         );
 
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([7u8; 16])
-        .unwrap();
+        let transfer_id = crate::bulk_transfer::transfer_id_from_bytes([7u8; 16]).unwrap();
         let response = Response::ExportSessionData {
             data: ExportSessionData {
                 session_id: Uuid::nil(),
                 kind: ExportSessionKind::TranscriptJson,
                 filename_extension: "json".into(),
                 mime: "application/json".into(),
-                transfer: crate::remote_transport::bulk::RemoteBulkTransferRef::new(
+                transfer: crate::bulk_transfer::BulkTransferRef::new(
                     transfer_id,
                     5,
                     [0u8; 32],
-                    crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
+                    crate::bulk_transfer::BulkMimeClass::RedactedExport,
                 )
                 .unwrap(),
                 session_count: Some(1),

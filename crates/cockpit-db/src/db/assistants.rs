@@ -6,6 +6,17 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::Db;
 
+fn validate_content_hash(content_hash: &str) -> Result<()> {
+    if content_hash.len() != 64
+        || !content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("assistant content hash must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantRow {
     pub name: String,
@@ -91,6 +102,9 @@ impl Db {
         config_json: &str,
         content_hash: &str,
     ) -> Result<AssistantRow> {
+        validate_content_hash(content_hash)?;
+        serde_json::from_str::<serde_json::Value>(config_json)
+            .context("assistant config must be valid JSON")?;
         let created_at = Utc::now().timestamp();
         conn.execute(
             "INSERT INTO assistants (name, created_at, home_dir, config_json, content_hash)

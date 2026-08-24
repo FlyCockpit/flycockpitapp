@@ -168,6 +168,7 @@ async fn ephemeral_flag_combinations_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "remote")]
 async fn org_logging_indicator_does_not_corrupt_ndjson() {
     let provider = repeating_text_provider("run dispatched").await;
     let home = IsolatedHome::new();

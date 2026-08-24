@@ -93,6 +93,15 @@ jobs:
       - name: Create local release tag
         run: git tag --force "${{ needs.validate.outputs.tag }}" "${{ github.sha }}"
 
+      - name: Enforce local-only Cargo feature policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_features="$(sed -n '/^\[features\]/,/^\[/p' apps/cli/Cargo.toml | sed -n 's/^default = \(.*\)$/\1/p')"
+          test "$default_features" = "[]"
+          grep -q '^remote = \[' apps/cli/Cargo.toml
+          ! grep -Eq 'features[[:space:]]*=[[:space:]]*\[[^]]*remote' dist-workspace.toml
+
       - name: Install dist
         shell: bash
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
@@ -116,6 +125,10 @@ jobs:
           mkdir -p target/distrib
           dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
+          if jq -e '.. | strings | select(test("(^|[ =,])(--features|--all-features)([ =,]|$)|cockpit-cli/remote"))' target/distrib/plan-dist-manifest.json >/dev/null; then
+            echo "::error::cargo-dist planned a non-local Cargo feature selection"
+            exit 1
+          fi
 
           : "${RUNNER_X86_64_UNKNOWN_LINUX_GNU:?missing ubuntu_2204_large}"
           : "${RUNNER_AARCH64_UNKNOWN_LINUX_GNU:?missing ubuntu_2204_arm}"

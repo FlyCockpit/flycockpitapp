@@ -14,10 +14,9 @@ use crate::cli::ImportArgs;
 async fn push_bulk_transfer(
     client: &DaemonClient,
     bytes: &[u8],
-) -> Result<cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef> {
-    use cockpit_core::daemon::proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
-    use cockpit_core::daemon::proto::remote_transport::bulk::{
-        RemoteBulkMimeClass, RemoteBulkTransferRef,
+) -> Result<cockpit_core::daemon::proto::bulk_transfer::BulkTransferRef> {
+    use cockpit_core::daemon::proto::bulk_transfer::{
+        BulkMimeClass, BulkTransferRef, transfer_id_from_bytes,
     };
     use rand::RngExt as _;
     use sha2::{Digest as _, Sha256};
@@ -32,13 +31,13 @@ async fn push_bulk_transfer(
     if transfer_id_bytes.iter().all(|b| *b == 0) {
         transfer_id_bytes[0] = 1;
     }
-    let transfer_id = tag_protocol_id_bytes::<kind::Transfer>(transfer_id_bytes)
+    let transfer_id = transfer_id_from_bytes(transfer_id_bytes)
         .map_err(|error| anyhow::anyhow!("building transfer id: {error}"))?;
-    let transfer = RemoteBulkTransferRef::new(
+    let transfer = BulkTransferRef::new(
         transfer_id,
         bytes.len() as u64,
         sha256,
-        RemoteBulkMimeClass::Archive,
+        BulkMimeClass::Archive,
     )
     .map_err(|error| anyhow::anyhow!("import archive rejected: {error}"))?;
 

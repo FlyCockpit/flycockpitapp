@@ -251,25 +251,41 @@ impl Db {
     ) -> Result<Vec<TaskDelegationPayloadRow>> {
         let now = Utc::now().timestamp();
         let job = TaskDelegationJobWrite::from(job);
-        let prepared_payloads = payloads
-            .into_iter()
-            .map(|payload| self.prepare_task_delegation_payload(payload))
-            .collect::<Result<Vec<_>>>()?;
+        let mut prepared_payloads = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            prepared_payloads.push(self.prepare_task_delegation_payload(payload).await?);
+        }
         // Keep the owner check, job, children, and payload rows under the
         // same immediate transaction.  `upsert_task_delegation_job_conn` is a
         // connection helper specifically so this does not nest transactions.
-        self.transaction(move |conn| {
-            Self::upsert_task_delegation_job_conn(conn, job, now)?;
-            let mut rows = Vec::with_capacity(prepared_payloads.len());
-            for prepared_payload in prepared_payloads {
-                rows.push(Self::insert_prepared_task_delegation_payload_conn(
-                    conn,
-                    prepared_payload,
-                )?);
+        let result = self
+            .transaction(move |conn| {
+                Self::upsert_task_delegation_job_conn(conn, job, now)?;
+                let mut rows = Vec::with_capacity(prepared_payloads.len());
+                for prepared_payload in prepared_payloads {
+                    rows.push(Self::insert_prepared_task_delegation_payload_conn(
+                        conn,
+                        prepared_payload,
+                    )?);
+                }
+                Ok(rows)
+            })
+            .await;
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                if let Err(reconcile_error) =
+                    self.reconcile_delegation_sidecar_prepare_intents().await
+                {
+                    tracing::warn!(%reconcile_error, "delegation sidecar prepare recovery remains pending after transaction failure");
+                }
+                return Err(error);
             }
-            Ok(rows)
-        })
-        .await
+        };
+        if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, "replaced delegation sidecar cleanup remains durable and pending");
+        }
+        Ok(rows)
     }
 
     fn upsert_task_delegation_job_conn(

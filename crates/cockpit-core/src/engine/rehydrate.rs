@@ -520,10 +520,7 @@ fn apply_text_artifact_tool_projections(
 /// idempotent for already-redacted text); tool results without a durable
 /// projection (e.g. forced-skill preludes) get the same egress boundary
 /// the live dispatch applies.
-fn scrub_tool_result_bodies(
-    history: &mut [Message],
-    redaction: &crate::redact::RedactionTable,
-) {
+fn scrub_tool_result_bodies(history: &mut [Message], redaction: &crate::redact::RedactionTable) {
     for message in history.iter_mut() {
         if let Message::User { content, .. } = message {
             for part in content.iter_mut() {

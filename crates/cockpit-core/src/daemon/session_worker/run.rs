@@ -399,6 +399,7 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
     }
 }
 
+#[cfg(feature = "remote")]
 pub(super) fn remote_queue_mutation_response(
     receipt: RemoteQueueMutationReceiptV1,
 ) -> proto::RemoveQueuedUserMessageResult {
@@ -417,16 +418,6 @@ pub(super) fn remote_queue_mutation_response(
 /// and the dispatch image-duplicate fast path so BOTH reserve the operation
 /// through the SAME ledger primitive (no remote send returns accepted without a
 /// ledger operation row).
-pub(crate) enum RemoteSendDecision {
-    /// A fresh operation identity reserved and committed a ledger row.
-    Accepted,
-    /// The operation identity was already committed (exact replay).
-    Replayed,
-    /// Reject the send WITHOUT accepting: operation/actor conflict, or a
-    /// capacity/ledger failure. No fresh acceptance occurs.
-    Rejected(proto::ErrorPayload),
-}
-
 /// Reserve+commit the transactional remote-operation ledger row for a remote
 /// send. The request hash (bound to session + client_submission_id + payload in
 /// dispatch) is the exactly-once key: a replayed identity returns `Replayed`
@@ -465,10 +456,12 @@ pub(crate) enum RemoteSendDecision {
 /// `unify-media-model-and-send-user-message-v2-cutover` lane. This lane adds only
 /// the ledger row; the marker is unchanged from main; the cross-record atomicity
 /// is the V2 cutover's job.
-pub(crate) async fn reserve_remote_send_operation(
+#[cfg(feature = "remote")]
+pub(super) async fn reserve_remote_send_operation_impl(
     db: &crate::db::Db,
     remote: &crate::daemon::session_worker::RemoteQueueOperation,
-) -> RemoteSendDecision {
+) -> crate::daemon::session_worker::RemoteSendDecision {
+    use crate::daemon::session_worker::RemoteSendDecision;
     let outcome = db
         .execute_transactional_remote_operation(
             crate::db::remote_attachment_operations::ReserveRemoteOperation {
@@ -505,14 +498,18 @@ pub(crate) async fn reserve_remote_send_operation(
             RemoteSendDecision::Replayed
         }
         Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict)
-        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
             RemoteSendDecision::Rejected(proto::ErrorPayload {
                 code: proto::ErrorCode::Conflict,
                 message: "remote operation conflict".into(),
             })
         }
         Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
-        | Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
+        | Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => RemoteSendDecision::Rejected(proto::ErrorPayload {
+            code: proto::ErrorCode::Conflict,
+            message: "remote operation capacity reached".into(),
+        }),
+        Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
             code: proto::ErrorCode::Internal,
             message: "remote send could not be committed to the operation ledger".into(),
         }),
@@ -880,6 +877,7 @@ pub(super) async fn replay_accepted_oversized_text_artifact_queue(
     Ok(replayed)
 }
 
+#[cfg(feature = "remote")]
 struct RemoteQueueMutationCommit<'a> {
     session: &'a Session,
     queue: &'a crate::engine::message::UserSubmissionQueue,
@@ -891,6 +889,7 @@ struct RemoteQueueMutationCommit<'a> {
     redaction: &'a SharedRedactionTable,
 }
 
+#[cfg(feature = "remote")]
 async fn commit_remote_queue_mutation(
     input: RemoteQueueMutationCommit<'_>,
 ) -> std::result::Result<RemoteQueueMutationReceiptV1, proto::ErrorPayload> {
@@ -978,11 +977,15 @@ async fn commit_remote_queue_mutation(
             send_terminal_receipts_event(event_tx, redaction, session_id, &receipts, disposition);
             Ok(receipt)
         }
-        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
             if let Some(staged) = staged.as_ref() { queue.abort_staged_removal(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })
         }
-        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => {
+            if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
+            Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })
+        }
+        Err(_) => {
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })
         }
@@ -2113,6 +2116,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::UserMessage {
                     mut submission,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     artifact_admission,
                     respond_to,
@@ -2639,6 +2643,7 @@ pub(super) async fn run_worker(
                             // the transactional ledger (#3) — record a fresh operation,
                             // replay an already-committed one, or reject an
                             // operation/actor conflict — but NEVER enqueue a second copy.
+                            #[cfg(feature = "remote")]
                             if let Some(remote) = remote_operation.as_ref() {
                                 match reserve_remote_send_operation(&session.db, remote).await {
                                     RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
@@ -2711,6 +2716,7 @@ pub(super) async fn run_worker(
                     // the operation WITHOUT a second enqueue (#3); a conflict is
                     // rejected with no ledger row. This runs after the terminal /
                     // durable-receipt / model-fence checks above.
+                    #[cfg(feature = "remote")]
                     if let Some(remote) = remote_operation.as_ref() {
                         let (peek, snapshot) = driver_input_queue
                             .peek_idempotent(
@@ -2870,6 +2876,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -2881,6 +2888,7 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
@@ -2970,11 +2978,15 @@ pub(super) async fn run_worker(
                                 }
                                 Err(error) => { let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() })); continue; }
                             },
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.abort_staged_removal(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })); continue;
                             }
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity) => {
+                                if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
+                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })); continue;
+                            }
+                            Err(_) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
                             }
@@ -3019,6 +3031,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -3037,6 +3050,7 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
                             session: &session,
@@ -3099,6 +3113,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation,
                     respond_to,
                 } => {
@@ -3119,6 +3134,7 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
+                    #[cfg(feature = "remote")]
                     if let Some(operation) = remote_operation {
                         match commit_remote_queue_mutation(RemoteQueueMutationCommit {
                             session: &session,

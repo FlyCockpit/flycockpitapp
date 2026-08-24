@@ -9,6 +9,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# FlyCockpit service synchronization, remote principals, and remote attachment
+# ledgers are excluded from the public local v0.1 dependency surface.
+default = []
+remote = []
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -26,6 +32,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 cockpit-test-support = { path = "../cockpit-test-support" }
+toml = { workspace = true }
 # Authorized by db-blocking-api-removal: AST/call-graph boundary gate only.
 # proc-macro2 is the span type used by syn; pin the lockfile-compatible line.
 proc-macro2 = { version = "1", features = ["span-locations"] }

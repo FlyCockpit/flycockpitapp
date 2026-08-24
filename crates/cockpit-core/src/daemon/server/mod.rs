@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+#[cfg(feature = "remote")]
+use tokio::sync::watch;
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -185,12 +187,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::PackageImported { .. }
         | proto::Response::PackagesPruned { .. }
         | proto::Response::KclPackagesImported { .. }
-        | proto::Response::ConnectorState { .. }
-        | proto::Response::OrgSyncStatus { .. }
         | proto::Response::EndedSessionsPurged { .. }
         | proto::Response::AssistantDeleted { .. }
         | proto::Response::MediaReservationDiagnosis { .. }
         | proto::Response::MediaReservationRepaired { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::ConnectorState { .. } | proto::Response::OrgSyncStatus { .. } => {}
         // Free-text-bearing owner-remoted reads: the vaulted-secret redaction
         // backstop scrubs a value that later becomes a credential out of raw
         // tool I/O, compaction event payloads, assistant config, and rendered
@@ -393,6 +395,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        #[cfg(feature = "remote")]
         proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Assistants { assistants } => {
@@ -572,10 +575,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             config_generation: _,
         }
         | proto::Response::WorkspaceTrust { .. }
-        | proto::Response::FlycockpitStored
-        | proto::Response::FlycockpitNotLoggedIn
         | proto::Response::SecretInventory { .. }
-        | proto::Response::FlycockpitAccount { .. }
         | proto::Response::ProviderCatalogSnapshot { .. }
         | proto::Response::ProviderModelsFetched { .. }
         | proto::Response::ProviderUsageSnapshot { .. }
@@ -583,13 +583,20 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderCredentialDeleted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::FlycockpitStored
+        | proto::Response::FlycockpitNotLoggedIn
+        | proto::Response::FlycockpitAccount { .. } => {}
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitAlreadyLoggedIn { email, server_url } => {
             scrub_string(email, redact);
             scrub_string(server_url, redact);
         }
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitCleared { server_url } => {
             scrub_string(server_url, redact);
         }
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitOrgSync { outcome } => {
             if let proto::FlycockpitOrgSyncOutcome::EnrollmentRequired { org_id } = outcome {
                 scrub_string(org_id, redact);
@@ -629,11 +636,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
-        | proto::Response::RemoteOperationStatus { .. }
         | proto::Response::ProviderOAuthCompleted { .. }
         | proto::Response::McpOAuthCompleted { .. }
         | proto::Response::McpOAuthCancelled { .. }
         | proto::Response::McpConfigSaved { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::ProviderOAuthStarted { authorize_url, .. } => {
             scrub_string(authorize_url, redact);
         }
@@ -1187,6 +1195,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             lid_close_guaranteed: _,
             message,
         } => scrub_option_string(message, redact),
+        #[cfg(feature = "remote")]
         proto::Event::ConnectorStatus {
             enabled: _,
             status: _,
@@ -2017,7 +2026,14 @@ pub struct DaemonContext {
     shutdown_grace_override: StdMutex<Option<Duration>>,
     env_baseline: Arc<std::sync::RwLock<EnvSnapshot>>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
+    #[cfg(feature = "remote")]
     connector_wake: watch::Sender<u64>,
+    /// Serializes a remote operation identity from admission through every
+    /// external side effect and its transactional replay commit. Different
+    /// request hashes intentionally share the same key: the conflict loser
+    /// must learn that it lost before it can stop workers or touch media.
+    #[cfg(feature = "remote")]
+    remote_operation_locks: tokio::sync::Mutex<HashMap<(Uuid, Uuid), Weak<tokio::sync::Mutex<()>>>>,
     pub scheduler: Option<DaemonSchedulerHandle>,
     /// Stable, nonzero daemon boot UUID for all image-generation scheduler
     /// passes and deadline observation. The lifecycle worker uses it as its
@@ -2101,6 +2117,7 @@ pub struct DaemonContext {
     /// root hash). The default is an empty deny-all resolver; production wiring
     /// against attachment/operation-ledger state is owned by the
     /// transport-wiring prompts.
+    #[cfg(feature = "remote")]
     pub remote_project_resolver:
         Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
     /// Daemon-owned host capability snapshot. Authority for feature gating.
@@ -2202,6 +2219,7 @@ impl DaemonContext {
             Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
         > = None;
         let (client_count, _) = tokio::sync::watch::channel(0usize);
+        #[cfg(feature = "remote")]
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
         let secret_vault = crate::secure_key::open_for_db(&db)
@@ -2357,7 +2375,10 @@ impl DaemonContext {
                 EnvSnapshotSource::DaemonStart,
             ))),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
+            #[cfg(feature = "remote")]
             connector_wake,
+            #[cfg(feature = "remote")]
+            remote_operation_locks: tokio::sync::Mutex::new(HashMap::new()),
             scheduler,
             image_generation_boot_id,
             _image_generation_worker: image_generation_worker,
@@ -2383,6 +2404,7 @@ impl DaemonContext {
             // Deny-all default: an empty resolver maps no root, so the
             // attempt-grant authorization path fails closed until the
             // transport-wiring prompts install the real resolver.
+            #[cfg(feature = "remote")]
             remote_project_resolver: Arc::new(
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
             ),
@@ -2401,6 +2423,7 @@ impl DaemonContext {
     /// resolver backed by attachment/operation-ledger state; tests inject a
     /// deterministic static mapping. The resolver never widens authority: an
     /// unmapped root fails closed.
+    #[cfg(feature = "remote")]
     pub fn with_remote_project_resolver(
         mut self,
         resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
@@ -2549,6 +2572,7 @@ impl DaemonContext {
         self
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn load_flycockpit_credential(
         &self,
     ) -> Result<Option<crate::auth::flycockpit::StoredFlycockpitCredential>> {
@@ -2561,7 +2585,7 @@ impl DaemonContext {
             .map(Some)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote"))]
     pub(crate) fn store_flycockpit_credential(
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
@@ -2637,6 +2661,7 @@ impl DaemonContext {
     /// restoring both the exact vault row and the prior sync enablement. A
     /// failed compensation poisons the daemon rather than serving with an
     /// unverifiable secret/redaction state.
+    #[cfg(feature = "remote")]
     pub(crate) async fn mutate_owner_vault_item_with_org_sync_disabled(
         &self,
         kind: cockpit_db::secret_vault::SecretVaultKind,
@@ -2894,6 +2919,7 @@ impl DaemonContext {
         }
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn flycockpit_account_view(&self) -> Result<Option<proto::FlycockpitAccountView>> {
         let Some(credential) = self.load_flycockpit_credential()? else {
             return Ok(None);
@@ -3015,10 +3041,12 @@ impl DaemonContext {
     /// Subscribe to connector wakeups. Credential store/clear requests use
     /// this to interrupt the connector's fallback polling sleep and any active
     /// relay socket so credential changes take effect immediately.
+    #[cfg(feature = "remote")]
     pub fn connector_wake_rx(&self) -> watch::Receiver<u64> {
         self.connector_wake.subscribe()
     }
 
+    #[cfg(feature = "remote")]
     pub fn wake_connector(&self) {
         self.connector_wake.send_modify(|version| {
             *version = version.wrapping_add(1);
@@ -3117,6 +3145,12 @@ pub(crate) async fn boot_with_db(
     timer.phase("prune_and_sweep");
     #[cfg_attr(test, allow(unused_mut))]
     let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    db.reconcile_delegation_sidecar_prepare_intents()
+        .await
+        .context("reconciling delegation sidecar prepare intents")?;
+    db.reconcile_delegation_sidecar_cleanup_intents()
+        .await
+        .context("reconciling delegation sidecar cleanup intents")?;
     if let Some(storage) = &ctx.media_storage_recovery {
         storage
             .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
@@ -3512,6 +3546,7 @@ async fn run_boot_housekeeping(db: &Db) {
 pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
     // Wiring invariant (debug/CI): the transactional ledger-site registry must
     // exactly cover the remotely-admissible transactional_mutation commands.
+    #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
     // Startup recovery: converge any effective-default journal left behind by
     // an unclean shutdown before the first client can read a config snapshot.
@@ -4263,6 +4298,7 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
     handle_client_transport(stream, ctx).await
 }
 
+#[cfg(feature = "remote")]
 pub(crate) async fn handle_relay_channel_as_with_instance<S>(
     stream: S,
     ctx: Arc<DaemonContext>,
@@ -4812,78 +4848,6 @@ async fn handle_client_frame(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RemoteOperationContext {
-    pub(super) request_id: Uuid,
-    pub(super) logical_attachment_id: Uuid,
-    pub(super) operation_id: Uuid,
-    pub(super) authenticated_device_id: Uuid,
-    pub(super) authenticated_device_generation: u64,
-}
-
-fn remote_operation_denied() -> ErrorPayload {
-    ErrorPayload {
-        code: ErrorCode::Authorization,
-        message: "remote operations require a valid server-authenticated actor binding and operation identity"
-            .to_string(),
-    }
-}
-
-fn admit_remote_operation(
-    principal: &ClientPrincipal,
-    request_id: Uuid,
-    operation: Option<proto::RemoteOperationIdentityV1>,
-    request: &Request,
-) -> std::result::Result<Option<RemoteOperationContext>, ErrorPayload> {
-    if principal.is_owner() {
-        return Ok(None);
-    }
-    let class = request
-        .remote_operation_class()
-        .map_err(|_| remote_operation_denied())?;
-    if class == proto::RemoteOperationClass::ReadOnly && operation.is_none() {
-        return Ok(None);
-    }
-    let ClientPrincipal::Remote(remote) = principal else {
-        unreachable!("owner principal returned above")
-    };
-    // A relay-authenticated principal without a device actor binding is not
-    // participating in cross-transport remote operations. It is admitted
-    // without an operation identity; the regular authorization layer
-    // enforces session/project/terminal grants independently.
-    if remote.actor_binding.is_none() {
-        return Ok(None);
-    }
-    let (Some(actor), Some(operation)) = (remote.actor_binding.as_ref(), operation) else {
-        return Err(remote_operation_denied());
-    };
-    let operation_valid = operation.schema_version == 1
-        && !operation.logical_attachment_id.is_nil()
-        && operation.logical_attachment_id.get_variant() == uuid::Variant::RFC4122
-        && !operation.operation_id.is_nil()
-        && operation.operation_id.get_variant() == uuid::Variant::RFC4122
-        && operation.operation_id.get_version_num() == 7;
-    let actor_valid = actor.schema_version == 1
-        && actor.device_generation > 0
-        && !actor.device_id.is_nil()
-        && actor.device_id.get_variant() == uuid::Variant::RFC4122
-        && !actor.logical_attachment_id.is_nil()
-        && actor.logical_attachment_id.get_variant() == uuid::Variant::RFC4122;
-    if !operation_valid
-        || !actor_valid
-        || actor.logical_attachment_id != operation.logical_attachment_id
-    {
-        return Err(remote_operation_denied());
-    }
-    Ok(Some(RemoteOperationContext {
-        request_id,
-        logical_attachment_id: operation.logical_attachment_id,
-        operation_id: operation.operation_id,
-        authenticated_device_id: actor.device_id,
-        authenticated_device_generation: actor.device_generation,
-    }))
-}
-
 async fn handle_envelope(
     env: Envelope,
     state: &mut MutableClientState,
@@ -4900,18 +4864,27 @@ async fn handle_envelope(
     match env.body {
         Body::Request {
             id,
+            #[cfg(feature = "remote")]
             operation,
             request,
         } => {
-            let remote_operation =
-                match admit_remote_operation(&state.principal, id, operation, &request) {
-                    Ok(context) => context,
-                    Err(error) => {
-                        let envelope = Envelope::error(Some(id), error);
-                        let _ = send_writer_envelope(writer_tx, envelope).await;
-                        return Ok(());
-                    }
-                };
+            #[cfg(feature = "remote")]
+            let remote_operation = match remote_dispatch::admit(
+                ctx,
+                &state.principal,
+                id,
+                operation,
+                &request,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    let envelope = Envelope::error(Some(id), error);
+                    let _ = send_writer_envelope(writer_tx, envelope).await;
+                    return Ok(());
+                }
+            };
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -4923,6 +4896,7 @@ async fn handle_envelope(
                     let _permit = permit;
                     let response_shared = request_shared.clone();
                     let response_ctx = ctx.clone();
+                    #[cfg(feature = "remote")]
                     let result = run_concurrent_request_catching_panic_with_remote_operation(
                         request,
                         request_shared,
@@ -4930,6 +4904,9 @@ async fn handle_envelope(
                         remote_operation,
                     )
                     .await;
+                    #[cfg(not(feature = "remote"))]
+                    let result =
+                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
                     let envelope =
                         response_envelope_for_shared(id, result, &response_shared, &response_ctx);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
@@ -4938,6 +4915,7 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
+            #[cfg(feature = "remote")]
             let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
                 request,
                 state,
@@ -4945,6 +4923,15 @@ async fn handle_envelope(
                 ctx,
                 &mut effects,
                 remote_operation.as_ref(),
+            ))
+            .await;
+            #[cfg(not(feature = "remote"))]
+            let result = Box::pin(dispatch::handle_serialized_request(
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
             ))
             .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
@@ -5000,6 +4987,7 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
             id,
             after_event_seq,
@@ -5081,6 +5069,7 @@ async fn handle_envelope(
             };
             let _ = send_writer_envelope(writer_tx, envelope).await;
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
             id,
             delivery_id,
@@ -5140,6 +5129,7 @@ async fn handle_envelope(
             )
             .await;
         }
+        #[cfg(feature = "remote")]
         Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
         | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
             tracing::warn!(%id, "client sent a replay response; ignoring");
@@ -5165,14 +5155,24 @@ async fn run_concurrent_request_catching_panic(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    run_concurrent_request_catching_panic_with_remote_operation(request, shared, ctx, None).await
+    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "concurrent request handler panicked".to_string(),
+        }),
+    }
 }
 
+#[cfg(feature = "remote")]
 async fn run_concurrent_request_catching_panic_with_remote_operation(
     request: Request,
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
-    remote_operation: Option<RemoteOperationContext>,
+    remote_operation: Option<remote_dispatch::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     match AssertUnwindSafe(dispatch::handle_concurrent_request_with_remote_operation(
         request,
@@ -5315,9 +5315,13 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayRequest(_) => "replay_request",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayResponse(_) => "replay_response",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAck(_) => "replay_ack",
+        #[cfg(feature = "remote")]
         Body::RemoteReplayAckResponse(_) => "replay_ack_response",
         Body::Unknown => "unknown",
     }
@@ -5356,6 +5360,10 @@ fn read_only_error(message: impl Into<String>) -> ErrorPayload {
 mod attachments;
 mod authz;
 mod dispatch;
+#[cfg(feature = "remote")]
+mod remote_dispatch;
+#[cfg(feature = "remote")]
+pub(crate) use remote_dispatch::RemoteOperationContext;
 mod image_control_mutations;
 mod image_control_reads;
 mod run_invocation;
@@ -5371,9 +5379,13 @@ mod host_capabilities_tests;
 pub(crate) mod inventory;
 #[cfg(test)]
 mod leaks_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod secret_store_boot_tests;
+#[cfg(test)]
+mod secret_store_local_tests;
 mod sessions;
+#[cfg(feature = "remote")]
+mod sessions_remote;
 #[cfg(test)]
 mod tests;
 

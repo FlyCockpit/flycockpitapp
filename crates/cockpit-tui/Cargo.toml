@@ -12,6 +12,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+remote = ["cockpit-core/remote", "cockpit-proto/remote"]
+
 [dependencies]
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
@@ -89,7 +93,7 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-cockpit-config = { path = "../cockpit-config" }
+cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
 cockpit-core = { path = "../cockpit-core", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }

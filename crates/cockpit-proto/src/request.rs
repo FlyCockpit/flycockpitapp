@@ -368,11 +368,11 @@ pub enum Request {
         expected_model_state_generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
+        transfer: crate::bulk_transfer::BulkTransferRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        display_transfer: Option<crate::remote_transport::bulk::RemoteBulkTransferRef>,
+        display_transfer: Option<crate::bulk_transfer::BulkTransferRef>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tag_expansions: Vec<TagExpansionMeta>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -388,6 +388,7 @@ pub enum Request {
     },
 
     /// Query the durable outcome of an operation on the authenticated logical attachment.
+    #[cfg(feature = "remote")]
     OperationStatus {
         operation_id: Uuid,
     },
@@ -729,7 +730,7 @@ pub enum Request {
     /// portable artifact assembled through the enforced redaction path, so
     /// `redact.enabled = false` and provider trust never relax export
     /// redaction. It is staged as
-    /// [`crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport`]
+    /// [`crate::bulk_transfer::BulkMimeClass::RedactedExport`]
     /// and served over the owner-remoted type-bound
     /// [`Request::ReadRedactedExportChunk`] reader.
     ///
@@ -756,7 +757,7 @@ pub enum Request {
     /// bulk-lane transfer; the daemon reads the bytes from there after the
     /// transfer's digest and length have been verified.
     ImportSessionArchive {
-        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
+        transfer: crate::bulk_transfer::BulkTransferRef,
     },
 
     /// Push one chunk of a bulk transfer into daemon-side staging.
@@ -766,7 +767,7 @@ pub enum Request {
     /// and each body is bounded by [`crate::MAX_ATTACHMENT_CHUNK_BASE64_BYTES`],
     /// which keeps the encoded frame inside one bulk-lane logical payload.
     WriteBulkTransferChunk {
-        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
+        transfer: crate::bulk_transfer::BulkTransferRef,
         chunk_index: u32,
         data_base64: String,
     },
@@ -775,7 +776,7 @@ pub enum Request {
     /// reader): a remoted caller is rejected, so raw `Export` bytes never leave
     /// the host over this reader.
     ReadBulkTransferChunk {
-        transfer_id: crate::remote_protocol_id::RemoteTransferId,
+        transfer_id: crate::bulk_transfer::BulkTransferId,
         chunk_index: u32,
     },
 
@@ -783,13 +784,13 @@ pub enum Request {
     ///
     /// Pull one chunk of a staged transfer, admitting it ONLY when its staged
     /// kind is
-    /// [`crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport`].
+    /// [`crate::bulk_transfer::BulkMimeClass::RedactedExport`].
     /// A raw `Export` transfer id (or any other bulk kind) is rejected with no
     /// bytes — this is what lets a remoted owner download a redacted export
     /// while the raw archive stays owner-local behind
     /// [`Request::ReadBulkTransferChunk`].
     ReadRedactedExportChunk {
-        transfer_id: crate::remote_protocol_id::RemoteTransferId,
+        transfer_id: crate::bulk_transfer::BulkTransferId,
         chunk_index: u32,
     },
 
@@ -1369,6 +1370,7 @@ pub enum Request {
     /// in SQLite; the daemon holds the unwrapped key in memory) and wake the
     /// relay connector immediately. Owner-only; ephemeral daemons reject it
     /// because they must not own persistent credentials.
+    #[cfg(feature = "remote")]
     StoreFlycockpitCredential {
         credential: StoredFlycockpitCredential,
         /// When false, a vault hit returns [`crate::Response::FlycockpitAlreadyLoggedIn`]
@@ -1380,20 +1382,24 @@ pub enum Request {
     /// Clear Flycockpit instance credentials from the daemon vault and wake
     /// the relay connector so active sockets stop promptly. Owner-only;
     /// ephemeral daemons reject it.
+    #[cfg(feature = "remote")]
     ClearFlycockpitCredential,
 
     /// Enable or disable the daemon-owned relay connector for the current
     /// FlyCockpit account. The daemon resolves the account from its vault.
+    #[cfg(feature = "remote")]
     SetFlycockpitConnectorEnabled {
         enabled: bool,
     },
 
     /// Fetch and apply the current organization session-log policy for the
     /// daemon-owned FlyCockpit account. No credential material is returned.
+    #[cfg(feature = "remote")]
     SyncFlycockpitOrgPolicy,
 
     /// Persist the owner's explicit organization session-log enrollment.
     /// The daemon resolves the account and server URL from its vault.
+    #[cfg(feature = "remote")]
     EnrollFlycockpitOrgSync {
         #[serde(deserialize_with = "deserialize_owner_org_id")]
         org_id: String,
@@ -1501,6 +1507,7 @@ pub enum Request {
     },
 
     /// Return redacted Flycockpit account metadata, never the instance token.
+    #[cfg(feature = "remote")]
     GetFlycockpitAccount,
 
     /// Return the daemon-owned, redacted provider catalog/config projection.
@@ -2012,9 +2019,11 @@ pub enum Request {
     },
 
     /// Read the FlyCockpit connector state for the current account.
+    #[cfg(feature = "remote")]
     GetConnectorState,
 
     /// Read org-policy session-log sync state and audit upload cursors.
+    #[cfg(feature = "remote")]
     GetOrgSyncStatus,
 
     /// List recent failed/recovered tool calls (owner-remoted read).
@@ -2129,6 +2138,7 @@ impl Request {
         }
 
         match self {
+            #[cfg(feature = "remote")]
             Self::StoreFlycockpitCredential { credential, .. } => {
                 credential
                     .validate()
@@ -2260,10 +2270,8 @@ impl Request {
                     );
                 }
                 let is_opaque_text_transfer =
-                    |reference: &crate::remote_transport::bulk::RemoteBulkTransferRef,
-                     minimum_length: u64| {
-                        reference.mime_class
-                            == crate::remote_transport::bulk::RemoteBulkMimeClass::Opaque
+                    |reference: &crate::bulk_transfer::BulkTransferRef, minimum_length: u64| {
+                        reference.mime_class == crate::bulk_transfer::BulkMimeClass::Opaque
                             && (minimum_length
                                 ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
                                 .contains(&reference.total_length_value())
@@ -2364,6 +2372,7 @@ impl Request {
                     return Err("subscription provider id exceeds maximum length".to_string());
                 }
             }
+            #[cfg(feature = "remote")]
             Self::EnrollFlycockpitOrgSync { org_id } => {
                 validate_owner_identifier("organization id", org_id, MAX_OWNER_ORG_ID_BYTES)?;
             }
@@ -2683,6 +2692,7 @@ impl Request {
             } if client_submission_id.is_nil() => {
                 return Err("client_submission_id must not be nil".to_string());
             }
+            #[cfg(feature = "remote")]
             Self::OperationStatus { operation_id }
                 if operation_id.is_nil() || operation_id.get_version_num() != 7 =>
             {
@@ -2702,6 +2712,7 @@ macro_rules! request_variants {
             (Request::SendUserMessage { .. }, "send_user_message");
             (Request::SendUserMessageBulk { .. }, "send_user_message_bulk");
             (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
+            #[cfg(feature = "remote")]
             (Request::OperationStatus { .. }, "operation_status");
             (Request::CancelRunInvocation { .. }, "cancel_run_invocation");
             (Request::SteerDelegation { .. }, "steer_delegation");
@@ -2827,10 +2838,15 @@ macro_rules! request_variants {
             (Request::Prune, "prune");
             (Request::Compact, "compact");
             (Request::Pin { .. }, "pin");
+            #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { .. }, "store_flycockpit_credential");
+            #[cfg(feature = "remote")]
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential");
+            #[cfg(feature = "remote")]
             (Request::SetFlycockpitConnectorEnabled { .. }, "set_flycockpit_connector_enabled");
+            #[cfg(feature = "remote")]
             (Request::SyncFlycockpitOrgPolicy, "sync_flycockpit_org_policy");
+            #[cfg(feature = "remote")]
             (Request::EnrollFlycockpitOrgSync { .. }, "enroll_flycockpit_org_sync");
             (Request::ListSecretInventory { .. }, "list_secret_inventory");
             (Request::PutNamedSecret { .. }, "put_named_secret");
@@ -2843,6 +2859,7 @@ macro_rules! request_variants {
             (Request::CompleteMcpOAuth { .. }, "complete_mcp_oauth");
             (Request::CancelMcpOAuth { .. }, "cancel_mcp_oauth");
             (Request::DeleteProviderCredential { .. }, "delete_provider_credential");
+            #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account");
             (Request::GetProviderCatalogSnapshot { .. }, "get_provider_catalog_snapshot");
             (Request::FetchProviderModels { .. }, "fetch_provider_models");
@@ -2903,7 +2920,9 @@ macro_rules! request_variants {
             (Request::ImportPackage { .. }, "import_package");
             (Request::PrunePackages { .. }, "prune_packages");
             (Request::ImportKclPackages { .. }, "import_kcl_packages");
+            #[cfg(feature = "remote")]
             (Request::GetConnectorState, "get_connector_state");
+            #[cfg(feature = "remote")]
             (Request::GetOrgSyncStatus, "get_org_sync_status");
             (Request::ListFailedToolCalls { .. }, "list_failed_tool_calls");
             (Request::GetSessionCompactions { .. }, "get_session_compactions");
@@ -2926,9 +2945,9 @@ macro_rules! request_variants {
 impl Request {
     pub fn wire_tag(&self) -> &'static str {
         macro_rules! wire_tag {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {
                 match self {
-                    $($pattern => $tag,)+
+                    $($(#[$row_attr])* $pattern => $tag,)+
                 }
             };
         }
@@ -2940,10 +2959,10 @@ impl Request {
     /// `btw_create`).
     pub fn command_tag(&self) -> &'static str {
         macro_rules! command_tag {
-            (($($context:ident),*) [$(($pattern:pat, $tag:literal, $($rest:tt)*);)+]) => {
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $($rest:tt)*);)+]) => {
                 #[allow(unused_variables)]
                 match self {
-                    $($pattern => $tag,)+
+                    $($(#[$row_attr])* $pattern => $tag,)+
                 }
             };
         }
@@ -2961,8 +2980,9 @@ macro_rules! command {
             (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
-            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::remote_transport::bulk::RemoteBulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::remote_transport::bulk::RemoteBulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
+            #[cfg(feature = "remote")]
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
             (Request::CancelRunInvocation { client_submission_id }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             (Request::SteerDelegation { session_id, task_call_id, label, message }, "steer_delegation", custom(authorize_steer_delegation), field(session_id), true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "session_id:Uuid|task_call_id:String|label:String|message:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param, message: String => param]);
@@ -3017,14 +3037,14 @@ macro_rules! command {
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
-            (Request::ImportSessionArchive { transfer }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param]);
+            (Request::ImportSessionArchive { transfer }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef", [transfer: $crate::bulk_transfer::BulkTransferRef => param]);
             // Remote oversized text ingress stages source bytes over the bulk
             // lane before its reference-only FCM2 request. It is scoped to the
             // attached session writer (while local owners retain their normal
             // bypass), and exact chunk replay is acknowledged by bulk staging.
-            (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
-            (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, local_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
-            (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
+            (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "transfer:crate::bulk_transfer::BulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::bulk_transfer::BulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
+            (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, local_only, none, concurrent, none, "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32", [transfer_id: $crate::bulk_transfer::BulkTransferId => param, chunk_index: u32 => param]);
+            (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32", [transfer_id: $crate::bulk_transfer::BulkTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
             (Request::CancelTurn, "cancel_turn", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::FsList { project_root, path, show_hidden }, "fs_list", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|show_hidden:bool", [project_root: String => project_root, path: String => file_existing(project_root), show_hidden: bool => param]);
@@ -3092,10 +3112,15 @@ macro_rules! command {
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
+            #[cfg(feature = "remote")]
             (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
+            #[cfg(feature = "remote")]
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            #[cfg(feature = "remote")]
             (Request::SetFlycockpitConnectorEnabled { enabled }, "set_flycockpit_connector_enabled", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "enabled:bool", [enabled: bool => param]);
+            #[cfg(feature = "remote")]
             (Request::SyncFlycockpitOrgPolicy, "sync_flycockpit_org_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
+            #[cfg(feature = "remote")]
             (Request::EnrollFlycockpitOrgSync { org_id }, "enroll_flycockpit_org_sync", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "org_id:String", [org_id: String => param]);
             (Request::ListSecretInventory { cursor, limit }, "list_secret_inventory", owner_only, none, false, read_only, none, serialized, none, "cursor:Option<String>|limit:Option<u16>", [cursor: Option<String> => param, limit: Option<u16> => param]);
             (Request::PutNamedSecret { name, value }, "put_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|value:String", [name: String => param, value: String => param]);
@@ -3119,6 +3144,7 @@ macro_rules! command {
             (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
             (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
             (Request::DeleteProviderCredential { provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|project_root:Option<String>", [provider_id: String => param, project_root: Option<String> => param]);
+            #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetProviderCatalogSnapshot { project_root, provider_id }, "get_provider_catalog_snapshot", owner_only, none, false, read_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
@@ -3182,7 +3208,9 @@ macro_rules! command {
             (Request::ImportPackage { project_root, dir, package, id, as_path }, "import_package", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|dir:Option<String>|package:Option<String>|id:Option<String>|as_path:bool", [project_root: String => param, dir: Option<String> => param, package: Option<String> => param, id: Option<String> => param, as_path: bool => param]);
             (Request::PrunePackages { project_root, days, dry_run }, "prune_packages", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|days:u32|dry_run:bool", [project_root: String => param, days: u32 => param, dry_run: bool => param]);
             (Request::ImportKclPackages { project_root }, "import_kcl_packages", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String", [project_root: String => param]);
+            #[cfg(feature = "remote")]
             (Request::GetConnectorState, "get_connector_state", owner_only, none, false, read_only, none, concurrent, none, "-", []);
+            #[cfg(feature = "remote")]
             (Request::GetOrgSyncStatus, "get_org_sync_status", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::ListFailedToolCalls { since_epoch, tool, model, project_id, include_recovered, limit }, "list_failed_tool_calls", owner_only, none, false, read_only, none, concurrent, none, "since_epoch:i64|tool:Option<String>|model:Option<String>|project_id:Option<String>|include_recovered:bool|limit:u32", [since_epoch: i64 => param, tool: Option<String> => param, model: Option<String> => param, project_id: Option<String> => param, include_recovered: bool => param, limit: u32 => param]);
             (Request::GetSessionCompactions { session_id }, "get_session_compactions", owner_only, none, false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => param]);
@@ -3253,6 +3281,7 @@ pub enum AttachmentPurpose {
 /// instead carries a remote class for future authenticated-owner transports.
 /// A class defines retry semantics, not authority: authorization remains the
 /// barrier and current remote principals are denied owner-only work.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteOperationClass {
@@ -3264,6 +3293,7 @@ pub enum RemoteOperationClass {
 
 /// Durable evidence required before an adapter operation can report a
 /// terminal outcome. This is independent of authorization/audit mutability.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAdapterRecoveryStrategy {
@@ -3273,6 +3303,7 @@ pub enum RemoteAdapterRecoveryStrategy {
     StagedFilesystemCommit,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteAdapterEvidenceV1 {
@@ -3282,6 +3313,7 @@ pub enum RemoteAdapterEvidenceV1 {
     StagedArtifactFingerprintsAndFsyncBarriers,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAdapterRecoveryContractV1 {
@@ -3294,6 +3326,7 @@ pub struct RemoteAdapterRecoveryContractV1 {
     pub requires_dispatch_generation: bool,
 }
 
+#[cfg(feature = "remote")]
 macro_rules! remote_class_value {
     (read_only) => {
         Some(RemoteOperationClass::ReadOnly)
@@ -3319,9 +3352,11 @@ macro_rules! remote_class_value {
     };
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnknownRemoteOperationClass;
 
+#[cfg(feature = "remote")]
 macro_rules! recovery_contract_value {
     (none) => {
         None
@@ -3365,6 +3400,7 @@ macro_rules! recovery_contract_value {
     };
 }
 
+#[cfg(feature = "remote")]
 impl RemoteAdapterRecoveryContractV1 {
     const fn new(
         strategy: RemoteAdapterRecoveryStrategy,
@@ -3383,26 +3419,30 @@ impl RemoteAdapterRecoveryContractV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_remote_class_tag {
-    (($tag_value:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        match $tag_value { $($tag => remote_class_value!($remote_class),)+ _ => None }
+    (($tag_value:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $tag_value { $($(#[$row_attr])* $tag => remote_class_value!($remote_class),)+ _ => None }
     }};
 }
+#[cfg(feature = "remote")]
 macro_rules! command_remote_recovery_tag {
-    (($tag_value:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        match $tag_value { $($tag => recovery_contract_value!($recovery $(($recovery_evidence))?),)+ _ => None }
+    (($tag_value:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $tag_value { $($(#[$row_attr])* $tag => recovery_contract_value!($recovery $(($recovery_evidence))?),)+ _ => None }
     }};
 }
+#[cfg(feature = "remote")]
 macro_rules! command_remote_fcor_schema_tag {
-    (($tag_value:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        match $tag_value { $($tag => Some($fcor_schema),)+ _ => None }
+    (($tag_value:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $tag_value { $($(#[$row_attr])* $tag => Some($fcor_schema),)+ _ => None }
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_typed_fcor_fields {
-    (($request:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => {
+            $($(#[$row_attr])* $pattern => {
                 // Matching `&Request` binds every field by reference. These
                 // assignments make a wrong typed token a compile error and
                 // make every token a consumed runtime value rather than
@@ -3414,12 +3454,14 @@ macro_rules! command_typed_fcor_fields {
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! encode_fcor_bound_fields {
     ($out:ident; $($name:ident: $ty:ty => $role:ident $(($($arg:ident),*))?),* $(,)?) => {{
         $(encode_fcor_role!($out, $name, $role);)*
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! encode_fcor_role {
     ($out:ident, $name:ident, param) => {
         $name.encode_fcor_value_v1(&mut $out)?;
@@ -3439,11 +3481,12 @@ macro_rules! encode_fcor_role {
     };
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_encode_fcor_params {
-    (($request:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         use $crate::remote_operation_fcor::CanonicalFcorValueV1 as _;
         match $request {
-            $($pattern => {
+            $($(#[$row_attr])* $pattern => {
                 $(let _: &$fcor_type = $fcor_field;)*
                 let mut out = $crate::remote_operation_fcor::CanonicalParamsV1::new();
                 // Resource-only and fieldless variants still share this arm.
@@ -3457,6 +3500,7 @@ macro_rules! command_encode_fcor_params {
     }};
 }
 
+#[cfg(feature = "remote")]
 impl Request {
     pub fn remote_operation_class(
         &self,
@@ -3486,13 +3530,16 @@ impl Request {
         crate::command!(command_encode_fcor_params, self)
     }
 }
+#[cfg(feature = "remote")]
 pub fn remote_operation_class_for_tag(tag: &str) -> Option<RemoteOperationClass> {
     crate::command!(command_remote_class_tag, tag)
 }
+#[cfg(feature = "remote")]
 pub fn remote_operation_fcor_schema_for_tag(tag: &str) -> Option<&'static str> {
     crate::command!(command_remote_fcor_schema_tag, tag)
 }
 
+#[cfg(feature = "remote")]
 fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "u16" => "u16",
@@ -3570,15 +3617,16 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // cross-language canonical identifier).
         "crate::terminal::TerminalBinding" => "struct:TerminalBinding:v1",
         "crate::terminal::TerminalIngressMetadata" => "struct:TerminalIngressMetadata:v1",
-        "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
-        "Option<crate::remote_transport::bulk::RemoteBulkTransferRef>" => {
+        "crate::bulk_transfer::BulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
+        "Option<crate::bulk_transfer::BulkTransferRef>" => {
             "option<struct:RemoteBulkTransferRef:v1>"
         }
-        "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
+        "crate::bulk_transfer::BulkTransferId" => "struct:RemoteTransferId:v1",
         _ => return None,
     })
 }
 
+#[cfg(feature = "remote")]
 pub fn canonical_remote_operation_fcor_schema_for_tag(tag: &str) -> Option<String> {
     let source = remote_operation_fcor_schema_for_tag(tag)?;
     if source == "-" {
@@ -3599,11 +3647,13 @@ pub fn canonical_remote_operation_fcor_schema_for_tag(tag: &str) -> Option<Strin
         .collect::<Option<Vec<_>>>()
         .map(|fields| fields.join("|"))
 }
+#[cfg(feature = "remote")]
 pub fn remote_adapter_recovery_contract_for_tag(
     tag: &str,
 ) -> Option<RemoteAdapterRecoveryContractV1> {
     crate::command!(command_remote_recovery_tag, tag)
 }
+#[cfg(feature = "remote")]
 pub fn remote_adapter_recovery_strategy_for_tag(
     tag: &str,
 ) -> Option<RemoteAdapterRecoveryStrategy> {
@@ -3613,6 +3663,7 @@ pub fn remote_adapter_recovery_strategy_for_tag(
 /// Largest 48-bit Unix-millisecond timestamp an RFC 9562 UUIDv7 can encode
 /// (`2^48 - 1`). Timestamps beyond this range cannot be represented and are
 /// rejected by [`remote_operation_uuid_v7_from_parts`].
+#[cfg(feature = "remote")]
 pub const MAX_UUID_V7_UNIX_MS: u64 = 0xffff_ffff_ffff;
 
 /// Build an RFC 9562 UUIDv7 operation identity from an injected wall clock and
@@ -3624,6 +3675,7 @@ pub const MAX_UUID_V7_UNIX_MS: u64 = 0xffff_ffff_ffff;
 /// The shared vectors in `remote-operation-uuidv7-v1.json` lock this contract
 /// across languages. This is a pure constructor; it makes no claim of
 /// process-global monotonic ordering.
+#[cfg(feature = "remote")]
 pub fn remote_operation_uuid_v7_from_parts(
     unix_ms: u64,
     mut bytes: [u8; 16],
@@ -3659,8 +3711,10 @@ mod tests {
     /// offers nowhere to put the bytes.
     #[test]
     fn import_session_archive_rejects_inline_bytes() {
-        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::MAX_NDJSON_FRAME_BYTES;
+        use crate::bulk_transfer::{
+            BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+        };
 
         // The retired inline shape fails to parse. This is the assertion the
         // pre-migration production code could not satisfy.
@@ -3681,10 +3735,7 @@ mod tests {
         assert!(serde_json::from_value::<Request>(huge).is_err());
 
         // The accepted shape is a bounded typed transfer reference.
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([9u8; 16])
-        .unwrap();
+        let transfer_id = crate::bulk_transfer::transfer_id_from_bytes([9u8; 16]).unwrap();
         let request = Request::ImportSessionArchive {
             transfer: RemoteBulkTransferRef::new(
                 transfer_id,
@@ -3703,7 +3754,7 @@ mod tests {
             "a transfer reference must stay small, got {} bytes",
             encoded.len()
         );
-        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < MAX_NDJSON_FRAME_BYTES);
         // No base64 blob field survives anywhere in the encoding.
         assert!(!encoded.contains("archive_base64"));
 
@@ -3831,16 +3882,17 @@ mod tests {
 
     #[test]
     fn bulk_user_message_is_reference_only_at_exact_transport_boundaries() {
-        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
-        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::bulk_transfer::{
+            BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
+        };
 
         let request = |total_length, mime_class| Request::SendUserMessageBulk {
             client_submission_id: Uuid::new_v4(),
             expected_model_state_generation: None,
             expected_model: None,
             transfer: RemoteBulkTransferRef::new(
-                tag_protocol_id_bytes::<Transfer>([7; 16]).unwrap(),
+                transfer_id_from_bytes([7; 16]).unwrap(),
                 total_length,
                 [0xAB; 32],
                 mime_class,
@@ -3860,7 +3912,7 @@ mod tests {
                 .expect("exact bulk text boundary must be accepted");
             let encoded = serde_json::to_vec(&request).unwrap();
             assert!(
-                encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES,
+                encoded.len() < 1024 && encoded.len() < crate::MAX_NDJSON_FRAME_BYTES,
                 "the {boundary}-byte body must stay on the bulk lane"
             );
             assert!(
@@ -3879,19 +3931,20 @@ mod tests {
 
     #[test]
     fn bulk_user_message_can_stage_a_large_display_form_without_inline_frame_growth() {
-        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
-        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::bulk_transfer::{
+            BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
+        };
 
         let transfer = RemoteBulkTransferRef::new(
-            tag_protocol_id_bytes::<Transfer>([8; 16]).unwrap(),
+            transfer_id_from_bytes([8; 16]).unwrap(),
             5,
             [0xAC; 32],
             RemoteBulkMimeClass::Opaque,
         )
         .unwrap();
         let display_transfer = RemoteBulkTransferRef::new(
-            tag_protocol_id_bytes::<Transfer>([9; 16]).unwrap(),
+            transfer_id_from_bytes([9; 16]).unwrap(),
             8 * 1024 * 1024,
             [0xBD; 32],
             RemoteBulkMimeClass::Opaque,
@@ -3912,7 +3965,7 @@ mod tests {
             .validate_semantics()
             .expect("a display transfer permits an inline-sized source transfer");
         let encoded = serde_json::to_vec(&request).unwrap();
-        assert!(encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < 1024 && encoded.len() < crate::MAX_NDJSON_FRAME_BYTES);
         assert!(!String::from_utf8_lossy(&encoded).contains("large remote preview"));
 
         let mut conflicting_inline = request.clone();
@@ -3944,6 +3997,7 @@ mod tests {
         assert!(shared_transfer.validate_semantics().is_err());
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn semantic_validation_rechecks_in_process_owner_credential() {
         let mut invalid = crate::StoredFlycockpitCredential {
@@ -4016,28 +4070,37 @@ mod tests {
     }
 
     macro_rules! command_tags {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$($tag),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut tags = Vec::new();
+            $($(#[$row_attr])* tags.push($tag);)+
+            tags
         }};
     }
 
+    #[cfg(feature = "remote")]
     macro_rules! remote_operation_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($tag, $mutating, stringify!($authz), stringify!($remote_class))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($tag, $mutating, stringify!($authz), stringify!($remote_class)));)+
+            rows
         }};
     }
 
+    #[cfg(feature = "remote")]
     macro_rules! fcor_source_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$((
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push((
                 stringify!($pattern),
                 $tag,
                 $fcor_schema,
                 vec![$((stringify!($fcor_field), stringify!($fcor_type), concat!(stringify!($fcor_role), $("(", stringify!($($fcor_role_arg),*), ")")?))),*],
-            )),+]
+            ));)+
+            rows
         }};
     }
 
+    #[cfg(feature = "remote")]
     fn request_source_field_schemas() -> std::collections::BTreeMap<String, String> {
         use quote::ToTokens;
         let syntax = syn::parse_file(include_str!("request.rs")).expect("request.rs parses");
@@ -4076,6 +4139,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_operation_fcor_source_schema_cannot_drift() {
         let declared = request_source_field_schemas();
@@ -4179,6 +4243,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     macro_rules! remote_evidence_json {
         () => {
             serde_json::Value::Null
@@ -4188,9 +4253,11 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "remote")]
     macro_rules! remote_operation_fixture_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(serde_json::json!({
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(serde_json::json!({
                 "tag": $tag,
                 "class": stringify!($remote_class),
                 "strategy": stringify!($recovery),
@@ -4207,10 +4274,12 @@ mod tests {
                     "type": stringify!($fcor_type).replace(' ', "").replace("$crate", "crate"),
                     "role": concat!(stringify!($fcor_role), $("(", stringify!($($fcor_role_arg),*), ")")?),
                 }),*],
-            })),+]
+            }));)+
+            rows
         }};
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_operation_classification_is_exhaustive() {
         use std::collections::BTreeSet;
@@ -4393,6 +4462,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn docs_ask_is_owner_remoted_read_only() {
         // AC6/AC7: `docs_ask` is owner-remoted (it reserves a remote operation,
@@ -4435,6 +4505,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn owner_secret_wire_projections_and_debug_never_include_plaintext() {
         let unique = "owner_rpc_plaintext_must_not_escape";
@@ -4580,6 +4651,7 @@ mod tests {
         assert!(!error.contains("secret"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_operation_uuidv7_vectors() {
         // Byte-identity with the TypeScript `generateRemoteOperationUuidV7`:
@@ -4713,12 +4785,13 @@ mod tests {
             name: "a".into(),
             home_dir: "/a".into(),
             config_json: "{}".into(),
-            content_hash: "h".into(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
         };
         assert_eq!(request.wire_tag(), "upsert_assistant");
         assert!(crate::command!(command_tags).contains(&request.wire_tag()));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn upsert_assistant_is_owner_remoted() {
         // AC6: reclassified away from `local_only`; reserves a remote op.
@@ -4728,6 +4801,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn export_session_data_is_owner_remoted() {
         // AC4: the redacted session export is reclassified from `local_only` to
@@ -4744,6 +4818,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn raw_export_reader_stays_local_only_while_opaque_ingress_is_remoted() {
         // AC5/AC8: the generic bulk reader that serves the raw `--include-sensitive`
@@ -4761,6 +4836,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn repair_media_reservation_is_owner_remoted() {
         // AC7: owner-remoted serialized mutation, not `local_only`.
@@ -4770,6 +4846,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn get_workspace_trust_is_required_owner_remoted() {
         // AC8: the existing workspace-trust tag is the owner-remoted read;
@@ -4785,6 +4862,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn new_cli_surface_rpcs_are_owner_remoted_never_local_only() {
         // AC1: every new row exists and is not `local_only` (None class).
@@ -4922,6 +5000,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn sealed_owner_rpcs_are_owner_remoted() {
         // AC3: every new tag reserves a remote operation (not `local_only`,
@@ -4952,6 +5031,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn apply_sealed_owner_operation_carries_bounded_zeroizing_literal() {
         // AC1 / core security property: the plaintext rides the apply request
@@ -4989,6 +5069,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn apply_literal_plaintext_never_enters_fcor_canonical_params() {
         // FINDING 1: the sealed plaintext must never be copied into the

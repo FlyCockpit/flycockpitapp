@@ -6,6 +6,7 @@ use super::run::{encode_durable_model_fence, replay_accepted_oversized_text_arti
 use super::*;
 
 #[test]
+#[cfg(feature = "remote")]
 fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
     let receipt = RemoteQueueMutationReceiptV1 {
         schema_version: 1,
@@ -52,6 +53,7 @@ fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_queue_receipt_and_terminal_disposition_commit_and_replay_together() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
@@ -726,6 +728,7 @@ async fn terminal_receipt_write_failure_returns_promptly_and_holds_the_exact_que
 }
 
 #[test]
+#[cfg(feature = "remote")]
 fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
     crate::test_env::run_async_with_large_stack(|| async {
         let tmp = tempfile::tempdir().unwrap();
@@ -815,6 +818,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::UserMessage {
                     submission: Box::new(submission),
+                    #[cfg(feature = "remote")]
                     remote_operation: None,
                     artifact_admission: None,
                     respond_to,
@@ -884,6 +888,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id: id,
+                    #[cfg(feature = "remote")]
                     remote_operation: operation,
                     respond_to,
                 })
@@ -969,6 +974,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::RemoveNewestQueuedUserMessage {
                     target_id: Some("root".into()),
+                    #[cfg(feature = "remote")]
                     remote_operation: Some(operation),
                     respond_to,
                 })
@@ -1011,6 +1017,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             handle
                 .send_work(SessionWork::RemoveEditableQueuedUserMessages {
                     target_id: Some("root".into()),
+                    #[cfg(feature = "remote")]
                     remote_operation: Some(operation),
                     respond_to,
                 })
@@ -1058,6 +1065,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
 /// found *after* an oversized FCM2 phase-one reservation uses that reservation's
 /// exact DB-owned terminal composition rather than leaving its bound run live.
 #[test]
+#[cfg(feature = "remote")]
 fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_conflicts() {
     crate::test_env::run_async_with_large_stack(|| async {
         let tmp = tempfile::tempdir().unwrap();
@@ -1145,6 +1153,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             handle
                 .send_work(SessionWork::UserMessage {
                     submission: Box::new(submission),
+                    #[cfg(feature = "remote")]
                     remote_operation: Some(operation),
                     artifact_admission: None,
                     respond_to,
@@ -1268,7 +1277,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         let admission = OversizedTextArtifactAdmission {
             canonical_message,
             operation_id: *operation_id.as_bytes(),
-            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+            actor: crate::db::message_attachments::MessageActor::ExternalPrincipal {
                 id: *device_id.as_bytes(),
                 generation: conflict_operation.authenticated_device_generation,
             },
@@ -1290,6 +1299,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
         handle
             .send_work(SessionWork::UserMessage {
                 submission: Box::new(oversized_submission),
+                #[cfg(feature = "remote")]
                 remote_operation: Some(conflict_operation.clone()),
                 artifact_admission: Some(Box::new(admission)),
                 respond_to,
@@ -1355,6 +1365,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
 /// part of that DB-owned terminal composition; leaving it accepted would let a
 /// rejected oversized source reserve later provider work after restart.
 #[test]
+#[cfg(feature = "remote")]
 fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
     crate::test_env::run_async_with_large_stack(|| async {
         let tmp = tempfile::tempdir().unwrap();
@@ -1467,7 +1478,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         let admission = OversizedTextArtifactAdmission {
             canonical_message,
             operation_id: *operation_id.as_bytes(),
-            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+            actor: crate::db::message_attachments::MessageActor::ExternalPrincipal {
                 id: *device_id.as_bytes(),
                 generation: operation.authenticated_device_generation,
             },
@@ -1489,6 +1500,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
         handle
             .send_work(SessionWork::UserMessage {
                 submission: Box::new(submission),
+                #[cfg(feature = "remote")]
                 remote_operation: Some(operation),
                 artifact_admission: Some(Box::new(admission)),
                 respond_to,
@@ -2958,9 +2970,14 @@ async fn roster_trim_removed_default_primary_notice_is_one_time() {
 async fn resolve_root_agent_assistant_session_bypasses_primary_allowlist() {
     use crate::config::extended::DefaultPrimaryAgent as D;
     let db = crate::db::Db::open_in_memory().unwrap();
-    db.upsert_assistant("helper-bot", "/tmp/helper-bot", "{}", "hash")
-        .await
-        .unwrap();
+    db.upsert_assistant(
+        "helper-bot",
+        "/tmp/helper-bot",
+        "{}",
+        crate::assistants::VALID_ASSISTANT_CONTENT_HASH_FIXTURE,
+    )
+    .await
+    .unwrap();
     let row = db
         .create_assistant_session("proj", "/proj", "helper-bot", "helper-bot")
         .await

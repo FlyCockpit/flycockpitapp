@@ -5,6 +5,85 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+#[cfg(test)]
+static SIDECAR_SYNC_FAILURE_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn force_sidecar_parent_sync_failure_for_test(path: Option<PathBuf>) {
+    *SIDECAR_SYNC_FAILURE_PATH
+        .lock()
+        .expect("sidecar sync failure hook poisoned") = path;
+}
+
+fn sidecar_parent_sync_forced_failure(path: &Path) -> bool {
+    #[cfg(test)]
+    {
+        return SIDECAR_SYNC_FAILURE_PATH
+            .lock()
+            .expect("sidecar sync failure hook poisoned")
+            .as_deref()
+            == Some(path);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Process-independent guard for database boot, backup, and migration.
+///
+/// The lock file is persistent, but ownership is held by the kernel on this
+/// open file description. A crashed process therefore cannot leave stale
+/// ownership behind (unlike a create-new or PID-file protocol).
+pub(crate) struct DatabaseOwnerLock {
+    _file: std::fs::File,
+}
+
+impl DatabaseOwnerLock {
+    pub(crate) fn acquire(database: &Path) -> Result<Self> {
+        let lock_path = database.with_extension("boot.lock");
+        ensure_parent_dir_private(&lock_path)?;
+        create_private_file_if_missing(&lock_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening database boot lock {}", lock_path.display()))?;
+        repair_private_file(&lock_path, "database boot lock")?;
+        file.try_lock().with_context(|| {
+            format!(
+                "database already has a live exclusive owner at {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Non-mutating diagnostic ownership. It can coexist with other diagnostic
+/// readers, but never with the daemon's exclusive lifetime owner.
+pub(crate) struct DatabaseDiagnosticLock {
+    _file: std::fs::File,
+}
+
+impl DatabaseDiagnosticLock {
+    pub(crate) fn try_acquire(database: &Path) -> Result<Self> {
+        let lock_path = database.with_extension("boot.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening database ownership lock {}", lock_path.display()))?;
+        file.try_lock_shared().with_context(|| {
+            format!(
+                "database is owned by a live daemon; diagnostics must use its RPC: {}",
+                database.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 pub(crate) fn cockpit_data_dir() -> Result<PathBuf> {
     if let Ok(s) = std::env::var("XDG_DATA_HOME")
         && !s.trim().is_empty()
@@ -174,24 +253,189 @@ pub(crate) fn create_private_file_if_missing(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Publish a new DB-owned sidecar through a fully durable, private temporary
+/// file. The final pathname becomes visible only after its bytes are synced;
+/// syncing the parent then makes the rename durable before SQLite may refer to
+/// it. `destination` must not already exist (callers use non-reusable names).
+pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = opts
-        .open(path)
-        .with_context(|| format!("opening {} for write", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    file.write_all(bytes)?;
-    Ok(())
+    let parent = destination
+        .parent()
+        .context("durable sidecar destination has no parent")?;
+    ensure_private_dir(parent)?;
+    let file_name = destination
+        .file_name()
+        .context("durable sidecar destination has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::now_v7()));
+
+    struct TempGuard(PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let guard = TempGuard(temporary.clone());
+    #[cfg(unix)]
+    let file_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+    };
+    #[cfg(not(unix))]
+    let file_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary);
+    let mut file = file_result.with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        // `hard_link` is the portable Unix no-replace publication primitive:
+        // destination creation is atomic and fails with AlreadyExists under a
+        // racing publisher. Both paths are in the same private directory, so
+        // this cannot cross filesystems. Removing the temporary name leaves
+        // the fully synced inode reachable at exactly one final pathname.
+        std::fs::hard_link(&temporary, destination).with_context(|| {
+            format!(
+                "publishing durable sidecar {} as {} without replacement",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        std::fs::remove_file(&temporary)
+            .with_context(|| format!("removing published temporary {}", temporary.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::ensure!(
+            !destination.exists(),
+            "refusing to replace existing durable sidecar {}",
+            destination.display()
+        );
+        std::fs::rename(&temporary, destination).with_context(|| {
+            format!(
+                "publishing durable sidecar {} as {}",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        std::mem::forget(guard);
+    }
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            // FILE_FLAG_BACKUP_SEMANTICS is required to open a directory.
+            .custom_flags(0x0200_0000)
+            .open(parent)
+    };
+    #[cfg(not(windows))]
+    let directory = std::fs::File::open(parent);
+    let directory =
+        directory.with_context(|| format!("opening sidecar parent {}", parent.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("syncing sidecar parent {}", parent.display()))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+/// Unlink a DB-owned sidecar beneath `base` without following any path
+/// component, then durably commit the directory-entry change. Missing is
+/// success, but still syncs the parent directory so a retry after an uncertain
+/// prior unlink cannot discard its durable cleanup intent prematurely.
+#[cfg(unix)]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    anyhow::ensure!(!components.is_empty(), "sidecar cleanup path is empty");
+    anyhow::ensure!(
+        components
+            .iter()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "sidecar cleanup path must be relative and normalized"
+    );
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(base)
+        .with_context(|| format!("opening sidecar cleanup base {}", base.display()))?;
+    let mut durable_parent = base.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("components were validated")
+        };
+        durable_parent.push(name);
+        let name = CString::new(name.as_bytes()).context("sidecar directory contains NUL")?;
+        // SAFETY: `directory` is a live directory fd and `name` contains one
+        // validated normal component. O_NOFOLLOW refuses a raced symlink.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "opening sidecar cleanup directory beneath {}",
+                    base.display()
+                )
+            });
+        }
+        // SAFETY: successful `openat` returned a newly owned descriptor.
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let std::path::Component::Normal(name) = components.last().expect("nonempty validated path")
+    else {
+        unreachable!("components were validated")
+    };
+    let name = CString::new(name.as_bytes()).context("sidecar filename contains NUL")?;
+    // SAFETY: held parent fd plus a single literal filename; unlinkat never
+    // follows a symlink in the final component.
+    let rc = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("unlinking delegation payload sidecar");
+        }
+    }
+    anyhow::ensure!(
+        !sidecar_parent_sync_forced_failure(&durable_parent),
+        "injected delegation payload sidecar parent fsync failure"
+    );
+    directory
+        .sync_all()
+        .context("fsyncing delegation payload sidecar parent")
+}
+
+#[cfg(windows)]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    let _ = (base, relative);
+    anyhow::bail!(
+        "durable no-follow sidecar deletion is unsupported on Windows; cleanup is retained for a future safe implementation"
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    let path = base.join(relative);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("unlinking delegation payload sidecar"),
+    }
 }

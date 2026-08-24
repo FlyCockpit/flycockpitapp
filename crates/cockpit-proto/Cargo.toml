@@ -9,6 +9,17 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Remote signaling, tenant authority, continuity, and transport wire contracts
+# are opt-in and propagate the same capability to their persistence DTOs.
+default = []
+remote = [
+    "cockpit-db/remote",
+    "dep:hmac",
+    "dep:p256",
+    "dep:sha1",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -16,11 +27,11 @@ cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 chrono = { workspace = true }
 futures = { workspace = true }
-hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
-p256 = { workspace = true }
+hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"], optional = true }
+p256 = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha1 = "=0.11.0"
+sha1 = { version = "=0.11.0", optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
@@ -34,3 +45,59 @@ zeroize = { workspace = true }
 quote = "1"
 sha2 = { workspace = true }
 syn = { version = "2", features = ["full"] }
+
+[[test]]
+name = "remote_attempt_grant_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_authority_conformance"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_connection_metadata_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_device_identity_enrollment_conformance"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_identity_custody_signing_conformance"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_identity_protocol_conformance"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_operation_replay"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_public_service_policy_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_signaling_attempt_store_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_transport_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_transport_selection"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_version_negotiation_fixtures"
+required-features = ["remote"]
+
+[[test]]
+name = "remote_wire_magic_registry_conformance"
+required-features = ["remote"]
+
+[[test]]
+name = "tenant_authority_protocol_conformance"
+required-features = ["remote"]

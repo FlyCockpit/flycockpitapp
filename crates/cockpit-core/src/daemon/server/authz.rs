@@ -1,6 +1,7 @@
 use super::sessions::*;
 use super::*;
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AuthorizedFcorResource {
     pub(super) kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
@@ -9,9 +10,11 @@ pub(super) struct AuthorizedFcorResource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthorizedRequestContext {
+    #[cfg(feature = "remote")]
     pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
 }
 
+#[cfg(feature = "remote")]
 impl AuthorizedRequestContext {
     /// Build the canonical operation bytes from resources resolved at the
     /// authorization boundary. Callers must supply the request-specific
@@ -44,6 +47,7 @@ impl AuthorizedRequestContext {
     }
 }
 
+#[cfg(feature = "remote")]
 fn canonical_project_root_bytes(
     path: &std::path::Path,
 ) -> std::result::Result<Vec<u8>, ErrorPayload> {
@@ -54,6 +58,7 @@ fn canonical_project_root_bytes(
     Ok(text.as_bytes().to_vec())
 }
 
+#[cfg(feature = "remote")]
 fn push_fcor_resource(
     resources: &mut Vec<AuthorizedFcorResource>,
     kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
@@ -62,9 +67,11 @@ fn push_fcor_resource(
     resources.push(AuthorizedFcorResource { kind, value });
 }
 
+#[cfg(feature = "remote")]
 trait SessionFcorResource {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>);
 }
+#[cfg(feature = "remote")]
 impl SessionFcorResource for Uuid {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
         push_fcor_resource(
@@ -74,6 +81,7 @@ impl SessionFcorResource for Uuid {
         );
     }
 }
+#[cfg(feature = "remote")]
 impl SessionFcorResource for Option<Uuid> {
     fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
         if let Some(value) = self {
@@ -82,20 +90,24 @@ impl SessionFcorResource for Option<Uuid> {
     }
 }
 
+#[cfg(feature = "remote")]
 trait OptionalFcorText {
     fn optional_text(&self) -> Option<&str>;
 }
+#[cfg(feature = "remote")]
 impl OptionalFcorText for String {
     fn optional_text(&self) -> Option<&str> {
         Some(self)
     }
 }
+#[cfg(feature = "remote")]
 impl OptionalFcorText for Option<String> {
     fn optional_text(&self) -> Option<&str> {
         self.as_deref()
     }
 }
 
+#[cfg(feature = "remote")]
 macro_rules! resolve_fcor_role {
     ($resources:ident, $cwd:ident, $name:ident => param) => {
         let _ = $name;
@@ -240,9 +252,10 @@ macro_rules! resolve_fcor_role {
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_resolve_fcor_resources {
-    (($request:ident, $cwd:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        match $request { $($pattern => {
+    (($request:ident, $cwd:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request { $($(#[$row_attr])* $pattern => {
             let mut resources = Vec::new();
             let _: &mut Vec<AuthorizedFcorResource> = &mut resources;
             let _ = $cwd;
@@ -254,6 +267,7 @@ macro_rules! command_resolve_fcor_resources {
 
 /// Resolve path-bearing FCOR resources only after request authorization.
 /// Raw client path text never leaves this boundary.
+#[cfg(feature = "remote")]
 fn resolve_authorized_fcor_resources(
     request: &Request,
     daemon_cwd: &std::path::Path,
@@ -267,10 +281,11 @@ pub(super) async fn authorize_request_context(
     ctx: &DaemonContext,
 ) -> std::result::Result<AuthorizedRequestContext, ErrorPayload> {
     authorize_request(request, state, ctx).await?;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote"))]
     ctx.fcor_resolver_calls
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(AuthorizedRequestContext {
+        #[cfg(feature = "remote")]
         fcor_resources: resolve_authorized_fcor_resources(request, &ctx.canonical_cwd)?,
     })
 }
@@ -449,6 +464,7 @@ pub(super) async fn require_remote_target_session_writer(
     }
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_session_id_value {
     ($state:expr, none) => {
         None
@@ -464,19 +480,22 @@ macro_rules! command_session_id_value {
     };
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_request_session_id_match {
-    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident, $state:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_session_id_value!($state, $session $(($session_arg))?),)+
+            $($(#[$row_attr])* $pattern => command_session_id_value!($state, $session $(($session_arg))?),)+
         }
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn request_session_id(request: &Request, state: &MutableClientState) -> Option<Uuid> {
     proto::command!(command_request_session_id_match, request, state)
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_audit_path_value {
     (none) => {
         None
@@ -489,32 +508,37 @@ macro_rules! command_audit_path_value {
     };
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_request_audit_path_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_audit_path_value!($audit_path $(($($audit_arg),+))?),)+
+            $($(#[$row_attr])* $pattern => command_audit_path_value!($audit_path $(($($audit_arg),+))?),)+
         }
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn request_audit_path(request: &Request) -> Option<String> {
     proto::command!(command_request_audit_path_match, request)
 }
 
+#[cfg(any(feature = "remote", test))]
 macro_rules! command_is_remote_mutating_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => $mutating,)+
+            $($(#[$row_attr])* $pattern => $mutating,)+
         }
     }};
 }
 
+#[cfg(any(feature = "remote", test))]
 #[allow(unused_variables)]
 pub(super) fn is_remote_mutating_request(request: &Request) -> bool {
     proto::command!(command_is_remote_mutating_match, request)
 }
 
+#[cfg(feature = "remote")]
 pub(super) async fn audit_remote_request(
     ctx: &DaemonContext,
     principal: &ClientPrincipal,
@@ -972,13 +996,13 @@ pub(super) async fn authorize_session_row_reader(
 //   best-effort id. Any authz tag not mapped above (and every `custom` handler)
 //   fails closed. A read-only ceiling therefore denies every write category.
 
-use cockpit_proto::remote_public_service_policy::{
-    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
-};
+#[cfg(feature = "remote")]
+use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1};
 
 /// Resolve a raw project-root string to its 16-byte control-plane project id
 /// through the injected deny-closed resolver. A canonicalization failure or a
 /// resolver miss is a hard authorization failure (fail closed).
+#[cfg(feature = "remote")]
 fn attempt_grant_resolve_project_id(
     ctx: &DaemonContext,
     raw_root: &str,
@@ -993,6 +1017,7 @@ fn attempt_grant_resolve_project_id(
 
 /// Require a project capability on the resolver-resolved control-plane project
 /// id for `raw_root`. Deny-closed on resolver miss or absent capability.
+#[cfg(feature = "remote")]
 fn attempt_grant_require_project_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     ctx: &DaemonContext,
@@ -1011,6 +1036,7 @@ fn attempt_grant_require_project_capability(
 
 /// Require an attachment capability in the verified ceiling. Deny-closed on
 /// absence.
+#[cfg(feature = "remote")]
 fn attempt_grant_require_attachment_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     capability: RemoteAttachmentCapabilityV1,
@@ -1026,6 +1052,7 @@ fn attempt_grant_require_attachment_capability(
 
 /// Require a project capability on the *attached* session's resolved project
 /// root. Not attached → fail closed; resolver miss / absent capability → deny.
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_attached_session_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     state: &MutableClientState,
@@ -1050,6 +1077,7 @@ async fn attempt_grant_require_attached_session_capability(
 }
 
 /// Shared-snapshot variant of [`attempt_grant_require_attached_session_capability`].
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_shared_session_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     shared: &SharedClientState,
@@ -1078,6 +1106,7 @@ async fn attempt_grant_require_shared_session_capability(
 
 /// Require a project capability on a specific target session's resolved project
 /// root. Unknown session → typed error; resolver miss / absent capability → deny.
+#[cfg(feature = "remote")]
 async fn attempt_grant_require_session_row_capability(
     auth: &crate::daemon::principal::AttemptGrantAuthorization,
     ctx: &DaemonContext,
@@ -1099,6 +1128,7 @@ async fn attempt_grant_require_session_row_capability(
 /// Map one command-table row's authz tag onto a verified-ceiling capability
 /// query for a `MutableClientState` (serialized executor path). Every unmapped
 /// tag and every `custom` handler fails closed.
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_value {
     ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -1178,6 +1208,7 @@ macro_rules! command_authorize_attempt_grant_value {
 }
 
 /// Shared-snapshot analogue of [`command_authorize_attempt_grant_value`].
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_shared_value {
     ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -1304,17 +1335,18 @@ macro_rules! command_authorize_value {
 }
 
 macro_rules! command_authorize_request_match {
-    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_authorize_value!($principal, $state, $ctx, $request, $authz $(($authz_arg))?),)+
+            $($(#[$row_attr])* $pattern => command_authorize_value!($principal, $state, $ctx, $request, $authz $(($authz_arg))?),)+
         }
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_request_match {
-    (($request:ident, $state:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident, $state:ident, $ctx:ident, $auth:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_authorize_attempt_grant_value!($auth, $state, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
+            $($(#[$row_attr])* $pattern => command_authorize_attempt_grant_value!($auth, $state, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
         }
     }};
 }
@@ -1333,6 +1365,7 @@ pub(super) async fn authorize_request(
     // An attempt-grant principal is authorized only against its verified
     // ceiling — never through the legacy `PrincipalScope` helpers. Fail-closed
     // on any unmapped category or resolver miss.
+    #[cfg(feature = "remote")]
     if let Some(auth) = principal.attempt_grant_authorization() {
         return proto::command!(
             command_authorize_attempt_grant_request_match,
@@ -1403,17 +1436,18 @@ macro_rules! command_authorize_shared_value {
 }
 
 macro_rules! command_authorize_shared_request_match {
-    (($request:ident, $shared:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident, $shared:ident, $ctx:ident, $principal:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_authorize_shared_value!($principal, $shared, $ctx, $request, $authz $(($authz_arg))?),)+
+            $($(#[$row_attr])* $pattern => command_authorize_shared_value!($principal, $shared, $ctx, $request, $authz $(($authz_arg))?),)+
         }
     }};
 }
 
+#[cfg(feature = "remote")]
 macro_rules! command_authorize_attempt_grant_shared_request_match {
-    (($request:ident, $shared:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident, $shared:ident, $ctx:ident, $auth:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_authorize_attempt_grant_shared_value!($auth, $shared, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
+            $($(#[$row_attr])* $pattern => command_authorize_attempt_grant_shared_value!($auth, $shared, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
         }
     }};
 }
@@ -1430,6 +1464,7 @@ pub(super) async fn authorize_request_shared(
     }
 
     // Attempt-grant principals: ceiling-only enforcement on the shared path too.
+    #[cfg(feature = "remote")]
     if let Some(auth) = principal.attempt_grant_authorization() {
         return proto::command!(
             command_authorize_attempt_grant_shared_request_match,
@@ -1492,17 +1527,22 @@ mod remote_attempt_authz_tests {
     }
 
     macro_rules! remote_attempt_authz_rows {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($kind, remote_attempt_authz_class!($authz))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($kind, remote_attempt_authz_class!($authz)));)+
+            rows
         }};
     }
 
     macro_rules! remote_attempt_authz_row_count {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            0usize $(+ { let _ = stringify!($pattern); 1usize })+
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut count = 0usize;
+            $($(#[$row_attr])* { let _ = stringify!($pattern); count += 1; })+
+            count
         }};
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_attempt_request_authz_table_exhaustive() {
         let rows = proto::command!(remote_attempt_authz_rows);

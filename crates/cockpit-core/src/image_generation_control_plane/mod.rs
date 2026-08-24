@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use cockpit_proto::remote_public_service_policy::{
+use cockpit_proto::capability_ceiling::{
     RemotePermissionCeilingDigestV1, RemotePermissionCeilingV1, RemoteProjectCapabilityV1,
     permission_ceiling_digest,
 };
@@ -1105,7 +1105,7 @@ pub fn ceiling_authorizes_admin(
 /// Verify that `image_generation_admin=15` is type/field-disjoint from
 /// attachment capabilities despite intentional numeric overlap.
 pub fn verify_capability_disjoint() -> bool {
-    use cockpit_proto::remote_public_service_policy::RemoteAttachmentCapabilityV1;
+    use cockpit_proto::capability_ceiling::RemoteAttachmentCapabilityV1;
     // Ordinal 15 must be a valid project capability but not a valid attachment
     // capability.
     let proj = RemoteProjectCapabilityV1::from_ordinal(IMAGE_GENERATION_ADMIN_ORDINAL);

@@ -2392,6 +2392,7 @@ impl App {
                     self.show_toast(message, kind);
                 }
             }
+            #[cfg(feature = "remote")]
             TurnEvent::ConnectorStatus {
                 enabled,
                 status,

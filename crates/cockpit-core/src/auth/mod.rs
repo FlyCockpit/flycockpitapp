@@ -11,6 +11,7 @@
 
 pub mod codex_oauth;
 pub mod copilot_setup;
+#[cfg(feature = "remote")]
 pub mod flycockpit;
 mod refresh_guard;
 pub mod subscription_ack;

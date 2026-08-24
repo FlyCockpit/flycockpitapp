@@ -169,7 +169,7 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
 

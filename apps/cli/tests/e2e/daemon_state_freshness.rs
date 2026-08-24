@@ -224,10 +224,21 @@ fn daemon_refuses_newer_migration_ledger() {
     assert_failure("doctor without providers", &initialize, &home);
 
     let conn = Connection::open(home.db_path()).expect("open current DB");
+    let fingerprint: String = conn
+        .query_row(
+            "SELECT schema_fingerprint FROM schema_version WHERE version = ?1",
+            [cockpit_cli::db::EXPECTED_SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .expect("read current schema fingerprint");
     conn.execute(
-        "INSERT INTO schema_version (version, name, sha256, applied_at) \
-         VALUES (?1, 'future', 'future', CURRENT_TIMESTAMP)",
-        [cockpit_cli::db::EXPECTED_SCHEMA_VERSION + 1],
+        "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) \
+         VALUES (?1, 'future', ?2, ?3, 'local-v0.1', CURRENT_TIMESTAMP)",
+        rusqlite::params![
+            cockpit_cli::db::EXPECTED_SCHEMA_VERSION + 1,
+            "0".repeat(64),
+            fingerprint
+        ],
     )
     .expect("seed newer migration ledger");
     drop(conn);
@@ -240,7 +251,8 @@ fn daemon_refuses_newer_migration_ledger() {
     assert_failure("newer-ledger daemon start", &output, &home);
     let text = output_text(&output);
     assert!(
-        text.contains("database migration ledger is newer than this binary"),
+        text.contains("incompatible prerelease database schema v2")
+            && text.contains("Restore a compatible migration backup or move the database aside"),
         "{text}"
     );
     assert!(

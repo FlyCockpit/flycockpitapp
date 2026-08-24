@@ -324,7 +324,7 @@ pub(super) async fn write_export_no_clobber(
 /// does not reproduce both exactly is rejected rather than written to disk.
 async fn pull_bulk_transfer(
     attached_request: &AttachedRequestBinding,
-    transfer: &cockpit_core::daemon::proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: &cockpit_core::daemon::proto::bulk_transfer::BulkTransferRef,
     command: &'static str,
     shutdown: &AsyncActionCancellation,
 ) -> Result<Vec<u8>, String> {
@@ -401,7 +401,7 @@ mod tests {
     use super::*;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
     use cockpit_core::daemon::proto::ExportSessionData;
-    use cockpit_core::daemon::proto::remote_transport::bulk as proto_bulk;
+    use cockpit_core::daemon::proto::bulk_transfer as proto_bulk;
     use std::sync::{Arc, Mutex};
 
     fn last_plain(app: &App) -> &str {
@@ -469,16 +469,13 @@ mod tests {
         digest
     }
 
-    fn transfer_ref(bytes: &[u8]) -> proto_bulk::RemoteBulkTransferRef {
-        let transfer_id = cockpit_core::daemon::proto::remote_protocol_id::tag_protocol_id_bytes::<
-            cockpit_core::daemon::proto::remote_protocol_id::kind::Transfer,
-        >([0x2A; 16])
-        .unwrap();
-        proto_bulk::RemoteBulkTransferRef::new(
+    fn transfer_ref(bytes: &[u8]) -> proto_bulk::BulkTransferRef {
+        let transfer_id = proto_bulk::transfer_id_from_bytes([0x2A; 16]).unwrap();
+        proto_bulk::BulkTransferRef::new(
             transfer_id,
             bytes.len() as u64,
             digest_of(bytes),
-            proto_bulk::RemoteBulkMimeClass::RedactedExport,
+            proto_bulk::BulkMimeClass::RedactedExport,
         )
         .unwrap()
     }

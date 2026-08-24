@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use cockpit_proto::remote_public_service_policy::{
-    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
-};
+#[cfg(feature = "remote")]
+use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1};
 
 use crate::daemon::proto::{self, Request};
 
@@ -13,9 +12,11 @@ use crate::daemon::proto::{self, Request};
 #[allow(clippy::large_enum_variant)]
 pub enum ClientPrincipal {
     Owner,
+    #[cfg(feature = "remote")]
     Remote(RemotePrincipal),
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemotePrincipal {
     pub user_id: String,
@@ -25,7 +26,19 @@ pub struct RemotePrincipal {
     /// is present and never widens an attempt-grant ceiling through the legacy
     /// scope helpers.
     pub authorization: RemoteAuthorization,
-    pub actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+    pub actor_binding: Option<ClientActorBindingV1>,
+}
+
+/// Transport-neutral copy of the authenticated device binding. Keeping this
+/// DTO in the daemon authority layer prevents the local build from depending
+/// on or compiling the legacy relay envelope crate.
+#[cfg(feature = "remote")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientActorBindingV1 {
+    pub schema_version: u8,
+    pub device_id: uuid::Uuid,
+    pub device_generation: u64,
+    pub logical_attachment_id: uuid::Uuid,
 }
 
 /// The kind of authorization a remote principal carries.
@@ -36,6 +49,7 @@ pub struct RemotePrincipal {
 /// and is deleted wholesale by `remote-standalone-relay-cutover`. `AttemptGrant`
 /// is constructed only by
 /// `crate::daemon::remote_attempt::construct_principal_from_grant`.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteAuthorization {
     /// Legacy relay-derived scopes. Connector relay boundary only.
@@ -49,6 +63,7 @@ pub enum RemoteAuthorization {
 /// typed permission ceiling verbatim (attachment capabilities + per-project
 /// capability sets keyed by 16-byte project id), never a lossy projection onto
 /// the legacy scope vocabulary.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptGrantAuthorization {
     /// Canonical 22-char base64url (no padding) alias of the grant's
@@ -64,12 +79,14 @@ pub struct AttemptGrantAuthorization {
 /// A typed permission ceiling: attachment capabilities plus per-project
 /// capability sets keyed by the 16-byte control-plane project id. Imported
 /// from the foundation policy enums; never redefined.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCeilingAuthorization {
     pub attachment_capabilities: Vec<RemoteAttachmentCapabilityV1>,
     pub projects: Vec<([u8; 16], Vec<RemoteProjectCapabilityV1>)>,
 }
 
+#[cfg(feature = "remote")]
 impl RemoteCeilingAuthorization {
     /// True if the attachment capability set contains `cap`.
     pub fn has_attachment_capability(&self, cap: RemoteAttachmentCapabilityV1) -> bool {
@@ -92,6 +109,7 @@ impl RemoteCeilingAuthorization {
 /// The device/attachment binding carried by an attempt-grant principal. Sourced
 /// only from verified grant claims — never from a relay envelope — so the
 /// module guard scans stay green.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantDeviceBinding {
     pub client_device_id: [u8; 16],
@@ -155,10 +173,11 @@ impl ClientPrincipal {
     /// rather than from a relay-stamped envelope. The optional
     /// `actor_binding` is the device-bound verification artifact carried
     /// alongside the verified grants.
+    #[cfg(feature = "remote")]
     pub fn from_verified_remote(
         user_id: String,
         grants: Vec<PrincipalGrant>,
-        actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+        actor_binding: Option<ClientActorBindingV1>,
     ) -> Self {
         Self::Remote(RemotePrincipal {
             user_id,
@@ -171,10 +190,11 @@ impl ClientPrincipal {
     /// This is the only constructor that produces an
     /// `RemoteAuthorization::AttemptGrant`, and it never yields `Owner` — the
     /// authorization is exactly the grant's verified ceiling.
+    #[cfg(feature = "remote")]
     pub fn from_attempt_grant(
         user_id: String,
         authorization: AttemptGrantAuthorization,
-        actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+        actor_binding: Option<ClientActorBindingV1>,
     ) -> Self {
         Self::Remote(RemotePrincipal {
             user_id,
@@ -185,6 +205,7 @@ impl ClientPrincipal {
 
     /// The verified attempt-grant authorization, if this principal is an
     /// attempt-grant principal. `None` for `Owner` and legacy relay principals.
+    #[cfg(feature = "remote")]
     pub fn attempt_grant_authorization(&self) -> Option<&AttemptGrantAuthorization> {
         match self {
             Self::Remote(remote) => match &remote.authorization {
@@ -202,6 +223,7 @@ impl ClientPrincipal {
     pub fn tag(&self) -> Option<String> {
         match self {
             Self::Owner => None,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => Some(format!("flycockpit:{}", remote.user_id)),
         }
     }
@@ -209,6 +231,7 @@ impl ClientPrincipal {
     pub fn steer_origin(&self) -> String {
         match self {
             Self::Owner => format!("local:{}", local_principal_name()),
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => format!("flycockpit:{}", remote.user_id),
         }
     }
@@ -233,6 +256,7 @@ impl ClientPrincipal {
     pub fn has_project_scope(&self, scope: PrincipalScope, project_root: &str) -> bool {
         match self {
             Self::Owner => true,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => grants
                     .iter()
@@ -249,6 +273,7 @@ impl ClientPrincipal {
     fn has_scope(&self, scope: PrincipalScope) -> bool {
         match self {
             Self::Owner => true,
+            #[cfg(feature = "remote")]
             Self::Remote(remote) => match &remote.authorization {
                 RemoteAuthorization::LegacyRelayScopes(grants) => {
                     grants.iter().any(|grant| grant.scope == scope)
@@ -309,9 +334,9 @@ fn canonical_if_exists(path: &str) -> PathBuf {
 }
 
 macro_rules! command_request_kind_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => $kind,)+
+            $($(#[$row_attr])* $pattern => $kind,)+
         }
     }};
 }
@@ -342,9 +367,9 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! command_request_ordering_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_request_ordering_value!($ordering),)+
+            $($(#[$row_attr])* $pattern => command_request_ordering_value!($ordering),)+
         }
     }};
 }
@@ -359,32 +384,38 @@ mod tests {
     use super::*;
 
     macro_rules! request_ordering_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            &[$(($kind, command_request_ordering_value!($ordering))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($kind, command_request_ordering_value!($ordering)));)+
+            rows
         }};
     }
 
     macro_rules! request_ordering_row_count_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            0usize $(+ {
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut count = 0usize;
+            $($(#[$row_attr])* {
                 let _ = stringify!($pattern);
-                1usize
+                count += 1;
             })+
+            count
         }};
     }
 
     macro_rules! request_ordering_no_wildcard_check {
-        (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             let classify_without_wildcard: fn(&Request) -> RequestOrdering = |$request| {
                 match $request {
-                    $($pattern => command_request_ordering_value!($ordering),)+
+                    $($(#[$row_attr])* $pattern => command_request_ordering_value!($ordering),)+
                 }
             };
-            let names = &[$($kind),+];
+            let mut names = Vec::new();
+            $($(#[$row_attr])* names.push($kind);)+
             (classify_without_wildcard, names)
         }};
     }
 
+    #[cfg(feature = "remote")]
     fn remote(scope: PrincipalScope, project_root: Option<String>) -> ClientPrincipal {
         ClientPrincipal::from_verified_remote(
             "user-1".to_string(),
@@ -396,6 +427,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn agent_scope_allows_write_and_read_for_matching_project() {
         let principal = remote(PrincipalScope::Agent, Some("/workspace/app".to_string()));
@@ -404,6 +436,7 @@ mod tests {
         assert!(!principal.can_agent_write_project("/workspace/other"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn readonly_scope_allows_read_but_not_write() {
         let principal = remote(
@@ -414,6 +447,7 @@ mod tests {
         assert!(principal.can_agent_read_project("/workspace/app"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn instance_wide_grant_matches_any_project() {
         let principal = remote(PrincipalScope::ProjectFiles, None);
@@ -421,6 +455,7 @@ mod tests {
         assert!(principal.has_project_files("/elsewhere"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn image_generation_admin_scope_grants_no_terminal_agent_or_file_access() {
         // AC1: `ImageGenerationAdmin` must NEVER imply terminal, agent, or
@@ -451,6 +486,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn rootless_image_generation_admin_grant_does_not_wildcard_match() {
         // A directly-constructed `ImageGenerationAdmin` grant with no project
@@ -481,6 +517,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn from_verified_remote_is_the_only_remote_constructor() {
         // After the standalone relay cutover, the legacy

@@ -2458,7 +2458,10 @@ pub(super) mod tests {
             ),
         );
         click_agent_action(&mut dialog, &edit_action);
-        assert!(page(&dialog).editing.is_some(), "pointer Edit opens raw editor");
+        assert!(
+            page(&dialog).editing.is_some(),
+            "pointer Edit opens raw editor"
+        );
 
         let original = fs::read_to_string(agents_dir.join("pointer-agent.md")).unwrap();
         let _ = super::super::tests::render_settings_rows(&dialog, 90, 28);

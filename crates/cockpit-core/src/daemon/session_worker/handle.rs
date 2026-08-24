@@ -1497,15 +1497,6 @@ pub enum UserMessageProbeResult {
     Conflict,
 }
 
-#[derive(Debug, Clone)]
-pub struct RemoteQueueOperation {
-    pub logical_attachment_id: String,
-    pub operation_id: String,
-    pub authenticated_device_id: String,
-    pub authenticated_device_generation: u64,
-    pub request_hash: [u8; 32],
-}
-
 /// FCM2 admission evidence for a text-only oversized user submission. The
 /// worker validates these opaque bytes against the queued `UserSubmission`,
 /// then asks the DB to create the receipt triple and quota lease atomically
@@ -1536,35 +1527,6 @@ pub struct OversizedRunInvocationAdmission {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemoteQueueMutationReceiptV1 {
-    pub schema_version: u8,
-    pub applied: bool,
-    pub reason: proto::RemoveQueuedUserMessageReason,
-    pub removed_count: u32,
-}
-
-impl RemoteQueueMutationReceiptV1 {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.schema_version == 1, "unsupported queue receipt schema");
-        anyhow::ensure!(
-            self.removed_count <= 10_000,
-            "queue receipt removed_count exceeds bound"
-        );
-        let removed = matches!(self.reason, proto::RemoveQueuedUserMessageReason::Removed);
-        anyhow::ensure!(
-            self.applied == removed,
-            "queue receipt applied/reason mismatch"
-        );
-        anyhow::ensure!(
-            removed == (self.removed_count > 0),
-            "queue receipt count mismatch"
-        );
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub enum SessionWork {
     WakeGoal,
@@ -1583,7 +1545,8 @@ pub enum SessionWork {
         /// the submission, so a replayed operation is a durable no-op rather
         /// than a second accept. Owner/local sends pass `None` and take the
         /// unchanged in-memory accept path.
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         /// Present only for text-only sources above 64KiB. Unlike the legacy
         /// in-memory acceptance path, this branch has a durable FCM2 receipt
         /// and exact artifact lease before it reaches the driver.
@@ -1607,21 +1570,24 @@ pub enum SessionWork {
     },
     RemoveQueuedUserMessage {
         queue_item_id: Uuid,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveNewestQueuedUserMessage {
         target_id: Option<String>,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveEditableQueuedUserMessages {
         target_id: Option<String>,
-        remote_operation: Option<RemoteQueueOperation>,
+        #[cfg(feature = "remote")]
+        remote_operation: Option<super::RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
         >,

@@ -619,7 +619,7 @@ mod tests {
     impl ImageSpendPersistence for FilePersistence {
         fn load(&self, project_key: String) -> LoadResult {
             let store =
-                cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&self.path)
+                cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&self.path)
                     .map_err(|error| error.to_string())?;
             image_spend_runtime()?
                 .block_on(store.current(project_key))
@@ -639,7 +639,7 @@ mod tests {
             expected_version: Option<u64>,
         ) -> Result<LoadedImageSpendPolicy, String> {
             let store =
-                cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&self.path)
+                cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&self.path)
                     .map_err(|error| error.to_string())?;
             image_spend_runtime()?
                 .block_on(store.activate(project_key, settings, expected_version, self.saved_at_ms))
@@ -844,7 +844,7 @@ mod tests {
         reopened.save();
         assert!(reopened.save.lock().unwrap().is_none());
         let store =
-            cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&path).unwrap();
+            cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&path).unwrap();
         let persisted = image_spend_runtime()
             .unwrap()
             .block_on(store.current("project".into()))

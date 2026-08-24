@@ -4710,7 +4710,7 @@ mod tests {
             config_generation: 6,
             refresh_epoch: 3,
             connected_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
-            location_class: AddressClass::PublicRemote,
+            location_class: AddressClass::PublicNetwork,
             hops_digest: "a".repeat(64),
         }
     }
@@ -4826,7 +4826,7 @@ mod tests {
             connection: Some(ConnectionProof {
                 authority: "example.test".into(),
                 connected_ip: "203.0.113.10".parse().unwrap(),
-                location: AddressClass::PublicRemote,
+                location: AddressClass::PublicNetwork,
                 established_at: 0,
                 hops: vec![],
             }),

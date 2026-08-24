@@ -69,12 +69,14 @@ pub mod ask;
 pub mod assistant;
 pub mod bash_hints;
 pub mod config;
+#[cfg(feature = "remote")]
 pub mod connect;
 pub mod daemon;
 pub mod debug;
 pub mod doctor;
 pub mod export;
 pub mod fetch_models;
+#[cfg(feature = "remote")]
 pub mod flycockpit;
 pub mod import;
 pub mod init;
@@ -92,6 +94,7 @@ pub mod session;
 pub mod setup;
 pub mod skill;
 pub mod stats;
+#[cfg(feature = "remote")]
 pub mod sync;
 pub mod trust;
 pub mod tui;

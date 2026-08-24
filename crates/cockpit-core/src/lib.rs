@@ -71,7 +71,9 @@ pub mod process_containment;
 mod production_path_ratchet;
 pub mod providers;
 pub mod redact;
+#[cfg(feature = "remote")]
 pub mod remote_daemon_identity_custody;
+#[cfg(feature = "remote")]
 pub mod remote_webrtc_endpoint;
 pub mod sealed;
 pub mod secret_command;

@@ -858,21 +858,49 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
 pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    #[cfg(windows)]
+    for member in collect_subtree(conn, session_id)? {
+        let sidecars: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_delegation_payloads
+              WHERE parent_session_id=?1 AND sidecar_path IS NOT NULL",
+            [member.to_string()],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            sidecars == 0,
+            "session deletion with delegation sidecars is unavailable on Windows until durable reparse-safe cleanup is supported"
+        );
+    }
     // Media metadata may cascade only after owned bytes have independently
     // reached a deletion-evidenced terminal. Starting cleanup is owned by the
     // media storage orchestrator; this DB boundary is the final fail-closed
     // guard for every current and future session-deletion caller.
-    let unsafe_media: i64 = conn
-        .query_row(
-            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION ALL SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )
-        .context("checking session media deletion barrier")?;
+    let mut unsafe_media = 0_i64;
+    for member in collect_subtree(conn, session_id)? {
+        unsafe_media += conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_attachments a
+                  WHERE a.session_id=?1 AND (
+                    a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted')
+                    OR EXISTS(SELECT 1 FROM media_attachment_components c
+                               WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted'))",
+                [member.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("checking session media deletion barrier")?;
+    }
     anyhow::ensure!(
         unsafe_media == 0,
         "session media cleanup must complete before session deletion"
     );
+    // Capture every delegation sidecar path before the session cascade removes
+    // its owning payload row. Keeping this at the universal delete boundary
+    // covers local, remote-ledgered, retention, and recovery callers alike.
+    Db::enqueue_delegation_sidecar_cleanup_conn(
+        conn,
+        session_id,
+        crate::db::session_log::now_ms().max(0),
+    )?;
     // The delete cascades to descendant forks and `/btw` rows, so every member
     // of the cascade set needs a tombstone — not just the requested root. A
     // descendant deleted without one loses the owner-visible marker for its
@@ -1226,8 +1254,13 @@ impl Db {
         // each statement autocommits separately — a failure between them would
         // leave a tombstone for a session that still exists, or a deleted
         // session with no owner-visible marker for its unresolved operations.
-        self.transaction(move |conn| Self::end_btw_fork_conn(conn, parent_session_id))
-            .await
+        let removed = self
+            .transaction(move |conn| Self::end_btw_fork_conn(conn, parent_session_id))
+            .await?;
+        if removed && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, %parent_session_id, "btw sidecar cleanup remains durably pending");
+        }
+        Ok(removed)
     }
 
     /// End-`/btw` body without an owning transaction. The caller supplies a
@@ -1521,6 +1554,23 @@ impl Db {
         Ok(())
     }
 
+    /// Transaction-composable rename which reports whether the authoritative
+    /// root row still existed at the instant of mutation.
+    pub fn rename_existing_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        title: &str,
+    ) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET title = ?1, user_renamed = 1, title_recovery_nudge_state = 0
+                 WHERE session_id = ?2",
+                params![title, session_id.to_string()],
+            )
+            .context("renaming existing session")?;
+        Ok(affected == 1)
+    }
+
     pub async fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
         self.write(move |conn| Self::rename_session_conn(conn, session_id, &title))
@@ -1772,15 +1822,91 @@ impl Db {
     }
 
     /// Delete a session and its complete fork subtree. SQLite owns the
-    /// cascading relationship; the pre-delete walk only discovers sidecar
-    /// files that must be removed after the transaction commits.
+    /// cascading relationship; durable cleanup intents retain sidecar
+    /// identities across the commit and are reconciled afterward.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<()> {
-        let sidecars = self.session_delegation_sidecar_paths(session_id).await?;
-        // One transaction so the tombstone and the deletion commit together.
         self.transaction(move |conn| delete_session_conn(conn, session_id))
             .await?;
-        Self::remove_delegation_sidecars(sidecars)?;
+        if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+            tracing::warn!(%error, %session_id, "session sidecar cleanup remains durably pending");
+        }
         Ok(())
+    }
+
+    /// Persist sidecar cleanup identities in the same transaction which will
+    /// cascade their source payload rows.
+    pub fn enqueue_delegation_sidecar_cleanup_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            now_unix_ms >= 0,
+            "cleanup intent timestamp must be nonnegative"
+        );
+        for member in collect_subtree(conn, session_id)? {
+            conn.execute(
+                "INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)
+                 SELECT sidecar_path,parent_session_id,?2 FROM task_delegation_payloads
+                  WHERE parent_session_id=?1 AND sidecar_path IS NOT NULL",
+                params![member.to_string(), now_unix_ms],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Replay durable filesystem cleanup. The intent is removed only after a
+    /// successful unlink (or proof the file is already absent).
+    pub async fn reconcile_delegation_sidecar_cleanup_intents(&self) -> Result<usize> {
+        let rows = self
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT sidecar_path FROM task_delegation_sidecar_cleanup_intents ORDER BY created_at_unix_ms,sidecar_path",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        let base = self.delegation_payload_base_dir()?;
+        let mut completed = 0;
+        for relative in rows {
+            let cleanup_base = base.clone();
+            let cleanup_relative = relative.clone();
+            let removed = self
+                .transaction(move |conn| {
+                    // This read and the intent deletion share the writer
+                    // transaction. A payload insertion cannot race between
+                    // the reference proof and unlink. Non-reusable sidecar
+                    // generations also cover the prepare-before-insert gap.
+                    let referenced: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_delegation_payloads WHERE sidecar_path=?1)",
+                        [&cleanup_relative],
+                        |row| row.get(0),
+                    )?;
+                    if referenced {
+                        return Ok(false);
+                    }
+                    crate::db::files::delete_relative_file_durable_nofollow(
+                        &cleanup_base,
+                        std::path::Path::new(&cleanup_relative),
+                    )?;
+                    Ok(conn.execute(
+                        "DELETE FROM task_delegation_sidecar_cleanup_intents WHERE sidecar_path=?1",
+                        [cleanup_relative],
+                    )? == 1)
+                })
+                .await;
+            let removed = match removed {
+                Ok(removed) => removed,
+                Err(error) => {
+                    tracing::warn!(%error, sidecar_path=%relative, "delegation sidecar cleanup remains pending");
+                    continue;
+                }
+            };
+            completed += usize::from(removed);
+        }
+        Ok(completed)
     }
 
     /// Absolute sidecar payload paths owned by `session_id` and its fork
@@ -1823,10 +1949,21 @@ impl Db {
 
     /// Connection-direct session deletion for the transactional
     /// remote-operation ledger writer (already inside a transaction). Writes
-    /// the external tombstone and deletes the row + fork subtree. Sidecar file
-    /// removal is the caller's post-commit responsibility.
+    /// the external tombstone, captures durable sidecar cleanup intents, and
+    /// deletes the row + fork subtree. Intent reconciliation remains the
+    /// caller's post-commit responsibility.
     pub fn delete_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         delete_session_conn(conn, session_id)
+    }
+
+    /// Transaction-composable deletion which refuses to treat a concurrently
+    /// removed root as a successful remote mutation.
+    pub fn delete_existing_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
+        if get_session_inner(conn, session_id)?.is_none() {
+            return Ok(false);
+        }
+        delete_session_conn(conn, session_id)?;
+        Ok(true)
     }
 
     /// Discard a single ephemeral side-conversation session (`/side`),
@@ -1837,8 +1974,15 @@ impl Db {
     pub async fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
         // `transaction` so the guard read, the tombstone, and the deletion are
         // one atomic step.
-        self.transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
-            .await
+        let removed = self
+            .transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
+            .await?;
+        if removed {
+            if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
+                tracing::warn!(%error, %session_id, "discarded-session sidecar cleanup remains durably pending");
+            }
+        }
+        Ok(removed)
     }
 
     /// Discard-ephemeral body without an owning transaction. The caller
@@ -1982,6 +2126,34 @@ impl Db {
         Ok(())
     }
 
+    /// Transaction-composable archive which validates the root in the same
+    /// transaction as the subtree update.
+    pub fn archive_existing_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        cascade: bool,
+        now: i64,
+    ) -> Result<bool> {
+        let targets = if cascade {
+            collect_subtree(conn, session_id)?
+        } else if get_session_inner(conn, session_id)?.is_some() {
+            vec![session_id]
+        } else {
+            Vec::new()
+        };
+        if targets.is_empty() {
+            return Ok(false);
+        }
+        for id in targets {
+            conn.execute(
+                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
+                params![now, id.to_string()],
+            )
+            .context("archiving existing session")?;
+        }
+        Ok(true)
+    }
+
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
     pub async fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
@@ -1996,6 +2168,17 @@ impl Db {
         )
         .context("unarchiving session")?;
         Ok(())
+    }
+
+    /// Transaction-composable unarchive which reports concurrent removal.
+    pub fn unarchive_existing_session_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+                [session_id.to_string()],
+            )
+            .context("unarchiving existing session")?;
+        Ok(affected == 1)
     }
 
     /// Count the descendant forks of a session (depth-unbounded, not
@@ -2019,35 +2202,8 @@ impl Db {
     /// against cyclic/dangling parents. Used by the daemon to decide
     /// which live workers to interrupt before a cascading archive/delete.
     pub async fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
-        if root == node {
-            return Ok(true);
-        }
-        self.read(move |conn| {
-            let mut cur = node;
-            // Bound the walk so a corrupted parent cycle can't spin.
-            for _ in 0..10_000 {
-                let parent: Option<String> = match conn.query_row(
-                    "SELECT parent_session_id FROM sessions WHERE session_id = ?1",
-                    [cur.to_string()],
-                    |row| row.get(0),
-                ) {
-                    Ok(p) => p,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
-                    Err(e) => return Err(anyhow::Error::from(e)).context("is_in_subtree walk"),
-                };
-                let Some(parent) = parent else {
-                    return Ok(false);
-                };
-                let parent =
-                    parse_uuid(&parent).map_err(|e| anyhow::anyhow!("decoding parent id: {e}"))?;
-                if parent == root {
-                    return Ok(true);
-                }
-                cur = parent;
-            }
-            Ok(false)
-        })
-        .await
+        self.read(move |conn| Ok(collect_subtree(conn, root)?.contains(&node)))
+            .await
     }
 
     /// Move `last_active_at` to now. Called by the daemon on every
@@ -2626,7 +2782,7 @@ fn summary_pin_count_or_zero(session_id: Uuid, result: Result<i64>) -> u32 {
 /// an unknown id yields an empty set. Echoing it would report a delete set for
 /// a session that does not exist, and `delete_session_conn` would write a
 /// tombstone for a row whose deletion cascades nothing.
-fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
+pub fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
     let mut stmt = conn
         .prepare(
             "WITH RECURSIVE cascade(session_id) AS (
@@ -3250,7 +3406,10 @@ mod tests {
     async fn backdate_session(db: &Db, session_id: Uuid, seconds: i64) {
         db.write(move |conn| {
             conn.execute(
-                "UPDATE sessions SET last_active_at = last_active_at - ?1 WHERE session_id = ?2",
+                "UPDATE sessions
+                    SET started_at = started_at - ?1,
+                        last_active_at = last_active_at - ?1
+                  WHERE session_id = ?2",
                 params![seconds, session_id.to_string()],
             )
             .context("backdating session")?;
@@ -4267,6 +4426,20 @@ mod tests {
         let root = db.create_session("p", "/x", "a").await.unwrap();
         let child = db.create_fork(root.session_id, None).await.unwrap();
         let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+        let btw_only = db.create_session("p", "/x", "a").await.unwrap();
+        db.write({
+            let root = root.session_id;
+            let btw_only = btw_only.session_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id=NULL,btw_parent_session_id=?2 WHERE session_id=?1",
+                    params![btw_only.to_string(), root.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
         let other = db.create_session("p", "/x", "a").await.unwrap();
         assert!(
             db.is_in_subtree(root.session_id, root.session_id)
@@ -4282,6 +4455,12 @@ mod tests {
             db.is_in_subtree(root.session_id, grandchild.session_id)
                 .await
                 .unwrap()
+        );
+        assert!(
+            db.is_in_subtree(root.session_id, btw_only.session_id)
+                .await
+                .unwrap(),
+            "the shared subtree walker follows the BTW cascade edge"
         );
         assert!(
             !db.is_in_subtree(root.session_id, other.session_id)

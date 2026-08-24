@@ -74,6 +74,8 @@ pub enum ReserveRemoteOperationOutcome {
 /// fresh operation still falls through to the resolve-then-reserve path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTransactionalReplayLookup {
+    /// No durable reservation exists for this identity.
+    Absent,
     /// The operation identity is already committed with a matching actor/hash;
     /// carries the cached safe response.
     CommittedReplay(Vec<u8>),
@@ -81,9 +83,10 @@ pub enum RemoteTransactionalReplayLookup {
     OperationConflict,
     /// Same operation id, different authenticated actor — a conflict.
     OperationActorConflict,
-    /// No committed match: no row, or a still-in-flight (non-committed) row.
-    /// The caller must resolve target state and reserve as a fresh operation.
-    NotCommitted,
+    /// An exact reservation exists but did not reach a committed terminal
+    /// outcome. It must never be treated as a fresh operation: after a crash
+    /// the daemon cannot prove whether a pre-commit external effect occurred.
+    ExistingIndeterminate,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +124,21 @@ pub enum TransactionalRemoteOperationOutcome<T> {
     Replay(Vec<u8>),
     OperationConflict,
     OperationActorConflict,
+    ExistingIndeterminate,
     AttachmentLedgerCapacity,
+    AttachmentOutboxCapacity,
+}
+
+/// Internal transaction-abort marker. Capacity is a typed protocol outcome,
+/// but it must travel through the writer as an error so `Db::transaction`
+/// rolls back the domain mutation and reservation before the public outcome is
+/// reconstructed outside the transaction boundary.
+#[derive(Debug, thiserror::Error)]
+enum RemoteOperationCapacityAbort {
+    #[error("remote attachment operation ledger capacity reached")]
+    Ledger,
+    #[error("remote attachment outbox capacity reached")]
+    Outbox,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +163,7 @@ pub enum BeginIdempotentAdapterRemoteOperationOutcome {
     Replay(Vec<u8>),
     OperationConflict,
     OperationActorConflict,
+    ExistingIndeterminate,
     AttachmentLedgerCapacity,
 }
 
@@ -178,68 +196,7 @@ pub enum PrepareRemoteRenameOutcome {
     AttachmentLedgerCapacity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RemoteFilesystemIdentityV1 {
-    pub filesystem_id: u64,
-    pub object_id: u128,
-    pub kind: u8,
-    pub len: u64,
-    pub mode: u32,
-    pub owner_id: u64,
-    pub link_count: u64,
-}
-
-impl RemoteFilesystemIdentityV1 {
-    pub const ENCODED_LEN: usize = 57;
-    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN]> {
-        self.validate()?;
-        let mut out = [0; Self::ENCODED_LEN];
-        out[..4].copy_from_slice(b"RFI1");
-        out[4..12].copy_from_slice(&self.filesystem_id.to_be_bytes());
-        out[12..28].copy_from_slice(&self.object_id.to_be_bytes());
-        out[28] = self.kind;
-        out[29..37].copy_from_slice(&self.len.to_be_bytes());
-        out[37..41].copy_from_slice(&self.mode.to_be_bytes());
-        out[41..49].copy_from_slice(&self.owner_id.to_be_bytes());
-        out[49..57].copy_from_slice(&self.link_count.to_be_bytes());
-        Ok(out)
-    }
-    fn validate(self) -> Result<()> {
-        ensure!(
-            matches!(self.kind, 1 | 2),
-            "invalid remote filesystem identity kind"
-        );
-        ensure!(
-            self.link_count > 0,
-            "remote filesystem identity has no links"
-        );
-        let mode_kind = self.mode & 0o170000;
-        ensure!(
-            (self.kind == 1 && mode_kind == 0o100000) || (self.kind == 2 && mode_kind == 0o040000),
-            "remote filesystem identity kind and mode disagree"
-        );
-        Ok(())
-    }
-    pub fn decode(value: &[u8]) -> Result<Self> {
-        ensure!(
-            value.len() == Self::ENCODED_LEN && &value[..4] == b"RFI1",
-            "invalid remote filesystem identity codec"
-        );
-        let array =
-            |range: std::ops::Range<usize>| -> Result<[u8; 8]> { Ok(value[range].try_into()?) };
-        let decoded = Self {
-            filesystem_id: u64::from_be_bytes(array(4..12)?),
-            object_id: u128::from_be_bytes(value[12..28].try_into()?),
-            kind: value[28],
-            len: u64::from_be_bytes(array(29..37)?),
-            mode: u32::from_be_bytes(value[37..41].try_into()?),
-            owner_id: u64::from_be_bytes(array(41..49)?),
-            link_count: u64::from_be_bytes(array(49..57)?),
-        };
-        decoded.validate()?;
-        Ok(decoded)
-    }
-}
+pub use crate::db::filesystem_identity::FilesystemIdentityV1 as RemoteFilesystemIdentityV1;
 
 pub struct TransactionalRemoteMutation<T> {
     pub value: T,
@@ -517,11 +474,22 @@ impl Db {
     pub async fn begin_idempotent_adapter_remote_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
+        daemon_incarnation_id: Uuid,
+        lease_duration_ms: i64,
     ) -> Result<BeginIdempotentAdapterRemoteOperationOutcome> {
         ensure!(
             request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
             "adapter dispatcher requires idempotent_adapter_mutation class"
         );
+        ensure!(
+            lease_duration_ms > 0,
+            "adapter lease duration must be positive"
+        );
+        let lease_owner = daemon_incarnation_id.hyphenated().to_string();
+        let lease_expires_at_ms = request
+            .now_ms
+            .checked_add(lease_duration_ms)
+            .context("adapter lease expiry overflow")?;
         let owned = OwnedReserveRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.to_owned(),
             operation_id: request.operation_id.to_owned(),
@@ -535,11 +503,15 @@ impl Db {
             ReserveRemoteOperationOutcome::Reserved(reservation) => {
                 conn.execute(
                     "UPDATE remote_attachment_operations
-                     SET state='dispatched', dispatch_generation=1, updated_at_ms=?3
+                     SET state='dispatched', dispatch_generation=1,
+                         dispatch_lease_owner=?3, dispatch_lease_expires_at_ms=?4,
+                         updated_at_ms=?5
                      WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",
                     params![
                         owned.logical_attachment_id,
                         owned.operation_id,
+                        lease_owner,
+                        lease_expires_at_ms,
                         owned.now_ms
                     ],
                 )?;
@@ -556,24 +528,39 @@ impl Db {
                 ))
             }
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
-                let generation: i64 = conn.query_row(
-                    "UPDATE remote_attachment_operations
-                     SET dispatch_generation=dispatch_generation+1, updated_at_ms=?3
-                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='dispatched'
-                     RETURNING dispatch_generation",
-                    params![
-                        owned.logical_attachment_id,
-                        owned.operation_id,
-                        owned.now_ms
-                    ],
-                    |row| row.get(0),
-                )?;
-                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
-                    operation_seq: replay.operation_seq,
-                    dispatch_generation: generation.try_into()?,
-                })
+                let reclaimed = conn
+                    .query_row(
+                        "UPDATE remote_attachment_operations
+                     SET dispatch_generation=dispatch_generation+1,
+                         dispatch_lease_owner=?3, dispatch_lease_expires_at_ms=?4,
+                         updated_at_ms=?5
+                     WHERE logical_attachment_id=?1 AND operation_id=?2
+                       AND state='dispatched' AND operation_class='idempotent_adapter_mutation'
+                       AND dispatch_lease_expires_at_ms <= ?5
+                     RETURNING operation_seq,dispatch_generation",
+                        params![
+                            owned.logical_attachment_id,
+                            owned.operation_id,
+                            lease_owner,
+                            lease_expires_at_ms,
+                            owned.now_ms
+                        ],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                match reclaimed {
+                    Some((operation_seq, dispatch_generation)) => {
+                        Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                            operation_seq: operation_seq.try_into()?,
+                            dispatch_generation: dispatch_generation.try_into()?,
+                        })
+                    }
+                    None => Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate),
+                }
             }
-            ReserveRemoteOperationOutcome::Replay(_) => bail!("invalid adapter replay state"),
+            ReserveRemoteOperationOutcome::Replay(_) => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate)
+            }
             ReserveRemoteOperationOutcome::OperationConflict => {
                 Ok(BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict)
             }
@@ -982,63 +969,82 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
-            ReserveRemoteOperationOutcome::Reserved(_) => {
-                let result = mutation(conn)?;
-                let delivery_id = Uuid::now_v7().to_string();
-                let committed = commit_conn(
-                    conn,
-                    &OwnedCommitRemoteOperation {
-                        logical_attachment_id: owned.logical_attachment_id.clone(),
-                        operation_id: owned.operation_id.clone(),
-                        safe_response: result.safe_response,
-                        outbox_delivery_id: delivery_id,
-                        outbox_kind: result.outbox_kind,
-                        outbox_payload: result.outbox_payload,
-                        now_ms: owned.now_ms,
-                    },
-                )?;
-                match committed {
-                    CommitRemoteOperationOutcome::Committed { .. } => {
-                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
-                    }
-                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        bail!("transactional remote operation ledger capacity")
-                    }
-                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        bail!("transactional remote operation outbox capacity")
+        let outcome = self
+            .transaction(move |conn| match reserve_conn(conn, &owned)? {
+                ReserveRemoteOperationOutcome::Reserved(_) => {
+                    let result = mutation(conn)?;
+                    let delivery_id = Uuid::now_v7().to_string();
+                    let committed = commit_conn(
+                        conn,
+                        &OwnedCommitRemoteOperation {
+                            logical_attachment_id: owned.logical_attachment_id.clone(),
+                            operation_id: owned.operation_id.clone(),
+                            safe_response: result.safe_response,
+                            outbox_delivery_id: delivery_id,
+                            outbox_kind: result.outbox_kind,
+                            outbox_payload: result.outbox_payload,
+                            now_ms: owned.now_ms,
+                        },
+                    )?;
+                    match committed {
+                        CommitRemoteOperationOutcome::Committed { .. } => {
+                            Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                        }
+                        CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                            Err(RemoteOperationCapacityAbort::Ledger.into())
+                        }
+                        CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                            Err(RemoteOperationCapacityAbort::Outbox.into())
+                        }
                     }
                 }
-            }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
-                Ok(TransactionalRemoteOperationOutcome::Replay(
-                    replay
-                        .safe_response
-                        .context("committed operation missing safe response")?,
-                ))
-            }
-            ReserveRemoteOperationOutcome::Replay(_) => {
-                bail!("transactional remote operation is indeterminate")
-            }
-            ReserveRemoteOperationOutcome::OperationConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
-            }
-            ReserveRemoteOperationOutcome::OperationActorConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
-            }
-            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                    Ok(TransactionalRemoteOperationOutcome::Replay(
+                        replay
+                            .safe_response
+                            .context("committed operation missing safe response")?,
+                    ))
+                }
+                ReserveRemoteOperationOutcome::Replay(_) => {
+                    Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
+                }
+                ReserveRemoteOperationOutcome::OperationConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+                }
+                ReserveRemoteOperationOutcome::OperationActorConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+                }
+                ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                    Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                }
+            })
+            .await;
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-        })
-        .await
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read-only lookup of a transactional operation identity (no reserve, no
     /// commit). Returns `CommittedReplay` only for an exact match (same actor,
     /// same request hash, `transactional_mutation` class) that has already
-    /// committed; a mismatched actor/hash is a conflict; anything else is
-    /// `NotCommitted`. Used to short-circuit an exact replay of a destructive
-    /// request without re-resolving (now-absent) target state.
+    /// committed; a mismatched actor/hash is a conflict. An absent row is
+    /// distinct from an existing nonterminal row so restart recovery can fail
+    /// closed instead of redispatching an effect with an unknown outcome.
     pub async fn lookup_committed_transactional_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
@@ -1083,7 +1089,7 @@ impl Db {
                 .optional()
                 .context("looking up committed remote operation")?;
             let Some((device_id, generation, hash, class, state, response)) = existing else {
-                return Ok(RemoteTransactionalReplayLookup::NotCommitted);
+                return Ok(RemoteTransactionalReplayLookup::Absent);
             };
             if device_id != authenticated_device_id || generation != actor_generation {
                 return Ok(RemoteTransactionalReplayLookup::OperationActorConflict);
@@ -1095,7 +1101,7 @@ impl Db {
                 let bytes = response.context("committed operation missing safe response")?;
                 Ok(RemoteTransactionalReplayLookup::CommittedReplay(bytes))
             } else {
-                Ok(RemoteTransactionalReplayLookup::NotCommitted)
+                Ok(RemoteTransactionalReplayLookup::ExistingIndeterminate)
             }
         })
         .await
@@ -1143,52 +1149,73 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
-            ReserveRemoteOperationOutcome::Reserved(_) => {
-                let result = mutation(conn)?;
-                let delivery_id = Uuid::now_v7().to_string();
-                match commit_conn(
-                    conn,
-                    &OwnedCommitRemoteOperation {
-                        logical_attachment_id: owned.logical_attachment_id.clone(),
-                        operation_id: owned.operation_id.clone(),
-                        safe_response: result.safe_response,
-                        outbox_delivery_id: delivery_id,
-                        outbox_kind: result.outbox_kind,
-                        outbox_payload: result.outbox_payload,
-                        now_ms: owned.now_ms,
-                    },
-                )? {
-                    CommitRemoteOperationOutcome::Committed { .. } => {
-                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
-                    }
-                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        bail!("adapter operation ledger capacity")
-                    }
-                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        bail!("adapter operation outbox capacity")
+        let outcome = self
+            .transaction(move |conn| match reserve_conn(conn, &owned)? {
+                ReserveRemoteOperationOutcome::Reserved(_) => {
+                    let result = mutation(conn)?;
+                    let delivery_id = Uuid::now_v7().to_string();
+                    match commit_conn(
+                        conn,
+                        &OwnedCommitRemoteOperation {
+                            logical_attachment_id: owned.logical_attachment_id.clone(),
+                            operation_id: owned.operation_id.clone(),
+                            safe_response: result.safe_response,
+                            outbox_delivery_id: delivery_id,
+                            outbox_kind: result.outbox_kind,
+                            outbox_payload: result.outbox_payload,
+                            now_ms: owned.now_ms,
+                        },
+                    )? {
+                        CommitRemoteOperationOutcome::Committed { .. } => {
+                            Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                        }
+                        CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                            Err(RemoteOperationCapacityAbort::Ledger.into())
+                        }
+                        CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                            Err(RemoteOperationCapacityAbort::Outbox.into())
+                        }
                     }
                 }
-            }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
-                Ok(TransactionalRemoteOperationOutcome::Replay(
-                    replay
-                        .safe_response
-                        .context("committed adapter operation missing safe response")?,
-                ))
-            }
-            ReserveRemoteOperationOutcome::Replay(_) => bail!("adapter operation is indeterminate"),
-            ReserveRemoteOperationOutcome::OperationConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
-            }
-            ReserveRemoteOperationOutcome::OperationActorConflict => {
-                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
-            }
-            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                    Ok(TransactionalRemoteOperationOutcome::Replay(
+                        replay
+                            .safe_response
+                            .context("committed adapter operation missing safe response")?,
+                    ))
+                }
+                ReserveRemoteOperationOutcome::Replay(_) => {
+                    Ok(TransactionalRemoteOperationOutcome::ExistingIndeterminate)
+                }
+                ReserveRemoteOperationOutcome::OperationConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+                }
+                ReserveRemoteOperationOutcome::OperationActorConflict => {
+                    Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+                }
+                ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                    Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                }
+            })
+            .await;
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-        })
-        .await
+            Err(error)
+                if error
+                    .downcast_ref::<RemoteOperationCapacityAbort>()
+                    .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Atomically commits a bounded safe outcome and its authoritative outbox
@@ -1208,6 +1235,56 @@ impl Db {
         };
         self.transaction(move |conn| commit_conn(conn, &owned))
             .await
+    }
+
+    /// Commits an idempotent adapter result only for the generation leased by
+    /// the caller. A superseded daemon incarnation can never publish a stale
+    /// terminal response or append an outbox event.
+    pub async fn commit_idempotent_adapter_remote_operation(
+        &self,
+        request: CommitRemoteOperation<'_>,
+        expected_dispatch_owner: Uuid,
+        expected_dispatch_generation: u64,
+    ) -> Result<CommitRemoteOperationOutcome> {
+        ensure!(
+            expected_dispatch_generation > 0,
+            "adapter generation must be positive"
+        );
+        let owned = OwnedCommitRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            safe_response: request.safe_response.to_vec(),
+            outbox_delivery_id: request.outbox_delivery_id.to_owned(),
+            outbox_kind: request.outbox_kind.to_owned(),
+            outbox_payload: request.outbox_payload.to_vec(),
+            now_ms: request.now_ms,
+        };
+        let generation = i64::try_from(expected_dispatch_generation)?;
+        let owner = expected_dispatch_owner.hyphenated().to_string();
+        self.transaction(move |conn| {
+            let owns_generation: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND operation_id=?2
+                   AND operation_class='idempotent_adapter_mutation'
+                   AND operation_kind='generic' AND state='dispatched'
+                   AND dispatch_generation=?3 AND dispatch_lease_owner=?4
+                   AND dispatch_lease_expires_at_ms>?5)",
+                params![
+                    owned.logical_attachment_id,
+                    owned.operation_id,
+                    generation,
+                    owner,
+                    owned.now_ms
+                ],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                owns_generation,
+                "adapter commit lost live dispatch owner/generation authority"
+            );
+            commit_conn_with_policy(conn, &owned, false)
+        })
+        .await
     }
 
     /// Commits a staged rename only after its exact dispatch generation has
@@ -1514,6 +1591,7 @@ fn commit_conn_with_policy(
     conn.execute(
         "UPDATE remote_attachment_operations
          SET state = 'committed', safe_response = ?3, event_high_water_mark = ?4,
+             dispatch_lease_owner = NULL, dispatch_lease_expires_at_ms = NULL,
              updated_at_ms = ?5
          WHERE logical_attachment_id = ?1 AND operation_id = ?2 AND state IN ('reserved','dispatched')",
         params![
@@ -1565,7 +1643,7 @@ fn reservation(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
 
@@ -1874,6 +1952,40 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_nonterminal_transaction_is_not_fresh_after_reopen_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000019";
+        let request = reserve(operation, [9; 32]);
+        assert!(matches!(
+            db.lookup_committed_transactional_operation(request.clone())
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::Absent
+        ));
+        assert!(matches!(
+            db.reserve_remote_attachment_operation(request.clone())
+                .await
+                .unwrap(),
+            ReserveRemoteOperationOutcome::Reserved(_)
+        ));
+        assert!(matches!(
+            db.lookup_committed_transactional_operation(request.clone())
+                .await
+                .unwrap(),
+            RemoteTransactionalReplayLookup::ExistingIndeterminate
+        ));
+
+        let mut conflicting = reserve(operation, [10; 32]);
+        conflicting.operation_class = RemoteOperationClass::IdempotentAdapterMutation;
+        assert!(matches!(
+            db.reserve_remote_attachment_operation(conflicting)
+                .await
+                .unwrap(),
+            ReserveRemoteOperationOutcome::OperationConflict
+        ));
     }
 
     #[test]
@@ -2571,15 +2683,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_dispatch_generation_advances_for_reconciliation_then_replays_commit() {
+    async fn adapter_dispatch_lease_rejects_live_duplicate_and_fences_stale_commit() {
         let db = Db::open_in_memory().unwrap();
         let operation = "01890f3e-4c00-7000-8000-00000000009d";
-        let request = || ReserveRemoteOperation {
+        let first_incarnation = Uuid::parse_str("00000000-0000-4000-8000-000000000111").unwrap();
+        let second_incarnation = Uuid::parse_str("00000000-0000-4000-8000-000000000112").unwrap();
+        let request = |now_ms| ReserveRemoteOperation {
             operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            now_ms,
             ..reserve(operation, [11; 32])
         };
         assert!(matches!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(10), first_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
@@ -2587,8 +2702,14 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            db.begin_idempotent_adapter_remote_operation(request(11), first_incarnation, 100)
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate
+        );
         assert!(matches!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(110), second_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
@@ -2596,19 +2717,60 @@ mod tests {
                 ..
             }
         ));
-        db.commit_remote_attachment_operation(CommitRemoteOperation {
+        let commit = |now_ms| CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,
             operation_id: operation,
             safe_response: b"adapter-safe",
             outbox_delivery_id: "00000000-0000-4000-8000-00000000009e",
             outbox_kind: "adapter_test",
             outbox_payload: b"adapter-event",
-            now_ms: 12,
-        })
-        .await
-        .unwrap();
+            now_ms,
+        };
+        // A generation alone is not authority: the exact daemon incarnation
+        // that owns the live lease must present it.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(commit(111), first_incarnation, 2)
+                .await
+                .is_err()
+        );
+        // Lease validity is a strict interval. At the expiry boundary the
+        // unreclaimed owner may no longer publish a response or outbox row.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(commit(210), second_incarnation, 2)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            db.begin_idempotent_adapter_remote_operation(request(210), first_incarnation, 100)
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 3,
+                ..
+            }
+        ));
+        // Reclaiming permanently fences the former owner and generation.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(commit(211), second_incarnation, 2)
+                .await
+                .is_err()
+        );
+        let outbox_before_commit = db
+            .read(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM remote_attachment_outbox", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbox_before_commit, 0, "rejected commits must not publish");
+        db.commit_idempotent_adapter_remote_operation(commit(211), first_incarnation, 3)
+            .await
+            .unwrap();
         assert_eq!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(112), second_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Replay(b"adapter-safe".to_vec())

@@ -1288,5 +1288,5 @@ pub fn construct_principal_from_grant(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod tests;

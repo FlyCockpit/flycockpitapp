@@ -1,3 +1,5 @@
+#![cfg(feature = "remote")]
+
 //! Customer-operated tenant-authority reference service.
 //!
 //! Standalone Rust service implementing the eleven closed canonical tenant-

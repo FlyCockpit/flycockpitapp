@@ -41,10 +41,12 @@ pub mod agent_tree_decisions;
 pub mod app_flags;
 pub mod archive_import;
 pub mod assistants;
+#[cfg(feature = "remote")]
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
 mod files;
+pub mod filesystem_identity;
 pub mod guidance;
 pub mod image_generation;
 pub mod image_generation_plan;
@@ -57,6 +59,7 @@ pub mod locks;
 pub mod media_attachments;
 pub mod message_attachments;
 pub mod needs_attention;
+#[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod packages;
 pub mod paused_work;
@@ -66,7 +69,9 @@ pub mod project_notes;
 pub mod protected_leak_records;
 pub mod protected_redaction_history;
 pub mod prune_ledger;
+#[cfg(feature = "remote")]
 pub mod remote_attachment_operations;
+#[cfg(feature = "remote")]
 pub mod remote_audit_upload;
 pub mod retention;
 pub mod run_invocations;
@@ -134,18 +139,79 @@ struct WriteRequest {
     reply: mpsc::SyncSender<Result<Box<dyn Any + Send>>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("database transaction rollback failed after {primary:#}: {rollback}")]
+struct TransactionRollbackFailed {
+    primary: anyhow::Error,
+    rollback: rusqlite::Error,
+}
+
+#[cfg(test)]
+static FORCED_ROLLBACK_FAILURE_DB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn force_rollback_failure_for_test(database: Option<String>) {
+    *FORCED_ROLLBACK_FAILURE_DB
+        .lock()
+        .expect("rollback failure hook poisoned") = database;
+}
+
+fn rollback_transaction(conn: &Connection) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    {
+        let database: String = conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut forced = FORCED_ROLLBACK_FAILURE_DB
+            .lock()
+            .expect("rollback failure hook poisoned");
+        if forced.as_deref() == Some(database.as_str()) {
+            *forced = None;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    conn.execute_batch("ROLLBACK;")
+}
+
 #[derive(Clone)]
 struct Writer {
-    tx: mpsc::SyncSender<WriteRequest>,
+    inner: Arc<WriterInner>,
+}
+
+/// Shared writer lifetime. `Db` declares its `writer` field before its owner
+/// lock, so the final clone joins this thread (including its final checkpoint)
+/// before releasing exclusive database ownership.
+struct WriterInner {
+    tx: Mutex<Option<mpsc::SyncSender<WriteRequest>>>,
+    join: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+}
+
+impl Drop for WriterInner {
+    fn drop(&mut self) {
+        // Closing the channel is the writer's orderly shutdown signal.
+        if let Ok(slot) = self.tx.get_mut() {
+            slot.take();
+        }
+        let join = self.join.get_mut().ok().and_then(Option::take);
+        if let Some(join) = join {
+            match join.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(%error, "database writer shutdown failed"),
+                Err(_) => tracing::error!("database writer thread panicked during shutdown"),
+            }
+        }
+    }
 }
 
 impl Writer {
     fn start(path: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<WriteRequest>(1024);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("cockpit-db-writer".into())
-            .spawn(move || {
+            .spawn(move || -> Result<()> {
                 let conn = match Connection::open(&path)
                     .with_context(|| format!("opening sqlite writer at {}", path.display()))
                     .and_then(|conn| {
@@ -160,7 +226,7 @@ impl Writer {
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.to_string()));
-                        return;
+                        return Err(e);
                     }
                 };
 
@@ -168,13 +234,41 @@ impl Writer {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
                         .and_then(|result| result);
+                    let poison = result.as_ref().err().is_some_and(|error| {
+                        error
+                            .chain()
+                            .any(|cause| cause.is::<TransactionRollbackFailed>())
+                    });
                     let _ = request.reply.send(result);
+                    if poison {
+                        // The connection may still own an unknown transaction.
+                        // Drop it and close the queue rather than serving a
+                        // later write from an unprovable state.
+                        return Err(anyhow::anyhow!(
+                            "database writer poisoned after rollback failure"
+                        ));
+                    }
                 }
+                // The last database owner performs an explicit truncating
+                // checkpoint before SQLite closes the writer. This bounds
+                // WAL growth and makes the durable shutdown boundary
+                // independent of SQLite's build-time autocheckpoint defaults.
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .context("checkpointing SQLite WAL during writer shutdown")?;
+                Ok(())
             })
             .context("spawning db writer thread")?;
         match ready_rx.recv().context("waiting for db writer startup")? {
-            Ok(()) => Ok(Self { tx }),
-            Err(e) => anyhow::bail!(e),
+            Ok(()) => Ok(Self {
+                inner: Arc::new(WriterInner {
+                    tx: Mutex::new(Some(tx)),
+                    join: Mutex::new(Some(join)),
+                }),
+            }),
+            Err(e) => {
+                let _ = join.join();
+                anyhow::bail!(e)
+            }
         }
     }
 
@@ -188,7 +282,12 @@ impl Writer {
             let value = f(conn)?;
             Ok(Box::new(value) as Box<dyn Any + Send>)
         });
-        self.tx
+        self.inner
+            .tx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db writer mutex poisoned"))?
+            .as_ref()
+            .context("db writer is shut down")?
             .send(WriteRequest { job, reply })
             .map_err(|_| anyhow::anyhow!("db writer is shut down"))?;
         Ok(rx)
@@ -308,6 +407,11 @@ pub struct Db {
     read_pool: Option<Arc<ReadPool>>,
     /// `None` for in-memory databases (tests).
     path: Option<PathBuf>,
+    /// Kernel-backed exclusive ownership retained by every clone until the
+    /// final file-backed daemon handle is dropped.
+    _owner_lock: Option<Arc<files::DatabaseOwnerLock>>,
+    _diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
+    read_only: bool,
 }
 
 impl std::fmt::Debug for Db {
@@ -334,24 +438,54 @@ impl Db {
             .parent()
             .context("canonical cockpit DB path has no parent")?;
         files::ensure_private_dir(dir).with_context(|| format!("securing {}", dir.display()))?;
-        Self::open(&path)
+        Self::open_daemon_owned(&path)
     }
 
-    /// Open a database at an arbitrary path.
+    /// Open a database at an arbitrary path without claiming daemon ownership.
+    ///
+    /// This is the general/test multi-handle API. Production daemon startup
+    /// must use [`Self::open_default`] (or [`Self::open_daemon_owned`]) so its
+    /// migration and writer lifetime remain protected by the singleton lock.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_impl(path, false)
+    }
+
+    /// Open an arbitrary database as its exclusive daemon owner.
+    pub fn open_daemon_owned(path: &Path) -> Result<Self> {
+        Self::open_impl(path, true)
+    }
+
+    fn open_impl(path: &Path, daemon_owned: bool) -> Result<Self> {
         let mut timer = files::PhaseTimer::start("Db::open");
-        let existed_before_open = path.exists();
         files::ensure_parent_dir_private(path)
             .with_context(|| format!("securing parent of {}", path.display()))?;
+        // Acquire exclusive process ownership before opening SQLite. The guard
+        // is stored in `Db`, so backup/migration, writer startup, and the full
+        // daemon lifetime are one ownership interval.
+        let owner_lock = daemon_owned
+            .then(|| files::DatabaseOwnerLock::acquire(path))
+            .transpose()?
+            .map(Arc::new);
+        let existed_before_open = path.exists();
+        if existed_before_open {
+            let incoming = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| {
+                    format!("opening existing SQLite read-only at {}", path.display())
+                })?;
+            // Preserve a recovery copy for every rejected/unproven prerelease
+            // database, then prove ledger checksum, exact DDL fingerprint,
+            // profile, and user_version before any source-database mutation.
+            backup_before_pending_migration(&incoming, path, MIGRATIONS.len())?;
+            if table_exists(&incoming, "schema_version")? {
+                verify_existing_database(&incoming, MIGRATIONS)?;
+            }
+        }
         files::create_private_file_if_missing(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
         apply_connection_pragmas(&conn, true)
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
-        if existed_before_open {
-            backup_before_pending_migration(&conn, path, MIGRATIONS.len())?;
-        }
         timer.phase("connect_and_pragmas");
         migrate(&conn)?;
         timer.phase("migrate");
@@ -363,6 +497,9 @@ impl Db {
             writer: Some(writer),
             read_pool: Some(Arc::new(ReadPool::new(path.to_path_buf()))),
             path: Some(path.to_path_buf()),
+            _owner_lock: owner_lock,
+            _diagnostic_lock: None,
+            read_only: false,
         };
         timer.done();
         Ok(db)
@@ -380,8 +517,64 @@ impl Db {
             writer: None,
             read_pool: None,
             path: None,
+            _owner_lock: None,
+            _diagnostic_lock: None,
+            read_only: false,
         };
         Ok(db)
+    }
+
+    /// Open the canonical database for the hidden offline diagnostic worker.
+    /// This never creates files, applies pragmas, backs up, migrates, repairs,
+    /// or starts a writer. The shared non-blocking ownership lock also ensures
+    /// a live daemon must be queried over RPC rather than inspected beside it.
+    pub fn open_default_read_only_diagnostic() -> Result<Self> {
+        let path = Self::default_path()?;
+        if !path.is_file() {
+            anyhow::bail!("database does not exist at {}", path.display());
+        }
+        let diagnostic_lock = Arc::new(files::DatabaseDiagnosticLock::try_acquire(&path)?);
+        Self::open_read_only_diagnostic_impl(path, Some(diagnostic_lock))
+    }
+
+    /// Inspect an explicitly supplied offline copy/snapshot. Unlike the
+    /// canonical database path, a copied database has no ownership sidecar;
+    /// the caller must opt into this API and the file is opened read-only.
+    pub fn open_read_only_diagnostic_snapshot(path: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            path.is_file(),
+            "database snapshot does not exist at {}",
+            path.display()
+        );
+        Self::open_read_only_diagnostic_impl(path.to_path_buf(), None)
+    }
+
+    fn open_read_only_diagnostic_impl(
+        path: PathBuf,
+        diagnostic_lock: Option<Arc<files::DatabaseDiagnosticLock>>,
+    ) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening SQLite read-only at {}", path.display()))?;
+        verify_existing_database(&conn, MIGRATIONS)?;
+        foreign_key_check(&conn).context("validating diagnostic foreign keys")?;
+        let quick_check: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .context("running diagnostic SQLite quick_check")?;
+        if quick_check != "ok" {
+            anyhow::bail!("SQLite quick_check failed: {quick_check}");
+        }
+        Ok(Self {
+            memory: Some(Arc::new(Mutex::new(conn))),
+            writer: None,
+            read_pool: None,
+            path: Some(path),
+            _owner_lock: None,
+            _diagnostic_lock: diagnostic_lock,
+            read_only: true,
+        })
     }
 
     /// In-memory database constructor for `#[tokio::test]` and other async
@@ -450,6 +643,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit writes");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
             let boxed = tokio::task::spawn_blocking(move || {
@@ -488,6 +684,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit transactions");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(move |conn| run_transaction(conn, f))?;
             let boxed = tokio::task::spawn_blocking(move || {
@@ -616,6 +815,9 @@ impl Db {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if self.read_only {
+            anyhow::bail!("read-only diagnostic database does not permit writes");
+        }
         if let Some(writer) = &self.writer {
             let rx = writer.submit(f)?;
             let boxed = rx
@@ -647,19 +849,29 @@ where
     match result {
         Ok(Ok(value)) => {
             if let Err(error) = conn.execute_batch("COMMIT;") {
-                let _ = conn.execute_batch("ROLLBACK;");
-                Err(error).context("committing db transaction")
+                let primary = anyhow::Error::new(error).context("committing db transaction");
+                match rollback_transaction(conn) {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
+                }
             } else {
                 Ok(value)
             }
         }
-        Ok(Err(error)) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(error)
-        }
+        Ok(Err(error)) => match rollback_transaction(conn) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(TransactionRollbackFailed {
+                primary: error,
+                rollback,
+            }
+            .into()),
+        },
         Err(_) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(anyhow::anyhow!("db transaction job panicked"))
+            let primary = anyhow::anyhow!("db transaction job panicked");
+            match rollback_transaction(conn) {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
+            }
         }
     }
 }
@@ -704,15 +916,26 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .context("enabling foreign_keys")?;
     if on_disk {
+        // Durable daemon acknowledgements mean the WAL commit has crossed the
+        // operating-system durability boundary. Do not inherit SQLite build or
+        // environment defaults for this contract.
+        conn.execute_batch(
+            "PRAGMA synchronous = FULL;
+             PRAGMA wal_autocheckpoint = 1000;
+             PRAGMA journal_size_limit = 67108864;",
+        )
+        .context("setting SQLite durability policy")?;
         // `pragma_update` doesn't accept the kind of literal that
         // `journal_mode = WAL` needs; the query-row form does. The
-        // return value is the resolved mode — we don't use it but a
-        // non-`wal` result on a file DB would mean WAL is unavailable
-        // (older SQLite, exotic FS), which is fine to silently fall
-        // back to.
-        let _: String = conn
+        // return value is the resolved mode. A non-WAL result fails closed:
+        // the read-pool and durability contracts rely on WAL semantics.
+        let journal_mode: String = conn
             .query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))
             .context("enabling WAL")?;
+        anyhow::ensure!(
+            journal_mode.eq_ignore_ascii_case("wal"),
+            "file-backed SQLite database requires WAL journal mode; SQLite selected {journal_mode:?}"
+        );
     }
     Ok(())
 }
@@ -725,6 +948,24 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
+    extension_sql: &'static str,
+}
+
+#[cfg(feature = "remote")]
+const SCHEMA_PROFILE: &str = "remote-v0.1";
+#[cfg(not(feature = "remote"))]
+const SCHEMA_PROFILE: &str = "local-v0.1";
+
+/// Stable diagnostic identifier for attempting to open one prerelease build
+/// profile's database with the other profile. Profile transitions are not an
+/// in-place migration in v0.1: opt-in remote builds must use a separate data
+/// directory (or an explicit supported export/import flow).
+pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
+
+fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{SCHEMA_PROFILE_MISMATCH_CODE}: database schema profile is {database_profile}, binary requires {SCHEMA_PROFILE}; in-place local/remote profile transitions are unsupported in v0.1; use a separate data directory or a supported export/import flow"
+    )
 }
 
 /// All schema migrations in version order. Pre-release: fold schema changes
@@ -732,6 +973,10 @@ struct Migration {
 const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
+    #[cfg(not(feature = "remote"))]
+    extension_sql: "",
+    #[cfg(feature = "remote")]
+    extension_sql: include_str!("migrations/0001_remote_profile.sql"),
 }];
 
 /// Latest schema version understood by this build.
@@ -745,25 +990,144 @@ fn backup_before_pending_migration(
     path: &Path,
     migration_count: usize,
 ) -> Result<()> {
-    if current_schema_version(conn)? >= migration_count as i64 {
+    let backup_reason = match prerelease_backup_reason(conn, migration_count) {
+        Ok(reason) => reason,
+        Err(assessment_error) => {
+            create_migration_backup(
+                conn,
+                path,
+                0,
+                "rejecting an unproven or malformed prerelease schema ledger",
+            )?;
+            return Err(assessment_error).context(
+                "database schema could not be proven compatible; a validated backup was created before rejection",
+            );
+        }
+    };
+    let Some((schema_version, reason)) = backup_reason else {
         return Ok(());
-    }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .context("checkpointing database before migration backup")?;
+    };
+    create_migration_backup(conn, path, schema_version, reason)
+}
+
+fn create_migration_backup(
+    conn: &Connection,
+    path: &Path,
+    schema_version: i64,
+    reason: &str,
+) -> Result<()> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let backup = path.with_extension(format!("backup-{stamp}.sqlite"));
-    std::fs::copy(path, &backup).with_context(|| {
-        format!(
-            "backing up {} before migration to {}",
-            path.display(),
-            backup.display()
-        )
-    })?;
+    let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
+    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        .with_context(|| {
+            format!(
+                "creating SQLite online backup of {} at {} before {reason}",
+                path.display(),
+                backup.display()
+            )
+        })?;
     files::repair_private_file(&backup, "database backup")?;
+    validate_migration_backup(&backup)?;
+    fsync_file_and_parent(&backup)?;
     prune_migration_backups(path)?;
+    Ok(())
+}
+
+/// Decide whether opening an existing prerelease database must first preserve
+/// a consistent recovery snapshot. This check intentionally understands the
+/// legacy ledger shape so we never select a column that an older v1 lacks.
+fn prerelease_backup_reason(
+    conn: &Connection,
+    migration_count: usize,
+) -> Result<Option<(i64, &'static str)>> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(Some((0, "rejecting an unledgered prerelease database")));
+    }
+    let columns = table_columns(conn, "schema_version")?;
+    if !columns.iter().any(|column| column == "schema_fingerprint") {
+        let version = legacy_schema_version(conn)?;
+        return Ok(Some((
+            version,
+            "rejecting a legacy prerelease schema ledger",
+        )));
+    }
+    let version = current_schema_version(conn)?;
+    if version > migration_count as i64 {
+        return Ok(Some((version, "rejecting a future prerelease schema")));
+    }
+    if version < migration_count as i64 {
+        return Ok(Some((version, "applying a pending migration")));
+    }
+    let profile: String = conn
+        .query_row(
+            "SELECT schema_profile FROM schema_version ORDER BY version DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("reading prerelease schema profile")?;
+    if profile != SCHEMA_PROFILE {
+        return Ok(Some((
+            version,
+            "rejecting a different database schema profile",
+        )));
+    }
+    if version == 1 {
+        let recorded: String = conn
+            .query_row(
+                "SELECT sha256 FROM schema_version WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("reading prerelease v1 migration checksum")?;
+        if recorded != migration_definition_hash(&MIGRATIONS[0]) {
+            return Ok(Some((version, "rejecting an amended prerelease v1")));
+        }
+    }
+    let recorded_fingerprint: String = conn
+        .query_row(
+            "SELECT schema_fingerprint FROM schema_version WHERE version = ?1",
+            [version],
+            |row| row.get(0),
+        )
+        .context("reading prerelease schema fingerprint")?;
+    if recorded_fingerprint != exact_ddl_fingerprint(conn)? {
+        return Ok(Some((version, "rejecting schema fingerprint drift")));
+    }
+    if sqlite_schema_version(conn)? != version {
+        return Ok(Some((version, "rejecting SQLite user_version drift")));
+    }
+    Ok(None)
+}
+
+fn validate_migration_backup(path: &Path) -> Result<()> {
+    let backup = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening migration backup {}", path.display()))?;
+    let result: String = backup
+        .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+        .context("validating migration backup with quick_check")?;
+    if result != "ok" {
+        anyhow::bail!(
+            "migration backup {} failed SQLite quick_check: {result}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn fsync_file_and_parent(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("opening migration backup {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("fsyncing migration backup {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -774,19 +1138,27 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
     let prefix = format!(
         "{}{}",
         path.file_stem().unwrap_or_default().to_string_lossy(),
-        ".backup-"
+        "."
     );
     let mut backups = std::fs::read_dir(parent)?
         .flatten()
-        .map(|entry| entry.path())
-        .filter(|candidate| {
-            candidate
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        .filter_map(|entry| {
+            let candidate = entry.path();
+            let owned = candidate.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.contains(".backup-") && name.ends_with(".sqlite")
+            });
+            owned.then(|| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (modified, candidate)
+            })
         })
         .collect::<Vec<_>>();
-    backups.sort();
-    for stale in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
+    backups.sort_by_key(|(modified, _)| *modified);
+    for (_, stale) in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
         std::fs::remove_file(stale)?;
     }
     Ok(())
@@ -803,30 +1175,157 @@ fn migration_hash(sql: &str) -> String {
         .collect()
 }
 
+fn migration_definition_hash(migration: &Migration) -> String {
+    // The checksum identifies the exact SQL applied by this build profile.
+    // Omitting the extension made two materially different schemas share a
+    // migration checksum and allowed an edited profile extension to pass the
+    // ledger check.
+    let mut definition = String::with_capacity(migration.sql.len() + migration.extension_sql.len());
+    definition.push_str(migration.sql);
+    definition.push_str(migration.extension_sql);
+    migration_hash(&definition)
+}
+
+fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
+    let expected = Connection::open_in_memory().context("opening expected-schema database")?;
+    for migration in migrations {
+        expected.execute_batch(migration.sql)?;
+        expected.execute_batch(migration.extension_sql)?;
+    }
+    expected.execute_batch(
+        "CREATE TABLE schema_version (\
+            version INTEGER PRIMARY KEY CHECK (version > 0), \
+            name TEXT NOT NULL CHECK (length(name) > 0), \
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
+            schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
+            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+            applied_at TEXT NOT NULL\
+        );",
+    )?;
+    exact_ddl_fingerprint(&expected)
+}
+
+/// Hash the exact persisted DDL text for every application-owned table,
+/// index, trigger, and view. This is deliberately an exact-DDL fingerprint,
+/// not a semantic schema hash: formatting or equivalent rewritten SQL is an
+/// amended prerelease schema and requires controlled recovery.
+fn exact_ddl_fingerprint(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') \
+         FROM sqlite_schema \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name, tbl_name",
+    )?;
+    let mut canonical = String::new();
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (kind, name, table, sql) = row?;
+        use std::fmt::Write as _;
+        writeln!(&mut canonical, "{kind}\0{name}\0{table}\0{sql}")?;
+    }
+    Ok(migration_hash(&canonical))
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT version, name, sha256 FROM schema_version ORDER BY version")?;
+    let mut stmt = conn.prepare(
+        "SELECT version, name, sha256, schema_fingerprint, schema_profile \
+             FROM schema_version ORDER BY version",
+    )?;
+    let mut expected_version = 1_i64;
     for row in stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })? {
-        let (version, name, hash) = row?;
+        let (version, name, hash, fingerprint, profile) = row?;
+        if version != expected_version {
+            anyhow::bail!(
+                "database migration ledger is corrupt: expected version {expected_version}, found {version}"
+            );
+        }
         if version > migrations.len() as i64 {
-            anyhow::bail!("database migration ledger is newer than this binary");
+            anyhow::bail!(
+                "incompatible prerelease database schema v{version}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+                migrations.len()
+            );
+        }
+        if !is_lower_hex_64(&hash) || !is_lower_hex_64(&fingerprint) {
+            anyhow::bail!(
+                "database migration ledger is corrupt at version {version}: hashes must be 64 lowercase hexadecimal characters"
+            );
         }
         let expected = &migrations[(version - 1) as usize];
         let expected_name = expected.name;
-        let expected_hash = migration_hash(expected.sql);
+        let expected_hash = migration_definition_hash(expected);
         if name != expected_name || hash != expected_hash {
             anyhow::bail!(
                 "migration checksum mismatch for {expected_name}: applied migration was amended"
             );
         }
+        if profile != SCHEMA_PROFILE {
+            return Err(schema_profile_mismatch(&profile));
+        }
+        if version == current_schema_version(conn)? && fingerprint != exact_ddl_fingerprint(conn)? {
+            anyhow::bail!(
+                "database schema fingerprint mismatch at migration {version}: schema objects were altered or are missing"
+            );
+        }
+        expected_version += 1;
     }
     Ok(())
+}
+
+fn verify_user_version(conn: &Connection, ledger_version: i64) -> Result<()> {
+    let user_version = sqlite_schema_version(conn)?;
+    if user_version != ledger_version {
+        anyhow::bail!(
+            "database schema version is inconsistent: migration ledger is {ledger_version}, SQLite user_version is {user_version}"
+        );
+    }
+    Ok(())
+}
+
+fn verify_existing_database(conn: &Connection, migrations: &[Migration]) -> Result<()> {
+    verify_supported_ledger_shape(conn)?;
+    verify_ledger(conn, migrations)?;
+    let current = current_schema_version(conn)?;
+    if current == 0 {
+        anyhow::bail!("database migration ledger is empty");
+    }
+    verify_user_version(conn, current)?;
+    if exact_ddl_fingerprint(conn)? != compiled_expected_fingerprint(migrations)? {
+        anyhow::bail!(
+            "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
+        );
+    }
+    Ok(())
+}
+
+fn database_has_application_objects(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .context("checking whether database is proven empty")
 }
 
 /// Apply pending migrations under one `BEGIN IMMEDIATE` writer lock.
@@ -837,9 +1336,18 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
 /// migrations; migration SQL must not emit `PRAGMA foreign_keys` itself
 /// because that pragma is a no-op inside a transaction.
 fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
+    verify_supported_ledger_shape(conn)?;
+    if !table_exists(conn, "schema_version")? && database_has_application_objects(conn)? {
+        anyhow::bail!(
+            "unledgered prerelease database contains application schema objects; refusing to bootstrap over unproven data"
+        );
+    }
     let current_before_lock = current_schema_version(conn)?;
     if current_before_lock > migrations.len() as i64 {
-        anyhow::bail!("database migration ledger is newer than this binary");
+        anyhow::bail!(
+            "incompatible prerelease database schema v{current_before_lock}; this binary supports v{}. Restore a compatible migration backup or move the database aside and restart",
+            migrations.len()
+        );
     }
 
     let fk_was_on = foreign_keys_enabled(conn).context("reading foreign_keys pragma")?;
@@ -850,12 +1358,22 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             .context("database is busy applying migrations")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);",
+            "CREATE TABLE IF NOT EXISTS schema_version (\
+                version INTEGER PRIMARY KEY CHECK (version > 0), \
+                name TEXT NOT NULL CHECK (length(name) > 0), \
+                sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
+                schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
+                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+                applied_at TEXT NOT NULL\
+            );",
         )
         .context("creating schema_version table")?;
 
         verify_ledger(conn, migrations)?;
         let current = current_schema_version(conn)?;
+        if current > 0 {
+            verify_user_version(conn, current)?;
+        }
 
         for (i, migration) in migrations.iter().enumerate() {
             let version = (i as i64) + 1;
@@ -864,14 +1382,34 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
+            if !migration.extension_sql.is_empty() {
+                conn.execute_batch(migration.extension_sql)
+                    .with_context(|| format!("applying migration {version} build profile"))?;
+            }
+            let fingerprint = exact_ddl_fingerprint(conn)?;
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
-                rusqlite::params![version, migration.name, migration_hash(migration.sql)],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
+                rusqlite::params![
+                    version,
+                    migration.name,
+                    migration_definition_hash(migration),
+                    fingerprint,
+                    SCHEMA_PROFILE
+                ],
             )
             .with_context(|| format!("recording migration {version}"))?;
         }
 
         conn.pragma_update(None, "user_version", migrations.len() as i64)?;
+        verify_ledger(conn, migrations)?;
+        verify_user_version(conn, migrations.len() as i64)?;
+        let actual = exact_ddl_fingerprint(conn)?;
+        let expected = compiled_expected_fingerprint(migrations)?;
+        if actual != expected {
+            anyhow::bail!(
+                "database schema does not match the exact DDL compiled for schema profile {SCHEMA_PROFILE}"
+            );
+        }
 
         if fk_was_on {
             foreign_key_check(conn).context("validating migration foreign keys")?;
@@ -906,16 +1444,75 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(exists != 0)
 }
 
-fn current_schema_version(conn: &Connection) -> Result<i64> {
-    if !table_exists(conn, "schema_version")? {
-        return Ok(0);
-    }
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let quoted = table.replace('"', "\"\"");
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info(\"{quoted}\");"))
+        .with_context(|| format!("inspecting `{table}` columns"))?;
+    stmt.query_map([], |row| row.get(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("decoding `{table}` columns"))
+}
+
+fn legacy_schema_version(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
         |row| row.get(0),
     )
-    .context("reading current schema version")
+    .context("reading legacy prerelease schema version")
+}
+
+fn verify_supported_ledger_shape(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(());
+    }
+    let columns = table_columns(conn, "schema_version")?;
+    const REQUIRED: &[&str] = &[
+        "version",
+        "name",
+        "sha256",
+        "schema_fingerprint",
+        "schema_profile",
+        "applied_at",
+    ];
+    let missing = REQUIRED
+        .iter()
+        .copied()
+        .filter(|required| !columns.iter().any(|column| column == required))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let version = legacy_schema_version(conn)?;
+        anyhow::bail!(
+            "incompatible legacy prerelease database schema v{version}: migration ledger is missing {}. A validated backup was created; move the database aside and restart to create the local v0.1 schema, or restore it with a compatible older binary",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn current_schema_version(conn: &Connection) -> Result<i64> {
+    if !table_exists(conn, "schema_version")? {
+        return Ok(0);
+    }
+    let (count, minimum, maximum): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(version), MAX(version) FROM schema_version",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .context("reading current schema version")?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let minimum = minimum.context("migration ledger has no minimum version")?;
+    let maximum = maximum.context("migration ledger has no maximum version")?;
+    if minimum != 1 || maximum != count {
+        anyhow::bail!(
+            "database migration ledger is corrupt: expected contiguous versions 1 through {count}, found {minimum} through {maximum}"
+        );
+    }
+    Ok(maximum)
 }
 
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
@@ -985,9 +1582,42 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
+                extension_sql: "",
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_poison_closes_the_writer_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollback-poison.db");
+        let db = Db::open(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        force_rollback_failure_for_test(Some(canonical.to_string_lossy().into_owned()));
+
+        let first: Result<()> = db
+            .transaction(|_| anyhow::bail!("injected transaction failure"))
+            .await;
+        let error = first.unwrap_err();
+        assert!(
+            error.to_string().contains("rollback failed"),
+            "the initiating request receives the poisoned rollback: {error:#}"
+        );
+
+        let queued = db
+            .write(|conn| {
+                conn.execute_batch("CREATE TABLE must_not_run(value INTEGER)")?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            queued.to_string().contains("writer")
+                || queued.to_string().contains("channel")
+                || queued.to_string().contains("reply dropped"),
+            "later queued work must fail closed after writer poison: {queued:#}"
+        );
     }
 
     #[tokio::test]
@@ -1165,6 +1795,28 @@ mod tests {
     }
 
     #[test]
+    fn user_version_drift_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(error.contains("user_version"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn altered_schema_fingerprint_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn.execute_batch("DROP INDEX idx_scheduled_jobs_owner;")
+            .unwrap();
+        let error = migrate_with(&conn, MIGRATIONS).unwrap_err().to_string();
+        assert!(
+            error.contains("schema fingerprint mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn amended_migration_is_refused() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ledger.db");
@@ -1237,12 +1889,18 @@ mod tests {
     fn newer_database_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
-        conn.execute("INSERT INTO schema_version (version, name, sha256, applied_at) VALUES (99, \"future\", \"future\", \"now\")", []).unwrap();
+        let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+        let future_hash = migration_hash("future");
+        conn.execute(
+            "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at) VALUES (2, 'future', ?1, ?2, ?3, 'now')",
+            rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
+        )
+        .unwrap();
         assert!(
             migrate_with(&conn, MIGRATIONS)
                 .unwrap_err()
                 .to_string()
-                .contains("newer")
+                .contains("incompatible prerelease database schema v2")
         );
     }
 
@@ -1253,16 +1911,18 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             migrate_with(&conn, MIGRATIONS).unwrap();
+            let fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+            let future_hash = migration_hash("future");
             conn.execute(
-                "INSERT INTO schema_version (version, name, sha256, applied_at)
-                 VALUES (2, 'future', 'future', 'now')",
-                [],
+                "INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
+                 VALUES (2, 'future', ?1, ?2, ?3, 'now')",
+                rusqlite::params![future_hash, fingerprint, SCHEMA_PROFILE],
             )
             .unwrap();
         }
         let err = Db::open(&path).unwrap_err().to_string();
         assert!(
-            err.contains("newer than this binary"),
+            err.contains("incompatible prerelease database schema v2"),
             "future v2 must fail closed, not recreate: {err}"
         );
         assert!(
@@ -1919,12 +2579,20 @@ mod tests {
             .execute_batch(&format!(
                 r#"
                 BEGIN IMMEDIATE;
-                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, applied_at TEXT);
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT, sha256 TEXT, schema_fingerprint TEXT, schema_profile TEXT, applied_at TEXT);
                 CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);
-                INSERT INTO schema_version (version, name, sha256, applied_at)
-                    VALUES (1, '0001_test.sql', '{probe_hash}', CURRENT_TIMESTAMP);
+                INSERT INTO schema_version (version, name, sha256, schema_fingerprint, schema_profile, applied_at)
+                    VALUES (1, '0001_test.sql', '{probe_hash}', '', '{SCHEMA_PROFILE}', CURRENT_TIMESTAMP);
+                PRAGMA user_version = 1;
                 "#,
             ))
+            .unwrap();
+        let fingerprint = exact_ddl_fingerprint(&conn_a).unwrap();
+        conn_a
+            .execute(
+                "UPDATE schema_version SET schema_fingerprint = ?1 WHERE version = 1",
+                [fingerprint],
+            )
             .unwrap();
 
         let path_for_thread = path.clone();
@@ -2544,7 +3212,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_delete_cascades_to_all_tables() {
+    async fn session_delete_cascades_to_retained_local_children() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/p", "Build").await.unwrap();
+        db.insert_session_event(
+            session.session_id,
+            crate::db::session_log::SessionEventKind::UserNote,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": "local child" }),
+        )
+        .await
+        .unwrap();
+
+        db.delete_session(session.session_id).await.unwrap();
+        let remaining: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "retained local child rows must cascade");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "remote")]
+    async fn session_delete_cascades_to_remote_audit_extension() {
         let db = Db::open_in_memory().unwrap();
         let session_id = Uuid::new_v4();
         let id = session_id.to_string();
@@ -2644,11 +3338,159 @@ mod tests {
         assert!(!sidecar.exists());
     }
 
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_intent_survives_delete_commit() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        let relative = format!("delegation_payloads/{id}/recovery.txt");
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "payload").unwrap();
+        db.write({
+            let id = id.clone();
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
+                Db::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, 2)?;
+                Db::delete_existing_session_row_conn(conn, session_id)?;
+                Ok(())
+            }
+        }).await.unwrap();
+        assert!(sidecar.exists(), "commit precedes external cleanup");
+        let pending = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending, 1);
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_refuses_a_current_payload_reference() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        let relative = format!("delegation_payloads/{id}/generation.txt");
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "current").unwrap();
+        db.write({
+            let id = id.clone();
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
+                conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,id])?;
+                Ok(())
+            }
+        }).await.unwrap();
+
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            sidecar.exists(),
+            "a current payload reference protects its sidecar"
+        );
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM task_delegation_payloads WHERE sidecar_path=?1",
+                [relative],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!sidecar.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_retains_intent_when_parent_fsync_fails() {
+        struct ResetSyncFailure;
+        impl Drop for ResetSyncFailure {
+            fn drop(&mut self) {
+                crate::db::files::force_sidecar_parent_sync_failure_for_test(None);
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let relative = "delegation_payloads/orphan/generation.txt".to_string();
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "orphan").unwrap();
+        db.write({
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,Uuid::new_v4().to_string()])?;
+                Ok(())
+            }
+        }).await.unwrap();
+
+        let _reset = ResetSyncFailure;
+        crate::db::files::force_sidecar_parent_sync_failure_for_test(Some(
+            sidecar.parent().unwrap().to_path_buf(),
+        ));
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            0
+        );
+        let pending = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending, 1, "uncertain unlink durability retains the intent");
+
+        crate::db::files::force_sidecar_parent_sync_failure_for_test(None);
+        assert_eq!(
+            db.reconcile_delegation_sidecar_cleanup_intents()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Pre-release: `migrations/` is exactly `0001_initial.sql`. The
-        // expected list is an independent literal so a stray file (or a
-        // deletion) is caught rather than mirrored from `MIGRATIONS`.
+        // Pre-release: the directory contains the local base plus the opt-in
+        // remote profile extension. The independent literal catches stray or
+        // deleted schema inputs without deriving expectations from MIGRATIONS.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -2660,6 +3502,12 @@ mod tests {
             .collect();
         migrations.sort();
 
-        assert_eq!(migrations, vec!["0001_initial.sql".to_string()]);
+        assert_eq!(
+            migrations,
+            vec![
+                "0001_initial.sql".to_string(),
+                "0001_remote_profile.sql".to_string(),
+            ]
+        );
     }
 }

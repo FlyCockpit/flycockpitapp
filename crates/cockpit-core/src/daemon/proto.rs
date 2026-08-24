@@ -782,6 +782,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
             default_update_id,
             outcome,
         }],
+        #[cfg(feature = "remote")]
         TurnEvent::ConnectorStatus { .. } => vec![],
         TurnEvent::HostCapabilitiesChanged { .. } => vec![],
     }

@@ -52,7 +52,7 @@ use cockpit_db::external_journal::{
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
 #[cfg(any(unix, test))]
-use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
+use cockpit_db::filesystem_identity::FilesystemIdentityV1;
 
 pub(crate) use fsguard::DirGuard;
 #[cfg(unix)]
@@ -1831,9 +1831,9 @@ pub(crate) struct RemoteRenameArtifactV1 {
     pub logical_attachment_id: Uuid,
     pub operation_id: Uuid,
     pub dispatch_generation: u64,
-    pub source_identity: RemoteFilesystemIdentityV1,
-    pub source_parent_identity: RemoteFilesystemIdentityV1,
-    pub target_parent_identity: RemoteFilesystemIdentityV1,
+    pub source_identity: FilesystemIdentityV1,
+    pub source_parent_identity: FilesystemIdentityV1,
+    pub target_parent_identity: FilesystemIdentityV1,
     pub source_name: String,
     pub target_name: String,
 }
@@ -1926,7 +1926,7 @@ impl RemoteRenameArtifactV1 {
             .map_err(|error| ExternalJournalError::Containment(error.to_string()))?;
         let dispatch_generation = u64::from_be_bytes(take(&mut cursor, 8)?.try_into().unwrap());
         let decode_identity = |cursor: &mut usize| {
-            RemoteFilesystemIdentityV1::decode(take(cursor, 57)?)
+            FilesystemIdentityV1::decode(take(cursor, 57)?)
                 .map_err(|error| ExternalJournalError::Containment(error.to_string()))
         };
         let source_identity = decode_identity(&mut cursor)?;

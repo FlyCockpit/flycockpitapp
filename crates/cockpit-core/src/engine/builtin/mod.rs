@@ -4573,9 +4573,14 @@ mod tests {
         )
         .unwrap();
         let db = test_assistant_db();
-        db.upsert_assistant("helper-bot", assistant_home.to_str().unwrap(), "{}", "hash")
-            .await
-            .unwrap();
+        db.upsert_assistant(
+            "helper-bot",
+            assistant_home.to_str().unwrap(),
+            "{}",
+            crate::assistants::VALID_ASSISTANT_CONTENT_HASH_FIXTURE,
+        )
+        .await
+        .unwrap();
         let args = test_spawn_args(tmp.path());
 
         for name in [

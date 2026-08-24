@@ -2,6 +2,8 @@ use super::attachments::*;
 use super::authz::*;
 use super::run_invocation::{principal_digest, wall_ms_now};
 use super::sessions::*;
+#[cfg(feature = "remote")]
+use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
@@ -17,10 +19,52 @@ pub(crate) use crate::secret_ownership::{
 };
 use rusqlite::OptionalExtension;
 
+// Keep the local dispatch AST free of remote operation types and helpers while
+// sharing the mutation body with the opt-in remote profile. In the local
+// expansion the operation token is deliberately consumed but never emitted.
+#[cfg(feature = "remote")]
+macro_rules! finish_nonrepeatable_response {
+    ($operation:ident, $ctx:expr, $kind:literal, $response:expr) => {{
+        match $operation {
+            Some(operation) => commit_remote_nonrepeatable(operation, $ctx, $kind, $response).await,
+            None => Ok($response),
+        }
+    }};
+}
+
+#[cfg(feature = "remote")]
+macro_rules! finish_provider_mutation_future {
+    ($operation:ident, $ctx:expr, $kind:literal, $mutation:expr) => {{
+        match $operation {
+            Some(operation) => {
+                finish_remote_provider_mutation(operation, $ctx, $kind, $mutation).await
+            }
+            None => $mutation.await,
+        }
+    }};
+}
+
+#[cfg(not(feature = "remote"))]
+macro_rules! finish_provider_mutation_future {
+    ($operation:ident, $ctx:expr, $kind:literal, $mutation:expr) => {{
+        let _ = $ctx;
+        $mutation.await
+    }};
+}
+
+#[cfg(not(feature = "remote"))]
+macro_rules! finish_nonrepeatable_response {
+    ($operation:ident, $ctx:expr, $kind:literal, $response:expr) => {{
+        let _ = $ctx;
+        Ok($response)
+    }};
+}
+
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static SECRET_OWNER_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Credential clear must never wait indefinitely on a best-effort remote
 /// instance revoke. Local vault ownership is cleared independently below.
+#[cfg(feature = "remote")]
 const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Serialize daemon-side provider/config read-modify-write operations. The
 /// ConfigDoc writer also takes the shared cross-process lock, so this closes
@@ -227,9 +271,18 @@ fn oauth_owner(state: &MutableClientState) -> String {
 /// the ledger path is exercised with an owner principal.
 fn is_local_owner_action(
     state: &MutableClientState,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> bool {
-    state.principal.is_owner() && remote_operation.is_none()
+    state.principal.is_owner() && {
+        #[cfg(feature = "remote")]
+        {
+            remote_operation.is_none()
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            true
+        }
+    }
 }
 
 /// Concurrent-lane analogue of [`is_local_owner_action`] over a shared snapshot.
@@ -237,6 +290,7 @@ fn is_local_owner_action(
 /// remote-operation ledger dispatch. A remoted owner (an owner principal
 /// carrying a remote-operation context) is NOT a local-owner action, so it is
 /// refused the raw `--include-sensitive` export exactly like any other remote.
+#[cfg(feature = "remote")]
 fn is_local_owner_action_shared(
     shared: &SharedClientState,
     remote_operation: Option<&super::RemoteOperationContext>,
@@ -321,6 +375,7 @@ fn workspace_trust_mode_from_db(
     }
 }
 
+#[cfg(feature = "remote")]
 fn org_disclosure_to_proto(
     value: crate::db::org_sync::OrgSyncDisclosure,
 ) -> proto::OrgSyncDisclosure {
@@ -331,6 +386,7 @@ fn org_disclosure_to_proto(
     }
 }
 
+#[cfg(feature = "remote")]
 fn connector_disclosure_to_proto(
     value: crate::db::connector::ConnectorDisclosure,
 ) -> proto::ConnectorDisclosure {
@@ -380,6 +436,7 @@ pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub display_text: Option<&'a str>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: Option<&'a str>,
+    #[cfg(feature = "remote")]
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
 
@@ -401,6 +458,7 @@ pub(super) fn oversized_text_artifact_admission(
         display_text,
         tag_expansions,
         forced_skill,
+        #[cfg(feature = "remote")]
         remote_operation,
     } = request;
     if text.len() <= INLINE_USER_TEXT_BYTES {
@@ -476,6 +534,7 @@ pub(super) fn oversized_text_artifact_admission(
         code: ErrorCode::BadRequest,
         message: "message is not a valid bounded FCM2 submission".to_owned(),
     })?;
+    #[cfg(feature = "remote")]
     let (operation_id, actor, request_hash) = match remote_operation {
         Some(operation) => {
             if operation.operation_id == client_submission_id {
@@ -493,7 +552,7 @@ pub(super) fn oversized_text_artifact_admission(
             .map_err(internal)?;
             (
                 operation.operation_id,
-                crate::db::db::message_attachments::MessageActor::RemoteDevice {
+                crate::db::db::message_attachments::MessageActor::ExternalPrincipal {
                     id: *operation.authenticated_device_id.as_bytes(),
                     generation: operation.authenticated_device_generation,
                 },
@@ -518,6 +577,23 @@ pub(super) fn oversized_text_artifact_admission(
                     .to_owned(),
             });
         }
+    };
+    #[cfg(not(feature = "remote"))]
+    let (operation_id, actor, request_hash) = if principal.is_owner() {
+        let operation_id = Uuid::new_v5(
+            &session_id,
+            format!("typed-session-artifacts-v1:{client_submission_id}").as_bytes(),
+        );
+        (
+            operation_id,
+            crate::db::db::message_attachments::MessageActor::LocalOwner,
+            Sha256::digest(&canonical_message).into(),
+        )
+    } else {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "oversized user messages require the local owner".to_owned(),
+        });
     };
     Ok(Some(
         crate::daemon::session_worker::OversizedTextArtifactAdmission {
@@ -561,7 +637,7 @@ async fn handle_send_user_message(
     image_refs: Vec<proto::ImageAttachmentRef>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if ctx.shutdown.is_draining() {
         return Err(ErrorPayload {
@@ -622,6 +698,7 @@ async fn handle_send_user_message(
                 display_text: display_text.as_deref(),
                 tag_expansions: &tag_expansions,
                 forced_skill: forced_skill.as_deref(),
+                #[cfg(feature = "remote")]
                 remote_operation,
             },
         )?
@@ -685,6 +762,7 @@ async fn handle_send_user_message(
     // queue ledger: that would create a second accept path after phase one.
     // Media and inline text retain their existing legacy ledger until their
     // own transport representation is migrated.
+    #[cfg(feature = "remote")]
     let remote_queue_operation = if artifact_admission.is_some() {
         None
     } else {
@@ -732,6 +810,7 @@ async fn handle_send_user_message(
                 // worker uses — record a fresh operation, replay an already
                 // committed one, or reject an operation/actor conflict — so no
                 // remote send returns accepted without a ledger operation row.
+                #[cfg(feature = "remote")]
                 if let Some(operation) = &remote_queue_operation {
                     match crate::daemon::session_worker::reserve_remote_send_operation(
                         &ctx.db, operation,
@@ -816,6 +895,7 @@ async fn handle_send_user_message(
     handle
         .send_work(SessionWork::UserMessage {
             submission: Box::new(submission),
+            #[cfg(feature = "remote")]
             remote_operation: remote_queue_operation,
             artifact_admission: artifact_admission.clone().map(Box::new),
             respond_to,
@@ -853,10 +933,10 @@ async fn handle_send_user_message(
 /// `SendUserMessageBulk` consumer use distinct request operation UUIDs, so the
 /// stable authenticated attachment/device binding (plus principal) is the
 /// operation identity that can safely span the whole transfer.
-pub(super) fn bulk_user_message_transfer_owner(
+fn bulk_user_message_transfer_owner_impl(
     principal: &ClientPrincipal,
     session_id: Uuid,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
     let mut identity = Vec::with_capacity(128);
     identity.extend_from_slice(b"principal:");
@@ -866,21 +946,26 @@ pub(super) fn bulk_user_message_transfer_owner(
             .unwrap_or_else(|| "local-owner".to_owned())
             .as_bytes(),
     );
-    match remote_operation {
-        Some(operation) => {
-            identity.extend_from_slice(b"\0remote-actor:");
-            identity.extend_from_slice(operation.logical_attachment_id.as_bytes());
-            identity.extend_from_slice(operation.authenticated_device_id.as_bytes());
-            identity.extend_from_slice(&operation.authenticated_device_generation.to_be_bytes());
-        }
-        None if principal.is_owner() => identity.extend_from_slice(b"\0local-owner"),
-        None => {
-            return Err(ErrorPayload {
-                code: ErrorCode::Authorization,
-                message: "bulk user-message transfers require an authenticated operation actor"
-                    .to_owned(),
-            });
-        }
+    #[cfg(feature = "remote")]
+    if let Some(operation) = remote_operation {
+        identity.extend_from_slice(b"\0remote-actor:");
+        identity.extend_from_slice(operation.logical_attachment_id.as_bytes());
+        identity.extend_from_slice(operation.authenticated_device_id.as_bytes());
+        identity.extend_from_slice(&operation.authenticated_device_generation.to_be_bytes());
+        return Ok(
+            crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
+                session_id, &identity,
+            ),
+        );
+    }
+    if principal.is_owner() {
+        identity.extend_from_slice(b"\0local-owner");
+    } else {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "bulk user-message transfers require an authenticated operation actor"
+                .to_owned(),
+        });
     }
     Ok(
         crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
@@ -889,28 +974,62 @@ pub(super) fn bulk_user_message_transfer_owner(
     )
 }
 
+pub(super) fn bulk_user_message_transfer_owner_local(
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
+    bulk_user_message_transfer_owner_impl(principal, session_id)
+}
+
+#[cfg(feature = "remote")]
+pub(super) fn bulk_user_message_transfer_owner(
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
+    bulk_user_message_transfer_owner_impl(principal, session_id, remote_operation)
+}
+
 /// The durable FCM2 replay gate parallel to [`bulk_user_message_transfer_owner`].
 /// A consumed/expired reference may only be reconstructed for the same stored
 /// message actor, never merely because another client knows its transfer id and
 /// client submission id.
+fn bulk_user_message_replay_actor_impl(
+    principal: &ClientPrincipal,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
+    #[cfg(feature = "remote")]
+    if let Some(operation) = remote_operation {
+        return Ok(
+            crate::db::message_attachments::MessageActor::ExternalPrincipal {
+                id: *operation.authenticated_device_id.as_bytes(),
+                generation: operation.authenticated_device_generation,
+            },
+        );
+    }
+    if principal.is_owner() {
+        Ok(crate::db::message_attachments::MessageActor::LocalOwner)
+    } else {
+        Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "bulk user-message transfers require an authenticated operation actor"
+                .to_owned(),
+        })
+    }
+}
+
+pub(super) fn bulk_user_message_replay_actor_local(
+    principal: &ClientPrincipal,
+) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
+    bulk_user_message_replay_actor_impl(principal)
+}
+
+#[cfg(feature = "remote")]
 pub(super) fn bulk_user_message_replay_actor(
     principal: &ClientPrincipal,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
-    match remote_operation {
-        Some(operation) => Ok(crate::db::message_attachments::MessageActor::RemoteDevice {
-            id: *operation.authenticated_device_id.as_bytes(),
-            generation: operation.authenticated_device_generation,
-        }),
-        None if principal.is_owner() => {
-            Ok(crate::db::message_attachments::MessageActor::LocalOwner)
-        }
-        None => Err(ErrorPayload {
-            code: ErrorCode::Authorization,
-            message: "bulk user-message transfers require an authenticated operation actor"
-                .to_owned(),
-        }),
-    }
+    bulk_user_message_replay_actor_impl(principal, remote_operation)
 }
 
 pub(super) fn unavailable_bulk_user_message_transfer() -> ErrorPayload {
@@ -925,9 +1044,9 @@ pub(super) struct BulkUserMessagePayloadRequest<'a> {
     pub owner: &'a crate::daemon::bulk_staging::BulkTransferOwner,
     pub replay_actor: crate::db::message_attachments::MessageActor,
     pub client_submission_id: Uuid,
-    pub transfer: &'a cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    pub transfer: &'a cockpit_proto::bulk_transfer::BulkTransferRef,
     pub display_text: &'a Option<String>,
-    pub display_transfer: &'a Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
+    pub display_transfer: &'a Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: &'a Option<String>,
 }
@@ -941,7 +1060,7 @@ pub(super) async fn resolve_bulk_user_message_payload(
     ctx: &Arc<DaemonContext>,
     request: BulkUserMessagePayloadRequest<'_>,
 ) -> std::result::Result<(String, Option<String>), ErrorPayload> {
-    use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+    use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
 
     let BulkUserMessagePayloadRequest {
         session_id,
@@ -955,14 +1074,13 @@ pub(super) async fn resolve_bulk_user_message_payload(
         forced_skill,
     } = request;
 
-    let is_opaque_text_transfer =
-        |reference: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
-         minimum_length: u64| {
-            reference.mime_class == RemoteBulkMimeClass::Opaque
-                && (minimum_length
-                    ..=crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
-                    .contains(&reference.total_length_value())
-        };
+    let is_opaque_text_transfer = |reference: &cockpit_proto::bulk_transfer::BulkTransferRef,
+                                   minimum_length: u64| {
+        reference.mime_class == RemoteBulkMimeClass::Opaque
+            && (minimum_length
+                ..=crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
+                .contains(&reference.total_length_value())
+    };
     let source_minimum_length = if display_transfer.is_some() {
         1
     } else {
@@ -1103,17 +1221,23 @@ async fn handle_send_user_message_bulk(
     client_submission_id: Uuid,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    transfer: cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
     display_text: Option<String>,
-    display_transfer: Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
+    display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let session_id = require_attached(state)?.handle.session_id;
+    #[cfg(feature = "remote")]
     let owner = bulk_user_message_transfer_owner(&state.principal, session_id, remote_operation)?;
+    #[cfg(not(feature = "remote"))]
+    let owner = bulk_user_message_transfer_owner_local(&state.principal, session_id)?;
+    #[cfg(feature = "remote")]
     let replay_actor = bulk_user_message_replay_actor(&state.principal, remote_operation)?;
+    #[cfg(not(feature = "remote"))]
+    let replay_actor = bulk_user_message_replay_actor_local(&state.principal)?;
     let (text, display_text) = resolve_bulk_user_message_payload(
         ctx,
         BulkUserMessagePayloadRequest {
@@ -1141,6 +1265,7 @@ async fn handle_send_user_message_bulk(
         Vec::new(),
         forced_skill,
         run_invocation_options,
+        #[cfg(feature = "remote")]
         remote_operation,
     )
     .await
@@ -1153,12 +1278,13 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
-    Box::pin(handle_serialized_request_with_remote_operation(
-        request, state, shared, ctx, effects, None,
+    Box::pin(handle_serialized_request_impl(
+        request, state, shared, ctx, effects,
     ))
     .await
 }
 
+#[cfg(feature = "remote")]
 async fn begin_remote_nonrepeatable(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -1199,6 +1325,7 @@ async fn begin_remote_nonrepeatable(
 /// daemon-held vault key. FCOR is canonical and authenticated, but its plain
 /// SHA-256 is intentionally not suitable for ledger rows because it would let
 /// anyone who can read a row test guesses for secret-bearing requests.
+#[cfg(feature = "remote")]
 pub(super) fn remote_request_hash(ctx: &DaemonContext, canonical: &[u8]) -> [u8; 32] {
     ctx.secret_vault
         .keyed_request_identity(b"flycockpit-remote-operation-v1\0", canonical)
@@ -1219,7 +1346,7 @@ pub(super) fn remote_request_hash(ctx: &DaemonContext, canonical: &[u8]) -> [u8;
 /// equals the remotely-admissible `transactional_mutation` rows enumerated from
 /// the `command!` classification table (a new tag missing here — or a stale tag
 /// listed here — fails the gate).
-#[cfg(any(unix, test))]
+#[cfg(all(any(unix, test), feature = "remote"))]
 pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
     "send_user_message",
     "send_user_message_bulk",
@@ -1255,11 +1382,13 @@ pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
 /// registry entry fails there); it does NOT trip a release daemon. The set
 /// computation still references the registry in every profile so the const is
 /// never dead code.
-#[cfg(any(unix, test))]
+#[cfg(all(any(unix, test), feature = "remote"))]
 pub(super) fn debug_assert_ledger_site_registry_consistent() {
     macro_rules! transactional_registry_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($tag, stringify!($authz), stringify!($remote_class)));)+
+            rows
         }};
     }
     let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_registry_rows);
@@ -1286,6 +1415,7 @@ pub(super) fn debug_assert_ledger_site_registry_consistent() {
 /// dispatch arms (`fork_session`/`discard_session`/`btw_create`/`btw_end`/
 /// `delete_session`) so the durable mutation and its exactly-once replay record
 /// commit together on the daemon.
+#[cfg(feature = "remote")]
 fn build_remote_session_ledger(
     ctx: &DaemonContext,
     authorized_request: &AuthorizedRequestContext,
@@ -1300,6 +1430,7 @@ fn build_remote_session_ledger(
     Ok(RemoteSessionLedger::new(operation, request_hash))
 }
 
+#[cfg(feature = "remote")]
 async fn commit_remote_nonrepeatable(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
@@ -1356,6 +1487,7 @@ async fn commit_remote_nonrepeatable(
 /// filesystem.  Close the reserved operation as unknown in that case: a
 /// retry must never run the mutation again and turn an indeterminate write
 /// into a second provider-layer change.
+#[cfg(feature = "remote")]
 pub(super) async fn finish_remote_provider_mutation<F>(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
@@ -1393,6 +1525,7 @@ where
 // context, and the response together so the whole thing commits atomically;
 // bundling them into a params struct would only obscure that hot security path
 // for a purely cosmetic lint, so allow the count here.
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 async fn mutate_owner_vault_item_with_remote_ledger(
     ctx: &DaemonContext,
@@ -1476,12 +1609,25 @@ async fn mutate_owner_vault_item_with_remote_ledger(
     Ok(response)
 }
 
+#[cfg(feature = "remote")]
+enum RemoteAdapterBegin {
+    Dispatch { generation: u64 },
+    Replay(Response),
+}
+
+#[cfg(feature = "remote")]
+fn remote_adapter_incarnation_id() -> Uuid {
+    static ID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+    *ID.get_or_init(Uuid::now_v7)
+}
+
+#[cfg(feature = "remote")]
 async fn begin_remote_idempotent_adapter(
     request: &Request,
     authorized: &AuthorizedRequestContext,
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
-) -> std::result::Result<Option<Response>, ErrorPayload> {
+) -> std::result::Result<RemoteAdapterBegin, ErrorPayload> {
     let params = request
         .canonical_remote_operation_params_v1()
         .map_err(internal)?;
@@ -1499,23 +1645,27 @@ async fn begin_remote_idempotent_adapter(
             operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
             request_hash,
             now_ms: chrono::Utc::now().timestamp_millis(),
-        },
+        }, remote_adapter_incarnation_id(), 30_000,
     ).await.map_err(internal)? {
-        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { dispatch_generation, .. } => Ok(RemoteAdapterBegin::Dispatch { generation: dispatch_generation }),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Replay(bytes) =>
-            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+            serde_json::from_slice(&bytes).map(RemoteAdapterBegin::Replay).map_err(internal),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict
         | crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation has an indeterminate persisted outcome; it will not be retried".into() }),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::AttachmentLedgerCapacity =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
     }
 }
 
+#[cfg(feature = "remote")]
 async fn commit_remote_idempotent_adapter(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
     kind: &str,
+    expected_dispatch_generation: u64,
     response: Response,
 ) -> std::result::Result<Response, ErrorPayload> {
     let attachment = operation.logical_attachment_id.to_string();
@@ -1524,7 +1674,7 @@ async fn commit_remote_idempotent_adapter(
     let delivery = Uuid::now_v7().to_string();
     match ctx
         .db
-        .commit_remote_attachment_operation(
+        .commit_idempotent_adapter_remote_operation(
             crate::db::remote_attachment_operations::CommitRemoteOperation {
                 logical_attachment_id: &attachment,
                 operation_id: &operation_id,
@@ -1534,6 +1684,8 @@ async fn commit_remote_idempotent_adapter(
                 outbox_payload: &bytes,
                 now_ms: chrono::Utc::now().timestamp_millis(),
             },
+            remote_adapter_incarnation_id(),
+            expected_dispatch_generation,
         )
         .await
         .map_err(internal)?
@@ -1549,7 +1701,7 @@ async fn commit_remote_idempotent_adapter(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 fn db_filesystem_identity(
     value: crate::external_journal::HeldEntryIdentity,
 ) -> crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
@@ -1564,7 +1716,7 @@ fn db_filesystem_identity(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 async fn cleanup_remote_rename_artifacts(
     _ctx: &DaemonContext,
     journal: &crate::external_journal::ExternalJournal,
@@ -1574,7 +1726,7 @@ async fn cleanup_remote_rename_artifacts(
     let _ = journal.drain_remote_rename_artifact_cleanup().await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 async fn close_remote_rename_effect_unknown(
     ctx: &DaemonContext,
     journal: &crate::external_journal::ExternalJournal,
@@ -1600,7 +1752,7 @@ async fn close_remote_rename_effect_unknown(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 pub(crate) async fn execute_remote_staged_rename(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -1610,7 +1762,7 @@ pub(crate) async fn execute_remote_staged_rename(
     execute_remote_staged_rename_with_hook(request, authorized, operation, ctx, |_| Ok(())).await
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 pub(super) async fn execute_remote_staged_rename_with_hook(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -2160,13 +2312,13 @@ async fn dispatch_image_control_read(
     }
 }
 
-pub(super) async fn handle_serialized_request_with_remote_operation(
+async fn handle_serialized_request_impl(
     request: Request,
     state: &mut MutableClientState,
     shared: &Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
@@ -2174,6 +2326,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             message: "daemon is shutting down after a redaction publication failure".into(),
         });
     }
+    #[cfg(feature = "remote")]
     if let Some(operation) = remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -2214,10 +2367,15 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             .await
             .map_err(internal)?;
     }
+    #[cfg(feature = "remote")]
     let request_kind = principal::request_kind(&request);
+    #[cfg(feature = "remote")]
     let audit_session_id = request_session_id(&request, state);
+    #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
+    #[cfg(feature = "remote")]
     let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
+    #[cfg(feature = "remote")]
     let authorized_request = match authorize_request_context(&request, state, ctx).await {
         Ok(authorized) => authorized,
         Err(error) => {
@@ -2253,6 +2411,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             return Err(error);
         }
     };
+    #[cfg(not(feature = "remote"))]
+    if let Err(error) = authorize_request_context(&request, state, ctx).await {
+        return Err(error);
+    }
+    #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
             ctx,
@@ -2375,6 +2538,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 image_refs,
                 forced_skill,
                 run_invocation_options,
+                #[cfg(feature = "remote")]
                 remote_operation,
             ))
             .await
@@ -2403,6 +2567,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 tag_expansions,
                 forced_skill,
                 run_invocation_options,
+                #[cfg(feature = "remote")]
                 remote_operation,
             ))
             .await
@@ -2417,6 +2582,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::CancelRunInvocation {
             client_submission_id,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let canonical_request = Request::CancelRunInvocation {
                     client_submission_id,
@@ -2502,8 +2668,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         (result, None, false)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
                 if applied
                     && result.outcome == proto::RunInvocationCancelOutcome::CancellationRequested
@@ -2516,6 +2684,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             } else {
                 run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
             }
+            #[cfg(not(feature = "remote"))]
+            {
+                run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
+            }
         }
 
         Request::SteerDelegation {
@@ -2524,6 +2696,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             label,
             message,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SteerDelegation {
                     session_id,
@@ -2546,6 +2719,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         "session is not live".to_string(),
                     ),
                 };
+                #[cfg(feature = "remote")]
                 return match remote_operation {
                     Some(operation) => {
                         commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response)
@@ -2553,6 +2727,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     }
                     None => Ok(response),
                 };
+                #[cfg(not(feature = "remote"))]
+                return Ok(response);
             };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
@@ -2567,11 +2743,19 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .map_err(internal)?;
             let result = response_rx.await.map_err(internal)?;
             let response = Response::DelegationSteer { result };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response).await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response)
+                            .await
+                    }
+                    None => Ok(response),
                 }
-                None => Ok(response),
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                Ok(response)
             }
         }
 
@@ -2617,6 +2801,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::RemoveQueuedUserMessage { queue_item_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 let request = Request::RemoveQueuedUserMessage { queue_item_id };
                 let params = request
@@ -2637,6 +2822,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })
@@ -2652,6 +2838,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveNewestQueuedUserMessage { target_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 if target_id.is_none() {
                     return Err(ErrorPayload {
@@ -2681,6 +2868,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })
@@ -2696,6 +2884,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::RemoveEditableQueuedUserMessages { target_id } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             let remote_queue_operation = if let Some(operation) = remote_operation {
                 let request = Request::RemoveEditableQueuedUserMessages {
                     target_id: target_id.clone(),
@@ -2718,6 +2907,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             att.handle
                 .send_work(SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    #[cfg(feature = "remote")]
                     remote_operation: remote_queue_operation,
                     respond_to,
                 })
@@ -2733,6 +2923,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::ResumePausedWork { session_id } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::ResumePausedWork { session_id };
                 let canonical_params = request
@@ -2774,8 +2965,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         Ok(response)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             let changed = ctx
@@ -2796,6 +2989,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::CancelPausedWork { session_id } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::CancelPausedWork { session_id };
                 let canonical_params = request
@@ -2840,8 +3034,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         Ok(response)
                     }
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             let changed = ctx
@@ -2872,6 +3068,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     message: "repair_resume session_id does not match the attached session".into(),
                 });
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::RepairResume { session_id };
                 if let Some(response) =
@@ -2887,13 +3084,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .await
                 .map_err(internal)?;
             match response_rx.await.map_err(internal)? {
-                Ok(()) => match remote_operation {
-                    Some(operation) => {
-                        commit_remote_nonrepeatable(operation, ctx, "repair_resume", Response::Ack)
-                            .await
-                    }
-                    None => Ok(Response::Ack),
-                },
+                Ok(()) => finish_nonrepeatable_response!(
+                    remote_operation,
+                    ctx,
+                    "repair_resume",
+                    Response::Ack
+                ),
                 Err(message) => Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message,
@@ -2952,6 +3148,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 });
             }
             let policy_json = serde_json::to_string(&policy).map_err(internal)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::CreateGoal {
                     session_id,
@@ -2989,8 +3186,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let receipt = match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
                 if receipt.schema_version != 1
                     || receipt.session_id != session_id
@@ -3089,6 +3288,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     });
                 }
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetGoalStatus { session_id, status };
                 let params = request
@@ -3119,8 +3319,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let receipt = match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
                 if receipt.schema_version != 1
                     || receipt.session_id != session_id
@@ -3170,6 +3372,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::ClearGoal { session_id } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::ClearGoal { session_id };
                 let canonical_params = request
@@ -3230,8 +3433,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         }
                         Ok(response)
                     }
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             let cleared = ctx
@@ -3255,6 +3460,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::PinMessage { session_id, seq } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::PinMessage { session_id, seq };
                 let canonical_params = request
@@ -3292,8 +3498,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             ctx.db
@@ -3303,6 +3511,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .map_err(|error| bad_request(error.to_string()))
         }
         Request::UnpinMessage { session_id, seq } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::UnpinMessage { session_id, seq };
                 let canonical_params = request
@@ -3336,8 +3545,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             ctx.db
@@ -3347,6 +3558,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .map_err(|error| bad_request(error.to_string()))
         }
         Request::TogglePinnedMessage { session_id, seq } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::TogglePinnedMessage { session_id, seq };
                 let canonical_params = request
@@ -3380,8 +3592,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 return match outcome {
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
             }
             ctx.db
@@ -3863,6 +4077,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             })
         }
         Request::GetStartupDisclosures { project_root: _ } => {
+            #[cfg(not(feature = "remote"))]
+            return Ok(Response::StartupDisclosures {
+                org_sync: None,
+                connector: None,
+                config_generation: inventory::current_config_generation(),
+            });
+            #[cfg(feature = "remote")]
             let (org_sync, connector) =
                 if let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? {
                     let org = ctx
@@ -3881,11 +4102,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 } else {
                     (None, None)
                 };
-            Ok(Response::StartupDisclosures {
+            #[cfg(feature = "remote")]
+            return Ok(Response::StartupDisclosures {
                 org_sync,
                 connector,
                 config_generation: inventory::current_config_generation(),
-            })
+            });
         }
         Request::GetAppFlag { key } => {
             let db_key = app_flag_db_key(key);
@@ -3999,6 +4221,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             config_json,
             content_hash,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::UpsertAssistant {
                 name: name.clone(),
                 home_dir: home_dir.clone(),
@@ -4010,6 +4233,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4025,12 +4249,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             let response = Response::AssistantUpserted {
                 assistant: assistant_to_proto(row),
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "upsert_assistant", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "upsert_assistant", response)
         }
 
         Request::AddPackage {
@@ -4041,6 +4260,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             local_path,
             deep,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::AddPackage {
                 project_root: project_root.clone(),
                 identifier: identifier.clone(),
@@ -4054,6 +4274,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept package registry writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4086,12 +4307,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             let response = Response::PackageAdded {
                 package_json: serde_json::to_string(&package_row_json(&row)).map_err(internal)?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "add_package", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "add_package", response)
         }
 
         Request::ImportPackage {
@@ -4101,6 +4317,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             id,
             as_path,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::ImportPackage {
                 project_root: project_root.clone(),
                 dir: dir.clone(),
@@ -4113,6 +4330,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept package registry writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4149,12 +4367,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 summary_json: serde_json::to_string(&package_import_summary_json(&summary))
                     .map_err(internal)?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "import_package", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "import_package", response)
         }
 
         Request::PrunePackages {
@@ -4162,6 +4375,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             days,
             dry_run,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::PrunePackages {
                 project_root: project_root.clone(),
                 days,
@@ -4172,6 +4386,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept package registry writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4191,15 +4406,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 report_json: serde_json::to_string(&package_prune_report_json(&report))
                     .map_err(internal)?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "prune_packages", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "prune_packages", response)
         }
 
         Request::ImportKclPackages { project_root } => {
+            #[cfg(feature = "remote")]
             let request = Request::ImportKclPackages {
                 project_root: project_root.clone(),
             };
@@ -4208,6 +4419,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept package registry writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4230,22 +4442,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             let response = Response::KclPackagesImported {
                 result_json: serde_json::to_string(&value).map_err(internal)?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "import_kcl_packages", response)
-                        .await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "import_kcl_packages", response)
         }
 
         Request::PurgeEndedSessions { before } => {
+            #[cfg(feature = "remote")]
             let request = Request::PurgeEndedSessions { before };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent session purges",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4277,22 +4485,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 purged,
                 session_ids_json: serde_json::to_string(&session_ids).map_err(internal)?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "purge_ended_sessions", response)
-                        .await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
         }
 
         Request::DeleteAssistant { name } => {
+            #[cfg(feature = "remote")]
             let request = Request::DeleteAssistant { name: name.clone() };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4302,12 +4506,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             let deleted = ctx.db.delete_assistant(&name).await.map_err(internal)?;
             let response = Response::AssistantDeleted { deleted };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "delete_assistant", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
         }
 
         Request::RepairMediaReservation {
@@ -4317,6 +4516,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             repair_plan_digest,
             idempotency_key,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::RepairMediaReservation {
                 scope: scope.clone(),
                 id: id.clone(),
@@ -4329,6 +4529,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept media reservation repairs",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4358,25 +4559,21 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             let response = Response::MediaReservationRepaired {
                 outcome: outcome.code().to_string(),
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(
-                        operation,
-                        ctx,
-                        "repair_media_reservation",
-                        response,
-                    )
-                    .await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "repair_media_reservation",
+                response
+            )
         }
 
         // The following owner-remoted reads are `read_only`/concurrent and are
         // dispatched on the concurrent path; the serialized match is also
         // exhaustive over `Request`, so they delegate to the shared helpers.
         Request::ListPackages => list_packages_response(ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetOrgSyncStatus => get_org_sync_status_response(ctx).await,
         Request::ListFailedToolCalls {
             since_epoch,
@@ -4508,7 +4705,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             include_generated_artifacts,
             include_sensitive,
         } => {
-            let local_owner_action = is_local_owner_action(state, remote_operation);
+            let local_owner_action = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             export_session_data(
                 ctx,
                 session_id,
@@ -4523,6 +4724,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             transfer_id,
             chunk_index,
         } => read_redacted_export_chunk(&transfer_id, chunk_index).await,
+        #[cfg(feature = "remote")]
         Request::OperationStatus { operation_id } => {
             let ClientPrincipal::Remote(remote) = &shared.principal else {
                 return Err(ErrorPayload {
@@ -4576,18 +4778,27 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             chunk_index,
             data_base64,
         } => {
-            let owner = if transfer.mime_class
-                == cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque
-            {
-                let session_id = require_attached(state)?.handle.session_id;
-                Some(bulk_user_message_transfer_owner(
-                    &state.principal,
-                    session_id,
-                    remote_operation,
-                )?)
-            } else {
-                None
-            };
+            let owner =
+                if transfer.mime_class == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque {
+                    let session_id = require_attached(state)?.handle.session_id;
+                    #[cfg(feature = "remote")]
+                    {
+                        Some(bulk_user_message_transfer_owner(
+                            &state.principal,
+                            session_id,
+                            remote_operation,
+                        )?)
+                    }
+                    #[cfg(not(feature = "remote"))]
+                    {
+                        Some(bulk_user_message_transfer_owner_local(
+                            &state.principal,
+                            session_id,
+                        )?)
+                    }
+                } else {
+                    None
+                };
             write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
         }
         Request::ReadBulkTransferChunk {
@@ -4602,6 +4813,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::CancelTurn => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::CancelTurn;
                 let params = request
@@ -4718,6 +4930,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             content,
             base_hash,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::FsWrite {
                     project_root: project_root.clone(),
@@ -4725,12 +4938,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     content: content.clone(),
                     base_hash: base_hash.clone(),
                 };
-                if let Some(response) =
-                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
-                        .await?
+                let generation = match begin_remote_idempotent_adapter(
+                    &request,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
                 {
-                    return Ok(response);
-                }
+                    RemoteAdapterBegin::Replay(response) => return Ok(response),
+                    RemoteAdapterBegin::Dispatch { generation } => generation,
+                };
                 let response = crate::daemon::fs_api::fs_write_staged_remote(
                     ctx.clone(),
                     project_root,
@@ -4740,8 +4958,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     operation.operation_id.to_string(),
                 )
                 .await?;
-                return commit_remote_idempotent_adapter(operation, ctx, "fs_write", response)
-                    .await;
+                return commit_remote_idempotent_adapter(
+                    operation, ctx, "fs_write", generation, response,
+                )
+                .await;
             }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
                 .await
@@ -4753,12 +4973,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             content,
             base_hash,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::SaveExtendedConfig {
                 project_root: project_root.clone(),
                 path: path.clone(),
                 content: content.clone(),
                 base_hash: base_hash.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4797,18 +5019,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 }
                 Ok(response)
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "save_extended_config",
-                        mutation,
-                    )
-                    .await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "save_extended_config",
+                mutation
+            )
         }
 
         Request::ExportPolicy { project_root } => {
@@ -4826,11 +5042,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             bundle_json,
             replace,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::ImportPolicy {
                 project_root: project_root.clone(),
                 bundle_json: bundle_json.clone(),
                 replace,
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4860,12 +5078,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     provider_count,
                 })
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(operation, ctx, "import_policy", mutation).await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(remote_operation, ctx, "import_policy", mutation)
         }
 
         Request::GetImageSpendPolicy { project_key } => {
@@ -4912,11 +5125,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             settings_json,
             expected_policy_version,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::SaveImageSpendPolicy {
                 project_key: project_key.clone(),
                 settings_json: settings_json.clone(),
                 expected_policy_version,
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -4943,37 +5158,43 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     policy_version: saved.policy_version,
                 })
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "save_image_spend_policy",
-                        mutation,
-                    )
-                    .await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "save_image_spend_policy",
+                mutation
+            )
         }
 
         Request::FsCreateDir { project_root, path } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::FsCreateDir {
                     project_root: project_root.clone(),
                     path: path.clone(),
                 };
-                if let Some(response) =
-                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
-                        .await?
+                let generation = match begin_remote_idempotent_adapter(
+                    &request,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
                 {
-                    return Ok(response);
-                }
+                    RemoteAdapterBegin::Replay(response) => return Ok(response),
+                    RemoteAdapterBegin::Dispatch { generation } => generation,
+                };
                 let response =
                     crate::daemon::fs_api::fs_create_dir_reconciled_remote(project_root, path)
                         .await?;
-                return commit_remote_idempotent_adapter(operation, ctx, "fs_create_dir", response)
-                    .await;
+                return commit_remote_idempotent_adapter(
+                    operation,
+                    ctx,
+                    "fs_create_dir",
+                    generation,
+                    response,
+                )
+                .await;
             }
             crate::daemon::fs_api::fs_create_dir(project_root, path).await
         }
@@ -4984,6 +5205,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             to_path,
         } => {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 if ctx.external_journal.is_some() {
                     let request = Request::FsRename {
@@ -5077,6 +5299,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .terminal_views
                 .get(&terminal_id)
                 .ok_or_else(invalid_terminal_ingress)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::TerminalInput {
                     terminal_id,
@@ -5104,6 +5327,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .terminal_views
                 .get(&terminal_id)
                 .ok_or_else(invalid_terminal_ingress)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::TerminalResize {
                     terminal_id,
@@ -5390,78 +5614,26 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             session_id,
             cascade,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::ArchiveSession {
                     session_id,
                     cascade,
                 };
-                let params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let logical_attachment_id = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device_id = operation.authenticated_device_id.to_string();
-                let outcome = ctx.db.execute_transactional_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
-                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                    move |conn| {
-                        crate::db::Db::archive_session_conn(conn, session_id, cascade, chrono::Utc::now().timestamp())?;
-                        let response = Response::Ack;
-                        let bytes = serde_json::to_vec(&response)?;
-                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                            value: response, safe_response: bytes.clone(), outbox_kind: "archive_session".into(), outbox_payload: bytes,
-                        })
-                    },
-                ).await.map_err(internal)?;
-                return match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
+                let ledger =
+                    build_remote_session_ledger(ctx, &authorized_request, &request, operation)?;
+                return sessions_remote::archive_session(ctx, session_id, cascade, &ledger).await;
             }
             archive_session(ctx, session_id, cascade).await
         }
 
         Request::UnarchiveSession { session_id } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::UnarchiveSession { session_id };
-                let params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let logical_attachment_id = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device_id = operation.authenticated_device_id.to_string();
-                let outcome = ctx.db.execute_transactional_remote_operation(
-                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
-                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
-                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                    move |conn| {
-                        crate::db::Db::unarchive_session_conn(conn, session_id)?;
-                        let response = Response::Ack;
-                        let bytes = serde_json::to_vec(&response)?;
-                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                            value: response, safe_response: bytes.clone(), outbox_kind: "unarchive_session".into(), outbox_payload: bytes,
-                        })
-                    },
-                ).await.map_err(internal)?;
-                return match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
+                let ledger =
+                    build_remote_session_ledger(ctx, &authorized_request, &request, operation)?;
+                return sessions_remote::unarchive_session(ctx, session_id, &ledger).await;
             }
             unarchive_session(ctx, session_id).await
         }
@@ -5471,8 +5643,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             fork_point_turn_id,
             ephemeral,
         } => {
-            let ledger = match remote_operation {
-                Some(operation) => Some(build_remote_session_ledger(
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let ledger = build_remote_session_ledger(
                     ctx,
                     &authorized_request,
                     &Request::ForkSession {
@@ -5481,39 +5654,48 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         ephemeral,
                     },
                     operation,
-                )?),
-                None => None,
-            };
+                )?;
+                return sessions_remote::fork_session(
+                    ctx,
+                    &state.principal,
+                    parent_session_id,
+                    fork_point_turn_id,
+                    ephemeral,
+                    &ledger,
+                )
+                .await;
+            }
             fork_session(
                 ctx,
                 &state.principal,
                 parent_session_id,
                 fork_point_turn_id,
                 ephemeral,
-                ledger.as_ref(),
             )
             .await
         }
 
         Request::DiscardSession { session_id } => {
-            let ledger = match remote_operation {
-                Some(operation) => Some(build_remote_session_ledger(
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let ledger = build_remote_session_ledger(
                     ctx,
                     &authorized_request,
                     &Request::DiscardSession { session_id },
                     operation,
-                )?),
-                None => None,
-            };
-            discard_session(state, ctx, session_id, ledger.as_ref()).await
+                )?;
+                return sessions_remote::discard_session(state, ctx, session_id, &ledger).await;
+            }
+            discard_session(state, ctx, session_id).await
         }
 
         Request::CreateBtwFork {
             parent_session_id,
             tangent,
         } => {
-            let ledger = match remote_operation {
-                Some(operation) => Some(build_remote_session_ledger(
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let ledger = build_remote_session_ledger(
                     ctx,
                     &authorized_request,
                     &Request::CreateBtwFork {
@@ -5521,79 +5703,43 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         tangent,
                     },
                     operation,
-                )?),
-                None => None,
-            };
-            create_btw_fork(
-                ctx,
-                &state.principal,
-                parent_session_id,
-                tangent,
-                ledger.as_ref(),
-            )
-            .await
+                )?;
+                return sessions_remote::create_btw_fork(
+                    ctx,
+                    &state.principal,
+                    parent_session_id,
+                    tangent,
+                    &ledger,
+                )
+                .await;
+            }
+            create_btw_fork(ctx, &state.principal, parent_session_id, tangent).await
         }
 
         Request::EndBtwFork { parent_session_id } => {
-            let ledger = match remote_operation {
-                Some(operation) => Some(build_remote_session_ledger(
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let ledger = build_remote_session_ledger(
                     ctx,
                     &authorized_request,
                     &Request::EndBtwFork { parent_session_id },
                     operation,
-                )?),
-                None => None,
-            };
-            end_btw_fork(ctx, parent_session_id, ledger.as_ref()).await
+                )?;
+                return sessions_remote::end_btw_fork(ctx, parent_session_id, &ledger).await;
+            }
+            end_btw_fork(ctx, parent_session_id).await
         }
 
         Request::RenameSession { session_id, title } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::RenameSession {
                     session_id,
                     title: title.clone(),
                 };
-                let canonical_params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let logical_attachment_id = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device_id = operation.authenticated_device_id.to_string();
-                let outcome = ctx
-                    .db
-                    .execute_transactional_remote_operation(
-                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                            logical_attachment_id: &logical_attachment_id,
-                            operation_id: &operation_id,
-                            authenticated_device_id: &device_id,
-                            authenticated_device_generation: operation
-                                .authenticated_device_generation,
-                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                            request_hash,
-                            now_ms: chrono::Utc::now().timestamp_millis(),
-                        },
-                        move |conn| {
-                            crate::db::Db::rename_session_conn(conn, session_id, &title)?;
-                            let response = Response::Ack;
-                            let safe_response = serde_json::to_vec(&response)?;
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                                value: response,
-                                safe_response: safe_response.clone(),
-                                outbox_kind: "rename_session".into(),
-                                outbox_payload: safe_response,
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(internal)?;
-                return match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
+                let ledger =
+                    build_remote_session_ledger(ctx, &authorized_request, &request, operation)?;
+                return sessions_remote::rename_session(ctx, session_id, title, &ledger).await;
             }
             rename_session(ctx, session_id, &title).await
         }
@@ -5607,94 +5753,37 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::RecordSessionNote { session_id, text } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::RecordSessionNote {
                     session_id,
                     text: text.clone(),
                 };
-                let canonical_params = request
-                    .canonical_remote_operation_params_v1()
-                    .map_err(internal)?;
-                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
-                let request_hash = remote_request_hash(ctx, &canonical);
-                let agent = ctx
-                    .db
-                    .get_session(session_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| ErrorPayload {
-                        code: ErrorCode::UnknownSession,
-                        message: format!("unknown session {session_id}"),
-                    })?
-                    .active_agent;
-                let data_json = serde_json::to_string(&serde_json::json!({ "text": text }))
-                    .map_err(internal)?;
-                let logical_attachment_id = operation.logical_attachment_id.to_string();
-                let operation_id = operation.operation_id.to_string();
-                let device_id = operation.authenticated_device_id.to_string();
-                let outcome = ctx
-                    .db
-                    .execute_transactional_remote_operation(
-                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
-                            logical_attachment_id: &logical_attachment_id,
-                            operation_id: &operation_id,
-                            authenticated_device_id: &device_id,
-                            authenticated_device_generation: operation
-                                .authenticated_device_generation,
-                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-                            request_hash,
-                            now_ms: chrono::Utc::now().timestamp_millis(),
-                        },
-                        move |conn| {
-                            let seq = crate::db::Db::insert_session_event_json_conn(
-                                conn,
-                                session_id,
-                                crate::db::session_log::SessionEventKind::UserNote,
-                                Some(&agent),
-                                None,
-                                crate::db::session_log::SessionEventContext::default(),
-                                chrono::Utc::now().timestamp_millis(),
-                                &data_json,
-                            )?;
-                            let response = Response::NoteRecorded { seq };
-                            let safe_response = serde_json::to_vec(&response)?;
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
-                                value: response,
-                                safe_response: safe_response.clone(),
-                                outbox_kind: "record_session_note".into(),
-                                outbox_payload: safe_response,
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(internal)?;
-                return match outcome {
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
-                };
+                let ledger =
+                    build_remote_session_ledger(ctx, &authorized_request, &request, operation)?;
+                return sessions_remote::record_session_note(ctx, session_id, text, &ledger).await;
             }
             record_session_note(ctx, session_id, &text).await
         }
 
         Request::DeleteSession { session_id } => {
-            let ledger = match remote_operation {
-                Some(operation) => Some(build_remote_session_ledger(
+            #[cfg(feature = "remote")]
+            if let Some(operation) = remote_operation {
+                let ledger = build_remote_session_ledger(
                     ctx,
                     &authorized_request,
                     &Request::DeleteSession { session_id },
                     operation,
-                )?),
-                None => None,
-            };
-            delete_session(
-                ctx,
-                session_id,
-                state.negotiated_protocol_version(),
-                ledger.as_ref(),
-            )
-            .await
+                )?;
+                return sessions_remote::delete_session(
+                    ctx,
+                    session_id,
+                    state.negotiated_protocol_version(),
+                    &ledger,
+                )
+                .await;
+            }
+            delete_session(ctx, session_id, state.negotiated_protocol_version()).await
         }
 
         Request::GetInventoryBundle {
@@ -5915,6 +6004,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             validate_set_agent(ctx, att, &name)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
                 let request = Request::SetAgent { name: name.clone() };
@@ -5949,8 +6039,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
                 // Idempotent live convergence. If the process dies here, the
                 // durable session row is authoritative on resume/recovery.
@@ -5969,6 +6061,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::SetLlmMode { mode } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetLlmMode { mode },
@@ -5984,16 +6077,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .send_work(SessionWork::SetLlmMode { mode })
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_llm_mode", Response::Ack).await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_llm_mode", Response::Ack)
         }
 
         Request::SetSessionLlmMode { mode } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let session_id = att.handle.session_id;
                 let request = Request::SetSessionLlmMode { mode };
@@ -6028,8 +6117,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
                     crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
-                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
-                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::ExistingIndeterminate => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
                 };
                 att.handle
                     .send_work(SessionWork::SetSessionLlmMode { mode })
@@ -6051,6 +6142,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             monty_nudge,
         } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetToolSurfaceOverride {
                     override_json: override_json.clone(),
@@ -6076,18 +6168,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(
-                        operation,
-                        ctx,
-                        "set_tool_surface_override",
-                        Response::Ack,
-                    )
-                    .await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "set_tool_surface_override",
+                Response::Ack
+            )
         }
 
         Request::SetGoalSettingsOverride {
@@ -6095,6 +6181,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             persist_session,
         } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetGoalSettingsOverride {
                     override_json: override_json.clone(),
@@ -6119,22 +6206,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(
-                        operation,
-                        ctx,
-                        "set_goal_settings_override",
-                        Response::Ack,
-                    )
-                    .await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "set_goal_settings_override",
+                Response::Ack
+            )
         }
 
         Request::SetApprovalMode { mode } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetApprovalMode { mode },
@@ -6148,12 +6230,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             let mode = att.handle.set_approval_mode(mode);
             let response = Response::ApprovalModeState { mode };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_approval_mode", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_approval_mode", response)
         }
 
         Request::SetDelegationRecursion {
@@ -6161,6 +6238,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             default_depth,
         } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetDelegationRecursion {
@@ -6186,18 +6264,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 enabled,
                 default_depth,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(
-                        operation,
-                        ctx,
-                        "set_delegation_recursion",
-                        response,
-                    )
-                    .await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "set_delegation_recursion",
+                response
+            )
         }
 
         Request::SetCaffeinate { mode } => set_caffeinate(state, ctx, mode),
@@ -6220,6 +6292,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // broadcasts a `SandboxState` event so every attached client
             // stays in sync.
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetSandbox {
                     mode,
@@ -6251,16 +6324,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 container_availability: crate::container::availability_snapshot(),
                 persisted_intent: Some(applied.persisted_intent),
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_sandbox", response)
         }
 
         Request::SetSandboxEscalation { enabled } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetSandboxEscalation { enabled },
@@ -6274,13 +6343,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             let enabled = att.handle.set_sandbox_escalation(enabled);
             let response = Response::SandboxEscalationState { enabled };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox_escalation", response)
-                        .await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "set_sandbox_escalation",
+                response
+            )
         }
 
         Request::SetPreflight { enabled } => {
@@ -6289,6 +6357,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // the resulting state (→ toast + mirror). Session-only — no
             // config-file write.
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetPreflight { enabled },
@@ -6314,16 +6383,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_preflight", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_preflight", response)
         }
 
         Request::SetLongcache { enabled } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::SetLongcache { enabled },
@@ -6349,12 +6414,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_longcache", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_longcache", response)
         }
 
         Request::SetRedaction {
@@ -6368,6 +6428,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // broadcasts the resulting state (→ toast). Session-only — no
             // config-file write. `scrub()` stays non-bypassable.
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetRedaction {
                     scan_environment,
@@ -6400,12 +6461,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 scan_dotenv,
                 scan_ssh_keys,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_redaction", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "set_redaction", response)
         }
 
         Request::SetTandemModels { models } => {
@@ -6415,6 +6471,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // state (+ token-burn warning) via `Event::TandemState`.
             // Session-only — no config-file write.
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SetTandemModels {
                     models: models.clone(),
@@ -6430,17 +6487,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .send_work(SessionWork::SetTandemModels { models })
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "set_tandem_models", Response::Ack)
-                        .await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(
+                remote_operation,
+                ctx,
+                "set_tandem_models",
+                Response::Ack
+            )
         }
 
         Request::Prune => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&Request::Prune, &authorized_request, operation, ctx)
@@ -6452,16 +6509,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .send_work(SessionWork::Prune)
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "prune", Response::Ack).await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "prune", Response::Ack)
         }
 
         Request::Compact => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::Compact,
@@ -6477,16 +6530,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .send_work(SessionWork::Compact)
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "compact", Response::Ack).await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "compact", Response::Ack)
         }
 
         Request::Pin { text } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::Pin { text: text.clone() };
                 if let Some(response) =
@@ -6500,14 +6549,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .send_work(SessionWork::Pin { text })
                 .await
                 .map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "pin", Response::Ack).await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "pin", Response::Ack)
         }
 
+        #[cfg(feature = "remote")]
         Request::StoreFlycockpitCredential { credential, force } => {
             let request = Request::StoreFlycockpitCredential {
                 credential: credential.clone(),
@@ -6518,6 +6563,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6582,12 +6628,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             result
         }
 
+        #[cfg(feature = "remote")]
         Request::ClearFlycockpitCredential => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::ClearFlycockpitCredential,
@@ -6701,6 +6749,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             result
         }
 
+        #[cfg(feature = "remote")]
         Request::SetFlycockpitConnectorEnabled { enabled } => {
             let request = Request::SetFlycockpitConnectorEnabled { enabled };
             if ctx.paths.ephemeral {
@@ -6708,6 +6757,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept FlyCockpit connector settings",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6738,6 +6788,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::SyncFlycockpitOrgPolicy => {
             let request = Request::SyncFlycockpitOrgPolicy;
             if ctx.paths.ephemeral {
@@ -6745,6 +6796,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept FlyCockpit org policy sync",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6793,6 +6845,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::EnrollFlycockpitOrgSync { org_id } => {
             let request = Request::EnrollFlycockpitOrgSync {
                 org_id: org_id.clone(),
@@ -6802,6 +6855,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept FlyCockpit org sync enrollment",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6837,6 +6891,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::PutNamedSecret { name, value } => {
+            #[cfg(feature = "remote")]
             let request = Request::PutNamedSecret {
                 name: name.clone(),
                 value: value.clone(),
@@ -6846,6 +6901,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6855,33 +6911,47 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             reject_owned_named_secret(ctx, &name).await?;
-            match remote_operation {
-                Some(operation) => {
-                    mutate_owner_vault_item_with_remote_ledger(
-                        ctx,
-                        operation,
-                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
-                        &name,
-                        Some(value.as_bytes()),
-                        "put_named_secret",
-                        Response::Ack,
-                        None,
-                    )
-                    .await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        mutate_owner_vault_item_with_remote_ledger(
+                            ctx,
+                            operation,
+                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                            &name,
+                            Some(value.as_bytes()),
+                            "put_named_secret",
+                            Response::Ack,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                            &name,
+                            Some(value.as_bytes()),
+                        )
+                        .map_err(internal)?;
+                        Ok(Response::Ack)
+                    }
                 }
-                None => {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
-                        &name,
-                        Some(value.as_bytes()),
-                    )
-                    .map_err(internal)?;
-                    Ok(Response::Ack)
-                }
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    &name,
+                    Some(value.as_bytes()),
+                )
+                .map_err(internal)?;
+                Ok(Response::Ack)
             }
         }
 
         Request::PutSubscriptionAck { provider_id } => {
+            #[cfg(feature = "remote")]
             let request = Request::PutSubscriptionAck {
                 provider_id: provider_id.clone(),
             };
@@ -6890,6 +6960,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6900,39 +6971,54 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
             let payload = serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
-            match remote_operation {
-                Some(operation) => {
-                    mutate_owner_vault_item_with_remote_ledger(
-                        ctx,
-                        operation,
-                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                        &item_id,
-                        Some(&payload),
-                        "put_subscription_ack",
-                        Response::Ack,
-                        None,
-                    )
-                    .await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        mutate_owner_vault_item_with_remote_ledger(
+                            ctx,
+                            operation,
+                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                            &item_id,
+                            Some(&payload),
+                            "put_subscription_ack",
+                            Response::Ack,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                            &item_id,
+                            Some(&payload),
+                        )
+                        .map_err(internal)?;
+                        Ok(Response::Ack)
+                    }
                 }
-                None => {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                        &item_id,
-                        Some(&payload),
-                    )
-                    .map_err(internal)?;
-                    Ok(Response::Ack)
-                }
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                    &item_id,
+                    Some(&payload),
+                )
+                .map_err(internal)?;
+                Ok(Response::Ack)
             }
         }
 
         Request::DeleteNamedSecret { name } => {
+            #[cfg(feature = "remote")]
             let request = Request::DeleteNamedSecret { name: name.clone() };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent named-secret writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6942,29 +7028,42 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             reject_owned_named_secret(ctx, &name).await?;
-            match remote_operation {
-                Some(operation) => {
-                    mutate_owner_vault_item_with_remote_ledger(
-                        ctx,
-                        operation,
-                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
-                        &name,
-                        None,
-                        "delete_named_secret",
-                        Response::Ack,
-                        None,
-                    )
-                    .await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        mutate_owner_vault_item_with_remote_ledger(
+                            ctx,
+                            operation,
+                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                            &name,
+                            None,
+                            "delete_named_secret",
+                            Response::Ack,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                            &name,
+                            None,
+                        )
+                        .map_err(internal)?;
+                        Ok(Response::Ack)
+                    }
                 }
-                None => {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
-                        &name,
-                        None,
-                    )
-                    .map_err(internal)?;
-                    Ok(Response::Ack)
-                }
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    &name,
+                    None,
+                )
+                .map_err(internal)?;
+                Ok(Response::Ack)
             }
         }
 
@@ -6972,6 +7071,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             provider_id,
             record,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::PutProviderCredential {
                 provider_id: provider_id.clone(),
                 record: record.clone(),
@@ -6981,6 +7081,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -6996,29 +7097,42 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             })?;
             let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            match remote_operation {
-                Some(operation) => {
-                    mutate_owner_vault_item_with_remote_ledger(
-                        ctx,
-                        operation,
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &provider_id,
-                        Some(&record_bytes),
-                        "put_provider_credential",
-                        Response::Ack,
-                        None,
-                    )
-                    .await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        mutate_owner_vault_item_with_remote_ledger(
+                            ctx,
+                            operation,
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &provider_id,
+                            Some(&record_bytes),
+                            "put_provider_credential",
+                            Response::Ack,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &provider_id,
+                            Some(&record_bytes),
+                        )
+                        .map_err(internal)?;
+                        Ok(Response::Ack)
+                    }
                 }
-                None => {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &provider_id,
-                        Some(&record_bytes),
-                    )
-                    .map_err(internal)?;
-                    Ok(Response::Ack)
-                }
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &provider_id,
+                    Some(&record_bytes),
+                )
+                .map_err(internal)?;
+                Ok(Response::Ack)
             }
         }
 
@@ -7072,6 +7186,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::CompleteProviderOAuth {
                 flow_id: flow_id.clone(),
                 input: input.clone(),
@@ -7082,6 +7197,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // (which carries no token) without re-running the exchange. The PKCE
             // verifier and the exchanged tokens stay server-side / in the vault
             // and never enter the ledger's safe response or any log.
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7186,18 +7302,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     retry_after_seconds: None,
                 })
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "complete_provider_oauth",
-                        mutation,
-                    )
-                    .await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "complete_provider_oauth",
+                mutation
+            )
         }
 
         Request::BeginMcpOAuth {
@@ -7241,7 +7351,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // listener); the remote client presents it and returns the callback
             // code over `CompleteMcpOAuth`. `is_local_owner_action` derives this
             // from daemon-assigned signals the caller cannot forge.
-            let local_display = is_local_owner_action(state, remote_operation);
+            let local_display = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             let (flow, authorize_url) =
                 crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
                     .await
@@ -7270,6 +7384,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::CompleteMcpOAuth {
                 flow_id: flow_id.clone(),
                 input: input.clone(),
@@ -7280,6 +7395,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // response). The exchanged tokens are staged into the vault inside
             // the BEGIN IMMEDIATE transaction below and never enter the ledger
             // safe response or any log.
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7354,13 +7470,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     authenticated: true,
                 })
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(operation, ctx, "complete_mcp_oauth", mutation)
-                        .await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(remote_operation, ctx, "complete_mcp_oauth", mutation)
         }
 
         Request::CancelMcpOAuth { flow_id } => {
@@ -7373,6 +7483,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             provider_id,
             project_root,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::DeleteProviderCredential {
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
@@ -7382,6 +7493,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept persistent provider credential writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7432,32 +7544,46 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             } else {
                 (provider_id.clone(), Response::Ack)
             };
-            match remote_operation {
-                Some(operation) => {
-                    mutate_owner_vault_item_with_remote_ledger(
-                        ctx,
-                        operation,
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &credential_record_id,
-                        None,
-                        "delete_provider_credential",
-                        response,
-                        None,
-                    )
-                    .await
+            #[cfg(feature = "remote")]
+            {
+                match remote_operation {
+                    Some(operation) => {
+                        mutate_owner_vault_item_with_remote_ledger(
+                            ctx,
+                            operation,
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &credential_record_id,
+                            None,
+                            "delete_provider_credential",
+                            response,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &credential_record_id,
+                            None,
+                        )
+                        .map_err(internal)?;
+                        Ok(response)
+                    }
                 }
-                None => {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &credential_record_id,
-                        None,
-                    )
-                    .map_err(internal)?;
-                    Ok(response)
-                }
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                ctx.mutate_owner_vault_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &credential_record_id,
+                    None,
+                )
+                .map_err(internal)?;
+                Ok(response)
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::GetFlycockpitAccount => ctx
             .flycockpit_account_view()
             .map(|account| Response::FlycockpitAccount { account })
@@ -7481,6 +7607,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept provider model fetches that persist config",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::FetchProviderModels {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
@@ -7489,6 +7616,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 on_unlisted,
                 allow_fallback,
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7496,39 +7624,22 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "fetch_provider_models",
-                        provider_models_fetch(
-                            ctx,
-                            &project_root,
-                            provider_id.as_deref(),
-                            model_id.as_deref(),
-                            deep,
-                            on_unlisted,
-                            allow_fallback,
-                            provider_env_snapshot(ctx, state),
-                        ),
-                    )
-                    .await
-                }
-                None => {
-                    provider_models_fetch(
-                        ctx,
-                        &project_root,
-                        provider_id.as_deref(),
-                        model_id.as_deref(),
-                        deep,
-                        on_unlisted,
-                        allow_fallback,
-                        provider_env_snapshot(ctx, state),
-                    )
-                    .await
-                }
-            }
+            let mutation = provider_models_fetch(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                model_id.as_deref(),
+                deep,
+                on_unlisted,
+                allow_fallback,
+                provider_env_snapshot(ctx, state),
+            );
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "fetch_provider_models",
+                mutation
+            )
         }
 
         Request::GetProviderUsageSnapshot {
@@ -7554,11 +7665,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::UpsertProviderConfig {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
                 entry: entry.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7566,18 +7679,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "upsert_provider_config",
-                        provider_config_upsert(ctx, &project_root, &provider_id, entry),
-                    )
-                    .await
-                }
-                None => provider_config_upsert(ctx, &project_root, &provider_id, entry).await,
-            }
+            let mutation = provider_config_upsert(ctx, &project_root, &provider_id, entry);
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "upsert_provider_config",
+                mutation
+            )
         }
 
         Request::SaveProviderConfig {
@@ -7591,12 +7699,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::SaveProviderConfig {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
                 entry: entry.clone(),
                 header_secrets: header_secrets.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7604,27 +7714,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            let result = match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "save_provider_config",
-                        provider_config_save(
-                            ctx,
-                            &project_root,
-                            &provider_id,
-                            entry,
-                            header_secrets,
-                        ),
-                    )
-                    .await
-                }
-                None => {
-                    provider_config_save(ctx, &project_root, &provider_id, entry, header_secrets)
-                        .await
-                }
-            };
+            let mutation =
+                provider_config_save(ctx, &project_root, &provider_id, entry, header_secrets);
+            let result = finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "save_provider_config",
+                mutation
+            );
             // Invalidate + re-resolve the command secrets this provider
             // references AFTER the save completes and its config-publication lock
             // is released (so a slow, up-to-30s subprocess never blocks other
@@ -7672,10 +7769,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept Copilot auth setup",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::SetupCopilotAuth {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7688,7 +7787,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // GitHub token; any remote caller is failed closed inside
             // `setup_copilot_auth`. `is_local_owner` is derived only from
             // daemon-assigned signals — see `is_local_owner_action`.
-            let is_local_owner = is_local_owner_action(state, remote_operation);
+            let is_local_owner = is_local_owner_action(
+                state,
+                #[cfg(feature = "remote")]
+                remote_operation,
+            );
             let operation_result = setup_copilot_auth(
                 ctx,
                 &project_root,
@@ -7698,15 +7801,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             )
             .await;
             let operation_result = operation_result.map(|_| Response::Ack);
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(operation, ctx, "setup_copilot_auth", async {
-                        operation_result
-                    })
-                    .await
-                }
-                None => operation_result,
-            }
+            finish_provider_mutation_future!(remote_operation, ctx, "setup_copilot_auth", async {
+                operation_result
+            })
         }
 
         Request::ApplySetupWizard {
@@ -7714,11 +7811,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             wizard_id,
             answers_json,
         } => {
+            #[cfg(feature = "remote")]
             let request = Request::ApplySetupWizard {
                 project_root: project_root.clone(),
                 wizard_id: wizard_id.clone(),
                 answers_json: answers_json.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7740,13 +7839,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     default_scope: result.2,
                 })
             };
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(operation, ctx, "apply_setup_wizard", mutation)
-                        .await
-                }
-                None => mutation.await,
-            }
+            finish_provider_mutation_future!(remote_operation, ctx, "apply_setup_wizard", mutation)
         }
 
         Request::SaveMcpConfig {
@@ -7760,12 +7853,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept MCP config writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::SaveMcpConfig {
                 project_root: project_root.clone(),
                 config_json: config_json.clone(),
                 secret_values_json: secret_values_json.clone(),
                 cleanup_names_json: cleanup_names_json.clone(),
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7780,18 +7875,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 &secret_values_json,
                 &cleanup_names_json,
             );
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "save_mcp_config",
-                        operation_result,
-                    )
-                    .await
-                }
-                None => operation_result.await,
-            }
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "save_mcp_config",
+                operation_result
+            )
         }
 
         Request::DeleteProviderConfig {
@@ -7804,11 +7893,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept provider config writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::DeleteProviderConfig {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
                 delete_stored_secrets,
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7816,26 +7907,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "delete_provider_config",
-                        provider_config_delete(
-                            ctx,
-                            &project_root,
-                            &provider_id,
-                            delete_stored_secrets,
-                        ),
-                    )
-                    .await
-                }
-                None => {
-                    provider_config_delete(ctx, &project_root, &provider_id, delete_stored_secrets)
-                        .await
-                }
-            }
+            let mutation =
+                provider_config_delete(ctx, &project_root, &provider_id, delete_stored_secrets);
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "delete_provider_config",
+                mutation
+            )
         }
 
         Request::SetProviderLayerMetadata {
@@ -7848,11 +7927,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept provider metadata writes",
                 ));
             }
+            #[cfg(feature = "remote")]
             let request = Request::SetProviderLayerMetadata {
                 project_root: project_root.clone(),
                 category_defaults_json: category_defaults_json.clone(),
                 on_unlisted_models_fetch,
             };
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) =
                     begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
@@ -7860,31 +7941,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             {
                 return Ok(response);
             }
-            match remote_operation {
-                Some(operation) => {
-                    finish_remote_provider_mutation(
-                        operation,
-                        ctx,
-                        "set_provider_layer_metadata",
-                        provider_layer_metadata_set(
-                            ctx,
-                            &project_root,
-                            category_defaults_json,
-                            on_unlisted_models_fetch,
-                        ),
-                    )
-                    .await
-                }
-                None => {
-                    provider_layer_metadata_set(
-                        ctx,
-                        &project_root,
-                        category_defaults_json,
-                        on_unlisted_models_fetch,
-                    )
-                    .await
-                }
-            }
+            let mutation = provider_layer_metadata_set(
+                ctx,
+                &project_root,
+                category_defaults_json,
+                on_unlisted_models_fetch,
+            );
+            finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "set_provider_layer_metadata",
+                mutation
+            )
         }
 
         Request::DaemonStatus => Ok(Response::DaemonStatus {
@@ -7910,6 +7978,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::RefreshEnv { vars } => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::RefreshEnv { vars: vars.clone() };
                 if let Some(response) =
@@ -7920,16 +7989,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 }
             }
             att.handle.set_env_overlay(vars);
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "refresh_env", Response::Ack).await
-                }
-                None => Ok(Response::Ack),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "refresh_env", Response::Ack)
         }
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation
                 && let Some(response) = begin_remote_nonrepeatable(
                     &Request::RefreshConfig,
@@ -7952,12 +8017,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 applied_generation: refreshed.applied_generation,
                 changed: refreshed.changed,
             };
-            match remote_operation {
-                Some(operation) => {
-                    commit_remote_nonrepeatable(operation, ctx, "refresh_config", response).await
-                }
-                None => Ok(response),
-            }
+            finish_nonrepeatable_response!(remote_operation, ctx, "refresh_config", response)
         }
 
         Request::RecordUsage {
@@ -8810,6 +8870,26 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     }
 }
 
+#[cfg(feature = "remote")]
+pub(super) async fn handle_serialized_request_with_remote_operation(
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    Box::pin(handle_serialized_request_impl(
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        remote_operation,
+    ))
+    .await
+}
+
 // ---- `/leaks` dispatch helpers ---------------------------------------------
 //
 // These handlers back the `/leaks` page. List rows never carry plaintext; the
@@ -9026,12 +9106,13 @@ pub(super) async fn delete_leak_report(
     Ok(Response::LeakReportDeleted { report_id })
 }
 
-pub(super) async fn handle_concurrent_request_with_remote_operation(
+async fn handle_concurrent_request_impl(
     request: Request,
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
-    remote_operation: Option<super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    #[cfg(feature = "remote")]
     if let Some(operation) = &remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -9044,9 +9125,12 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     }
     validate_request_semantics(&request)?;
     let request_kind = principal::request_kind(&request);
+    #[cfg(feature = "remote")]
     let audit_path = request_audit_path(&request);
+    #[cfg(feature = "remote")]
     let audit_remote = !shared.principal.is_owner() && is_remote_mutating_request(&request);
     if let Err(error) = authorize_request_shared(&request, &shared, &ctx).await {
+        #[cfg(feature = "remote")]
         if audit_remote {
             audit_remote_request(
                 &ctx,
@@ -9060,6 +9144,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
         }
         return Err(error);
     }
+    #[cfg(feature = "remote")]
     if audit_remote {
         audit_remote_request(
             &ctx,
@@ -9220,8 +9305,11 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             include_generated_artifacts,
             include_sensitive,
         } => {
+            #[cfg(feature = "remote")]
             let local_owner_action =
                 is_local_owner_action_shared(&shared, remote_operation.as_ref());
+            #[cfg(not(feature = "remote"))]
+            let local_owner_action = shared.principal.is_owner();
             export_session_data(
                 &ctx,
                 session_id,
@@ -9239,25 +9327,34 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             chunk_index,
             data_base64,
         } => {
-            let owner = if transfer.mime_class
-                == cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque
-            {
-                let session_id = shared
-                    .attached
-                    .as_ref()
-                    .map(SharedAttachedSession::session_id)
-                    .ok_or_else(|| ErrorPayload {
-                        code: ErrorCode::NotAttached,
-                        message: "request requires an attached session".to_owned(),
-                    })?;
-                Some(bulk_user_message_transfer_owner(
-                    &shared.principal,
-                    session_id,
-                    remote_operation.as_ref(),
-                )?)
-            } else {
-                None
-            };
+            let owner =
+                if transfer.mime_class == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque {
+                    let session_id = shared
+                        .attached
+                        .as_ref()
+                        .map(SharedAttachedSession::session_id)
+                        .ok_or_else(|| ErrorPayload {
+                            code: ErrorCode::NotAttached,
+                            message: "request requires an attached session".to_owned(),
+                        })?;
+                    #[cfg(feature = "remote")]
+                    {
+                        Some(bulk_user_message_transfer_owner(
+                            &shared.principal,
+                            session_id,
+                            remote_operation.as_ref(),
+                        )?)
+                    }
+                    #[cfg(not(feature = "remote"))]
+                    {
+                        Some(bulk_user_message_transfer_owner_local(
+                            &shared.principal,
+                            session_id,
+                        )?)
+                    }
+                } else {
+                    None
+                };
             write_bulk_transfer_chunk(&transfer, chunk_index, &data_base64, owner.as_ref()).await
         }
         Request::ReadBulkTransferChunk {
@@ -9623,7 +9720,9 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             provider_id,
         } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
         Request::ListPackages => list_packages_response(&ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(&ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetOrgSyncStatus => get_org_sync_status_response(&ctx).await,
         Request::ListFailedToolCalls {
             since_epoch,
@@ -9670,6 +9769,26 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             message: format!("request `{request_kind}` is not marked concurrent"),
         }),
     }
+}
+
+/// Local-profile concurrent dispatch entry point. Remote operation identity is
+/// not part of the caller-facing contract.
+pub(super) async fn handle_concurrent_request(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    handle_concurrent_request_impl(request, shared, ctx).await
+}
+
+#[cfg(feature = "remote")]
+pub(super) async fn handle_concurrent_request_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    handle_concurrent_request_impl(request, shared, ctx, remote_operation).await
 }
 
 fn current_host_capability_snapshot(ctx: &DaemonContext) -> cockpit_proto::HostCapabilitySnapshot {
@@ -10406,7 +10525,7 @@ pub(super) fn bounded_provider_response(
     response: Response,
 ) -> std::result::Result<Response, ErrorPayload> {
     let encoded = serde_json::to_vec(&response).map_err(internal)?;
-    if encoded.len() > proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES {
+    if encoded.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES {
         return Err(bad_request(
             "provider response exceeds the interactive payload limit; narrow the provider or model selection",
         ));
@@ -13493,6 +13612,7 @@ fn package_row_json(row: &crate::db::packages::PackageRow) -> serde_json::Value 
 }
 
 /// Non-secret JSON projection of the FlyCockpit connector state.
+#[cfg(feature = "remote")]
 fn connector_state_json(state: &crate::db::connector::ConnectorState) -> serde_json::Value {
     serde_json::json!({
         "server_url": state.server_url,
@@ -13508,6 +13628,7 @@ fn connector_state_json(state: &crate::db::connector::ConnectorState) -> serde_j
 }
 
 /// Non-secret JSON projection of one org-policy sync state row.
+#[cfg(feature = "remote")]
 fn org_sync_state_json(state: &crate::db::org_sync::OrgSyncState) -> serde_json::Value {
     serde_json::json!({
         "server_url": state.server_url,
@@ -13522,6 +13643,7 @@ fn org_sync_state_json(state: &crate::db::org_sync::OrgSyncState) -> serde_json:
 }
 
 /// Non-secret JSON projection of one remote-audit upload cursor row.
+#[cfg(feature = "remote")]
 fn audit_upload_state_json(
     state: &crate::db::remote_audit_upload::RemoteAuditUploadState,
 ) -> serde_json::Value {
@@ -13614,6 +13736,7 @@ async fn list_packages_response(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn get_connector_state_response(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -13634,6 +13757,7 @@ async fn get_connector_state_response(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn get_org_sync_status_response(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -14318,7 +14442,7 @@ fn staging_error(error: crate::daemon::bulk_staging::BulkStagingError) -> ErrorP
 
 /// Accept one pushed chunk of a bulk transfer into daemon-side staging.
 pub(super) async fn write_bulk_transfer_chunk(
-    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
     chunk_index: u32,
     data_base64: &str,
     owner: Option<&crate::daemon::bulk_staging::BulkTransferOwner>,
@@ -14336,7 +14460,7 @@ pub(super) async fn write_bulk_transfer_chunk(
             message: format!("invalid bulk transfer chunk encoding: {error}"),
         })?;
     let accepted = match transfer.mime_class {
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque => {
+        cockpit_proto::bulk_transfer::BulkMimeClass::Opaque => {
             let owner = owner.ok_or_else(unavailable_bulk_user_message_transfer)?;
             crate::daemon::bulk_staging::write_chunk_owned(transfer, owner, chunk_index, &chunk)
                 .map_err(|error| match error {
@@ -14351,7 +14475,7 @@ pub(super) async fn write_bulk_transfer_chunk(
     };
     Ok(Response::BulkTransferChunkAccepted {
         next_chunk_index: accepted.next_chunk_index,
-        received_bytes: cockpit_proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+        received_bytes: cockpit_proto::wire_scalar::CanonicalU64DecimalStringV1::from_u64(
             accepted.received_bytes,
         ),
         complete: accepted.complete,
@@ -14367,13 +14491,13 @@ pub(super) async fn write_bulk_transfer_chunk(
 /// no session/actor proof on this request shape. User-message bodies are
 /// consumed exclusively by the owned `SendUserMessageBulk` path.
 pub(super) async fn read_bulk_transfer_chunk(
-    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    transfer_id: &cockpit_proto::bulk_transfer::BulkTransferId,
     chunk_index: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let (chunk, last) = crate::daemon::bulk_staging::read_chunk_of_kind(
         *transfer_id.as_bytes(),
         chunk_index,
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        cockpit_proto::bulk_transfer::BulkMimeClass::Export,
     )
     .map_err(staging_error)?;
     Ok(Response::BulkTransferChunk {
@@ -14385,7 +14509,7 @@ pub(super) async fn read_bulk_transfer_chunk(
 
 pub(super) async fn import_session_archive(
     ctx: &Arc<DaemonContext>,
-    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The archive bytes were staged by prior WriteBulkTransferChunk calls; the
     // staging layer verified their length and SHA-256 before releasing them.
@@ -14414,9 +14538,8 @@ pub(super) async fn import_session_archive(
 /// single assemble funnel below, never by the caller streaming it back.
 fn stage_export_bytes(
     bytes: &[u8],
-    mime_class: cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass,
-) -> std::result::Result<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef, ErrorPayload>
-{
+    mime_class: cockpit_proto::bulk_transfer::BulkMimeClass,
+) -> std::result::Result<cockpit_proto::bulk_transfer::BulkTransferRef, ErrorPayload> {
     use rand::RngExt as _;
     let mut transfer_id = [0u8; 16];
     rand::rng().fill(&mut transfer_id[..]);
@@ -14436,13 +14559,13 @@ fn stage_export_bytes(
 /// This is what keeps the raw archive owner-local while a redacted export is
 /// downloadable over the wire.
 pub(super) async fn read_redacted_export_chunk(
-    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    transfer_id: &cockpit_proto::bulk_transfer::BulkTransferId,
     chunk_index: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let (chunk, last) = crate::daemon::bulk_staging::read_chunk_of_kind(
         *transfer_id.as_bytes(),
         chunk_index,
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
+        cockpit_proto::bulk_transfer::BulkMimeClass::RedactedExport,
     )
     .map_err(staging_error)?;
     Ok(Response::BulkTransferChunk {
@@ -14460,7 +14583,7 @@ pub(super) async fn export_session_data(
     include_sensitive: bool,
     local_owner_action: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+    use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
     // AC1: the raw, unredacted export is owner-LOCAL only. A remoted caller (a
     // remote-operation ledger dispatch, or any non-owner principal) is refused
     // BEFORE any archive is assembled or staged, so the only remoted success

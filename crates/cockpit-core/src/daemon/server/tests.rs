@@ -233,6 +233,7 @@ fn sealed_owner_channel_requests() -> Vec<Request> {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn non_owner_rejected() {
     // AC4: every sealed-owner RPC fails closed with an Authorization error for a
     // remote (non-owner) principal, before any handler logic runs.
@@ -500,6 +501,7 @@ async fn pin_rpc_rejects_seq_not_in_session() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn pin_rpcs_reject_non_owner_principal() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -536,6 +538,7 @@ async fn pin_rpcs_reject_non_owner_principal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn pin_reader_principal_can_read_but_not_write() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -704,6 +707,7 @@ async fn project_note_rejects_id_from_another_project_root() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn project_note_rpcs_reject_unauthorized_project_root() {
     let ctx = test_ctx();
     let note = ctx.db.create_project_note("/repo", "todo").await.unwrap();
@@ -1390,6 +1394,7 @@ async fn docs_ask_uses_docs_agent_session() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn upsert_assistant_rejects_non_owner_principal() {
     let ctx = test_ctx();
     let mut state = remote_state_with_grants(vec![crate::daemon::principal::PrincipalGrant {
@@ -4132,6 +4137,7 @@ async fn detached_client_cannot_remove_editable_queued_messages() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_session_messages_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4192,6 +4198,7 @@ async fn read_session_messages_requires_read_access_returns_page_and_does_not_sp
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_worker() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4255,6 +4262,7 @@ async fn read_history_page_requires_read_access_returns_page_and_does_not_spawn_
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn read_history_page_denied_without_session_read_access() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -4698,6 +4706,7 @@ async fn new_session_state_requests_are_classified() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn new_session_state_requests_enforce_authorization() {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
@@ -5488,6 +5497,7 @@ async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_au
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
     for live in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
@@ -5628,6 +5638,7 @@ async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn attach_update_daemon_environment_policy_requires_owner() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -7471,6 +7482,7 @@ fn remote_state_with_grants(
     }
 }
 
+#[cfg(feature = "remote")]
 fn project_files_grant(root: &Path) -> crate::daemon::principal::PrincipalGrant {
     crate::daemon::principal::PrincipalGrant {
         scope: crate::daemon::principal::PrincipalScope::ProjectFiles,
@@ -7478,6 +7490,7 @@ fn project_files_grant(root: &Path) -> crate::daemon::principal::PrincipalGrant 
     }
 }
 
+#[cfg(feature = "remote")]
 fn terminal_grant() -> crate::daemon::principal::PrincipalGrant {
     crate::daemon::principal::PrincipalGrant {
         scope: crate::daemon::principal::PrincipalScope::Terminal,
@@ -11480,6 +11493,7 @@ async fn get_workspace_trust_reads_persisted_mode() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn fs_requests_require_project_files_scope_for_matching_root() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11550,6 +11564,7 @@ async fn fs_requests_require_project_files_scope_for_matching_root() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn terminal_requests_require_terminal_scope_and_audit_open_close() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
@@ -11843,7 +11858,10 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    feature = "remote",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation_or_reservation() {
@@ -15506,7 +15524,7 @@ async fn dispatch_matrix_mutating_dispatch_cases_traverse_socket_path() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     assert_dispatch_matrix_coverage_complete();

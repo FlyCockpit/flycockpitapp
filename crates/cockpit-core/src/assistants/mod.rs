@@ -164,9 +164,6 @@ pub async fn create_assistant_with_installation_id(
     installation_id: Uuid,
 ) -> Result<AssistantRow> {
     validate_assistant_name(&spec.name)?;
-    if db.get_assistant(&spec.name).await?.is_some() {
-        bail!("assistant `{}` already exists", spec.name);
-    }
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
     }
@@ -181,6 +178,13 @@ pub async fn create_assistant_with_installation_id(
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
+    recover_creation_journal(db, &spec.home_dir).await?;
+    if db.get_assistant(&spec.name).await?.is_some() {
+        bail!("assistant `{}` already exists", spec.name);
+    }
+    if cockpit_config::config::read_config_file_nofollow(&path)?.is_some() {
+        bail!("assistant definition already exists without a registry row");
+    }
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description,
@@ -660,6 +664,23 @@ pub async fn save_definition_cas(
     };
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
     Ok(updated)
+}
+
+/// Remove only the registry binding while retaining the user's assistant home.
+/// The same definition lock and journal recovery used by saves ensures delete
+/// cannot race an in-flight file/row commit.
+pub async fn delete_registration(db: &Db, name: &str) -> Result<bool> {
+    validate_assistant_name(name)?;
+    let Some(row) = db.get_assistant(name).await? else {
+        return Ok(false);
+    };
+    let target = assistant_definition_path(Path::new(&row.home_dir));
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&target)?;
+    recover_creation_journal(db, Path::new(&row.home_dir)).await?;
+    let row = db.get_assistant(name).await?
+        .context("assistant disappeared during delete recovery")?;
+    recover_definition_journal_locked(db, &row).await?;
+    db.delete_assistant(name).await
 }
 
 #[cfg(test)]

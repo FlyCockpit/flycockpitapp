@@ -4542,7 +4542,9 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let deleted = ctx.db.delete_assistant(&name).await.map_err(internal)?;
+            let deleted = crate::assistants::delete_registration(&ctx.db, &name)
+                .await
+                .map_err(internal)?;
             let response = Response::AssistantDeleted { deleted };
             finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
         }

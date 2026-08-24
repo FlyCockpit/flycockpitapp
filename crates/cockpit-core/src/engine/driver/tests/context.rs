@@ -1445,17 +1445,16 @@ async fn prepare_commits_nothing() {
         serde_json::to_value(&driver.stack[0].history).unwrap(),
         before_history
     );
-    assert_eq!(prepared.compressed_entries.len(), 1);
     assert_eq!(prepared.seed_tags.len(), 1);
     assert!(
         driver
             .session
             .db
-            .list_compressed_tool_results(driver.session.id)
+            .list_text_artifacts(driver.session.id)
             .await
             .unwrap()
             .is_empty(),
-        "prepare must not persist compressed results"
+        "prepare must not persist text artifacts"
     );
     let events_after = driver
         .session
@@ -1537,7 +1536,7 @@ async fn apply_rejects_stale_prepared_compaction() {
         driver
             .session
             .db
-            .list_compressed_tool_results(driver.session.id)
+            .list_text_artifacts(driver.session.id)
             .await
             .unwrap()
             .is_empty()
@@ -1705,13 +1704,6 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
         .expect("CompactReady emitted");
     assert_eq!(ready, emitted.len() - 1, "CompactReady is last");
 
-    let stored = driver
-        .session
-        .db
-        .list_compressed_tool_results(driver.session.id)
-        .await
-        .unwrap();
-    assert_eq!(stored.len(), 1);
     let db_events = driver
         .session
         .db
@@ -1728,7 +1720,6 @@ async fn apply_ordering_persists_then_runs_seeds_then_emits_ready() {
     assert_eq!(
         *apply_trace.lock().unwrap(),
         [
-            "compressed_results_persisted",
             "live_history_swapped",
             "timeline_recorded",
             "compact_ready_emitted",
@@ -1762,7 +1753,7 @@ async fn rollback_paths_are_gone_because_prepare_is_pure() {
         driver
             .session
             .db
-            .list_compressed_tool_results(driver.session.id)
+            .list_text_artifacts(driver.session.id)
             .await
             .unwrap()
             .is_empty()
@@ -2461,7 +2452,7 @@ async fn compact_prune_stage_does_not_mutate_live_history() {
 }
 
 #[tokio::test]
-async fn compact_private_prune_preserves_shell_condensation() {
+async fn compact_private_prune_does_not_invent_an_artifact_owner() {
     use crate::config::providers::{CacheMode, ContextConfig};
     use crate::engine::message::AssistantContent;
     use rig::message::{ToolCall, ToolFunction};
@@ -2506,15 +2497,14 @@ async fn compact_private_prune_preserves_shell_condensation() {
     driver.do_compact(&tx).await;
 
     let wire = serde_json::to_string(&driver.stack[0].history).unwrap();
-    assert!(wire.contains("compressed tool result"), "{wire}");
+    assert!(!wire.contains("cockpit_artifact_v1"), "{wire}");
     let stored = driver
         .session
         .db
-        .list_compressed_tool_results(driver.session.id)
+        .list_text_artifacts(driver.session.id)
         .await
         .unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].content, original);
+    assert!(stored.is_empty());
 }
 
 #[tokio::test]

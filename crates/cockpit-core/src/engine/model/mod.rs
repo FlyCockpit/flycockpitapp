@@ -90,7 +90,7 @@ mod display_dispatch;
 mod failure;
 mod http_client;
 mod outbound_guard;
-mod redact;
+pub(crate) mod redact;
 pub(crate) mod rig_boundary;
 mod wire;
 pub(crate) mod wire_schema;

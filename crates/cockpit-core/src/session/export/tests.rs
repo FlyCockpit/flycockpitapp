@@ -2708,24 +2708,34 @@ async fn export_tool_output_sidecar_writes_file_and_keeps_event_bounded() {
 }
 
 #[tokio::test]
-async fn export_compressed_tool_results_writes_index_and_payload() {
+async fn export_text_artifacts_writes_index_and_payload() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
-    db.insert_compressed_tool_result(
-        "0123456789abcdefabcdef12",
-        crate::db::compressed_results::NewCompressedToolResult {
-            session_id: sid,
-            agent_id: "Build",
-            tool: "bash",
-            call_id: "tc-long",
-            original_byte_len: 15,
-            compressed_byte_len: Some(5),
+    db.record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+        session_id: sid,
+        kind: SessionEventKind::ToolCall,
+        agent: Some("Build".into()),
+        call_id: Some("tc-long".into()),
+        context: Default::default(),
+        ts_ms: 123,
+        data_json: json!({"output":"short"}).to_string(),
+        artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+            relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+            projection_slot: Some(0),
+            kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+            capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+            content: "redacted output".into(),
+            host_captured_bytes: 15,
+            host_original_bytes: 15,
+            host_dropped_bytes: 0,
+            stored_source_bytes: 15,
+            provenance_json: json!({"agent_id":"Build","tool":"bash","call_id":"tc-long"})
+                .to_string(),
             created_at: 123,
-            kind: "truncated",
-            content: "redacted output",
-        },
-    )
+        }],
+        unavailable_projection: None,
+    })
     .await
     .unwrap();
 
@@ -2733,45 +2743,203 @@ async fn export_compressed_tool_results_writes_index_and_payload() {
     let bundle = collect_bundle(&db, sid).await.unwrap();
     let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let names = entry_names(&zip);
-    assert!(
-        names
-            .iter()
-            .any(|n| n == "compressed_tool_results/index.json")
-    );
+    assert!(names.iter().any(|n| n == "text_artifacts/index.json"));
     let index: Vec<Value> =
-        serde_json::from_str(&read_zip_entry(&zip, "compressed_tool_results/index.json").unwrap())
-            .unwrap();
-    assert_eq!(index[0]["hash"], "0123456789abcdefabcdef12");
-    assert_eq!(index[0]["tool"], "bash");
-    assert_eq!(index[0]["original_byte_len"], 15);
-    assert_eq!(index[0]["compressed_byte_len"], 5);
-    assert_ne!(
-        index[0]["original_byte_len"],
-        index[0]["compressed_byte_len"]
+        serde_json::from_str(&read_zip_entry(&zip, "text_artifacts/index.json").unwrap()).unwrap();
+    assert_eq!(index[0]["kind"], "tool_result");
+    assert_eq!(index[0]["host_original_bytes"], 15);
+    assert_eq!(index[0]["stored_source_bytes"], 15);
+    assert_eq!(
+        index[0]["representation"]["mode"],
+        "redacted_length_preserving"
     );
-    let file = index[0]["file"].as_str().unwrap();
+    let file = index[0]["representation"]["content_file"].as_str().unwrap();
     assert_eq!(read_zip_entry(&zip, file).unwrap(), "redacted output");
 }
 
 #[tokio::test]
-async fn export_truncate_only_result_omits_compressed_byte_len() {
+async fn oversized_user_export_round_trips_a_typed_source_for_import_and_rehydrate() {
+    struct AllowArtifactReceipt;
+
+    impl crate::db::message_attachments::MessageAcceptanceJoin for AllowArtifactReceipt {
+        fn validate_and_join(
+            &self,
+            _: &rusqlite::Connection,
+            _: &crate::db::message_attachments::AcceptMessageInput,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let db = Db::open_in_memory().unwrap();
+    let source_session = create_test_session(&db, "p", "/proj", "Build").await;
+    let source = "user artifact source\n".repeat(4_097);
+    assert!(source.len() > 64 * 1024);
+    let client_submission_id = [91; 16];
+    let reservation = match db
+        .accept_message_with_text_artifact_reservation(
+            crate::db::message_attachments::AcceptMessageInput {
+                session_id: source_session.session_id,
+                operation_id: [90; 16],
+                actor: crate::db::message_attachments::MessageActor::LocalOwner,
+                request_hash: [92; 32],
+                message_request_digest: [93; 32],
+                attachment_set_digest: [94; 32],
+                client_submission_id,
+                queue_item_id: [95; 16],
+                canonical_message: b"FCM2\x02typed-user-artifact".to_vec(),
+                attachments: Vec::new(),
+                outbox_sequence: 0,
+                now_ms: 1_000,
+            },
+            std::sync::Arc::new(AllowArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap()
+    {
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
+            reservation
+        }
+        other => panic!("expected a typed source reservation, got {other:?}"),
+    };
+    let materialized = db
+        .materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: r#"{"version":3,"parts":[{"type":"authored_text_slot"}]}"#.to_owned(),
+                source_text: source.clone(),
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: Default::default(),
+                now_ms: 1_001,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        materialized,
+        crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized { .. }
+    ));
+
+    let bundle = collect_bundle(&db, source_session.session_id).await.unwrap();
+    let archive = trusted_build_zip(&db, &source_session, &bundle).await.unwrap();
+    let index: Vec<Value> = serde_json::from_str(
+        &read_zip_entry(&archive, "text_artifacts/index.json")
+            .expect("export contains the typed user source index"),
+    )
+    .unwrap();
+    assert!(index.iter().any(|entry| {
+        entry["kind"] == "user_input_source"
+            && entry["relation"] == "source_user_input"
+            && entry["capture_reason"] == "oversized_user_input"
+    }));
+
+    let destination = Db::open_in_memory().unwrap();
+    let imported = crate::session::import::import_archive(
+        &destination,
+        crate::session::import::read_archive_bytes(&archive).unwrap(),
+    )
+    .await
+    .expect("typed oversized source remains importable");
+    let imported_session_id = imported.imported[0];
+    let rebuilt = crate::engine::rehydrate::rehydrate_session(
+        &destination,
+        imported_session_id,
+        "Build",
+    )
+    .await
+    .expect("imported typed source is rehydratable")
+    .expect("imported session has history");
+    let rig::message::Message::User { content } = &rebuilt.history[0] else {
+        panic!("expected imported user message");
+    };
+    let Some(rig::message::UserContent::Text(frame)) = content.first() else {
+        panic!("expected imported user text frame");
+    };
+    assert!(frame.text.starts_with("<cockpit_artifact_v1 "));
+    assert!(!frame.text.contains(&source));
+}
+
+#[tokio::test]
+async fn oversized_user_export_keeps_a_legacy_mixed_media_corruption_unimportable() {
+    let db = Db::open_in_memory().unwrap();
+    let source_session = create_test_session(&db, "p", "/proj", "Build").await;
+    let source = "legacy mixed-media source\n".repeat(3_001);
+    assert!(source.len() > 64 * 1024);
+    db.insert_session_event(
+        source_session.session_id,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &json!({
+            "text": source,
+            "images": [{"id": Uuid::new_v4()}],
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Production dispatch now rejects this shape before it becomes durable.
+    // This export/import path proves an old/corrupt database cannot turn it
+    // back into a silently accepted, unreplayable event.
+    let bundle = collect_bundle(&db, source_session.session_id).await.unwrap();
+    let archive = trusted_build_zip(&db, &source_session, &bundle).await.unwrap();
+    let destination = Db::open_in_memory().unwrap();
+    let error = crate::session::import::import_archive(
+        &destination,
+        crate::session::import::read_archive_bytes(&archive).unwrap(),
+    )
+    .await
+    .expect_err("a long mixed-media event must remain artifact-ineligible after export");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot carry media/file parts"),
+        "unexpected import error: {error:#}"
+    );
+    assert!(
+        destination
+            .list_sessions(false, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "import validation fails before creating a destination session"
+    );
+}
+
+#[tokio::test]
+async fn export_text_artifact_preserves_capture_accounting() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", "/proj", "Build").await;
     let sid = s.session_id;
-    db.insert_compressed_tool_result(
-        "fedcba987654321001234567",
-        crate::db::compressed_results::NewCompressedToolResult {
-            session_id: sid,
-            agent_id: "Build",
-            tool: "code",
-            call_id: "tc-truncated",
-            original_byte_len: 128,
-            compressed_byte_len: None,
+    let body = "retained pre-truncation body";
+    db.record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+        session_id: sid,
+        kind: SessionEventKind::ToolCall,
+        agent: Some("Build".into()),
+        call_id: Some("tc-truncated".into()),
+        context: Default::default(),
+        ts_ms: 124,
+        data_json: json!({"output":"short"}).to_string(),
+        artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+            relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+            projection_slot: Some(0),
+            kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+            capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+            content: body.into(),
+            host_captured_bytes: body.len(),
+            host_original_bytes: 128,
+            host_dropped_bytes: 128 - body.len(),
+            stored_source_bytes: body.len(),
+            provenance_json: json!({"agent_id":"Build","tool":"bash","call_id":"tc-truncated"})
+                .to_string(),
             created_at: 124,
-            kind: "truncated",
-            content: "retained pre-truncation body",
-        },
-    )
+        }],
+        unavailable_projection: None,
+    })
     .await
     .unwrap();
 
@@ -2779,17 +2947,121 @@ async fn export_truncate_only_result_omits_compressed_byte_len() {
     let bundle = collect_bundle(&db, sid).await.unwrap();
     let zip = build_zip(&db, &target, &bundle).await.unwrap();
     let index: Vec<Value> =
-        serde_json::from_str(&read_zip_entry(&zip, "compressed_tool_results/index.json").unwrap())
-            .unwrap();
+        serde_json::from_str(&read_zip_entry(&zip, "text_artifacts/index.json").unwrap()).unwrap();
 
-    assert_eq!(index[0]["kind"], "truncated");
-    assert_eq!(index[0]["original_byte_len"], 128);
-    assert!(index[0].get("compressed_byte_len").is_none());
-    let file = index[0]["file"].as_str().unwrap();
+    assert_eq!(index[0]["kind"], "tool_result");
+    assert_eq!(index[0]["host_original_bytes"], 128);
+    assert_eq!(index[0]["stored_source_bytes"], body.len());
+    let file = index[0]["representation"]["content_file"].as_str().unwrap();
     assert_eq!(
         read_zip_entry(&zip, file).unwrap(),
         "retained pre-truncation body"
     );
+}
+
+#[tokio::test]
+async fn text_artifact_fork_imported_redacted_artifact_reexports_as_irreversible_redacted_bytes() {
+    let source = Db::open_in_memory().unwrap();
+    let source_session = create_test_session(&source, "p", "/proj", "Build").await;
+    let body = "already-export-redacted-********";
+    source
+        .record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+            session_id: source_session.session_id,
+            kind: SessionEventKind::ToolCall,
+            agent: Some("Build".into()),
+            call_id: Some("tc-imported-redacted".into()),
+            context: Default::default(),
+            ts_ms: 125,
+            data_json: json!({"output":"short"}).to_string(),
+            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                projection_slot: Some(0),
+                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                content: body.into(),
+                host_captured_bytes: body.len(),
+                host_original_bytes: body.len(),
+                host_dropped_bytes: 0,
+                stored_source_bytes: body.len(),
+                provenance_json: json!({
+                    "agent_id":"Build",
+                    "tool":"bash",
+                    "call_id":"tc-imported-redacted"
+                })
+                .to_string(),
+                created_at: 125,
+            }],
+            unavailable_projection: None,
+        })
+        .await
+        .unwrap();
+
+    // The default /3 archive deliberately carries the artifact's
+    // length-preserving export representation, even when this test's empty
+    // redactor makes the bytes already safe.
+    let source_zip = build_zip(&source, &source_session, std::slice::from_ref(&source_session))
+        .await
+        .unwrap();
+    let imported_db = Db::open_in_memory().unwrap();
+    let imported = crate::session::import::import_archive(
+        &imported_db,
+        crate::session::import::read_archive_bytes(&source_zip).unwrap(),
+    )
+    .await
+    .unwrap();
+    let imported_session_id = imported.imported[0];
+    let imported_artifact = imported_db
+        .list_text_artifacts(imported_session_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        imported_artifact.representation,
+        crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
+    );
+    assert!(imported_artifact.archive_import_id.is_some());
+
+    let child = imported_db.create_fork(imported_session_id, None).await.unwrap();
+    let child_artifact = imported_db
+        .list_text_artifacts(child.session_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        child_artifact.representation,
+        crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
+    );
+    assert_eq!(child_artifact.archive_import_id, imported_artifact.archive_import_id);
+
+    // An explicit raw local export cannot resurrect a body that was already
+    // imported as an irreversible redacted representation. It must preserve
+    // both the bytes and the redacted-length-preserving manifest mode.
+    let raw_reexport = trusted_build_zip_with_options(
+        &imported_db,
+        &child,
+        std::slice::from_ref(&child),
+        ExportBundleOptions {
+            include_generated_artifacts: false,
+            redacted: false,
+        },
+        &test_export_env(),
+    )
+    .await
+    .unwrap();
+    let index: Vec<Value> = serde_json::from_str(
+        &read_zip_entry(&raw_reexport, "text_artifacts/index.json").unwrap(),
+    )
+    .unwrap();
+    let child_artifact_id = child_artifact.artifact_id.to_string();
+    let entry = index
+        .iter()
+        .find(|entry| entry["artifact_id"].as_str() == Some(child_artifact_id.as_str()))
+        .unwrap();
+    assert_eq!(entry["representation"]["mode"], "redacted_length_preserving");
+    let file = entry["representation"]["content_file"].as_str().unwrap();
+    assert_eq!(read_zip_entry(&raw_reexport, file).unwrap(), body);
 }
 
 #[tokio::test]
@@ -2958,10 +3230,10 @@ async fn export_older_events_without_new_fields_still_parse() {
         bash["data"].get("exit_code").is_none(),
         "older export carries no exit_code key"
     );
-    // The pre-release export contract is the intentional breaking /2 shape.
+    // The pre-release export contract is the intentional breaking /3 shape.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/2");
+    assert_eq!(manifest["schema"], "cockpit-session-export/3");
 }
 
 #[tokio::test]
@@ -3043,7 +3315,7 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     // Manifest round-trips and lists the session.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bytes, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/2");
+    assert_eq!(manifest["schema"], "cockpit-session-export/3");
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],

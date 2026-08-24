@@ -84,7 +84,8 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("start_build"),
     ToolTimeoutSafety::abandon_safe("task"),
     ToolTimeoutSafety::abandon_safe("todo"),
-    ToolTimeoutSafety::abandon_safe("tool_result_retrieve"),
+    ToolTimeoutSafety::abandon_safe("artifact_read"),
+    ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),
     // `use_sealed_value` dispatches an Owner-compiled adapter outbound to a
     // fixed destination. Abandoning it mid-flight cannot be assumed safe: the

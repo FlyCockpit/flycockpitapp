@@ -54,7 +54,7 @@ fn sandbox_meta_for_tests() -> crate::engine::tool::SandboxMeta {
 }
 
 #[tokio::test]
-async fn bash_truncated_output_carries_retention() {
+async fn bash_truncated_output_carries_text_artifact_capture() {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = large_bash_stdout();
     std::fs::write(tmp.path().join("big.txt"), &stdout).unwrap();
@@ -69,20 +69,20 @@ async fn bash_truncated_output_carries_retention() {
         .expect("bash call returns");
 
     assert!(output.truncated);
-    let retention = output
-        .truncated_retention
+    let capture = output
+        .text_artifact_capture
         .as_ref()
-        .expect("truncated bash output is retained");
-    assert!(!retention.partial);
+        .expect("truncated bash output has a capture");
+    assert_eq!(capture.host_dropped_bytes, 0);
     let rendered_bytes = output
         .output_sidecar
         .as_ref()
         .and_then(|sidecar| sidecar.payload["display"]["rendered_bytes"].as_u64())
         .expect("truncated bash sidecar records rendered length") as usize;
-    assert_eq!(retention.original_byte_len, rendered_bytes);
-    assert_eq!(retention.content.len(), retention.original_byte_len);
-    assert!(retention.content.starts_with("stdout:\nline 0000"));
-    assert!(retention.content.ends_with("exit: 0\n"));
+    assert_eq!(capture.host_original_bytes, rendered_bytes);
+    assert_eq!(capture.content.len(), capture.host_original_bytes);
+    assert!(capture.content.starts_with("stdout:\nline 0000"));
+    assert!(capture.content.ends_with("exit: 0\n"));
 }
 
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn bash_large_output_is_bounded_at_pipe() {
 }
 
 #[tokio::test]
-async fn bash_untruncated_output_carries_no_retention() {
+async fn bash_untruncated_output_carries_no_text_artifact_capture() {
     let tmp = tempfile::tempdir().unwrap();
     let command = "printf ok";
     let ctx = sandbox_off_ctx_with_grant(tmp.path(), command).await;
@@ -120,11 +120,11 @@ async fn bash_untruncated_output_carries_no_retention() {
         .expect("bash call returns");
 
     assert!(!output.truncated);
-    assert!(output.truncated_retention.is_none());
+    assert!(output.text_artifact_capture.is_none());
 }
 
 #[tokio::test]
-async fn bash_truncated_output_carries_retention_on_the_container_render_path() {
+async fn bash_truncated_output_carries_capture_on_the_container_render_path() {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = large_bash_stdout();
     let command = "cat big.txt";
@@ -150,13 +150,13 @@ async fn bash_truncated_output_carries_retention_on_the_container_render_path() 
     );
 
     assert!(output.truncated);
-    let retention = output
-        .truncated_retention
+    let capture = output
+        .text_artifact_capture
         .as_ref()
-        .expect("container-rendered truncated output is retained");
-    assert_eq!(retention.original_byte_len, expected_body.len());
-    assert_eq!(retention.content, expected_body);
-    assert!(!retention.partial);
+        .expect("container-rendered truncated output has a capture");
+    assert_eq!(capture.host_original_bytes, expected_body.len());
+    assert_eq!(capture.content, expected_body);
+    assert_eq!(capture.host_dropped_bytes, 0);
 }
 
 #[tokio::test]

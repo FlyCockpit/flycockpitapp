@@ -31,6 +31,47 @@ impl From<crate::db::skill_pairs::SkillPairRow> for SkillPair {
     }
 }
 
+/// A forced-skill load whose only effect so far is reading the skill tool.  It
+/// deliberately carries no driver/history/session mutation: oversized user
+/// input must finish its durable phase-two composition before the seed becomes
+/// observable in any of those places.
+pub(in crate::engine::driver) struct PreparedForcedSkill {
+    call_id: String,
+    skill_name: String,
+    args: serde_json::Value,
+    body: String,
+    hard_fail: bool,
+    duration_ms: u64,
+    missing_tool: bool,
+}
+
+impl PreparedForcedSkill {
+    /// The exact host-rendered skill contribution that must be retained in an
+    /// accepted oversized envelope.  A later crash may prevent the synthetic
+    /// tool pair from being appended, so the durable user composition itself
+    /// is the authority for the first provider handoff.
+    pub(in crate::engine::driver) fn envelope_guidance(&self) -> String {
+        if self.missing_tool {
+            return String::new();
+        }
+        format!(
+            "Skill `{}` (forced, package result):\n\n{}\n\n---\n\n",
+            self.skill_name, self.body
+        )
+    }
+
+    pub(in crate::engine::driver) fn envelope_prelude(&self) -> Option<serde_json::Value> {
+        (!self.missing_tool).then(|| serde_json::json!({
+            "type": "forced_skill",
+            "call_id": self.call_id,
+            "name": self.skill_name,
+            "args": self.args,
+            "body": self.body,
+            "hard_fail": self.hard_fail,
+        }))
+    }
+}
+
 /// Remove from the root history the user-invoked skill pairs owned by the
 /// outgoing primary `owner` that are not flagged `intentional_steer`, so an
 /// abandoned skill the outgoing primary declined to follow does not cross a
@@ -244,27 +285,21 @@ impl Driver {
     /// synthesized call, no repair), exactly like a seeded call the caller
     /// made itself. An unknown skill name surfaces the tool's own
     /// `invalid_input` error as the recorded result (never a silent no-op).
-    pub(in crate::engine::driver) async fn seed_forced_skill(
-        &mut self,
+    pub(in crate::engine::driver) async fn prepare_forced_skill(
+        &self,
         skill_name: &str,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) {
-        use crate::engine::message::{AssistantContent, Message, ToolCall};
-        use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
-
+    ) -> PreparedForcedSkill {
         let agent = self.stack.last().expect("stack never empty").agent.clone();
         let Some(tool) = agent.tools.get("skill") else {
-            // No `skill` tool on this agent (shouldn't happen for the
-            // interactive front-door agents) — surface a notice rather than
-            // silently dropping the user's explicit invocation.
-            let _ = tx
-                .send(TurnEvent::Notice {
-                    text: format!(
-                        "skill `{skill_name}` not invoked: this agent has no `skill` tool"
-                    ),
-                })
-                .await;
-            return;
+            return PreparedForcedSkill {
+                call_id: skill_slash_call_id(),
+                skill_name: skill_name.to_owned(),
+                args: serde_json::json!({ "name": skill_name }),
+                body: String::new(),
+                hard_fail: true,
+                duration_ms: 0,
+                missing_tool: true,
+            };
         };
 
         let args = serde_json::json!({ "name": skill_name });
@@ -298,9 +333,9 @@ impl Driver {
             mcp_builtin_registry: agent.tools.mcp_builtin_registry(),
             has_tree: agent.tools.get("code").is_some(),
             has_bash: agent.tools.get("bash").is_some(),
-            // Route a blocked `read`'s waiting indicator through this
-            // run's turn-event stream (`read-wait-and-lock-expiry.md`).
-            events: Some(tx.clone()),
+            // Preparation is deliberately silent.  Applying the prepared
+            // seed after phase two emits the usual lifecycle events.
+            events: None,
             lsp: None,
             resource_scheduler: self.resource_scheduler.clone(),
             config: self.config.clone(),
@@ -315,22 +350,68 @@ impl Driver {
             // error as the recorded result — clear, never a silent no-op.
             Err(e) => (format!("Error: {e}"), true),
         };
-        // Record a successfully-loaded user-invoked skill in the active set
-        // so a later `/skill <name>` tag can reuse the loaded instructions.
-        // The skill tool's output is
-        // `Skill \`name\` (package directory: ...):\n\n<rendered body>`; strip
-        // that header so the seeded payload carries the instructions, not the
-        // wrapper line.
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        PreparedForcedSkill {
+            call_id: skill_slash_call_id(),
+            skill_name: skill_name.to_owned(),
+            args,
+            body,
+            hard_fail,
+            duration_ms,
+            missing_tool: false,
+        }
+    }
+
+    pub(in crate::engine::driver) async fn seed_forced_skill(
+        &mut self,
+        skill_name: &str,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let prepared = self.prepare_forced_skill(skill_name).await;
+        self.apply_prepared_forced_skill(prepared, tx, true).await;
+    }
+
+    /// Apply a previously prepared forced skill.  This is the sole mutation
+    /// point for active-skill state, history, tool audit/events and the durable
+    /// skill-pair ledger.
+    pub(in crate::engine::driver) async fn apply_prepared_forced_skill(
+        &mut self,
+        prepared: PreparedForcedSkill,
+        tx: &mpsc::Sender<TurnEvent>,
+        include_history: bool,
+    ) {
+        use crate::engine::message::{AssistantContent, Message, ToolCall};
+        use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
+
+        let PreparedForcedSkill {
+            call_id,
+            skill_name,
+            args,
+            body,
+            hard_fail,
+            duration_ms,
+            missing_tool,
+        } = prepared;
+        if missing_tool {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "skill `{skill_name}` not invoked: this agent has no `skill` tool"
+                    ),
+                })
+                .await;
+            return;
+        }
+        let agent = self.stack.last().expect("stack never empty").agent.clone();
         if !hard_fail {
             let seed_body = body
                 .strip_prefix(&format!("Skill `{skill_name}` (package directory: "))
                 .and_then(|rest| rest.split_once("):\n\n").map(|(_, body)| body))
                 .unwrap_or(&body);
-            self.record_active_skill(skill_name, seed_body);
+            self.record_active_skill(&skill_name, seed_body);
         }
-        let duration_ms = started.elapsed().as_millis() as u64;
 
-        let call_id = skill_slash_call_id();
         let provider_identity = crate::session::ToolCallProviderIdentity::synthetic_cockpit_call(
             &call_id,
             Some(agent.model.current_wire_api()),
@@ -451,6 +532,7 @@ impl Driver {
             signature: None,
             additional_params: None,
         };
+        if include_history {
         let history = &mut self.stack.last_mut().expect("stack never empty").history;
         history.push(Message::Assistant {
             id: None,
@@ -464,6 +546,7 @@ impl Driver {
                 content: vec![ToolResultContent::text(body)],
             })],
         });
+        }
 
         // Record ownership so a later primary swap can strip this pair if the
         // owning primary is swapped away without acting on it

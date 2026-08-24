@@ -696,6 +696,14 @@ fn copy_fork_transcript(
         &surviving_call_ids,
     )?;
 
+    crate::db::text_artifacts::fork_session_artifacts_conn(
+        conn,
+        parent_session_id,
+        child_session_id,
+        &seq_pairs,
+    )
+    .context("copying fork text artifacts")?;
+
     for (old_seq, new_seq) in seq_pairs {
         conn.execute(
             "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)

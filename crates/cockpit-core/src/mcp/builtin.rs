@@ -1128,30 +1128,10 @@ async fn invoke_native_tool(ctx: &HostContext, tool: Arc<dyn Tool>, args: Value)
         }
     }
 
-    if output.truncated {
-        let recheck_modified_output = delivered != before_recheck;
-        let call_id = tool_ctx
-            .current_tool_call_id
-            .clone()
-            .unwrap_or_else(|| format!("mcp:{}", Uuid::new_v4()));
-        if let Err(error) = crate::engine::agent::maybe_store_retrievable_truncated_tool_result(
-            &tool_ctx.session,
-            &tool_ctx.agent_id,
-            tool.name(),
-            &call_id,
-            &mut delivered,
-            output.truncated_retention.as_ref(),
-            recheck_modified_output,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %error,
-                tool = %tool.name(),
-                "storing Monty native truncated tool result failed"
-            );
-        }
-    }
+    // The outer `mcp` call is the durable owner for a Monty-native result.
+    // Its bounded text is returned here without recursively minting a second
+    // artifact from an inner tool page.
+    let _ = (output.truncated, before_recheck);
 
     Ok(Value::String(delivered))
 }
@@ -1418,7 +1398,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::engine::tool::{RetainedTruncatedOutput, ToolEffect, ToolOutput};
+    use crate::engine::tool::{TextArtifactCapture, ToolEffect, ToolOutput};
     use async_trait::async_trait;
     use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1432,7 +1412,7 @@ mod tests {
         effect: ToolEffect,
         params_calls: Arc<AtomicUsize>,
         seen_ctx: Arc<Mutex<Vec<(Uuid, bool, bool)>>>,
-        truncated_retention: Option<RetainedTruncatedOutput>,
+        text_artifact_capture: Option<TextArtifactCapture>,
         bad_descriptor_field: bool,
     }
 
@@ -1447,7 +1427,7 @@ mod tests {
                 effect: ToolEffect::ReadOnly,
                 params_calls: Arc::new(AtomicUsize::new(0)),
                 seen_ctx: Arc::new(Mutex::new(Vec::new())),
-                truncated_retention: None,
+                text_artifact_capture: None,
                 bad_descriptor_field: false,
             }
         }
@@ -1472,8 +1452,8 @@ mod tests {
             self
         }
 
-        fn with_retention(mut self, retention: RetainedTruncatedOutput) -> Self {
-            self.truncated_retention = Some(retention);
+        fn with_capture(mut self, capture: TextArtifactCapture) -> Self {
+            self.text_artifact_capture = Some(capture);
             self
         }
 
@@ -1530,13 +1510,13 @@ mod tests {
                 ctx.has_bash,
                 ctx.cancel.is_cancelled(),
             ));
-            let mut output = if self.truncated_retention.is_some() {
+            let mut output = if self.text_artifact_capture.is_some() {
                 ToolOutput::truncated_text(self.output.clone())
             } else {
                 ToolOutput::text(self.output.clone())
             };
-            if let Some(retention) = self.truncated_retention.clone() {
-                output = output.with_truncated_retention(retention);
+            if let Some(capture) = self.text_artifact_capture.clone() {
+                output = output.with_text_artifact_capture(capture);
             }
             Ok(output)
         }
@@ -2181,17 +2161,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monty_adapter_spillover_uses_native_retrieval_store() {
+    async fn monty_adapter_does_not_recursively_capture_inner_pages() {
         let tmp = tempfile::tempdir().unwrap();
         let full = "retained-output\n".repeat(2000);
         let delivered =
             crate::tools::common::truncate_head_tail(&full, crate::tools::common::OUTPUT_BYTE_CAP);
         let tool = Arc::new(
-            MontyAdapterTool::new("large_native", delivered).with_retention(
-                RetainedTruncatedOutput {
+            MontyAdapterTool::new("large_native", delivered).with_capture(
+                TextArtifactCapture {
                     content: full.clone(),
-                    original_byte_len: full.len(),
-                    partial: false,
+                    host_captured_bytes: full.len(),
+                    host_original_bytes: full.len(),
+                    host_dropped_bytes: 0,
+                    stored_source_bytes: full.len(),
                 },
             ),
         );
@@ -2202,42 +2184,10 @@ mod tests {
             .await
             .unwrap();
         let body = monty.as_str().unwrap();
-        assert!(
-            body.contains("retrieve with tool_result_retrieve"),
-            "{body}"
-        );
-        let hash = body
-            .split("hash=")
-            .nth(1)
-            .unwrap()
-            .split_whitespace()
-            .next()
-            .unwrap();
-        let retrieved = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
-            .call(serde_json::json!({ "hash": hash }), &ctx)
-            .await
-            .unwrap();
-
-        assert!(retrieved.truncated);
-        assert!(retrieved.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
-        assert!(retrieved.content.starts_with("retained-output\n"));
-        assert!(retrieved.content.contains("ask tool_result_retrieve"));
-        let next = retrieved
-            .content
-            .split("start_line=")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next())
-            .and_then(|line| line.parse::<usize>().ok())
-            .expect("retrieval continuation line");
-        let continued = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
-            .call(
-                serde_json::json!({ "hash": hash, "start_line": next }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(continued.content.starts_with("retained-output\n"));
-        assert!(continued.content.len() < full.len());
+        assert_eq!(body, crate::tools::common::truncate_head_tail(
+            &full,
+            crate::tools::common::OUTPUT_BYTE_CAP,
+        ));
     }
 
     #[tokio::test]

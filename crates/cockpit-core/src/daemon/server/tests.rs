@@ -1511,6 +1511,12 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
     let reachable_mutation = Request::CancelRunInvocation {
         client_submission_id: Uuid::new_v4(),
     };
+    let bulk_chunk = Request::WriteBulkTransferChunk {
+        transfer: archive_transfer_ref(b"remote opaque source chunk"),
+        chunk_index: 0,
+        data_base64: base64::engine::general_purpose::STANDARD
+            .encode(b"remote opaque source chunk"),
+    };
     let mut reached_dispatch = 0;
     let cases = [
         ("actorless_read", principal(None), None, &read, true),
@@ -1576,6 +1582,13 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             true,
         ),
         (
+            "valid_remote_bulk_ingress_chunk",
+            principal(Some(actor.clone())),
+            Some(operation),
+            &bulk_chunk,
+            true,
+        ),
+        (
             "remote_local_only_mutation",
             principal(Some(actor.clone())),
             Some(operation),
@@ -1610,7 +1623,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             }
         }
     }
-    assert_eq!(reached_dispatch, 3);
+    assert_eq!(reached_dispatch, 4);
 }
 
 #[tokio::test]
@@ -10024,11 +10037,13 @@ async fn transactional_mutation_inventory_has_ledger_site() {
         "ledger-site registry entries that are not remotely-admissible transactional_mutation rows: {stale:?}"
     );
 
-    // The six tags this lane wired must each be present in the production
+    // The bulk and inline message paths plus the five session-mutation tags
+    // this lane wired must each be present in the production
     // registry (their per-tag ledger-commit tests prove the site actually
     // commits + replays).
     for tag in [
         "send_user_message",
+        "send_user_message_bulk",
         "fork_session",
         "discard_session",
         "btw_create",
@@ -12592,6 +12607,789 @@ async fn attached_state_with_worker_receiver(
     )
 }
 
+fn opaque_user_transfer_ref(bytes: &[u8]) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+    use proto::remote_protocol_id::{kind, tag_protocol_id_bytes};
+    use proto::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+    use rand::RngExt as _;
+    use sha2::{Digest as _, Sha256};
+
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&Sha256::digest(bytes));
+    let mut id = [0u8; 16];
+    rand::rng().fill(&mut id[..]);
+    if id.iter().all(|byte| *byte == 0) {
+        id[0] = 1;
+    }
+    RemoteBulkTransferRef::new(
+        tag_protocol_id_bytes::<kind::Transfer>(id).expect("nonzero transfer id"),
+        bytes.len() as u64,
+        digest,
+        RemoteBulkMimeClass::Opaque,
+    )
+    .expect("opaque user transfer reference")
+}
+
+fn stage_opaque_user_transfer(
+    bytes: &[u8],
+    owner: &crate::daemon::bulk_staging::BulkTransferOwner,
+) -> proto::remote_transport::bulk::RemoteBulkTransferRef {
+    let reference = opaque_user_transfer_ref(bytes);
+    for (index, chunk) in bytes
+        .chunks(crate::daemon::bulk_staging::STAGED_CHUNK_BYTES)
+        .enumerate()
+    {
+        crate::daemon::bulk_staging::write_chunk_owned(&reference, owner, index as u32, chunk)
+            .expect("stage opaque user chunk");
+    }
+    reference
+}
+
+struct AllowOversizedUserArtifactReceipt;
+
+impl crate::db::message_attachments::MessageAcceptanceJoin for AllowOversizedUserArtifactReceipt {
+    fn validate_and_join(
+        &self,
+        _: &rusqlite::Connection,
+        _: &crate::db::message_attachments::AcceptMessageInput,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+async fn user_message_ingress_counts(
+    ctx: &Arc<DaemonContext>,
+    session_id: Uuid,
+) -> (i64, i64, i64, i64) {
+    ctx.db
+        .read(move |conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_operation_receipts WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_submission_receipts WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM message_queue_items WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?,
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_text_artifact_quota_reservations WHERE session_id=?1",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .expect("count user-message durable ingress rows")
+}
+
+#[tokio::test]
+async fn large_user_message_ingress_rejects_over_fcm2_before_durable_or_worker_side_effects() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let error = handle_request(
+        Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            text: "x".repeat(crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES + 1),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("over-limit ingress is rejected before FCM2 admission");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        matches!(
+            work_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "no worker/provider path receives an over-limit source"
+    );
+    assert_eq!(
+        user_message_ingress_counts(&ctx, session_id).await,
+        (0, 0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn oversized_user_artifact_mixed_media_is_rejected_before_worker_and_boundary_media_uses_legacy_probe()
+ {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
+    let error = handle_request(
+        Request::SendUserMessage {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            text: "x".repeat(64 * 1024 + 1),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            image_refs: vec![image_ref.clone()],
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("mixed media cannot create an unrehydratable long event");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert!(
+        matches!(
+            work_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "rejection happens before image probing or worker delivery"
+    );
+    assert_eq!(
+        user_message_ingress_counts(&ctx, session_id).await,
+        (0, 0, 0, 0)
+    );
+
+    let boundary_ctx = ctx.clone();
+    let boundary = tokio::spawn(async move {
+        let result = handle_request(
+            Request::SendUserMessage {
+                expected_model_state_generation: None,
+                expected_model: None,
+                client_submission_id: Uuid::new_v4(),
+                text: "x".repeat(64 * 1024),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                image_refs: vec![image_ref],
+                forced_skill: None,
+                run_invocation_options: None,
+            },
+            &mut state,
+            &boundary_ctx,
+        )
+        .await;
+        (state, result)
+    });
+    let SessionWork::ProbeUserMessage { respond_to, .. } = work_rx
+        .recv()
+        .await
+        .expect("64KiB media submission still follows the existing image probe path")
+    else {
+        panic!("expected boundary media submission to probe the worker");
+    };
+    respond_to
+        .send(Ok(UserMessageProbeResult::Unknown))
+        .unwrap();
+    let (_state, boundary_result) = boundary.await.unwrap();
+    let boundary_error =
+        boundary_result.expect_err("unstaged image still fails its normal attachment validation");
+    assert!(
+        !boundary_error.message.contains("64 KiB artifact threshold"),
+        "the inline boundary is not rejected by the oversized-media rule"
+    );
+}
+
+#[tokio::test]
+async fn large_user_message_ingress_bulk_consumes_source_and_display_atomically() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "s".repeat(1024 * 1024 + 17);
+    let display = "d".repeat(64 * 1024 + 23);
+    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let source_transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+    let display_transfer = stage_opaque_user_transfer(display.as_bytes(), &owner);
+    let source_replay = source_transfer.clone();
+    let display_replay = display_transfer.clone();
+    let request_ctx = ctx.clone();
+    let request = tokio::spawn(async move {
+        let result = handle_request(
+            Request::SendUserMessageBulk {
+                expected_model_state_generation: None,
+                expected_model: None,
+                client_submission_id: Uuid::new_v4(),
+                transfer: source_transfer,
+                display_text: None,
+                display_transfer: Some(display_transfer),
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                run_invocation_options: None,
+            },
+            &mut state,
+            &request_ctx,
+        )
+        .await;
+        (state, result)
+    });
+    let SessionWork::UserMessage {
+        submission,
+        artifact_admission,
+        respond_to,
+        ..
+    } = work_rx
+        .recv()
+        .await
+        .expect("bulk source reaches the normal FCM2 worker ingress")
+    else {
+        panic!("expected a bulk user-message worker submission");
+    };
+    assert_eq!(submission.text, source);
+    assert_eq!(submission.display_text.as_deref(), Some(display.as_str()));
+    assert!(submission.images.is_empty());
+    assert!(artifact_admission.is_some());
+    assert!(
+        crate::daemon::bulk_staging::take(&source_replay).is_err()
+            && crate::daemon::bulk_staging::take(&display_replay).is_err(),
+        "source/display transfers are consumed together before the worker runs"
+    );
+    let item = proto::QueueItem {
+        id: submission.client_submissions[0].id,
+        status: proto::QueueItemStatus::Folding,
+        text: submission.text.clone(),
+        display_text: submission.display_text.clone(),
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
+    let (_state, result) = request.await.unwrap();
+    assert!(matches!(result, Ok(Response::UserMessageQueued { .. })));
+}
+
+#[tokio::test]
+async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let operation = remote_owner_operation();
+    let mut remote = remote_principal();
+    let ClientPrincipal::Remote(remote_identity) = &mut remote else {
+        panic!("remote fixture must remain remote");
+    };
+    remote_identity.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: operation.authenticated_device_id,
+        device_generation: operation.authenticated_device_generation,
+        logical_attachment_id: operation.logical_attachment_id,
+    });
+    state.principal = remote;
+
+    let source = "remote owned bulk source\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, Some(&operation))
+        .expect("actor-bound remote request owns its opaque staging");
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+    let client_submission_id = Uuid::new_v4();
+    let expected_operation_id = *operation.operation_id.as_bytes();
+    let expected_device_id = *operation.authenticated_device_id.as_bytes();
+    let expected_device_generation = operation.authenticated_device_generation;
+    let shared = state.shared_snapshot();
+    let request_ctx = ctx.clone();
+    let task = tokio::spawn(async move {
+        let mut effects = ClientRequestEffects::default();
+        let result = Box::pin(handle_serialized_request_with_remote_operation(
+            Request::SendUserMessageBulk {
+                expected_model_state_generation: None,
+                expected_model: None,
+                client_submission_id,
+                transfer,
+                display_text: None,
+                display_transfer: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                run_invocation_options: None,
+            },
+            &mut state,
+            &shared,
+            &request_ctx,
+            &mut effects,
+            Some(&operation),
+        ))
+        .await;
+        (state, result)
+    });
+
+    let SessionWork::UserMessage {
+        submission,
+        remote_operation,
+        artifact_admission: Some(admission),
+        respond_to,
+        ..
+    } = work_rx
+        .recv()
+        .await
+        .expect("actor-owned opaque bytes reach the normal worker ingress")
+    else {
+        panic!("expected remote bulk FCM2 user-message work");
+    };
+    assert_eq!(submission.text, source);
+    assert!(
+        remote_operation.is_none(),
+        "FCM2 owns its remote receipt directly"
+    );
+    assert_eq!(admission.operation_id, expected_operation_id);
+    assert!(matches!(
+        admission.actor,
+        crate::db::message_attachments::MessageActor::RemoteDevice { id, generation }
+            if id == expected_device_id && generation == expected_device_generation
+    ));
+    let item = proto::QueueItem {
+        id: client_submission_id,
+        status: proto::QueueItemStatus::Folding,
+        text: source,
+        display_text: None,
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
+    let (_state, result) = task.await.unwrap();
+    assert!(matches!(result, Ok(Response::UserMessageQueued { .. })));
+}
+
+#[tokio::test]
+async fn large_user_message_ingress_bulk_replays_consumed_references_from_durable_fcm2() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "durable bulk replay source\n".repeat(40_001);
+    let display = "durable bulk replay display\n".repeat(3_001);
+    assert!(source.len() > 1024 * 1024);
+    assert!(display.len() > 64 * 1024);
+    let client_submission_id = Uuid::new_v4();
+    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        session_id,
+        canonical_project_digest: [41; 32],
+        model_config_generation: 0,
+        canonical_model_digest: [42; 32],
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id,
+            text: source.clone(),
+            display_text: Some(display.clone()),
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    }
+    .encode()
+    .unwrap();
+    let accepted = ctx
+        .db
+        .accept_message_with_text_artifact_reservation(
+            crate::db::message_attachments::AcceptMessageInput {
+                session_id,
+                operation_id: [43; 16],
+                actor: crate::db::message_attachments::MessageActor::LocalOwner,
+                request_hash: [44; 32],
+                message_request_digest: [45; 32],
+                attachment_set_digest: [46; 32],
+                client_submission_id: *client_submission_id.as_bytes(),
+                queue_item_id: *client_submission_id.as_bytes(),
+                canonical_message: canonical,
+                attachments: Vec::new(),
+                outbox_sequence: 0,
+                now_ms: 1_000,
+            },
+            Arc::new(AllowOversizedUserArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+
+    // The original source/display transfers were already consumed by the
+    // first SendUserMessageBulk request. Replaying the same digest-bound refs
+    // must use the durable canonical FCM2 bytes, never require a new inline
+    // body or manufacture a different source.
+    let source_reference = opaque_user_transfer_ref(source.as_bytes());
+    let display_reference = opaque_user_transfer_ref(display.as_bytes());
+    let (replayed_source, replayed_display) = resolve_bulk_user_message_payload(
+        &ctx,
+        session_id,
+        &bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap(),
+        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+        client_submission_id,
+        &source_reference,
+        &None,
+        &Some(display_reference),
+        &[],
+        &None,
+    )
+    .await
+    .expect("durable FCM2 accepts replay after staged bytes are consumed");
+    assert_eq!(replayed_source, source);
+    assert_eq!(replayed_display.as_deref(), Some(display.as_str()));
+}
+
+#[tokio::test]
+async fn bulk_user_message_owner_mismatch_is_non_oracular_and_multi_ref_atomic() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "owner-bound source\n".repeat(4_000);
+    let display = "owner-bound display\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let foreign = crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
+        Uuid::new_v4(),
+        b"another authenticated principal",
+    );
+    let source_transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+    let display_transfer = stage_opaque_user_transfer(display.as_bytes(), &owner);
+    let foreign_error = resolve_bulk_user_message_payload(
+        &ctx,
+        session_id,
+        &foreign,
+        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+        Uuid::new_v4(),
+        &source_transfer,
+        &None,
+        &Some(display_transfer.clone()),
+        &[],
+        &None,
+    )
+    .await
+    .expect_err("a cross-session/principal owner cannot consume opaque refs");
+    let unknown_error = resolve_bulk_user_message_payload(
+        &ctx,
+        session_id,
+        &foreign,
+        bulk_user_message_replay_actor(&state.principal, None).unwrap(),
+        Uuid::new_v4(),
+        &opaque_user_transfer_ref(source.as_bytes()),
+        &None,
+        &Some(opaque_user_transfer_ref(display.as_bytes())),
+        &[],
+        &None,
+    )
+    .await
+    .expect_err("an unknown opaque ref is the same safe response");
+    assert_eq!(foreign_error.code, ErrorCode::BadRequest);
+    assert_eq!(
+        (foreign_error.code, foreign_error.message),
+        (unknown_error.code, unknown_error.message),
+        "owner mismatch must not disclose whether another caller staged the reference"
+    );
+    assert_eq!(
+        crate::daemon::bulk_staging::take_all_owned(
+            &[&source_transfer, &display_transfer],
+            &owner,
+        )
+        .unwrap(),
+        vec![source.into_bytes(), display.into_bytes()],
+        "a rejected foreign display sibling must leave every legitimate source live"
+    );
+}
+
+#[tokio::test]
+async fn opaque_user_message_transfers_cannot_be_read_through_the_generic_export_endpoint() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "opaque user body\n".repeat(4_000);
+    let owner = bulk_user_message_transfer_owner(&state.principal, session_id, None).unwrap();
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+
+    let error = read_bulk_transfer_chunk(&transfer.transfer_id, 0)
+        .await
+        .expect_err("the export reader has no session/actor proof for opaque text");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(
+        crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
+        source.as_bytes(),
+        "a rejected generic read leaves the owned source available to its FCM2 consumer"
+    );
+}
+
+#[tokio::test]
+async fn remote_bulk_consumed_refs_replay_only_for_the_receipt_actor() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let source = "remote bulk replay source\n".repeat(4_000);
+    let client_submission_id = Uuid::new_v4();
+    let operation = remote_owner_operation();
+    let mut remote = remote_principal();
+    let ClientPrincipal::Remote(remote_principal) = &mut remote else {
+        panic!("remote fixture must remain remote");
+    };
+    remote_principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: operation.authenticated_device_id,
+        device_generation: operation.authenticated_device_generation,
+        logical_attachment_id: operation.logical_attachment_id,
+    });
+    state.principal = remote;
+    let owner =
+        bulk_user_message_transfer_owner(&state.principal, session_id, Some(&operation)).unwrap();
+    let actor = bulk_user_message_replay_actor(&state.principal, Some(&operation)).unwrap();
+    let transfer = stage_opaque_user_transfer(source.as_bytes(), &owner);
+    assert_eq!(
+        crate::daemon::bulk_staging::take_owned(&transfer, &owner).unwrap(),
+        source.as_bytes(),
+        "the original remote owner has already consumed the ephemeral transfer"
+    );
+    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        session_id,
+        canonical_project_digest: [51; 32],
+        model_config_generation: 0,
+        canonical_model_digest: [52; 32],
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id,
+            text: source.clone(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    }
+    .encode()
+    .unwrap();
+    let accepted = ctx
+        .db
+        .accept_message_with_text_artifact_reservation(
+            crate::db::message_attachments::AcceptMessageInput {
+                session_id,
+                operation_id: *operation.operation_id.as_bytes(),
+                actor,
+                request_hash: [53; 32],
+                message_request_digest: [54; 32],
+                attachment_set_digest: [55; 32],
+                client_submission_id: *client_submission_id.as_bytes(),
+                queue_item_id: *client_submission_id.as_bytes(),
+                canonical_message: canonical,
+                attachments: Vec::new(),
+                outbox_sequence: 0,
+                now_ms: 1_000,
+            },
+            Arc::new(AllowOversizedUserArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+
+    let (replayed, display) = resolve_bulk_user_message_payload(
+        &ctx,
+        session_id,
+        &owner,
+        actor,
+        client_submission_id,
+        &transfer,
+        &None,
+        &None,
+        &[],
+        &None,
+    )
+    .await
+    .expect("the authenticated receipt actor can replay a consumed remote ref");
+    assert_eq!(replayed, source);
+    assert_eq!(display, None);
+
+    let other_operation = remote_owner_operation();
+    let mut other_principal = remote_principal();
+    let ClientPrincipal::Remote(other_remote) = &mut other_principal else {
+        panic!("remote fixture must remain remote");
+    };
+    other_remote.user_id = "different-remote-user".to_owned();
+    other_remote.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: other_operation.authenticated_device_id,
+        device_generation: other_operation.authenticated_device_generation,
+        logical_attachment_id: other_operation.logical_attachment_id,
+    });
+    let other_owner =
+        bulk_user_message_transfer_owner(&other_principal, session_id, Some(&other_operation))
+            .unwrap();
+    let denied = resolve_bulk_user_message_payload(
+        &ctx,
+        session_id,
+        &other_owner,
+        bulk_user_message_replay_actor(&other_principal, Some(&other_operation)).unwrap(),
+        client_submission_id,
+        &transfer,
+        &None,
+        &None,
+        &[],
+        &None,
+    )
+    .await
+    .expect_err("a different authenticated actor cannot replay another actor's consumed ref");
+    assert_eq!(denied, unavailable_bulk_user_message_transfer());
+}
+
+#[tokio::test]
+async fn implicit_oversized_fcm2_fence_replays_across_active_model_switches_but_explicit_fences_conflict()
+ {
+    fn acceptance_input(
+        session_id: Uuid,
+        client_submission_id: Uuid,
+        admission: &crate::daemon::session_worker::OversizedTextArtifactAdmission,
+    ) -> crate::db::message_attachments::AcceptMessageInput {
+        crate::db::message_attachments::AcceptMessageInput {
+            session_id,
+            operation_id: admission.operation_id,
+            actor: admission.actor,
+            request_hash: admission.request_hash,
+            message_request_digest: admission.message_request_digest,
+            attachment_set_digest: admission.attachment_set_digest,
+            client_submission_id: *client_submission_id.as_bytes(),
+            queue_item_id: *client_submission_id.as_bytes(),
+            canonical_message: admission.canonical_message.clone(),
+            attachments: Vec::new(),
+            outbox_sequence: 0,
+            now_ms: 1_000,
+        }
+    }
+
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (state, session_id, _work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let handle = state.attached.as_ref().unwrap().handle.clone();
+    let client_submission_id = Uuid::new_v4();
+    let source = "model-fence replay\n".repeat(4_000);
+    assert!(source.len() > 64 * 1024);
+
+    let implicit_before = oversized_text_artifact_admission(
+        &ctx,
+        &handle,
+        &state.principal,
+        session_id,
+        client_submission_id,
+        None,
+        None,
+        &source,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let switched = crate::config::providers::ActiveModelRef {
+        provider: "lmstudio".to_owned(),
+        model: "switched-model".to_owned(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    handle.set_authoritative_active_model_state_for_tests(proto::ActiveModelState {
+        selection: switched.clone(),
+        default_selection: Some(switched.clone()),
+        diverged: false,
+        generation: 99,
+    });
+    let implicit_after = oversized_text_artifact_admission(
+        &ctx,
+        &handle,
+        &state.principal,
+        session_id,
+        client_submission_id,
+        None,
+        None,
+        &source,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        implicit_before.canonical_message,
+        implicit_after.canonical_message
+    );
+    assert_eq!(
+        implicit_before.message_request_digest, implicit_after.message_request_digest,
+        "an omitted caller fence must not inherit the mutable active model"
+    );
+
+    let first = ctx
+        .db
+        .accept_message_with_text_artifact_reservation(
+            acceptance_input(session_id, client_submission_id, &implicit_before),
+            Arc::new(AllowOversizedUserArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        first,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+    let replay = ctx
+        .db
+        .accept_message_with_text_artifact_reservation(
+            acceptance_input(session_id, client_submission_id, &implicit_after),
+            Arc::new(AllowOversizedUserArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+
+    let explicit = oversized_text_artifact_admission(
+        &ctx,
+        &handle,
+        &state.principal,
+        session_id,
+        client_submission_id,
+        Some(99),
+        Some(&switched),
+        &source,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(implicit_after.canonical_message, explicit.canonical_message);
+    let conflict = ctx
+        .db
+        .accept_message_with_text_artifact_reservation(
+            acceptance_input(session_id, client_submission_id, &explicit),
+            Arc::new(AllowOversizedUserArtifactReceipt),
+            crate::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        conflict,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Conflict
+    ));
+}
+
 #[tokio::test]
 async fn client_state_split_snapshot_republishes_on_attach_and_detach() {
     let ctx = test_ctx();
@@ -13021,6 +13819,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "send_user_message",
             effect_class: DriverForwarded,
             observation: "SessionWork::UserMessage delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "send_user_message_bulk",
+            effect_class: DriverForwarded,
+            observation: "owned opaque bytes materialize into SessionWork::UserMessage exactly once",
         },
         MutatingDispatchCase {
             kind: "cancel_run_invocation",
@@ -13548,6 +14351,23 @@ fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
     authz_session_writer_with_known_holes(kind, &[])
 }
 
+/// Bulk message bytes are bound to an authenticated remote operation, rather
+/// than merely the remote principal used by this legacy socket authz matrix.
+/// The owner fixture reaches the non-oracular unknown-transfer result; the
+/// remote-writer fixture intentionally proves that an actorless transport
+/// cannot obtain an opaque-transfer owner even after its session-writer grant
+/// passed the central authorization gate.
+fn authz_bulk_user_message() -> AuthzDispatchCase {
+    AuthzDispatchCase {
+        kind: "send_user_message_bulk",
+        owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
+        readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        known_holes: &[],
+    }
+}
+
 fn authz_session_writer_with_known_holes(
     kind: &'static str,
     known_holes: &'static [AuthzKnownHole],
@@ -13910,6 +14730,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_reader("attach"),
         authz_session_reader("subagent_transcript"),
         authz_session_writer("send_user_message"),
+        authz_bulk_user_message(),
         authz_session_writer("steer_delegation"),
         authz_session_writer("begin_attachment_upload"),
         authz_session_writer("upload_attachment_chunk"),
@@ -13954,7 +14775,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
         authz_owner_only("import_session_archive"),
-        authz_owner_only("write_bulk_transfer_chunk"),
+        authz_session_writer("write_bulk_transfer_chunk"),
         authz_owner_only("read_bulk_transfer_chunk"),
         authz_owner_only("read_redacted_export_chunk"),
         authz_owner_only("curator"),
@@ -14845,6 +15666,7 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
     matches!(
         kind,
         "send_user_message"
+            | "send_user_message_bulk"
             | "begin_attachment_upload"
             | "upload_attachment_chunk"
             | "finish_attachment_upload"
@@ -14901,6 +15723,17 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        "send_user_message_bulk" => Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            transfer: opaque_user_transfer_ref(&"authz bulk ".repeat(6_000)),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
             forced_skill: None,
             run_invocation_options: None,
         },
@@ -15188,7 +16021,6 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "import_session_archive" => Request::ImportSessionArchive {
             transfer: archive_transfer_ref(b"not-staged"),
-            as_new: false,
         },
         "write_bulk_transfer_chunk" => Request::WriteBulkTransferChunk {
             transfer: archive_transfer_ref(b"chunk"),
@@ -16782,6 +17614,7 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "set_model_favorite" => assert_set_model_favorite_happy().await,
         "set_default_model" => assert_set_default_model_happy().await,
         "send_user_message"
+        | "send_user_message_bulk"
         | "steer_delegation"
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
@@ -16999,6 +17832,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         | "refresh_config"
         | "lsp_control"
         | "send_user_message"
+        | "send_user_message_bulk"
         | "remove_queued_user_message"
         | "remove_newest_queued_user_message"
         | "remove_editable_queued_user_messages"
@@ -17264,6 +18098,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+    let bulk_text = "bulk worker payload\n".repeat(4_000);
+    let bulk_transfer = (kind == "send_user_message_bulk").then(|| {
+        let owner = bulk_user_message_transfer_owner(&ClientPrincipal::owner(), session_id, None)
+            .expect("local owner has an attached opaque-transfer binding");
+        stage_opaque_user_transfer(bulk_text.as_bytes(), &owner)
+    });
     let request = match kind {
         "send_user_message" => Request::SendUserMessage {
             expected_model_state_generation: None,
@@ -17273,6 +18113,17 @@ async fn assert_worker_delivery_happy(kind: &str) {
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        "send_user_message_bulk" => Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            transfer: bulk_transfer.expect("bulk case staged an owned transfer"),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
             forced_skill: None,
             run_invocation_options: None,
         },
@@ -17373,14 +18224,19 @@ async fn assert_worker_delivery_happy(kind: &str) {
         dispatch_attached_worker_request(&ctx, tmp.path(), session_id, work_rx, request, |work| {
             match (kind, work) {
                 (
-                    "send_user_message",
+                    "send_user_message" | "send_user_message_bulk",
                     SessionWork::UserMessage {
                         submission,
                         respond_to,
                         ..
                     },
                 ) => {
-                    assert_eq!(submission.text, "hello worker");
+                    let expected = if kind == "send_user_message_bulk" {
+                        bulk_text.as_str()
+                    } else {
+                        "hello worker"
+                    };
+                    assert_eq!(submission.text, expected);
                     let item = proto_queue_item(&submission.text);
                     respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
                 }
@@ -17613,7 +18469,9 @@ async fn assert_worker_delivery_happy(kind: &str) {
         .await
         .expect("worker dispatch succeeds");
     match kind {
-        "send_user_message" => assert!(matches!(response, Response::UserMessageQueued { .. })),
+        "send_user_message" | "send_user_message_bulk" => {
+            assert!(matches!(response, Response::UserMessageQueued { .. }))
+        }
         "steer_delegation" => assert!(matches!(response, Response::DelegationSteer { .. })),
         "remove_queued_user_message" | "remove_newest_queued_user_message" => {
             assert!(matches!(
@@ -17778,6 +18636,17 @@ async fn assert_attached_required_malformed(kind: &str) {
             display_text: None,
             tag_expansions: Vec::new(),
             image_refs: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        },
+        "send_user_message_bulk" => Request::SendUserMessageBulk {
+            expected_model_state_generation: None,
+            expected_model: None,
+            client_submission_id: Uuid::new_v4(),
+            transfer: opaque_user_transfer_ref(&"detached bulk ".repeat(5_000)),
+            display_text: None,
+            display_transfer: None,
+            tag_expansions: Vec::new(),
             forced_skill: None,
             run_invocation_options: None,
         },
@@ -19448,7 +20317,7 @@ async fn assert_auto_title_mutating_malformed() {
 fn minimal_import_archive_base64() -> (Uuid, String) {
     let session_id = Uuid::new_v4();
     let manifest = serde_json::json!({
-        "schema": "cockpit-session-export/2",
+        "schema": "cockpit-session-export/3",
         "redacted": false,
         "target": {
             "project_id": "import-dispatch-test",
@@ -19596,17 +20465,19 @@ async fn assert_import_session_archive_happy() {
         &ctx,
         Request::ImportSessionArchive {
             transfer: stage_archive_transfer(&archive_bytes),
-            as_new: false,
         },
     )
     .await
     .expect("valid archive imports");
-    assert!(matches!(
-        response,
-        Response::ImportSessionArchive { imported, redacted: false }
-            if imported == vec![session_id]
-    ));
-    assert!(ctx.db.get_session(session_id).await.unwrap().is_some());
+    let imported = match response {
+        Response::ImportSessionArchive {
+            imported,
+            redacted: false,
+        } if imported.len() == 1 => imported[0],
+        other => panic!("unexpected import response: {other:?}"),
+    };
+    assert_ne!(imported, session_id);
+    assert!(ctx.db.get_session(imported).await.unwrap().is_some());
 }
 
 #[cfg(unix)]
@@ -19617,7 +20488,6 @@ async fn assert_import_session_archive_malformed() {
         Request::ImportSessionArchive {
             // Never staged: the daemon has no bytes for this reference.
             transfer: archive_transfer_ref(b"not-staged"),
-            as_new: false,
         },
     )
     .await
@@ -20646,6 +21516,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "terminal_resize",
         "close_terminal",
         "send_user_message",
+        "send_user_message_bulk",
         "remove_queued_user_message",
         "remove_newest_queued_user_message",
         "remove_editable_queued_user_messages",
@@ -20793,6 +21664,23 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 run_invocation_options: None,
             },
             kind: "send_user_message",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::SendUserMessageBulk {
+                expected_model_state_generation: None,
+                expected_model: None,
+                client_submission_id: Uuid::new_v4(),
+                transfer: opaque_user_transfer_ref(&"bulk metadata".repeat(8_193)),
+                display_text: None,
+                display_transfer: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                run_invocation_options: None,
+            },
+            kind: "send_user_message_bulk",
             session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
@@ -21008,7 +21896,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::ImportSessionArchive {
                 transfer: archive_transfer_ref(b"UEsDB"),
-                as_new: false,
             },
             kind: "import_session_archive",
             session_id: None,
@@ -21022,7 +21909,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 data_base64: String::new(),
             },
             kind: "write_bulk_transfer_chunk",
-            session_id: None,
+            session_id: Some(attached_session_id),
             audit_path: None,
             mutating: true,
         },
@@ -22528,6 +23415,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         Attach,
         SubagentTranscript,
         SendUserMessage,
+        SendUserMessageBulk,
         GetRunInvocationStatus,
         OperationStatus,
         CancelRunInvocation,

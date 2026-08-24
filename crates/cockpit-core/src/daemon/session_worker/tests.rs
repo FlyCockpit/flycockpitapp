@@ -180,20 +180,312 @@ async fn paste_fence_model_switch_ordering_change_before_and_after_acceptance() 
             crate::engine::message::QueueTarget::root("Build"),
         )
         .await;
-    let accepted = queue.has_accepted(id).await;
-    assert!(accepted);
-    assert!(model_fence_allows_insert(
-        accepted,
-        Some(&changed),
-        7,
-        &selection
-    ));
+    assert!(queue.has_accepted(id).await);
     assert!(!model_fence_allows_insert(
-        false,
         Some(&changed),
         7,
         &selection
     ));
+}
+
+/// Regression seam for restart recovery: a durable explicit fence is checked
+/// against the current state before replay may insert into the driver queue.
+/// The production replay helper performs this check immediately before its
+/// sole `push_idempotent` call; an absent fence deliberately has no check.
+#[test]
+fn oversized_user_artifact_replay_explicit_fence_requires_current_model() {
+    let expected = cockpit_config::providers::ActiveModelRef {
+        provider: "provider-a".to_string(),
+        model: "model-a".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let matching = proto::ActiveModelState {
+        selection: expected.clone(),
+        default_selection: None,
+        diverged: false,
+        generation: 41,
+    };
+    assert!(model_fence_allows_insert(Some(&matching), 41, &expected));
+
+    let mut switched = matching;
+    switched.generation = 42;
+    assert!(!model_fence_allows_insert(Some(&switched), 41, &expected));
+    assert!(!model_fence_allows_insert(None, 41, &expected));
+}
+
+async fn reserve_oversized_restart_fixture(
+    db: &Db,
+    session: &Session,
+    seed: u8,
+    fence: Option<(u64, cockpit_config::providers::ActiveModelRef)>,
+    bind_run: bool,
+) -> ([u8; 16], Uuid) {
+    let client_submission_id = Uuid::new_v4();
+    let text = "restart-fence-source\n".repeat(4_000);
+    assert!(text.len() > 64 * 1024);
+    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        session_id: session.id,
+        canonical_project_digest: [seed; 32],
+        model_config_generation: 0,
+        canonical_model_digest: [seed.wrapping_add(1); 32],
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id,
+            text: text.clone(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    };
+    let canonical_message = canonical.encode().unwrap();
+    let input = crate::db::message_attachments::AcceptMessageInput {
+        session_id: session.id,
+        operation_id: [seed; 16],
+        actor: crate::db::message_attachments::MessageActor::LocalOwner,
+        request_hash: [seed.wrapping_add(2); 32],
+        message_request_digest: canonical.message_request_digest().unwrap(),
+        attachment_set_digest: canonical.attachment_set_digest().unwrap(),
+        client_submission_id: *client_submission_id.as_bytes(),
+        queue_item_id: *client_submission_id.as_bytes(),
+        canonical_message,
+        attachments: Vec::new(),
+        outbox_sequence: 0,
+        now_ms: 1_000,
+    };
+    let model_fence = fence
+        .as_ref()
+        .map(|(generation, model)| crate::db::text_artifacts::TextArtifactModelFence {
+            generation: *generation,
+            model_json: encode_durable_model_fence(model).unwrap(),
+        });
+    let result = if bind_run {
+        db.accept_message_with_text_artifact_reservation_and_run_invocation_with_model_fence(
+            input,
+            std::sync::Arc::new(RestartArtifactReceiptJoin),
+            crate::db::text_artifacts::source_digest(&text),
+            text.len(),
+            crate::db::text_artifacts::TextArtifactRunInvocationInput {
+                origin_principal_digest: "restart-fence-principal".to_owned(),
+                options_json: r#"{"max_turns":null,"timeout_ms":null}"#.to_owned(),
+                options_digest: "restart-fence-options".to_owned(),
+                content_digest: "restart-fence-content".to_owned(),
+                max_turns: None,
+                timeout_ms: None,
+            },
+            model_fence,
+        )
+        .await
+        .unwrap()
+    } else {
+        db.accept_message_with_text_artifact_reservation_with_model_fence(
+            input,
+            std::sync::Arc::new(RestartArtifactReceiptJoin),
+            crate::db::text_artifacts::source_digest(&text),
+            text.len(),
+            model_fence,
+        )
+        .await
+        .unwrap()
+    };
+    assert!(matches!(
+        result,
+        crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+    ([seed; 16], client_submission_id)
+}
+
+struct RestartArtifactReceiptJoin;
+
+impl crate::db::message_attachments::MessageAcceptanceJoin for RestartArtifactReceiptJoin {
+    fn validate_and_join(
+        &self,
+        _: &rusqlite::Connection,
+        input: &crate::db::message_attachments::AcceptMessageInput,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            input.attachments.is_empty(),
+            "oversized restart fixture cannot carry attachments"
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn oversized_user_artifact_restart_replay_enforces_fences_and_preserves_implicit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let session = Session::create_for_test(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let expected = cockpit_config::providers::ActiveModelRef {
+        provider: "provider-a".to_owned(),
+        model: "model-a".to_owned(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+    let (stale_operation, stale_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        71,
+        Some((7, expected.clone())),
+        true,
+    )
+    .await;
+    let changed = proto::ActiveModelState {
+        selection: cockpit_config::providers::ActiveModelRef {
+            model: "model-b".to_owned(),
+            ..expected.clone()
+        },
+        default_selection: None,
+        diverged: false,
+        generation: 8,
+    };
+    let state = std::sync::Arc::new(std::sync::RwLock::new(Some(changed)));
+    let (updates, _updates_rx) = watch::channel(Vec::new());
+    let restarted_queue = crate::engine::message::UserSubmissionQueue::new(updates);
+    assert_eq!(
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &restarted_queue,
+            crate::engine::message::QueueTarget::root("Build"),
+            &state,
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(restarted_queue.snapshot().await.is_empty());
+    assert!(db
+        .reserved_text_artifact_submission(session.id, *stale_submission.as_bytes())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.text_artifact_reservation_replay(session.id, stale_operation, 2_000)
+            .await
+            .unwrap(),
+        crate::db::text_artifacts::TextArtifactReservationReplay::Terminal {
+            reason: crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
+        }
+    ));
+    let run = db.get_run_invocation(stale_submission).await.unwrap().unwrap();
+    assert_eq!(run.state, "failed");
+    assert_eq!(run.terminal_reason.as_deref(), Some("failed"));
+    let session_id = session.id;
+    let terminal_states = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT o.state,s.state,q.state
+                   FROM message_operation_receipts o
+                   JOIN message_submission_receipts s
+                     ON s.session_id=o.session_id AND s.operation_id=o.operation_id
+                   JOIN message_queue_items q
+                     ON q.session_id=s.session_id AND q.queue_item_id=s.queue_item_id
+                  WHERE o.session_id=?1 AND o.operation_id=?2",
+                rusqlite::params![session_id.to_string(), stale_operation.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_states,
+        (
+            "terminal_rejected".to_owned(),
+            "terminal_rejected".to_owned(),
+            "terminal_rejected".to_owned(),
+        )
+    );
+    assert!(db.list_session_events(session.id).await.unwrap().is_empty());
+    assert!(db.list_text_artifacts(session.id).await.unwrap().is_empty());
+
+    let (matching_operation, matching_submission) = reserve_oversized_restart_fixture(
+        &db,
+        &session,
+        72,
+        Some((9, expected.clone())),
+        false,
+    )
+    .await;
+    *state.write().unwrap() = Some(proto::ActiveModelState {
+        selection: expected.clone(),
+        default_selection: None,
+        diverged: false,
+        generation: 9,
+    });
+    let (matching_updates, _matching_rx) = watch::channel(Vec::new());
+    let matching_queue = crate::engine::message::UserSubmissionQueue::new(matching_updates);
+    assert_eq!(
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &matching_queue,
+            crate::engine::message::QueueTarget::root("Build"),
+            &state,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(matching_queue.snapshot().await.len(), 1);
+    assert!(db
+        .reserved_text_artifact_submission(session.id, *matching_submission.as_bytes())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        db.text_artifact_reservation_replay(session.id, matching_operation, 2_000)
+            .await
+            .unwrap(),
+        crate::db::text_artifacts::TextArtifactReservationReplay::Live(_)
+    ));
+
+    let (_implicit_operation, implicit_submission) = reserve_oversized_restart_fixture(
+        &db, &session, 73, None, false,
+    )
+    .await;
+    *state.write().unwrap() = Some(proto::ActiveModelState {
+        selection: cockpit_config::providers::ActiveModelRef {
+            model: "model-c".to_owned(),
+            ..expected
+        },
+        default_selection: None,
+        diverged: false,
+        generation: 10,
+    });
+    let (implicit_updates, _implicit_rx) = watch::channel(Vec::new());
+    let implicit_queue = crate::engine::message::UserSubmissionQueue::new(implicit_updates);
+    assert_eq!(
+        replay_accepted_oversized_text_artifact_queue(
+            &session,
+            &implicit_queue,
+            crate::engine::message::QueueTarget::root("Build"),
+            &state,
+        )
+        .await
+        .unwrap(),
+        2,
+        "the matching fenced lease and implicit lease each replay exactly once"
+    );
+    assert_eq!(implicit_queue.snapshot().await.len(), 2);
+    assert!(db
+        .reserved_text_artifact_submission(session.id, *implicit_submission.as_bytes())
+        .await
+        .unwrap()
+        .is_some());
 }
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
@@ -520,6 +812,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
                 .send_work(SessionWork::UserMessage {
                     submission: Box::new(submission),
                     remote_operation: None,
+                    artifact_admission: None,
                     respond_to,
                 })
                 .await
@@ -757,9 +1050,11 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
 /// the transactional remote-operation ledger on the REAL worker ACCEPT path
 /// (`SessionWork::UserMessage`), not a dispatch-arm shim. A replayed operation
 /// identity is a durable no-op (the ledger row stays committed and the message
-/// is not accepted a second time).
+/// is not accepted a second time). It also proves that an in-memory conflict
+/// found *after* an oversized FCM2 phase-one reservation uses that reservation's
+/// exact DB-owned terminal composition rather than leaving its bound run live.
 #[test]
-fn send_user_message_remote_path_commits_transactional_ledger() {
+fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_conflicts() {
     crate::test_env::run_async_with_large_stack(|| async {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
@@ -847,6 +1142,7 @@ fn send_user_message_remote_path_commits_transactional_ledger() {
                 .send_work(SessionWork::UserMessage {
                     submission: Box::new(submission),
                     remote_operation: Some(operation),
+                    artifact_admission: None,
                     respond_to,
                 })
                 .await
@@ -926,6 +1222,306 @@ fn send_user_message_remote_path_commits_transactional_ledger() {
             .is_none(),
             "a rejected conflicting send must reserve NO transactional ledger row"
         );
+
+        // An FCM2 message has its own durable receipt/lease composition, so it
+        // can acquire phase one even though the old in-memory queue already
+        // owns this client id. The subsequent remote `peek_idempotent` conflict
+        // must terminalize THAT exact FCM2 owner (including its bound run), not
+        // merely return an error and strand the accepted reservation.
+        let oversized_source = "remote FCM2 in-memory conflict\n".repeat(4_000);
+        assert!(oversized_source.len() > 64 * 1024);
+        let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+            session_id: session.id,
+            canonical_project_digest: [31; 32],
+            model_config_generation: 0,
+            canonical_model_digest: [32; 32],
+            request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id,
+                text: oversized_source.clone(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        };
+        let message_request_digest = canonical.message_request_digest().unwrap();
+        let attachment_set_digest = canonical.attachment_set_digest().unwrap();
+        let canonical_message = canonical.encode().unwrap();
+        let mut oversized_submission =
+            crate::engine::message::UserSubmission::text(&oversized_source);
+        let fingerprint = oversized_submission.client_fingerprint();
+        oversized_submission.queue_item_ids = vec![client_submission_id];
+        oversized_submission.run_invocation_id = Some(client_submission_id);
+        oversized_submission.client_submissions =
+            vec![crate::engine::message::ClientSubmissionReceipt {
+                id: client_submission_id,
+                fingerprint: fingerprint.clone(),
+                wire_fingerprint: format!("fcm2-{fingerprint}"),
+                origin_principal: None,
+            }];
+        let operation_id = Uuid::parse_str(&conflict_operation.operation_id).unwrap();
+        let device_id = Uuid::parse_str(&conflict_operation.authenticated_device_id).unwrap();
+        let admission = OversizedTextArtifactAdmission {
+            canonical_message,
+            operation_id: *operation_id.as_bytes(),
+            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+                id: *device_id.as_bytes(),
+                generation: conflict_operation.authenticated_device_generation,
+            },
+            request_hash: [12; 32],
+            message_request_digest,
+            attachment_set_digest,
+            model_fence: None,
+            run_invocation: Some(OversizedRunInvocationAdmission {
+                origin_principal_digest: "remote-fcm2-conflict".to_owned(),
+                options_json: r#"{"approval_mode":null,"max_turns":null,"timeout_ms":5000}"#
+                    .to_owned(),
+                options_digest: "remote-fcm2-conflict-options".to_owned(),
+                content_digest: "remote-fcm2-conflict-content".to_owned(),
+                max_turns: None,
+                timeout_ms: Some(5_000),
+            }),
+        };
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::UserMessage {
+                submission: Box::new(oversized_submission),
+                remote_operation: Some(conflict_operation.clone()),
+                artifact_admission: Some(admission),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), response)
+            .await
+            .expect("worker replies to the phase-one in-memory conflict")
+            .expect("worker response channel remains open")
+            .expect_err("phase-one FCM2 conflict rejects its exact owner");
+        assert_eq!(error.code, proto::ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            db.text_artifact_submission_durable_state(
+                session.id,
+                *client_submission_id.as_bytes(),
+            )
+            .await
+            .unwrap(),
+            crate::db::text_artifacts::TextArtifactSubmissionDurableState::Terminal {
+                reason: crate::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict
+            }
+        );
+        assert!(
+            db.reserved_text_artifact_submission(session.id, *client_submission_id.as_bytes())
+                .await
+                .unwrap()
+                .is_none(),
+            "an in-memory conflict releases the exact FCM2 reservation"
+        );
+        let run = db
+            .get_run_invocation(client_submission_id)
+            .await
+            .unwrap()
+            .expect("bound run remains as a terminal replay row");
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.terminal_reason.as_deref(), Some("failed"));
+        assert!(
+            db.remote_operation_status(
+                &conflict_operation.logical_attachment_id,
+                &conflict_operation.operation_id,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the FCM2 conflict does not create the obsolete legacy ledger row"
+        );
+
+        handle.send_work(SessionWork::Cancel).await.unwrap();
+        handle
+            .send_work(SessionWork::Shutdown {
+                pause_for_resume: false,
+            })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), join).await;
+        provider_server.abort();
+    });
+}
+
+/// A fresh remote-ledger conflict discovered only after FCM2 phase one must
+/// close the exact receipt/lease owner. In particular, the bound run row is
+/// part of that DB-owned terminal composition; leaving it accepted would let a
+/// rejected oversized source reserve later provider work after restart.
+#[test]
+fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
+    crate::test_env::run_async_with_large_stack(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            Session::create_for_test(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.install_test_external_journal();
+        session
+            .set_active_model("lmstudio", "session-model")
+            .unwrap();
+
+        // The request is rejected before it can reach inference, but a parked
+        // provider gives the worker the same live accept topology as production.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider_server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut providers = lmstudio_test_providers();
+        providers.providers.get_mut("lmstudio").unwrap().url = format!("http://{address}/v1");
+        let redact = Arc::new(RedactionTable::empty());
+        let model =
+            Arc::new(crate::engine::model::Model::from_config(&providers, redact.clone()).unwrap());
+        let mut extended = crate::config::extended::ExtendedConfig::default();
+        extended.sandbox.default_mode = crate::config::sandbox_mode::SandboxMode::Off;
+        let (handle, join) = spawn(
+            session.clone(),
+            Arc::new(LockManager::in_memory(db.clone())),
+            redact,
+            model,
+            None,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            false,
+            false,
+            &extended,
+            Arc::new(crate::daemon::lsp::LspManager::new()),
+            None,
+            Arc::new(StdMutex::new(None)),
+            Arc::new(StdMutex::new(None)),
+            None,
+            trusted_test_policy(tmp.path()),
+            None,
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            ),
+            SessionConfigSnapshot::new(0, providers, extended.clone()),
+        );
+
+        let operation = RemoteQueueOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000071".into(),
+            operation_id: "01890f3e-4c00-7000-8000-0000000000d1".into(),
+            authenticated_device_id: "00000000-0000-4000-8000-000000000072".into(),
+            authenticated_device_generation: 1,
+            request_hash: [72; 32],
+        };
+        // Seed the same operation identity with a different keyed request
+        // hash. The worker's fresh in-memory `Inserted` owner must see this as
+        // `RemoteSendDecision::Rejected` only after phase one is durable.
+        let mut conflicting_seed = operation.clone();
+        conflicting_seed.request_hash = [71; 32];
+        assert!(matches!(
+            reserve_remote_send_operation(&db, &conflicting_seed).await,
+            RemoteSendDecision::Accepted
+        ));
+
+        let client_submission_id = Uuid::new_v4();
+        let source = "remote FCM2 terminalization\n".repeat(4_000);
+        assert!(source.len() > 64 * 1024);
+        let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+            session_id: session.id,
+            canonical_project_digest: [1; 32],
+            model_config_generation: 0,
+            canonical_model_digest: [2; 32],
+            request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+                client_submission_id,
+                text: source.clone(),
+                display_text: None,
+                tag_expansions: Vec::new(),
+                forced_skill: None,
+                attachments: Vec::new(),
+            },
+        };
+        let message_request_digest = canonical.message_request_digest().unwrap();
+        let attachment_set_digest = canonical.attachment_set_digest().unwrap();
+        let canonical_message = canonical.encode().unwrap();
+        let mut submission = crate::engine::message::UserSubmission::text(&source);
+        let fingerprint = submission.client_fingerprint();
+        submission.origin_principal = Some("remote-test-principal".to_owned());
+        submission.queue_item_ids = vec![client_submission_id];
+        submission.run_invocation_id = Some(client_submission_id);
+        submission.client_submissions = vec![crate::engine::message::ClientSubmissionReceipt {
+            id: client_submission_id,
+            fingerprint: fingerprint.clone(),
+            wire_fingerprint: format!("fcm2-{fingerprint}"),
+            origin_principal: submission.origin_principal.clone(),
+        }];
+        let operation_id = Uuid::parse_str(&operation.operation_id).unwrap();
+        let device_id = Uuid::parse_str(&operation.authenticated_device_id).unwrap();
+        let admission = OversizedTextArtifactAdmission {
+            canonical_message,
+            operation_id: *operation_id.as_bytes(),
+            actor: crate::db::message_attachments::MessageActor::RemoteDevice {
+                id: *device_id.as_bytes(),
+                generation: operation.authenticated_device_generation,
+            },
+            request_hash: [73; 32],
+            message_request_digest,
+            attachment_set_digest,
+            model_fence: None,
+            run_invocation: Some(OversizedRunInvocationAdmission {
+                origin_principal_digest: "remote-test-principal".to_owned(),
+                options_json: r#"{"approval_mode":null,"max_turns":null,"timeout_ms":5000}"#
+                    .to_owned(),
+                options_digest: "remote-fcm2-options".to_owned(),
+                content_digest: "remote-fcm2-content".to_owned(),
+                max_turns: None,
+                timeout_ms: Some(5_000),
+            }),
+        };
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        handle
+            .send_work(SessionWork::UserMessage {
+                submission: Box::new(submission),
+                remote_operation: Some(operation),
+                artifact_admission: Some(admission),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), response)
+            .await
+            .expect("worker replies to remote FCM2 ledger conflict")
+            .expect("worker response channel remains open")
+            .expect_err("fresh remote ledger conflict rejects the FCM2 owner");
+        assert_eq!(error.code, proto::ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            db.text_artifact_submission_durable_state(
+                session.id,
+                *client_submission_id.as_bytes(),
+            )
+            .await
+            .unwrap(),
+            crate::db::text_artifacts::TextArtifactSubmissionDurableState::Terminal {
+                reason: crate::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict
+            }
+        );
+        assert!(
+            db.reserved_text_artifact_submission(session.id, *client_submission_id.as_bytes())
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected fresh owner releases its exact phase-one lease"
+        );
+        let run = db
+            .get_run_invocation(client_submission_id)
+            .await
+            .unwrap()
+            .expect("bound run remains as a terminal replay row");
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.terminal_reason.as_deref(), Some("failed"));
 
         handle.send_work(SessionWork::Cancel).await.unwrap();
         handle

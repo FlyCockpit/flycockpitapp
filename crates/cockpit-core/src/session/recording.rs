@@ -1919,38 +1919,70 @@ impl Session {
         remaining_budget: Option<u64>,
         trigger_reason: Option<&str>,
     ) -> Result<i64> {
-        self.record_event(
-            crate::db::session_log::SessionEventKind::ContextPruned,
-            Some(agent),
-            None,
-            &serde_json::json!({
-                "kind": "prune",
-                "trigger": if auto { "auto" } else { "manual" },
-                "messages_before": messages_before,
-                "messages_after": messages_after,
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_after,
-                // The projected cl100k_base wire saving this prune realized,
-                // so `analyze-session-logs` can judge effectiveness without
-                // re-diffing the adjacent request payloads.
-                "tokens_saved": tokens_saved,
-                // Remaining context budget (model window − post-prune input
-                // tokens) when the window + last usage are known; `null`
-                // otherwise (ctx%-gated metrics inert).
-                "remaining_budget": remaining_budget,
-                "elided": elided,
-                // Present for auto-prune so exports show why it fired
-                // (cold cache, no-cache provider, upstream bust, or the warm
-                // ctx/prunable threshold branch). Manual `/prune` leaves it
-                // null because the trigger is the user command.
-                "trigger_reason": trigger_reason,
-                // The classifying reason: `overlap-merge`, `exact-identity`,
-                // or `mixed` — distinct from the escalation-to-compaction
-                // path, which records a `session_compacted` boundary instead.
-                "reason": reason,
-            }),
-        )
-        .await
+        let result = self
+            .record_context_pruned_with_artifacts(
+                agent,
+                auto,
+                messages_before,
+                messages_after,
+                tokens_before,
+                tokens_after,
+                elided,
+                reason,
+                tokens_saved,
+                remaining_budget,
+                trigger_reason,
+                Vec::new(),
+            )
+            .await?;
+        Ok(result.event_seq)
+    }
+
+    /// Compose a prune event and every prune-boundary artifact in one durable
+    /// write.  A failed admission is represented in the event's typed
+    /// projection rather than by a dangling marker or a follow-up event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_context_pruned_with_artifacts(
+        &self,
+        agent: &str,
+        auto: bool,
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: u64,
+        tokens_after: u64,
+        elided: &[String],
+        reason: &str,
+        tokens_saved: u64,
+        remaining_budget: Option<u64>,
+        trigger_reason: Option<&str>,
+        artifacts: Vec<crate::db::text_artifacts::TextArtifactCandidate>,
+    ) -> Result<crate::db::text_artifacts::TextArtifactEventResult> {
+        let data = serde_json::json!({
+            "kind": "prune",
+            "trigger": if auto { "auto" } else { "manual" },
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+            "tokens_saved": tokens_saved,
+            "remaining_budget": remaining_budget,
+            "elided": elided,
+            "trigger_reason": trigger_reason,
+            "reason": reason,
+        });
+        self.db
+            .record_event_with_text_artifacts(crate::db::text_artifacts::TextArtifactEventInput {
+                session_id: self.id,
+                kind: crate::db::session_log::SessionEventKind::ContextPruned,
+                agent: Some(agent.to_string()),
+                call_id: None,
+                context: Default::default(),
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                data_json: serde_json::to_string(&data)?,
+                artifacts,
+                unavailable_projection: None,
+            })
+            .await
     }
 
     /// Record a `session_compacted` timeline boundary (session-log-export

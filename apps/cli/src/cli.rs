@@ -1191,9 +1191,6 @@ pub struct ExportArgs {
 #[derive(Debug, clap::Args)]
 pub struct ImportArgs {
     pub file: PathBuf,
-    /// Import under fresh session IDs instead of refusing existing IDs.
-    #[arg(long)]
-    pub as_new: bool,
 }
 
 /// Scope toggle for `cockpit stats`.

@@ -1,3 +1,5 @@
+import { FCM2_MAX_BYTES } from "./send-user-message-v2";
+
 export const FCOR_MAGIC = new Uint8Array([0x46, 0x43, 0x4f, 0x52]);
 export const FCOR_SCHEMA_VERSION = 1;
 
@@ -25,7 +27,7 @@ export type ValidatedFcorV1 = Uint8Array & { readonly [validatedFcorV1]: true };
 
 const U32_MAX = 0xffffffff;
 export const MAX_FCOR_V1_BYTES = U32_MAX;
-export const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES = 2_631_500;
+export const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES = FCM2_MAX_BYTES;
 export type CanonicalParamErrorCode =
   | "non_nfc"
   | "nul"

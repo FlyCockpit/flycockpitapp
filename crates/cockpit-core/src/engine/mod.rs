@@ -51,6 +51,7 @@ pub mod safety_gate;
 pub mod schedule;
 pub mod task_identity;
 pub mod text_call;
+pub mod text_artifact_frame;
 pub mod think;
 pub mod tool;
 pub mod translate;

@@ -3675,6 +3675,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "restart_if_idle",
         "resume_paused_work",
         "send_user_message",
+        "send_user_message_bulk",
         "session_live_status",
         "set_active_model",
         "set_workspace_trust",

@@ -126,3 +126,49 @@ pub(crate) async fn result_recheck(
         }
     }
 }
+
+/// Recheck a body which would otherwise become durable. Unlike display output,
+/// an unavailable utility check is fail-closed: callers receive no body to
+/// retain and must discard the capture entirely. The ordinary capped result
+/// remains the canonical event/model output; no artifact projection, frame,
+/// reason, reference, or quota state is written.
+pub(crate) async fn result_recheck_for_artifact_capture(
+    output: &str,
+    ctx: &ResultRecheckCtx,
+    tx: &mpsc::Sender<TurnEvent>,
+) -> Result<Option<String>> {
+    use crate::config::extended::resolve_injection_guard;
+    use crate::engine::injection_check::check;
+    let (extended, providers) = ctx.config.configs();
+    let guard = resolve_injection_guard(&ctx.cwd);
+    if guard.threshold == crate::config::extended::InjectionThreshold::Off
+        || ctx.session.approval_mode() == crate::config::extended::ApprovalMode::Yolo
+    {
+        return Ok(Some(output.to_owned()));
+    }
+    match result_recheck_action(
+        check(
+            extended.guard_model_ref(),
+            &providers,
+            ctx.redact.clone(),
+            None,
+            &guard.check_prompt,
+            output,
+        )
+        .await,
+        guard.threshold,
+        guard.result_action,
+    ) {
+        RecheckAction::Block => result_injection_override(output, ctx, tx).await.map(Some),
+        RecheckAction::Ask => result_injection_ask(output, ctx, tx).await.map(Some),
+        RecheckAction::Warn => {
+            let _ = tx.send(TurnEvent::Notice { text: "tool result rated `medium` for prompt injection — delivering with caution".to_owned() }).await;
+            Ok(Some(output.to_owned()))
+        }
+        RecheckAction::Pass => Ok(Some(output.to_owned())),
+        RecheckAction::Unavailable => {
+            let _ = tx.send(TurnEvent::Notice { text: "tool result could not be re-checked for prompt injection; retained artifact unavailable".to_owned() }).await;
+            Ok(None)
+        }
+    }
+}

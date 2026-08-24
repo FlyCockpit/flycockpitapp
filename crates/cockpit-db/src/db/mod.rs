@@ -39,8 +39,8 @@
 pub mod agent_installations;
 pub mod agent_tree_decisions;
 pub mod app_flags;
+pub mod archive_import;
 pub mod assistants;
-pub mod compressed_results;
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
@@ -91,6 +91,7 @@ pub mod tandem;
 pub mod task_delegation_payloads;
 pub mod task_delegations;
 pub mod task_todos;
+pub mod text_artifacts;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;

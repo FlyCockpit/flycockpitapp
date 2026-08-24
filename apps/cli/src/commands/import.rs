@@ -77,10 +77,7 @@ pub async fn run(args: ImportArgs) -> Result<()> {
     // then hand the daemon a reference it can verify.
     let transfer = push_bulk_transfer(&client, &bytes).await?;
     let imported = match client
-        .request_ok(Request::ImportSessionArchive {
-            transfer,
-            as_new: args.as_new,
-        })
+        .request_ok(Request::ImportSessionArchive { transfer })
         .await?
     {
         Response::ImportSessionArchive { imported, redacted } => {

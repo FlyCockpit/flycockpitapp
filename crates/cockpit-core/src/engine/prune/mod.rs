@@ -53,7 +53,6 @@ pub use overlap::OVERLAP_REASON;
 /// `write` are intentionally absent (see module docs).
 pub const SNAPSHOT_TOOLS: &[&str] = &["read", "code", "graph", "search"];
 
-pub const COMPRESSED_RESULT_MARKER_PREFIX: &str = "[compressed tool result:";
 pub const REASON_TOOL_RESULT_CONDENSED: &str = "tool result condensed";
 
 const PRUNE_BOUNDARY_CONDENSE_TOOLS: &[&str] = &["bash"];
@@ -67,47 +66,6 @@ fn is_snapshot_tool(name: &str) -> bool {
 fn is_prune_boundary_condense_tool(name: &str) -> bool {
     PRUNE_BOUNDARY_CONDENSE_TOOLS.contains(&name)
         && !PRUNE_BOUNDARY_CONDENSE_EXCLUDED_TOOLS.contains(&name)
-}
-
-pub fn compressed_tool_result_marker(
-    tool: &str,
-    original_bytes: usize,
-    condensed_bytes: usize,
-    lines: usize,
-    hash: &str,
-) -> String {
-    format!(
-        "{COMPRESSED_RESULT_MARKER_PREFIX} tool={tool} original_bytes={original_bytes} condensed_bytes={condensed_bytes} lines={lines} hash={hash} retrieve with tool_result_retrieve]"
-    )
-}
-
-pub fn is_compressed_tool_result_marker(body: &str) -> bool {
-    body.lines().any(is_compressed_tool_result_marker_line)
-}
-
-fn is_compressed_tool_result_marker_line(line: &str) -> bool {
-    line.starts_with(COMPRESSED_RESULT_MARKER_PREFIX)
-        && line.contains(" retrieve with tool_result_retrieve]")
-}
-
-fn is_truncated_tool_result_marker_line(line: &str) -> bool {
-    line.starts_with("[truncated")
-        && line.contains(" tool result:")
-        && line.contains(" retrieve with tool_result_retrieve]")
-}
-
-fn strip_truncated_tool_result_marker_lines(body: &str) -> String {
-    let mut out = String::new();
-    let mut stripped = false;
-    for line in body.lines() {
-        if is_truncated_tool_result_marker_line(line) {
-            stripped = true;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if stripped { out } else { body.to_string() }
 }
 
 fn contains_overlap_marker(body: &str) -> bool {
@@ -130,6 +88,107 @@ pub struct CondenseCandidate {
     pub call_id: String,
     pub original_body: String,
     pub condensed_body: String,
+}
+
+/// Render the only model-visible representation of a prune-boundary body.
+/// The original remains in the session artifact store; `condensed_body` is a
+/// planning aid and must never become a second ad-hoc retrieval protocol.
+pub fn render_prune_artifact_frame(
+    candidate: &CondenseCandidate,
+    artifact: Option<&crate::db::text_artifacts::TextArtifact>,
+    unavailable_reason: Option<&str>,
+) -> String {
+    render_prune_artifact_frame_with_agent(
+        candidate,
+        artifact,
+        unavailable_reason,
+        None,
+    )
+}
+
+/// Render a prune frame with the exact agent provenance that the owning
+/// `context_pruned` event persisted.  The generic helper keeps the historical
+/// test/planning path deterministic (`agent_id: null`), while the live
+/// composition supplies its active agent so an unavailable quota frame and its
+/// restart regeneration cannot diverge.
+pub fn render_prune_artifact_frame_with_agent(
+    candidate: &CondenseCandidate,
+    artifact: Option<&crate::db::text_artifacts::TextArtifact>,
+    unavailable_reason: Option<&str>,
+    agent_id: Option<&str>,
+) -> String {
+    let (
+        content,
+        artifact_id,
+        host_captured_bytes,
+        host_original_bytes,
+        host_dropped_bytes,
+        stored_source_bytes,
+        content_bytes,
+        provenance_json,
+    ) = if let Some(artifact) = artifact {
+        (
+            artifact.content.as_str(),
+            Some(artifact.artifact_id),
+            artifact.host_captured_bytes,
+            artifact.host_original_bytes,
+            artifact.host_dropped_bytes,
+            artifact.stored_source_bytes,
+            artifact.content_bytes,
+            artifact.provenance_json.as_str(),
+        )
+    } else {
+        let agent_id = agent_id
+            .map(|agent_id| serde_json::to_string(agent_id).expect("agent id is serializable"))
+            .unwrap_or_else(|| "null".to_owned());
+        let provenance = format!(
+            "{{\"agent_id\":{},\"tool\":{},\"call_id\":{}}}",
+            agent_id,
+            serde_json::to_string(&candidate.tool).expect("tool name is serializable"),
+            serde_json::to_string(&candidate.call_id).expect("call ID is serializable"),
+        );
+        let bytes = candidate.original_body.len();
+        let (head, tail) =
+            crate::engine::text_artifact_frame::utf8_preview_pair(&candidate.original_body);
+        return crate::engine::text_artifact_frame::render_artifact_frame(
+            &crate::engine::text_artifact_frame::ArtifactFrame {
+                status: "unavailable",
+                reason: unavailable_reason.or(Some("persistence_unavailable")),
+                artifact_id: None,
+                kind: "tool_result",
+                capture_reason: "prune_boundary",
+                provenance_json: &provenance,
+                host_captured_bytes: bytes,
+                host_original_bytes: bytes,
+                host_dropped_bytes: 0,
+                stored_source_bytes: bytes,
+                content_bytes: bytes,
+                line_count: candidate.original_body.lines().count(),
+                preview_head: head,
+                preview_tail: tail,
+            },
+        );
+    };
+    let (preview_head, preview_tail) =
+        crate::engine::text_artifact_frame::utf8_preview_pair(content);
+    crate::engine::text_artifact_frame::render_artifact_frame(
+        &crate::engine::text_artifact_frame::ArtifactFrame {
+            status: "available",
+            reason: None,
+            artifact_id,
+            kind: "tool_result",
+            capture_reason: "prune_boundary",
+            provenance_json,
+            host_captured_bytes,
+            host_original_bytes,
+            host_dropped_bytes,
+            stored_source_bytes,
+            content_bytes,
+            line_count: content.lines().count(),
+            preview_head,
+            preview_tail,
+        },
+    )
 }
 
 /// A reasoning-block / superseded snapshot body that has been removed
@@ -447,6 +506,17 @@ pub fn prune_history(history: &mut [Message]) -> DedupPlan {
 }
 
 pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
+    condense_candidates_with_artifact_calls(history, &std::collections::BTreeSet::new())
+}
+
+/// Return newly eligible prune-boundary captures. Existing projections are
+/// selected from their durable owner state, never from frame-shaped text in a
+/// tool result; a tool can legitimately emit either artifact sentinel as part
+/// of its ordinary output.
+pub fn condense_candidates_with_artifact_calls(
+    history: &[Message],
+    model_context_artifact_calls: &std::collections::BTreeSet<String>,
+) -> Vec<CondenseCandidate> {
     let mut calls: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for msg in history {
@@ -479,7 +549,9 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
                         continue;
                     };
                     let body = tool_result_body(&tr.content);
-                    if Elision::contains_marker(&body) || is_compressed_tool_result_marker(&body) {
+                    if Elision::contains_marker(&body)
+                        || model_context_artifact_calls.contains(tr.call.as_str())
+                    {
                         continue;
                     }
                     let Some(condensed_body) =
@@ -504,9 +576,9 @@ pub fn condense_candidates(history: &[Message]) -> Vec<CondenseCandidate> {
 pub fn apply_condensed_tool_result(
     history: &mut [Message],
     candidate: &CondenseCandidate,
-    hash: &str,
+    replacement: &str,
 ) -> bool {
-    apply_condensed_tool_result_direct(history, candidate, hash)
+    apply_condensed_tool_result_direct(history, candidate, replacement)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,13 +589,16 @@ pub struct CondensePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CondenseTarget {
     pub candidate: CondenseCandidate,
-    pub hash: String,
+    /// The already-rendered model projection.  Production passes the shared
+    /// artifact frame after the owning event commits; private planning may use
+    /// the deterministic condensed preview while no durable artifact exists.
+    pub replacement: String,
 }
 
 pub fn apply_condense_plan_to(history: &[Message], plan: &CondensePlan) -> Vec<Message> {
     let mut derived = history.to_vec();
     for target in &plan.targets {
-        apply_condensed_tool_result_direct(&mut derived, &target.candidate, &target.hash);
+        apply_condensed_tool_result_direct(&mut derived, &target.candidate, &target.replacement);
     }
     derived
 }
@@ -531,14 +606,14 @@ pub fn apply_condense_plan_to(history: &[Message], plan: &CondensePlan) -> Vec<M
 pub fn apply_condensed_tool_result_to(
     history: &[Message],
     candidate: &CondenseCandidate,
-    hash: &str,
+    replacement: &str,
 ) -> Vec<Message> {
     apply_condense_plan_to(
         history,
         &CondensePlan {
             targets: vec![CondenseTarget {
                 candidate: candidate.clone(),
-                hash: hash.to_string(),
+                replacement: replacement.to_string(),
             }],
         },
     )
@@ -547,20 +622,8 @@ pub fn apply_condensed_tool_result_to(
 fn apply_condensed_tool_result_direct(
     history: &mut [Message],
     candidate: &CondenseCandidate,
-    hash: &str,
+    replacement: &str,
 ) -> bool {
-    let condensed_body = strip_truncated_tool_result_marker_lines(&candidate.condensed_body);
-    let replacement = format!(
-        "{}\n{}",
-        compressed_tool_result_marker(
-            &candidate.tool,
-            candidate.original_body.len(),
-            condensed_body.len(),
-            candidate.original_body.lines().count(),
-            hash,
-        ),
-        condensed_body
-    );
     let Some(msg) = history.get_mut(candidate.history_index) else {
         return false;
     };
@@ -569,7 +632,7 @@ fn apply_condensed_tool_result_direct(
             if let UserContent::ToolResult(tr) = c
                 && tr.call.as_str() == candidate.call_id
             {
-                tr.content = vec![ToolResultContent::text(replacement)];
+                tr.content = vec![ToolResultContent::text(replacement.to_string())];
                 return true;
             }
         }
@@ -591,16 +654,19 @@ fn tool_names_by_call_id(history: &[Message]) -> std::collections::HashMap<Strin
     tools
 }
 
-fn is_generated_prune_body(body: &str, call_id: &str, tool: Option<&str>) -> bool {
+fn is_generated_prune_body(
+    body: &str,
+    call_id: &str,
+    tool: Option<&str>,
+    prune_boundary_calls: &std::collections::BTreeSet<String>,
+) -> bool {
     let Some(tool) = tool else {
         return false;
     };
     if is_snapshot_tool(tool) {
         exact_snapshot_marker(body, call_id) || contains_overlap_marker(body)
     } else if is_prune_boundary_condense_tool(tool) {
-        body.lines()
-            .next()
-            .is_some_and(is_compressed_tool_result_marker_line)
+        prune_boundary_calls.contains(call_id)
     } else {
         false
     }
@@ -621,6 +687,16 @@ fn is_generated_prune_body(body: &str, call_id: &str, tool: Option<&str>) -> boo
 /// flag (GOALS §14: dimming is a wire-state view; scrollback stays
 /// full-fidelity).
 pub fn current_elided_ids(history: &[Message]) -> Vec<String> {
+    current_elided_ids_with_prune_boundary_calls(history, &std::collections::BTreeSet::new())
+}
+
+/// Return live elision ids using the durable set of prune-boundary projection
+/// owners. The set comes from the session event state and therefore cannot be
+/// forged by a tool result that happens to contain a frame-looking string.
+pub fn current_elided_ids_with_prune_boundary_calls(
+    history: &[Message],
+    prune_boundary_calls: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let tools = tool_names_by_call_id(history);
     let mut ids = Vec::new();
     for msg in history {
@@ -632,6 +708,7 @@ pub fn current_elided_ids(history: &[Message]) -> Vec<String> {
                         &body,
                         tr.call.as_str(),
                         tools.get(tr.call.as_str()).map(String::as_str),
+                        prune_boundary_calls,
                     ) {
                         ids.push(tr.call.to_string());
                     }
@@ -686,6 +763,21 @@ fn static_reason(reason: &str) -> &'static str {
 /// reproduces the exact marker. `watermark` is the depth-1 `prune_watermark`
 /// (root history length at the last prune).
 pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
+    capture_ledger_with_prune_boundary_calls(
+        history,
+        watermark,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// Capture the wire-prune delta using durable prune-boundary owner ids rather
+/// than parsing the rendered artifact frame.  Only these typed owners can be
+/// re-rendered after restart.
+pub fn capture_ledger_with_prune_boundary_calls(
+    history: &[Message],
+    watermark: usize,
+    prune_boundary_calls: &std::collections::BTreeSet<String>,
+) -> PruneLedger {
     let tools = tool_names_by_call_id(history);
     let mut elided = Vec::new();
     for msg in history {
@@ -715,19 +807,17 @@ pub fn capture_ledger(history: &[Message], watermark: usize) -> PruneLedger {
                             partial_body: Some(body),
                         });
                     } else if tool.is_some_and(is_prune_boundary_condense_tool)
-                        && body
-                            .lines()
-                            .next()
-                            .is_some_and(is_compressed_tool_result_marker_line)
+                        && prune_boundary_calls.contains(tr.call.as_str())
                     {
-                        // Prune-boundary tool condensation: store the
-                        // model-bound condensed body verbatim so resume
-                        // reproduces the pruned context exactly. The exact
-                        // full body lives in compressed_tool_results.
+                        // The immutable original and the frame identity are
+                        // owned by the `context_pruned` event's typed
+                        // association. Do not copy a rendered frame (and its
+                        // source UUID) into the ledger: resume re-renders it
+                        // from that association after applying the ledger.
                         elided.push(LedgerEntry {
                             original_event_id: tr.call.to_string(),
                             reason: REASON_TOOL_RESULT_CONDENSED.to_string(),
-                            partial_body: Some(body),
+                            partial_body: None,
                         });
                     }
                 }
@@ -1092,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn characterize_condense_apply_wire_shape() {
+    fn characterize_prune_artifact_frame_wire_shape() {
         let original = long_shell_body();
         let mut history = vec![
             assistant_call("bash-one", "bash", json!({ "command": "cargo test" })),
@@ -1101,25 +1191,12 @@ mod tests {
 
         let candidates = condense_candidates(&history);
         assert_eq!(candidates.len(), 1);
-        let expected_condensed =
-            crate::tools::shell_compress::prune_boundary_condense("cargo test", &original)
-                .expect("fixture should condense");
-        let expected = format!(
-            "{}\n{}",
-            compressed_tool_result_marker(
-                "bash",
-                original.len(),
-                expected_condensed.len(),
-                original.lines().count(),
-                "0123456789abcdefabcdef12",
-            ),
-            expected_condensed
-        );
+        let expected = render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"));
 
         assert!(apply_condensed_tool_result(
             &mut history,
             &candidates[0],
-            "0123456789abcdefabcdef12",
+            &expected,
         ));
 
         assert_eq!(history.len(), 2);
@@ -1273,10 +1350,13 @@ mod tests {
         let plan = CondensePlan {
             targets: candidates
                 .iter()
-                .enumerate()
-                .map(|(index, candidate)| CondenseTarget {
+                .map(|candidate| CondenseTarget {
                     candidate: candidate.clone(),
-                    hash: format!("hash-{index}"),
+                    replacement: render_prune_artifact_frame(
+                        candidate,
+                        None,
+                        Some("artifact_limit"),
+                    ),
                 })
                 .collect(),
         };
@@ -1286,7 +1366,7 @@ mod tests {
             assert!(apply_condensed_tool_result(
                 &mut sequential,
                 &target.candidate,
-                &target.hash,
+                &target.replacement,
             ));
         }
         let bulk = apply_condense_plan_to(&history, &plan);
@@ -1295,8 +1375,8 @@ mod tests {
             serde_json::to_value(bulk).unwrap(),
             serde_json::to_value(&sequential).unwrap()
         );
-        assert!(body_at(&sequential, 1).contains("hash=hash-0"));
-        assert!(body_at(&sequential, 3).contains("hash=hash-1"));
+        assert!(body_at(&sequential, 1).contains("<cockpit_artifact_v1"));
+        assert!(body_at(&sequential, 3).contains("<cockpit_artifact_v1"));
     }
 
     #[test]
@@ -1504,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_boundary_condenses_large_surviving_bash_result() {
+    fn tool_result_prune_artifact_boundary_replaces_large_surviving_bash_result_with_a_frame() {
         let mut history = vec![
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &long_shell_body()),
@@ -1518,34 +1598,13 @@ mod tests {
         assert!(apply_condensed_tool_result(
             &mut history,
             &candidates[0],
-            "0123456789abcdefabcdef12"
+            &render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"))
         ));
         let body = body_at(&history, 1);
-        assert!(body.contains(COMPRESSED_RESULT_MARKER_PREFIX));
-        assert!(body.contains("tool=bash"));
-        assert!(body.contains("original_bytes="));
-        assert!(body.contains("condensed_bytes="));
-        assert!(body.contains("lines=700"));
-        assert!(body.contains("hash=0123456789abcdefabcdef12"));
-        assert!(body.contains("[deterministic shell condensation]"));
-    }
-
-    #[test]
-    fn compressed_marker_reports_line_count() {
-        let marker =
-            compressed_tool_result_marker("bash", 1000, 100, 42, "0123456789abcdefabcdef12");
-
-        assert!(marker.contains("lines=42"));
-        assert!(marker.contains("retrieve with tool_result_retrieve"));
-    }
-
-    #[test]
-    fn compressed_marker_with_line_count_is_still_detected() {
-        let marker =
-            compressed_tool_result_marker("bash", 1000, 100, 42, "0123456789abcdefabcdef12");
-
-        assert!(is_compressed_tool_result_marker(&marker));
-        assert!(is_compressed_tool_result_marker_line(&marker));
+        assert!(body.starts_with("<cockpit_artifact_v1 "));
+        assert!(body.contains("\"capture_reason\":\"prune_boundary\""));
+        assert!(body.contains("\"line_count\":700"));
+        assert!(body.contains("\"status\":\"unavailable\""));
     }
 
     #[test]
@@ -1567,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn elision_marker_is_not_mistaken_for_a_compressed_marker() {
+    fn frame_shaped_output_needs_a_durable_prune_owner() {
         let snapshot = Elision {
             original_event_id: "call-hidden".to_string(),
             reason: REASON_SNAPSHOT_SUPERSEDED,
@@ -1575,10 +1634,13 @@ mod tests {
         .marker_text();
         let overlap = overlap::overlap_marker_line();
 
-        for marker in [snapshot, overlap] {
-            assert!(!marker.ends_with(" retrieve with tool_result_retrieve]"));
-            assert!(!is_compressed_tool_result_marker(&marker));
-            assert!(!is_compressed_tool_result_marker_line(&marker));
+        for body in [snapshot, overlap] {
+            let history = vec![
+                assistant_call("c1", "bash", json!({ "command": "printf marker" })),
+                tool_result("c1", &body),
+            ];
+            assert!(current_elided_ids(&history).is_empty());
+            assert!(capture_ledger(&history, history.len()).elided.is_empty());
         }
     }
 
@@ -1644,11 +1706,8 @@ mod tests {
     }
 
     #[test]
-    fn bash_truncated_body_still_condenses_to_one_compressed_marker() {
-        let original = format!(
-            "[truncated tool result: tool=bash delivered_bytes=8000 stored_bytes=12000 original_bytes=12000 lines=900 hash=aaaaaaaaaaaaaaaaaaaaaaaa retrieve with tool_result_retrieve]\n{}",
-            long_shell_body()
-        );
+    fn bash_truncated_body_is_replaced_by_one_artifact_frame() {
+        let original = format!("[truncated]\n{}", long_shell_body());
         let mut history = vec![
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &original),
@@ -1659,21 +1718,11 @@ mod tests {
         assert!(apply_condensed_tool_result(
             &mut history,
             &candidates[0],
-            "0123456789abcdefabcdef12"
+            &render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"))
         ));
 
         let body = body_at(&history, 1);
-        assert_eq!(
-            body.lines()
-                .filter(|line| line.starts_with(COMPRESSED_RESULT_MARKER_PREFIX))
-                .count(),
-            1,
-            "{body}"
-        );
-        assert_eq!(
-            body.matches("retrieve with tool_result_retrieve").count(),
-            1
-        );
+        assert_eq!(body.matches("<cockpit_artifact_v1").count(), 1, "{body}");
     }
 
     #[test]
@@ -1706,30 +1755,28 @@ mod tests {
     }
 
     #[test]
-    fn prune_ledger_reapplies_condensed_tool_result_body() {
+    fn prune_ledger_keeps_artifact_frame_out_of_the_durable_delta() {
         let original = long_shell_body();
         let mut pruned = vec![
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &original),
         ];
         let candidates = condense_candidates(&pruned);
-        apply_condensed_tool_result(&mut pruned, &candidates[0], "0123456789abcdefabcdef12");
-        let condensed = body_at(&pruned, 1);
-
-        let ledger = capture_ledger(&pruned, 2);
+        let frame = render_prune_artifact_frame(&candidates[0], None, Some("artifact_limit"));
+        apply_condensed_tool_result(&mut pruned, &candidates[0], &frame);
+        let durable_prune_calls = std::collections::BTreeSet::from(["c1".to_owned()]);
+        assert!(condense_candidates_with_artifact_calls(&pruned, &durable_prune_calls).is_empty());
+        let ledger = capture_ledger_with_prune_boundary_calls(&pruned, 2, &durable_prune_calls);
         assert_eq!(ledger.elided.len(), 1);
         assert_eq!(ledger.elided[0].reason, REASON_TOOL_RESULT_CONDENSED);
-        assert_eq!(
-            ledger.elided[0].partial_body.as_deref(),
-            Some(condensed.as_str())
-        );
+        assert_eq!(ledger.elided[0].partial_body, None);
 
         let mut rebuilt = vec![
             assistant_call("c1", "bash", json!({ "command": "cargo test" })),
             tool_result("c1", &original),
         ];
         assert_eq!(reapply_ledger(&ledger, &mut rebuilt).unwrap(), 1);
-        assert_eq!(body_at(&rebuilt, 1), condensed);
+        assert_ne!(body_at(&rebuilt, 1), frame);
     }
 
     /// Already-elided newest body → leave older bodies full (no marker
@@ -1789,10 +1836,10 @@ mod tests {
                 "[elided: command output, not cockpit state]\nstill real output",
             ),
             (
-                "bash-compressed",
+                "bash-frame-shaped",
                 "bash",
                 json!({ "command": "printf marker" }),
-                "[compressed tool result: command output, not cockpit state]\nstill real output",
+                "<cockpit_artifact_v1 payload_utf8_bytes=1>\nnot a valid generated frame\n</cockpit_artifact_v1>\nstill real output",
             ),
             (
                 "read-elided",

@@ -520,23 +520,55 @@ pub(crate) async fn attach_send_pump(
     // Sole invocation identity: allocated once before first SendUserMessage.
     let client_submission_id = Uuid::new_v4();
     if submitted_message {
-        let image_refs = load_and_upload_images(client, options.image_data).await?;
-        // Send the user message. `cockpit run` always includes the run marker;
-        // init/learn omit options and create no RunInvocationState.
-        let send_result = client
-            .request(Request::SendUserMessage {
-                expected_model_state_generation: None,
-                expected_model: None,
-                client_submission_id,
-                text: prompt,
-                display_text: None,
-                tag_expansions: Vec::new(),
-                image_refs,
-                forced_skill: None,
-                run_invocation_options: options.run_invocation_options.clone(),
-            })
-            .await
-            .context("sending user message")?;
+        let use_bulk = cockpit_core::daemon::bulk_upload::user_message_needs_bulk(&prompt, None);
+        if use_bulk && !options.image_data.is_empty() {
+            return Err(RunUsageError(
+                "media/file submissions cannot carry text over the 64 KiB artifact threshold"
+                    .to_owned(),
+            )
+            .into());
+        }
+        // Never place a source that will become an FCM2 artifact in the
+        // NDJSON control request.  The bulk helper emits bounded chunks and
+        // returns a digest-bound opaque ref; the daemon consumes it atomically
+        // with the eventual SendUserMessageBulk receipt. `cockpit run` always
+        // includes the run marker; init/learn omit options and create no
+        // RunInvocationState.
+        let send_result = if use_bulk {
+            let transfer =
+                cockpit_core::daemon::bulk_upload::stage_opaque_user_text(client, &prompt)
+                    .await
+                    .map_err(|error| RunUsageError(error.to_string()))?;
+            client
+                .request(Request::SendUserMessageBulk {
+                    expected_model_state_generation: None,
+                    expected_model: None,
+                    client_submission_id,
+                    transfer,
+                    display_text: None,
+                    display_transfer: None,
+                    tag_expansions: Vec::new(),
+                    forced_skill: None,
+                    run_invocation_options: options.run_invocation_options.clone(),
+                })
+                .await
+        } else {
+            let image_refs = load_and_upload_images(client, options.image_data).await?;
+            client
+                .request(Request::SendUserMessage {
+                    expected_model_state_generation: None,
+                    expected_model: None,
+                    client_submission_id,
+                    text: prompt,
+                    display_text: None,
+                    tag_expansions: Vec::new(),
+                    image_refs,
+                    forced_skill: None,
+                    run_invocation_options: options.run_invocation_options.clone(),
+                })
+                .await
+        }
+        .context("sending user message")?;
         match send_result {
             Ok(_) => {}
             Err(error)

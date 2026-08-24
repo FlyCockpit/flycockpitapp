@@ -1,5 +1,11 @@
 {
   "schema": "flycockpit.send_user_message_v2.canonical_vectors.v1",
+  "limits": {
+    "fcm2_max_bytes": 17439564,
+    "fcm2_max_current_encoding_bytes": 17311564,
+    "text_max_bytes": 8388608,
+    "text_max_scalars": 8388608
+  },
   "vectors": [
     {
       "name": "attachment_only_audio",

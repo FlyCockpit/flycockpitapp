@@ -232,6 +232,14 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
+    // The source bytes are carried by `write_bulk_transfer_chunk`; this
+    // request is a typed transfer reference and stays below the application
+    // frame cap even for an 8 MiB message.
+    row(
+        "send_user_message_bulk",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::BulkReference,
+    ),
     row(
         "get_run_invocation_status",
         RemoteMessageClass::BoundedRequestResponse,

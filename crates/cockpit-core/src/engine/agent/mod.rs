@@ -386,6 +386,12 @@ async fn toolbox_with_retrieval_if_needed(
     session: &Session,
     llm_mode: crate::config::extended::LlmMode,
 ) -> ToolBox {
+    // These two tools are registered with the built-in inventory so their
+    // schemas are available once a capture exists, but they must never be
+    // offered speculatively.  Start by removing any static registration so a
+    // rebuilt/restarted session gets the same artifact-dependent surface as a
+    // newly-created one.
+    tools = tools.without("artifact_read").without("artifact_search");
     if session.sandbox_escalation_enabled()
         && crate::engine::tool::Capability::SandboxEscalate.enabled(llm_mode)
     {
@@ -393,10 +399,15 @@ async fn toolbox_with_retrieval_if_needed(
     } else {
         tools = tools.without("escalate");
     }
-    if session.has_retrievable_tool_results() {
-        tools = tools.with(Arc::new(
-            crate::tools::tool_result_retrieve::ToolResultRetrieveTool,
-        ));
+    if session
+        .db
+        .session_has_text_artifacts(session.id)
+        .await
+        .unwrap_or(false)
+    {
+        tools = tools
+            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
+            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
     }
     if session
         .db
@@ -411,115 +422,37 @@ async fn toolbox_with_retrieval_if_needed(
     tools
 }
 
-fn truncated_tool_result_is_retrievable(tool: &str) -> bool {
-    // Retrieve tools page stored results; storing their own truncated pages
-    // would mint a fresh hash for each continuation.
+pub(crate) fn text_artifact_capture_is_eligible(tool: &str) -> bool {
+    // Read/search pages are bounded responses, not new durable captures.
     !matches!(
         tool,
         "read"
             | "write"
             | "edit"
             | "unlock"
-            | "tool_result_retrieve"
+            | "artifact_read"
+            | "artifact_search"
             | "delegation_payload_retrieve"
     )
 }
 
-#[cfg(test)]
-async fn store_genuinely_compressed_tool_result(
-    session: &Session,
-    agent_id: &str,
+pub(crate) fn text_artifact_capture_is_persistable(
     tool: &str,
-    call_id: &str,
-    original: &str,
-    compressed: &str,
-) -> Result<String> {
-    let hash = crate::db::compressed_results::compressed_result_hash(original);
-    session
-        .db
-        .insert_compressed_tool_result(
-            &hash,
-            crate::db::compressed_results::NewCompressedToolResult {
-                session_id: session.id,
-                agent_id,
-                tool,
-                call_id,
-                original_byte_len: original.len(),
-                compressed_byte_len: Some(compressed.len()),
-                created_at: Utc::now().timestamp(),
-                kind: "prune-boundary",
-                content: original,
-            },
-        )
-        .await?;
-    session.set_has_retrievable_tool_results();
-    Ok(hash)
-}
-
-async fn store_truncated_tool_result(
-    session: &Session,
-    agent_id: &str,
-    tool: &str,
-    call_id: &str,
-    retained: &crate::engine::tool::RetainedTruncatedOutput,
-) -> Result<String> {
-    let hash = crate::db::compressed_results::compressed_result_hash(&retained.content);
-    session
-        .db
-        .insert_compressed_tool_result(
-            &hash,
-            crate::db::compressed_results::NewCompressedToolResult {
-                session_id: session.id,
-                agent_id,
-                tool,
-                call_id,
-                original_byte_len: retained.original_byte_len,
-                compressed_byte_len: None,
-                created_at: Utc::now().timestamp(),
-                kind: "truncated",
-                content: &retained.content,
-            },
-        )
-        .await?;
-    session.set_has_retrievable_tool_results();
-    Ok(hash)
-}
-
-pub(crate) async fn maybe_store_retrievable_truncated_tool_result(
-    session: &Session,
-    agent_id: &str,
-    tool: &str,
-    call_id: &str,
-    delivered_body: &mut String,
-    retained: Option<&crate::engine::tool::RetainedTruncatedOutput>,
+    capture: Option<&crate::engine::tool::TextArtifactCapture>,
+    delivered_body: &str,
     recheck_modified_output: bool,
-) -> Result<Option<String>> {
-    if !truncated_tool_result_is_retrievable(tool) {
-        return Ok(None);
-    }
-    if recheck_modified_output {
-        // The retained body has not passed through the same result-recheck edit
-        // or drop path as `delivered_body`. Suppress retrieval rather than
-        // persisting bytes the recheck removed.
-        return Ok(None);
-    }
-    let Some(retained) = retained else {
-        return Ok(None);
-    };
-    if retained.content.is_empty() || retained.content == *delivered_body {
-        return Ok(None);
-    }
-
-    let hash = store_truncated_tool_result(session, agent_id, tool, call_id, retained).await?;
-    let partial = if retained.partial { " partial" } else { "" };
-    let lines = retained.content.lines().count();
-    delivered_body.push_str(&format!(
-        "\n[truncated{partial} tool result: tool={tool} delivered_bytes={} stored_bytes={} original_bytes={} lines={lines} hash={hash} retrieve with tool_result_retrieve]\n",
-        delivered_body.len(),
-        retained.content.len(),
-        retained.original_byte_len,
-    ));
-    Ok(Some(hash))
+) -> bool {
+    text_artifact_capture_is_eligible(tool)
+        && !recheck_modified_output
+        && capture.is_some_and(|value| {
+            !value.content.is_empty()
+                && value.content != delivered_body
+                && value.host_original_bytes >= value.host_captured_bytes
+                && value.host_dropped_bytes
+                    == value.host_original_bytes - value.host_captured_bytes
+                && value.stored_source_bytes == value.content.len()
+                && value.stored_source_bytes <= value.host_captured_bytes
+        })
 }
 
 async fn record_usage_blocking(
@@ -1673,12 +1606,12 @@ fn assistant_content_has_signed_reasoning(
 }
 
 #[cfg(test)]
-mod compressed_tool_result_tests {
+mod text_artifact_tests {
     use super::*;
     use std::path::PathBuf;
 
     #[tokio::test]
-    async fn retrieval_tool_advertisement_is_sticky_after_store() {
+    async fn artifact_tools_are_dynamic_after_an_owning_event_commits() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create_for_test(
             db,
@@ -1688,7 +1621,10 @@ mod compressed_tool_result_tests {
         )
         .unwrap();
         session.set_sandbox_escalation_enabled(false);
-        let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
+        let tools = ToolBox::new()
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::artifact_read::ArtifactReadTool))
+            .with(Arc::new(crate::tools::artifact_search::ArtifactSearchTool));
         assert!(
             !toolbox_with_retrieval_if_needed(
                 tools.clone(),
@@ -1697,18 +1633,32 @@ mod compressed_tool_result_tests {
             )
             .await
             .names()
-            .contains(&"tool_result_retrieve")
+            .contains(&"artifact_read")
         );
-        store_genuinely_compressed_tool_result(
-            &session,
-            "Build",
-            "bash",
-            "call-1",
-            "redacted original output",
-            "redacted",
-        )
-        .await
-        .unwrap();
+        let event = crate::db::text_artifacts::TextArtifactEventInput {
+            session_id: session.id,
+            kind: crate::db::session_log::SessionEventKind::ToolCall,
+            agent: Some("Build".to_string()),
+            call_id: Some("call-1".to_string()),
+            context: Default::default(),
+            ts_ms: 1,
+            data_json: serde_json::json!({"output":"short"}).to_string(),
+            artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                projection_slot: Some(0),
+                kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                content: "redacted original output".to_string(),
+                host_captured_bytes: 24,
+                host_original_bytes: 24,
+                host_dropped_bytes: 0,
+                stored_source_bytes: 24,
+                provenance_json: serde_json::json!({"tool":"bash","call_id":"call-1","agent_id":"Build"}).to_string(),
+                created_at: 1,
+            }],
+            unavailable_projection: None,
+        };
+        session.db.record_event_with_text_artifacts(event).await.unwrap();
         assert!(
             toolbox_with_retrieval_if_needed(
                 tools,
@@ -1717,139 +1667,30 @@ mod compressed_tool_result_tests {
             )
             .await
             .names()
-            .contains(&"tool_result_retrieve")
+            .contains(&"artifact_read")
         );
-    }
-
-    #[tokio::test]
-    async fn truncate_only_store_leaves_compressed_len_none() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        let retained = crate::engine::tool::RetainedTruncatedOutput {
-            content: "visible\nhidden\n".to_string(),
-            original_byte_len: "visible\nhidden\n".len(),
-            partial: false,
-        };
-
-        let hash = store_truncated_tool_result(&session, "Build", "code", "call-1", &retained)
-            .await
-            .unwrap();
-        let row = session
-            .db
-            .compressed_tool_result(session.id, &hash)
-            .await
-            .unwrap()
-            .expect("stored truncated result");
-
-        assert_eq!(row.kind, "truncated");
-        assert_eq!(row.compressed_byte_len, None);
-        assert_eq!(row.original_byte_len, retained.original_byte_len);
-        assert_eq!(row.content, retained.content);
-    }
-
-    #[tokio::test]
-    async fn retrieval_advertisement_suppressed_when_retrieval_adds_nothing() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        session.set_sandbox_escalation_enabled(false);
-        let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
-        let mut delivered = "already delivered".to_string();
-        let retained = crate::engine::tool::RetainedTruncatedOutput {
-            content: delivered.clone(),
-            original_byte_len: delivered.len(),
-            partial: false,
-        };
-
-        let stored = maybe_store_retrievable_truncated_tool_result(
-            &session,
-            "Build",
-            "code",
-            "call-1",
-            &mut delivered,
-            Some(&retained),
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(stored.is_none());
-        assert_eq!(delivered, "already delivered");
-        assert!(
-            !toolbox_with_retrieval_if_needed(
-                tools,
-                &session,
-                crate::config::extended::LlmMode::Normal
-            )
-            .await
-            .names()
-            .contains(&"tool_result_retrieve")
-        );
-    }
-
-    #[tokio::test]
-    async fn truncated_marker_reports_line_count() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create_for_test(
-            db,
-            PathBuf::from("/x"),
-            "Build",
-            crate::session::test_redaction_key_resolver(),
-        )
-        .unwrap();
-        let mut delivered = "visible line\n[truncated]\n".to_string();
-        let retained = crate::engine::tool::RetainedTruncatedOutput {
-            content: "visible line\nhidden line\nlast line\n".to_string(),
-            original_byte_len: "visible line\nhidden line\nlast line\n".len(),
-            partial: false,
-        };
-
-        let stored = maybe_store_retrievable_truncated_tool_result(
-            &session,
-            "Build",
-            "bash",
-            "call-1",
-            &mut delivered,
-            Some(&retained),
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(stored.is_some());
-        assert!(delivered.contains("[truncated tool result: tool=bash"));
-        assert!(delivered.contains("lines=3"));
-        assert!(delivered.contains("retrieve with tool_result_retrieve"));
+        assert!(toolbox_with_retrieval_if_needed(
+            ToolBox::new(), &session, crate::config::extended::LlmMode::Normal,
+        ).await.names().contains(&"artifact_search"));
     }
 
     #[test]
-    fn retrieve_tools_are_not_retrievable() {
+    fn artifact_tools_are_not_capture_eligible() {
         for tool in [
-            "read",
             "read",
             "write",
             "edit",
             "unlock",
-            "tool_result_retrieve",
+            "artifact_read",
+            "artifact_search",
             "delegation_payload_retrieve",
         ] {
             assert!(
-                !truncated_tool_result_is_retrievable(tool),
-                "{tool} must not store retrievable truncated output"
+                !text_artifact_capture_is_eligible(tool),
+                "{tool} must not capture its bounded output"
             );
         }
-        assert!(truncated_tool_result_is_retrievable("bash"));
+        assert!(text_artifact_capture_is_eligible("bash"));
     }
 
     #[tokio::test]

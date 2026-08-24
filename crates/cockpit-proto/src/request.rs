@@ -348,6 +348,39 @@ pub enum Request {
         run_invocation_options: Option<RunInvocationOptions>,
     },
 
+    /// Remote-safe oversized text ingress. The UTF-8 source itself is staged
+    /// and integrity-checked on the existing bulk lane; this bounded request
+    /// carries only its typed reference and the canonical FCM2 metadata.
+    ///
+    /// `display_transfer` is deliberately a second typed reference rather
+    /// than an inline escape hatch. FCM2 gives `display_text` the same 8 MiB
+    /// domain as `text`, so leaving a large display form inline would bypass
+    /// the 524360-byte remote application-frame cap even when the authored
+    /// source correctly used the bulk path. It is mutually exclusive with
+    /// `display_text`. When it is present, `transfer` may carry an otherwise
+    /// inline-sized source so a large display form can still be transported
+    /// without inventing a second request shape.
+    /// This is intentionally text-only, so it cannot mix bulk ownership with
+    /// the existing image-attachment composition.
+    SendUserMessageBulk {
+        client_submission_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_model_state_generation: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
+        transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_transfer: Option<crate::remote_transport::bulk::RemoteBulkTransferRef>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tag_expansions: Vec<TagExpansionMeta>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forced_skill: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_invocation_options: Option<RunInvocationOptions>,
+    },
+
     /// Query durable run-invocation status by the canonical client submission
     /// id. Does not require an attached session.
     GetRunInvocationStatus {
@@ -724,8 +757,6 @@ pub enum Request {
     /// transfer's digest and length have been verified.
     ImportSessionArchive {
         transfer: crate::remote_transport::bulk::RemoteBulkTransferRef,
-        #[serde(default)]
-        as_new: bool,
     },
 
     /// Push one chunk of a bulk transfer into daemon-side staging.
@@ -2209,6 +2240,80 @@ impl Request {
                     }
                 }
             }
+            Self::SendUserMessageBulk {
+                client_submission_id,
+                expected_model_state_generation,
+                expected_model,
+                transfer,
+                display_text,
+                display_transfer,
+                run_invocation_options,
+                ..
+            } => {
+                if client_submission_id.is_nil() {
+                    return Err("client_submission_id must not be nil".to_string());
+                }
+                if expected_model_state_generation.is_some() != expected_model.is_some() {
+                    return Err(
+                        "expected model generation and identity must be supplied together"
+                            .to_string(),
+                    );
+                }
+                let is_opaque_text_transfer = |reference: &crate::remote_transport::bulk::RemoteBulkTransferRef,
+                                                minimum_length: u64| {
+                    reference.mime_class
+                        == crate::remote_transport::bulk::RemoteBulkMimeClass::Opaque
+                        && (minimum_length
+                            ..=crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES as u64)
+                            .contains(&reference.total_length_value())
+                };
+                let source_minimum_length = if display_transfer.is_some() { 1 } else { 65_537 };
+                if !is_opaque_text_transfer(transfer, source_minimum_length) {
+                    return Err(
+                        "bulk user message must be an opaque 64KiB..8MiB transfer"
+                            .to_string(),
+                    );
+                }
+                if display_text
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 64 * 1024)
+                {
+                    return Err(
+                        "bulk user message display text over 64KiB must use a transfer"
+                            .to_string(),
+                    );
+                }
+                if let Some(display_transfer) = display_transfer {
+                    if display_text.is_some() {
+                        return Err(
+                            "bulk user message display text must be inline or a transfer, not both"
+                                .to_string(),
+                        );
+                    }
+                    if !is_opaque_text_transfer(display_transfer, 1) {
+                        return Err(
+                            "bulk user message display transfer must be an opaque 1B..8MiB transfer"
+                                .to_string(),
+                        );
+                    }
+                    if display_transfer.transfer_id == transfer.transfer_id {
+                        return Err(
+                            "bulk user message text and display transfers must be distinct"
+                                .to_string(),
+                        );
+                    }
+                }
+                if let Some(options) = run_invocation_options {
+                    if options.max_turns == Some(0) {
+                        return Err("run_invocation_options.max_turns must not be zero".to_string());
+                    }
+                    if options.timeout_ms == Some(0) {
+                        return Err(
+                            "run_invocation_options.timeout_ms must not be zero".to_string()
+                        );
+                    }
+                }
+            }
             Self::ListSecretInventory { cursor, limit } => {
                 if cursor
                     .as_ref()
@@ -2592,6 +2697,7 @@ macro_rules! request_variants {
             (Request::Attach { .. }, "attach");
             (Request::SubagentTranscript { .. }, "subagent_transcript");
             (Request::SendUserMessage { .. }, "send_user_message");
+            (Request::SendUserMessageBulk { .. }, "send_user_message_bulk");
             (Request::GetRunInvocationStatus { .. }, "get_run_invocation_status");
             (Request::OperationStatus { .. }, "operation_status");
             (Request::CancelRunInvocation { .. }, "cancel_run_invocation");
@@ -2852,6 +2958,7 @@ macro_rules! command {
             (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
+            (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::remote_transport::bulk::RemoteBulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::remote_transport::bulk::RemoteBulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::GetRunInvocationStatus { client_submission_id }, "get_run_invocation_status", public_read, none, false, read_only, none, concurrent, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
             (Request::OperationStatus { operation_id }, "operation_status", public_read, none, false, read_only, none, serialized, none, "operation_id:Uuid", [operation_id: Uuid => param]);
             (Request::CancelRunInvocation { client_submission_id }, "cancel_run_invocation", public_read, none, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid", [client_submission_id: Uuid => param]);
@@ -2907,8 +3014,12 @@ macro_rules! command {
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
-            (Request::ImportSessionArchive { transfer, as_new }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, as_new: bool => param]);
-            (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", owner_only, none, true, local_only, none, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
+            (Request::ImportSessionArchive { transfer }, "import_session_archive", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param]);
+            // Remote oversized text ingress stages source bytes over the bulk
+            // lane before its reference-only FCM2 request. It is scoped to the
+            // attached session writer (while local owners retain their normal
+            // bypass), and exact chunk replay is acknowledged by bulk staging.
+            (Request::WriteBulkTransferChunk { transfer, chunk_index, data_base64 }, "write_bulk_transfer_chunk", session_writer, attached, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String", [transfer: $crate::remote_transport::bulk::RemoteBulkTransferRef => param, chunk_index: u32 => param, data_base64: String => param]);
             (Request::ReadBulkTransferChunk { transfer_id, chunk_index }, "read_bulk_transfer_chunk", owner_only, none, false, local_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
             (Request::ReadRedactedExportChunk { transfer_id, chunk_index }, "read_redacted_export_chunk", owner_only, none, false, read_only, none, concurrent, none, "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32", [transfer_id: $crate::remote_protocol_id::RemoteTransferId => param, chunk_index: u32 => param]);
             (Request::Curator { project_root, action }, "curator", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "project_root:String|action:CuratorAction", [project_root: String => project_root, action: CuratorAction => param]);
@@ -3363,7 +3474,10 @@ impl Request {
     /// v2 message envelope is intentionally a separate protocol and the
     /// retired legacy message variant has no remote-operation encoding.
     pub fn canonical_remote_operation_params_v1(&self) -> anyhow::Result<Vec<u8>> {
-        if matches!(self, Self::SendUserMessage { .. }) {
+        if matches!(
+            self,
+            Self::SendUserMessage { .. } | Self::SendUserMessageBulk { .. }
+        ) {
             anyhow::bail!("legacy_send_user_message_not_remote_operation");
         }
         crate::command!(command_encode_fcor_params, self)
@@ -3573,7 +3687,6 @@ mod tests {
                 RemoteBulkMimeClass::Archive,
             )
             .unwrap(),
-            as_new: true,
         };
         assert_eq!(request.wire_tag(), "import_session_archive");
 
@@ -3590,8 +3703,7 @@ mod tests {
 
         let round_tripped: Request = serde_json::from_str(&encoded).unwrap();
         match round_tripped {
-            Request::ImportSessionArchive { transfer, as_new } => {
-                assert!(as_new);
+            Request::ImportSessionArchive { transfer } => {
                 assert_eq!(transfer.total_length_value(), 64 * 1024 * 1024);
                 assert_eq!(transfer.mime_class, RemoteBulkMimeClass::Archive);
             }
@@ -3709,6 +3821,110 @@ mod tests {
             nil_submission.validate_semantics().unwrap_err(),
             "client_submission_id must not be nil"
         );
+    }
+
+    #[test]
+    fn bulk_user_message_is_reference_only_at_exact_transport_boundaries() {
+        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
+        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+
+        let request = |total_length, mime_class| Request::SendUserMessageBulk {
+            client_submission_id: Uuid::new_v4(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            transfer: RemoteBulkTransferRef::new(
+                tag_protocol_id_bytes::<Transfer>([7; 16]).unwrap(),
+                total_length,
+                [0xAB; 32],
+                mime_class,
+            )
+            .unwrap(),
+            display_text: Some("large remote preview".to_owned()),
+            display_transfer: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        };
+
+        for boundary in [65_537, 8 * 1024 * 1024] {
+            let request = request(boundary, RemoteBulkMimeClass::Opaque);
+            request
+                .validate_semantics()
+                .expect("exact bulk text boundary must be accepted");
+            let encoded = serde_json::to_vec(&request).unwrap();
+            assert!(
+                encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES,
+                "the {boundary}-byte body must stay on the bulk lane"
+            );
+            assert!(
+                !String::from_utf8_lossy(&encoded).contains("\"text\""),
+                "bulk request must contain a transfer reference, not a text body"
+            );
+        }
+
+        let under = request(65_536, RemoteBulkMimeClass::Opaque);
+        assert!(under.validate_semantics().is_err());
+        let over = request(8 * 1024 * 1024 + 1, RemoteBulkMimeClass::Opaque);
+        assert!(over.validate_semantics().is_err());
+        let wrong_kind = request(65_537, RemoteBulkMimeClass::Archive);
+        assert!(wrong_kind.validate_semantics().is_err());
+    }
+
+    #[test]
+    fn bulk_user_message_can_stage_a_large_display_form_without_inline_frame_growth() {
+        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
+        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+
+        let transfer = RemoteBulkTransferRef::new(
+            tag_protocol_id_bytes::<Transfer>([8; 16]).unwrap(),
+            5,
+            [0xAC; 32],
+            RemoteBulkMimeClass::Opaque,
+        )
+        .unwrap();
+        let display_transfer = RemoteBulkTransferRef::new(
+            tag_protocol_id_bytes::<Transfer>([9; 16]).unwrap(),
+            8 * 1024 * 1024,
+            [0xBD; 32],
+            RemoteBulkMimeClass::Opaque,
+        )
+        .unwrap();
+        let request = Request::SendUserMessageBulk {
+            client_submission_id: Uuid::new_v4(),
+            expected_model_state_generation: None,
+            expected_model: None,
+            transfer: transfer.clone(),
+            display_text: None,
+            display_transfer: Some(display_transfer.clone()),
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            run_invocation_options: None,
+        };
+        request
+            .validate_semantics()
+            .expect("a display transfer permits an inline-sized source transfer");
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(!String::from_utf8_lossy(&encoded).contains("large remote preview"));
+
+        let conflicting_inline = Request::SendUserMessageBulk {
+            display_text: Some("inline too".to_owned()),
+            ..request.clone()
+        };
+        assert!(conflicting_inline.validate_semantics().is_err());
+        let oversized_inline_display = Request::SendUserMessageBulk {
+            display_transfer: None,
+            display_text: Some("x".repeat(65_537)),
+            ..request.clone()
+        };
+        assert!(oversized_inline_display.validate_semantics().is_err());
+        let shared_transfer = Request::SendUserMessageBulk {
+            display_transfer: Some(transfer),
+            ..request
+        };
+        assert!(shared_transfer.validate_semantics().is_err());
     }
 
     #[test]
@@ -4113,7 +4329,12 @@ mod tests {
         );
         assert_eq!(
             remote_operation_class_for_tag("write_bulk_transfer_chunk"),
-            None
+            Some(RemoteOperationClass::IdempotentAdapterMutation),
+            "remote FCM2 ingress must be able to stage its opaque source before the bounded reference request"
+        );
+        assert_eq!(
+            remote_adapter_recovery_strategy_for_tag("write_bulk_transfer_chunk"),
+            Some(RemoteAdapterRecoveryStrategy::DomainTransaction)
         );
         assert_eq!(
             remote_adapter_recovery_strategy_for_tag("set_default_model"),
@@ -4507,18 +4728,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_export_generic_reader_stays_local_only() {
+    fn raw_export_reader_stays_local_only_while_opaque_ingress_is_remoted() {
         // AC5/AC8: the generic bulk reader that serves the raw `--include-sensitive`
         // archive stays `local_only` (no remote operation class), so a remote
         // principal is refused it at admission — the sanctioned owner-local carve
-        // out. The write side is likewise local-only.
+        // out. The write side is different: it is the authenticated, attached
+        // session-writer ingress for reference-only opaque FCM2 bodies.
         assert_eq!(
             remote_operation_class_for_tag("read_bulk_transfer_chunk"),
             None
         );
         assert_eq!(
             remote_operation_class_for_tag("write_bulk_transfer_chunk"),
-            None
+            Some(RemoteOperationClass::IdempotentAdapterMutation)
         );
     }
 

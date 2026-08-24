@@ -750,12 +750,8 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Search the current session's compaction lineage.",
             condition: Some("interactive sessions"),
         },
-        BuiltinToolInventoryItem {
-            family: "Session",
-            name: "tool_result_retrieve",
-            summary: "Retrieve an elided tool result.",
-            condition: Some("internal recovery"),
-        },
+        BuiltinToolInventoryItem { family: "Session", name: "artifact_read", summary: "Read an immutable session text artifact.", condition: Some("when the session has artifacts") },
+        BuiltinToolInventoryItem { family: "Session", name: "artifact_search", summary: "Search an immutable session text artifact.", condition: Some("when the session has artifacts") },
         BuiltinToolInventoryItem {
             family: "Session",
             name: "delegation_payload_retrieve",
@@ -902,7 +898,8 @@ fn extra_custom_tool_reserved_names() -> &'static [&'static str] {
         "seed",
         "list-packages",
         "add-package",
-        "tool_result_retrieve",
+        "artifact_read",
+        "artifact_search",
         "delegation_payload_retrieve",
     ]
 }
@@ -972,7 +969,8 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::session_read::SessionReadTool),
         Arc::new(tools::session_search::SessionLineageSearchTool),
         Arc::new(tools::todo::TodoTool),
-        Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
+        Arc::new(tools::artifact_read::ArtifactReadTool),
+        Arc::new(tools::artifact_search::ArtifactSearchTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::grep::GrepTool),

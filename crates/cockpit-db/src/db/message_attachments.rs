@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+/// Database-local queue ceiling. This mirrors the protocol contract without
+/// introducing a production cockpit-db to cockpit-proto dependency.
+pub const MAX_QUEUED_CANONICAL_MESSAGE_BYTES: usize = 17_439_564;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageActor {
     LocalOwner,
@@ -59,7 +63,7 @@ pub enum MessageSafeOutcome {
 }
 
 impl MessageSafeOutcome {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = b"FCMS\x01".to_vec();
         match self {
             Self::Accepted { queue_item_id } => {
@@ -240,14 +244,18 @@ impl Db {
     }
 }
 
-fn accept_conn(
+pub(crate) fn accept_conn(
     conn: &Connection,
     input: &AcceptMessageInput,
     join: &dyn MessageAcceptanceJoin,
 ) -> Result<AcceptMessageResult> {
     ensure!(
-        input.canonical_message.len() <= 2_631_500,
+        input.canonical_message.len() <= MAX_QUEUED_CANONICAL_MESSAGE_BYTES,
         "canonical message exceeds FCM2 maximum"
+    );
+    ensure!(
+        input.canonical_message.len() >= 5 && input.canonical_message.starts_with(b"FCM2"),
+        "canonical message is not a non-empty FCM2 envelope"
     );
     ensure!(
         input.attachments.len() <= 16,
@@ -377,7 +385,7 @@ mod tests {
             attachment_set_digest: [4; 32],
             client_submission_id: [5; 16],
             queue_item_id: [6; 16],
-            canonical_message: b"FCM2".to_vec(),
+            canonical_message: b"FCM2\x02".to_vec(),
             attachments: vec![MessageAttachmentReferenceInput {
                 attachment_id: [7; 16],
                 attachment_version: u64::MAX,
@@ -465,7 +473,7 @@ mod tests {
         );
         let queue = db.accepted_message_queue(session.session_id).await.unwrap();
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].canonical_message, b"FCM2");
+        assert_eq!(queue[0].canonical_message, b"FCM2\x02");
         let status = db
             .message_receipt_status(session.session_id, original.operation_id)
             .await
@@ -530,6 +538,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_message_limit_direct_sql_rejects_type_magic_and_outer_bound_bypasses() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db
+            .create_session("project", "/workspace", "Build")
+            .await
+            .unwrap();
+        let accepted = input(session.session_id);
+        db.accept_message_with_attachments(accepted.clone(), Arc::new(Allow))
+            .await
+            .unwrap();
+
+        let session_id = session.session_id.to_string();
+        let queue_item_id = accepted.queue_item_id;
+        db.transaction(move |conn| {
+            let update = |canonical_message: &dyn rusqlite::ToSql| {
+                conn.execute(
+                    "UPDATE message_queue_items SET canonical_message=?1
+                      WHERE session_id=?2 AND queue_item_id=?3",
+                    rusqlite::params![canonical_message, session_id, queue_item_id.as_slice()],
+                )
+            };
+            let text_value = "FCM2\\x02".to_owned();
+            let under_five = b"FCM2".to_vec();
+            let wrong_magic = b"NOPE\\x02".to_vec();
+            assert!(
+                update(&text_value).is_err(),
+                "TEXT must not pass the BLOB guard"
+            );
+            assert!(update(&under_five).is_err(), "under-five BLOB must fail");
+            assert!(
+                update(&wrong_magic).is_err(),
+                "wrong-magic BLOB must fail"
+            );
+            let mut one_over = vec![b'x'; MAX_QUEUED_CANONICAL_MESSAGE_BYTES + 1];
+            one_over[..4].copy_from_slice(b"FCM2");
+            assert!(update(&one_over).is_err(), "outer-cap-plus-one BLOB must fail");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

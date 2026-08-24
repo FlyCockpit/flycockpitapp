@@ -117,6 +117,11 @@ pub struct UserSubmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSubmissionTerminalDisposition {
     PreflightRejected,
+    /// This queued turn owns a phase-one FCM2 text-artifact reservation. It
+    /// is not a terminal disposition; the driver uses the durable flag to
+    /// ensure a lost/expired lease can never silently fall back to the legacy
+    /// inline user-message path after preprocessing.
+    OversizedTextArtifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

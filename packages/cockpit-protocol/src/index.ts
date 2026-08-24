@@ -648,6 +648,8 @@ const requestParamSchemas = {
   send_user_message: z
     .object({
       client_submission_id: clientSubmissionIdSchema,
+      expected_model_state_generation: safeU64NumberSchema.optional(),
+      expected_model: activeModelRefSchema.optional(),
       text: z.string(),
       display_text: optionalStringSchema,
       tag_expansions: z.array(passthroughObjectSchema).optional(),
@@ -662,7 +664,97 @@ const requestParamSchemas = {
         .strict()
         .optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine((value, ctx) => {
+      if (
+        (value.expected_model_state_generation === undefined) !==
+        (value.expected_model === undefined)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "expected model generation and identity must be supplied together",
+        });
+      }
+    }),
+  // The body is UTF-8 bytes staged through the existing bulk lane. Keeping
+  // this request reference-only prevents a 64KiB..8MiB user message from ever
+  // crossing the 524360-byte application-frame cap.
+  send_user_message_bulk: z
+    .object({
+      client_submission_id: clientSubmissionIdSchema,
+      expected_model_state_generation: safeU64NumberSchema.optional(),
+      expected_model: activeModelRefSchema.optional(),
+      transfer: bulkTransferRefSchema,
+      display_text: optionalStringSchema,
+      display_transfer: bulkTransferRefSchema.optional(),
+      tag_expansions: z.array(passthroughObjectSchema).optional(),
+      forced_skill: optionalStringSchema,
+      run_invocation_options: z
+        .object({
+          max_turns: z.number().int().positive().optional(),
+          timeout_ms: positiveSafeU64NumberSchema.optional(),
+          approval_mode: z.enum(["manual", "auto", "yolo"]).optional(),
+        })
+        .strict()
+        .optional(),
+    })
+    .strict()
+    .superRefine((value, ctx) => {
+      if (
+        (value.expected_model_state_generation === undefined) !==
+        (value.expected_model === undefined)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "expected model generation and identity must be supplied together",
+        });
+      }
+      const sourceMinimumBytes = value.display_transfer === undefined ? 65_537 : 1;
+      const bytes = Number(value.transfer.total_length);
+      if (
+        value.transfer.mime_class !== "opaque" ||
+        !Number.isSafeInteger(bytes) ||
+        bytes < sourceMinimumBytes ||
+        bytes > 8 * 1024 * 1024
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "bulk user message must be an opaque 64KiB..8MiB transfer",
+        });
+      }
+      if (value.display_text !== undefined && value.display_transfer !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "bulk user message display text must be inline or a transfer, not both",
+        });
+      }
+      if (new TextEncoder().encode(value.display_text ?? "").length > 64 * 1024) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "bulk user message display text over 64KiB must use a transfer",
+        });
+      }
+      if (value.display_transfer) {
+        const displayBytes = Number(value.display_transfer.total_length);
+        if (
+          value.display_transfer.mime_class !== "opaque" ||
+          !Number.isSafeInteger(displayBytes) ||
+          displayBytes < 1 ||
+          displayBytes > 8 * 1024 * 1024
+        ) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "bulk user message display transfer must be an opaque 1B..8MiB transfer",
+          });
+        }
+        if (value.display_transfer.transfer_id === value.transfer.transfer_id) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "bulk user message text and display transfers must be distinct",
+          });
+        }
+      }
+    }),
   get_run_invocation_status: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   operation_status: z.object({ operation_id: uuidV7Schema }).strict(),
   cancel_run_invocation: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
@@ -718,9 +810,7 @@ const requestParamSchemas = {
     })
     .strict(),
   unarchive_session: z.object({ session_id: uuidSchema }).strict(),
-  import_session_archive: z
-    .object({ transfer: bulkTransferRefSchema, as_new: z.boolean().optional() })
-    .strict(),
+  import_session_archive: z.object({ transfer: bulkTransferRefSchema }).strict(),
   write_bulk_transfer_chunk: z
     .object({
       transfer: bulkTransferRefSchema,
@@ -808,6 +898,7 @@ const clientRequestVariants = [
   requestVariantNoParams("restart_if_idle"),
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
+  requestVariant("send_user_message_bulk", requestParamSchemas.send_user_message_bulk),
   requestVariant("get_run_invocation_status", requestParamSchemas.get_run_invocation_status),
   requestVariant("operation_status", requestParamSchemas.operation_status),
   requestVariant("cancel_run_invocation", requestParamSchemas.cancel_run_invocation),

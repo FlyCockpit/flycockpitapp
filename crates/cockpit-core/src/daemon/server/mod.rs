@@ -5360,7 +5360,7 @@ mod sealed_capabilities;
 pub use run_invocation::{
     RemainingRestart as RunInvocationRemaining,
     principal_digest as run_invocation_principal_digest,
-    remaining_after_restart as run_invocation_remaining_after_restart,
+    remaining_after_restart_for_row as run_invocation_remaining_after_restart,
     wall_ms_now as run_invocation_wall_ms_now,
 };
 #[cfg(test)]

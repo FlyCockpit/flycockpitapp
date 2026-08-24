@@ -97,7 +97,7 @@ impl UnrenderableWireField {
 /// `scrub` is deterministic + idempotent, so re-scrubbing already-scrubbed
 /// cached history each turn yields byte-stable output — prompt caching is
 /// unaffected (verified by the redact module's determinism test).
-pub(super) fn scrub_message(
+pub(crate) fn scrub_message(
     redact: &RedactionTable,
     msg: &Message,
 ) -> Result<Message, UnrenderableWireField> {
@@ -239,7 +239,7 @@ fn scrub_media_source(
 /// Scrub one [`UserContent`] part. Exhaustive over every rig `UserContent`
 /// variant with no silent-passthrough arm, so a new rig variant is a compile
 /// error rather than a leak.
-fn scrub_user_content(
+pub(crate) fn scrub_user_content(
     redact: &RedactionTable,
     part: &UserContent,
 ) -> Result<UserContent, UnrenderableWireField> {

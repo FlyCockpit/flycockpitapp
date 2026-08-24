@@ -960,41 +960,73 @@ pub(crate) async fn execute_ordinary_call(
     }
     let recheck_modified_output = output_str != output_before_recheck;
 
-    if !hard_fail
-        && matches!(
-            &result,
-            Ok(ToolOutput {
-                truncated: true,
-                ..
-            })
+    let mut artifact_capture = (!hard_fail)
+        .then(|| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|output| output.text_artifact_capture.clone())
+        })
+        .flatten()
+        .map(|mut capture| {
+            // Artifacts are durable and retrievable, so their source crosses
+            // the same outbound redaction boundary before admission. Host
+            // accounting remains pre-safety; only `stored_source_bytes` and
+            // the immutable body describe the post-safety value. A configured
+            // placeholder can be longer than a short secret, which would
+            // violate the store's non-expanding source accounting. In that
+            // case fail closed by withholding the capture rather than storing
+            // the pre-safety bytes or inventing a lossy counter.
+            let scrubbed = env.ctx.redact.scrub(&capture.content);
+            if scrubbed.len() <= capture.host_captured_bytes {
+                capture.content = scrubbed;
+                capture.stored_source_bytes = capture.content.len();
+            } else {
+                capture.content.clear();
+                capture.stored_source_bytes = 0;
+            }
+            capture
+        });
+    // The display body above can be capped well before an adversarial tail.
+    // A durable artifact is a separate outbound surface, so a flagged result
+    // must pass the same injection decision over the complete retained body
+    // before it can be persisted or rendered into a frame.  Preserve host
+    // capture counters; only the accepted post-safety body/accounting changes.
+    let mut artifact_capture_recheck_unavailable = false;
+    if recheck_result && let Some(capture) = artifact_capture.as_mut() {
+        let recheck_ctx = ResultRecheckCtx::from_tool_ctx(env.ctx);
+        match crate::engine::agent::recheck::result_recheck_for_artifact_capture(
+            &capture.content,
+            &recheck_ctx,
+            env.tx,
         )
-    {
-        let retained = result
-            .as_ref()
-            .ok()
-            .and_then(|output| output.truncated_retention.as_ref());
-        match maybe_store_retrievable_truncated_tool_result(
-            env.session,
-            &env.agent.name,
-            resolved_name,
-            &tc.id,
-            &mut output_str,
-            retained,
-            recheck_modified_output,
-        )
-        .await
+        .await?
         {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    tool = %resolved_name,
-                    call_id = %tc.id,
-                    "truncated tool result store failed"
-                );
+            Some(accepted) => {
+                capture.content = env.ctx.redact.scrub(&accepted);
+                capture.stored_source_bytes = capture.content.len();
+            }
+            None => {
+                // This is not a quota or persistence outcome. The closed
+                // durable projection vocabulary has no safety-unavailable
+                // state, so retain no capture/projection at all; the ordinary
+                // capped tool output remains the sole canonical event body.
+                artifact_capture_recheck_unavailable = true;
             }
         }
     }
+    if artifact_capture_recheck_unavailable {
+        tracing::warn!(tool = %resolved_name, "discarding retained tool capture because result safety recheck was unavailable");
+        artifact_capture = None;
+    }
+    let artifact_capture = artifact_capture.filter(|capture| {
+        crate::engine::agent::text_artifact_capture_is_persistable(
+            resolved_name,
+            Some(capture),
+            &output_str,
+            recheck_modified_output,
+        )
+    });
 
     let truncated = matches!(
         &result,
@@ -1170,21 +1202,128 @@ pub(crate) async fn execute_ordinary_call(
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
-    let tool_call_seq = match env
-        .session
-        .record_event_with_model_frame(
-            crate::db::session_log::SessionEventKind::ToolCall,
-            Some(&env.agent.name),
-            Some(&tc.id),
-            tool_frame(),
-            &event_data,
-        )
-        .await
-    {
-        Ok(seq) => Some(seq),
-        Err(e) => {
-            tracing::warn!(error = %e, tool = %resolved_name, "record tool_call event failed");
-            None
+    let mut model_artifact_frame = None;
+    let tool_call_seq = if let Some(capture) = artifact_capture.as_ref() {
+        let provenance_json = serde_json::json!({
+            "agent_id": &env.agent.name,
+            "tool": resolved_name,
+            "call_id": &tc.id,
+        })
+        .to_string();
+        let candidate = crate::db::text_artifacts::TextArtifactCandidate {
+            relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+            projection_slot: Some(0),
+            kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+            capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+            content: capture.content.clone(),
+            host_captured_bytes: capture.host_captured_bytes,
+            host_original_bytes: capture.host_original_bytes,
+            host_dropped_bytes: capture.host_dropped_bytes,
+            stored_source_bytes: capture.stored_source_bytes,
+            provenance_json: provenance_json.clone(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+        };
+        let event = crate::db::text_artifacts::TextArtifactEventInput {
+            session_id: env.session.id,
+            kind: crate::db::session_log::SessionEventKind::ToolCall,
+            agent: Some(env.agent.name.clone()),
+            call_id: Some(tc.id.to_string()),
+            context: Default::default(),
+            ts_ms: chrono::Utc::now().timestamp_millis(),
+            data_json: event_data.to_string(),
+            artifacts: vec![candidate.clone()],
+            unavailable_projection: None,
+        };
+        match env.session.db.record_event_with_text_artifacts(event).await {
+            Ok(result) => {
+                let mut slots = result.slots.into_iter().filter(|slot| {
+                    slot.relation == candidate.relation
+                        && slot.projection_slot == candidate.projection_slot
+                });
+                match (slots.next(), slots.next().is_none()) {
+                    (Some(slot), true) => {
+                        match slot.admission {
+                            crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => {
+                                let (preview_head, preview_tail) =
+                                    crate::engine::text_artifact_frame::utf8_preview_pair(
+                                        &artifact.content,
+                                    );
+                                model_artifact_frame = Some(
+                                    crate::engine::text_artifact_frame::render_artifact_frame(
+                                        &crate::engine::text_artifact_frame::ArtifactFrame {
+                                            status: "available",
+                                            reason: None,
+                                            artifact_id: Some(artifact.artifact_id),
+                                            kind: "tool_result",
+                                            capture_reason: artifact.capture_reason.as_str(),
+                                            provenance_json: &artifact.provenance_json,
+                                            host_captured_bytes: artifact.host_captured_bytes,
+                                            host_original_bytes: artifact.host_original_bytes,
+                                            host_dropped_bytes: artifact.host_dropped_bytes,
+                                            stored_source_bytes: artifact.stored_source_bytes,
+                                            content_bytes: artifact.content_bytes,
+                                            line_count: artifact.content.lines().count(),
+                                            preview_head,
+                                            preview_tail,
+                                        },
+                                    ),
+                                );
+                            }
+                            admission => {
+                                let reason = match admission {
+                                crate::db::text_artifacts::TextArtifactAdmission::ArtifactLimit => "artifact_limit",
+                                crate::db::text_artifacts::TextArtifactAdmission::SessionQuota => "session_quota",
+                                crate::db::text_artifacts::TextArtifactAdmission::Stored(_) => unreachable!(),
+                            };
+                                model_artifact_frame = Some(
+                                    render_unavailable_tool_artifact_frame(&candidate, reason),
+                                );
+                            }
+                        }
+                    }
+                    (None, _) => {
+                        tracing::error!(tool = %resolved_name, "tool artifact event returned no matching owner slot");
+                        model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                            &candidate,
+                            "persistence_unavailable",
+                        ));
+                    }
+                    (Some(_), false) => {
+                        tracing::error!(tool = %resolved_name, "tool artifact event returned duplicate owner slots");
+                        model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                            &candidate,
+                            "persistence_unavailable",
+                        ));
+                    }
+                }
+                Some(result.event_seq)
+            }
+            Err(error) => {
+                tracing::warn!(%error, tool = %resolved_name, "tool artifact event composition failed");
+                model_artifact_frame = Some(render_unavailable_tool_artifact_frame(
+                    &candidate,
+                    "persistence_unavailable",
+                ));
+                None
+            }
+        }
+    } else {
+        match env
+            .session
+            .record_event_with_model_frame(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some(&env.agent.name),
+                Some(&tc.id),
+                tool_frame(),
+                &event_data,
+            )
+            .await
+        {
+            Ok(seq) => Some(seq),
+            Err(error) => {
+                tracing::warn!(%error, tool = %resolved_name, "record tool_call event failed");
+                None
+            }
         }
     };
     if hard_fail {
@@ -1338,6 +1477,13 @@ pub(crate) async fn execute_ordinary_call(
         }
         wire_output.push_str(&format!("\n--- hint({}): {}\n", hint.kind, hint.wire_text));
     }
+    // A typed artifact projection replaces the entire model body.  Resume
+    // rebuilds the same tool result from the durable frame alone; appending a
+    // frame to the live capped body would make a live turn and its replay
+    // byte-different (and would leak the capped body back into model context).
+    if let Some(frame) = model_artifact_frame {
+        wire_output = frame;
+    }
     // Loop-collapse on the WIRE history (`loop-collapse-structural-
     // dedup.md`). When the loop guard rejected this call, the contiguous run
     // of identical rejected `(tool, args)` calls is represented by exactly
@@ -1361,6 +1507,32 @@ pub(crate) async fn execute_ordinary_call(
         wire_output,
     ));
     Ok(())
+}
+
+fn render_unavailable_tool_artifact_frame(
+    candidate: &crate::db::text_artifacts::TextArtifactCandidate,
+    reason: &'static str,
+) -> String {
+    let (preview_head, preview_tail) =
+        crate::engine::text_artifact_frame::utf8_preview_pair(&candidate.content);
+    crate::engine::text_artifact_frame::render_artifact_frame(
+        &crate::engine::text_artifact_frame::ArtifactFrame {
+            status: "unavailable",
+            reason: Some(reason),
+            artifact_id: None,
+            kind: "tool_result",
+            capture_reason: candidate.capture_reason.as_str(),
+            provenance_json: &candidate.provenance_json,
+            host_captured_bytes: candidate.host_captured_bytes,
+            host_original_bytes: candidate.host_original_bytes,
+            host_dropped_bytes: candidate.host_dropped_bytes,
+            stored_source_bytes: candidate.stored_source_bytes,
+            content_bytes: candidate.content.len(),
+            line_count: candidate.content.lines().count(),
+            preview_head,
+            preview_tail,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1525,16 +1697,16 @@ mod tests {
         }
     }
 
-    struct RetainedTruncatedTool;
+    struct ArtifactCaptureTool;
 
     #[async_trait]
-    impl crate::engine::tool::Tool for RetainedTruncatedTool {
+    impl crate::engine::tool::Tool for ArtifactCaptureTool {
         fn name(&self) -> &str {
             "big"
         }
 
         fn description(&self) -> &str {
-            "Return truncated test output with retained bytes."
+            "Return truncated test output with a typed artifact capture."
         }
 
         fn parameters(&self) -> Value {
@@ -1542,30 +1714,59 @@ mod tests {
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-            Ok(
-                ToolOutput::truncated_text("visible line\n[truncated]\n").with_truncated_retention(
-                    crate::engine::tool::RetainedTruncatedOutput {
-                        content: "visible line\nhidden line\n".to_string(),
-                        original_byte_len: "visible line\nhidden line\n".len(),
-                        partial: false,
-                    },
-                ),
-            )
+            Ok(ToolOutput::truncated_text("visible line\n[truncated]\n")
+                .with_text_artifact_capture(crate::engine::tool::TextArtifactCapture {
+                    content: "visible line\nhidden line\n".to_string(),
+                    host_captured_bytes: "visible line\nhidden line\n".len(),
+                    host_original_bytes: "visible line\nhidden line\n".len(),
+                    host_dropped_bytes: 0,
+                    stored_source_bytes: "visible line\nhidden line\n".len(),
+                }))
         }
     }
 
-    struct NamedRetainedTruncatedTool {
+    struct RedactedArtifactCaptureTool;
+
+    #[async_trait]
+    impl crate::engine::tool::Tool for RedactedArtifactCaptureTool {
+        fn name(&self) -> &str {
+            "redacted_big"
+        }
+
+        fn description(&self) -> &str {
+            "Return a captured result containing an outbound-redacted value."
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            let captured = "visible line\nsuper-secret-token-value\nhidden line\n".to_string();
+            Ok(ToolOutput::truncated_text("visible line\n[truncated]\n").with_text_artifact_capture(
+                crate::engine::tool::TextArtifactCapture {
+                    host_captured_bytes: captured.len(),
+                    host_original_bytes: captured.len(),
+                    host_dropped_bytes: 0,
+                    stored_source_bytes: captured.len(),
+                    content: captured,
+                },
+            ))
+        }
+    }
+
+    struct NamedArtifactCaptureTool {
         name: &'static str,
     }
 
     #[async_trait]
-    impl crate::engine::tool::Tool for NamedRetainedTruncatedTool {
+    impl crate::engine::tool::Tool for NamedArtifactCaptureTool {
         fn name(&self) -> &str {
             self.name
         }
 
         fn description(&self) -> &str {
-            "Return retained truncated output for marker retrieval tests."
+            "Return a typed artifact capture for frame and tool tests."
         }
 
         fn parameters(&self) -> Value {
@@ -1573,28 +1774,33 @@ mod tests {
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-            let retained = format!("head line\n{}tail line\n", "retained line\n".repeat(700));
+            let captured = format!(
+                "head line\n{}INJECTION_SENTINEL_ONLY_IN_RETAINED_TAIL\ntail line\n",
+                "captured line\n".repeat(700),
+            );
             Ok(
                 ToolOutput::truncated_text("head line\n... [truncated]\ntail line\n")
-                    .with_truncated_retention(crate::engine::tool::RetainedTruncatedOutput {
-                        original_byte_len: retained.len(),
-                        content: retained,
-                        partial: false,
+                    .with_text_artifact_capture(crate::engine::tool::TextArtifactCapture {
+                        host_captured_bytes: captured.len(),
+                        host_original_bytes: captured.len(),
+                        host_dropped_bytes: 0,
+                        stored_source_bytes: captured.len(),
+                        content: captured,
                     }),
             )
         }
     }
 
-    struct PartialRetainedTruncatedTool;
+    struct PartialArtifactCaptureTool;
 
     #[async_trait]
-    impl crate::engine::tool::Tool for PartialRetainedTruncatedTool {
+    impl crate::engine::tool::Tool for PartialArtifactCaptureTool {
         fn name(&self) -> &str {
             "big_partial"
         }
 
         fn description(&self) -> &str {
-            "Return truncated test output with partial retained bytes."
+            "Return truncated test output with a host-dropped artifact capture."
         }
 
         fn parameters(&self) -> Value {
@@ -1602,15 +1808,14 @@ mod tests {
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-            Ok(
-                ToolOutput::truncated_text("visible line\n[truncated]\n").with_truncated_retention(
-                    crate::engine::tool::RetainedTruncatedOutput {
-                        content: "visible line\nhidden prefix".to_string(),
-                        original_byte_len: 10_000,
-                        partial: true,
-                    },
-                ),
-            )
+            Ok(ToolOutput::truncated_text("visible line\n[truncated]\n")
+                .with_text_artifact_capture(crate::engine::tool::TextArtifactCapture {
+                    content: "visible line\nhidden prefix".to_string(),
+                    host_captured_bytes: "visible line\nhidden prefix".len(),
+                    host_original_bytes: 10_000,
+                    host_dropped_bytes: 10_000 - "visible line\nhidden prefix".len(),
+                    stored_source_bytes: "visible line\nhidden prefix".len(),
+                }))
         }
     }
 
@@ -1805,16 +2010,16 @@ mod tests {
         }
     }
 
-    struct BashRetainedTruncatedTool;
+    struct BashArtifactCaptureTool;
 
     #[async_trait]
-    impl crate::engine::tool::Tool for BashRetainedTruncatedTool {
+    impl crate::engine::tool::Tool for BashArtifactCaptureTool {
         fn name(&self) -> &str {
             "bash"
         }
 
         fn description(&self) -> &str {
-            "Synthetic retained bash output for dispatch retrieval tests."
+            "Synthetic bash artifact capture for dispatch tests."
         }
 
         fn parameters(&self) -> Value {
@@ -1828,13 +2033,15 @@ mod tests {
         }
 
         async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-            let retained = format!("head line\n{}tail line\n", "retained line\n".repeat(700));
+            let captured = format!("head line\n{}tail line\n", "captured line\n".repeat(700));
             Ok(
                 ToolOutput::truncated_text("head line\n... [truncated]\ntail line\n")
-                    .with_truncated_retention(crate::engine::tool::RetainedTruncatedOutput {
-                        original_byte_len: retained.len(),
-                        content: retained,
-                        partial: false,
+                    .with_text_artifact_capture(crate::engine::tool::TextArtifactCapture {
+                        host_captured_bytes: captured.len(),
+                        host_original_bytes: captured.len(),
+                        host_dropped_bytes: 0,
+                        stored_source_bytes: captured.len(),
+                        content: captured,
                     }),
             )
         }
@@ -2012,6 +2219,51 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    async fn seed_tool_artifact(
+        session: &Arc<Session>,
+        content: &str,
+        call_id: &str,
+    ) -> crate::db::text_artifacts::TextArtifact {
+        let result = session
+            .db
+            .record_event_with_text_artifacts(
+                crate::db::text_artifacts::TextArtifactEventInput {
+                    session_id: session.id,
+                    kind: crate::db::session_log::SessionEventKind::ToolCall,
+                    agent: Some("Build".to_owned()),
+                    call_id: Some(call_id.to_owned()),
+                    context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                    ts_ms: 1,
+                    data_json: serde_json::json!({ "output": "visible" }).to_string(),
+                    artifacts: vec![crate::db::text_artifacts::TextArtifactCandidate {
+                        relation: crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                        projection_slot: Some(0),
+                        kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                        capture_reason: crate::db::text_artifacts::CaptureReason::DisplayTruncation,
+                        content: content.to_owned(),
+                        host_captured_bytes: content.len(),
+                        host_original_bytes: content.len(),
+                        host_dropped_bytes: 0,
+                        stored_source_bytes: content.len(),
+                        provenance_json: serde_json::json!({
+                            "agent_id": "Build",
+                            "tool": "synthetic",
+                            "call_id": call_id,
+                        })
+                        .to_string(),
+                        created_at: 1,
+                    }],
+                    unavailable_projection: None,
+                },
+            )
+            .await
+            .unwrap();
+        match result.slots.into_iter().next().unwrap().admission {
+            crate::db::text_artifacts::TextArtifactAdmission::Stored(artifact) => artifact,
+            other => panic!("expected stored test artifact, got {other:?}"),
+        }
     }
 
     fn redaction_table(root: &std::path::Path, placeholder: &str) -> RedactionTable {
@@ -3887,9 +4139,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_only_banner_says_truncated_not_compressed() {
+    async fn captured_tool_result_emits_a_typed_artifact_frame() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(RetainedTruncatedTool));
+        let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -3923,21 +4175,113 @@ mod tests {
             .pop()
             .unwrap();
         assert!(row.truncated);
-        assert!(
-            row.output.contains("[truncated tool result:"),
-            "{}",
-            row.output
-        );
-        assert!(!row.output.contains("compressed"), "{}", row.output);
+        assert_eq!(row.output, "visible line\n[truncated]\n");
         let wire = last_tool_result_text(&history);
-        assert!(wire.contains("[truncated tool result:"), "{wire}");
-        assert!(!wire.contains("compressed"), "{wire}");
+        assert!(wire.contains("<cockpit_artifact_v1"), "{wire}");
+        assert!(wire.contains("\"status\":\"available\""), "{wire}");
+        assert!(wire.contains("\"kind\":\"tool_result\""), "{wire}");
     }
 
     #[tokio::test]
-    async fn truncated_tool_result_store_holds_pre_truncation_body() {
+    async fn tool_result_artifact_live_projection_is_byte_identical_to_rehydrate() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(RetainedTruncatedTool));
+        let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("big", serde_json::json!({}));
+        let mut live_history = Vec::new();
+        push_assistant_call(&mut live_history, &call);
+
+        execute_ordinary_call(&env, &mut live_history, &call, "big", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        let live = last_tool_result_text(&live_history);
+        assert!(live.starts_with("<cockpit_artifact_v1>\n"), "{live}");
+        assert!(
+            !live.starts_with("visible line\n[truncated]\n"),
+            "an artifact frame must replace, not append to, the capped live body: {live}"
+        );
+
+        let replayed = crate::engine::rehydrate::rehydrate_session(
+            &session.db,
+            session.id,
+            "Build",
+        )
+        .await
+        .unwrap()
+        .expect("the durable tool turn rehydrates");
+        let replay = last_tool_result_text(&replayed.history);
+        assert_eq!(
+            live, replay,
+            "live and restart/replay tool-result bytes must use one frame composition"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_tool_result_persists_only_the_post_safety_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(RedactedArtifactCaptureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("redacted_big", serde_json::json!({}));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(
+            &env,
+            &mut history,
+            &call,
+            "redacted_big",
+            Recovery::Clean,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = session.db.list_text_artifacts(session.id).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].content.contains("super-secret-token-value"));
+        assert!(stored[0].content.contains("[redacted]"));
+        assert!(stored[0].stored_source_bytes < stored[0].host_captured_bytes);
+        assert!(!last_tool_result_text(&history).contains("super-secret-token-value"));
+    }
+
+    #[tokio::test]
+    async fn captured_tool_result_is_owned_by_the_same_session_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(ArtifactCaptureTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -3963,23 +4307,25 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = session
-            .db
-            .list_compressed_tool_results(session.id)
-            .await
-            .unwrap();
+        let stored = session.db.list_text_artifacts(session.id).await.unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].kind, "truncated");
-        assert_eq!(stored[0].compressed_byte_len, None);
+        assert_eq!(
+            stored[0].kind,
+            crate::db::text_artifacts::TextArtifactKind::ToolResult
+        );
+        assert_eq!(
+            stored[0].relation,
+            crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+        );
         assert!(stored[0].content.contains("visible line"));
         assert!(stored[0].content.contains("hidden line"));
         assert!(!last_tool_result_text(&history).contains("hidden line"));
     }
 
     #[tokio::test]
-    async fn bash_truncated_marker_is_appended_and_retrievable() {
+    async fn bash_artifact_frame_is_readable_by_id() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(BashRetainedTruncatedTool));
+        let tools = ToolBox::new().with(Arc::new(BashArtifactCaptureTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -4005,20 +4351,18 @@ mod tests {
             .await
             .unwrap();
 
-        let wire = last_tool_result_text(&history);
-        let marker_count = wire
-            .lines()
-            .filter(|line| line.starts_with("[truncated tool result:"))
-            .count();
-        assert_eq!(marker_count, 1, "{wire}");
-        assert!(wire.contains("tool=bash"), "{wire}");
-        let hash = wire
-            .split("hash=")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next())
-            .expect("truncated marker hash");
-        let retrieved = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
-            .call(serde_json::json!({ "hash": hash }), &ctx)
+        let artifact = session
+            .db
+            .list_text_artifacts(session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let retrieved = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id }),
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -4026,9 +4370,363 @@ mod tests {
         assert!(retrieved.content.len() > "head line\n... [truncated]\ntail line\n".len());
     }
 
-    async fn assert_named_truncated_marker_is_retrievable(tool_name: &'static str) {
+    #[tokio::test]
+    async fn unavailable_full_capture_recheck_discards_tail_without_a_projection() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(NamedRetainedTruncatedTool { name: tool_name }));
+        std::fs::create_dir(tmp.path().join(".cockpit")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit/config.json"),
+            r#"{"prompt_injection_guard":{"threshold":"low"}}"#,
+        )
+        .unwrap();
+        let tools = ToolBox::new().with(Arc::new(BashArtifactCaptureTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("bash", serde_json::json!({ "command": "synthetic" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(
+            policy,
+            execute_ordinary_call(&env, &mut history, &call, "bash", Recovery::Clean, None),
+        )
+        .await
+        .unwrap();
+
+        let capped = "head line\n... [truncated]\ntail line\n";
+        assert_eq!(last_tool_result_text(&history), capped);
+        assert!(session.db.list_text_artifacts(session.id).await.unwrap().is_empty());
+        let session_id = session.id;
+        let (refs, reservations): (i64, i64) = session
+            .db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM session_text_artifact_event_refs WHERE session_id=?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM session_text_artifact_quota_reservations WHERE session_id=?1",
+                        [session_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((refs, reservations), (0, 0));
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let event = events.iter().find(|event| event.kind == "tool_call").unwrap();
+        assert!(event.data.get("artifact_projection").is_none());
+        assert!(!event
+            .data
+            .to_string()
+            .contains("INJECTION_SENTINEL_ONLY_IN_RETAINED_TAIL"));
+        let resumed = crate::engine::rehydrate::rehydrate_session(&session.db, session.id, "Build")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_tool_result_text(&resumed.history), capped);
+    }
+
+    #[tokio::test]
+    async fn artifact_read_pages_utf8_lines_and_hides_foreign_session_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let long_line = "é".repeat(5_000);
+        let artifact = seed_tool_artifact(
+            &session,
+            &format!("first line\n{long_line}\nlast line\n"),
+            "artifact-read-page",
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+
+        let first_line = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "start_line": 1,
+                    "end_line": 1,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_line.content, "first line\n");
+
+        let first_page = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "start_line": 2,
+                    "end_line": 2,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(first_page.truncated);
+        assert!(first_page.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
+        assert!(first_page.content.contains(&format!(
+            "artifact continuation artifact_id={} start_line=2 start_byte=",
+            artifact.artifact_id
+        )));
+        let continuation_byte = first_page.content.split("start_byte=").nth(1)
+            .and_then(|suffix| suffix.split(']').next()).unwrap().parse::<usize>().unwrap();
+
+        let second_page = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "start_line": 2,
+                    "end_line": 2,
+                    "start_byte": continuation_byte,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!second_page.truncated);
+        assert!(!second_page.content.is_empty());
+        assert!(!second_page.content.contains("artifact continuation"));
+
+        let foreign = Arc::new(
+            Session::create_for_test(
+                session.db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let foreign_ctx = tool_ctx(foreign, tmp.path(), &tx);
+        let hidden = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id }),
+                &foreign_ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hidden.content,
+            "No text artifact with that ID is available in this session."
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_search_honors_literal_regex_case_caps_order_and_session_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let artifact = seed_tool_artifact(
+            &session,
+            "Alpha alpha\nneedle once needle twice\nNEEDLE uppercase\nregex-42\nneedle final\n",
+            "artifact-search-modes",
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+
+        let literal = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "needle" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(literal.content, "2:needle once needle twice\n5:needle final\n");
+
+        let regex = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "pattern": "regex-\\d+",
+                    "mode": "regex",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(regex.content, "4:regex-42\n");
+
+        let insensitive = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "pattern": "needle",
+                    "case_sensitive": false,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            insensitive.content,
+            "2:needle once needle twice\n3:NEEDLE uppercase\n5:needle final\n"
+        );
+
+        let capped = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({
+                    "artifact_id": artifact.artifact_id,
+                    "pattern": "needle",
+                    "max_matches": 1,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            capped.content,
+            "2:needle once needle twice\n[additional matches omitted by max_matches]\n"
+        );
+
+        let no_matches = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "absent" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_matches.content, "No matches.");
+
+        let output_capped = seed_tool_artifact(
+            &session,
+            &format!("needle {}\n", "é".repeat(5_000)),
+            "artifact-search-output-cap",
+        )
+        .await;
+        let truncated = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({ "artifact_id": output_capped.artifact_id, "pattern": "needle" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(truncated.truncated);
+        assert!(truncated.content.contains("[search output truncated]"));
+        assert!(truncated.content.len() <= crate::tools::common::OUTPUT_BYTE_CAP);
+
+        let foreign = Arc::new(
+            Session::create_for_test(
+                session.db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let foreign_ctx = tool_ctx(foreign, tmp.path(), &tx);
+        let hidden = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": "needle" }),
+                &foreign_ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hidden.content,
+            "No text artifact with that ID is available in this session."
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_tools_recheck_imported_falsely_redacted_content_before_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_session = test_session(tmp.path());
+        let secret = "super-secret-token-value";
+        seed_tool_artifact(
+            &source_session,
+            &format!("safe line\n{secret}\n"),
+            "artifact-imported-false-redaction",
+        )
+        .await;
+        let source_row = source_session
+            .db
+            .get_session(source_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // This test export has no matching source redactor, so the manifest's
+        // redacted-length-preserving representation is structurally valid but
+        // falsely claims this local secret was already removed.
+        let archive = crate::session::export::build_zip(
+            &source_session.db,
+            &source_row,
+            std::slice::from_ref(&source_row),
+        )
+        .await
+        .unwrap();
+        let imported_db = crate::db::Db::open_in_memory().unwrap();
+        let imported = crate::session::import::import_archive(
+            &imported_db,
+            crate::session::import::read_archive_bytes(&archive).unwrap(),
+        )
+        .await
+        .unwrap();
+        let imported_session = Arc::new(
+            Session::resume_for_test(
+                imported_db,
+                imported.imported[0],
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let artifact = imported_session
+            .db
+            .list_text_artifacts(imported_session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            artifact.representation,
+            crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
+        );
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(imported_session, tmp.path(), &tx);
+        ctx.redact = Arc::new(redaction_table(tmp.path(), "[redacted]"));
+        let read = crate::tools::artifact_read::ArtifactReadTool
+            .call(serde_json::json!({ "artifact_id": artifact.artifact_id }), &ctx)
+            .await
+            .unwrap();
+        assert!(!read.content.contains(secret));
+        assert!(read.content.contains("[redacted]"));
+        let search = crate::tools::artifact_search::ArtifactSearchTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id, "pattern": secret }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.content, "No matches.");
+    }
+
+    async fn assert_named_artifact_is_readable(tool_name: &'static str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(NamedArtifactCaptureTool { name: tool_name }));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -4054,20 +4752,18 @@ mod tests {
             .await
             .unwrap();
 
-        let wire = last_tool_result_text(&history);
-        let marker_count = wire
-            .lines()
-            .filter(|line| line.starts_with("[truncated tool result:"))
-            .count();
-        assert_eq!(marker_count, 1, "{wire}");
-        assert!(wire.contains(&format!("tool={tool_name}")), "{wire}");
-        let hash = wire
-            .split("hash=")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next())
-            .expect("truncated marker hash");
-        let retrieved = crate::tools::tool_result_retrieve::ToolResultRetrieveTool
-            .call(serde_json::json!({ "hash": hash }), &ctx)
+        let artifact = session
+            .db
+            .list_text_artifacts(session.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let retrieved = crate::tools::artifact_read::ArtifactReadTool
+            .call(
+                serde_json::json!({ "artifact_id": artifact.artifact_id }),
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -4076,19 +4772,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tool_truncated_marker_is_retrievable() {
-        assert_named_truncated_marker_is_retrievable("mcp").await;
+    async fn mcp_tool_artifact_is_readable() {
+        assert_named_artifact_is_readable("mcp").await;
     }
 
     #[tokio::test]
-    async fn custom_tool_truncated_marker_is_retrievable() {
-        assert_named_truncated_marker_is_retrievable("custom_large").await;
+    async fn custom_tool_artifact_is_readable() {
+        assert_named_artifact_is_readable("custom_large").await;
     }
 
     #[tokio::test]
-    async fn retained_truncated_tool_result_partial_banner_says_partial() {
+    async fn host_dropped_artifact_preserves_accounting() {
         let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolBox::new().with(Arc::new(PartialRetainedTruncatedTool));
+        let tools = ToolBox::new().with(Arc::new(PartialArtifactCaptureTool));
         let agent = test_agent(tools.clone());
         let session = test_session(tmp.path());
         let model = test_model();
@@ -4122,18 +4818,14 @@ mod tests {
         .unwrap();
 
         let wire = last_tool_result_text(&history);
-        assert!(wire.contains("[truncated partial tool result:"), "{wire}");
-        let stored = session
-            .db
-            .list_compressed_tool_results(session.id)
-            .await
-            .unwrap();
-        assert_eq!(stored[0].original_byte_len, 10_000);
-        assert!(stored[0].original_byte_len > stored[0].content.len());
+        assert!(wire.contains("\"host_original_bytes\":10000"), "{wire}");
+        let stored = session.db.list_text_artifacts(session.id).await.unwrap();
+        assert_eq!(stored[0].host_original_bytes, 10_000);
+        assert!(stored[0].host_dropped_bytes > 0);
     }
 
     #[tokio::test]
-    async fn retrieval_banner_suppressed_without_retained_body() {
+    async fn artifact_tools_are_absent_without_a_capture() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = ToolBox::new().with(Arc::new(TruncatedTool));
         let agent = test_agent(tools.clone());
@@ -4162,7 +4854,7 @@ mod tests {
             .unwrap();
 
         let wire = last_tool_result_text(&history);
-        assert!(!wire.contains("tool_result_retrieve"), "{wire}");
+        assert!(!wire.contains("cockpit_artifact_v1"), "{wire}");
         assert!(
             !toolbox_with_retrieval_if_needed(
                 tools,
@@ -4171,12 +4863,12 @@ mod tests {
             )
             .await
             .names()
-            .contains(&"tool_result_retrieve")
+            .contains(&"artifact_read")
         );
     }
 
     #[tokio::test]
-    async fn recheck_modified_output_does_not_store_unrechecked_body() {
+    async fn recheck_modified_output_is_not_capture_eligible() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Session::create_for_test(
             db,
@@ -4185,31 +4877,25 @@ mod tests {
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let mut delivered = "[tool result withheld]".to_string();
-        let retained = crate::engine::tool::RetainedTruncatedOutput {
+        let delivered = "[tool result withheld]".to_string();
+        let capture = crate::engine::tool::TextArtifactCapture {
             content: "raw content removed by recheck".to_string(),
-            original_byte_len: "raw content removed by recheck".len(),
-            partial: false,
+            host_captured_bytes: "raw content removed by recheck".len(),
+            host_original_bytes: "raw content removed by recheck".len(),
+            host_dropped_bytes: 0,
+            stored_source_bytes: "raw content removed by recheck".len(),
         };
 
-        let stored = maybe_store_retrievable_truncated_tool_result(
-            &session,
-            "Build",
+        assert!(!text_artifact_capture_is_persistable(
             "code",
-            "call-1",
-            &mut delivered,
-            Some(&retained),
+            Some(&capture),
+            &delivered,
             true,
-        )
-        .await
-        .unwrap();
-
-        assert!(stored.is_none());
-        assert_eq!(delivered, "[tool result withheld]");
+        ));
         assert!(
             session
                 .db
-                .list_compressed_tool_results(session.id)
+                .list_text_artifacts(session.id)
                 .await
                 .unwrap()
                 .is_empty()

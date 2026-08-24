@@ -66,6 +66,10 @@ pub enum ReserveTurnOutcome {
     AlreadyTerminal(RunInvocationRow),
     /// Cancellation was requested first; no further dispatch.
     CancelRequested(RunInvocationRow),
+    /// A bound oversized FCM2 source is still only phase-one accepted. Its
+    /// timeout clock intentionally has not begun, and provider dispatch must
+    /// wait for phase-two materialization to arm it.
+    ClockNotStarted(RunInvocationRow),
     /// No durable record.
     NotFound,
 }
@@ -77,7 +81,21 @@ pub enum TimeoutFireOutcome {
     Committed(RunInvocationRow),
     /// Already terminal (including a prior timeout); no second transition.
     AlreadyTerminal(RunInvocationRow),
+    /// A bound oversized FCM2 source is still phase-one accepted. It is not a
+    /// timeout candidate until materialization arms its clock.
+    ClockNotStarted(RunInvocationRow),
     NotFound,
+}
+
+/// True only for a bounded invocation accepted alongside an oversized FCM2
+/// reservation. `remaining_ms = NULL` has historically also represented an
+/// unbounded invocation, so the accepted state and configured timeout together
+/// are the durable, backwards-free discriminator for a queued unarmed clock.
+pub fn timeout_clock_is_deferred(row: &RunInvocationRow) -> bool {
+    row.terminal_at_wall_ms.is_none()
+        && row.state == "accepted"
+        && row.timeout_ms.is_some()
+        && row.remaining_ms.is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,69 +267,19 @@ impl Db {
         timeout_ms: Option<u64>,
         now_wall_ms: i64,
     ) -> Result<AcceptRunInvocationOutcome> {
-        let accounted = accounted_bytes_for_invocation(
-            &origin_principal_digest,
-            &options_json,
-            &options_digest,
-            &content_digest,
-            "accepted",
-            None,
-            None,
-        )?;
         self.transaction(move |conn| {
-            delete_expired_run_invocation_rows(conn, now_wall_ms)?;
-
-            if let Some(existing) = get_run_invocation_conn(conn, client_submission_id)? {
-                if existing.origin_principal_digest != origin_principal_digest {
-                    return Ok(AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable);
-                }
-                if existing.options_digest == options_digest
-                    && existing.content_digest == content_digest
-                {
-                    return Ok(AcceptRunInvocationOutcome::ExactReplay(existing));
-                }
-                return Ok(AcceptRunInvocationOutcome::IdempotencyConflict);
-            }
-
-            if tombstone_exists_conn(conn, client_submission_id)? {
-                return Ok(AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable);
-            }
-
-            if !session_quota_allows(conn, session_id, accounted)?
-                || !principal_quota_allows(conn, &origin_principal_digest, accounted, false)?
-            {
-                return Ok(AcceptRunInvocationOutcome::CapacityExceeded);
-            }
-
-            let remaining_ms = timeout_ms;
-            conn.execute(
-                "INSERT INTO run_invocations (
-                    client_submission_id, origin_principal_digest, session_id,
-                    options_json, options_digest, content_digest, state, state_version,
-                    created_at_wall_ms, updated_at_wall_ms, last_observed_wall_ms,
-                    remaining_ms, reserved_turns, max_turns, timeout_ms,
-                    cancel_requested, cancel_result, terminal_reason,
-                    terminal_at_wall_ms, expires_at_wall_ms, accounted_bytes
-                 ) VALUES (?1,?2,?3,?4,?5,?6,'accepted',1,?7,?7,?7,?8,0,?9,?10,0,NULL,NULL,NULL,NULL,?11)",
-                params![
-                    client_submission_id.to_string(),
-                    origin_principal_digest,
-                    session_id.to_string(),
-                    options_json,
-                    options_digest,
-                    content_digest,
-                    now_wall_ms,
-                    remaining_ms.map(|v| v as i64),
-                    max_turns.map(|v| v as i64),
-                    timeout_ms.map(|v| v as i64),
-                    accounted as i64,
-                ],
+            accept_run_invocation_conn(
+                conn,
+                client_submission_id,
+                &origin_principal_digest,
+                session_id,
+                &options_json,
+                &options_digest,
+                &content_digest,
+                max_turns,
+                timeout_ms,
+                now_wall_ms,
             )
-            .context("inserting run invocation")?;
-
-            let created = get_run_invocation_conn(conn, client_submission_id)?
-                .context("run invocation missing after insert")?;
-            Ok(AcceptRunInvocationOutcome::Created(created))
         })
         .await
     }
@@ -615,6 +583,13 @@ impl Db {
             if existing.terminal_at_wall_ms.is_some() {
                 return Ok(Some(existing));
             }
+            // A timeout-bearing oversized FCM2 invocation is intentionally
+            // unarmed while its source is only phase-one accepted. A status or
+            // restart checkpoint must not turn the `NULL` remaining budget into
+            // an unbounded/expired clock or consume queued wall time.
+            if timeout_clock_is_deferred(&existing) {
+                return Ok(Some(existing));
+            }
             // Clock rollback never extends expiry.
             if now_wall_ms < existing.last_observed_wall_ms {
                 let expires = now_wall_ms
@@ -680,6 +655,9 @@ impl Db {
             }
             if existing.cancel_requested {
                 return Ok(ReserveTurnOutcome::CancelRequested(existing));
+            }
+            if timeout_clock_is_deferred(&existing) {
+                return Ok(ReserveTurnOutcome::ClockNotStarted(existing));
             }
             if let Some(max) = existing.max_turns
                 && existing.reserved_turns >= max
@@ -759,6 +737,9 @@ impl Db {
             if existing.terminal_at_wall_ms.is_some() {
                 return Ok(TimeoutFireOutcome::AlreadyTerminal(existing));
             }
+            if timeout_clock_is_deferred(&existing) {
+                return Ok(TimeoutFireOutcome::ClockNotStarted(existing));
+            }
             let expires = now_wall_ms
                 .checked_add(RUN_INVOCATION_RETENTION_MS)
                 .context("timeout expiry overflow")?;
@@ -811,60 +792,14 @@ impl Db {
         let terminal_reason = terminal_reason.to_owned();
         let state = state.to_owned();
         self.transaction(move |conn| {
-            let Some(existing) = get_run_invocation_conn(conn, client_submission_id)? else {
-                return Ok(None);
-            };
-            if existing.terminal_at_wall_ms.is_some() {
-                return Ok(Some(existing));
-            }
-            // Cancel-first: cancel wins over later success/failure.
-            let (final_state, final_reason) = if existing.cancel_requested
-                && !matches!(
-                    terminal_reason.as_str(),
-                    "cancelled"
-                        | "cancelled_session_deleted"
-                        | "timeout_expired"
-                        | "max_turns_exceeded"
-                        | "clock_rollback_timed_out"
-                )
-            {
-                ("cancelled", "cancelled".to_string())
-            } else {
-                (state.as_str(), terminal_reason)
-            };
-            let expires = now_wall_ms
-                .checked_add(RUN_INVOCATION_RETENTION_MS)
-                .context("terminal mark expiry overflow")?;
-            let new_version = existing
-                .state_version
-                .checked_add(1)
-                .context("state_version overflow")?;
-            conn.execute(
-                "UPDATE run_invocations SET
-                    state = ?1,
-                    state_version = ?2,
-                    updated_at_wall_ms = ?3,
-                    last_observed_wall_ms = ?3,
-                    remaining_ms = 0,
-                    cancel_requested = CASE WHEN ?4 THEN 1 ELSE cancel_requested END,
-                    cancel_result = COALESCE(cancel_result, CASE WHEN ?4 THEN 'cancellation_requested' ELSE NULL END),
-                    terminal_reason = ?5,
-                    terminal_at_wall_ms = ?3,
-                    expires_at_wall_ms = ?6
-                 WHERE client_submission_id = ?7
-                   AND terminal_at_wall_ms IS NULL",
-                params![
-                    final_state,
-                    new_version as i64,
-                    now_wall_ms,
-                    final_reason == "cancelled",
-                    final_reason,
-                    expires,
-                    client_submission_id.to_string(),
-                ],
+            mark_run_invocation_terminal_conn(
+                conn,
+                client_submission_id,
+                None,
+                &terminal_reason,
+                &state,
+                now_wall_ms,
             )
-            .context("marking run invocation terminal")?;
-            get_run_invocation_conn(conn, client_submission_id)
         })
         .await
     }
@@ -891,6 +826,276 @@ impl Db {
         })
         .await
     }
+}
+
+/// Connection-direct admission used by larger durable compositions.  The
+/// caller controls the surrounding transaction, so a rejected companion
+/// receipt can roll this insertion back instead of leaving an accepted run
+/// invocation detached from the only message it is allowed to execute.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accept_run_invocation_conn(
+    conn: &rusqlite::Connection,
+    client_submission_id: Uuid,
+    origin_principal_digest: &str,
+    session_id: Uuid,
+    options_json: &str,
+    options_digest: &str,
+    content_digest: &str,
+    max_turns: Option<u32>,
+    timeout_ms: Option<u64>,
+    now_wall_ms: i64,
+) -> Result<AcceptRunInvocationOutcome> {
+    accept_run_invocation_conn_with_clock_start(
+        conn,
+        client_submission_id,
+        origin_principal_digest,
+        session_id,
+        options_json,
+        options_digest,
+        content_digest,
+        max_turns,
+        timeout_ms,
+        now_wall_ms,
+        true,
+    )
+}
+
+/// Connection-direct admission for an oversized FCM2-bound invocation. Phase
+/// one persists the run identity but deliberately leaves a configured timeout
+/// unarmed; the phase-two event/artifact materialization transaction starts it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accept_run_invocation_deferred_timeout_conn(
+    conn: &rusqlite::Connection,
+    client_submission_id: Uuid,
+    origin_principal_digest: &str,
+    session_id: Uuid,
+    options_json: &str,
+    options_digest: &str,
+    content_digest: &str,
+    max_turns: Option<u32>,
+    timeout_ms: Option<u64>,
+    now_wall_ms: i64,
+) -> Result<AcceptRunInvocationOutcome> {
+    accept_run_invocation_conn_with_clock_start(
+        conn,
+        client_submission_id,
+        origin_principal_digest,
+        session_id,
+        options_json,
+        options_digest,
+        content_digest,
+        max_turns,
+        timeout_ms,
+        now_wall_ms,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_run_invocation_conn_with_clock_start(
+    conn: &rusqlite::Connection,
+    client_submission_id: Uuid,
+    origin_principal_digest: &str,
+    session_id: Uuid,
+    options_json: &str,
+    options_digest: &str,
+    content_digest: &str,
+    max_turns: Option<u32>,
+    timeout_ms: Option<u64>,
+    now_wall_ms: i64,
+    start_timeout_clock: bool,
+) -> Result<AcceptRunInvocationOutcome> {
+    let accounted = accounted_bytes_for_invocation(
+        origin_principal_digest,
+        options_json,
+        options_digest,
+        content_digest,
+        "accepted",
+        None,
+        None,
+    )?;
+    delete_expired_run_invocation_rows(conn, now_wall_ms)?;
+
+    if let Some(existing) = get_run_invocation_conn(conn, client_submission_id)? {
+        if existing.origin_principal_digest != origin_principal_digest {
+            return Ok(AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable);
+        }
+        if existing.options_digest == options_digest && existing.content_digest == content_digest {
+            return Ok(AcceptRunInvocationOutcome::ExactReplay(existing));
+        }
+        return Ok(AcceptRunInvocationOutcome::IdempotencyConflict);
+    }
+
+    if tombstone_exists_conn(conn, client_submission_id)? {
+        return Ok(AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable);
+    }
+
+    if !session_quota_allows(conn, session_id, accounted)?
+        || !principal_quota_allows(conn, origin_principal_digest, accounted, false)?
+    {
+        return Ok(AcceptRunInvocationOutcome::CapacityExceeded);
+    }
+
+    let remaining_ms = if start_timeout_clock {
+        timeout_ms
+    } else {
+        None
+    };
+    conn.execute(
+        "INSERT INTO run_invocations (
+            client_submission_id, origin_principal_digest, session_id,
+            options_json, options_digest, content_digest, state, state_version,
+            created_at_wall_ms, updated_at_wall_ms, last_observed_wall_ms,
+            remaining_ms, reserved_turns, max_turns, timeout_ms,
+            cancel_requested, cancel_result, terminal_reason,
+            terminal_at_wall_ms, expires_at_wall_ms, accounted_bytes
+         ) VALUES (?1,?2,?3,?4,?5,?6,'accepted',1,?7,?7,?7,?8,0,?9,?10,0,NULL,NULL,NULL,NULL,?11)",
+        params![
+            client_submission_id.to_string(),
+            origin_principal_digest,
+            session_id.to_string(),
+            options_json,
+            options_digest,
+            content_digest,
+            now_wall_ms,
+            remaining_ms.map(|v| v as i64),
+            max_turns.map(|v| v as i64),
+            timeout_ms.map(|v| v as i64),
+            accounted as i64,
+        ],
+    )
+    .context("inserting run invocation")?;
+
+    let created = get_run_invocation_conn(conn, client_submission_id)?
+        .context("run invocation missing after insert")?;
+    Ok(AcceptRunInvocationOutcome::Created(created))
+}
+
+/// Atomically arm a bound oversized invocation's timeout when phase two has
+/// materialized its source/event/artifacts. This function is connection-direct
+/// because it must commit in the same transaction as the receipt transition;
+/// if any materialization write fails, neither the event nor the clock start is
+/// durable.
+pub(crate) fn start_deferred_run_invocation_timeout_conn(
+    conn: &rusqlite::Connection,
+    client_submission_id: Uuid,
+    expected_session_id: Uuid,
+    now_wall_ms: i64,
+) -> Result<RunInvocationRow> {
+    let existing = get_run_invocation_conn(conn, client_submission_id)?
+        .context("bound oversized artifact reservation lacks its run invocation")?;
+    ensure!(
+        existing.session_id == expected_session_id,
+        "run invocation {} belongs to session {}, not artifact session {}",
+        client_submission_id,
+        existing.session_id,
+        expected_session_id
+    );
+    ensure!(
+        existing.terminal_at_wall_ms.is_none(),
+        "bound oversized artifact invocation is already terminal"
+    );
+    ensure!(
+        existing.state == "accepted",
+        "bound oversized artifact invocation is not phase-one accepted"
+    );
+    let new_version = existing
+        .state_version
+        .checked_add(1)
+        .context("state_version overflow")?;
+    conn.execute(
+        "UPDATE run_invocations SET
+            state='running', state_version=?1, updated_at_wall_ms=?2,
+            last_observed_wall_ms=?2, remaining_ms=?3
+          WHERE client_submission_id=?4 AND state='accepted' AND terminal_at_wall_ms IS NULL",
+        params![
+            new_version as i64,
+            now_wall_ms,
+            existing.timeout_ms.map(|value| value as i64),
+            client_submission_id.to_string(),
+        ],
+    )
+    .context("arming bound oversized run invocation timeout")?;
+    get_run_invocation_conn(conn, client_submission_id)?
+        .context("bound oversized invocation missing after phase-two clock start")
+}
+
+/// Connection-direct terminalization used by DB-owned compositions that must
+/// change a run invocation and another durable record together.  When an
+/// expected session is supplied, a matching invocation from another session
+/// is an invariant violation rather than a row that can be terminalized by an
+/// unrelated message receipt.
+pub(crate) fn mark_run_invocation_terminal_conn(
+    conn: &rusqlite::Connection,
+    client_submission_id: Uuid,
+    expected_session_id: Option<Uuid>,
+    terminal_reason: &str,
+    state: &str,
+    now_wall_ms: i64,
+) -> Result<Option<RunInvocationRow>> {
+    let Some(existing) = get_run_invocation_conn(conn, client_submission_id)? else {
+        return Ok(None);
+    };
+    if let Some(expected_session_id) = expected_session_id
+        && existing.session_id != expected_session_id
+    {
+        anyhow::bail!(
+            "run invocation {} belongs to session {}, not message session {}",
+            client_submission_id,
+            existing.session_id,
+            expected_session_id
+        );
+    }
+    if existing.terminal_at_wall_ms.is_some() {
+        return Ok(Some(existing));
+    }
+    // Cancel-first: cancel wins over later success/failure.
+    let (final_state, final_reason) = if existing.cancel_requested
+        && !matches!(
+            terminal_reason,
+            "cancelled"
+                | "cancelled_session_deleted"
+                | "timeout_expired"
+                | "max_turns_exceeded"
+                | "clock_rollback_timed_out"
+        ) {
+        ("cancelled", "cancelled")
+    } else {
+        (state, terminal_reason)
+    };
+    let expires = now_wall_ms
+        .checked_add(RUN_INVOCATION_RETENTION_MS)
+        .context("terminal mark expiry overflow")?;
+    let new_version = existing
+        .state_version
+        .checked_add(1)
+        .context("state_version overflow")?;
+    conn.execute(
+        "UPDATE run_invocations SET
+            state = ?1,
+            state_version = ?2,
+            updated_at_wall_ms = ?3,
+            last_observed_wall_ms = ?3,
+            remaining_ms = 0,
+            cancel_requested = CASE WHEN ?4 THEN 1 ELSE cancel_requested END,
+            cancel_result = COALESCE(cancel_result, CASE WHEN ?4 THEN 'cancellation_requested' ELSE NULL END),
+            terminal_reason = ?5,
+            terminal_at_wall_ms = ?3,
+            expires_at_wall_ms = ?6
+         WHERE client_submission_id = ?7
+           AND terminal_at_wall_ms IS NULL",
+        params![
+            final_state,
+            new_version as i64,
+            now_wall_ms,
+            final_reason == "cancelled",
+            final_reason,
+            expires,
+            client_submission_id.to_string(),
+        ],
+    )
+    .context("marking run invocation terminal")?;
+    get_run_invocation_conn(conn, client_submission_id)
 }
 
 fn get_run_invocation_conn(

@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::engine::agent::TurnEvent;
 use crate::engine::tool::{Tool, ToolBox, ToolCtx, ToolOutput, invalid_input};
-use crate::intel::budget::retained_truncated_body;
+use crate::intel::budget::capture_text_artifact_body;
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 pub struct McpTool;
@@ -144,7 +144,7 @@ impl Tool for McpTool {
 fn rendered_result_output(out: String) -> ToolOutput {
     if out.len() > OUTPUT_BYTE_CAP {
         ToolOutput::truncated_text(truncate_head_tail(&out, OUTPUT_BYTE_CAP))
-            .with_truncated_retention(retained_truncated_body(&out))
+            .with_text_artifact_capture(capture_text_artifact_body(&out))
     } else {
         ToolOutput::text(out)
     }
@@ -185,26 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tool_over_cap_result_carries_retention() {
+    fn mcp_tool_over_cap_result_carries_text_artifact_capture() {
         let body = "m".repeat(OUTPUT_BYTE_CAP + 32);
 
         let output = rendered_result_output(body.clone());
 
         assert!(output.truncated);
-        let retained = output
-            .truncated_retention
+        let capture = output
+            .text_artifact_capture
             .as_ref()
-            .expect("retention for over-cap mcp result");
-        assert_eq!(retained.original_byte_len, body.len());
-        assert_eq!(retained.content, body);
+            .expect("capture for over-cap mcp result");
+        assert_eq!(capture.host_original_bytes, body.len());
+        assert_eq!(capture.content, body);
     }
 
     #[test]
-    fn mcp_tool_under_cap_result_has_no_retention() {
+    fn mcp_tool_under_cap_result_has_no_text_artifact_capture() {
         let output = rendered_result_output("small result".to_string());
 
         assert!(!output.truncated);
-        assert!(output.truncated_retention.is_none());
+        assert!(output.text_artifact_capture.is_none());
     }
 
     #[test]

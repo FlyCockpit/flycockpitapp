@@ -853,6 +853,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
                 // Scheduled jobs are daemon-local, not authenticated remote
                 // operations, so they reserve no transactional ledger row.
                 remote_operation: None,
+                artifact_admission: None,
                 respond_to,
             })
             .await

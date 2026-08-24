@@ -139,6 +139,13 @@ struct WriteRequest {
     reply: mpsc::SyncSender<Result<Box<dyn Any + Send>>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("database transaction rollback failed after {primary:#}: {rollback}")]
+struct TransactionRollbackFailed {
+    primary: anyhow::Error,
+    rollback: rusqlite::Error,
+}
+
 #[derive(Clone)]
 struct Writer {
     inner: Arc<WriterInner>,
@@ -198,7 +205,16 @@ impl Writer {
                     let result = catch_unwind(AssertUnwindSafe(|| (request.job)(&conn)))
                         .map_err(|_| anyhow::anyhow!("db writer job panicked"))
                         .and_then(|result| result);
+                    let poison = result.as_ref().err().is_some_and(|error| {
+                        error.chain().any(|cause| cause.is::<TransactionRollbackFailed>())
+                    });
                     let _ = request.reply.send(result);
+                    if poison {
+                        // The connection may still own an unknown transaction.
+                        // Drop it and close the queue rather than serving a
+                        // later write from an unprovable state.
+                        return Err(anyhow::anyhow!("database writer poisoned after rollback failure"));
+                    }
                 }
                 // The last database owner performs an explicit truncating
                 // checkpoint before SQLite closes the writer. This bounds
@@ -794,19 +810,27 @@ where
     match result {
         Ok(Ok(value)) => {
             if let Err(error) = conn.execute_batch("COMMIT;") {
-                let _ = conn.execute_batch("ROLLBACK;");
-                Err(error).context("committing db transaction")
+                let primary = anyhow::Error::new(error).context("committing db transaction");
+                match conn.execute_batch("ROLLBACK;") {
+                    Ok(()) => Err(primary),
+                    Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
+                }
             } else {
                 Ok(value)
             }
         }
         Ok(Err(error)) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(error)
+            match conn.execute_batch("ROLLBACK;") {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(TransactionRollbackFailed { primary: error, rollback }.into()),
+            }
         }
         Err(_) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(anyhow::anyhow!("db transaction job panicked"))
+            let primary = anyhow::anyhow!("db transaction job panicked");
+            match conn.execute_batch("ROLLBACK;") {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
+            }
         }
     }
 }

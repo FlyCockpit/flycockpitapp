@@ -46,7 +46,8 @@ use tokio::sync::oneshot;
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
     MediaReservationHandle, ObservationId, ProviderMediaVariant, SanitizedComputerFrame,
-    ScreenshotMediaType, TransientProviderRequest,
+    ScreenshotMediaType, TransientProviderRequest, anthropic_transient_image_block,
+    openai_transient_computer_output,
 };
 use super::target::{
     BackendKind, PhysicalTargetKey, TargetEvidenceAdapter, TargetUnavailableReason,
@@ -2600,8 +2601,53 @@ impl ComputerActionCoordinator {
         call_id: &str,
         actions: &[OpenAiComputerAction],
     ) -> CoordinatedOutcome {
-        // Dedup check: duplicate/replayed calls return the prior sanitized
-        // outcome and never touch input again.
+        // Build the backend action list + action identity BEFORE any dedup, so
+        // the identity check is the PRIMARY dedup key. A reused (session,
+        // delegation, provider_call_id, batch_index) with a DIFFERENT payload is
+        // an identity_conflict with zero dispatch — it must NOT be masked by the
+        // call-id convenience dedup below as a stale DuplicateReplay (AC14).
+        let mut backend_actions = Vec::new();
+        for action in actions {
+            backend_actions.extend(action.to_backend_actions());
+        }
+        let action_label = format!("openai_call:{}", actions.len());
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay. Return the
+                // prior sanitized outcome (call-id keyed). A lease-denied replay
+                // recorded its identity but no call-id outcome, so it replays as
+                // `CancelledBeforeDispatch`, exactly as before.
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                // identity_conflict — same identity, different payload.
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity (a human Deny outranks a payload), so a
+        // replay of one returns its prior sanitized outcome here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2613,7 +2659,7 @@ impl ComputerActionCoordinator {
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
         // later invalidated or the backend died. This runs AFTER the dedup
-        // guard (replayed call IDs keep their prior outcome) but BEFORE the
+        // guards (replayed calls keep their prior outcome) but BEFORE the
         // invalidated/backend_dead checks, because a human deny is a decision
         // that outranks a subsequent state transition. A new delegation gets a
         // new coordinator, which starts clean.
@@ -2641,49 +2687,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        // Build the backend action list.
-        let mut backend_actions = Vec::new();
-        for action in actions {
-            backend_actions.extend(action.to_backend_actions());
-        }
-        let action_label = format!("openai_call:{}", actions.len());
-
-        // Action identity check: a duplicate (session, delegation,
-        // provider_call_id, batch_index) with a different payload is
-        // identity_conflict with zero dispatch.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {} // New identity — proceed.
-            Ok(false) => {
-                // Same identity + same digest — duplicate replay (should have
-                // been caught by the call-id dedup above, but handle it).
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                // identity_conflict — different payload, same identity.
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement: TypeText and KeyChord require a
@@ -2730,7 +2733,45 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20251124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Dedup check.
+        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
+        // call id with a DIFFERENT payload is an identity_conflict with zero
+        // dispatch rather than a stale DuplicateReplay (AC14).
+        let backend_actions = action.to_backend_actions();
+        let action_label = "anthropic_20251124_call".to_string();
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay (a lease-denied
+                // replay has no call-id outcome and replays as
+                // `CancelledBeforeDispatch`, as before).
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity, so a replay of one returns here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2741,7 +2782,7 @@ impl ComputerActionCoordinator {
         // transition: after one human Deny, every subsequent computer action on
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guard but
+        // later invalidated or the backend died. Runs AFTER the dedup guards but
         // BEFORE the invalidated/backend_dead checks. A new delegation gets a
         // new coordinator, which starts clean.
         if let Some(reason) = &self.denied {
@@ -2766,40 +2807,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20251124_call".to_string();
-
-        // Action identity check.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {}
-            Ok(false) => {
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement for type/key actions.
@@ -2840,7 +2847,45 @@ impl ComputerActionCoordinator {
         call_id: &str,
         action: &Anthropic20250124ComputerAction,
     ) -> CoordinatedOutcome {
-        // Dedup check.
+        // Identity is the PRIMARY dedup key (built before any dedup), so a reused
+        // call id with a DIFFERENT payload is an identity_conflict with zero
+        // dispatch rather than a stale DuplicateReplay (AC14).
+        let backend_actions = action.to_backend_actions();
+        let action_label = "anthropic_20250124_call".to_string();
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed to the call-id / state checks.
+            Ok(false) => {
+                // Same identity + same digest — a genuine replay (a lease-denied
+                // replay has no call-id outcome and replays as
+                // `CancelledBeforeDispatch`, as before).
+                return CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Call-id dedup: a denied/invalidated/backend-dead outcome records by
+        // call id but NOT by identity, so a replay of one returns here.
         if let Some(prior) = self.journal.lookup(call_id) {
             return CoordinatedOutcome::DuplicateReplay {
                 prior_outcome: Box::new(prior.clone()),
@@ -2851,7 +2896,7 @@ impl ComputerActionCoordinator {
         // transition: after one human Deny, every subsequent computer action on
         // this delegation returns journaled `Denied` without prompting again
         // (the authorizer is never consulted) — even if the coordinator was
-        // later invalidated or the backend died. Runs AFTER the dedup guard but
+        // later invalidated or the backend died. Runs AFTER the dedup guards but
         // BEFORE the invalidated/backend_dead checks. A new delegation gets a
         // new coordinator, which starts clean.
         if let Some(reason) = &self.denied {
@@ -2876,40 +2921,6 @@ impl ComputerActionCoordinator {
             };
             self.journal.record(call_id, outcome.clone());
             return outcome;
-        }
-
-        let backend_actions = action.to_backend_actions();
-        let action_label = "anthropic_20250124_call".to_string();
-
-        // Action identity check.
-        let identity = ActionIdentity {
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone(),
-            provider_call_id: call_id.to_string(),
-            batch_index: 0,
-        };
-        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
-        match self.journal.check_identity(&identity, &payload_digest) {
-            Ok(true) => {}
-            Ok(false) => {
-                let outcome = CoordinatedOutcome::DuplicateReplay {
-                    prior_outcome: Box::new(
-                        self.journal
-                            .lookup(call_id)
-                            .cloned()
-                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
-                    ),
-                };
-                return outcome;
-            }
-            Err(()) => {
-                let outcome = CoordinatedOutcome::IdentityConflict {
-                    identity: identity.clone(),
-                };
-                self.journal.record(call_id, outcome.clone());
-                self.journal.record_identity(identity, payload_digest);
-                return outcome;
-            }
         }
 
         // Focus generation requirement for type/key actions.
@@ -3304,31 +3315,50 @@ impl NativeResponseExtractor {
     pub fn build_continuation(
         call: &NativeComputerCall,
         outcome: &CoordinatedOutcome,
+        live_frame: Option<&LiveComputerFrame>,
     ) -> NativeComputerContinuation {
         match call {
             NativeComputerCall::OpenAi { call_id, .. } => {
                 match outcome {
-                    CoordinatedOutcome::Completed { screenshot, .. } => {
-                        // Build a transient wire payload from the sanitized
-                        // projection. In a real system the live frame would be
-                        // borrowed; here we build a text-only continuation
-                        // because the live frame was dropped after capture.
-                        // The sanitized projection is the only durable record.
-                        let _ = screenshot;
-                        NativeComputerContinuation::TextOnly {
-                            call_id: call_id.clone(),
-                            text: "computer action completed".to_string(),
-                            provider: NativeProvider::OpenAi,
+                    CoordinatedOutcome::Completed { completed, .. } => {
+                        // With the transient live frame retained, build a real
+                        // `computer_call_output` carrying the screenshot; the
+                        // durable projection is recorded, pixels stay transient.
+                        // Without it (capture missed / not retained by the
+                        // caller) fall back to a text-only continuation.
+                        match live_frame {
+                            Some(frame) => NativeComputerContinuation::OpenAi {
+                                call_id: call_id.clone(),
+                                transient: Some(openai_transient_computer_output(
+                                    frame,
+                                    call_id,
+                                    completed.len(),
+                                    None,
+                                )),
+                            },
+                            None => NativeComputerContinuation::TextOnly {
+                                call_id: call_id.clone(),
+                                text: "computer action completed".to_string(),
+                                provider: NativeProvider::OpenAi,
+                            },
                         }
                     }
-                    CoordinatedOutcome::BackendCompleted { screenshot, .. } => {
-                        let _ = screenshot;
-                        NativeComputerContinuation::TextOnly {
+                    CoordinatedOutcome::BackendCompleted { completed, .. } => match live_frame {
+                        Some(frame) => NativeComputerContinuation::OpenAi {
+                            call_id: call_id.clone(),
+                            transient: Some(openai_transient_computer_output(
+                                frame,
+                                call_id,
+                                completed.len(),
+                                None,
+                            )),
+                        },
+                        None => NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
                             text: "computer action backend completed".to_string(),
                             provider: NativeProvider::OpenAi,
-                        }
-                    }
+                        },
+                    },
                     CoordinatedOutcome::Failed { failure, .. } => {
                         NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
@@ -3400,6 +3430,7 @@ impl NativeResponseExtractor {
                     outcome,
                     NativeProvider::Anthropic20251124,
                     ProviderMediaVariant::Anthropic20251124ImageBlock,
+                    live_frame,
                 )
             }
             NativeComputerCall::Anthropic20250124 { tool_use_id, .. } => {
@@ -3408,6 +3439,7 @@ impl NativeResponseExtractor {
                     outcome,
                     NativeProvider::Anthropic20250124,
                     ProviderMediaVariant::Anthropic20250124ImageBlock,
+                    live_frame,
                 )
             }
             NativeComputerCall::UnsupportedVariant { provider, detail } => {
@@ -3439,17 +3471,17 @@ impl NativeResponseExtractor {
         outcome: &CoordinatedOutcome,
         provider: NativeProvider,
         variant: ProviderMediaVariant,
+        live_frame: Option<&LiveComputerFrame>,
     ) -> NativeComputerContinuation {
         match outcome {
-            CoordinatedOutcome::Completed { .. } => NativeComputerContinuation::Anthropic {
+            CoordinatedOutcome::Completed { .. }
+            | CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
                 tool_use_id: tool_use_id.to_string(),
                 variant,
-                transient: None, // text-only; live frame was dropped
-            },
-            CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
-                tool_use_id: tool_use_id.to_string(),
-                variant,
-                transient: None,
+                // Attach the transient image block when the live frame was
+                // retained; otherwise text-only (no screenshot to send).
+                transient: live_frame
+                    .map(|frame| anthropic_transient_image_block(frame, tool_use_id, variant)),
             },
             CoordinatedOutcome::Failed { failure, .. } => NativeComputerContinuation::TextOnly {
                 call_id: tool_use_id.to_string(),
@@ -3667,7 +3699,7 @@ mod tests {
         let outcome = coordinator.execute_openai_call(call_id, actions).await;
 
         // Build the continuation through the native seam.
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::TextOnly {
@@ -3690,6 +3722,75 @@ mod tests {
                 assert!(!proj_json.contains("data:image"));
             }
             other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_continuation_attaches_transient_when_live_frame_retained() {
+        // With the transient live frame retained, a successful continuation
+        // carries a real provider transient (the screenshot); without it, the
+        // continuation is text-only. The pixels never leave the transient path.
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reservation: Box<dyn MediaReservationHandle> =
+            Box::new(InMemoryReservationHandle::new(released));
+        let frame = LiveComputerFrame::try_new(
+            vec![1, 2, 3, 4],
+            ScreenshotMediaType::Png,
+            FrameDimensions {
+                width: 2,
+                height: 2,
+                region: None,
+                native_zoom: None,
+            },
+            ObservationId("call-frame".to_string()),
+            ActionId("call-frame".to_string()),
+            CaptureEpoch(1),
+            reservation,
+            None,
+        )
+        .expect("live frame construction");
+
+        let completed = CoordinatedOutcome::Completed {
+            completed: Vec::new(),
+            screenshot: Some(frame.sanitized()),
+        };
+
+        // OpenAI: a retained frame yields an `OpenAi` continuation with a
+        // transient; no frame yields text-only.
+        let openai_call = NativeComputerCall::OpenAi {
+            call_id: "call-frame".to_string(),
+            actions: Vec::new(),
+        };
+        match NativeResponseExtractor::build_continuation(&openai_call, &completed, Some(&frame)) {
+            NativeComputerContinuation::OpenAi { call_id, transient } => {
+                assert_eq!(call_id, "call-frame");
+                assert!(transient.is_some(), "a retained live frame builds a transient");
+            }
+            other => panic!("expected OpenAi continuation with transient, got {other:?}"),
+        }
+        assert!(matches!(
+            NativeResponseExtractor::build_continuation(&openai_call, &completed, None),
+            NativeComputerContinuation::TextOnly {
+                provider: NativeProvider::OpenAi,
+                ..
+            }
+        ));
+
+        // Anthropic: a retained frame yields an image-block transient.
+        let anthropic_call = NativeComputerCall::Anthropic20251124 {
+            tool_use_id: "tool-frame".to_string(),
+            action: Anthropic20251124ComputerAction::Screenshot,
+        };
+        match NativeResponseExtractor::build_continuation(&anthropic_call, &completed, Some(&frame)) {
+            NativeComputerContinuation::Anthropic {
+                tool_use_id,
+                transient,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "tool-frame");
+                assert!(transient.is_some(), "a retained live frame builds a transient");
+            }
+            other => panic!("expected Anthropic continuation with transient, got {other:?}"),
         }
     }
 
@@ -3733,7 +3834,7 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20251124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::Anthropic { .. }
@@ -3779,7 +3880,7 @@ mod tests {
         let outcome = coordinator
             .execute_anthropic_20250124_call(tool_use_id, action)
             .await;
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         assert!(matches!(
             continuation,
             NativeComputerContinuation::Anthropic { .. }
@@ -4698,7 +4799,7 @@ mod tests {
         let outcome = CoordinatedOutcome::UnsupportedProviderVariant {
             detail: "unknown action type `foo`".to_string(),
         };
-        let continuation = NativeResponseExtractor::build_continuation(&call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(&call, &outcome, None);
         match continuation {
             NativeComputerContinuation::Unsupported {
                 provider,
@@ -4777,7 +4878,7 @@ mod tests {
             })
             .await;
 
-        let continuation = NativeResponseExtractor::build_continuation(call, &outcome);
+        let continuation = NativeResponseExtractor::build_continuation(call, &outcome, None);
         // The continuation does not carry pixel data in a serializable form.
         // (The TransientProviderRequest, if present, is not Serialize.)
         let _ = continuation;
@@ -6395,45 +6496,29 @@ mod tests {
             .await;
         assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
 
-        // The call_id is the same but the payload is different — this is
-        // caught by the call-id dedup first (returns DuplicateReplay). The
-        // identity_conflict check is for the same (session, delegation,
-        // provider_call_id, batch_index) with a different payload digest,
-        // which would happen if the journal was accessed by identity rather
-        // than call_id. Since the call-id dedup catches it first, we verify
-        // the identity_conflict path through the journal directly.
-        let identity = ActionIdentity {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            provider_call_id: "call-conflict".to_string(),
-            batch_index: 0,
-        };
-        let digest1 = ActionPayloadDigest::from_actions(&[ComputerAction::MoveCursor {
-            to: Point {
-                x: 4.0,
-                y: 5.0,
-                space: CoordinateSpace::Physical,
-            },
-            duration: Duration::from_millis(0),
-            easing: Easing::Linear,
-        }]);
-        let digest2 = ActionPayloadDigest::from_actions(&[ComputerAction::MoveCursor {
+        // Same call_id, DIFFERENT payload: identity is the PRIMARY dedup key, so
+        // this is an identity_conflict with ZERO additional dispatch through the
+        // coordinator — NOT a stale DuplicateReplay of the first outcome (AC14).
+        let dispatched_after_first = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        let actions2 = vec![OpenAiComputerAction::Move {
             to: Point {
                 x: 100.0,
                 y: 200.0,
                 space: CoordinateSpace::Physical,
             },
-            duration: Duration::from_millis(0),
-            easing: Easing::Linear,
-        }]);
-
-        // Different payloads produce different digests.
-        assert_ne!(digest1, digest2);
-
-        // The journal check_identity returns Err for a different payload.
-        let mut journal = OutcomeJournal::new();
-        journal.record_identity(identity.clone(), digest1);
-        assert_eq!(journal.check_identity(&identity, &digest2), Err(()));
+        }];
+        let outcome2 = coordinator
+            .execute_openai_call("call-conflict", &actions2)
+            .await;
+        assert!(
+            matches!(outcome2, CoordinatedOutcome::IdentityConflict { .. }),
+            "same call id + different payload must be an identity_conflict, got {outcome2:?}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            dispatched_after_first,
+            "an identity_conflict must dispatch zero backend actions"
+        );
     }
 
     // =====================================================================

@@ -234,6 +234,7 @@
           "harnesses": {},
           "hintToolCallCorrections": false,
           "image_generation": {
+            "base_tier_known_cost_threshold_usd_micros": 250000,
             "endpoints": [],
             "openrouter_provider_allowlist": [],
             "targets": [],

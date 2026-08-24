@@ -335,3 +335,41 @@ fn inference_config_round_trips_without_generation_aliases() {
     let text = serde_json::to_string(&inference).unwrap();
     assert!(!text.contains("image_generation") && !text.contains("generation_targets"));
 }
+
+#[test]
+fn base_tier_known_cost_threshold_defaults_overrides_and_fails_closed() {
+    // Absent field → the default; programmatic construction is the default too.
+    let default_cfg: ImageGenerationConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(
+        default_cfg.base_tier_known_cost_threshold_usd_micros(),
+        DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS
+    );
+    assert_eq!(
+        config().base_tier_known_cost_threshold_usd_micros(),
+        DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS
+    );
+    assert_eq!(
+        ImageGenerationConfig::default().base_tier_known_cost_threshold_usd_micros(),
+        DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS
+    );
+
+    // In-range authored overrides are honored: 0 (always prompt), a mid value,
+    // and the exact hard ceiling.
+    for value in [0_u64, 1_000_000, BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS] {
+        let cfg: ImageGenerationConfig = serde_json::from_str(&format!(
+            r#"{{"base_tier_known_cost_threshold_usd_micros": {value}}}"#
+        ))
+        .unwrap();
+        assert_eq!(cfg.base_tier_known_cost_threshold_usd_micros(), value);
+    }
+
+    // A value above the hard ceiling is rejected fail-closed at load.
+    let over = serde_json::from_str::<ImageGenerationConfig>(&format!(
+        r#"{{"base_tier_known_cost_threshold_usd_micros": {}}}"#,
+        BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS + 1
+    ));
+    assert!(
+        over.is_err(),
+        "a base-tier threshold above the hard ceiling must be rejected"
+    );
+}

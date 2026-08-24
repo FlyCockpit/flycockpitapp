@@ -117,7 +117,8 @@
             "endpoints": [],
             "targets": [],
             "workflows": [],
-            "openrouter_provider_allowlist": []
+            "openrouter_provider_allowlist": [],
+            "base_tier_known_cost_threshold_usd_micros": 250000
           },
           "harnesses": {},
           "agent_guidance_files": ["AGENTS.md"],

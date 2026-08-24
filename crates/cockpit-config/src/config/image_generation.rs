@@ -1116,12 +1116,32 @@ impl RegisteredComfyWorkflow {
     }
 }
 
+/// Default base-tier known-cost approval threshold (USD micros): a generation
+/// whose known cost is at or below this dispatches without a spend prompt in the
+/// base tier. Authored config may override it up to the hard ceiling below.
+pub const DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS: u64 = 250_000;
+
+/// Hard ceiling for the authored base-tier threshold (USD micros). A configured
+/// value above this is rejected fail-closed at config load — the threshold can
+/// never be widened past this bound regardless of the config file.
+pub const BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS: u64 = 10_000_000;
+
+fn default_base_tier_known_cost_threshold_usd_micros() -> u64 {
+    DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImageGenerationConfig {
     endpoints: Vec<ImageEndpoint>,
     targets: Vec<ImageGenerationTarget>,
     workflows: Vec<RegisteredComfyWorkflow>,
     openrouter_provider_allowlist: Vec<String>,
+    /// Base-tier known-cost approval threshold (USD micros). Validated at load
+    /// against [`BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS`]; defaults to
+    /// [`DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS`]. A later increment
+    /// wires the `generate_image` risk classifier to read this in place of its
+    /// hardcoded constant.
+    base_tier_known_cost_threshold_usd_micros: u64,
 }
 
 #[derive(Deserialize)]
@@ -1135,6 +1155,8 @@ struct RawImageGenerationConfig {
     workflows: Vec<RegisteredComfyWorkflow>,
     #[serde(default)]
     openrouter_provider_allowlist: Vec<String>,
+    #[serde(default = "default_base_tier_known_cost_threshold_usd_micros")]
+    base_tier_known_cost_threshold_usd_micros: u64,
 }
 
 impl<'de> Deserialize<'de> for ImageGenerationConfig {
@@ -1146,6 +1168,11 @@ impl<'de> Deserialize<'de> for ImageGenerationConfig {
             raw.workflows,
             raw.openrouter_provider_allowlist,
         )
+        .and_then(|config| {
+            config.with_base_tier_known_cost_threshold_usd_micros(
+                raw.base_tier_known_cost_threshold_usd_micros,
+            )
+        })
         .map_err(serde::de::Error::custom)
     }
 }
@@ -1162,6 +1189,32 @@ impl ImageGenerationConfig {
     }
     pub fn openrouter_provider_allowlist(&self) -> &[String] {
         &self.openrouter_provider_allowlist
+    }
+    /// The base-tier known-cost approval threshold (USD micros), validated at
+    /// load against [`BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS`].
+    pub fn base_tier_known_cost_threshold_usd_micros(&self) -> u64 {
+        self.base_tier_known_cost_threshold_usd_micros
+    }
+
+    /// Return this registry with the base-tier threshold replaced, validated
+    /// against [`BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS`] (fail-closed
+    /// above the ceiling). This is the single validation point for the field:
+    /// `Deserialize` applies an authored value through it, and a registry
+    /// mutation (which rebuilds through [`Self::new`], resetting the threshold
+    /// to the default) re-applies the prior value through it so an authored
+    /// override survives an endpoint/target/workflow edit.
+    pub fn with_base_tier_known_cost_threshold_usd_micros(
+        mut self,
+        value: u64,
+    ) -> Result<Self, ImageGenerationConfigError> {
+        if value > BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS {
+            return Err(ImageGenerationConfigError::BaseTierThresholdAboveCeiling {
+                value,
+                ceiling: BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS,
+            });
+        }
+        self.base_tier_known_cost_threshold_usd_micros = value;
+        Ok(self)
     }
 
     /// The registry as it may appear in a config SNAPSHOT that crosses a trust
@@ -1289,6 +1342,10 @@ impl ImageGenerationConfig {
             targets,
             workflows,
             openrouter_provider_allowlist: allowlist,
+            // Programmatic construction uses the default threshold; an authored
+            // override enters (and is validated) only through `Deserialize`.
+            base_tier_known_cost_threshold_usd_micros:
+                DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
         })
     }
 }
@@ -1567,6 +1624,7 @@ pub enum ImageGenerationConfigError {
     MissingEvidence,
     InvalidPrice,
     ArithmeticOverflow,
+    BaseTierThresholdAboveCeiling { value: u64, ceiling: u64 },
 }
 
 impl fmt::Display for ImageGenerationConfigError {

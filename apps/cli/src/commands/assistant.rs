@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 use crate::agents::{AgentDef, GoalSettingsOverride};
 use crate::assistants::{
@@ -139,6 +140,17 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 /// Pure local IO — no daemon — so a parity test can compare its output against
 /// the canonical `create_assistant` and fail if the two ever drift.
 fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
+    write_assistant_home_with_installation_id(spec, Uuid::new_v4())
+}
+
+/// Write a home with a preallocated installation identity.
+///
+/// Keeping identity allocation explicit here allows the caller to use the
+/// exact same identity in the definition and persisted registry config.
+fn write_assistant_home_with_installation_id(
+    spec: &CreateAssistantSpec,
+    installation_id: Uuid,
+) -> Result<(String, String)> {
     crate::assistants::validate_assistant_name(&spec.name)?;
     if spec.description.trim().is_empty() {
         bail!("assistant description is required");
@@ -152,16 +164,19 @@ fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> 
     let agent = AgentDef {
         name: spec.name.clone(),
         description: spec.description.clone(),
-        mode: spec.mode,
-        model: spec.model.clone(),
+        mode: crate::agents::AgentMode::Primary,
+        model: None,
         temperature: None,
-        tools: spec.tools.clone(),
-        tool_tiers: spec.tool_tiers.clone(),
+        tools: None,
+        tool_tiers: std::collections::BTreeMap::new(),
         tool_descriptions: std::collections::BTreeMap::new(),
         scan_tool_results: None,
         goal_supervision: GoalSettingsOverride::default(),
         permission: None,
         fork_eligible: false,
+        vnext: Some(crate::assistants::vnext_for_private_assistant(
+            installation_id,
+        )),
         prompt: spec.prompt.clone(),
         prompt_variants: std::collections::HashMap::new(),
         source: path.clone(),
@@ -172,6 +187,7 @@ fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> 
         .with_context(|| format!("writing assistant definition {}", path.display()))?;
     identity::seed_identity_files(&spec.home_dir)?;
     let config = AssistantConfig {
+        installation_id,
         agent_source: path.to_string_lossy().into_owned(),
         soul_hash: identity::hash_optional_file(&identity::soul_path(&spec.home_dir))?,
         user_hash: identity::hash_optional_file(&identity::user_path(&spec.home_dir))?,
@@ -253,20 +269,24 @@ async fn show(name: &str) -> Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
     // The registry row carries name/home_dir/content_hash; the description,
-    // mode, model and tools live in the on-disk definition file.
+    // description lives in the on-disk schemaVersion 2 definition file.
     let def = crate::assistants::load_from_home(&assistant.name, Path::new(&assistant.home_dir))?;
     println!("name: {}", def.name);
     println!("description: {}", def.description);
     println!("home_dir: {}", def.home_dir.display());
     println!("definition: {}", def.agent.source.display());
     println!("content_hash: {}", assistant.content_hash);
-    println!("mode: {:?}", def.agent.mode);
-    if let Some(model) = def.agent.model.as_deref() {
-        println!("model: {model}");
-    }
-    if let Some(tools) = def.agent.tools.as_ref() {
-        println!("tools: {}", tools.join(","));
-    }
+    println!(
+        "agent_id: {}",
+        def.agent.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)
+    );
+    let execution_kind = match def.agent.vnext.as_ref().map(|v| v.execution_kind) {
+        Some(cockpit_core::agents::ExecutionKind::Assistant) => "assistant",
+        Some(cockpit_core::agents::ExecutionKind::Coding) => "coding",
+        Some(cockpit_core::agents::ExecutionKind::Computer) => "computer",
+        None => "<legacy>",
+    };
+    println!("execution_kind: {execution_kind}");
     Ok(())
 }
 
@@ -415,8 +435,7 @@ impl TerminalActionHandler for AssistantNewAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::AgentMode;
-    use crate::assistants::create_assistant;
+    use crate::assistants::{create_assistant, create_assistant_with_installation_id};
     use crate::db::Db;
     use crate::wizard::WizardAnswer;
 
@@ -424,10 +443,6 @@ mod tests {
         crate::assistants::CreateAssistantSpec {
             name: "helper-bot".to_string(),
             description: "Helps with tests".to_string(),
-            mode: AgentMode::Primary,
-            tools: Some(vec!["read".to_string()]),
-            tool_tiers: std::collections::BTreeMap::new(),
-            model: Some("openai/gpt-5.5".to_string()),
             prompt: "Stay focused.".to_string(),
             home_dir: home,
         }
@@ -493,11 +508,19 @@ mod tests {
         let cli_home = temp.path().join("cli").join("helper-bot");
 
         let db = Db::open_in_memory().unwrap();
-        let core_row = create_assistant(&db, sample_spec(core_home.clone()))
-            .await
-            .unwrap();
-        let (_config_json, cli_hash) =
-            write_assistant_home(&sample_spec(cli_home.clone())).unwrap();
+        let installation_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let core_row = create_assistant_with_installation_id(
+            &db,
+            sample_spec(core_home.clone()),
+            installation_id,
+        )
+        .await
+        .unwrap();
+        let (_config_json, cli_hash) = write_assistant_home_with_installation_id(
+            &sample_spec(cli_home.clone()),
+            installation_id,
+        )
+        .unwrap();
 
         let core_md = std::fs::read(assistant_definition_path(&core_home)).unwrap();
         let cli_md = std::fs::read(assistant_definition_path(&cli_home)).unwrap();
@@ -521,10 +544,6 @@ mod tests {
             crate::assistants::CreateAssistantSpec {
                 name: "helper-bot".to_string(),
                 description: "Helps with tests".to_string(),
-                mode: AgentMode::Primary,
-                tools: Some(vec!["read".to_string()]),
-                tool_tiers: std::collections::BTreeMap::new(),
-                model: Some("openai/gpt-5.5".to_string()),
                 prompt: "Stay focused.".to_string(),
                 home_dir: home.clone(),
             },
@@ -537,8 +556,12 @@ mod tests {
         assert_eq!(db.list_assistants().await.unwrap().len(), 1);
 
         let def = crate::assistants::load_from_row(&row).unwrap();
-        assert_eq!(def.agent.model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(def.agent.tools.as_deref(), Some(&["read".to_string()][..]));
+        assert_eq!(
+            def.agent.vnext.as_ref().map(|v| v.execution_kind),
+            Some(cockpit_core::agents::ExecutionKind::Assistant)
+        );
+        assert!(def.agent.model.is_none());
+        assert!(def.agent.tools.is_none());
     }
 
     #[tokio::test]
@@ -551,10 +574,6 @@ mod tests {
             crate::assistants::CreateAssistantSpec {
                 name: "helper-bot".to_string(),
                 description: "Helps with tests".to_string(),
-                mode: AgentMode::Primary,
-                tools: Some(vec!["read".to_string()]),
-                tool_tiers: std::collections::BTreeMap::new(),
-                model: Some("openai/gpt-5.5".to_string()),
                 prompt: "Stay focused.".to_string(),
                 home_dir: home.clone(),
             },
@@ -602,24 +621,11 @@ mod tests {
         let mut run = WizardRun::new(crate::assistants::descriptor()).unwrap();
         run.submit(WizardAnswer::Text("Persistent helper".to_string()))
             .unwrap();
-        run.submit(WizardAnswer::Select("all".to_string())).unwrap();
-        run.submit(WizardAnswer::Text("openai/gpt-5.5".to_string()))
-            .unwrap();
-        let mut tool_tiers = std::collections::BTreeMap::new();
-        tool_tiers.insert("search".to_string(), crate::agents::ToolTier::Discoverable);
-        run.submit(WizardAnswer::ToolSurface(
-            crate::agents::ToolSurfaceSelection {
-                tools: vec!["read".to_string(), "search".to_string(), "mcp".to_string()],
-                tool_tiers: tool_tiers.clone(),
-            },
-        ))
-        .unwrap();
         run.submit(WizardAnswer::Text("Help the user.".to_string()))
             .unwrap();
         let spec =
             spec_from_wizard("helper-bot", std::path::PathBuf::from("/tmp/helper"), &run).unwrap();
-        assert_eq!(spec.mode, AgentMode::All);
-        assert_eq!(spec.tools.unwrap(), vec!["read", "search", "mcp"]);
-        assert_eq!(spec.tool_tiers, tool_tiers);
+        assert_eq!(spec.description, "Persistent helper");
+        assert_eq!(spec.prompt, "Help the user.");
     }
 }

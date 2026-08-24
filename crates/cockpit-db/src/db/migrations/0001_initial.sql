@@ -967,6 +967,103 @@ CREATE TABLE lock_reads (
 -- proto::InterruptQuestionSet; the single-question `question_json` column
 -- serves the `jobs` needs-attention nudge. A row never populates both.
 
+-- ---- recursive agent tree and decision persistence ---------------------------
+-- These rows are daemon-owned durable control state. Contracts below are
+-- redacted summaries, never a prompt, credential, or resolver context.
+CREATE TABLE agent_instances (
+    agent_instance_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parent_agent_instance_id TEXT,
+    task_delegation_job_id TEXT UNIQUE,
+    task_delegation_child_uuid TEXT UNIQUE,
+    resolved_profile_snapshot_id TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+        'created', 'running', 'waiting_for_user', 'waiting_for_approval',
+        'completed', 'failed', 'cancelled'
+    )),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (agent_instance_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT,
+    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT,
+    FOREIGN KEY (resolved_profile_snapshot_id, session_id)
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_agent_instances_session_state
+    ON agent_instances(session_id, state, updated_at_unix_ms);
+CREATE INDEX idx_agent_instances_parent
+    ON agent_instances(parent_agent_instance_id)
+    WHERE parent_agent_instance_id IS NOT NULL;
+
+CREATE TABLE decision_requests (
+    decision_request_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    options_contract_json TEXT NOT NULL,
+    free_text_contract_json TEXT,
+    recommendation_json TEXT,
+    rationale_redaction_class TEXT NOT NULL CHECK (rationale_redaction_class IN ('public', 'sensitive', 'secret')),
+    deadline_unix_ms INTEGER,
+    policy_receipt_json TEXT NOT NULL,
+    resolver_route TEXT CHECK (resolver_route IN ('user', 'policy', 'utility', 'timeout', 'cancellation')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'resolving', 'answered', 'auto_resolved', 'timed_out', 'cancelled')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (decision_request_id, session_id),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_decision_requests_agent_state
+    ON decision_requests(agent_instance_id, state, updated_at_unix_ms);
+
+CREATE TABLE decision_receipts (
+    decision_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    terminal_state TEXT NOT NULL CHECK (terminal_state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')),
+    terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
+    receipt_json TEXT NOT NULL,
+    session_event_seq INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE TABLE agent_transition_receipts (
+    agent_instance_id TEXT NOT NULL,
+    terminal_state TEXT NOT NULL CHECK (terminal_state IN ('completed', 'failed', 'cancelled')),
+    session_id TEXT NOT NULL,
+    terminal_revision INTEGER NOT NULL CHECK (terminal_revision >= 0),
+    receipt_json TEXT NOT NULL,
+    session_event_seq INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (agent_instance_id, terminal_state),
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER decision_receipts_immutable
+BEFORE UPDATE ON decision_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'decision receipts are immutable');
+END;
+
+CREATE TRIGGER agent_transition_receipts_immutable
+BEFORE UPDATE ON agent_transition_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'agent transition receipts are immutable');
+END;
+
 CREATE TABLE needs_attention (
     interrupt_id   TEXT    PRIMARY KEY,
     session_id     TEXT    NOT NULL,
@@ -983,6 +1080,15 @@ CREATE TABLE needs_attention (
     parked_call_id TEXT,                            -- assistant tool-call id for parked replay, or NULL
     parked_resume_json TEXT,                        -- serialized resume anchor, or NULL
     parked_gate_json TEXT,                          -- serialized per-call gate replay memo, or NULL
+    -- Recursive-agent decisions use this typed ownership edge. Legacy
+    -- interrupts leave it NULL; a decision row never carries legacy question
+    -- or parked-call authority.
+    decision_request_id TEXT UNIQUE,
+    -- A decision-owned row is a durable projection of its decision state,
+    -- rather than an independently mutable interrupt.  Legacy rows retain
+    -- their historical unversioned API; the decision state machine advances
+    -- this revision under its own transaction-only guard.
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
     CHECK (question_json IS NULL OR questions_json IS NULL),
     CHECK (
         (parked_tool IS NULL AND parked_args_json IS NULL AND parked_call_id IS NULL AND parked_resume_json IS NULL)
@@ -993,10 +1099,92 @@ CREATE TABLE needs_attention (
     CHECK ((state = 'resolved') = (resolved_at IS NOT NULL)),
     CHECK (state IN ('executing', 'interrupted', 'resolved') OR response_json IS NULL),
     CHECK (state <> 'executing' OR response_json IS NOT NULL),
+    CHECK (
+        decision_request_id IS NULL OR
+        (question_json IS NULL AND questions_json IS NULL
+         AND parked_tool IS NULL AND parked_args_json IS NULL
+         AND parked_call_id IS NULL AND parked_resume_json IS NULL
+         AND parked_gate_json IS NULL)
+    ),
+    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_na_session_open ON needs_attention (session_id, state);
+
+-- `agent_tree_decisions` installs this guard only for the short portion of
+-- its transaction which resolves a decision-owned projection.  Existing
+-- interrupt APIs never create a guard, so they cannot accidentally race or
+-- mutate rows owned by the decision state machine.  It is intentionally
+-- empty outside that transaction (and is removed before commit).
+CREATE TABLE decision_attention_mutation_guards (
+    decision_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    FOREIGN KEY (decision_request_id, session_id)
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER needs_attention_decision_session_insert
+BEFORE INSERT ON needs_attention
+WHEN NEW.decision_request_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM decision_requests d
+    WHERE d.decision_request_id = NEW.decision_request_id
+      AND d.session_id = NEW.session_id
+      AND d.agent_instance_id = NEW.agent_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
+END;
+
+CREATE TRIGGER needs_attention_decision_session_update
+BEFORE UPDATE OF decision_request_id, session_id, agent_id ON needs_attention
+WHEN NEW.decision_request_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM decision_requests d
+    WHERE d.decision_request_id = NEW.decision_request_id
+      AND d.session_id = NEW.session_id
+      AND d.agent_instance_id = NEW.agent_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision needs-attention session mismatch');
+END;
+
+CREATE TRIGGER needs_attention_decision_owned_update
+BEFORE UPDATE ON needs_attention
+WHEN OLD.decision_request_id IS NOT NULL
+ AND (
+    NEW.interrupt_id IS NOT OLD.interrupt_id
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.agent_id IS NOT OLD.agent_id
+    OR NEW.description IS NOT OLD.description
+    OR NEW.question_json IS NOT OLD.question_json
+    OR NEW.raised_at IS NOT OLD.raised_at
+    OR NEW.questions_json IS NOT OLD.questions_json
+    OR NEW.parked_tool IS NOT OLD.parked_tool
+    OR NEW.parked_args_json IS NOT OLD.parked_args_json
+    OR NEW.parked_call_id IS NOT OLD.parked_call_id
+    OR NEW.parked_resume_json IS NOT OLD.parked_resume_json
+    OR NEW.parked_gate_json IS NOT OLD.parked_gate_json
+    OR NEW.decision_request_id IS NOT OLD.decision_request_id
+    OR NEW.state <> 'resolved'
+    OR NEW.resolved_at IS NULL
+    OR NEW.revision <> OLD.revision + 1
+    OR NOT EXISTS (
+        SELECT 1 FROM decision_attention_mutation_guards g
+        WHERE g.decision_request_id = OLD.decision_request_id
+          AND g.session_id = OLD.session_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM decision_requests d
+        WHERE d.decision_request_id = OLD.decision_request_id
+          AND d.session_id = OLD.session_id
+          AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'decision-owned needs-attention is managed by decision state machine');
+END;
 
 -- ---- tool_call_stats view ----------------------------------------------------
 
@@ -1302,6 +1490,219 @@ CREATE INDEX idx_sevents_origin_principal ON session_events (origin_principal)
 CREATE INDEX idx_sevents_session_trust_seq ON session_events (session_id, model_trust, seq)
   WHERE model_trust IS NOT NULL;
 
+-- ---- verification ledger ----------------------------------------------------
+-- Verification work is daemon-owned audit state.  Rows deliberately contain
+-- only bounded classifications, opaque identifiers, and SHA-256 digests.  The
+-- selected executable artifact, provider receipt, candidate body, and raw
+-- verifier evidence remain volatile host state and are never recoverable from
+-- SQLite.
+CREATE TABLE verification_operations (
+    operation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    requested_candidate_count INTEGER NOT NULL CHECK (requested_candidate_count >= 0 AND requested_candidate_count <= 64),
+    effective_candidate_count INTEGER NOT NULL CHECK (effective_candidate_count >= 0 AND effective_candidate_count <= requested_candidate_count),
+    total_token_ceiling INTEGER NOT NULL CHECK (total_token_ceiling >= 0),
+    estimated_cost_ceiling_microunits INTEGER NOT NULL CHECK (estimated_cost_ceiling_microunits >= 0),
+    cost_unit TEXT NOT NULL CHECK (cost_unit IN ('microusd')),
+    collection_deadline_unix_ms INTEGER NOT NULL,
+    collection_duration_ms INTEGER NOT NULL CHECK (collection_duration_ms >= 0),
+    conservative_token_reservation INTEGER NOT NULL CHECK (conservative_token_reservation >= 0),
+    conservative_cost_reservation_microunits INTEGER NOT NULL CHECK (conservative_cost_reservation_microunits >= 0),
+    estimate_state TEXT NOT NULL CHECK (estimate_state IN ('available', 'estimate_unavailable')),
+    budget_action TEXT CHECK (budget_action IN ('refuse', 'dispatch_original')),
+    original_operation_digest TEXT NOT NULL CHECK (length(original_operation_digest) = 64 AND original_operation_digest NOT GLOB '*[^0-9a-f]*'),
+    pretool_context_capability_digest TEXT NOT NULL CHECK (length(pretool_context_capability_digest) = 64 AND pretool_context_capability_digest NOT GLOB '*[^0-9a-f]*'),
+    state TEXT NOT NULL CHECK (state IN ('created', 'collecting', 'synthesizing', 'dispatching', 'succeeded', 'failed', 'cancelled', 'aborted', 'skipped_budget_refused', 'unknown')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    collection_closed_at_unix_ms INTEGER,
+    collection_revision INTEGER NOT NULL DEFAULT 0 CHECK (collection_revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
+           (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
+    CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
+    -- Both estimate-unavailable dispositions are pre-candidate branches.
+    -- `refuse` suppresses the operation while `dispatch_original` dispatches
+    -- the original operation, but neither reserves verification candidates.
+    -- A normal estimable operation may legitimately use an effective count of
+    -- zero, so do not make zero count imply one particular budget action.
+    CHECK (budget_action IS NULL OR effective_candidate_count = 0)
+);
+
+CREATE INDEX idx_verification_operations_session_state
+    ON verification_operations(session_id, state, updated_at_unix_ms);
+
+CREATE TABLE verification_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
+    canonical_call_digest TEXT NOT NULL CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
+    artifact_union_digest TEXT NOT NULL CHECK (length(artifact_union_digest) = 64 AND artifact_union_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_summary_json TEXT NOT NULL,
+    reserved_tokens INTEGER NOT NULL CHECK (reserved_tokens >= 0),
+    reserved_cost_microunits INTEGER NOT NULL CHECK (reserved_cost_microunits >= 0),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'valid', 'invalid', 'cancelled', 'timed_out', 'malformed')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (candidate_id, operation_id),
+    UNIQUE (candidate_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_verification_candidates_operation_state
+    ON verification_candidates(operation_id, state, created_at_unix_ms);
+
+-- A write candidate's file-level union is digest-only: callers can prove a
+-- synthesis is composed entirely of valid candidates without persisting a raw
+-- path, diff, binary body, or mode string in the ledger.
+CREATE TABLE verification_candidate_artifacts (
+    candidate_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('add', 'delete', 'modify', 'rename', 'mode')),
+    affected_path_digest TEXT NOT NULL CHECK (length(affected_path_digest) = 64 AND affected_path_digest NOT GLOB '*[^0-9a-f]*'),
+    prior_path_digest TEXT CHECK (length(prior_path_digest) = 64 AND prior_path_digest NOT GLOB '*[^0-9a-f]*'),
+    content_digest TEXT CHECK (length(content_digest) = 64 AND content_digest NOT GLOB '*[^0-9a-f]*'),
+    binary_metadata_digest TEXT CHECK (length(binary_metadata_digest) = 64 AND binary_metadata_digest NOT GLOB '*[^0-9a-f]*'),
+    mode_digest TEXT CHECK (length(mode_digest) = 64 AND mode_digest NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (candidate_id, ordinal),
+    FOREIGN KEY (candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_id, session_id)
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+    CHECK ((operation_kind = 'rename') = (prior_path_digest IS NOT NULL)),
+    CHECK ((operation_kind = 'mode') = (mode_digest IS NOT NULL))
+);
+
+CREATE TABLE verification_late_results (
+    late_result_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    result_kind TEXT NOT NULL CHECK (result_kind IN ('valid', 'invalid', 'malformed', 'failed')),
+    result_digest TEXT NOT NULL CHECK (length(result_digest) = 64 AND result_digest NOT GLOB '*[^0-9a-f]*'),
+    received_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (candidate_id, result_digest),
+    FOREIGN KEY (candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (candidate_id, session_id)
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_syntheses (
+    synthesis_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'selected', 'synthesized_write', 'refused', 'no_valid_candidate', 'failed')),
+    selected_candidate_id TEXT,
+    artifact_kind TEXT CHECK (artifact_kind IN ('proposed_call', 'write_change_set')),
+    canonical_call_digest TEXT CHECK (length(canonical_call_digest) = 64 AND canonical_call_digest NOT GLOB '*[^0-9a-f]*'),
+    write_union_receipt_digest TEXT CHECK (length(write_union_receipt_digest) = 64 AND write_union_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_summary_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (selected_candidate_id, operation_id)
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT,
+    CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
+        OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
+        OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
+);
+
+-- A synthesized write is a digest-only union of exact members owned by valid
+-- write candidates. This proves no output path or operation kind was invented
+-- outside the candidate set without retaining raw path or patch data.
+CREATE TABLE verification_synthesis_artifacts (
+    synthesis_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    source_candidate_id TEXT NOT NULL,
+    source_artifact_ordinal INTEGER NOT NULL CHECK (source_artifact_ordinal >= 0),
+    PRIMARY KEY (synthesis_id, ordinal),
+    UNIQUE (synthesis_id, source_candidate_id, source_artifact_ordinal),
+    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_candidate_id, source_artifact_ordinal)
+        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT
+);
+
+CREATE TABLE verification_projection_envelopes (
+    envelope_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    prepared_projection_id TEXT NOT NULL UNIQUE,
+    prepared_projection_digest TEXT NOT NULL CHECK (length(prepared_projection_digest) = 64 AND prepared_projection_digest NOT GLOB '*[^0-9a-f]*'),
+    batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
+    surrogate_kind TEXT NOT NULL CHECK (surrogate_kind IN ('selected_call', 'synthesized_write', 'normalized_original')),
+    model_visible_projection_json TEXT NOT NULL,
+    retention_state TEXT NOT NULL CHECK (retention_state IN ('retained', 'cleaned')),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_dispatch_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    host_idempotency_key TEXT NOT NULL UNIQUE,
+    dispatch_digest TEXT NOT NULL CHECK (length(dispatch_digest) = 64 AND dispatch_digest NOT GLOB '*[^0-9a-f]*'),
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'executing', 'succeeded', 'failed', 'unknown', 'cancelled_no_submission')),
+    redacted_receipt_json TEXT,
+    receipt_digest TEXT CHECK (length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_projections (
+    projection_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('suppressed', 'committed')),
+    batch_digest TEXT NOT NULL CHECK (length(batch_digest) = 64 AND batch_digest NOT GLOB '*[^0-9a-f]*'),
+    redacted_result_json TEXT,
+    created_at_unix_ms INTEGER NOT NULL,
+    UNIQUE (projection_id, session_id),
+    UNIQUE (operation_id, session_id),
+    FOREIGN KEY (operation_id, session_id)
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE verification_projection_events (
+    projection_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    session_id TEXT NOT NULL,
+    session_event_seq INTEGER NOT NULL,
+    PRIMARY KEY (projection_id, ordinal),
+    UNIQUE (projection_id, session_event_seq),
+    FOREIGN KEY (projection_id, session_id)
+        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, session_event_seq)
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_verification_projection_events_session
+    ON verification_projection_events(session_id, session_event_seq);
+
 -- Durable idempotency tombstones for accepted client submissions that never
 -- become user_message events. A removed, cancelled, or preflight-rejected
 -- UUID must remain terminal across worker/daemon restarts; otherwise an
@@ -1336,6 +1737,12 @@ CREATE TABLE message_operation_receipts (
     client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
     state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
     safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
+    artifact_terminal_reason TEXT CHECK (artifact_terminal_reason IS NULL OR artifact_terminal_reason IN ('artifact_reservation_expired', 'artifact_quota_exhausted', 'artifact_too_large', 'artifact_security_rejected', 'artifact_preflight_rejected', 'artifact_idempotency_conflict', 'artifact_persistence_failed')),
+    -- The FCM2 v2 envelope is frozen.  Explicit model fencing for an
+    -- oversized submission therefore belongs to this durable receipt rather
+    -- than its canonical-wire bytes, and survives lease materialization.
+    artifact_model_fence_generation TEXT CHECK(artifact_model_fence_generation IS NULL OR (typeof(artifact_model_fence_generation) = 'text' AND artifact_model_fence_generation NOT GLOB '*[^0-9]*' AND length(artifact_model_fence_generation) BETWEEN 1 AND 20 AND (artifact_model_fence_generation = '0' OR substr(artifact_model_fence_generation, 1, 1) <> '0') AND (length(artifact_model_fence_generation) < 20 OR artifact_model_fence_generation <= '18446744073709551615'))),
+    artifact_model_fence_json TEXT CHECK(artifact_model_fence_json IS NULL OR (typeof(artifact_model_fence_json) = 'text' AND length(CAST(artifact_model_fence_json AS BLOB)) <= 8192 AND json_valid(artifact_model_fence_json) AND json_type(artifact_model_fence_json) = 'object' AND json(artifact_model_fence_json) = artifact_model_fence_json)),
     outbox_sequence        INTEGER NOT NULL CHECK (outbox_sequence >= 0),
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL,
@@ -1346,6 +1753,8 @@ CREATE TABLE message_operation_receipts (
       (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = zeroblob(8)) OR
       (actor_kind = 'remote_device' AND typeof(actor_id) = 'blob' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation <> zeroblob(8))
     ),
+    CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
+    CHECK ((artifact_model_fence_generation IS NULL) = (artifact_model_fence_json IS NULL)),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
@@ -1360,12 +1769,14 @@ CREATE TABLE message_submission_receipts (
     message_seq            INTEGER CHECK (message_seq IS NULL OR message_seq > 0),
     fold_ordinal           INTEGER CHECK (fold_ordinal IS NULL OR fold_ordinal >= 0),
     safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
+    artifact_terminal_reason TEXT CHECK (artifact_terminal_reason IS NULL OR artifact_terminal_reason IN ('artifact_reservation_expired', 'artifact_quota_exhausted', 'artifact_too_large', 'artifact_security_rejected', 'artifact_preflight_rejected', 'artifact_idempotency_conflict', 'artifact_persistence_failed')),
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
     UNIQUE (session_id, operation_id),
     UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
     CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
+    CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, operation_id)
       REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
     FOREIGN KEY (session_id, operation_id, client_submission_id, message_request_digest)
@@ -1377,12 +1788,18 @@ CREATE TABLE message_queue_items (
     session_id           TEXT NOT NULL,
     queue_item_id        BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
     client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
-    canonical_message    BLOB NOT NULL CHECK (typeof(canonical_message) = 'blob' AND length(canonical_message) <= 2631500),
+    canonical_message    BLOB NOT NULL CHECK (
+        typeof(canonical_message) = 'blob'
+        AND length(canonical_message) BETWEEN 5 AND 17439564
+        AND substr(canonical_message, 1, 4) = X'46434D32'
+    ),
     state                TEXT NOT NULL CHECK (state IN ('accepted', 'folding', 'materialized', 'terminal_rejected', 'removed')),
+    artifact_terminal_reason TEXT CHECK (artifact_terminal_reason IS NULL OR artifact_terminal_reason IN ('artifact_reservation_expired', 'artifact_quota_exhausted', 'artifact_too_large', 'artifact_security_rejected', 'artifact_preflight_rejected', 'artifact_idempotency_conflict', 'artifact_persistence_failed')),
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL,
     PRIMARY KEY (session_id, queue_item_id),
     UNIQUE (session_id, client_submission_id),
+    CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, client_submission_id)
       REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
 );
@@ -1994,27 +2411,665 @@ CREATE TABLE goal_root_turns (
     PRIMARY KEY(goal_id, attempt_generation, turn_id)
 );
 
--- ---- compressed_tool_results ------------------------------------------------------------
--- Durable retrieval records for compressed/truncated non-file tool
--- results.
-
-CREATE TABLE compressed_tool_results (
-    hash                  TEXT    NOT NULL,
-    session_id            TEXT    NOT NULL,
-    agent_id              TEXT    NOT NULL,
-    tool                  TEXT    NOT NULL,
-    call_id               TEXT    NOT NULL,
-    original_byte_len     INTEGER NOT NULL,
-    compressed_byte_len   INTEGER,
-    created_at            INTEGER NOT NULL,
-    kind                  TEXT    NOT NULL,
-    content               TEXT    NOT NULL,
-    PRIMARY KEY (session_id, hash),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+-- ---- session_text_artifacts --------------------------------------------------------------
+-- Immutable, session-owned captured UTF-8.  The five counters keep host loss,
+-- post-safety source, and stored representation separate; quota is always the
+-- exact UTF-8 byte length of `content`.
+--
+-- `export_redacted` is not an ordinary storage representation.  It can only
+-- enter through the archive-import composition, which first records an opaque
+-- import provenance row.  A fork may retain that same provenance because it
+-- is copying an irreversible imported body; it must never turn it into raw.
+CREATE TABLE session_text_artifact_archive_imports (
+    import_id TEXT PRIMARY KEY CHECK(
+        typeof(import_id) = 'text' AND length(import_id) = 36
+        AND substr(import_id, 9, 1) = '-' AND substr(import_id, 14, 1) = '-'
+        AND substr(import_id, 19, 1) = '-' AND substr(import_id, 24, 1) = '-'
+    ),
+    imported_at INTEGER NOT NULL CHECK(typeof(imported_at) = 'integer' AND imported_at BETWEEN -9223372036854775808 AND 9223372036854775807)
 );
 
-CREATE INDEX idx_ctr_session_created ON compressed_tool_results (session_id, created_at);
-CREATE INDEX idx_ctr_hash ON compressed_tool_results (hash);
+CREATE TABLE session_text_artifacts (
+    session_id TEXT NOT NULL CHECK(typeof(session_id) = 'text' AND length(session_id) > 0),
+    artifact_id TEXT NOT NULL CHECK(
+        typeof(artifact_id) = 'text' AND length(artifact_id) = 36
+        AND substr(artifact_id, 9, 1) = '-' AND substr(artifact_id, 14, 1) = '-'
+        AND substr(artifact_id, 19, 1) = '-' AND substr(artifact_id, 24, 1) = '-'
+    ),
+    kind TEXT NOT NULL CHECK(typeof(kind) = 'text' AND kind IN ('tool_result', 'user_input_source', 'user_input_projection')),
+    capture_reason TEXT NOT NULL CHECK(typeof(capture_reason) = 'text' AND capture_reason IN ('display_truncation', 'prune_boundary', 'oversized_user_input')),
+    content_representation TEXT NOT NULL CHECK(typeof(content_representation) = 'text' AND content_representation IN ('raw', 'export_redacted')),
+    archive_import_id TEXT,
+    owner_event_seq INTEGER NOT NULL CHECK(typeof(owner_event_seq) = 'integer' AND owner_event_seq > 0),
+    owner_relation TEXT NOT NULL CHECK(typeof(owner_relation) = 'text' AND owner_relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result')),
+    -- A source edge has no public projection slot.  The private -1 sentinel
+    -- makes that nullable SQL shape participate in the owning FK below.
+    owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
+    content TEXT NOT NULL CHECK(typeof(content) = 'text'),
+    host_captured_bytes INTEGER NOT NULL CHECK(typeof(host_captured_bytes) = 'integer' AND host_captured_bytes BETWEEN 0 AND 9223372036854775807),
+    host_original_bytes INTEGER NOT NULL CHECK(typeof(host_original_bytes) = 'integer' AND host_original_bytes BETWEEN 0 AND 9223372036854775807),
+    host_dropped_bytes INTEGER NOT NULL CHECK(typeof(host_dropped_bytes) = 'integer' AND host_dropped_bytes BETWEEN 0 AND 9223372036854775807),
+    stored_source_bytes INTEGER NOT NULL CHECK(typeof(stored_source_bytes) = 'integer' AND stored_source_bytes BETWEEN 0 AND 9223372036854775807),
+    content_bytes INTEGER NOT NULL CHECK(typeof(content_bytes) = 'integer' AND content_bytes BETWEEN 1 AND 8388608),
+    provenance_json TEXT NOT NULL CHECK(typeof(provenance_json) = 'text' AND length(CAST(provenance_json AS BLOB)) <= 256 AND json_valid(provenance_json) AND json_type(provenance_json) = 'object'),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at BETWEEN -9223372036854775808 AND 9223372036854775807),
+    PRIMARY KEY(session_id, artifact_id),
+    CHECK(host_original_bytes >= host_captured_bytes),
+    CHECK(host_dropped_bytes = host_original_bytes - host_captured_bytes),
+    CHECK(stored_source_bytes <= host_captured_bytes),
+    CHECK(content_bytes = length(CAST(content AS BLOB))),
+    CHECK(content_bytes = stored_source_bytes),
+    CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
+    CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),
+    CHECK((content_representation = 'raw' AND archive_import_id IS NULL) OR (content_representation = 'export_redacted' AND archive_import_id IS NOT NULL)),
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY(archive_import_id) REFERENCES session_text_artifact_archive_imports(import_id) ON DELETE RESTRICT,
+    -- This deferred circular ownership FK is intentionally the database-level
+    -- backstop for direct SQL: an artifact cannot commit without exactly its
+    -- one matching ref, while the normal composition can insert the immutable
+    -- body before its ref in the same transaction.
+    FOREIGN KEY(session_id,artifact_id,owner_event_seq,owner_relation,owner_slot)
+      REFERENCES session_text_artifact_event_refs(session_id,artifact_id,event_seq,relation,owner_slot)
+      ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE INDEX idx_session_text_artifacts_session_created
+    ON session_text_artifacts(session_id, created_at, artifact_id);
+
+-- The accepted model-facing composition for an artifact-backed user turn.
+-- Authored bytes are never duplicated here: the sole `authored_text` slot is
+-- replaced with the durable artifact frame on live dispatch and rehydrate.
+CREATE TABLE session_user_message_model_envelopes (
+    session_id TEXT NOT NULL CHECK(typeof(session_id) = 'text' AND length(session_id) > 0),
+    event_seq INTEGER NOT NULL CHECK(typeof(event_seq) = 'integer' AND event_seq > 0),
+    envelope_json TEXT NOT NULL CHECK(typeof(envelope_json) = 'text' AND length(CAST(envelope_json AS BLOB)) <= 131072 AND json_valid(envelope_json) AND json_type(envelope_json) = 'object'),
+    PRIMARY KEY(session_id, event_seq),
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE
+);
+
+-- An accepted submission is immutable.  In particular, a restart must never
+-- silently replace its already accepted model composition with whatever the
+-- current driver happens to assemble.
+CREATE TRIGGER session_user_message_model_envelopes_no_update
+BEFORE UPDATE ON session_user_message_model_envelopes
+BEGIN
+    SELECT RAISE(ABORT, 'user message model envelope is immutable');
+END;
+
+CREATE TABLE session_text_artifact_event_refs (
+    session_id TEXT NOT NULL CHECK(typeof(session_id) = 'text' AND length(session_id) > 0),
+    event_seq INTEGER NOT NULL CHECK(typeof(event_seq) = 'integer' AND event_seq > 0),
+    relation TEXT NOT NULL CHECK(typeof(relation) = 'text' AND relation IN ('source_user_input', 'model_user_input_projection', 'model_context_tool_result')),
+    projection_slot INTEGER CHECK(projection_slot IS NULL OR (typeof(projection_slot) = 'integer' AND projection_slot >= 0)),
+    owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
+    artifact_id TEXT NOT NULL CHECK(typeof(artifact_id) = 'text' AND length(artifact_id) = 36),
+    PRIMARY KEY(session_id, artifact_id),
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, artifact_id) REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE,
+    CHECK((relation = 'source_user_input' AND projection_slot IS NULL AND owner_slot = -1) OR (relation <> 'source_user_input' AND projection_slot IS NOT NULL AND owner_slot = projection_slot)),
+    UNIQUE(session_id,artifact_id,event_seq,relation,owner_slot)
+);
+-- SQLite treats NULLs as distinct in a normal unique index, so these two
+-- partial indexes are deliberately separate.
+CREATE UNIQUE INDEX uq_text_artifact_source_slot
+    ON session_text_artifact_event_refs(session_id, event_seq, relation)
+    WHERE projection_slot IS NULL;
+CREATE UNIQUE INDEX uq_text_artifact_model_slot
+    ON session_text_artifact_event_refs(session_id, event_seq, relation, projection_slot)
+    WHERE projection_slot IS NOT NULL;
+
+-- Every durable `available` projection must be backed by exactly one ref at
+-- commit. SQLite has deferred foreign keys but no deferred CHECK trigger, so
+-- an event insert creates one deliberately-unsatisfied, deferred pending row
+-- per declared available slot. The matching immutable ref clears that row in
+-- the same outer composition transaction. The sentinel intentionally has no
+-- rows and its write guards make it impossible to satisfy a pending row by
+-- direct SQL instead of supplying the owner ref.
+CREATE TABLE session_text_artifact_projection_pending_sentinel (
+    unresolved INTEGER PRIMARY KEY CHECK(unresolved = 1)
+);
+
+CREATE TABLE session_text_artifact_projection_pending_slots (
+    session_id TEXT NOT NULL,
+    event_seq INTEGER NOT NULL,
+    projection_slot INTEGER NOT NULL CHECK(typeof(projection_slot) = 'integer' AND projection_slot >= 0),
+    unresolved INTEGER NOT NULL DEFAULT 1 CHECK(unresolved = 1),
+    PRIMARY KEY(session_id, event_seq, projection_slot),
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+    FOREIGN KEY(unresolved) REFERENCES session_text_artifact_projection_pending_sentinel(unresolved)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TRIGGER text_artifact_projection_pending_sentinel_reject_insert
+BEFORE INSERT ON session_text_artifact_projection_pending_sentinel
+BEGIN SELECT RAISE(ABORT, 'text artifact projection pending sentinel is not writable'); END;
+CREATE TRIGGER text_artifact_projection_pending_sentinel_reject_update
+BEFORE UPDATE ON session_text_artifact_projection_pending_sentinel
+BEGIN SELECT RAISE(ABORT, 'text artifact projection pending sentinel is immutable'); END;
+CREATE TRIGGER text_artifact_projection_pending_sentinel_reject_delete
+BEFORE DELETE ON session_text_artifact_projection_pending_sentinel
+BEGIN SELECT RAISE(ABORT, 'text artifact projection pending sentinel is immutable'); END;
+
+-- Validate the entire declared durable state before a ref exists. The ref
+-- trigger below then binds each available state to its exact immutable body;
+-- this trigger closes the opposite direction (including all-unavailable
+-- prune arrays, which otherwise have no ref insertion to inspect).
+CREATE TRIGGER text_artifact_projection_event_validate_insert
+AFTER INSERT ON session_events
+WHEN NEW.type IN ('tool_call', 'context_pruned')
+ AND (
+    json_type(NEW.data_json, '$.artifact_projection') IS NOT NULL
+    OR json_type(NEW.data_json, '$.artifact_projections') IS NOT NULL
+ )
+BEGIN
+    SELECT CASE WHEN NEW.type = 'tool_call' AND NOT EXISTS (
+        SELECT 1
+         WHERE json_type(NEW.data_json, '$.artifact_projection') = 'object'
+           AND json_type(NEW.data_json, '$.artifact_projections') IS NULL
+           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection'))) = 15
+           AND json_extract(NEW.data_json, '$.artifact_projection.version') = 1
+           AND json_type(NEW.data_json, '$.artifact_projection.status') = 'text'
+           AND json_extract(NEW.data_json, '$.artifact_projection.status') IN ('available', 'unavailable')
+	           AND ((json_extract(NEW.data_json, '$.artifact_projection.status') = 'available'
+	                 AND json_type(NEW.data_json, '$.artifact_projection.reason') = 'null')
+	                OR (json_extract(NEW.data_json, '$.artifact_projection.status') = 'unavailable'
+	                    AND json_type(NEW.data_json, '$.artifact_projection.reason') = 'text'
+		                    AND json_extract(NEW.data_json, '$.artifact_projection.reason') IN ('artifact_limit', 'session_quota', 'persistence_unavailable')))
+           AND json_extract(NEW.data_json, '$.artifact_projection.kind') = 'tool_result'
+           AND json_extract(NEW.data_json, '$.artifact_projection.capture_reason') = 'display_truncation'
+           AND json_type(NEW.data_json, '$.artifact_projection.projection_slot') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.projection_slot') = 0
+           AND json_type(NEW.data_json, '$.artifact_projection.host_captured_bytes') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes') >= 0
+           AND json_type(NEW.data_json, '$.artifact_projection.host_original_bytes') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.host_original_bytes') >= json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
+           AND json_type(NEW.data_json, '$.artifact_projection.host_dropped_bytes') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.host_dropped_bytes') = json_extract(NEW.data_json, '$.artifact_projection.host_original_bytes') - json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
+           AND json_type(NEW.data_json, '$.artifact_projection.stored_source_bytes') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes') BETWEEN 1 AND json_extract(NEW.data_json, '$.artifact_projection.host_captured_bytes')
+	           AND json_type(NEW.data_json, '$.artifact_projection.content_bytes') = 'integer'
+	           AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') = json_extract(NEW.data_json, '$.artifact_projection.stored_source_bytes')
+	           -- `artifact_limit` means this exact candidate exceeded the per-artifact
+	           -- cap; `session_quota` is only meaningful for a candidate that could
+	           -- otherwise fit.  Keep that closed durable meaning true even when a
+	           -- direct SQL caller writes an unavailable-only projection with no ref.
+	           AND (json_extract(NEW.data_json, '$.artifact_projection.status') = 'available'
+	                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'artifact_limit'
+	                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') > 8388608)
+	                OR (json_extract(NEW.data_json, '$.artifact_projection.reason') = 'session_quota'
+	                    AND json_extract(NEW.data_json, '$.artifact_projection.content_bytes') <= 8388608))
+	           AND json_type(NEW.data_json, '$.artifact_projection.line_count') = 'integer'
+           AND json_extract(NEW.data_json, '$.artifact_projection.line_count') >= 1
+           AND json_type(NEW.data_json, '$.artifact_projection.preview_head') = 'text'
+           AND json_type(NEW.data_json, '$.artifact_projection.preview_tail') = 'text'
+           AND json_type(NEW.data_json, '$.artifact_projection.provenance') = 'object'
+           AND (SELECT count(*) FROM json_each(json_extract(NEW.data_json, '$.artifact_projection.provenance'))) = 3
+           AND json_type(NEW.data_json, '$.artifact_projection.provenance.tool') = 'text'
+           AND length(CAST(json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') AS BLOB)) BETWEEN 1 AND 256
+           AND json_extract(NEW.data_json, '$.artifact_projection.provenance.tool') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
+           AND json_type(NEW.data_json, '$.artifact_projection.provenance.call_id') = 'text'
+           AND length(CAST(json_extract(NEW.data_json, '$.artifact_projection.provenance.call_id') AS BLOB)) BETWEEN 1 AND 256
+           AND json_extract(NEW.data_json, '$.artifact_projection.provenance.call_id') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
+           AND json_extract(NEW.data_json, '$.artifact_projection.provenance.call_id') = NEW.call_id
+           AND (json_type(NEW.data_json, '$.artifact_projection.provenance.agent_id') = 'null'
+                OR (json_type(NEW.data_json, '$.artifact_projection.provenance.agent_id') = 'text'
+                    AND length(CAST(json_extract(NEW.data_json, '$.artifact_projection.provenance.agent_id') AS BLOB)) <= 256
+                    AND json_extract(NEW.data_json, '$.artifact_projection.provenance.agent_id') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'))
+           AND ((json_type(NEW.data_json, '$.artifact_projection.provenance.agent_id') = 'null' AND NEW.agent IS NULL)
+                OR json_extract(NEW.data_json, '$.artifact_projection.provenance.agent_id') = NEW.agent)
+    ) THEN RAISE(ABORT, 'tool artifact durable projection declaration is invalid') END;
+
+    SELECT CASE WHEN NEW.type = 'context_pruned' AND NOT EXISTS (
+        SELECT 1
+         WHERE json_type(NEW.data_json, '$.artifact_projections') = 'array'
+           AND json_type(NEW.data_json, '$.artifact_projection') IS NULL
+           AND json_array_length(NEW.data_json, '$.artifact_projections') > 0
+           AND NOT EXISTS (
+               SELECT 1 FROM json_each(NEW.data_json, '$.artifact_projections') p
+                WHERE json_type(p.value) IS NOT 'object'
+                   OR (SELECT count(*) FROM json_each(p.value)) IS NOT 15
+                   OR json_extract(p.value, '$.version') IS NOT 1
+                   OR json_type(p.value, '$.status') IS NOT 'text'
+                   OR (json_extract(p.value, '$.status') IS NOT 'available'
+                       AND json_extract(p.value, '$.status') IS NOT 'unavailable')
+                   OR (json_extract(p.value, '$.status') = 'available'
+                       AND json_type(p.value, '$.reason') IS NOT 'null')
+                   OR (json_extract(p.value, '$.status') = 'unavailable'
+                       AND (json_type(p.value, '$.reason') IS NOT 'text'
+                            OR (json_extract(p.value, '$.reason') IS NOT 'artifact_limit'
+                                AND json_extract(p.value, '$.reason') IS NOT 'session_quota')))
+                   OR json_extract(p.value, '$.kind') IS NOT 'tool_result'
+                   OR json_extract(p.value, '$.capture_reason') IS NOT 'prune_boundary'
+                   OR json_type(p.value, '$.projection_slot') IS NOT 'integer'
+                   OR json_extract(p.value, '$.projection_slot') IS NOT CAST(p.key AS INTEGER)
+                   OR json_type(p.value, '$.host_captured_bytes') IS NOT 'integer'
+                   OR json_extract(p.value, '$.host_captured_bytes') < 0
+                   OR json_type(p.value, '$.host_original_bytes') IS NOT 'integer'
+                   OR json_extract(p.value, '$.host_original_bytes') < json_extract(p.value, '$.host_captured_bytes')
+                   OR json_type(p.value, '$.host_dropped_bytes') IS NOT 'integer'
+                   OR json_extract(p.value, '$.host_dropped_bytes') IS NOT json_extract(p.value, '$.host_original_bytes') - json_extract(p.value, '$.host_captured_bytes')
+                   OR json_type(p.value, '$.stored_source_bytes') IS NOT 'integer'
+                   OR json_extract(p.value, '$.stored_source_bytes') NOT BETWEEN 1 AND json_extract(p.value, '$.host_captured_bytes')
+	                   OR json_type(p.value, '$.content_bytes') IS NOT 'integer'
+	                   OR json_extract(p.value, '$.content_bytes') IS NOT json_extract(p.value, '$.stored_source_bytes')
+	                   OR (json_extract(p.value, '$.status') = 'unavailable'
+	                       AND ((json_extract(p.value, '$.reason') = 'artifact_limit'
+	                             AND json_extract(p.value, '$.content_bytes') <= 8388608)
+	                            OR (json_extract(p.value, '$.reason') = 'session_quota'
+	                                AND json_extract(p.value, '$.content_bytes') > 8388608)))
+	                   OR json_type(p.value, '$.line_count') IS NOT 'integer'
+                   OR json_extract(p.value, '$.line_count') < 1
+                   OR json_type(p.value, '$.preview_head') IS NOT 'text'
+                   OR json_type(p.value, '$.preview_tail') IS NOT 'text'
+                   OR json_type(p.value, '$.provenance') IS NOT 'object'
+                   OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                   OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
+                   OR length(CAST(json_extract(p.value, '$.provenance.tool') AS BLOB)) NOT BETWEEN 1 AND 256
+                   OR json_extract(p.value, '$.provenance.tool') GLOB '*[' || char(1) || '-' || char(31) || ']*'
+                   OR json_type(p.value, '$.provenance.call_id') IS NOT 'text'
+                   OR length(CAST(json_extract(p.value, '$.provenance.call_id') AS BLOB)) NOT BETWEEN 1 AND 256
+                   OR json_extract(p.value, '$.provenance.call_id') GLOB '*[' || char(1) || '-' || char(31) || ']*'
+                   OR (json_type(p.value, '$.provenance.agent_id') IS NOT 'text'
+                       AND json_type(p.value, '$.provenance.agent_id') IS NOT 'null')
+                   OR (json_type(p.value, '$.provenance.agent_id') = 'text'
+                       AND (length(CAST(json_extract(p.value, '$.provenance.agent_id') AS BLOB)) > 256
+                            OR json_extract(p.value, '$.provenance.agent_id') GLOB '*[' || char(1) || '-' || char(31) || ']*'))
+                   OR ((json_type(p.value, '$.provenance.agent_id') = 'null' AND NEW.agent IS NOT NULL)
+                       OR (json_type(p.value, '$.provenance.agent_id') = 'text'
+                           AND json_extract(p.value, '$.provenance.agent_id') IS NOT NEW.agent))
+           )
+    ) THEN RAISE(ABORT, 'context-pruned text artifact projection declaration is invalid') END;
+
+    INSERT INTO session_text_artifact_projection_pending_slots(session_id,event_seq,projection_slot)
+    SELECT NEW.session_id, NEW.seq, 0
+     WHERE NEW.type = 'tool_call'
+       AND json_extract(NEW.data_json, '$.artifact_projection.status') = 'available';
+
+    INSERT INTO session_text_artifact_projection_pending_slots(session_id,event_seq,projection_slot)
+    SELECT NEW.session_id, NEW.seq, CAST(p.key AS INTEGER)
+      FROM json_each(NEW.data_json, '$.artifact_projections') p
+     WHERE NEW.type = 'context_pruned'
+       AND json_extract(p.value, '$.status') = 'available';
+END;
+
+CREATE TRIGGER text_artifact_projection_pending_reject_update
+BEFORE UPDATE ON session_text_artifact_projection_pending_slots
+BEGIN SELECT RAISE(ABORT, 'text artifact projection pending state is immutable'); END;
+-- A pending declaration can clear only after the matching immutable owner
+-- edge exists. Parent cascades remain legal because their event/session is
+-- already absent when the child row is reached.
+CREATE TRIGGER text_artifact_projection_pending_reject_unresolved_delete
+BEFORE DELETE ON session_text_artifact_projection_pending_slots
+WHEN EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = OLD.session_id)
+ AND EXISTS (
+     SELECT 1 FROM session_events e
+      WHERE e.session_id = OLD.session_id AND e.seq = OLD.event_seq
+ )
+ AND NOT EXISTS (
+     SELECT 1 FROM session_text_artifact_event_refs r
+      WHERE r.session_id = OLD.session_id AND r.event_seq = OLD.event_seq
+        AND r.relation = 'model_context_tool_result'
+        AND r.projection_slot = OLD.projection_slot
+ )
+BEGIN SELECT RAISE(ABORT, 'available text artifact projection lacks its owner ref'); END;
+
+CREATE TRIGGER text_artifact_ref_clear_projection_pending
+AFTER INSERT ON session_text_artifact_event_refs
+WHEN NEW.relation = 'model_context_tool_result'
+BEGIN
+    DELETE FROM session_text_artifact_projection_pending_slots
+     WHERE session_id = NEW.session_id AND event_seq = NEW.event_seq
+       AND projection_slot = NEW.projection_slot;
+END;
+
+CREATE TRIGGER text_artifact_ref_validate_insert
+BEFORE INSERT ON session_text_artifact_event_refs
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+    ) THEN RAISE(ABORT, 'text artifact reference must own a same-session artifact') END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND a.owner_event_seq = NEW.event_seq AND a.owner_relation = NEW.relation
+           AND a.owner_slot = NEW.owner_slot
+    ) THEN RAISE(ABORT, 'text artifact reference must match its immutable owner') END;
+    SELECT CASE WHEN NEW.relation = 'source_user_input' AND NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a JOIN session_events e
+          ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND a.kind = 'user_input_source' AND a.capture_reason = 'oversized_user_input'
+           AND a.content_bytes > 65536
+           AND e.type = 'user_message'
+           AND json_type(a.provenance_json, '$.event_seq') = 'integer'
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 1
+           AND json_extract(a.provenance_json, '$.event_seq') = NEW.event_seq
+           AND json_type(e.data_json, '$.text') = 'text'
+           AND json_extract(e.data_json, '$.text') = a.content
+    ) THEN RAISE(ABORT, 'source user artifact binding is invalid') END;
+    SELECT CASE WHEN NEW.relation = 'model_user_input_projection' AND NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a JOIN session_events e
+          ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND a.kind = 'user_input_projection' AND a.capture_reason = 'oversized_user_input'
+           AND NEW.projection_slot = 0 AND e.type = 'user_message'
+           AND json_type(a.provenance_json, '$.source_artifact_id') = 'text'
+           AND json_type(a.provenance_json, '$.preprocessing_version') = 'integer'
+           AND json_extract(a.provenance_json, '$.preprocessing_version') = 1
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 2
+           AND EXISTS (
+               SELECT 1 FROM session_text_artifact_event_refs source_ref
+               JOIN session_text_artifacts source ON source.session_id = source_ref.session_id AND source.artifact_id = source_ref.artifact_id
+                WHERE source_ref.session_id = NEW.session_id AND source_ref.event_seq = NEW.event_seq
+                  AND source_ref.relation = 'source_user_input' AND source_ref.projection_slot IS NULL
+                  AND source.artifact_id = json_extract(a.provenance_json, '$.source_artifact_id')
+                  AND source.content <> a.content
+           )
+    ) THEN RAISE(ABORT, 'derived user artifact binding is invalid') END;
+    SELECT CASE WHEN NEW.relation = 'model_context_tool_result' AND NOT EXISTS (
+        SELECT 1 FROM session_text_artifacts a JOIN session_events e
+          ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND a.kind = 'tool_result' AND e.type IN ('tool_call', 'context_pruned')
+           AND (
+               (e.type = 'tool_call' AND a.capture_reason = 'display_truncation' AND NEW.projection_slot = 0)
+               OR (e.type = 'context_pruned' AND a.capture_reason = 'prune_boundary')
+           )
+           AND json_type(a.provenance_json, '$.tool') = 'text'
+           AND length(CAST(json_extract(a.provenance_json, '$.tool') AS BLOB)) BETWEEN 1 AND 256
+           AND json_extract(a.provenance_json, '$.tool') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
+           AND json_type(a.provenance_json, '$.call_id') = 'text'
+           AND length(CAST(json_extract(a.provenance_json, '$.call_id') AS BLOB)) BETWEEN 1 AND 256
+           AND json_extract(a.provenance_json, '$.call_id') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
+           AND (
+               json_type(a.provenance_json, '$.agent_id') = 'null'
+               OR (
+                   json_type(a.provenance_json, '$.agent_id') = 'text'
+                   AND length(CAST(json_extract(a.provenance_json, '$.agent_id') AS BLOB)) BETWEEN 1 AND 256
+                   AND json_extract(a.provenance_json, '$.agent_id') NOT GLOB '*[' || char(1) || '-' || char(31) || ']*'
+               )
+           )
+           AND (
+               (json_type(a.provenance_json, '$.agent_id') = 'null' AND e.agent IS NULL)
+               OR json_extract(a.provenance_json, '$.agent_id') = e.agent
+           )
+           AND (
+               e.type = 'context_pruned'
+               OR json_extract(a.provenance_json, '$.call_id') = e.call_id
+           )
+           AND (SELECT count(*) FROM json_each(a.provenance_json)) = 3
+    ) THEN RAISE(ABORT, 'tool artifact binding is invalid') END;
+    -- The event-owned projection state is the authority for model context.
+    -- Do not allow direct SQL to attach a real body to a made-up tool slot,
+    -- a stale single projection, or a sparse/misaligned prune array.
+    SELECT CASE WHEN NEW.relation = 'model_context_tool_result' AND NOT EXISTS (
+        SELECT 1
+          FROM session_text_artifacts a
+          JOIN session_events e ON e.session_id = NEW.session_id AND e.seq = NEW.event_seq
+         WHERE a.session_id = NEW.session_id AND a.artifact_id = NEW.artifact_id
+           AND (
+                (
+                    e.type = 'tool_call' AND NEW.projection_slot = 0
+                    AND json_type(e.data_json, '$.artifact_projection') = 'object'
+                    AND json_type(e.data_json, '$.artifact_projections') IS NULL
+                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projection'))) = 15
+                    AND json_extract(e.data_json, '$.artifact_projection.version') = 1
+                    AND json_extract(e.data_json, '$.artifact_projection.status') = 'available'
+                    AND json_type(e.data_json, '$.artifact_projection.reason') = 'null'
+                    AND json_extract(e.data_json, '$.artifact_projection.kind') = 'tool_result'
+                    AND json_extract(e.data_json, '$.artifact_projection.capture_reason') = a.capture_reason
+                    AND json_extract(e.data_json, '$.artifact_projection.projection_slot') = 0
+                    AND json_type(e.data_json, '$.artifact_projection.host_captured_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.host_captured_bytes') = a.host_captured_bytes
+                    AND json_type(e.data_json, '$.artifact_projection.host_original_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.host_original_bytes') = a.host_original_bytes
+                    AND json_type(e.data_json, '$.artifact_projection.host_dropped_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.host_dropped_bytes') = a.host_dropped_bytes
+                    AND json_type(e.data_json, '$.artifact_projection.stored_source_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.stored_source_bytes') = a.stored_source_bytes
+                    AND json_type(e.data_json, '$.artifact_projection.content_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.content_bytes') = a.content_bytes
+                    AND json_type(e.data_json, '$.artifact_projection.line_count') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projection.line_count') =
+                        length(a.content) - length(replace(a.content, char(10), ''))
+                        + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    AND json_type(e.data_json, '$.artifact_projection.preview_head') = 'text'
+                    AND json_type(e.data_json, '$.artifact_projection.preview_tail') = 'text'
+                    AND json_type(e.data_json, '$.artifact_projection.provenance') = 'object'
+                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projection.provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projection.provenance.tool') = json_extract(a.provenance_json, '$.tool')
+                    AND json_extract(e.data_json, '$.artifact_projection.provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
+                    AND json_type(e.data_json, '$.artifact_projection.provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')
+                    AND (json_type(a.provenance_json, '$.agent_id') = 'null' OR json_extract(e.data_json, '$.artifact_projection.provenance.agent_id') = json_extract(a.provenance_json, '$.agent_id'))
+                )
+                OR (
+                    e.type = 'context_pruned'
+                    AND json_type(e.data_json, '$.artifact_projections') = 'array'
+                    AND json_type(e.data_json, '$.artifact_projection') IS NULL
+                    AND json_array_length(e.data_json, '$.artifact_projections') > NEW.projection_slot
+                    AND NOT EXISTS (
+                        SELECT 1 FROM json_each(e.data_json, '$.artifact_projections') p
+                         WHERE json_type(p.value) IS NOT 'object'
+                            OR (SELECT count(*) FROM json_each(p.value)) IS NOT 15
+                            OR json_extract(p.value, '$.version') IS NOT 1
+                            OR json_type(p.value, '$.projection_slot') IS NOT 'integer'
+                            OR json_extract(p.value, '$.projection_slot') IS NOT CAST(p.key AS INTEGER)
+                            OR json_type(p.value, '$.status') IS NOT 'text'
+                            OR (json_extract(p.value, '$.status') IS NOT 'available'
+                                AND json_extract(p.value, '$.status') IS NOT 'unavailable')
+                            OR (json_extract(p.value, '$.status') = 'available'
+                                AND json_type(p.value, '$.reason') IS NOT 'null')
+                            OR (json_extract(p.value, '$.status') = 'unavailable'
+                                AND (json_type(p.value, '$.reason') IS NOT 'text'
+                                     OR (json_extract(p.value, '$.reason') IS NOT 'artifact_limit'
+                                         AND json_extract(p.value, '$.reason') IS NOT 'session_quota')))
+                            OR json_extract(p.value, '$.kind') IS NOT 'tool_result'
+                            OR json_extract(p.value, '$.capture_reason') IS NOT 'prune_boundary'
+                            OR json_type(p.value, '$.host_captured_bytes') IS NOT 'integer'
+                            OR json_extract(p.value, '$.host_captured_bytes') < 0
+                            OR json_type(p.value, '$.host_original_bytes') IS NOT 'integer'
+                            OR json_extract(p.value, '$.host_original_bytes') < json_extract(p.value, '$.host_captured_bytes')
+                            OR json_type(p.value, '$.host_dropped_bytes') IS NOT 'integer'
+                            OR json_extract(p.value, '$.host_dropped_bytes') IS NOT json_extract(p.value, '$.host_original_bytes') - json_extract(p.value, '$.host_captured_bytes')
+                            OR json_type(p.value, '$.stored_source_bytes') IS NOT 'integer'
+                            OR json_extract(p.value, '$.stored_source_bytes') < 0
+                            OR json_extract(p.value, '$.stored_source_bytes') > json_extract(p.value, '$.host_captured_bytes')
+                            OR json_type(p.value, '$.content_bytes') IS NOT 'integer'
+                            OR json_extract(p.value, '$.content_bytes') IS NOT json_extract(p.value, '$.stored_source_bytes')
+                            OR json_type(p.value, '$.line_count') IS NOT 'integer'
+                            OR json_extract(p.value, '$.line_count') < 1
+                            OR json_type(p.value, '$.preview_head') IS NOT 'text'
+                            OR json_type(p.value, '$.preview_tail') IS NOT 'text'
+                            OR json_type(p.value, '$.provenance') IS NOT 'object'
+                            OR (SELECT count(*) FROM json_each(json_extract(p.value, '$.provenance'))) IS NOT 3
+                            OR json_type(p.value, '$.provenance.tool') IS NOT 'text'
+                            OR json_type(p.value, '$.provenance.call_id') IS NOT 'text'
+                            OR (json_type(p.value, '$.provenance.agent_id') IS NOT 'text'
+                                AND json_type(p.value, '$.provenance.agent_id') IS NOT 'null')
+                    )
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].version') = 1
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].status') = 'available'
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].reason') = 'null'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].kind') = 'tool_result'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].capture_reason') = a.capture_reason
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].projection_slot') = NEW.projection_slot
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_captured_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_captured_bytes') = a.host_captured_bytes
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_original_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_original_bytes') = a.host_original_bytes
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_dropped_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].host_dropped_bytes') = a.host_dropped_bytes
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].stored_source_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].stored_source_bytes') = a.stored_source_bytes
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].content_bytes') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].content_bytes') = a.content_bytes
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].line_count') = 'integer'
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].line_count') =
+                        length(a.content) - length(replace(a.content, char(10), ''))
+                        + CASE WHEN substr(a.content, -1) = char(10) THEN 0 ELSE 1 END
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_head') = 'text'
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].preview_tail') = 'text'
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance') = 'object'
+                    AND (SELECT count(*) FROM json_each(json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance'))) = 3
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.tool') = json_extract(a.provenance_json, '$.tool')
+                    AND json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.call_id') = json_extract(a.provenance_json, '$.call_id')
+                    AND json_type(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.agent_id') = json_type(a.provenance_json, '$.agent_id')
+                    AND (json_type(a.provenance_json, '$.agent_id') = 'null' OR json_extract(e.data_json, '$.artifact_projections[' || NEW.projection_slot || '].provenance.agent_id') = json_extract(a.provenance_json, '$.agent_id'))
+                )
+           )
+    ) THEN RAISE(ABORT, 'tool artifact durable projection state is invalid') END;
+END;
+CREATE TRIGGER text_artifact_ref_reject_update
+BEFORE UPDATE ON session_text_artifact_event_refs
+BEGIN SELECT RAISE(ABORT, 'session text artifact references are immutable'); END;
+-- Deleting an edge directly would make an otherwise-available canonical event
+-- unreconstructable. Event/session cascades remain legal: SQLite has already
+-- removed the owning event/session before their child edge is visited.
+CREATE TRIGGER text_artifact_ref_reject_independent_delete
+BEFORE DELETE ON session_text_artifact_event_refs
+WHEN EXISTS (
+    SELECT 1 FROM sessions s WHERE s.session_id = OLD.session_id
+)
+ AND EXISTS (
+    SELECT 1 FROM session_events e
+     WHERE e.session_id = OLD.session_id AND e.seq = OLD.event_seq
+)
+BEGIN SELECT RAISE(ABORT, 'session text artifact references may only be deleted by their owner cascade'); END;
+CREATE TRIGGER text_artifact_reject_update
+BEFORE UPDATE ON session_text_artifacts
+BEGIN SELECT RAISE(ABORT, 'session text artifacts are immutable'); END;
+-- An artifact can disappear only via its owner/event/session cascade.  This
+-- closes the direct-SQL delete escape hatch without interfering with FK
+-- cascades: by the time a parent ref/event/session cascade reaches this row,
+-- the owning ref or session is no longer visible.
+CREATE TRIGGER text_artifact_reject_independent_delete
+BEFORE DELETE ON session_text_artifacts
+WHEN EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = OLD.session_id)
+ AND EXISTS (
+     SELECT 1 FROM session_text_artifact_event_refs r
+      WHERE r.session_id = OLD.session_id AND r.artifact_id = OLD.artifact_id
+ )
+BEGIN SELECT RAISE(ABORT, 'session text artifacts may only be deleted by their owner cascade'); END;
+-- Once a typed projection has an owner edge, its event JSON is immutable as
+-- well. Without this guard direct SQL could rewrite an available slot after
+-- the ref trigger proved its state, breaking restart/rehydration determinism.
+CREATE TRIGGER text_artifact_projection_event_reject_update
+BEFORE UPDATE OF data_json ON session_events
+WHEN OLD.type IN ('tool_call', 'context_pruned')
+ AND (
+    json_type(OLD.data_json, '$.artifact_projection') IS NOT NULL
+    OR json_type(OLD.data_json, '$.artifact_projections') IS NOT NULL
+    OR json_type(NEW.data_json, '$.artifact_projection') IS NOT NULL
+    OR json_type(NEW.data_json, '$.artifact_projections') IS NOT NULL
+ )
+BEGIN SELECT RAISE(ABORT, 'session text artifact projection state is immutable'); END;
+CREATE TABLE session_text_artifact_quota_reservations (
+    session_id TEXT NOT NULL CHECK(typeof(session_id) = 'text' AND length(session_id) > 0),
+    client_submission_id BLOB NOT NULL CHECK(typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    operation_id BLOB NOT NULL CHECK(typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    queue_item_id BLOB NOT NULL CHECK(typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    source_digest BLOB NOT NULL CHECK(typeof(source_digest) = 'blob' AND length(source_digest) = 32),
+    source_bytes INTEGER NOT NULL CHECK(typeof(source_bytes) = 'integer' AND source_bytes BETWEEN 65537 AND 8388608),
+    reserved_bytes INTEGER NOT NULL CHECK(typeof(reserved_bytes) = 'integer' AND reserved_bytes = source_bytes + 8388608),
+    -- Set only by the atomic oversized-run phase-one composition. It makes
+    -- terminalization ownership explicit instead of inferring it from a UUID
+    -- that can also name an unrelated global invocation.
+    run_invocation_bound INTEGER NOT NULL DEFAULT 0 CHECK(typeof(run_invocation_bound) = 'integer' AND run_invocation_bound IN (0, 1)),
+    -- Explicit model fences are outside frozen FCM2 v2 bytes. Generation is a
+    -- canonical decimal u64 and the model is a bounded JSON object; the pair
+    -- is all-or-nothing so restart cannot degrade an explicit request.
+    model_fence_generation TEXT CHECK(model_fence_generation IS NULL OR (typeof(model_fence_generation) = 'text' AND model_fence_generation NOT GLOB '*[^0-9]*' AND length(model_fence_generation) BETWEEN 1 AND 20 AND (model_fence_generation = '0' OR substr(model_fence_generation, 1, 1) <> '0') AND (length(model_fence_generation) < 20 OR model_fence_generation <= '18446744073709551615'))),
+    model_fence_json TEXT CHECK(model_fence_json IS NULL OR (typeof(model_fence_json) = 'text' AND length(CAST(model_fence_json AS BLOB)) <= 8192 AND json_valid(model_fence_json) AND json_type(model_fence_json) = 'object' AND json(model_fence_json) = model_fence_json)),
+    lease_token TEXT NOT NULL CHECK(typeof(lease_token) = 'text' AND length(lease_token) = 36
+        AND substr(lease_token, 9, 1) = '-' AND substr(lease_token, 14, 1) = '-'
+        AND substr(lease_token, 19, 1) = '-' AND substr(lease_token, 24, 1) = '-'),
+    expires_at INTEGER NOT NULL CHECK(typeof(expires_at) = 'integer' AND expires_at BETWEEN -9223372036854775808 AND 9223372036854775807),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at BETWEEN -9223372036854775808 AND 9223372036854775807),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at BETWEEN -9223372036854775808 AND 9223372036854775807),
+    PRIMARY KEY(session_id, client_submission_id),
+    CHECK((model_fence_generation IS NULL) = (model_fence_json IS NULL)),
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, operation_id) REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, queue_item_id) REFERENCES message_queue_items(session_id, queue_item_id) ON DELETE CASCADE
+);
+-- The Rust admission planner is an optimization only. These transaction-safe
+-- SQL guards make committed bodies plus live worst-case reservations a hard
+-- 64 MiB session invariant even for direct SQL and concurrent writers.
+CREATE TRIGGER text_artifact_quota_validate_insert
+BEFORE INSERT ON session_text_artifacts
+BEGIN
+    SELECT CASE WHEN
+        (SELECT COALESCE(SUM(content_bytes), 0) FROM session_text_artifacts WHERE session_id = NEW.session_id)
+        + (SELECT COALESCE(SUM(reserved_bytes), 0) FROM session_text_artifact_quota_reservations WHERE session_id = NEW.session_id)
+        + NEW.content_bytes > 67108864
+    THEN RAISE(ABORT, 'session text artifact quota exceeded') END;
+END;
+CREATE TRIGGER text_artifact_reservation_quota_validate_insert
+BEFORE INSERT ON session_text_artifact_quota_reservations
+BEGIN
+    SELECT CASE WHEN
+        (SELECT COALESCE(SUM(content_bytes), 0) FROM session_text_artifacts WHERE session_id = NEW.session_id)
+        + (SELECT COALESCE(SUM(reserved_bytes), 0) FROM session_text_artifact_quota_reservations WHERE session_id = NEW.session_id)
+        + NEW.reserved_bytes > 67108864
+    THEN RAISE(ABORT, 'session text artifact quota exceeded') END;
+END;
+CREATE TRIGGER text_artifact_reservation_validate_insert
+BEFORE INSERT ON session_text_artifact_quota_reservations
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM message_operation_receipts o
+        JOIN message_submission_receipts s ON s.session_id=o.session_id AND s.operation_id=o.operation_id
+        JOIN message_queue_items q ON q.session_id=s.session_id AND q.queue_item_id=s.queue_item_id
+         WHERE o.session_id=NEW.session_id AND o.operation_id=NEW.operation_id
+           AND o.client_submission_id=NEW.client_submission_id AND o.state='accepted'
+           AND s.client_submission_id=NEW.client_submission_id AND s.state='accepted'
+           AND q.queue_item_id=NEW.queue_item_id AND q.client_submission_id=NEW.client_submission_id AND q.state='accepted'
+    ) THEN RAISE(ABORT, 'text artifact reservation receipt identity is not accepted') END;
+END;
+-- The receipt is the single authoritative identity record for an explicit
+-- fence.  The reservation retains a byte-for-byte copy solely for restart
+-- materialization, so reject direct-SQL disagreement instead of allowing two
+-- replay authorities to diverge.
+CREATE TRIGGER text_artifact_reservation_fence_matches_receipt
+BEFORE INSERT ON session_text_artifact_quota_reservations
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM message_operation_receipts o
+         WHERE o.session_id=NEW.session_id AND o.operation_id=NEW.operation_id
+           AND o.client_submission_id=NEW.client_submission_id
+           AND o.artifact_model_fence_generation IS NEW.model_fence_generation
+           AND o.artifact_model_fence_json IS NEW.model_fence_json
+    ) THEN RAISE(ABORT, 'text artifact reservation fence differs from receipt') END;
+END;
+-- The receipt is written before the companion reservation in phase one.  Its
+-- fence may therefore make one NULL-pair -> canonical-pair transition while
+-- the accepted receipt has no reservation; after that it is immutable.  This
+-- prevents direct SQL from creating a replay authority that disagrees with a
+-- live lease or from rewriting a materialized receipt later.
+CREATE TRIGGER text_artifact_receipt_fence_reject_mutation
+BEFORE UPDATE OF artifact_model_fence_generation, artifact_model_fence_json
+ON message_operation_receipts
+WHEN NOT (
+    (OLD.artifact_model_fence_generation IS NEW.artifact_model_fence_generation
+     AND OLD.artifact_model_fence_json IS NEW.artifact_model_fence_json)
+    OR (
+        OLD.artifact_model_fence_generation IS NULL
+        AND OLD.artifact_model_fence_json IS NULL
+        AND NEW.state = 'accepted'
+        AND NOT EXISTS (
+            SELECT 1 FROM session_text_artifact_quota_reservations r
+             WHERE r.session_id=OLD.session_id
+               AND r.client_submission_id=OLD.client_submission_id
+        )
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'text artifact receipt fence is immutable'); END;
+CREATE TRIGGER text_artifact_reservation_reject_update_identity
+BEFORE UPDATE OF session_id, client_submission_id, operation_id, queue_item_id, source_digest, source_bytes, reserved_bytes, run_invocation_bound, model_fence_generation, model_fence_json, created_at ON session_text_artifact_quota_reservations
+BEGIN SELECT RAISE(ABORT, 'text artifact reservation identity is immutable'); END;
+CREATE INDEX idx_text_artifact_reservations_expiry
+    ON session_text_artifact_quota_reservations(expires_at, session_id, client_submission_id);
 
 -- ---- workspace_trust ----------------------------------------------------------------------
 -- Per-root workspace trust decisions.
@@ -2060,6 +3115,7 @@ CREATE TABLE task_delegation_jobs (
 CREATE TABLE task_delegation_children (
     task_call_id TEXT NOT NULL,
     label TEXT NOT NULL,
+    child_uuid TEXT NOT NULL UNIQUE,
     child_agent TEXT NOT NULL,
     model TEXT,
     status TEXT NOT NULL CHECK (status IN (
@@ -2462,6 +3518,36 @@ CREATE TABLE run_invocations (
     accounted_bytes         INTEGER NOT NULL
 );
 
+-- An oversized run's lease is not authorized by a boolean or by deriving a
+-- UUID from an FCM2 receipt.  This companion edge is the durable, exact
+-- phase-one relation to the globally keyed invocation, including the
+-- principal which owns that invocation.
+CREATE TABLE session_text_artifact_run_invocation_bindings (
+    session_id TEXT NOT NULL,
+    client_submission_id BLOB NOT NULL CHECK(typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    run_invocation_id TEXT NOT NULL,
+    origin_principal_digest TEXT NOT NULL,
+    PRIMARY KEY(session_id, client_submission_id),
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES session_text_artifact_quota_reservations(session_id, client_submission_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_invocation_id) REFERENCES run_invocations(client_submission_id) ON DELETE RESTRICT
+);
+CREATE TRIGGER text_artifact_run_binding_validate_insert
+BEFORE INSERT ON session_text_artifact_run_invocation_bindings
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM session_text_artifact_quota_reservations r
+         JOIN run_invocations i ON i.client_submission_id=NEW.run_invocation_id
+         WHERE r.session_id=NEW.session_id
+           AND r.client_submission_id=NEW.client_submission_id
+           AND r.run_invocation_bound=1
+           AND i.session_id=NEW.session_id
+           AND i.origin_principal_digest=NEW.origin_principal_digest
+    ) THEN RAISE(ABORT, 'text artifact run binding is not the reservation invocation') END;
+END;
+CREATE TRIGGER text_artifact_run_binding_reject_update
+BEFORE UPDATE ON session_text_artifact_run_invocation_bindings
+BEGIN SELECT RAISE(ABORT, 'text artifact run binding is immutable'); END;
+
 CREATE INDEX idx_run_invocations_session
     ON run_invocations (session_id);
 CREATE INDEX idx_run_invocations_principal
@@ -2549,6 +3635,9 @@ CREATE TABLE write_scope_leases (
     session_id              TEXT NOT NULL,
     -- Owning task / async job, when the lease is bound to delegated work.
     task_id                 TEXT,
+    -- Recursive-agent ownership is an edge from the lease to its agent, not
+    -- an agent-held lease capability. Legacy task leases leave this NULL.
+    agent_instance_id       TEXT,
     -- Canonical absolute directory subtree this lease grants write authority over.
     scope_path              TEXT NOT NULL,
     -- Bumped by every authority-changing transition; invalidates older tokens.
@@ -2564,6 +3653,8 @@ CREATE TABLE write_scope_leases (
     updated_at_wall_ms      INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
     FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
 );
 
@@ -2823,6 +3914,319 @@ CREATE INDEX idx_write_scope_permits_session_state
 CREATE INDEX idx_write_scope_permits_held
     ON write_scope_permits (session_id)
     WHERE state = 'held';
+
+-- ---- workspace leases and commitless task artifacts -----------------------
+-- These rows are daemon-owned recovery metadata, never filesystem handles or
+-- file content. Canonical roots identify the host worktree; every mutable
+-- observation is represented by a SHA-256 receipt.
+CREATE TABLE workspace_leases (
+    workspace_lease_id        TEXT PRIMARY KEY,
+    session_id                TEXT NOT NULL,
+    agent_instance_id         TEXT NOT NULL,
+    write_scope_lease_id      TEXT NOT NULL,
+    canonical_repository_id   TEXT NOT NULL,
+    canonical_root            TEXT NOT NULL,
+    kind                      TEXT NOT NULL CHECK (kind IN ('worktree', 'repository')),
+    base_sha_digest           TEXT NOT NULL CHECK (length(base_sha_digest) = 64 AND base_sha_digest NOT GLOB '*[^0-9a-f]*'),
+    base_ref_digest           TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    managed_path              TEXT NOT NULL,
+    private_ref_digest        TEXT NOT NULL CHECK (length(private_ref_digest) = 64 AND private_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    state                     TEXT NOT NULL CHECK (state IN ('active', 'grace', 'cleaned', 'uncertain')),
+    expires_at_unix_ms        INTEGER NOT NULL,
+    revision                  INTEGER NOT NULL CHECK (revision >= 0),
+    terminal_reason           TEXT CHECK (terminal_reason IN ('expired', 'identity_mismatch', 'host_cleanup', 'restart_uncertain')),
+    uncertain_reason          TEXT CHECK (uncertain_reason IN ('expired', 'identity_mismatch', 'restart_uncertain')),
+    pinned_at_unix_ms         INTEGER,
+    pinned_by_agent_instance_id TEXT,
+    created_at_unix_ms        INTEGER NOT NULL,
+    updated_at_unix_ms        INTEGER NOT NULL,
+    UNIQUE (workspace_lease_id, session_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
+    FOREIGN KEY (pinned_by_agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+    CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
+    CHECK ((state = 'cleaned') = (terminal_reason IS NOT NULL)),
+    CHECK (
+        (state = 'active' AND terminal_reason IS NULL AND uncertain_reason IS NULL)
+        OR (state = 'grace' AND terminal_reason IS NULL AND uncertain_reason = 'expired')
+        OR (state = 'uncertain' AND terminal_reason IS NULL AND uncertain_reason IS NOT NULL)
+        OR (state = 'cleaned' AND terminal_reason IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_workspace_leases_session_owner_state
+    ON workspace_leases (session_id, agent_instance_id, state, expires_at_unix_ms);
+CREATE UNIQUE INDEX uq_workspace_leases_live_root
+    ON workspace_leases (session_id, canonical_repository_id, canonical_root)
+    WHERE state IN ('active', 'grace', 'uncertain');
+
+-- The lifecycle is storage-enforced so a maintenance caller cannot resurrect
+-- an ambiguous worktree or silently skip grace. Every mutation is a CAS
+-- revision advance; pinning and renewal are same-state mutations.
+CREATE TRIGGER workspace_leases_revision_monotonic
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.revision <> OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease revision must advance exactly once');
+END;
+
+CREATE TRIGGER workspace_leases_legal_transition
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+    'active>grace', 'active>uncertain', 'grace>cleaned',
+    'grace>uncertain', 'uncertain>cleaned'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease transition rejected');
+END;
+
+CREATE TRIGGER workspace_leases_cleaned_final
+BEFORE UPDATE ON workspace_leases
+WHEN OLD.state = 'cleaned'
+BEGIN
+    SELECT RAISE(ABORT, 'cleaned workspace lease is final');
+END;
+
+-- A lease's identity and provenance are an immutable recovery receipt. The
+-- only mutable lease data are lifecycle state/revision, expiry, pin retention,
+-- transition reasons, and its update timestamp.
+CREATE TRIGGER workspace_leases_provenance_immutable
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.workspace_lease_id <> OLD.workspace_lease_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.agent_instance_id <> OLD.agent_instance_id
+  OR NEW.write_scope_lease_id <> OLD.write_scope_lease_id
+  OR NEW.canonical_repository_id <> OLD.canonical_repository_id
+  OR NEW.canonical_root <> OLD.canonical_root
+  OR NEW.kind <> OLD.kind
+  OR NEW.base_sha_digest <> OLD.base_sha_digest
+  OR NEW.base_ref_digest <> OLD.base_ref_digest
+  OR NEW.managed_path <> OLD.managed_path
+  OR NEW.private_ref_digest <> OLD.private_ref_digest
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease provenance is immutable');
+END;
+
+CREATE TRIGGER workspace_leases_terminal_reason_immutable
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.terminal_reason IS NOT OLD.terminal_reason
+ AND NOT (OLD.terminal_reason IS NULL AND NEW.state = 'cleaned')
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease terminal reason is immutable');
+END;
+
+CREATE TRIGGER workspace_leases_uncertain_reason_transition_only
+BEFORE UPDATE ON workspace_leases
+WHEN NEW.uncertain_reason IS NOT OLD.uncertain_reason
+ AND NOT (NEW.state <> OLD.state AND NEW.state IN ('grace', 'uncertain'))
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease uncertainty reason may change only with transition');
+END;
+
+CREATE TRIGGER workspace_leases_scope_owner_matches
+BEFORE INSERT ON workspace_leases
+WHEN NOT EXISTS (
+    SELECT 1 FROM write_scope_leases w
+    WHERE w.lease_id = NEW.write_scope_lease_id
+      AND w.session_id = NEW.session_id
+      AND w.owner_id = NEW.agent_instance_id
+      AND w.state = 'active'
+      AND w.scope_path = NEW.canonical_root
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workspace lease requires active owned write scope');
+END;
+
+CREATE TABLE task_artifacts (
+    artifact_id                 TEXT PRIMARY KEY,
+    source_workspace_lease_id   TEXT NOT NULL,
+    session_id                  TEXT NOT NULL,
+    agent_instance_id           TEXT NOT NULL,
+    base_head_digest            TEXT NOT NULL CHECK (length(base_head_digest) = 64 AND base_head_digest NOT GLOB '*[^0-9a-f]*'),
+    base_ref_digest             TEXT NOT NULL CHECK (length(base_ref_digest) = 64 AND base_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    base_index_digest           TEXT NOT NULL CHECK (length(base_index_digest) = 64 AND base_index_digest NOT GLOB '*[^0-9a-f]*'),
+    touched_manifest_digest     TEXT NOT NULL CHECK (length(touched_manifest_digest) = 64 AND touched_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    untracked_manifest_digest   TEXT NOT NULL CHECK (length(untracked_manifest_digest) = 64 AND untracked_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    ordered_patch_digest        TEXT NOT NULL CHECK (length(ordered_patch_digest) = 64 AND ordered_patch_digest NOT GLOB '*[^0-9a-f]*'),
+    validation_receipt_digest   TEXT NOT NULL CHECK (length(validation_receipt_digest) = 64 AND validation_receipt_digest NOT GLOB '*[^0-9a-f]*'),
+    parent_result_json          TEXT NOT NULL,
+    state                       TEXT NOT NULL CHECK (state IN ('produced', 'integrating', 'integrated', 'stale', 'conflict', 'cancelled', 'failed')),
+    revision                    INTEGER NOT NULL CHECK (revision >= 0),
+    created_at_unix_ms          INTEGER NOT NULL,
+    updated_at_unix_ms          INTEGER NOT NULL,
+    UNIQUE (artifact_id, session_id),
+    -- Artifact provenance is session-owned even though its source lease and
+    -- agent references use restrictive composite FKs for normal lifecycle
+    -- operations. Session teardown must collect the whole recovery graph.
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_workspace_lease_id, session_id)
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT,
+    FOREIGN KEY (agent_instance_id, session_id)
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_task_artifacts_source_state
+    ON task_artifacts (source_workspace_lease_id, state);
+CREATE INDEX idx_task_artifacts_session_owner
+    ON task_artifacts (session_id, agent_instance_id, created_at_unix_ms);
+
+CREATE TRIGGER task_artifacts_source_owner_matches
+BEFORE INSERT ON task_artifacts
+WHEN NOT EXISTS (
+    SELECT 1 FROM workspace_leases w
+    WHERE w.workspace_lease_id = NEW.source_workspace_lease_id
+      AND w.session_id = NEW.session_id
+      AND w.agent_instance_id = NEW.agent_instance_id
+      AND w.state = 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact requires active owned workspace lease');
+END;
+
+CREATE TABLE task_artifact_integration_receipts (
+    artifact_id                 TEXT PRIMARY KEY,
+    session_id                  TEXT NOT NULL,
+    target_canonical_repository_id TEXT NOT NULL,
+    target_canonical_root       TEXT NOT NULL,
+    target_head_digest          TEXT NOT NULL CHECK (length(target_head_digest) = 64 AND target_head_digest NOT GLOB '*[^0-9a-f]*'),
+    target_ref_digest           TEXT NOT NULL CHECK (length(target_ref_digest) = 64 AND target_ref_digest NOT GLOB '*[^0-9a-f]*'),
+    target_index_digest         TEXT NOT NULL CHECK (length(target_index_digest) = 64 AND target_index_digest NOT GLOB '*[^0-9a-f]*'),
+    changed_path_manifest_digest TEXT NOT NULL CHECK (length(changed_path_manifest_digest) = 64 AND changed_path_manifest_digest NOT GLOB '*[^0-9a-f]*'),
+    target_write_scope_lease_id TEXT NOT NULL,
+    expected_target_generation  INTEGER NOT NULL CHECK (expected_target_generation >= 0),
+    expected_target_revision    INTEGER NOT NULL CHECK (expected_target_revision >= 0),
+    result_state                TEXT NOT NULL CHECK (result_state = 'integrated'),
+    created_at_unix_ms          INTEGER NOT NULL,
+    UNIQUE (artifact_id, session_id),
+    -- Keep the immutable receipt in the session-owned cascade graph as well
+    -- as under its artifact. This avoids a restrictive target-scope FK
+    -- disconnecting receipt cleanup from session lifecycle ownership.
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (artifact_id, session_id)
+        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_task_artifact_receipts_target
+    ON task_artifact_integration_receipts (target_write_scope_lease_id, session_id);
+
+CREATE INDEX idx_task_artifact_receipts_session
+    ON task_artifact_integration_receipts (session_id, artifact_id);
+
+CREATE TRIGGER task_artifacts_revision_monotonic
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.revision <> OLD.revision + 1
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact revision must advance exactly once');
+END;
+
+CREATE TRIGGER task_artifacts_legal_transition
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.state <> OLD.state
+ AND (OLD.state || '>' || NEW.state) NOT IN (
+    'produced>integrating', 'produced>cancelled',
+    'integrating>produced', 'integrating>integrated',
+    'integrating>stale', 'integrating>conflict',
+    'integrating>cancelled', 'integrating>failed'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact transition rejected');
+END;
+
+CREATE TRIGGER task_artifacts_terminal_final
+BEFORE UPDATE ON task_artifacts
+WHEN OLD.state IN ('integrated', 'stale', 'conflict', 'cancelled', 'failed')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal task artifact is final');
+END;
+
+CREATE TRIGGER task_artifacts_provenance_immutable
+BEFORE UPDATE ON task_artifacts
+WHEN NEW.artifact_id <> OLD.artifact_id
+  OR NEW.source_workspace_lease_id <> OLD.source_workspace_lease_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.agent_instance_id <> OLD.agent_instance_id
+  OR NEW.base_head_digest <> OLD.base_head_digest
+  OR NEW.base_ref_digest <> OLD.base_ref_digest
+  OR NEW.base_index_digest <> OLD.base_index_digest
+  OR NEW.touched_manifest_digest <> OLD.touched_manifest_digest
+  OR NEW.untracked_manifest_digest <> OLD.untracked_manifest_digest
+  OR NEW.ordered_patch_digest <> OLD.ordered_patch_digest
+  OR NEW.validation_receipt_digest <> OLD.validation_receipt_digest
+  OR NEW.parent_result_json <> OLD.parent_result_json
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact provenance is immutable');
+END;
+
+CREATE TRIGGER task_artifact_integrated_requires_receipt
+BEFORE UPDATE OF state ON task_artifacts
+WHEN NEW.state = 'integrated'
+ AND NOT EXISTS (
+    SELECT 1 FROM task_artifact_integration_receipts r
+    WHERE r.artifact_id = OLD.artifact_id AND r.session_id = OLD.session_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'integrated artifact requires immutable receipt');
+END;
+
+CREATE TRIGGER task_artifact_receipt_requires_integrating
+BEFORE INSERT ON task_artifact_integration_receipts
+WHEN NOT EXISTS (
+    SELECT 1 FROM task_artifacts a
+    WHERE a.artifact_id = NEW.artifact_id
+      AND a.session_id = NEW.session_id
+      AND a.state = 'integrating'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'integration receipt requires integrating artifact');
+END;
+
+CREATE TRIGGER task_artifact_receipt_target_owner_matches
+BEFORE INSERT ON task_artifact_integration_receipts
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM task_artifacts a
+    JOIN workspace_leases source
+      ON source.workspace_lease_id = a.source_workspace_lease_id
+     AND source.session_id = a.session_id
+    JOIN write_scope_leases w ON w.lease_id = NEW.target_write_scope_lease_id
+    WHERE a.artifact_id = NEW.artifact_id
+      AND a.session_id = NEW.session_id
+      AND w.session_id = a.session_id
+      AND w.owner_id = a.agent_instance_id
+      AND w.state = 'active'
+      AND w.scope_path = NEW.target_canonical_root
+      AND source.canonical_repository_id = NEW.target_canonical_repository_id
+      AND w.generation = NEW.expected_target_generation
+      AND w.version = NEW.expected_target_revision
+)
+BEGIN
+    SELECT RAISE(ABORT, 'integration receipt target scope is not owned or current');
+END;
+
+CREATE TRIGGER task_artifact_receipts_immutable
+BEFORE UPDATE ON task_artifact_integration_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact integration receipt is immutable');
+END;
+
+CREATE TRIGGER task_artifact_receipts_not_deletable
+BEFORE DELETE ON task_artifact_integration_receipts
+-- Direct deletion remains forbidden while the owning session exists. During
+-- session teardown, SQLite removes the parent row before applying FK actions,
+-- so the session-owned cascade can delete this otherwise immutable receipt.
+WHEN EXISTS (
+    SELECT 1 FROM sessions WHERE session_id = OLD.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task artifact integration receipt cannot be deleted');
+END;
 
 -- A released permit is final; resurrection would let a drained transfer barrier
 -- be re-entered after the authority already moved.
@@ -5241,3 +6645,187 @@ CREATE TABLE secret_credential_ownership (
 
 CREATE INDEX secret_credential_ownership_item
 ON secret_credential_ownership(item_id);
+
+-- ---- versioned agent installations ---------------------------------------
+--
+-- The daemon owns definition resolution and provider configuration.  This
+-- schema deliberately records only the resulting non-secret identities,
+-- digests, and canonical snapshots.  In particular, there is no credential,
+-- token, API-key, or provider-route payload column in this subsystem.
+
+CREATE TABLE agent_installations (
+    installation_id              TEXT PRIMARY KEY,
+    scope                        TEXT NOT NULL CHECK (scope IN ('global', 'workspace_private', 'workspace_shared')),
+    -- Empty only for global.  A non-null key avoids SQLite's NULL-unique
+    -- behaviour making two global same-name definitions accidentally distinct.
+    scope_workspace_key          TEXT NOT NULL DEFAULT '',
+    canonical_workspace_id       TEXT,
+    source_agent_id              TEXT NOT NULL,
+    source_identity              TEXT NOT NULL,
+    source_revision              TEXT,
+    source_digest                TEXT NOT NULL,
+    fetched_at_unix_ms           INTEGER NOT NULL,
+    installation_revision        INTEGER NOT NULL DEFAULT 1 CHECK (installation_revision >= 1),
+    deleted_at_unix_ms            INTEGER,
+    CHECK ((scope = 'global' AND scope_workspace_key = '' AND canonical_workspace_id IS NULL)
+        OR (scope <> 'global' AND scope_workspace_key <> '' AND canonical_workspace_id = scope_workspace_key)),
+    UNIQUE (scope, scope_workspace_key, source_agent_id)
+);
+
+CREATE TABLE installation_observations (
+    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    observed_digest              TEXT NOT NULL,
+    observation_revision         INTEGER NOT NULL CHECK (observation_revision >= 1),
+    review_state                  TEXT NOT NULL CHECK (review_state IN ('reviewed', 'rebind_required')),
+    observed_at_unix_ms           INTEGER NOT NULL
+);
+
+CREATE TABLE agent_model_bindings (
+    binding_id                    TEXT PRIMARY KEY,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    definition_digest             TEXT NOT NULL,
+    slot_id                       TEXT NOT NULL,
+    provider_profile_handle       TEXT NOT NULL,
+    model_id                      TEXT NOT NULL,
+    -- Canonical redacted non-secret provenance: recommendation ids/order,
+    -- upstream identities, aliases, capability result, etc.  This is an
+    -- opaque DB payload; it is resolved and validated by the caller.
+    provenance_payload            BLOB NOT NULL,
+    provenance_digest             TEXT NOT NULL,
+    -- Bind is admitted only after daemon-side hard capability validation.
+    -- Persist the result so a snapshot must prove its evidence against an
+    -- immutable accepted binding, rather than trusting a caller-provided bit.
+    hard_capability_verified      INTEGER NOT NULL CHECK (hard_capability_verified = 1),
+    binding_revision              INTEGER NOT NULL CHECK (binding_revision >= 1),
+    retired_at_unix_ms            INTEGER,
+    created_at_unix_ms            INTEGER NOT NULL,
+    UNIQUE (installation_id, definition_digest, slot_id, binding_revision)
+);
+CREATE UNIQUE INDEX agent_model_bindings_current_slot
+    ON agent_model_bindings(installation_id, definition_digest, slot_id)
+    WHERE retired_at_unix_ms IS NULL;
+
+-- The daemon installation service owns these operation rows.  They are
+-- deliberately separate from `agent_installations`: replay/recovery may
+-- observe or finish a file journal, but it must invoke the installation
+-- transaction above as the sole authority that changes binding/snapshot/
+-- revision state.
+CREATE TABLE installation_operations (
+    operation_id                 TEXT PRIMARY KEY,
+    idempotency_key              TEXT NOT NULL UNIQUE,
+    request_fingerprint          TEXT NOT NULL,
+    operation_kind               TEXT NOT NULL CHECK (operation_kind IN ('install', 'update', 'bind', 'create')),
+    canonical_workspace_id       TEXT,
+    state                        TEXT NOT NULL CHECK (state IN ('pending_choice', 'running', 'terminal')),
+    terminal_receipt_json        TEXT,
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL,
+    CHECK ((state = 'terminal') = (terminal_receipt_json IS NOT NULL))
+);
+
+CREATE TABLE installation_continuations (
+    continuation_token           TEXT PRIMARY KEY,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    choice_set_json              TEXT NOT NULL,
+    expires_at_unix_ms           INTEGER NOT NULL,
+    submitted_choice_id          TEXT,
+    state                        TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'expired', 'completed')),
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL
+);
+CREATE INDEX installation_continuations_expiry
+ON installation_continuations(state, expires_at_unix_ms);
+
+CREATE TABLE installation_journals (
+    journal_id                   TEXT PRIMARY KEY,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    checkpoint                   TEXT NOT NULL CHECK (checkpoint IN ('staged', 'db_committed', 'file_renamed', 'complete')),
+    staged_file_metadata_json    TEXT,
+    prior_file_metadata_json     TEXT,
+    expected_digest              TEXT NOT NULL,
+    created_at_unix_ms           INTEGER NOT NULL,
+    updated_at_unix_ms           INTEGER NOT NULL
+);
+
+-- Bind requests get their own receipt because a retry must be distinguished
+-- from a different mutation that happens to choose identical model metadata.
+CREATE TABLE agent_binding_receipts (
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    definition_digest             TEXT NOT NULL,
+    slot_id                       TEXT NOT NULL,
+    idempotency_key               TEXT NOT NULL,
+    request_fingerprint           TEXT NOT NULL,
+    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT,
+    created_at_unix_ms            INTEGER NOT NULL,
+    PRIMARY KEY (installation_id, definition_digest, slot_id, idempotency_key)
+);
+
+CREATE TABLE agent_profile_snapshots (
+    snapshot_id                   TEXT PRIMARY KEY,
+    session_id                    TEXT NOT NULL UNIQUE REFERENCES sessions(session_id) ON DELETE CASCADE,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    schema_version                INTEGER NOT NULL CHECK (schema_version >= 1),
+    canonical_payload             BLOB NOT NULL,
+    canonical_payload_digest      TEXT NOT NULL,
+    definition_digest             TEXT NOT NULL,
+    binding_revision_map_payload  BLOB NOT NULL,
+    binding_revision_map_digest   TEXT NOT NULL,
+    created_at_unix_ms            INTEGER NOT NULL,
+    UNIQUE (snapshot_id, session_id)
+);
+
+CREATE TABLE agent_session_preparations (
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    idempotency_key               TEXT NOT NULL,
+    request_fingerprint           TEXT NOT NULL,
+    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE,
+    -- This receipt is the module-owned Prepared marker.  A pre-existing
+    -- ordinary active session can never acquire a profile snapshot later.
+    -- `0` means the caller atomically claimed a pre-registered, idle
+    -- session through `agent_session_preparation_claims`; `1` means this
+    -- transaction created the session.  Neither spelling permits attaching a
+    -- profile to an arbitrary active session.
+    created_session               INTEGER NOT NULL CHECK (created_session IN (0, 1)),
+    lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('prepared', 'running', 'terminal')),
+    created_at_unix_ms            INTEGER NOT NULL,
+    started_at_unix_ms            INTEGER,
+    terminal_at_unix_ms           INTEGER,
+    PRIMARY KEY (session_id, idempotency_key)
+);
+
+-- An existing normal session is preparable only after its owner records this
+-- durable, single-use marker.  Preparation CASes `eligible` to `claimed` in
+-- the same transaction as its immutable snapshot; an ordinary active session
+-- has no marker and is therefore never silently adopted.
+CREATE TABLE agent_session_preparation_claims (
+    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    claim_token                   TEXT NOT NULL UNIQUE,
+    claim_state                   TEXT NOT NULL CHECK (claim_state IN ('eligible', 'claimed', 'running', 'terminal')),
+    created_at_unix_ms            INTEGER NOT NULL,
+    claimed_at_unix_ms            INTEGER,
+    terminal_at_unix_ms           INTEGER
+);
+
+-- Once an owner has offered an existing idle session to agent preparation,
+-- ordinary dispatch must not race in work before the preparation claim either
+-- starts or terminals.  The start CAS changes the marker to `running` before
+-- any event can be recorded.
+CREATE TRIGGER agent_session_preparation_claim_blocks_events
+BEFORE INSERT ON session_events
+WHEN EXISTS (
+    SELECT 1 FROM agent_session_preparation_claims AS claim
+    WHERE claim.session_id = NEW.session_id
+      AND claim.claim_state IN ('eligible', 'claimed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'agent session preparation claim is pending');
+END;
+
+CREATE TRIGGER agent_profile_snapshot_immutable
+BEFORE UPDATE ON agent_profile_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'agent profile snapshots are immutable');
+END;
+
+CREATE INDEX agent_model_bindings_lookup
+    ON agent_model_bindings(installation_id, definition_digest, slot_id, retired_at_unix_ms);

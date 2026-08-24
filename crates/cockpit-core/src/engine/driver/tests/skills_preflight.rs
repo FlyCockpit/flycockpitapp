@@ -605,3 +605,127 @@ async fn failed_user_invoked_skill_does_not_enter_seedable_set() {
         "failed skill should not inject a seeded skill body: {block:?}"
     );
 }
+
+/// Preparing an oversized forced-skill contribution is deliberately inert:
+/// phase two may still reject the reservation, in which case no seed pair,
+/// active skill, audit row, or turn event is allowed to escape.
+#[tokio::test]
+async fn prepared_forced_skill_is_side_effect_free_until_applied() {
+    let (driver, _tmp) = driver_with_skill_caller();
+    let before_history = driver.stack[0].history.clone();
+    let before_rows = driver
+        .session
+        .db
+        .list_tool_calls_for_session(driver.session.id)
+        .await
+        .unwrap();
+
+    let prepared = driver
+        .prepare_forced_skill("definitely-not-a-real-skill-xyz")
+        .await;
+
+    assert!(driver.active_skills.is_empty());
+    assert!(driver.skill_pairs.is_empty());
+    assert_eq!(driver.stack[0].history, before_history);
+    assert_eq!(
+        driver
+            .session
+            .db
+            .list_tool_calls_for_session(driver.session.id)
+            .await
+            .unwrap()
+            .len(),
+        before_rows.len()
+    );
+    assert!(
+        prepared
+            .envelope_guidance()
+            .contains("forced, package result")
+    );
+}
+
+#[test]
+fn prepared_auto_skill_guidance_is_stable_before_commit() {
+    let prepared = super::super::inbound::PreparedAutoSkillInjection::Selected {
+        selection: crate::skills::auto_select::Selection::Skills(vec![
+            crate::skills::auto_select::InjectedSkill {
+                name: "auto".to_owned(),
+                package_dir: "/skills/auto".to_owned(),
+                body: "AUTO BODY".to_owned(),
+                reason: Some("off-wire".to_owned()),
+            },
+        ]),
+        diagnostics: crate::skills::auto_select::SelectionDiagnostics::default(),
+    };
+    assert_eq!(
+        prepared.guidance("authored"),
+        "Skill `auto` (auto-selected, package directory: /skills/auto):\n\nAUTO BODY\n\n---\n\n"
+    );
+}
+
+/// Models the oversized phase-two rejection boundary: both contributions may
+/// be resolved after reservation, but a failed materialization must discard
+/// them rather than applying either observable half.  The DB fault itself is
+/// owned by text-artifact composition tests; this pins the driver's prepared
+/// values and every skill-visible surface at that boundary.
+#[tokio::test]
+async fn rejected_oversized_phase_two_discards_prepared_auto_and_forced_skills() {
+    let (driver, _tmp) = driver_with_skill_caller();
+    let auto = super::super::inbound::PreparedAutoSkillInjection::Selected {
+        selection: crate::skills::auto_select::Selection::Skills(vec![
+            crate::skills::auto_select::InjectedSkill {
+                name: "auto-rejected".to_owned(),
+                package_dir: "/skills/auto-rejected".to_owned(),
+                body: "AUTO REJECTED BODY".to_owned(),
+                reason: Some("test".to_owned()),
+            },
+        ]),
+        diagnostics: crate::skills::auto_select::SelectionDiagnostics::default(),
+    };
+    let forced = driver
+        .prepare_forced_skill("definitely-not-a-real-skill-xyz")
+        .await;
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+    // Simulate the materialization failure branch: neither `apply_*` method
+    // is called after phase two declines the accepted envelope.
+    drop(auto);
+    drop(forced);
+    drop(tx);
+
+    assert!(
+        rx.try_recv().is_err(),
+        "rejected phase two emits no skill rows"
+    );
+    assert!(driver.active_skills.is_empty());
+    assert!(driver.auto_injected_skills.is_empty());
+    assert!(driver.skill_pairs.is_empty());
+    assert!(driver.stack[0].history.is_empty());
+    assert!(
+        driver
+            .session
+            .db
+            .list_tool_calls_for_session(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_session_events(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .list_text_artifacts(driver.session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

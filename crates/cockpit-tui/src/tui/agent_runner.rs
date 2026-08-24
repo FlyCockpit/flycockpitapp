@@ -20,6 +20,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, on
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
+use cockpit_core::daemon::bulk_upload::{
+    BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
+    user_message_needs_bulk,
+};
 use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
 use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
 use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Response};
@@ -193,6 +197,18 @@ fn classify_image_upload_error(error: ImageUploadError) -> UserSubmissionSendErr
     match error {
         ImageUploadError::Usage(message) => UserSubmissionSendError::Rejected(message),
         ImageUploadError::Daemon(message) | ImageUploadError::Transport(message) => {
+            UserSubmissionSendError::Ambiguous(message)
+        }
+    }
+}
+
+fn classify_bulk_user_message_upload_error(
+    error: BulkUserMessageUploadError,
+) -> UserSubmissionSendError {
+    match error {
+        BulkUserMessageUploadError::Usage(message) => UserSubmissionSendError::Rejected(message),
+        BulkUserMessageUploadError::Daemon(message)
+        | BulkUserMessageUploadError::Transport(message) => {
             UserSubmissionSendError::Ambiguous(message)
         }
     }
@@ -1978,6 +1994,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
+            | proto::Event::ImageControlConfigChanged { .. }
     )
 }
 
@@ -2284,23 +2301,77 @@ fn try_spawn_inner(
                 let event_notify = event_notify.clone();
                 async move {
                     let client = current_client.read().await.clone();
-                    let refs = upload_submission_images(&client, &sub.images)
-                        .await
-                        .map_err(classify_image_upload_error)?;
-                    match client
-                        .request(Request::SendUserMessage {
-                            expected_model_state_generation: sub.expected_model_state_generation,
-                            expected_model: sub.expected_model,
-                            client_submission_id,
-                            text: sub.text,
-                            display_text: sub.display_text,
-                            tag_expansions: sub.tag_expansions,
-                            image_refs: refs,
-                            forced_skill: sub.forced_skill,
-                            run_invocation_options: None,
-                        })
-                        .await
-                    {
+                    let use_bulk = user_message_needs_bulk(&sub.text, sub.display_text.as_deref());
+                    // FCM2 source artifacts are intentionally text-only.  Do
+                    // this guard before image upload so a rejected mixed
+                    // submission does not create an attachment side effect
+                    // that cannot form a rehydratable durable message.
+                    if use_bulk && !sub.images.is_empty() {
+                        return Err(UserSubmissionSendError::Rejected(
+                            "media/file submissions cannot carry text over the 64 KiB artifact threshold"
+                                .to_owned(),
+                        ));
+                    }
+                    let response = if use_bulk {
+                        let transfer = stage_opaque_user_text(&client, &sub.text)
+                            .await
+                            .map_err(classify_bulk_user_message_upload_error)?;
+                        let display_transfer = if sub
+                            .display_text
+                            .as_ref()
+                            .is_some_and(|display| {
+                                display.len() > INLINE_USER_MESSAGE_TEXT_BYTES
+                            })
+                        {
+                            let transfer = stage_opaque_user_text(
+                                &client,
+                                sub.display_text
+                                    .as_deref()
+                                    .expect("oversized display text was present"),
+                            )
+                            .await
+                            .map_err(classify_bulk_user_message_upload_error)?;
+                            Some(transfer)
+                        } else {
+                            None
+                        };
+                        client
+                            .request(Request::SendUserMessageBulk {
+                                expected_model_state_generation: sub
+                                    .expected_model_state_generation,
+                                expected_model: sub.expected_model,
+                                client_submission_id,
+                                transfer,
+                                display_text: if display_transfer.is_some() {
+                                    None
+                                } else {
+                                    sub.display_text
+                                },
+                                display_transfer,
+                                tag_expansions: sub.tag_expansions,
+                                forced_skill: sub.forced_skill,
+                                run_invocation_options: None,
+                            })
+                            .await
+                    } else {
+                        let refs = upload_submission_images(&client, &sub.images)
+                            .await
+                            .map_err(classify_image_upload_error)?;
+                        client
+                            .request(Request::SendUserMessage {
+                                expected_model_state_generation: sub.expected_model_state_generation,
+                                expected_model: sub.expected_model,
+                                client_submission_id,
+                                text: sub.text,
+                                display_text: sub.display_text,
+                                tag_expansions: sub.tag_expansions,
+                                image_refs: refs,
+                                forced_skill: sub.forced_skill,
+                                run_invocation_options: None,
+                            })
+                            .await
+                    };
+                    match response {
                         Ok(response) => {
                             let queue = classify_user_message_response(response)?;
                             push_turn_event(
@@ -3345,6 +3416,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         CaffeinateState { .. }
         | DaemonDraining { .. }
         | ConnectorStatus { .. }
+        // Image-control configuration changes are daemon-global: they are
+        // keyed by project, not by an attached chat session.
+        | ImageControlConfigChanged { .. }
         | TerminalOutput { .. }
         | TerminalClipboard { .. }
         | TerminalViewers { .. }
@@ -4311,7 +4385,11 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
-        InterruptRaised { .. }
+        // This daemon-global, project-scoped invalidation has no image-control
+        // TUI state to refresh yet. Consume its safe projection explicitly so
+        // it is neither treated as a session event nor rendered as history.
+        ImageControlConfigChanged { .. }
+        | InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
         | TerminalOutput { .. }
@@ -6488,6 +6566,20 @@ mod tests {
             proto_event_to_turn_event(draining),
             Some(TurnEvent::DaemonDraining { forced: true })
         ));
+
+        let image_config_changed = proto::Event::ImageControlConfigChanged {
+            event: proto::image_control::ImageControlEventV1::config_changed(
+                "daemon".into(),
+                "project".into(),
+                proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
+            ),
+        };
+        assert!(event_session(&image_config_changed).is_none());
+        assert!(is_global_event(&image_config_changed));
+        assert!(
+            proto_event_to_turn_event(image_config_changed).is_none(),
+            "image-control config changes are not chat-history events"
+        );
 
         let meta = cockpit_core::env_snapshot::EnvSnapshotMeta {
             source: cockpit_core::env_snapshot::EnvSnapshotSource::DaemonStart,

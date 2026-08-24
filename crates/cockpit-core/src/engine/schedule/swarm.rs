@@ -507,6 +507,11 @@ async fn route_child_spawn(
 /// Build the recursive `Swarm` child agent at the spec's depth, so its own
 /// `spawn` description carries the remaining-budget hint (GOALS §24).
 fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<SwarmChild> {
+    if ctx.agent.vnext_grant.is_some() {
+        anyhow::bail!(
+            "vNext definitions cannot enter the legacy Swarm fork path; use the effective-grant task delegation route"
+        );
+    }
     let worker_agent = spec.worker.agent_name();
     // Pin the config to a held snapshot for THIS swarm child's build: model
     // selection AND the agent build below both read the same frozen generation,
@@ -591,6 +596,11 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         delegation_model: None,
         delegated: true,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
+        vnext_host_policy: None,
+        vnext_local_installation_resolver:
+            crate::agents::LocalInstallationResolver::no_installations(),
+        parent_vnext_grant: None,
         swarm_depth: spec.depth,
         swarm_max_depth: spec.max_depth,
         // Background swarm children carry no per-delegation grants.
@@ -990,6 +1000,7 @@ mod tests {
             write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             assistant_identity_prefix: None,
         };

@@ -198,6 +198,12 @@ pub fn validate_grant(
 /// specific reason (the offending tool / agent, backticked). The
 /// offending tool is **never** silently stripped.
 pub fn validate_invariants(def: &AgentDef) -> Result<()> {
+    if let Some(vnext) = &def.vnext {
+        // v2 declarations are deliberately authority-free. Their own closed
+        // schema is the only applicable definition-level invariant; legacy
+        // tool/role checks below must not accidentally reinterpret them.
+        return vnext.validate();
+    }
     def.goal_supervision.validate()?;
 
     let known = known_tool_names();
@@ -386,7 +392,10 @@ fn discoverable_default_tier(agent_name: &str, tool: &str) -> ToolTier {
 #[cfg(test)]
 mod grant_tests {
     use super::*;
-    use crate::agents::AgentMode;
+    use crate::agents::{
+        AgentMode, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
+        ModelLocality, ModelSlot, VnextAgentDef,
+    };
 
     fn g(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
@@ -413,6 +422,7 @@ mod grant_tests {
             goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
+            vnext: None,
             prompt: "body".to_string(),
             prompt_variants: std::collections::HashMap::new(),
             source: std::path::PathBuf::new(),
@@ -564,5 +574,48 @@ mod grant_tests {
         validate_invariants(&with_mcp).expect("mcp makes discoverable tool reachable");
         validate_invariants(&builtin).expect("enabled tier is directly reachable");
         validate_invariants(&disabled).expect("disabled tier is not discoverable");
+    }
+
+    #[test]
+    fn agent_vnext_invariants_apply_closed_schema_not_legacy_leaf_rules() {
+        let mut def = tiered_def(
+            "vnext-reviewer",
+            &["not-a-real-tool"],
+            "not-a-real-tool",
+            ToolTier::Enabled,
+        );
+        def.vnext = Some(VnextAgentDef {
+            schema_version: crate::agents::SCHEMA_VERSION,
+            agent_id: "acme/reviewer".to_string(),
+            execution_kind: ExecutionKind::Coding,
+            model_slots: std::collections::BTreeMap::from([(
+                "primary".to_string(),
+                ModelSlot {
+                    purpose: "Review source".to_string(),
+                    min_context_tokens: 1,
+                    required_capabilities: vec![ModelCapability::TextGeneration],
+                    locality: ModelLocality::Any,
+                    allow_default_fallback: false,
+                    suggested_models: Vec::new(),
+                },
+            )]),
+            delegation: DelegationPolicy::default(),
+            questions: None,
+            verification: None,
+        });
+        // A v2 definition has no user-authored tool authority, so legacy tool
+        // validation must not reinterpret its ignored internal fields.
+        validate_invariants(&def).unwrap();
+
+        let vnext = def.vnext.as_mut().unwrap();
+        vnext.execution_kind = ExecutionKind::Computer;
+        vnext.delegation = DelegationPolicy {
+            allowed_children: vec![],
+            max_descendant_depth: Some(1),
+            max_concurrent_children: Some(1),
+            targets: vec![DelegationTarget::SameRoot],
+        };
+        let error = validate_invariants(&def).unwrap_err().to_string();
+        assert!(error.contains("computer"), "{error}");
     }
 }

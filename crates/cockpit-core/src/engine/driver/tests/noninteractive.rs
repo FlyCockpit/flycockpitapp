@@ -1,5 +1,14 @@
 use super::*;
 
+/// Workspace-authored v2 coding definition used by positive on-disk fixtures.
+/// Tool authority deliberately stays out of these documents; tests that need a
+/// constrained host surface build it directly instead of reviving `tools:`.
+fn vnext_coding_agent_document(agent_id: &str, description: &str, body: &str) -> String {
+    format!(
+        "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/{agent_id}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+    )
+}
+
 #[tokio::test]
 async fn child_failure_carries_structured_envelope_to_parent() {
     let fallback_tried = vec![crate::engine::agent::FailoverAttempt {
@@ -1796,7 +1805,11 @@ fn dmh_docs_batch_exclusive_in_flight() -> usize {
                     std::fs::create_dir_all(&agents_dir).unwrap();
                     std::fs::write(
                         agents_dir.join("readonly-probe.md"),
-                        "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                        vnext_coding_agent_document(
+                            "readonly-probe",
+                            "read-only leaf",
+                            "Investigate read-only.",
+                        ),
                     )
                     .unwrap();
                     driver.refresh_config_from_disk_for_tests();
@@ -1989,7 +2002,11 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                     // Admission-time def: read-only → concurrently admissible.
                     std::fs::write(
                         &probe_path,
-                        "---\ndescription: read-only probe\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                        vnext_coding_agent_document(
+                            "probe",
+                            "read-only probe",
+                            "Investigate read-only.",
+                        ),
                     )
                     .unwrap();
                     driver.refresh_config_from_disk_for_tests();
@@ -2015,7 +2032,11 @@ fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
                     tokio::spawn(async move {
                         std::fs::write(
                             &mutate_path,
-                            "---\ndescription: now writes\nmode: subagent\ntools: [read, write]\n---\nInvestigate.\n",
+                            vnext_coding_agent_document(
+                                "probe",
+                                "now writes",
+                                "Investigate.",
+                            ),
                         )
                         .unwrap();
                     });
@@ -3439,6 +3460,31 @@ fn dmh_build_child(
     dmh_trusted(&cwd, || crate::engine::builtin::load(child_agent, &args)).unwrap()
 }
 
+/// A host-selected target model is runtime policy, not authored markdown.
+/// Keep the custody test's selection axis explicit by constructing the
+/// otherwise-v2 built-in definition at the trusted host boundary.
+fn dmh_build_host_selected_child(
+    driver: &Driver,
+    child_agent: &str,
+    model_selector: &str,
+) -> crate::engine::agent::Agent {
+    let cwd = driver.cwd.clone();
+    let args = driver.spawn_args_delegated_in_cwd(
+        &cwd,
+        false,
+        Vec::new(),
+        None,
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let mut definition =
+        crate::agents::embedded_default(child_agent).expect("known host-owned child definition");
+    definition.model = Some(model_selector.to_string());
+    dmh_trusted(&cwd, || {
+        crate::engine::builtin::agent_from_def(&definition, &args)
+    })
+    .unwrap()
+}
+
 /// Observable tool-schema/description posture: the `read` tool's rendered
 /// description at the agent's own resolved mode.
 fn dmh_read_desc(agent: &crate::engine::agent::Agent) -> String {
@@ -3471,7 +3517,7 @@ fn dmh_write_mode_probe_agent(driver: &Driver) {
     ] {
         std::fs::write(
             dir.join(file),
-            format!("---\ndescription: mode probe\nmode: subagent\ntools: [read]\n---\n{marker}\n"),
+            vnext_coding_agent_document("probe", "mode probe", marker),
         )
         .unwrap();
     }
@@ -3970,10 +4016,6 @@ async fn delegated_failover_reposture_resolves_db_backed_agent() {
         crate::assistants::CreateAssistantSpec {
             name: "dbonly-helper".to_string(),
             description: "db-backed helper".to_string(),
-            mode: crate::agents::AgentMode::Subagent,
-            tools: Some(vec!["read".to_string()]),
-            tool_tiers: Default::default(),
-            model: None,
             prompt: "DB-ONLY-ROLE-MARKER investigate.".to_string(),
             home_dir: home.path().to_path_buf(),
         },
@@ -4073,7 +4115,7 @@ fn delegated_trust_and_mode_cartesian_matrix() {
             std::fs::create_dir_all(&agents_dir).unwrap();
             std::fs::write(
                 agents_dir.join("explore.md"),
-                "---\ndescription: probe\nmode: subagent\nmodel: lmstudio:probe\ntools: [read]\n---\nInvestigate read-only.\n",
+                vnext_coding_agent_document("explore", "probe", "Investigate read-only."),
             )
             .unwrap();
             // The session model carries a redaction sentinel so the child model
@@ -4082,13 +4124,7 @@ fn delegated_trust_and_mode_cartesian_matrix() {
             // Parent frame posture is deliberately different from every cell.
             set_root_llm_mode(&mut driver, LlmMode::Defensive);
 
-            let child = dmh_build_child(
-                &driver,
-                "explore",
-                false,
-                None,
-                crate::engine::builtin::DelegationRecursionContext::default(),
-            );
+            let child = dmh_build_host_selected_child(&driver, "explore", "lmstudio:probe");
             assert_eq!(
                 child.model.model_id_ref(),
                 "probe",
@@ -4195,13 +4231,39 @@ fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
                         std::fs::create_dir_all(&agents_dir).unwrap();
                         std::fs::write(
                             agents_dir.join("explore.md"),
-                            "---\ndescription: probe\nmode: subagent\nmodel: lmstudio:probe\ntools: [read]\n---\nInvestigate read-only.\n",
+                            vnext_coding_agent_document(
+                                "explore",
+                                "probe",
+                                "Investigate read-only.",
+                            ),
                         )
                         .unwrap();
                         driver.refresh_config_from_disk_for_tests();
                         // The session model carries the sentinel redaction table so
                         // the child model inherits it by trust class.
                         dmh_inject_session_secret(&mut driver);
+                        // The target model is host-selected runtime policy.  Do
+                        // not put a selector back into v2 markdown: the
+                        // driver's model override is propagated into the child
+                        // SpawnArgs and preserves the provider's trusted-vs-
+                        // untrusted custody classification.
+                        let mut host_selected = driver.config.providers();
+                        host_selected.active_model = Some(
+                            crate::config::providers::ActiveModelRef {
+                                provider: "lmstudio".to_string(),
+                                model: "probe".to_string(),
+                                reasoning_effort: None,
+                                thinking_mode: None,
+                                prompt_cache_retention: None,
+                            },
+                        );
+                        driver.set_model_override(Some(std::sync::Arc::new(
+                            crate::engine::model::Model::from_config(
+                                &host_selected,
+                                std::sync::Arc::new(crate::redact::RedactionTable::empty()),
+                            )
+                            .unwrap(),
+                        )));
 
                         seed_task_delegation(&driver, "task-wire-egress", "default").await;
                         seed_task_payload(&driver, "task-wire-egress", "default", "explore").await;
@@ -4681,7 +4743,11 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("readonly-probe.md"),
-            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+            vnext_coding_agent_document(
+                "readonly-probe",
+                "read-only leaf",
+                "Investigate read-only.",
+            ),
         )
         .unwrap();
         let cwd = driver.cwd.clone();
@@ -4720,7 +4786,11 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("readonly-probe.md"),
-            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+            vnext_coding_agent_document(
+                "readonly-probe",
+                "read-only leaf",
+                "Investigate read-only.",
+            ),
         )
         .unwrap();
         let cwd = driver.cwd.clone();
@@ -4851,7 +4921,11 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("readonly-probe.md"),
-            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+            vnext_coding_agent_document(
+                "readonly-probe",
+                "read-only leaf",
+                "Investigate read-only.",
+            ),
         )
         .unwrap();
         let cwd = driver.cwd.clone();
@@ -4912,7 +4986,7 @@ fn resolved_child_execution_surface_matches_actual_attempt() {
         // write-capable in the single-writer-lock sense.
         std::fs::write(
             agents_dir.join("custom-writer.md"),
-            "---\ndescription: custom bash child\nmode: subagent\ntools: [read, webfetch]\n---\nInvestigate.\n",
+            vnext_coding_agent_document("custom-writer", "custom bash child", "Investigate."),
         )
         .unwrap();
         let scope = tmp.path().join("scope");
@@ -5152,7 +5226,11 @@ fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: 
                         std::fs::create_dir_all(&agents_dir).unwrap();
                         std::fs::write(
                             agents_dir.join("readonly-probe.md"),
-                            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                            vnext_coding_agent_document(
+                                "readonly-probe",
+                                "read-only leaf",
+                                "Investigate read-only.",
+                            ),
                         )
                         .unwrap();
                     }

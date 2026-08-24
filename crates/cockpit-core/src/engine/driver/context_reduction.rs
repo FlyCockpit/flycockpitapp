@@ -111,7 +111,6 @@ pub struct PreparedCompaction {
     pub trigger_ctx_pct: Option<f64>,
     pub seed_tags: Vec<String>,
     pub seed_tool_tokens: u64,
-    pub compressed_entries: Vec<crate::db::compressed_results::CompressedToolResultEntry>,
     /// Identity of the model that AUTHORED the brief/handoff text, so the
     /// `session_compacted` record journals through the frame-carrying path
     /// against that model's trust (decision 10.3 / K1). Threaded from the
@@ -158,7 +157,8 @@ pub(in crate::engine::driver) enum PreparedCompactionApplyError {
         expected: PreparedCompactionCoverage,
         actual: PreparedCompactionCoverage,
     },
-    StoreCompressedResults(String),
+    #[cfg_attr(not(test), allow(dead_code))]
+    StoreTextArtifacts(String),
 }
 
 #[derive(Debug)]
@@ -505,6 +505,23 @@ impl Driver {
         // `top` mutably (last reported usage + the model window).
         let window = self.active_model_context_length();
         let used_before = self.session.last_usage().map(|u| u.input_tokens);
+        // A frame-looking tool body is untrusted ordinary text. Only the
+        // durable owning-event projection state tells us that a call was
+        // already retained, including the quota-unavailable branch that has no
+        // artifact/ref row. If the state cannot be read, continue ordinary
+        // prune work but do not risk a duplicate/forged artifact projection.
+        let mut projection_calls = match self
+            .session
+            .db
+            .text_artifact_projection_call_ids(self.session.id)
+            .await
+        {
+            Ok(calls) => Some(calls),
+            Err(error) => {
+                tracing::warn!(%error, "loading durable text-artifact projection ids before prune failed");
+                None
+            }
+        };
 
         let depth = self.stack.len();
         let agent_name = self.active_agent().to_string();
@@ -526,53 +543,21 @@ impl Driver {
 
         let applied = this_prune;
         prune::apply_plan(&mut top.history, &applied);
-        for candidate in prune::condense_candidates(&top.history) {
-            let hash =
-                crate::db::compressed_results::compressed_result_hash(&candidate.original_body);
-            match self
-                .session
-                .db
-                .insert_compressed_tool_result(
-                    &hash,
-                    crate::db::compressed_results::NewCompressedToolResult {
-                        session_id: self.session.id,
-                        agent_id: &agent_name,
-                        tool: &candidate.tool,
-                        call_id: &candidate.call_id,
-                        original_byte_len: candidate.original_body.len(),
-                        compressed_byte_len: Some(candidate.condensed_body.len()),
-                        created_at: chrono::Utc::now().timestamp(),
-                        kind: "prune-boundary",
-                        content: &candidate.original_body,
-                    },
+        let prune_artifact_candidates = projection_calls
+            .as_ref()
+            .map(|calls| {
+                prune::condense_candidates_with_artifact_calls(
+                    &top.history,
+                    &calls.model_context_calls,
                 )
-                .await
-            {
-                Ok(()) => {
-                    self.session.set_has_retrievable_tool_results();
-                    prune::apply_condensed_tool_result(&mut top.history, &candidate, &hash);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        tool = %candidate.tool,
-                        call_id = %candidate.call_id,
-                        "prune-boundary compressed tool result store failed"
-                    );
-                }
-            }
-        }
+            })
+            .unwrap_or_default();
         let bodies = applied.targets.len();
         let tokens_saved = applied.tokens_saved() as u64;
-        let messages_after = top.history.len();
-        let tokens_after = wire_token_total(&top.history);
-        // The full live elided set (cumulative across prunes), so the TUI
-        // dims every currently-elided body — not just this prune's targets.
-        let elided = prune::current_elided_ids(&top.history);
+        let event_messages_after = top.history.len();
+        let event_tokens_after = wire_token_total(&top.history);
         // Update the watermark so auto-prune short-circuits until the
         // foreground history grows again.
-        self.prune_watermark.insert(depth, top.history.len());
-
         // Remaining context budget after this prune: model window − the
         // post-prune input-token estimate. The last reported usage is the
         // pre-prune prompt size; subtract this prune's wire saving to estimate
@@ -589,42 +574,168 @@ impl Driver {
         // Record this auto-prune's effectiveness for the escalation policy
         // (root frame only — a subagent frame's prune is transient). Only when
         // the ctx%-gated figures are known.
-        if auto
+        let effectiveness = if auto
             && depth == 1
             && bodies > 0
             && let (Some(w), Some(used)) = (window, used_before)
         {
             let window_f = f64::from(w);
-            self.note_prune_effectiveness(PruneEffectiveness {
+            Some(PruneEffectiveness {
                 ctx_pct: used as f64 / window_f * 100.0,
                 saved_pct: tokens_saved as f64 / window_f * 100.0,
-            });
-        }
+            })
+        } else {
+            None
+        };
 
         // Timeline event (Part C): record the prune so the export can
         // audit it. Only when something was actually elided — an empty
         // prune is not a meaningful timeline entry. Ordered immediately
         // before the next `inference_request` event by construction
         // (auto-prune fires right before a `turn`).
-        if bodies > 0
-            && let Err(e) = self
+        if bodies > 0 || !prune_artifact_candidates.is_empty() {
+            let artifacts = prune_artifact_candidates
+                .iter()
+                .enumerate()
+                .map(
+                    |(slot, candidate)| crate::db::text_artifacts::TextArtifactCandidate {
+                        relation:
+                            crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult,
+                        projection_slot: Some(slot as i64),
+                        kind: crate::db::text_artifacts::TextArtifactKind::ToolResult,
+                        capture_reason: crate::db::text_artifacts::CaptureReason::PruneBoundary,
+                        content: candidate.original_body.clone(),
+                        host_captured_bytes: candidate.original_body.len(),
+                        host_original_bytes: candidate.original_body.len(),
+                        host_dropped_bytes: 0,
+                        stored_source_bytes: candidate.original_body.len(),
+                        provenance_json: serde_json::json!({
+                            "agent_id": &agent_name,
+                            "tool": &candidate.tool,
+                            "call_id": &candidate.call_id,
+                        })
+                        .to_string(),
+                        created_at: chrono::Utc::now().timestamp_millis(),
+                    },
+                )
+                .collect();
+            match self
                 .session
-                .record_context_pruned(
+                .record_context_pruned_with_artifacts(
                     &agent_name,
                     auto,
                     messages_before,
-                    messages_after,
+                    event_messages_after,
                     tokens_before,
-                    tokens_after,
+                    event_tokens_after,
                     &this_elided,
                     &reason,
                     tokens_saved,
                     remaining_budget,
                     trigger_reason,
+                    artifacts,
                 )
                 .await
-        {
-            tracing::warn!(error = %e, "record context_pruned event failed");
+            {
+                Ok(result) => {
+                    if let Some(calls) = projection_calls.as_mut() {
+                        for candidate in &prune_artifact_candidates {
+                            calls.model_context_calls.insert(candidate.call_id.clone());
+                            calls.prune_boundary_calls.insert(candidate.call_id.clone());
+                        }
+                    }
+                    let mut admissions = std::collections::BTreeMap::new();
+                    let mut malformed = false;
+                    for slot in result.slots {
+                        let key = (slot.relation.as_str(), slot.projection_slot);
+                        if admissions.insert(key, slot.admission).is_some() {
+                            malformed = true;
+                        }
+                    }
+                    for (ordinal, candidate) in prune_artifact_candidates.iter().enumerate() {
+                        let key = (
+                            crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+                                .as_str(),
+                            Some(ordinal as i64),
+                        );
+                        let admission = admissions.remove(&key);
+                        let frame = match admission {
+                            Some(crate::db::text_artifacts::TextArtifactAdmission::Stored(
+                                artifact,
+                            )) => {
+                                prune::render_prune_artifact_frame(candidate, Some(&artifact), None)
+                            }
+                            Some(
+                                crate::db::text_artifacts::TextArtifactAdmission::ArtifactLimit,
+                            ) => prune::render_prune_artifact_frame_with_agent(
+                                candidate,
+                                None,
+                                Some("artifact_limit"),
+                                Some(&agent_name),
+                            ),
+                            Some(
+                                crate::db::text_artifacts::TextArtifactAdmission::SessionQuota,
+                            ) => prune::render_prune_artifact_frame_with_agent(
+                                candidate,
+                                None,
+                                Some("session_quota"),
+                                Some(&agent_name),
+                            ),
+                            None => {
+                                malformed = true;
+                                prune::render_prune_artifact_frame_with_agent(
+                                    candidate,
+                                    None,
+                                    Some("persistence_unavailable"),
+                                    Some(&agent_name),
+                                )
+                            }
+                        };
+                        let _ =
+                            prune::apply_condensed_tool_result(&mut top.history, candidate, &frame);
+                    }
+                    if malformed || !admissions.is_empty() {
+                        tracing::error!(
+                            "context prune artifact composition returned malformed owner slots"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "record context_pruned artifact composition failed");
+                    // `apply_plan` already removed the original bodies above.
+                    // A failed persistence composition must therefore render
+                    // the same canonical unavailable frame for *every*
+                    // candidate, rather than leaving an older ad-hoc elision
+                    // with no durable retrieval contract.
+                    for candidate in &prune_artifact_candidates {
+                        let frame = prune::render_prune_artifact_frame_with_agent(
+                            candidate,
+                            None,
+                            Some("persistence_unavailable"),
+                            Some(&agent_name),
+                        );
+                        let _ =
+                            prune::apply_condensed_tool_result(&mut top.history, candidate, &frame);
+                    }
+                }
+            }
+        }
+
+        // The full live elided set (cumulative across prunes), so the TUI
+        // dims every currently-elided body — not just this prune's targets.
+        let elided = projection_calls
+            .as_ref()
+            .map(|calls| {
+                prune::current_elided_ids_with_prune_boundary_calls(
+                    &top.history,
+                    &calls.prune_boundary_calls,
+                )
+            })
+            .unwrap_or_else(|| prune::current_elided_ids(&top.history));
+        self.prune_watermark.insert(depth, top.history.len());
+        let _ = top;
+        if let Some(effectiveness) = effectiveness {
+            self.note_prune_effectiveness(effectiveness);
         }
 
         // Persist the prune ledger so a later resume re-derives this exact
@@ -1162,9 +1273,9 @@ impl Driver {
                         "/compact: prepared compaction is stale; history was left unchanged"
                             .to_string()
                     }
-                    PreparedCompactionApplyError::StoreCompressedResults(error) => {
+                    PreparedCompactionApplyError::StoreTextArtifacts(error) => {
                         format!(
-                            "/compact: storing recoverable pruned results failed: {error}; history was left unchanged"
+                            "/compact: recording prepared artifacts failed: {error}; history was left unchanged"
                         )
                     }
                 };
@@ -1220,22 +1331,14 @@ impl Driver {
         // history until the normal compaction reset commits the final plan.
         let compact_prune =
             prune::dedup_plan(&self.stack.last().expect("stack never empty").history);
-        let mut pruned_history = prune::apply_plan_to(
+        let pruned_history = prune::apply_plan_to(
             &self.stack.last().expect("stack never empty").history,
             &compact_prune,
         );
-        let compact_condense_plan = prune::CondensePlan {
-            targets: prune::condense_candidates(&pruned_history)
-                .into_iter()
-                .map(|candidate| {
-                    let hash = crate::db::compressed_results::compressed_result_hash(
-                        &candidate.original_body,
-                    );
-                    prune::CondenseTarget { candidate, hash }
-                })
-                .collect(),
-        };
-        pruned_history = prune::apply_condense_plan_to(&pruned_history, &compact_condense_plan);
+        // Prune-boundary artifacts are committed only with their real owning
+        // `context_pruned` event.  A private compaction draft has no such
+        // event, so it deliberately keeps these bodies intact rather than
+        // inventing a marker or a second persistence path.
 
         // 1. Model brief from the foreground agent's current history.
         let filtered_history = self.compact_brief_history(&pruned_history);
@@ -1349,27 +1452,6 @@ impl Driver {
         let authoring_model = authoring_model.expect("draft ran at least one iteration");
         plan.tail_trimmed = initial_tail_trimmed + initial_tail_kept.saturating_sub(plan.tail_kept);
 
-        // Persist every recoverable original for the private prune transform
-        // atomically, but only after the handoff is proven to fit. A storage
-        // failure aborts before model history or timeline state changes.
-        let compressed_entries = compact_condense_plan
-            .targets
-            .into_iter()
-            .map(
-                |target| crate::db::compressed_results::CompressedToolResultEntry {
-                    hash: target.hash,
-                    session_id: self.session.id,
-                    agent_id: self.active_agent().to_string(),
-                    tool: target.candidate.tool,
-                    call_id: target.candidate.call_id,
-                    original_byte_len: target.candidate.original_body.len(),
-                    compressed_byte_len: Some(target.candidate.condensed_body.len()),
-                    created_at: chrono::Utc::now().timestamp(),
-                    kind: "prune-boundary".to_string(),
-                    content: target.candidate.original_body,
-                },
-            )
-            .collect();
         let history = normalize_prepared_history_for_serde(plan.history);
         Ok(PreparedCompaction {
             agent_name: self.active_agent().to_string(),
@@ -1388,7 +1470,6 @@ impl Driver {
             trigger_ctx_pct,
             seed_tool_tokens,
             seed_tags,
-            compressed_entries,
             authoring_provider_id: authoring_model.provider_id,
             authoring_model_id: authoring_model.model_id,
         })
@@ -1415,7 +1496,7 @@ impl Driver {
         if self.test_compact_force_failure == Some(super::CompactForceFailure::Apply) {
             // Exercise the real apply-failure branch (a store error /
             // concurrent-history `Stale` is genuinely reachable in production).
-            return Err(PreparedCompactionApplyError::StoreCompressedResults(
+            return Err(PreparedCompactionApplyError::StoreTextArtifacts(
                 "test-injected compaction apply failure".to_string(),
             ));
         }
@@ -1428,22 +1509,6 @@ impl Driver {
                 actual,
             });
         }
-
-        if let Err(error) = self
-            .session
-            .db
-            .insert_compressed_tool_results(prepared.compressed_entries.clone())
-            .await
-        {
-            return Err(PreparedCompactionApplyError::StoreCompressedResults(
-                error.to_string(),
-            ));
-        }
-        if !prepared.compressed_entries.is_empty() {
-            self.session.set_has_retrievable_tool_results();
-        }
-        #[cfg(test)]
-        self.trace_compaction_apply("compressed_results_persisted");
 
         // 5. Reset the foreground model context in place.
         self.stack.last_mut().expect("stack never empty").history = prepared.history.clone();
@@ -2308,24 +2373,22 @@ pub(in crate::engine::driver) fn auto_prune_trigger_breaks_cache(trigger_reason:
 #[cfg(test)]
 mod tests {
     #[test]
-    fn genuinely_compressed_result_has_distinct_byte_lengths() {
+    fn artifact_frame_never_claims_a_shorter_stored_body() {
         let original = "line 1\nline 2\nline 3\n";
-        let condensed = "[compressed tool result: omitted middle]\n";
-        let entry = crate::db::compressed_results::NewCompressedToolResult {
-            session_id: uuid::Uuid::new_v4(),
-            agent_id: "Build",
-            tool: "bash",
-            call_id: "call-1",
-            original_byte_len: original.len(),
-            compressed_byte_len: Some(condensed.len()),
-            created_at: 123,
-            kind: "prune-boundary",
-            content: original,
+        let candidate = crate::engine::prune::CondenseCandidate {
+            history_index: 0,
+            tool: "bash".to_string(),
+            call_id: "call-1".to_string(),
+            original_body: original.to_string(),
+            condensed_body: "summary".to_string(),
         };
-
-        assert_ne!(
-            entry.original_byte_len,
-            entry.compressed_byte_len.expect("compressed length")
+        let frame = crate::engine::prune::render_prune_artifact_frame(
+            &candidate,
+            None,
+            Some("artifact_limit"),
         );
+
+        assert!(frame.contains(&format!("\"content_bytes\":{}", original.len())));
+        assert!(frame.contains(&format!("\"stored_source_bytes\":{}", original.len())));
     }
 }

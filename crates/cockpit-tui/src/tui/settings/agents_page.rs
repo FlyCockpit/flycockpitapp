@@ -44,8 +44,6 @@ use crate::tui::tool_surface_picker::{
     ToolSurfaceDraft, ToolSurfaceEditOutcome, ToolSurfacePicker, ToolSurfaceRender,
     tool_surface_lines,
 };
-#[cfg(test)]
-use cockpit_core::agents::ToolTier;
 use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, list_all};
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
@@ -838,13 +836,27 @@ impl SettingsCx {
                 return;
             }
         };
-        let def = match cockpit_core::agents::load_named_from_file(&path, &name) {
+        let load_result = match &source {
+            AgentRowSource::Agent => {
+                cockpit_core::agents::load_workspace_named_from_file(&path, &name)
+            }
+            AgentRowSource::Assistant { .. } => {
+                cockpit_core::agents::load_daemon_local_named_from_file(&path, &name)
+            }
+        };
+        let def = match load_result {
             Ok(def) => def,
             Err(e) => {
                 p.status = Some(format!("structured editor unavailable for `{name}`: {e}"));
                 return;
             }
         };
+        if def.vnext.is_some() {
+            p.status = Some(format!(
+                "structured tool editing is unavailable for `{name}`: schemaVersion 2 tool authority is host-owned; edit only declarative definition fields in the raw editor"
+            ));
+            return;
+        }
         p.rows = rows_for(&cwd).0;
         if let Some(idx) = p.rows.iter().position(|r| r.name == name) {
             p.cursor = idx;
@@ -1973,8 +1985,10 @@ pub(super) mod tests {
         page_mut(d).detail.as_mut().unwrap().picker.set_cursor(idx);
     }
 
-    fn load_agent(path: &std::path::Path, name: &str) -> AgentDef {
-        cockpit_core::agents::load_named_from_file(path, name).unwrap()
+    fn vnext_workspace_agent(name: &str, description: &str, body: &str) -> String {
+        format!(
+            "---\ndescription: {description}\nschemaVersion: 2\nagentId: authored/{name}\nexecutionKind: coding\nmodelSlots:\n  primary:\n    purpose: Execute the assigned coding task\n    minContextTokens: 1\n    requiredCapabilities: [text_generation]\n    locality: any\n    allowDefaultFallback: false\n---\n{body}\n"
+        )
     }
 
     #[test]
@@ -1996,12 +2010,12 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("with-model.md"),
-            "---\ndescription: m\nmodel: anthropic/claude-opus-4-7\n---\nbody\n",
+            vnext_workspace_agent("with-model", "m", "body"),
         )
         .unwrap();
         fs::write(
             agents_dir.join("no-model.md"),
-            "---\ndescription: n\n---\nbody\n",
+            vnext_workspace_agent("no-model", "n", "body"),
         )
         .unwrap();
         let d = agents_dialog(&tmp);
@@ -2010,11 +2024,14 @@ pub(super) mod tests {
             .iter()
             .find(|r| r.name == "with-model")
             .unwrap();
-        assert_eq!(with.model.as_deref(), Some("anthropic/claude-opus-4-7"));
+        assert_eq!(
+            with.model, None,
+            "v2 model advice is not a binding selector"
+        );
         let without = page(&d).rows.iter().find(|r| r.name == "no-model").unwrap();
         assert_eq!(
             without.model, None,
-            "no frontmatter model → session default"
+            "v2 definitions defer model selection to the host"
         );
     }
 
@@ -2025,45 +2042,36 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("mine.md"),
-            "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\n---\nbody\n",
+            vnext_workspace_agent("mine", "mine", "body"),
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Enter));
-        let detail = page(&d).detail.as_ref().expect("detail opens");
-        assert!(detail.draft.granted("read"));
-        assert!(detail.draft.granted("search"));
-        assert_eq!(detail.draft.tier("search"), ToolTier::Discoverable);
+        assert!(page(&d).detail.is_none());
+        assert!(
+            page(&d)
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("tool authority is host-owned")
+        );
     }
 
     #[test]
-    fn agents_page_grant_and_tier_persist_to_markdown() {
+    fn agents_page_rejects_legacy_tool_grants_before_structured_editing() {
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
         let path = agents_dir.join("mine.md");
         fs::write(&path, "---\ndescription: mine\ntools: [read]\n---\nbody\n").unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "mine");
-        d.handle_key(press(KeyCode::Enter));
-        focus_tool(&mut d, "search");
-        d.handle_key(press(KeyCode::Char(' ')));
-        d.handle_key(press(KeyCode::Char('t')));
-        focus_tool(&mut d, "mcp");
-        d.handle_key(press(KeyCode::Char(' ')));
-        d.handle_key(ctrl_s());
-        let def = load_agent(&path, "mine");
-        assert!(def.tools.unwrap().iter().any(|tool| tool == "search"));
-        assert_eq!(def.tool_tiers.get("search"), Some(&ToolTier::Discoverable));
-        let on_disk = fs::read_to_string(&path).unwrap();
-        assert!(on_disk.contains("tools:"));
-        assert!(on_disk.contains("toolTiers:"));
-        assert!(on_disk.find("tools:").unwrap() < on_disk.find("toolTiers:").unwrap());
+        let err = cockpit_core::agents::load_workspace_named_from_file(&path, "mine")
+            .expect_err("v2 rejects manifest tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 2"));
     }
 
     #[test]
-    fn agents_page_structural_and_write_tools_skip_discoverable() {
+    fn agents_page_rejects_legacy_structural_and_write_tool_authority() {
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2072,80 +2080,40 @@ pub(super) mod tests {
             "---\ndescription: mine\ntools: [read, question, write]\n---\nbody\n",
         )
         .unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "mine");
-        d.handle_key(press(KeyCode::Enter));
-        for tool in ["question", "write"] {
-            focus_tool(&mut d, tool);
-            let mut observed = Vec::new();
-            for _ in 0..4 {
-                d.handle_key(press(KeyCode::Char('t')));
-                observed.push(page(&d).detail.as_ref().unwrap().draft.tier(tool));
-            }
-            assert!(!observed.contains(&ToolTier::Discoverable), "{tool}");
-            assert!(observed.contains(&ToolTier::Enabled), "{tool}");
-            assert!(!observed.contains(&ToolTier::Disabled), "{tool}");
-        }
+        let err = cockpit_core::agents::load_workspace_named_from_file(
+            &agents_dir.join("mine.md"),
+            "mine",
+        )
+        .expect_err("v2 rejects manifest tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 2"));
     }
 
     #[test]
-    fn agents_page_validation_error_blocks_persist() {
+    fn agents_page_rejects_legacy_fork_and_tool_authority() {
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
         let path = agents_dir.join("mine.md");
         let original = "---\ndescription: mine\nmode: subagent\ntools: [read]\n---\nbody\n";
         fs::write(&path, original).unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "mine");
-        d.handle_key(press(KeyCode::Enter));
-        focus_tool(&mut d, "start_build");
-        d.handle_key(press(KeyCode::Char(' ')));
-        d.handle_key(ctrl_s());
-        let detail = page(&d).detail.as_ref().unwrap();
-        assert!(
-            detail
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("start_build"),
-            "{:?}",
-            detail.status
-        );
-        assert!(detail.row_errors.contains_key("start_build"));
+        let err = cockpit_core::agents::load_workspace_named_from_file(&path, "mine")
+            .expect_err("v2 rejects legacy fork and tool authority");
+        assert!(format!("{err}").contains("schemaVersion: 2"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
-    fn agents_page_conflict_blocks_structured_overwrite() {
+    fn agents_page_legacy_tool_fixture_is_not_a_structured_editor_candidate() {
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
         let path = agents_dir.join("mine.md");
         fs::write(&path, "---\ndescription: mine\ntools: [read]\n---\nbody\n").unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "mine");
-        d.handle_key(press(KeyCode::Enter));
-        focus_tool(&mut d, "search");
-        d.handle_key(press(KeyCode::Char(' ')));
-        let changed = "---\ndescription: changed\ntools: [read]\n---\nbody\n";
-        fs::write(&path, changed).unwrap();
-        d.handle_key(ctrl_s());
-        assert!(
-            page(&d)
-                .detail
-                .as_ref()
-                .unwrap()
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("conflict")
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        assert!(cockpit_core::agents::load_workspace_named_from_file(&path, "mine").is_err());
     }
 
     #[test]
-    fn agents_page_ungrant_drops_tool_description_override_with_notice() {
+    fn agents_page_rejects_legacy_tool_descriptions() {
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2155,26 +2123,7 @@ pub(super) mod tests {
             "---\ndescription: mine\ntools: [read, search, mcp]\ntoolTiers:\n  search: discoverable\ntool_descriptions:\n  search:\n    normal: custom search\n---\nbody\n",
         )
         .unwrap();
-        let mut d = agents_dialog(&tmp);
-        focus(&mut d, "mine");
-        d.handle_key(press(KeyCode::Enter));
-        focus_tool(&mut d, "search");
-        d.handle_key(press(KeyCode::Char(' ')));
-        d.handle_key(ctrl_s());
-        let def = load_agent(&path, "mine");
-        assert!(!def.tools.unwrap().iter().any(|tool| tool == "search"));
-        assert!(!def.tool_tiers.contains_key("search"));
-        assert!(!def.tool_descriptions.contains_key("search"));
-        assert!(
-            page(&d)
-                .detail
-                .as_ref()
-                .unwrap()
-                .status
-                .as_deref()
-                .unwrap_or("")
-                .contains("removed custom description for `search`")
-        );
+        assert!(cockpit_core::agents::load_workspace_named_from_file(&path, "mine").is_err());
     }
 
     #[test]
@@ -2198,69 +2147,32 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn agents_page_assistant_wizard_tools_step_is_structured() {
+    fn agents_page_assistant_wizard_omits_host_owned_tool_authority() {
         let descriptor = cockpit_core::assistants::descriptor();
-        let step = descriptor
-            .steps
-            .iter()
-            .find(|step| step.id == "tools")
-            .unwrap();
-        assert!(matches!(
-            step.kind,
-            cockpit_core::wizard::StepKind::ToolSurface
-        ));
-        assert!(
-            cockpit_core::agents::tool_surface_catalog()
-                .iter()
-                .any(|tool| tool.name == "read")
-        );
+        assert!(descriptor.steps.iter().all(|step| step.id != "tools"
+            && !matches!(step.kind, cockpit_core::wizard::StepKind::ToolSurface)));
     }
 
     #[test]
-    fn agents_page_assistant_wizard_rejects_invalid_grant_before_save() {
+    fn agents_page_assistant_wizard_rejects_legacy_tool_surface_answer() {
         let mut run =
             cockpit_core::wizard::WizardRun::new(cockpit_core::assistants::descriptor()).unwrap();
-        run.submit(cockpit_core::wizard::WizardAnswer::Text(
-            "Assistant".to_string(),
-        ))
-        .unwrap();
-        run.submit(cockpit_core::wizard::WizardAnswer::Select(
-            "primary".to_string(),
-        ))
-        .unwrap();
-        run.submit(cockpit_core::wizard::WizardAnswer::Text(String::new()))
-            .unwrap();
         let result = run.submit(cockpit_core::wizard::WizardAnswer::ToolSurface(
             cockpit_core::agents::ToolSurfaceSelection {
                 tools: vec!["grep".to_string()],
-                tool_tiers: BTreeMap::new(),
+                tool_tiers: Default::default(),
             },
         ));
         assert!(result.is_err());
-        assert!(run.error().unwrap_or("").contains("grep"));
+        assert!(run.error().is_some());
     }
 
     #[test]
-    fn agents_page_assistant_wizard_tiers_persist_in_spec() {
+    fn agents_page_assistant_wizard_v2_spec_persists_identity_and_prompt_only() {
         let mut run =
             cockpit_core::wizard::WizardRun::new(cockpit_core::assistants::descriptor()).unwrap();
         run.submit(cockpit_core::wizard::WizardAnswer::Text(
             "Assistant".to_string(),
-        ))
-        .unwrap();
-        run.submit(cockpit_core::wizard::WizardAnswer::Select(
-            "primary".to_string(),
-        ))
-        .unwrap();
-        run.submit(cockpit_core::wizard::WizardAnswer::Text(String::new()))
-            .unwrap();
-        let mut tiers = BTreeMap::new();
-        tiers.insert("search".to_string(), ToolTier::Discoverable);
-        run.submit(cockpit_core::wizard::WizardAnswer::ToolSurface(
-            cockpit_core::agents::ToolSurfaceSelection {
-                tools: vec!["read".to_string(), "search".to_string(), "mcp".to_string()],
-                tool_tiers: tiers.clone(),
-            },
         ))
         .unwrap();
         run.submit(cockpit_core::wizard::WizardAnswer::Text(
@@ -2273,7 +2185,10 @@ pub(super) mod tests {
             &run,
         )
         .unwrap();
-        assert_eq!(spec.tool_tiers, tiers);
+        assert_eq!(spec.name, "helper-bot");
+        assert_eq!(spec.description, "Assistant");
+        assert_eq!(spec.prompt, "Help.");
+        assert_eq!(spec.home_dir, std::path::PathBuf::from("/tmp/helper-bot"));
     }
 
     #[test]
@@ -2302,7 +2217,7 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("mine.md"),
-            "---\ndescription: orig\n---\nbody\n",
+            vnext_workspace_agent("mine", "orig", "body"),
         )
         .unwrap();
         // Vim mode off → the in-TUI editor types chars directly.
@@ -2341,7 +2256,7 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("mine.md"),
-            "---\ndescription: orig\n---\nbody\n",
+            vnext_workspace_agent("mine", "orig", "body"),
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
@@ -2378,7 +2293,7 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("scratch.md"),
-            "---\ndescription: s\n---\nb\n",
+            vnext_workspace_agent("scratch", "s", "b"),
         )
         .unwrap();
         let mut d = agents_dialog(&tmp);
@@ -2521,7 +2436,7 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("pointer-agent.md"),
-            "---\ndescription: pointer fixture\n---\nbody\n",
+            vnext_workspace_agent("pointer-agent", "pointer fixture", "body"),
         )
         .unwrap();
         #[cfg(unix)]
@@ -2684,7 +2599,7 @@ pub(super) mod tests {
         assert_eq!(request.operation_id, operation);
         assert_eq!(
             request.text_before_launch,
-            "---\ndescription: pointer fixture\n---\nXbody\n"
+            vnext_workspace_agent("pointer-agent", "pointer fixture", "Xbody")
         );
         assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
         let cwd = dialog.cx.agents_cwd();
@@ -2811,7 +2726,11 @@ pub(super) mod tests {
         let replacement_cases: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
         for &replacement in replacement_cases {
             let target = agents_dir.join("pointer-agent.md");
-            fs::write(&target, "---\ndescription: pointer fixture\n---\nXbody\n").unwrap();
+            fs::write(
+                &target,
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "Xbody"),
+            )
+            .unwrap();
             let mut conflict = agents_dialog(&tmp);
             focus(&mut conflict, "pointer-agent");
             conflict.handle_key(press(KeyCode::Enter));
@@ -2829,13 +2748,14 @@ pub(super) mod tests {
                 .take_external_edit_request()
                 .expect("regular-file conflict effect");
             fs::write(&effect.path, "staged replacement").unwrap();
-            let concurrent = b"---\ndescription: pointer fixture\n---\nYbody\n";
+            let concurrent =
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "Ybody").into_bytes();
             if replacement {
                 let replacement_path = agents_dir.join("replacement.md");
-                fs::write(&replacement_path, concurrent).unwrap();
+                fs::write(&replacement_path, &concurrent).unwrap();
                 fs::rename(replacement_path, &target).unwrap();
             } else {
-                fs::write(&target, concurrent).unwrap();
+                fs::write(&target, &concurrent).unwrap();
             }
             conflict.finish_agent_external_edit(
                 effect.operation_id,
@@ -2959,7 +2879,7 @@ pub(super) mod tests {
             fs::create_dir_all(&agents_dir).unwrap();
             fs::write(
                 agents_dir.join("pointer-agent.md"),
-                "---\ndescription: pointer fixture\n---\nbody\n",
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "body"),
             )
             .unwrap();
             let mut dialog = agents_dialog(&tmp);
@@ -3016,7 +2936,8 @@ pub(super) mod tests {
                 );
             } else {
                 assert_eq!(
-                    persisted, "---\ndescription: pointer fixture\n---\nbody\n",
+                    persisted,
+                    vnext_workspace_agent("pointer-agent", "pointer fixture", "body"),
                     "Cancel discards the raw editor draft"
                 );
             }
@@ -3028,7 +2949,7 @@ pub(super) mod tests {
         fs::create_dir_all(&agents_dir).unwrap();
         fs::write(
             agents_dir.join("pointer-agent.md"),
-            "---\ndescription: pointer fixture\ntools: [read, search, mcp]\n---\nbody\n",
+            vnext_workspace_agent("pointer-agent", "pointer fixture", "body"),
         )
         .unwrap();
         agents_dialog(tmp)
@@ -3340,7 +3261,7 @@ pub(super) mod tests {
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::write(
             agents_dir.join("my-reviewer.md"),
-            "---\ndescription: r\n---\nb\n",
+            vnext_workspace_agent("my-reviewer", "r", "b"),
         )
         .unwrap();
         // Refresh the page so it sees the custom agent.

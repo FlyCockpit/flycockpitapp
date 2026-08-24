@@ -1,5 +1,34 @@
 use super::*;
 
+/// The side-effect-free result of the utility-model skill pass.  In
+/// particular, diagnostics are retained until the caller commits the user
+/// turn; recording them while a text-artifact reservation is still pending
+/// would leave a rejected submission observably mutating the session.
+pub(in crate::engine::driver) enum PreparedAutoSkillInjection {
+    NoUtilityModel,
+    Selected {
+        selection: crate::skills::auto_select::Selection,
+        diagnostics: crate::skills::auto_select::SelectionDiagnostics,
+    },
+}
+
+impl PreparedAutoSkillInjection {
+    /// The model-visible prefix this selection contributes.  Pure and usable
+    /// while composing an accepted oversized envelope.
+    pub(in crate::engine::driver) fn guidance(&self, user_text: &str) -> String {
+        match self {
+            Self::Selected {
+                selection: crate::skills::auto_select::Selection::Skills(skills),
+                ..
+            } => Driver::fold_injected_skills(skills, user_text)
+                .strip_suffix(user_text)
+                .unwrap_or_default()
+                .to_owned(),
+            Self::Selected { .. } | Self::NoUtilityModel => String::new(),
+        }
+    }
+}
+
 /// Resolve where to persist an edited injection check-prompt: the project
 /// `.cockpit/` layer for `cwd` when one already exists (so the override is
 /// project-scoped where the project already carries config), else the
@@ -50,14 +79,23 @@ impl Driver {
         user_text: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> String {
+        let prepared = self.prepare_auto_skill_injection(user_text).await;
+        self.apply_prepared_auto_skill_injection(prepared, user_text, tx)
+            .await
+    }
+
+    /// Resolve auto-skill selection without changing session-visible state.
+    /// Oversized submissions call this before their phase-two transaction so
+    /// a rejected reservation cannot consume the once-per-session set, create
+    /// diagnostics, alter active skills, or emit transcript rows.
+    pub(in crate::engine::driver) async fn prepare_auto_skill_injection(
+        &self,
+        user_text: &str,
+    ) -> PreparedAutoSkillInjection {
         let (extended, providers) = self.config.configs();
 
         if extended.skill_injection_model_ref().is_none() {
-            if !self.skills_no_utility_model_logged {
-                self.skills_no_utility_model_logged = true;
-                tracing::info!("skills auto-selection skipped: no `utility_model` configured");
-            }
-            return user_text.to_string();
+            return PreparedAutoSkillInjection::NoUtilityModel;
         }
 
         // Feed the selector the same window `predict` uses: the recent
@@ -92,6 +130,34 @@ impl Driver {
             &self.auto_injected_skills,
         )
         .await;
+        PreparedAutoSkillInjection::Selected {
+            selection,
+            diagnostics,
+        }
+    }
+
+    /// Make a prepared auto-selection visible after acceptance.  Keeping this
+    /// as the only mutation point gives the oversized phase-two boundary the
+    /// same all-or-nothing behavior as forced skill seeding.
+    pub(in crate::engine::driver) async fn apply_prepared_auto_skill_injection(
+        &mut self,
+        prepared: PreparedAutoSkillInjection,
+        user_text: &str,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> String {
+        let (selection, diagnostics) = match prepared {
+            PreparedAutoSkillInjection::NoUtilityModel => {
+                if !self.skills_no_utility_model_logged {
+                    self.skills_no_utility_model_logged = true;
+                    tracing::info!("skills auto-selection skipped: no `utility_model` configured");
+                }
+                return user_text.to_string();
+            }
+            PreparedAutoSkillInjection::Selected {
+                selection,
+                diagnostics,
+            } => (selection, diagnostics),
+        };
         if !diagnostics.is_empty() {
             // Host-generated: `rejections` are the auto-selector's own structured
             // reject reasons (skill name + host classification), not model-authored

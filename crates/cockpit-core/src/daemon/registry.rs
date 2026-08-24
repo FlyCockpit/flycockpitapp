@@ -2063,6 +2063,20 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_response_metrics_tokenizer_blocks_registry_attach_snapshot() {
+        fn assert_invalid_tokenizer_blocks_snapshot(
+            error: anyhow::Error,
+            expected_outer_context: &str,
+        ) {
+            // Registry callers require the fail-closed boundary, not an
+            // implementation-specific concrete error. Each entry point keeps
+            // its useful, stable outer context while the tokenizer cause stays
+            // redacted throughout the chain.
+            assert_eq!(error.to_string(), expected_outer_context);
+            let chain = format!("{error:#}");
+            assert!(chain.contains("configuration value is invalid"));
+            assert!(!chain.contains("invalid-registry-value"));
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let _home =
             crate::config::dirs::test_support::IsolatedCockpitHome::new_async(tmp.path()).await;
@@ -2105,11 +2119,7 @@ mod tests {
             .await
             .err()
             .expect("invalid tokenizer must block registry snapshot");
-        assert!(
-            error
-                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
-                .is_some()
-        );
+        assert_invalid_tokenizer_blocks_snapshot(error, "configuration value is invalid");
         let resume_error = reg
             .attach(
                 Some(persisted.session_id),
@@ -2125,21 +2135,22 @@ mod tests {
             .await
             .err()
             .expect("invalid tokenizer must block resumed snapshot");
-        assert!(
-            resume_error
-                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
-                .is_some()
-        );
+        assert_invalid_tokenizer_blocks_snapshot(resume_error, "configuration value is invalid");
         let assistant_home = tmp.path().join("assistant");
         std::fs::create_dir_all(&assistant_home).unwrap();
         std::fs::write(
             assistant_home.join("assistant.md"),
-            "---\ndescription: Test helper\nmode: primary\n---\n\nHelp with tests.\n",
+            "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nHelp with tests.\n",
         )
         .unwrap();
         reg.inner
             .db
-            .upsert_assistant("helper", assistant_home.to_str().unwrap(), "{}", "hash")
+            .upsert_assistant(
+                "helper",
+                assistant_home.to_str().unwrap(),
+                r#"{"installationId":"00000000-0000-0000-0000-000000000001"}"#,
+                "hash",
+            )
             .await
             .unwrap();
         let create_error = reg
@@ -2156,11 +2167,7 @@ mod tests {
             .await
             .err()
             .expect("invalid tokenizer must block assistant snapshot creation");
-        assert!(
-            create_error
-                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
-                .is_some()
-        );
+        assert_invalid_tokenizer_blocks_snapshot(create_error, "configuration value is invalid");
     }
 
     #[tokio::test]

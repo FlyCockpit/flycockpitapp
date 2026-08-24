@@ -3,817 +3,42 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::OptionalExtension;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use uuid::Uuid;
 
 use cockpit_db::db::Db;
-use cockpit_db::db::compressed_results::CompressedToolResultEntry;
-use cockpit_db::db::session_log::{SessionEventContext, SessionEventKind};
+pub use cockpit_db::db::archive_import::{
+    ArchiveImportResult as ImportResult, SessionArchiveImportGraph as ImportArchive,
+};
+use cockpit_db::db::archive_import::{
+    ImportedArchiveActiveModel, ImportedArchiveDelegationChild as ImportedDelegationChild,
+    ImportedArchiveDelegationJob as ImportedDelegationJob,
+    ImportedArchiveDelegationPayload as ImportedDelegationPayload,
+    ImportedArchiveDelegationSteer as ImportedDelegationSteer,
+    ImportedArchiveEvent as ImportedEvent, ImportedArchiveSession as ImportedSession,
+    ImportedArchiveTextArtifact as ImportedTextArtifact,
+};
+#[cfg(test)]
+use cockpit_db::db::session_log::SessionEventContext;
+use cockpit_db::db::session_log::SessionEventKind;
+use cockpit_db::db::text_artifacts::{
+    CaptureReason, TextArtifactKind, TextArtifactRelation, TextArtifactRepresentation,
+};
 
 // Current exports may emit one sidecar per tool or inference event; 16,384 permits
-// realistic long-lived session bundles while the independent 64MiB decompressed cap
+// realistic long-lived session bundles while the independent 1GiB decompressed cap
 // bounds archive resource use.
 const MAX_IMPORT_ENTRIES: usize = 16_384;
-const MAX_IMPORT_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
-const EXPORT_SCHEMA: &str = "cockpit-session-export/2";
+const MAX_IMPORT_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const EXPORT_SCHEMA: &str = "cockpit-session-export/3";
+const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
+const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-struct ImportedSession {
-    source_id: Uuid,
-    parent_source_id: Option<Uuid>,
-    short_id: Option<String>,
-    fork_point_turn_id: Option<String>,
-    active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    active_agent: String,
-    started_at: i64,
-    ended_at: Option<i64>,
-    title: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedEvent {
-    seq: i64,
-    ts_ms: i64,
-    kind: SessionEventKind,
-    source_session_id: Uuid,
-    agent: Option<String>,
-    call_id: Option<String>,
-    data_json: String,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedCompressedResult {
-    source_session_id: Uuid,
-    hash: String,
-    agent_id: String,
-    tool: String,
-    call_id: String,
-    original_byte_len: usize,
-    compressed_byte_len: Option<usize>,
-    created_at: i64,
-    kind: String,
-    content: String,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedDelegationChild {
-    label: String,
-    child_agent: String,
-    model: Option<String>,
-    status: String,
-    report: Option<String>,
-    output_dir: Option<String>,
-    todo_ids_json: Option<String>,
-    result_delivered: bool,
-    started_at: Option<i64>,
-    finished_at: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
-    requested_cwd: Option<String>,
-    resolved_cwd: Option<String>,
-}
-#[derive(Debug, Clone)]
-struct ImportedDelegationJob {
-    task_call_id: String,
-    function_call_id: Option<String>,
-    parent_source_id: Uuid,
-    parent_agent: String,
-    original_args_json: Option<String>,
-    status: String,
-    ack_delivered: bool,
-    final_delivered: bool,
-    created_at: i64,
-    updated_at: i64,
-    children: Vec<ImportedDelegationChild>,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedDelegationPayload {
-    task_call_id: String,
-    function_call_id: Option<String>,
-    source_session_id: Uuid,
-    parent_agent: String,
-    label: String,
-    payload_hash: String,
-    child_agent: String,
-    prompt_byte_len: usize,
-    created_at: i64,
-    delivered_at: Option<i64>,
-    body: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedDelegationSteer {
-    task_call_id: String,
-    label: String,
-    source_session_id: Uuid,
-    origin_principal: String,
-    body: String,
-    delivered: bool,
-    created_at: i64,
-    delivered_at: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ImportArchive {
-    project_id: String,
-    project_root: String,
-    pub redacted: bool,
-    sessions: Vec<ImportedSession>,
-    events: Vec<ImportedEvent>,
-    compressed_results: Vec<ImportedCompressedResult>,
-    delegation_jobs: Vec<ImportedDelegationJob>,
-    delegation_payloads: Vec<ImportedDelegationPayload>,
-    delegation_steers: Vec<ImportedDelegationSteer>,
-    inference_calls: Vec<Value>,
-    tool_calls: Vec<Value>,
-}
-
-pub async fn import_archive(db: &Db, archive: ImportArchive, as_new: bool) -> Result<ImportResult> {
-    db.transaction(move |conn| restore_archive_conn(conn, archive, as_new))
-        .await
-}
-
-#[derive(Debug, Clone)]
-pub struct ImportResult {
-    pub imported: Vec<Uuid>,
-    pub redacted: bool,
-}
-
-fn restore_archive_conn(
-    conn: &rusqlite::Connection,
-    archive: ImportArchive,
-    as_new: bool,
-) -> Result<ImportResult> {
-    let source_ids: BTreeSet<Uuid> = archive
-        .sessions
-        .iter()
-        .map(|session| session.source_id)
-        .collect();
-    if source_ids.len() != archive.sessions.len() {
-        bail!("import archive lists a session more than once");
-    }
-    for session in &archive.sessions {
-        if let Some(parent) = session.parent_source_id
-            && !source_ids.contains(&parent)
-        {
-            bail!("import archive references a parent session that is not in the archive");
-        }
-    }
-    for event in &archive.events {
-        if !source_ids.contains(&event.source_session_id) {
-            bail!("import archive contains an event for an unknown session");
-        }
-    }
-    for result in &archive.compressed_results {
-        if !source_ids.contains(&result.source_session_id) {
-            bail!("import archive contains a compressed result for an unknown session");
-        }
-    }
-    let delegation_jobs: BTreeMap<&str, &ImportedDelegationJob> = archive
-        .delegation_jobs
-        .iter()
-        .map(|job| (job.task_call_id.as_str(), job))
-        .collect();
-    if delegation_jobs.len() != archive.delegation_jobs.len() {
-        bail!("import archive lists a delegation job more than once");
-    }
-    for job in &archive.delegation_jobs {
-        if !source_ids.contains(&job.parent_source_id) {
-            bail!("import archive contains a delegation job for an unknown session");
-        }
-        validate_delegation_status(&job.status, "delegation job")?;
-        let labels: BTreeSet<&str> = job
-            .children
-            .iter()
-            .map(|child| child.label.as_str())
-            .collect();
-        if labels.len() != job.children.len() {
-            bail!("import archive lists a delegation child more than once");
-        }
-        for child in &job.children {
-            validate_delegation_status(&child.status, "delegation child")?;
-        }
-    }
-    for payload in &archive.delegation_payloads {
-        let job = delegation_jobs
-            .get(payload.task_call_id.as_str())
-            .ok_or_else(|| {
-                anyhow!("import archive contains a payload for an unknown delegation job")
-            })?;
-        if job.parent_source_id != payload.source_session_id {
-            bail!("import archive delegation payload session does not match its job");
-        }
-        if !job
-            .children
-            .iter()
-            .any(|child| child.label == payload.label)
-        {
-            bail!("import archive contains a payload for an unknown delegation child");
-        }
-    }
-    for steer in &archive.delegation_steers {
-        let job = delegation_jobs
-            .get(steer.task_call_id.as_str())
-            .ok_or_else(|| {
-                anyhow!("import archive contains a steer for an unknown delegation job")
-            })?;
-        if job.parent_source_id != steer.source_session_id {
-            bail!("import archive delegation steer session does not match its job");
-        }
-        if !job.children.iter().any(|child| child.label == steer.label) {
-            bail!("import archive contains a steer for an unknown delegation child");
-        }
-    }
-
-    preflight_global_call_id_collisions(conn, &archive, as_new)?;
-
-    let mut id_map = BTreeMap::new();
-    for source_id in &source_ids {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
-            [source_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if exists && !as_new {
-            bail!(
-                "session `{source_id}` already exists; rerun with --as-new to import a separate copy"
-            );
-        }
-        id_map.insert(*source_id, if as_new { Uuid::new_v4() } else { *source_id });
-    }
-
-    let task_call_id_map: BTreeMap<String, String> = if as_new {
-        archive
-            .delegation_jobs
-            .iter()
-            .map(|job| {
-                (
-                    job.task_call_id.clone(),
-                    format!(
-                        "import:{}:{}",
-                        id_map[&job.parent_source_id], job.task_call_id
-                    ),
-                )
-            })
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
-
-    let mut remaining: BTreeMap<Uuid, ImportedSession> = archive
-        .sessions
-        .into_iter()
-        .map(|session| (session.source_id, session))
-        .collect();
-    let mut inserted = BTreeSet::new();
-    let mut imported = Vec::new();
-    while !remaining.is_empty() {
-        let ready: Vec<Uuid> = remaining
-            .iter()
-            .filter_map(|(source_id, session)| {
-                session
-                    .parent_source_id
-                    .is_none_or(|parent| inserted.contains(&parent))
-                    .then_some(*source_id)
-            })
-            .collect();
-        if ready.is_empty() {
-            bail!("import archive contains a cyclic session parent relationship");
-        }
-        for source_id in ready {
-            let session = remaining.remove(&source_id).expect("ready session exists");
-            let mut row = Db::build_new_session_row_conn(
-                conn,
-                &archive.project_id,
-                &archive.project_root,
-                &session.active_agent,
-            )?;
-            row.session_id = id_map[&source_id];
-            row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
-            row.short_id = session.short_id;
-            row.fork_point_turn_id = session.fork_point_turn_id;
-            if let Some(active_model) = session.active_model {
-                row.provider = Some(active_model.provider.clone());
-                row.model = Some(active_model.model.clone());
-                row.model_selection_json = Some(
-                    serde_json::to_string(&active_model)
-                        .context("encoding imported session active model")?,
-                );
-            }
-            row.started_at = session.started_at;
-            row.last_active_at = session.started_at;
-            row.ended_at = session.ended_at;
-            row.title = session.title;
-            Db::insert_session_row_conn(conn, &row)?;
-            conn.execute(
-                "UPDATE sessions\n                    SET parent_session_id = ?1, fork_point_turn_id = ?2, ended_at = ?3,\n                        title = ?4, last_active_at = ?5\n                  WHERE session_id = ?6",
-                rusqlite::params![
-                    row.parent_session_id.map(|id| id.to_string()),
-                    row.fork_point_turn_id,
-                    row.ended_at,
-                    row.title,
-                    row.last_active_at,
-                    row.session_id.to_string(),
-                ],
-            )?;
-            inserted.insert(source_id);
-            imported.push(row.session_id);
-        }
-    }
-
-    for job in &archive.delegation_jobs {
-        conn.execute(
-            "INSERT INTO task_delegation_jobs (
-                task_call_id, function_call_id, parent_session_id, parent_agent,
-                original_args_json, status, ack_delivered, final_delivered, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                task_call_id_map
-                    .get(&job.task_call_id)
-                    .unwrap_or(&job.task_call_id),
-                job.function_call_id,
-                id_map[&job.parent_source_id].to_string(),
-                job.parent_agent,
-                job.original_args_json,
-                job.status,
-                job.ack_delivered as i64,
-                job.final_delivered as i64,
-                job.created_at,
-                job.updated_at,
-            ],
-        )?;
-    }
-    for job in &archive.delegation_jobs {
-        for child in &job.children {
-            conn.execute(
-                "INSERT INTO task_delegation_children (
-                    task_call_id, label, child_agent, model, status, report, output_dir,
-                    todo_ids_json, result_delivered, started_at, finished_at, created_at,
-                    updated_at, requested_cwd, resolved_cwd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                rusqlite::params![
-                    task_call_id_map
-                        .get(&job.task_call_id)
-                        .unwrap_or(&job.task_call_id),
-                    child.label,
-                    child.child_agent,
-                    child.model,
-                    child.status,
-                    child.report,
-                    child.output_dir,
-                    child.todo_ids_json,
-                    child.result_delivered as i64,
-                    child.started_at,
-                    child.finished_at,
-                    child.created_at,
-                    child.updated_at,
-                    child.requested_cwd,
-                    child.resolved_cwd,
-                ],
-            )?;
-        }
-    }
-    for payload in &archive.delegation_payloads {
-        // The schema requires an inline body or a sidecar path. Archives with
-        // `load_error` intentionally have neither, so retain their index metadata
-        // during parsing but do not manufacture an unreadable DB payload row.
-        let Some(body) = payload.body.as_deref() else {
-            continue;
-        };
-        conn.execute(
-            "INSERT INTO task_delegation_payloads (
-                task_call_id, label, payload_hash, parent_session_id, parent_agent,
-                function_call_id, child_agent, prompt_byte_len, body_inline, created_at, delivered_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                task_call_id_map.get(&payload.task_call_id).unwrap_or(&payload.task_call_id), payload.label, payload.payload_hash,
-                id_map[&payload.source_session_id].to_string(), payload.parent_agent,
-                payload.function_call_id, payload.child_agent, payload.prompt_byte_len as i64,
-                body, payload.created_at, payload.delivered_at,
-            ],
-        )?;
-    }
-    for steer in &archive.delegation_steers {
-        conn.execute(
-            "INSERT INTO task_delegation_steers (
-                task_call_id, label, body, origin_principal, delivered, created_at, delivered_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                task_call_id_map
-                    .get(&steer.task_call_id)
-                    .unwrap_or(&steer.task_call_id),
-                steer.label,
-                steer.body,
-                steer.origin_principal,
-                steer.delivered as i64,
-                steer.created_at,
-                steer.delivered_at,
-            ],
-        )?;
-    }
-
-    let compressed_results = archive
-        .compressed_results
-        .iter()
-        .map(|result| CompressedToolResultEntry {
-            hash: result.hash.clone(),
-            session_id: id_map[&result.source_session_id],
-            agent_id: result.agent_id.clone(),
-            tool: result.tool.clone(),
-            call_id: result.call_id.clone(),
-            original_byte_len: result.original_byte_len,
-            compressed_byte_len: result.compressed_byte_len,
-            created_at: result.created_at,
-            kind: result.kind.clone(),
-            content: result.content.clone(),
-        })
-        .collect::<Vec<_>>();
-    Db::insert_compressed_tool_results_conn(conn, &compressed_results)?;
-
-    restore_telemetry_rows(conn, &archive.inference_calls, &archive.tool_calls, &id_map)?;
-
-    let provenance_ts = archive
-        .events
-        .iter()
-        .map(|event| event.ts_ms)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let mut events = archive.events;
-    events.sort_by_key(|event| event.seq);
-    let mut event_seq_map = BTreeMap::new();
-    let mut tandem_sidecars = Vec::new();
-    for mut event in events {
-        let mut event_data: Value =
-            serde_json::from_str(&event.data_json).context("parsing hydrated import event data")?;
-        if let Some(remapped) = event
-            .call_id
-            .as_ref()
-            .and_then(|id| task_call_id_map.get(id))
-        {
-            event.call_id = Some(remapped.clone());
-        }
-        remap_task_call_id_references(&mut event_data, &task_call_id_map);
-        event.data_json = serde_json::to_string(&event_data)?;
-        if let Some(sidecar) = event_data.get("inference_request_sidecar")
-            && let Some(request) = sidecar.get("request")
-        {
-            let call_id = event
-                .call_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("inference request sidecar event lacks call_id"))?;
-            let status = sidecar
-                .get("status")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("inference request sidecar lacks status"))?;
-            // Round-trip the attempt ordinal + phase columns + per-attempt
-            // metadata without re-injecting phases into the immutable body.
-            // Absent (legacy archive) → ordinal 0, empty phases.
-            let ordinal = sidecar.get("ordinal").and_then(Value::as_i64).unwrap_or(0);
-            let phases = sidecar.get("phases");
-            let phase_ms = |key: &str| phases.and_then(|p| p.get(key)).and_then(Value::as_i64);
-            Db::insert_inference_request_conn(
-                conn,
-                &cockpit_db::db::session_log::ImportedInferenceRequest {
-                    call_id,
-                    ordinal,
-                    session_id: id_map[&event.source_session_id],
-                    ts_ms: event.ts_ms,
-                    payload: request,
-                    status,
-                    provider: sidecar.get("provider").and_then(Value::as_str),
-                    model: sidecar.get("model").and_then(Value::as_str),
-                    trust: sidecar.get("trust").and_then(Value::as_str),
-                    phases: cockpit_db::db::session_log::InferencePhaseTimings {
-                        first_token_ms: phase_ms("first_token_ms"),
-                        completed_ms: phase_ms("completed_ms"),
-                        failed_ms: phase_ms("failed_ms"),
-                    },
-                },
-            )?;
-        }
-        // `HookRun` is a sole-writer, data-only audit kind: the generic writer
-        // rejects it (`reject_generic_hook_run`). Restore it through the typed
-        // import writer, which re-validates the closed audit projection via
-        // `HookRunAudit::from_json` (rejecting unknown/sensitive fields) before
-        // it can enter the ledger. Unknown event kinds still hard-error in
-        // `parse_event_kind` above.
-        let restored_seq = if event.kind == SessionEventKind::HookRun {
-            Db::insert_imported_hook_run_conn(
-                conn,
-                id_map[&event.source_session_id],
-                event.ts_ms,
-                &event_data,
-            )?
-        } else {
-            Db::insert_session_event_json_conn(
-                conn,
-                id_map[&event.source_session_id],
-                event.kind,
-                event.agent.as_deref(),
-                event.call_id.as_deref(),
-                SessionEventContext::default(),
-                event.ts_ms,
-                &event.data_json,
-            )?
-        };
-        event_seq_map.insert((event.source_session_id, event.seq), restored_seq);
-        if let Some(sidecar) = event_data.get("tandem_inference_sidecar") {
-            tandem_sidecars.push((event, sidecar.clone()));
-        }
-    }
-    for (event, sidecar) in tandem_sidecars {
-        let call_id = event
-            .call_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("tandem inference sidecar event lacks call_id"))?;
-        let provider = required_sidecar_string(&sidecar, "provider", "tandem inference sidecar")?;
-        let model = required_sidecar_string(&sidecar, "model", "tandem inference sidecar")?;
-        let status = required_sidecar_string(&sidecar, "status", "tandem inference sidecar")?;
-        let request = sidecar
-            .get("request")
-            .ok_or_else(|| anyhow!("tandem inference sidecar lacks request"))?;
-        let parent_seq = *event_seq_map
-            .get(&(event.source_session_id, event.seq))
-            .ok_or_else(|| anyhow!("tandem inference parent event was not restored"))?;
-        let target_session_id = id_map[&event.source_session_id];
-        let imported_id = format!("import:{target_session_id}:{call_id}:{provider}:{model}");
-        Db::upsert_tandem_inference_conn(
-            conn,
-            &imported_id,
-            target_session_id,
-            call_id,
-            Some(parent_seq),
-            event.agent.as_deref(),
-            provider,
-            model,
-            event.ts_ms,
-            request,
-            sidecar.get("response"),
-            sidecar.get("usage"),
-            status,
-        )?;
-    }
-
-    // Provenance is a durable, user-visible notice rather than a hidden schema
-    // mutation. It intentionally records redaction so a restored transcript is
-    // never mistaken for the original unredacted conversation.
-    for source_id in &source_ids {
-        let data_json = serde_json::to_string(&json!({
-            "source": "session_import",
-            "original_session_id": source_id,
-            "redacted": archive.redacted,
-            "as_new": as_new,
-        }))?;
-        Db::insert_session_event_json_conn(
-            conn,
-            id_map[source_id],
-            SessionEventKind::Notice,
-            None,
-            None,
-            SessionEventContext::default(),
-            provenance_ts,
-            &data_json,
-        )?;
-    }
-    let foreign_key_violation: Option<String> = conn
-        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
-        .optional()?;
-    if let Some(violation) = foreign_key_violation {
-        bail!("import produced a foreign-key violation: {violation}");
-    }
-    Ok(ImportResult {
-        imported,
-        redacted: archive.redacted,
-    })
-}
-
-fn remap_task_call_id_references(value: &mut Value, task_call_id_map: &BTreeMap<String, String>) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object.iter_mut() {
-                if key == "task_call_id" || key == "cockpit_call_id" {
-                    if let Some(old) = value.as_str()
-                        && let Some(new) = task_call_id_map.get(old)
-                    {
-                        *value = Value::String(new.clone());
-                    }
-                } else {
-                    remap_task_call_id_references(value, task_call_id_map);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                remap_task_call_id_references(value, task_call_id_map);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn restore_telemetry_rows(
-    conn: &rusqlite::Connection,
-    inference_calls: &[Value],
-    tool_calls: &[Value],
-    id_map: &BTreeMap<Uuid, Uuid>,
-) -> Result<()> {
-    for value in inference_calls {
-        let o = value
-            .as_object()
-            .ok_or_else(|| anyhow!("inference call index entry must be an object"))?;
-        let source_session = parse_uuid(
-            required_string(o, "session_id", "inference call index")?,
-            "session_id",
-        )?;
-        let session_id = *id_map
-            .get(&source_session)
-            .ok_or_else(|| anyhow!("inference call references unknown session"))?;
-        let call_id = parse_uuid(
-            required_string(o, "call_id", "inference call index")?,
-            "call_id",
-        )?;
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM inference_calls WHERE call_id = ?1)",
-            [call_id.to_string()],
-            |r| r.get(0),
-        )?;
-        if exists {
-            bail!("inference call `{call_id}` already exists in the destination");
-        }
-        cockpit_db::db::Db::insert_inference_call_conn(
-            conn,
-            &cockpit_db::db::inference_calls::InferenceCallRow {
-                call_id,
-                session_id,
-                project_id: required_string(o, "project_id", "inference call index")?,
-                project_root: required_string(o, "project_root", "inference call index")?,
-                model: required_string(o, "model", "inference call index")?,
-                provider: required_string(o, "provider", "inference call index")?,
-                timestamp: required_i64(o, "timestamp", "inference call index")?,
-                input_tokens: required_i64(o, "input_tokens", "inference call index")?,
-                output_tokens: required_i64(o, "output_tokens", "inference call index")?,
-                cached_input_tokens: required_i64(
-                    o,
-                    "cached_input_tokens",
-                    "inference call index",
-                )?,
-                cache_creation_input_tokens: required_i64(
-                    o,
-                    "cache_creation_input_tokens",
-                    "inference call index",
-                )?,
-                cost_usd_micros: optional_i64(o.get("cost_usd_micros"), "cost_usd_micros")?,
-                is_utility: required_bool(o, "is_utility", "inference call index")?,
-            },
-        )?;
-    }
-    for value in tool_calls {
-        let o = value
-            .as_object()
-            .ok_or_else(|| anyhow!("tool call index entry must be an object"))?;
-        let source_session = parse_uuid(
-            required_string(o, "session_id", "tool call index")?,
-            "session_id",
-        )?;
-        let session_id = *id_map
-            .get(&source_session)
-            .ok_or_else(|| anyhow!("tool call references unknown session"))?;
-        let event_id = parse_uuid(
-            required_string(o, "event_id", "tool call index")?,
-            "event_id",
-        )?;
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tool_call_events WHERE event_id = ?1)",
-            [event_id.to_string()],
-            |r| r.get(0),
-        )?;
-        if exists {
-            bail!("tool call event `{event_id}` already exists in the destination");
-        }
-        let recovery_kind = optional_string(o.get("recovery_kind"), "recovery_kind")?;
-        let recovery_stage = optional_string(o.get("recovery_stage"), "recovery_stage")?;
-        let recovery = match recovery_kind {
-            Some(kind) => cockpit_db::db::tool_calls::Recovery::Unknown {
-                kind,
-                stage: recovery_stage,
-            },
-            None => cockpit_db::db::tool_calls::Recovery::Clean,
-        };
-        let original_input_json = o
-            .get("original_input_json")
-            .cloned()
-            .ok_or_else(|| anyhow!("tool call index lacks original_input_json"))?;
-        let wire_input_json = o
-            .get("wire_input_json")
-            .cloned()
-            .ok_or_else(|| anyhow!("tool call index lacks wire_input_json"))?;
-        cockpit_db::db::Db::insert_tool_call_conn(
-            conn,
-            &cockpit_db::db::tool_calls::ToolCallEvent {
-                event_id,
-                session_id,
-                call_id: required_string(o, "call_id", "tool call index")?,
-                parent_call_id: optional_string(o.get("parent_call_id"), "parent_call_id")?,
-                parent_child_index: optional_i64(
-                    o.get("parent_child_index"),
-                    "parent_child_index",
-                )?,
-                provider_item_id: optional_string(o.get("provider_item_id"), "provider_item_id")?,
-                provider_call_id: optional_string(o.get("provider_call_id"), "provider_call_id")?,
-                provider_call_id_source: optional_string(
-                    o.get("provider_call_id_source"),
-                    "provider_call_id_source",
-                )?,
-                wire_api: optional_string(o.get("wire_api"), "wire_api")?,
-                provider_family: optional_string(o.get("provider_family"), "provider_family")?,
-                timestamp: required_i64(o, "timestamp", "tool call index")?,
-                model: required_string(o, "model", "tool call index")?,
-                provider: required_string(o, "provider", "tool call index")?,
-                project_id: required_string(o, "project_id", "tool call index")?,
-                project_root: required_string(o, "project_root", "tool call index")?,
-                agent: required_string(o, "agent", "tool call index")?,
-                tool: required_string(o, "tool", "tool call index")?,
-                mcp_server: optional_string(o.get("mcp_server"), "mcp_server")?,
-                path: optional_string(o.get("path"), "path")?,
-                recovery,
-                hard_fail: required_bool(o, "hard_fail", "tool call index")?,
-                exit_code: optional_i64(o.get("exit_code"), "exit_code")?
-                    .map(i32::try_from)
-                    .transpose()
-                    .context("tool call exit_code")?,
-                sandbox_enabled: required_bool(o, "sandbox_enabled", "tool call index")?,
-                sandboxed: required_bool(o, "sandboxed", "tool call index")?,
-                sandbox_unavailable_reason: optional_string(
-                    o.get("sandbox_unavailable_reason"),
-                    "sandbox_unavailable_reason",
-                )?,
-                original_input_json,
-                wire_input_json,
-                output: required_string(o, "output", "tool call index")?,
-                truncated: required_bool(o, "truncated", "tool call index")?,
-                duration_ms: required_i64(o, "duration_ms", "tool call index")?
-                    .try_into()
-                    .context("tool call duration_ms")?,
-                cockpit_version: optional_string(o.get("cockpit_version"), "cockpit_version")?,
-                llm_mode: optional_string(o.get("llm_mode"), "llm_mode")?,
-                shape_fingerprint: optional_string(
-                    o.get("shape_fingerprint"),
-                    "shape_fingerprint",
-                )?,
-                hint: o.get("hint").filter(|v| !v.is_null()).cloned(),
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn preflight_global_call_id_collisions(
-    conn: &rusqlite::Connection,
-    archive: &ImportArchive,
-    as_new: bool,
-) -> Result<()> {
-    let mut inference_call_ids = BTreeSet::new();
-    for event in &archive.events {
-        let data: Value = serde_json::from_str(&event.data_json)
-            .context("parsing imported event data for collision preflight")?;
-        if data.get("inference_request_sidecar").is_some()
-            && let Some(call_id) = event.call_id.as_deref()
-            && !inference_call_ids.insert(call_id)
-        {
-            bail!("import archive repeats inference request call_id `{call_id}`");
-        }
-    }
-    for call_id in inference_call_ids {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM inference_requests WHERE call_id = ?1)",
-            [&call_id],
-            |row| row.get(0),
-        )?;
-        if exists {
-            bail!(
-                "inference request `{call_id}` already exists in the destination; import refuses to overwrite an existing captured request"
-            );
-        }
-    }
-    if !as_new {
-        for job in &archive.delegation_jobs {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM task_delegation_jobs WHERE task_call_id = ?1)",
-                [&job.task_call_id],
-                |row| row.get(0),
-            )?;
-            if exists {
-                bail!(
-                    "delegation `{}` already exists in the destination",
-                    job.task_call_id
-                );
-            }
-        }
-    }
-    Ok(())
+pub async fn import_archive(db: &Db, archive: ImportArchive) -> Result<ImportResult> {
+    db.import_session_archive_graph(archive).await
 }
 
 pub fn read_archive(path: &Path) -> Result<ImportArchive> {
@@ -828,13 +53,22 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
         bail!("import archive has too many entries");
     }
     let mut total = 0_u64;
+    let mut archive_paths = BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let name = entry.name();
+        let name = entry.name().to_string();
         if name.starts_with('/') || name.split('/').any(|part| part == "..") {
             bail!("import archive contains unsafe path `{name}`");
         }
-        total = total.saturating_add(entry.size());
+        if name.is_empty() || name.split('/').any(|part| part.is_empty()) {
+            bail!("import archive contains malformed path `{name}`");
+        }
+        if !archive_paths.insert(name.clone()) {
+            bail!("import archive contains duplicate path `{name}`");
+        }
+        total = total
+            .checked_add(entry.size())
+            .ok_or_else(|| anyhow!("import archive decompressed byte accounting overflow"))?;
         if total > MAX_IMPORT_UNCOMPRESSED_BYTES {
             bail!("import archive is too large when decompressed");
         }
@@ -865,7 +99,8 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
         .iter()
         .map(|value| parse_event(value, &mut archive))
         .collect::<Result<Vec<_>>>()?;
-    let compressed_results = parse_compressed_results(&mut archive)?;
+    let text_artifacts = parse_text_artifacts(&mut archive, &archive_paths)?;
+    validate_text_artifact_graph(&sessions, &events, &text_artifacts)?;
     let delegation_jobs = parse_delegation_jobs(&mut archive)?;
     let delegation_payloads = parse_delegation_payloads(&mut archive)?;
     let delegation_steers = parse_delegation_steers(&mut archive)?;
@@ -883,7 +118,7 @@ pub fn read_archive_bytes(bytes: &[u8]) -> Result<ImportArchive> {
             .unwrap_or(true),
         sessions,
         events,
-        compressed_results,
+        text_artifacts,
         delegation_jobs,
         delegation_payloads,
         delegation_steers,
@@ -1045,63 +280,685 @@ fn parse_delegation_steers(
         .collect()
 }
 
-fn parse_compressed_results(
+fn parse_text_artifacts(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Result<Vec<ImportedCompressedResult>> {
-    let index = match read_json_entry(archive, "compressed_tool_results/index.json") {
-        Ok(value) => value,
-        Err(error)
-            if error
-                .to_string()
-                .contains("lacks compressed_tool_results/index.json") =>
-        {
-            return Ok(Vec::new());
-        }
-        Err(error) => return Err(error),
-    };
+    archive_paths: &BTreeSet<String>,
+) -> Result<Vec<ImportedTextArtifact>> {
+    let index = read_json_entry(archive, "text_artifacts/index.json")?;
     let entries = index
         .as_array()
-        .ok_or_else(|| anyhow!("compressed result index must be an array"))?;
-    entries
+        .ok_or_else(|| anyhow!("text artifact index must be an array"))?;
+    let mut seen_artifact_ids = BTreeSet::new();
+    let mut seen_content_paths = BTreeSet::new();
+    let mut expected_paths = BTreeSet::from(["text_artifacts/index.json".to_owned()]);
+    let mut parsed = Vec::with_capacity(entries.len());
+    for value in entries {
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("text artifact index entry must be an object"))?;
+        let representation_meta = object
+            .get("representation")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("text artifact representation is missing"))?;
+        let representation_mode =
+            required_string(representation_meta, "mode", "text artifact representation")?;
+        let representation = match representation_mode.as_str() {
+            "raw" => TextArtifactRepresentation::Raw,
+            "redacted_length_preserving" => TextArtifactRepresentation::ExportRedacted,
+            _ => bail!("unsupported text artifact representation"),
+        };
+        let source_artifact_id = parse_uuid(
+            required_string(object, "artifact_id", "text artifact index")?,
+            "artifact_id",
+        )?;
+        if !seen_artifact_ids.insert(source_artifact_id) {
+            bail!("text artifact index repeats an artifact ID");
+        }
+        let file = required_string(
+            representation_meta,
+            "content_file",
+            "text artifact representation",
+        )?;
+        let expected_file = format!("text_artifacts/{source_artifact_id}.txt");
+        if file != expected_file {
+            bail!("text artifact content file is not its canonical safe path");
+        }
+        if !seen_content_paths.insert(file.clone()) || !archive_paths.contains(&file) {
+            bail!("text artifact content file is duplicate or missing");
+        }
+        expected_paths.insert(file.clone());
+        let content = read_text_entry(archive, &file)?;
+        let content_bytes: usize = required_i64(
+            representation_meta,
+            "content_bytes",
+            "text artifact representation",
+        )?
+        .try_into()?;
+        if content_bytes == 0
+            || content_bytes > MAX_TEXT_ARTIFACT_BYTES
+            || content.len() != content_bytes
+        {
+            bail!("text artifact content byte accounting mismatch");
+        }
+        let stored_source_bytes: usize =
+            required_i64(object, "stored_source_bytes", "text artifact index")?.try_into()?;
+        if content_bytes != stored_source_bytes {
+            bail!("text artifact representation must preserve stored source bytes");
+        }
+        let source_event_seq = required_i64(object, "event_seq", "text artifact index")?;
+        if source_event_seq <= 0 {
+            bail!("text artifact event sequence must be positive");
+        }
+        let host_captured_bytes: usize =
+            required_i64(object, "host_captured_bytes", "text artifact index")?.try_into()?;
+        let host_original_bytes: usize =
+            required_i64(object, "host_original_bytes", "text artifact index")?.try_into()?;
+        let host_dropped_bytes: usize =
+            required_i64(object, "host_dropped_bytes", "text artifact index")?.try_into()?;
+        if host_original_bytes < host_captured_bytes
+            || host_dropped_bytes != host_original_bytes - host_captured_bytes
+            || stored_source_bytes > host_captured_bytes
+        {
+            bail!("text artifact host/source accounting is invalid");
+        }
+        let provenance = object
+            .get("provenance")
+            .ok_or_else(|| anyhow!("text artifact provenance missing"))?;
+        if !provenance.is_object() {
+            bail!("text artifact provenance must be an object");
+        }
+        parsed.push(ImportedTextArtifact {
+            source_artifact_id,
+            source_session_id: parse_uuid(
+                required_string(object, "session_id", "text artifact index")?,
+                "session_id",
+            )?,
+            source_event_seq,
+            relation: serde_json::from_value(
+                object
+                    .get("relation")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("text artifact relation missing"))?,
+            )?,
+            projection_slot: optional_i64(object.get("projection_slot"), "projection_slot")?,
+            kind: serde_json::from_value(
+                object
+                    .get("kind")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("text artifact kind missing"))?,
+            )?,
+            capture_reason: serde_json::from_value(
+                object
+                    .get("capture_reason")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("text artifact capture reason missing"))?,
+            )?,
+            provenance_json: serde_json::to_string(provenance)?,
+            host_captured_bytes,
+            host_original_bytes,
+            host_dropped_bytes,
+            stored_source_bytes,
+            representation,
+            created_at: required_i64(object, "created_at", "text artifact index")?,
+            content,
+            model_envelope_json: match object.get("model_envelope") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if value.len() <= 131_072 => Some(value.clone()),
+                Some(_) => bail!("text artifact model envelope is invalid"),
+            },
+        });
+    }
+    for path in archive_paths
         .iter()
-        .map(|value| {
-            let object = value
-                .as_object()
-                .ok_or_else(|| anyhow!("compressed result index entry must be an object"))?;
-            let file = required_string(object, "file", "compressed result index")?;
-            if !file.starts_with("compressed_tool_results/") {
-                bail!("compressed result file is outside its archive directory");
+        .filter(|path| path.starts_with("text_artifacts/"))
+    {
+        if !expected_paths.contains(path) {
+            bail!("text artifact directory contains an unindexed member");
+        }
+    }
+    Ok(parsed)
+}
+
+/// Validate the complete immutable-artifact ownership graph before the import
+/// transaction writes a destination session.  The DB repeats these checks at
+/// the relational boundary, but doing them here keeps malformed archives from
+/// partially constructing unrelated imported rows before a late artifact
+/// failure rolls the outer transaction back.
+fn validate_text_artifact_graph(
+    sessions: &[ImportedSession],
+    events: &[ImportedEvent],
+    artifacts: &[ImportedTextArtifact],
+) -> Result<()> {
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.source_id)
+        .collect::<BTreeSet<_>>();
+    if session_ids.len() != sessions.len() {
+        bail!("import archive lists a session more than once");
+    }
+
+    let mut events_by_key = BTreeMap::<(Uuid, i64), &ImportedEvent>::new();
+    for event in events {
+        if event.seq <= 0 || !session_ids.contains(&event.source_session_id) {
+            bail!("text artifact graph contains an invalid event owner");
+        }
+        if events_by_key
+            .insert((event.source_session_id, event.seq), event)
+            .is_some()
+        {
+            bail!("text artifact graph repeats an event owner");
+        }
+    }
+
+    let mut slots = BTreeSet::new();
+    let mut source_by_event = BTreeMap::<(Uuid, i64), &ImportedTextArtifact>::new();
+    let mut quota_by_session = BTreeMap::<Uuid, usize>::new();
+    for artifact in artifacts {
+        let event = events_by_key
+            .get(&(artifact.source_session_id, artifact.source_event_seq))
+            .ok_or_else(|| {
+                anyhow!("text artifact references an event missing from the import graph")
+            })?;
+        let slot_key = (
+            artifact.source_session_id,
+            artifact.source_event_seq,
+            artifact.relation.as_str(),
+            artifact.projection_slot,
+        );
+        if !slots.insert(slot_key) {
+            bail!("text artifact graph repeats an owner slot");
+        }
+        let quota = quota_by_session
+            .entry(artifact.source_session_id)
+            .or_default();
+        *quota = quota
+            .checked_add(artifact.content.len())
+            .ok_or_else(|| anyhow!("text artifact quota accounting overflow"))?;
+        if *quota > MAX_SESSION_TEXT_ARTIFACT_BYTES {
+            bail!("text artifact graph exceeds a session quota");
+        }
+        validate_import_artifact_provenance(artifact, event)?;
+        match (
+            artifact.kind,
+            artifact.capture_reason,
+            artifact.relation,
+            artifact.projection_slot,
+        ) {
+            (
+                TextArtifactKind::ToolResult,
+                CaptureReason::DisplayTruncation | CaptureReason::PruneBoundary,
+                TextArtifactRelation::ModelContextToolResult,
+                Some(slot),
+            ) if slot >= 0
+                && matches!(
+                    event.kind,
+                    SessionEventKind::ToolCall | SessionEventKind::ContextPruned
+                ) => {}
+            (
+                TextArtifactKind::UserInputSource,
+                CaptureReason::OversizedUserInput,
+                TextArtifactRelation::SourceUserInput,
+                None,
+            ) if event.kind == SessionEventKind::UserMessage => {
+                if artifact.content.len() <= INLINE_USER_TEXT_BYTES {
+                    bail!("user input source does not cross the oversized threshold");
+                }
+                let envelope = artifact
+                    .model_envelope_json
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("oversized user source lacks its model envelope"))?;
+                crate::engine::text_artifact_frame::render_accepted_user_envelope(envelope, "")
+                    .context("text artifact model envelope is malformed")?;
+                if source_by_event
+                    .insert(
+                        (artifact.source_session_id, artifact.source_event_seq),
+                        artifact,
+                    )
+                    .is_some()
+                {
+                    bail!("user message owns more than one source text artifact");
+                }
             }
-            let content = read_text_entry(archive, &file)?;
-            Ok(ImportedCompressedResult {
-                source_session_id: parse_uuid(
-                    required_string(object, "session_id", "compressed result index")?,
-                    "session_id",
-                )?,
-                hash: required_string(object, "hash", "compressed result index")?,
-                agent_id: required_string(object, "agent_id", "compressed result index")?,
-                tool: required_string(object, "tool", "compressed result index")?,
-                call_id: required_string(object, "call_id", "compressed result index")?,
-                original_byte_len: required_i64(
-                    object,
-                    "original_byte_len",
-                    "compressed result index",
-                )?
-                .try_into()
-                .context("compressed result original_byte_len")?,
-                compressed_byte_len: optional_i64(
-                    object.get("compressed_byte_len"),
-                    "compressed_byte_len",
-                )?
-                .map(usize::try_from)
-                .transpose()
-                .context("compressed result compressed_byte_len")?,
-                created_at: required_i64(object, "created_at", "compressed result index")?,
-                kind: required_string(object, "kind", "compressed result index")?,
-                content,
-            })
+            (
+                TextArtifactKind::UserInputProjection,
+                CaptureReason::OversizedUserInput,
+                TextArtifactRelation::ModelUserInputProjection,
+                Some(0),
+            ) if event.kind == SessionEventKind::UserMessage => {}
+            _ => bail!("text artifact kind/reason/owner binding is invalid"),
+        }
+    }
+
+    for ((session_id, event_seq), source) in &source_by_event {
+        let event = events_by_key[&(*session_id, *event_seq)];
+        let data: Value = serde_json::from_str(&event.data_json)
+            .context("parsing source user event while validating text artifacts")?;
+        let text = data
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("source user artifact event lacks canonical text"))?;
+        if text != source.content {
+            bail!("source user artifact differs from canonical event text");
+        }
+        let provenance: Value = serde_json::from_str(&source.provenance_json)?;
+        if provenance.get("event_seq").and_then(Value::as_i64) != Some(*event_seq) {
+            bail!("source user artifact provenance does not bind its event");
+        }
+    }
+
+    for artifact in artifacts {
+        if artifact.kind != TextArtifactKind::UserInputProjection {
+            continue;
+        }
+        let owner = (artifact.source_session_id, artifact.source_event_seq);
+        let source = source_by_event
+            .get(&owner)
+            .ok_or_else(|| anyhow!("user projection lacks an owned source artifact"))?;
+        if artifact.content == source.content {
+            bail!("equal user projection must be omitted");
+        }
+        let provenance: Value = serde_json::from_str(&artifact.provenance_json)?;
+        let expected_source_id = source.source_artifact_id.to_string();
+        if provenance.get("source_artifact_id").and_then(Value::as_str)
+            != Some(expected_source_id.as_str())
+            || provenance
+                .get("preprocessing_version")
+                .and_then(Value::as_i64)
+                != Some(1)
+        {
+            bail!("user projection provenance does not bind its source artifact");
+        }
+    }
+
+    for event in events {
+        if event.kind != SessionEventKind::UserMessage {
+            continue;
+        }
+        let data: Value = serde_json::from_str(&event.data_json)
+            .context("parsing user event while validating text artifacts")?;
+        let Some(text) = data.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if text.len() > INLINE_USER_TEXT_BYTES && user_event_has_media_or_file_parts(&data) {
+            bail!("oversized user event cannot carry media/file parts");
+        }
+        if text.len() > INLINE_USER_TEXT_BYTES
+            && !source_by_event.contains_key(&(event.source_session_id, event.seq))
+        {
+            bail!("oversized user event lacks its source text artifact");
+        }
+    }
+    validate_tool_artifact_projection_graph(&events_by_key, artifacts)?;
+    Ok(())
+}
+
+/// Returns true for a nonempty media/file part or a malformed non-array
+/// declaration. Oversized typed-source events are text-only by construction,
+/// so archives must not restore either shape.
+fn user_event_has_media_or_file_parts(data: &Value) -> bool {
+    const MEDIA_OR_FILE_KEYS: [&str; 5] =
+        ["images", "image_refs", "attachments", "files", "file_refs"];
+
+    data.as_object().is_some_and(|object| {
+        MEDIA_OR_FILE_KEYS.iter().any(|key| match object.get(*key) {
+            Some(Value::Array(parts)) => !parts.is_empty(),
+            Some(_) => true,
+            None => false,
         })
-        .collect()
+    })
+}
+
+/// The database repeats these closed provenance checks when it attaches an
+/// owner ref.  Import performs them before opening its one writer transaction
+/// so malformed archive metadata cannot get as far as a destination event.
+fn validate_import_artifact_provenance(
+    artifact: &ImportedTextArtifact,
+    event: &ImportedEvent,
+) -> Result<()> {
+    if artifact.provenance_json.len() > 256 {
+        bail!("text artifact provenance exceeds 256 UTF-8 bytes");
+    }
+    let value: Value = serde_json::from_str(&artifact.provenance_json)
+        .context("parsing text artifact provenance during import preflight")?;
+    if !provenance_strings_are_bounded(&value) {
+        bail!("text artifact provenance has oversized or control-bearing text");
+    }
+    let provenance = value
+        .as_object()
+        .ok_or_else(|| anyhow!("text artifact provenance must be an object"))?;
+    match artifact.kind {
+        TextArtifactKind::ToolResult => {
+            require_exact_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+            let agent = provenance
+                .get("agent_id")
+                .ok_or_else(|| anyhow!("tool artifact provenance lacks agent_id"))?;
+            match (agent, event.agent.as_deref()) {
+                (Value::Null, None) => {}
+                (Value::String(agent), Some(event_agent))
+                    if valid_provenance_identifier(agent) && agent == event_agent => {}
+                _ => bail!("tool artifact provenance agent does not match its event"),
+            }
+            let tool = required_provenance_identifier(provenance, "tool")?;
+            let call_id = required_provenance_identifier(provenance, "call_id")?;
+            let _ = tool;
+            if event.kind == SessionEventKind::ToolCall && event.call_id.as_deref() != Some(call_id)
+            {
+                bail!("tool artifact provenance call id does not match its event");
+            }
+        }
+        TextArtifactKind::UserInputSource => {
+            require_exact_provenance_keys(provenance, &["event_seq"])?;
+            if provenance.get("event_seq").and_then(Value::as_i64)
+                != Some(artifact.source_event_seq)
+            {
+                bail!("source artifact provenance does not bind its event");
+            }
+        }
+        TextArtifactKind::UserInputProjection => {
+            require_exact_provenance_keys(
+                provenance,
+                &["source_artifact_id", "preprocessing_version"],
+            )?;
+            let source = provenance
+                .get("source_artifact_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("projection provenance lacks source artifact id"))?;
+            Uuid::parse_str(source)
+                .context("projection provenance has invalid source artifact id")?;
+            if provenance
+                .get("preprocessing_version")
+                .and_then(Value::as_i64)
+                != Some(1)
+            {
+                bail!("projection provenance has an invalid preprocessing version");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn provenance_strings_are_bounded(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            text.len() <= 256 && !text.bytes().any(|byte| byte.is_ascii_control())
+        }
+        Value::Array(values) => values.iter().all(provenance_strings_are_bounded),
+        Value::Object(values) => values.values().all(provenance_strings_are_bounded),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn require_exact_provenance_keys(
+    provenance: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> Result<()> {
+    if provenance.len() != expected.len()
+        || !expected.iter().all(|key| provenance.contains_key(*key))
+    {
+        bail!("text artifact provenance has an invalid shape");
+    }
+    Ok(())
+}
+
+fn valid_provenance_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn required_provenance_identifier<'a>(
+    provenance: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str> {
+    let value = provenance
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("text artifact provenance lacks {key}"))?;
+    if !valid_provenance_identifier(value) {
+        bail!("text artifact provenance {key} is invalid");
+    }
+    Ok(value)
+}
+
+/// Verify the complete durable projection-state graph before writes. Available
+/// tool states and immutable owner refs are a bijection; state-array ordinals
+/// are the stable prune slots, never a row-order convention.
+fn validate_tool_artifact_projection_graph(
+    events_by_key: &BTreeMap<(Uuid, i64), &ImportedEvent>,
+    artifacts: &[ImportedTextArtifact],
+) -> Result<()> {
+    let mut artifacts_by_slot = BTreeMap::<(Uuid, i64, i64), &ImportedTextArtifact>::new();
+    for artifact in artifacts
+        .iter()
+        .filter(|artifact| artifact.relation == TextArtifactRelation::ModelContextToolResult)
+    {
+        let slot = artifact
+            .projection_slot
+            .ok_or_else(|| anyhow!("tool artifact owner lacks a projection slot"))?;
+        if artifacts_by_slot
+            .insert(
+                (artifact.source_session_id, artifact.source_event_seq, slot),
+                artifact,
+            )
+            .is_some()
+        {
+            bail!("tool artifact graph repeats an owner slot");
+        }
+    }
+
+    let mut matched_available_slots = BTreeSet::new();
+    for ((session_id, event_seq), event) in events_by_key {
+        let data: Value = serde_json::from_str(&event.data_json)
+            .context("parsing event data while validating text artifact projection state")?;
+        let data = data
+            .as_object()
+            .ok_or_else(|| anyhow!("artifact-owning event data must be an object"))?;
+        match event.kind {
+            SessionEventKind::ToolCall => {
+                if data.get("artifact_projections").is_some() {
+                    bail!("ordinary tool event has a prune projection array");
+                }
+                match data.get("artifact_projection") {
+                    Some(projection) => {
+                        let artifact = artifacts_by_slot
+                            .get(&(*session_id, *event_seq, 0))
+                            .copied();
+                        if validate_tool_artifact_projection_state(projection, artifact, 0)? {
+                            matched_available_slots.insert((*session_id, *event_seq, 0));
+                        }
+                    }
+                    None if artifacts_by_slot.contains_key(&(*session_id, *event_seq, 0)) => {
+                        bail!("tool artifact owner has no durable projection state")
+                    }
+                    None => {}
+                }
+            }
+            SessionEventKind::ContextPruned => {
+                if data.get("artifact_projection").is_some() {
+                    bail!("prune event has an ordinary tool projection state");
+                }
+                match data.get("artifact_projections") {
+                    Some(Value::Array(projections)) => {
+                        for (ordinal, projection) in projections.iter().enumerate() {
+                            let slot: i64 = ordinal
+                                .try_into()
+                                .map_err(|_| anyhow!("prune projection slot overflows i64"))?;
+                            let artifact = artifacts_by_slot
+                                .get(&(*session_id, *event_seq, slot))
+                                .copied();
+                            if validate_tool_artifact_projection_state(projection, artifact, slot)?
+                            {
+                                matched_available_slots.insert((*session_id, *event_seq, slot));
+                            }
+                        }
+                    }
+                    Some(_) => bail!("prune artifact projections must be an array"),
+                    None if artifacts_by_slot
+                        .keys()
+                        .any(|(owner, seq, _)| owner == session_id && seq == event_seq) =>
+                    {
+                        bail!("prune artifact owner has no durable projection states")
+                    }
+                    None => {}
+                }
+            }
+            _ => {
+                if artifacts_by_slot
+                    .keys()
+                    .any(|(owner, seq, _)| owner == session_id && seq == event_seq)
+                {
+                    bail!("tool artifact relation is attached to a non-owning event");
+                }
+            }
+        }
+    }
+    if matched_available_slots.len() != artifacts_by_slot.len()
+        || artifacts_by_slot
+            .keys()
+            .any(|slot| !matched_available_slots.contains(slot))
+    {
+        bail!("tool artifact owner has no matching available projection state");
+    }
+    Ok(())
+}
+
+/// Return whether a state is available. An available state must join one
+/// immutable artifact; an unavailable state must join none.
+fn validate_tool_artifact_projection_state(
+    projection: &Value,
+    artifact: Option<&ImportedTextArtifact>,
+    expected_slot: i64,
+) -> Result<bool> {
+    let projection = projection
+        .as_object()
+        .ok_or_else(|| anyhow!("tool artifact projection must be an object"))?;
+    const FIELDS: &[&str] = &[
+        "version",
+        "status",
+        "reason",
+        "kind",
+        "capture_reason",
+        "projection_slot",
+        "provenance",
+        "host_captured_bytes",
+        "host_original_bytes",
+        "host_dropped_bytes",
+        "stored_source_bytes",
+        "content_bytes",
+        "line_count",
+        "preview_head",
+        "preview_tail",
+    ];
+    require_exact_provenance_keys(projection, FIELDS)
+        .context("tool artifact projection has an invalid shape")?;
+    if projection.get("version").and_then(Value::as_i64) != Some(1)
+        || projection.get("projection_slot").and_then(Value::as_i64) != Some(expected_slot)
+        || projection.get("kind").and_then(Value::as_str) != Some("tool_result")
+    {
+        bail!("tool artifact projection has an invalid version, kind, or slot");
+    }
+    let capture_reason = projection
+        .get("capture_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| matches!(*reason, "display_truncation" | "prune_boundary"))
+        .ok_or_else(|| anyhow!("tool artifact projection has an invalid capture reason"))?;
+    let provenance = projection
+        .get("provenance")
+        .ok_or_else(|| anyhow!("tool artifact projection lacks provenance"))?;
+    if !provenance_strings_are_bounded(provenance) {
+        bail!("tool artifact projection provenance has unsafe text");
+    }
+    let provenance = provenance
+        .as_object()
+        .ok_or_else(|| anyhow!("tool artifact projection provenance must be an object"))?;
+    require_exact_provenance_keys(provenance, &["agent_id", "tool", "call_id"])?;
+    let agent = provenance
+        .get("agent_id")
+        .ok_or_else(|| anyhow!("tool artifact projection provenance lacks agent_id"))?;
+    if !agent.is_null() && !agent.as_str().is_some_and(valid_provenance_identifier) {
+        bail!("tool artifact projection provenance agent_id is invalid");
+    }
+    required_provenance_identifier(provenance, "tool")?;
+    required_provenance_identifier(provenance, "call_id")?;
+
+    let numeric = |field: &str| -> Result<usize> {
+        projection
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?
+            .try_into()
+            .map_err(|_| anyhow!("tool artifact projection {field} exceeds usize"))
+    };
+    let host_captured_bytes = numeric("host_captured_bytes")?;
+    let host_original_bytes = numeric("host_original_bytes")?;
+    let host_dropped_bytes = numeric("host_dropped_bytes")?;
+    let stored_source_bytes = numeric("stored_source_bytes")?;
+    let content_bytes = numeric("content_bytes")?;
+    let _line_count = numeric("line_count")?;
+    if host_original_bytes < host_captured_bytes
+        || host_dropped_bytes != host_original_bytes - host_captured_bytes
+        || stored_source_bytes > host_captured_bytes
+        || content_bytes == 0
+    {
+        bail!("tool artifact projection has invalid byte accounting");
+    }
+    let preview = |field: &str| -> Result<&str> {
+        let value = projection
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?;
+        if value.len() > 2 * 1024 {
+            bail!("tool artifact projection {field} exceeds the preview cap");
+        }
+        Ok(value)
+    };
+    let preview_head = preview("preview_head")?;
+    let preview_tail = preview("preview_tail")?;
+
+    match projection.get("status").and_then(Value::as_str) {
+        Some("available") => {
+            if projection.get("reason") != Some(&Value::Null) {
+                bail!("available tool artifact projection has a reason");
+            }
+            let artifact = artifact
+                .ok_or_else(|| anyhow!("available tool projection lacks an artifact owner"))?;
+            if artifact.capture_reason.as_str() != capture_reason
+                || artifact.host_captured_bytes != host_captured_bytes
+                || artifact.host_original_bytes != host_original_bytes
+                || artifact.host_dropped_bytes != host_dropped_bytes
+                || artifact.stored_source_bytes != stored_source_bytes
+                || artifact.content.len() != content_bytes
+            {
+                bail!("available tool artifact projection differs from its sidecar");
+            }
+            let artifact_provenance: Value = serde_json::from_str(&artifact.provenance_json)
+                .context("parsing artifact provenance while validating projection state")?;
+            if artifact_provenance != Value::Object(provenance.clone()) {
+                bail!("available tool artifact projection provenance differs from its sidecar");
+            }
+            let (expected_head, expected_tail) =
+                crate::engine::text_artifact_frame::utf8_preview_pair(&artifact.content);
+            if projection.get("line_count").and_then(Value::as_u64)
+                != Some(artifact.content.lines().count() as u64)
+                || preview_head != expected_head
+                || preview_tail != expected_tail
+            {
+                bail!("available tool artifact projection previews differ from its sidecar");
+            }
+            Ok(true)
+        }
+        Some("unavailable") => {
+            if artifact.is_some() {
+                bail!("unavailable tool projection has an artifact owner");
+            }
+            if !matches!(
+                projection.get("reason").and_then(Value::as_str),
+                Some("artifact_limit" | "session_quota" | "persistence_unavailable")
+            ) {
+                bail!("unavailable tool projection has an invalid reason");
+            }
+            Ok(false)
+        }
+        _ => bail!("tool artifact projection has an invalid status"),
+    }
 }
 
 fn read_text_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<String> {
@@ -1139,10 +996,20 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
         )?,
         active_model: match object.get("active_model") {
             Some(Value::Null) => None,
-            Some(value) => Some(
-                serde_json::from_value(value.clone())
-                    .context("decoding import manifest session active_model")?,
-            ),
+            Some(value) => {
+                let active_model: cockpit_config::config::providers::ActiveModelRef =
+                    serde_json::from_value(value.clone())
+                        .context("decoding import manifest session active_model")?;
+                active_model
+                    .validate()
+                    .map_err(|error| anyhow!("invalid import manifest active_model: {error}"))?;
+                Some(ImportedArchiveActiveModel {
+                    provider: active_model.provider.clone(),
+                    model: active_model.model.clone(),
+                    selection_json: serde_json::to_string(&active_model)
+                        .context("encoding import manifest session active_model")?,
+                })
+            }
             None => bail!("import manifest session lacks active_model"),
         },
         active_agent: required_string(object, "active_agent", "import manifest session")?,
@@ -1207,13 +1074,6 @@ fn parse_event(
     })
 }
 
-fn required_sidecar_string<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{context} lacks string `{key}`"))
-}
-
 fn required_string(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1251,18 +1111,6 @@ fn required_bool(
         .and_then(Value::as_bool)
         .ok_or_else(|| anyhow!("{context} lacks boolean `{key}`"))
 }
-fn validate_delegation_status(status: &str, context: &str) -> Result<()> {
-    match status {
-        "running"
-        | "backgrounded"
-        | "completed"
-        | "failed"
-        | "cancelled"
-        | "paused_pending_tool"
-        | "lost" => Ok(()),
-        _ => bail!("import {context} has unsupported status `{status}`"),
-    }
-}
 fn optional_i64(value: Option<&Value>, key: &str) -> Result<Option<i64>> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -1292,6 +1140,7 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "tool_call" => ToolCall,
         "tool_call_started" => ToolCallStarted,
         "tool_call_completed" => ToolCallCompleted,
+        "tool_call_scheduling" => ToolCallScheduling,
         "subagent_spawned" => SubagentSpawned,
         "subagent_routing" => SubagentRouting,
         "subagent_report" => SubagentReport,
@@ -1321,7 +1170,94 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use rusqlite::OptionalExtension;
     use zip::write::{SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn queued_fcm2_limit_matches_protocol_and_shared_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            cockpit_db::db::message_attachments::MAX_QUEUED_CANONICAL_MESSAGE_BYTES,
+            crate::proto_crate::send_user_message_v2::MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES
+        );
+        assert_eq!(
+            fixture["limits"]["fcm2_max_bytes"].as_u64(),
+            Some(cockpit_db::db::message_attachments::MAX_QUEUED_CANONICAL_MESSAGE_BYTES as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn import_persists_deterministic_child_uuid_for_legacy_delegation_archives() {
+        let db = Db::open_in_memory().unwrap();
+        let source_session_id = Uuid::new_v4();
+        let archive = ImportArchive {
+            project_id: "import-test".into(),
+            project_root: "/tmp/import-test".into(),
+            redacted: true,
+            sessions: vec![ImportedSession {
+                source_id: source_session_id,
+                parent_source_id: None,
+                short_id: Some("imported".into()),
+                fork_point_turn_id: None,
+                active_model: None,
+                active_agent: "Build".into(),
+                started_at: 1,
+                ended_at: None,
+                title: Some("Imported".into()),
+            }],
+            events: Vec::new(),
+            text_artifacts: Vec::new(),
+            delegation_jobs: vec![ImportedDelegationJob {
+                task_call_id: "legacy-task".into(),
+                function_call_id: None,
+                parent_source_id: source_session_id,
+                parent_agent: "Build".into(),
+                original_args_json: None,
+                status: "completed".into(),
+                ack_delivered: true,
+                final_delivered: true,
+                created_at: 1,
+                updated_at: 2,
+                children: vec![ImportedDelegationChild {
+                    label: "worker".into(),
+                    child_agent: "worker".into(),
+                    model: None,
+                    status: "completed".into(),
+                    report: None,
+                    output_dir: None,
+                    todo_ids_json: None,
+                    result_delivered: true,
+                    started_at: Some(1),
+                    finished_at: Some(2),
+                    created_at: 1,
+                    updated_at: 2,
+                    requested_cwd: None,
+                    resolved_cwd: None,
+                }],
+            }],
+            delegation_payloads: Vec::new(),
+            delegation_steers: Vec::new(),
+            inference_calls: Vec::new(),
+            tool_calls: Vec::new(),
+        };
+        import_archive(&db, archive).await.unwrap();
+        let child_uuid: String = db
+            .read(|conn| {
+                let child_uuid = conn.query_row(
+                    "SELECT child_uuid FROM task_delegation_children
+                     WHERE label = 'worker'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(child_uuid)
+            })
+            .await
+            .unwrap();
+        assert_eq!(Uuid::parse_str(&child_uuid).unwrap().get_version_num(), 5);
+    }
 
     fn session(id: Uuid, parent: Option<Uuid>) -> Value {
         json!({
@@ -1365,6 +1301,9 @@ mod tests {
         zip.start_file("events.json", options).unwrap();
         zip.write_all(serde_json::to_string(&events).unwrap().as_bytes())
             .unwrap();
+        zip.start_file("text_artifacts/index.json", options)
+            .unwrap();
+        zip.write_all(b"[]").unwrap();
         zip.finish().unwrap();
         cursor.into_inner()
     }
@@ -1383,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_existing_id_refuses() {
+    async fn import_always_allocates_fresh_destination_session_ids() {
         let db = Db::open_in_memory().unwrap();
         let id = Uuid::new_v4();
         let archive =
@@ -1397,12 +1336,19 @@ mod tests {
         })
         .await
         .unwrap();
-        let error = import_archive(&db, archive, false).await.unwrap_err();
-        assert!(error.to_string().contains("already exists"));
+        let imported = import_archive(&db, archive).await.unwrap();
+        assert_ne!(imported.imported, vec![id]);
+        assert!(db.get_session(id).await.unwrap().is_some());
+        assert!(
+            db.get_session(imported.imported[0])
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
-    async fn import_as_new_records_provenance() {
+    async fn import_records_provenance_for_a_fresh_destination() {
         let db = Db::open_in_memory().unwrap();
         let id = Uuid::new_v4();
         db.transaction(move |conn| {
@@ -1420,7 +1366,7 @@ mod tests {
             true,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive, true).await.unwrap();
+        let imported = import_archive(&db, archive).await.unwrap();
         assert_ne!(imported.imported[0], id);
         let restored = db.get_session(imported.imported[0]).await.unwrap().unwrap();
         assert_eq!(restored.short_id.as_deref(), Some("export"));
@@ -1441,10 +1387,53 @@ mod tests {
             false,
         ))
         .unwrap();
-        let error = import_archive(&db, archive, false).await.unwrap_err();
+        let error = import_archive(&db, archive).await.unwrap_err();
         assert!(error.to_string().contains("cyclic"));
         assert!(db.get_session(root).await.unwrap().is_none());
         assert!(db.get_session(cycle).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn text_artifact_import_rejects_a_long_mixed_media_event_before_artifact_lookup() {
+        let db = Db::open_in_memory().unwrap();
+        let source_session_id = Uuid::new_v4();
+        let malformed_event = json!({
+            "seq": 1,
+            "ts_ms": 123,
+            "type": "user_message",
+            "session_id": source_session_id,
+            "short_id": "export",
+            "agent": "Build",
+            "call_id": null,
+            "data": {
+                "text": "x".repeat(64 * 1024 + 1),
+                "images": [{"id": Uuid::new_v4()}],
+            },
+        });
+        let archive = read_archive_bytes(&archive_bytes(
+            vec![session(source_session_id, None)],
+            vec![malformed_event],
+            false,
+        ))
+        .unwrap();
+        let error = import_archive(&db, archive)
+            .await
+            .expect_err("an archive cannot reintroduce an artifact-ineligible long media event");
+        assert!(
+            error.to_string().contains("cannot carry media/file parts"),
+            "unexpected import error: {error:#}"
+        );
+        let sessions: i64 = db
+            .read(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "validation fails before any destination rows are written"
+        );
     }
 
     #[tokio::test]
@@ -1457,7 +1446,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive, false).await.unwrap();
+        let imported = import_archive(&db, archive).await.unwrap();
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(
             events
@@ -1507,7 +1496,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive, false).await.unwrap();
+        let imported = import_archive(&db, archive).await.unwrap();
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         let hook_rows: Vec<_> = events.iter().filter(|e| e.kind == "hook_run").collect();
         assert_eq!(hook_rows.len(), 1, "exactly one hook_run row restored");
@@ -1531,7 +1520,7 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            import_archive(&db_forbidden, archive, false).await.is_err(),
+            import_archive(&db_forbidden, archive).await.is_err(),
             "hook_run with a field outside the closed audit projection must be rejected"
         );
         assert!(
@@ -1552,9 +1541,7 @@ mod tests {
         let bytes = archive_bytes(vec![session(unknown_id, None)], vec![unknown], false);
         let error = match read_archive_bytes(&bytes) {
             Err(error) => error,
-            Ok(archive) => import_archive(&db_unknown, archive, false)
-                .await
-                .unwrap_err(),
+            Ok(archive) => import_archive(&db_unknown, archive).await.unwrap_err(),
         };
         assert!(
             error.to_string().contains("unsupported import event type"),
@@ -1578,9 +1565,14 @@ mod tests {
             false,
         ))
         .unwrap();
-        import_archive(&db, archive, false).await.unwrap();
-        let restored = db.get_session(child).await.unwrap().unwrap();
-        assert_eq!(restored.parent_session_id, Some(root));
+        let imported = import_archive(&db, archive).await.unwrap();
+        assert_eq!(imported.imported.len(), 2);
+        let root_destination_id = imported.imported[0];
+        let child_destination_id = imported.imported[1];
+        assert_ne!(root_destination_id, root);
+        assert_ne!(child_destination_id, child);
+        let restored = db.get_session(child_destination_id).await.unwrap().unwrap();
+        assert_eq!(restored.parent_session_id, Some(root_destination_id));
         assert_eq!(restored.fork_point_turn_id.as_deref(), Some("42"));
         assert_eq!(restored.ended_at, Some(777));
         assert_eq!(restored.title.as_deref(), Some("Restored title"));
@@ -1603,7 +1595,7 @@ mod tests {
                 prompt_cache_retention: None,
             }
         );
-        let events = db.list_session_events(child).await.unwrap();
+        let events = db.list_session_events(child_destination_id).await.unwrap();
         assert!(
             events
                 .iter()
@@ -1661,9 +1653,11 @@ mod tests {
         let archive =
             read_archive_bytes(&archive_bytes(vec![without_model], vec![], false)).unwrap();
 
-        import_archive(&db, archive, false).await.unwrap();
+        let imported = import_archive(&db, archive).await.unwrap();
+        let destination_id = imported.imported[0];
 
-        let restored = db.get_session(id).await.unwrap().unwrap();
+        assert_ne!(destination_id, id);
+        let restored = db.get_session(destination_id).await.unwrap().unwrap();
         assert!(restored.provider.is_none());
         assert!(restored.model.is_none());
         assert!(restored.model_selection_json.is_none());
@@ -1691,7 +1685,7 @@ mod tests {
             false,
         ))
         .unwrap();
-        import_archive(&db, archive, false).await.unwrap();
+        import_archive(&db, archive).await.unwrap();
         let violations: Option<String> = db
             .read(|conn| {
                 Ok(conn
@@ -1713,7 +1707,7 @@ mod tests {
             true,
         ))
         .unwrap();
-        let imported = import_archive(&db, archive, false).await.unwrap();
+        let imported = import_archive(&db, archive).await.unwrap();
         assert!(imported.redacted);
         let events = db.list_session_events(imported.imported[0]).await.unwrap();
         assert!(events.iter().any(|event| event.kind == "notice"
@@ -1750,14 +1744,15 @@ mod tests {
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();
-        import_archive(&destination, read_archive_bytes(&bytes).unwrap(), false)
+        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
             .await
             .unwrap();
+        let destination_id = imported.imported[0];
         let grants: i64 = destination
             .read(move |conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM approval_grants WHERE session_id = ?1",
-                    [source_id.to_string()],
+                    [destination_id.to_string()],
                     |row| row.get(0),
                 )
                 .map_err(Into::into)
@@ -1834,10 +1829,18 @@ mod tests {
             .await
             .unwrap();
         let destination = Db::open_in_memory().unwrap();
-        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap(), false)
+        let imported = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
             .await
             .unwrap();
-        assert_eq!(imported.imported, vec![source_id]);
+        assert_eq!(imported.imported.len(), 1);
+        let destination_id = imported.imported[0];
+        assert_ne!(destination_id, source_id);
+        let imported_again = import_archive(&destination, read_archive_bytes(&bytes).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(imported_again.imported.len(), 1);
+        assert_ne!(imported_again.imported[0], source_id);
+        assert_ne!(imported_again.imported[0], destination_id);
         let source_counts: (i64, i64) = source
             .read(move |conn| {
                 Ok((
@@ -1856,11 +1859,15 @@ mod tests {
             .await
             .unwrap();
         let destination_counts: (i64, i64) = destination.read(move |conn| Ok((
-            conn.query_row("SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND type != 'notice'", [source_id.to_string()], |r| r.get(0))?,
-            conn.query_row("SELECT COUNT(*) FROM inference_calls WHERE session_id = ?1", [source_id.to_string()], |r| r.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND type != 'notice'", [destination_id.to_string()], |r| r.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM inference_calls WHERE session_id = ?1", [destination_id.to_string()], |r| r.get(0))?,
         ))).await.unwrap();
         assert_eq!(destination_counts, source_counts);
-        let restored = destination.get_session(source_id).await.unwrap().unwrap();
+        let restored = destination
+            .get_session(destination_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.provider.as_deref(), Some("test-provider"));
         assert_eq!(restored.model.as_deref(), Some("test-model"));
         assert_eq!(

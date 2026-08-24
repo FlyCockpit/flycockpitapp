@@ -1,6 +1,7 @@
 use cockpit_proto::send_user_message_v2::{
     AuthenticatedRemoteOperationEnvelopeV2, CanonicalSendUserMessageV2,
     LocalOwnerDirectSendUserMessageV2, MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES,
+    MAX_CURRENT_FCM2_ENCODING_BYTES, MAX_MESSAGE_TEXT_BYTES, MAX_MESSAGE_TEXT_SCALARS,
     MessageAttachmentIdentity, MessageAttachmentKind, MessageIngressProvenance,
     MessageTagExpansion, SendUserMessageV2, has_message_text, validate_fcm2_length,
 };
@@ -16,6 +17,31 @@ fn hex(raw: &str) -> Vec<u8> {
                 .expect("valid hex")
         })
         .collect()
+}
+
+#[test]
+fn send_user_message_v2_limits_match_shared_fixture() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/cockpit-protocol/fixtures/send-user-message-v2-canonical-vectors.json"
+    ))
+    .unwrap();
+    let limits = fixture["limits"].as_object().unwrap();
+    assert_eq!(
+        limits["fcm2_max_bytes"].as_u64(),
+        Some(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES as u64)
+    );
+    assert_eq!(
+        limits["fcm2_max_current_encoding_bytes"].as_u64(),
+        Some(MAX_CURRENT_FCM2_ENCODING_BYTES as u64)
+    );
+    assert_eq!(
+        limits["text_max_bytes"].as_u64(),
+        Some(MAX_MESSAGE_TEXT_BYTES as u64)
+    );
+    assert_eq!(
+        limits["text_max_scalars"].as_u64(),
+        Some(MAX_MESSAGE_TEXT_SCALARS as u64)
+    );
 }
 
 #[test]
@@ -154,7 +180,7 @@ fn send_user_message_v2_shared_scalar_predicate() {
 
 #[test]
 fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
-    let four_byte_scalars = "😀".repeat(262_144);
+    let ascii_max = "a".repeat(8_388_608);
     let tags = (0..64)
         .map(|_| MessageTagExpansion {
             tool: "t".repeat(128),
@@ -182,8 +208,8 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         canonical_model_digest: [2; 32],
         request: SendUserMessageV2 {
             client_submission_id: Uuid::from_u128(2),
-            text: four_byte_scalars.clone(),
-            display_text: Some(four_byte_scalars),
+            text: ascii_max.clone(),
+            display_text: Some(ascii_max),
             tag_expansions: tags,
             forced_skill: Some("s".repeat(128)),
             attachments,
@@ -191,8 +217,9 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
     };
     assert_eq!(
         value.encode().unwrap().len(),
-        MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES
+        MAX_CURRENT_FCM2_ENCODING_BYTES
     );
+    assert!(validate_fcm2_length(MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES).is_ok());
     let oversized_wire = vec![0; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1];
     assert_eq!(
         CanonicalSendUserMessageV2::decode(&oversized_wire)
@@ -201,16 +228,18 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         "FCM2 exceeds maximum size"
     );
     let mut one_scalar_over = value.clone();
-    one_scalar_over.request.text.push('😀');
+    one_scalar_over.request.text.push('a');
     assert_eq!(
         one_scalar_over.encode().unwrap_err().to_string(),
         "text exceeds byte limit"
     );
     let mut scalar_over = value.clone();
-    scalar_over.request.text = "a".repeat(262_145);
+    // Four-byte scalars exhaust the byte budget before the independent scalar
+    // ceiling; the byte check is deliberately first in both codecs.
+    scalar_over.request.text = "😀".repeat(2_097_153);
     assert_eq!(
         scalar_over.encode().unwrap_err().to_string(),
-        "text exceeds scalar limit"
+        "text exceeds byte limit"
     );
     let mut display_over = value.clone();
     display_over
@@ -218,7 +247,7 @@ fn send_user_message_v2_exact_maximum_and_preallocation_guard() {
         .display_text
         .as_mut()
         .unwrap()
-        .push('😀');
+        .push('a');
     assert_eq!(
         display_over.encode().unwrap_err().to_string(),
         "display text exceeds byte limit"

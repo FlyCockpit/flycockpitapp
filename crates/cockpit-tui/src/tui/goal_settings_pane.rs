@@ -278,6 +278,14 @@ impl GoalSettingsPane {
             Some(serde_json::to_string(&override_)?)
         };
         if target == GoalSettingsSaveTarget::Agent {
+            // vNext documents deliberately reject `goalSupervision` as a
+            // retired legacy field.  Do not report a successful agent save
+            // when canonical vNext serialization would omit the override.
+            if self.def.vnext.is_some() {
+                anyhow::bail!(
+                    "agent-scoped goal settings are unavailable for vNext agents; save them for this session instead"
+                );
+            }
             let mut def = self.def.clone();
             def.goal_supervision = override_;
             cockpit_core::agents::validate_invariants(&def)?;
@@ -418,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_settings_agent_save_writes_disk_and_ejects_pristine_builtin() {
+    fn goal_settings_agent_save_refuses_vnext_builtin_without_ejecting() {
         let tmp = tempfile::tempdir().unwrap();
         let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
         focus_field(&mut pane, GoalSettingsField::SkepticCount);
@@ -427,18 +435,18 @@ mod tests {
 
         let outcome = pane.confirmed_save();
 
-        assert!(matches!(
-            outcome,
-            GoalSettingsOutcome::Apply {
-                persist_session: false,
-                ..
-            }
-        ));
+        assert_eq!(outcome, GoalSettingsOutcome::Close);
+        assert!(
+            pane.status_text()
+                .is_some_and(|status| status.contains("unavailable for vNext agents")),
+            "vNext agent save must explain why it was refused: {:?}",
+            pane.status_text()
+        );
         let path = tmp.path().join(".cockpit").join("agents").join("Build.md");
-        assert!(path.exists(), "agent save must eject pristine built-in");
-        let text = std::fs::read_to_string(path).unwrap();
-        assert!(text.contains("goalSupervision:"));
-        assert!(text.contains("coldSkepticCount: 1"));
+        assert!(
+            !path.exists(),
+            "refused vNext agent save must not eject a pristine built-in"
+        );
     }
 
     #[test]

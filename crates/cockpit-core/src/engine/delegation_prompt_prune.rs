@@ -302,8 +302,7 @@ mod tests {
         let UserContent::ToolResult(result) = content.iter().next().unwrap() else {
             panic!("tool result content");
         };
-        let rig::message::ToolResultContent::Text(text) = result.content.iter().next().unwrap()
-        else {
+        let rig::message::ToolResultContent::Text(text) = result.content.first().unwrap() else {
             panic!("tool result text");
         };
         assert_eq!(text.text, report);

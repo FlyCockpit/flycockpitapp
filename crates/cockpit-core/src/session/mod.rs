@@ -268,7 +268,6 @@ pub struct Session {
     /// activation matches execution, including config tools and grants.
     active_tool_names: Mutex<std::collections::HashSet<String>>,
     active_sandbox_escalate_eligible: AtomicBool,
-    has_retrievable_tool_results: AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
     /// pre-§17 rows on [`Session::resume`].
@@ -663,15 +662,6 @@ impl Session {
             .iter()
             .cloned()
             .collect()
-    }
-
-    pub fn set_has_retrievable_tool_results(&self) {
-        self.has_retrievable_tool_results
-            .store(true, Ordering::Relaxed);
-    }
-
-    pub fn has_retrievable_tool_results(&self) -> bool {
-        self.has_retrievable_tool_results.load(Ordering::Relaxed)
     }
 
     pub fn model_system_prompt_snapshot(&self) -> Arc<ModelSystemPromptSnapshot> {

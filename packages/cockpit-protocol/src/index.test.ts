@@ -58,6 +58,69 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("accepts only opaque 64KiB-through-8MiB bulk user-message references", () => {
+    const envelope = (total_length: string, mime_class = "opaque") => ({
+      v: PROTOCOL_VERSION,
+      kind: "req",
+      id: "11111111-1111-4111-8111-111111111111",
+      request: "send_user_message_bulk",
+      params: {
+        client_submission_id: "22222222-2222-4222-8222-222222222222",
+        transfer: {
+          transfer_id: "AQIDBAUGBwgJCgsMDQ4PEA",
+          total_length,
+          sha256: "ab".repeat(32),
+          mime_class,
+        },
+      },
+    });
+    expect(clientEnvelopeSchema.safeParse(envelope("65537")).success).toBe(true);
+    expect(clientEnvelopeSchema.safeParse(envelope(String(8 * 1024 * 1024))).success).toBe(true);
+    expect(clientEnvelopeSchema.safeParse(envelope("65536")).success).toBe(false);
+    expect(clientEnvelopeSchema.safeParse(envelope(String(8 * 1024 * 1024 + 1))).success).toBe(
+      false,
+    );
+    expect(clientEnvelopeSchema.safeParse(envelope("65537", "archive")).success).toBe(false);
+
+    const withDisplayTransfer = {
+      ...envelope("5"),
+      params: {
+        ...envelope("5").params,
+        display_transfer: {
+          transfer_id: "AgMEBQYHCAkKCwwNDg8QEQ",
+          total_length: String(8 * 1024 * 1024),
+          sha256: "cd".repeat(32),
+          mime_class: "opaque",
+        },
+      },
+    };
+    expect(clientEnvelopeSchema.safeParse(withDisplayTransfer).success).toBe(true);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...withDisplayTransfer,
+        params: { ...withDisplayTransfer.params, display_text: "inline too" },
+      }).success,
+    ).toBe(false);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...envelope("65537"),
+        params: { ...envelope("65537").params, display_text: "x".repeat(65_537) },
+      }).success,
+    ).toBe(false);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...withDisplayTransfer,
+        params: {
+          ...withDisplayTransfer.params,
+          display_transfer: {
+            ...withDisplayTransfer.params.display_transfer,
+            transfer_id: withDisplayTransfer.params.transfer.transfer_id,
+          },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("parses every golden response envelope", () => {
     for (const [name, frame] of Object.entries(responsesFixture)) {
       const parsed = responseEnvelopeSchema.safeParse(frame);
@@ -466,7 +529,7 @@ describe("cockpit-proto daemon wire schemas", () => {
   });
 
   it("config_refreshed_typescript_mirror_is_v10", () => {
-    expect(PROTOCOL_VERSION).toBe(11);
+    expect(PROTOCOL_VERSION).toBe(12);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );

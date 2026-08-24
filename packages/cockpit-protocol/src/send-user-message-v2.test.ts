@@ -6,6 +6,9 @@ import {
   decodeCanonicalSendUserMessageV2,
   encodeCanonicalSendUserMessageV2,
   FCM2_MAX_BYTES,
+  FCM2_MAX_CURRENT_ENCODING_BYTES,
+  FCM2_MAX_TEXT_BYTES,
+  FCM2_MAX_TEXT_SCALARS,
   hasMessageText,
   messageRequestDigest,
   validateAuthenticatedRemoteMessageV2,
@@ -60,6 +63,15 @@ function compactBytes(vector: {
 }
 
 describe("send_user_message_v2_canonical_vectors", () => {
+  it("matches the shared protocol-limit fixture", () => {
+    expect(fixture.limits).toEqual({
+      fcm2_max_bytes: FCM2_MAX_BYTES,
+      fcm2_max_current_encoding_bytes: FCM2_MAX_CURRENT_ENCODING_BYTES,
+      text_max_bytes: FCM2_MAX_TEXT_BYTES,
+      text_max_scalars: FCM2_MAX_TEXT_SCALARS,
+    });
+  });
+
   it("validates distinct UUIDv7 transport and operation identities", () => {
     const request = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex)).request;
     const envelope = validateLocalOwnerDirectMessageV2({
@@ -203,7 +215,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
   });
 
   it("encodes the exact maximum and rejects cap plus one before allocation", () => {
-    const scalarMax = "😀".repeat(262_144);
+    const scalarMax = "a".repeat(8_388_608);
     const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
     const maximum: CanonicalSendUserMessageV2 = {
       ...decoded,
@@ -227,16 +239,18 @@ describe("send_user_message_v2_canonical_vectors", () => {
         })),
       },
     };
-    expect(encodeCanonicalSendUserMessageV2(maximum)).toHaveLength(FCM2_MAX_BYTES);
+    expect(encodeCanonicalSendUserMessageV2(maximum)).toHaveLength(FCM2_MAX_CURRENT_ENCODING_BYTES);
+    expect(() => validateFcm2Length(FCM2_MAX_BYTES)).not.toThrow();
     expect(() => decodeCanonicalSendUserMessageV2(new Uint8Array(FCM2_MAX_BYTES + 1))).toThrow(
       "FCM2 exceeds maximum size",
     );
-    maximum.request.text += "😀";
+    maximum.request.text += "a";
     expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds byte limit");
-    maximum.request.text = "a".repeat(262_145);
-    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds scalar limit");
+    // Four-byte scalars exhaust the byte budget before the scalar ceiling.
+    maximum.request.text = "😀".repeat(2_097_153);
+    expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow("text exceeds byte limit");
     maximum.request.text = "x";
-    maximum.request.display_text = `${scalarMax}😀`;
+    maximum.request.display_text = `${scalarMax}a`;
     expect(() => encodeCanonicalSendUserMessageV2(maximum)).toThrow(
       "display text exceeds byte limit",
     );

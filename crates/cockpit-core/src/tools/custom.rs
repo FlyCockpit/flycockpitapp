@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::config::extended::ToolCommandTemplate;
-use crate::engine::tool::{Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
-use crate::intel::budget::retained_truncated_body;
+use crate::engine::tool::{TextArtifactCapture, Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
+use crate::intel::budget::capture_text_artifact_body;
 use crate::process::{
     BoundedPipeCapture, CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES,
 };
@@ -364,7 +364,7 @@ impl Tool for CustomBashTool {
                 &combined,
                 OUTPUT_BYTE_CAP,
             ))
-            .with_truncated_retention(boundary_safe_retention(&ctx.redact, &combined))
+            .with_text_artifact_capture(boundary_safe_capture(&ctx.redact, &combined))
             .with_output_sidecar(self.provenance_sidecar(
                 &selected,
                 status.code(),
@@ -436,27 +436,18 @@ fn boundary_safe_join(table: &RedactionTable, cap: BoundedPipeCapture) -> String
     format!("{safe_head}{OMITTED_MIDDLE_MARKER}{safe_tail}")
 }
 
-/// Boundary-safe [`retained_truncated_body`] for the retrievable retention copy.
-/// The retention is a PREFIX cut of `combined` at `RETAINED_TRUNCATED_OUTPUT_BYTE_CAP`;
-/// when it is partial, a registered secret straddling that prefix cut leaves its
-/// PREFIX at the retained end. Since `combined` is already boundary-safe at every
-/// drain junction, the only residual boundary is that prefix cut, so drop its
-/// back margin. A non-partial retention (whole body retained) has no cut boundary
-/// and is returned unchanged.
-fn boundary_safe_retention(
-    table: &RedactionTable,
-    combined: &str,
-) -> crate::engine::tool::RetainedTruncatedOutput {
-    let base = retained_truncated_body(combined);
-    if !base.partial {
+/// Boundary-safe capture for the immutable artifact.  The host capture has a
+/// fixed 8 MiB boundary; safety removal is represented by a smaller stored
+/// source count rather than being misreported as host loss.
+fn boundary_safe_capture(table: &RedactionTable, combined: &str) -> TextArtifactCapture {
+    let mut base = capture_text_artifact_body(combined);
+    if base.host_dropped_bytes == 0 {
         return base;
     }
     let safe = drop_back_margin(table, &base.content);
-    crate::engine::tool::RetainedTruncatedOutput {
-        original_byte_len: base.original_byte_len,
-        content: safe.to_string(),
-        partial: true,
-    }
+    base.content = safe.to_string();
+    base.stored_source_bytes = base.content.len();
+    base
 }
 
 fn render_failure_diagnostic(
@@ -1020,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_tool_over_cap_output_carries_retention() {
+    async fn custom_tool_over_cap_output_carries_text_artifact_capture() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
@@ -1042,17 +1033,17 @@ mod tests {
         let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
 
         assert!(out.truncated);
-        let retained = out
-            .truncated_retention
+        let capture = out
+            .text_artifact_capture
             .as_ref()
-            .expect("retention for over-cap custom output");
-        assert!(retained.original_byte_len > out.content.len());
-        assert_eq!(retained.original_byte_len, retained.content.len());
-        assert!(retained.content.starts_with("0123456789"));
+            .expect("capture for over-cap custom output");
+        assert!(capture.host_original_bytes > out.content.len());
+        assert_eq!(capture.host_original_bytes, capture.content.len());
+        assert!(capture.content.starts_with("0123456789"));
     }
 
     #[tokio::test]
-    async fn custom_tool_under_cap_output_has_no_retention() {
+    async fn custom_tool_under_cap_output_has_no_text_artifact_capture() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let ctx = crate::tools::common::test_ctx(cwd);
@@ -1074,7 +1065,7 @@ mod tests {
         let out = tool.call(serde_json::json!({}), &ctx).await.unwrap();
 
         assert!(!out.truncated);
-        assert!(out.truncated_retention.is_none());
+        assert!(out.text_artifact_capture.is_none());
         let sidecar = out.output_sidecar.expect("sidecar").payload;
         assert_eq!(sidecar["provenance"], "configured");
         assert_eq!(sidecar["source"], "test");
@@ -1186,16 +1177,12 @@ mod tests {
         let scrubbed = ctx.redact.scrub(&out.content);
         assert!(!scrubbed.contains(SECRET), "contained secret not scrubbed");
         assert!(scrubbed.contains(ctx.redact.placeholder()));
-        // The retrievable retention (re-injected through §7 on retrieval) is
-        // likewise boundary-safe.
-        let retained = out
-            .truncated_retention
+        // The durable capture is likewise boundary-safe.
+        let capture = out
+            .text_artifact_capture
             .as_ref()
-            .expect("retention for over-cap output");
-        let scrubbed_ret = ctx.redact.scrub(&retained.content);
-        assert!(
-            !scrubbed_ret.contains(SECRET),
-            "retention leaked the secret"
-        );
+            .expect("capture for over-cap output");
+        let scrubbed_ret = ctx.redact.scrub(&capture.content);
+        assert!(!scrubbed_ret.contains(SECRET), "capture leaked the secret");
     }
 }

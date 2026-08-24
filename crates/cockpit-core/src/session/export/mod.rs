@@ -27,9 +27,9 @@
 //! │                           # data.orphaned=true
 //! ├── tool_outputs/
 //! │   └── {seq:05}_{short_id}_{tool_call_id}.json
-//! ├── compressed_tool_results/
-//! │   ├── index.json          # nullable compression lengths are omitted
-//! │   └── {short_id}_{hash}.txt
+//! ├── text_artifacts/
+//! │   ├── index.json          # typed owner/ref/accounting manifest
+//! │   └── {artifact_uuid}.txt
 //! ├── delegation_payloads/
 //! │   └── {short_id}_{task_call_id}_{label}_{hash}.txt
 //! ├── inference_requests/
@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -70,7 +70,7 @@ const REQ_DIR_UTILITY: &str = "inference_requests_utility";
 const REQ_DIR_TANDEM: &str = "inference_requests_tandem";
 /// Full post-redaction tool output sidecars for verbose `bash` calls.
 const TOOL_OUTPUT_DIR: &str = "tool_outputs";
-const COMPRESSED_TOOL_RESULTS_DIR: &str = "compressed_tool_results";
+const TEXT_ARTIFACTS_DIR: &str = "text_artifacts";
 const DELEGATION_PAYLOADS_DIR: &str = "delegation_payloads";
 const DELEGATION_STEERS_DIR: &str = "delegation_steers";
 const DELEGATIONS_DIR: &str = "delegations";
@@ -1043,8 +1043,18 @@ fn build_zip_with_options_and_env_conn_with_redactor(
     // regular calls and `inference_requests_utility/` for utility calls.
     let mut request_files: Vec<(String, String, i64)> = Vec::new(); // (path, call_id, ordinal)
     let mut tool_output_files: Vec<(String, Value)> = Vec::new(); // (path, sidecar payload)
-    let mut compressed_result_files: Vec<(String, String)> = Vec::new(); // (path, content)
-    let mut compressed_result_index: Vec<Value> = Vec::new();
+    // Artifact payloads are already transformed by the dedicated
+    // length-preserving projection below, so they must bypass the ordinary
+    // placeholder renderer at write time.
+    let mut text_artifact_files: Vec<(String, String)> = Vec::new(); // (path, exported content)
+    let mut text_artifact_index: Vec<Value> = Vec::new();
+    let mut exported_source_text: HashMap<(Uuid, i64), String> = HashMap::new();
+    // Projection state remains marker-free event metadata, but an available
+    // tool artifact's previews describe the same exported body. Keep the
+    // length-preserving form separately so the ordinary placeholder scrubber
+    // cannot make a /3 event preview disagree with its sidecar on re-import.
+    let mut exported_tool_artifact_previews: HashMap<(Uuid, i64, i64), (String, String)> =
+        HashMap::new();
     let mut delegation_payload_files: Vec<(String, String)> = Vec::new(); // (path, content)
     let mut delegation_payload_index: Vec<Value> = Vec::new();
     let mut delegation_steer_index: Vec<Value> = Vec::new();
@@ -1085,29 +1095,71 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             .get(&s.session_id)
             .cloned()
             .unwrap_or_else(|| s.session_id.to_string());
-        for entry in Db::list_compressed_tool_results_conn(conn, s.session_id)? {
-            let path = format!(
-                "{COMPRESSED_TOOL_RESULTS_DIR}/{}_{}.txt",
-                short,
-                fs_safe(&entry.hash)
-            );
-            let mut index_entry = json!({
-                "hash": entry.hash,
-                "session_id": entry.session_id.to_string(),
-                "short_id": short,
-                "agent_id": entry.agent_id,
-                "tool": entry.tool,
-                "call_id": entry.call_id,
-                "original_byte_len": entry.original_byte_len,
-                "created_at": entry.created_at,
-                "kind": entry.kind,
-                "file": path,
-            });
-            if let Some(compressed_byte_len) = entry.compressed_byte_len {
-                index_entry["compressed_byte_len"] = json!(compressed_byte_len);
+        for entry in crate::db::text_artifacts::list_text_artifacts_conn(conn, s.session_id)? {
+            let path = format!("{TEXT_ARTIFACTS_DIR}/{}.txt", entry.artifact_id);
+            // `export_redacted` is an irreversible imported representation.
+            // A later include-sensitive export has no raw body to restore and
+            // must retain both its exact safe bytes and its representation
+            // rather than relabeling them as raw.
+            let content = if entry.representation
+                == crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
+            {
+                entry.content.clone()
+            } else if options.redacted {
+                redact_artifact_length_preserving(&entry.content, export_redactor)
+            } else {
+                entry.content.clone()
+            };
+            debug_assert_eq!(content.len(), entry.content_bytes);
+            let representation_mode = if entry.representation
+                == crate::db::text_artifacts::TextArtifactRepresentation::ExportRedacted
+                || options.redacted
+            {
+                "redacted_length_preserving"
+            } else {
+                "raw"
+            };
+            if entry.relation == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput {
+                exported_source_text.insert((entry.session_id, entry.event_seq), content.clone());
             }
-            compressed_result_index.push(index_entry);
-            compressed_result_files.push((path, entry.content));
+            let model_envelope = if entry.relation
+                == crate::db::text_artifacts::TextArtifactRelation::SourceUserInput
+            {
+                Db::user_message_model_envelope_conn(conn, entry.session_id, entry.event_seq)?
+            } else {
+                None
+            };
+            if entry.relation
+                == crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+            {
+                let slot = entry
+                    .projection_slot
+                    .ok_or_else(|| anyhow!("tool artifact lacks an export projection slot"))?;
+                let (head, tail) = crate::engine::text_artifact_frame::utf8_preview_pair(&content);
+                exported_tool_artifact_previews.insert(
+                    (entry.session_id, entry.event_seq, slot),
+                    (head.to_owned(), tail.to_owned()),
+                );
+            }
+            let index_entry = json!({
+                "artifact_id": entry.artifact_id.to_string(),
+                "session_id": entry.session_id.to_string(),
+                "event_seq": entry.event_seq,
+                "relation": entry.relation,
+                "projection_slot": entry.projection_slot,
+                "kind": entry.kind,
+                "capture_reason": entry.capture_reason,
+                "provenance": serde_json::from_str::<Value>(&entry.provenance_json)?,
+                "host_captured_bytes": entry.host_captured_bytes,
+                "host_original_bytes": entry.host_original_bytes,
+                "host_dropped_bytes": entry.host_dropped_bytes,
+                "stored_source_bytes": entry.stored_source_bytes,
+                "model_envelope": model_envelope,
+                "representation": { "mode": representation_mode, "content_bytes": content.len(), "content_file": path },
+                "created_at": entry.created_at,
+            });
+            text_artifact_index.push(index_entry);
+            text_artifact_files.push((path, content));
         }
         for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
             // Collected RAW (body embedded whole, no truncation); the whole index
@@ -1393,6 +1445,33 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             })
     });
 
+    // Event members ordinarily use the common one-pass export scrubber. A
+    // `user_input_source` is different: its canonical event text must remain
+    // byte-identical to its separately exported, length-preserving source
+    // artifact. Scrub the complete event once, then restore that one canonical
+    // field from the already length-preserving body before the prescrubbed
+    // writer serializes it. This keeps every other event field protected while
+    // preventing a configurable placeholder from changing source accounting.
+    for value in &mut event_values {
+        let source_text = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|session_id| Uuid::parse_str(session_id).ok())
+            .zip(value.get("seq").and_then(Value::as_i64))
+            .and_then(|key| exported_source_text.get(&key).cloned());
+        redact_value_for_export(value, export_redactor);
+        if let Some(source_text) = source_text {
+            let data = value
+                .get_mut("data")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    anyhow!("source artifact event lost its object data during export")
+                })?;
+            data.insert("text".to_string(), json!(source_text));
+        }
+        restore_exported_tool_artifact_previews(value, &exported_tool_artifact_previews)?;
+    }
+
     let manifest = build_manifest_conn(conn, target, bundle, options, env)?;
     let config_entries = collect_config_entries_with_env(
         target,
@@ -1410,12 +1489,11 @@ fn build_zip_with_options_and_env_conn_with_redactor(
 
         write_redacted_json_member(&mut zw, opts, "manifest.json", &manifest, export_redactor)?;
 
-        write_redacted_json_member(
+        write_prescrubbed_json_member(
             &mut zw,
             opts,
             "events.json",
             &Value::Array(event_values.clone()),
-            export_redactor,
         )?;
 
         // One file per inference request, split across `inference_requests/`
@@ -1482,18 +1560,19 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             )?;
         }
 
-        if !compressed_result_index.is_empty() {
-            let path = format!("{COMPRESSED_TOOL_RESULTS_DIR}/index.json");
-            write_redacted_json_member(
-                &mut zw,
-                opts,
-                &path,
-                &Value::Array(compressed_result_index.clone()),
-                export_redactor,
-            )?;
-        }
-        for (path, body) in &compressed_result_files {
-            write_redacted_text_member(&mut zw, opts, path, body, export_redactor)?;
+        // `/3` always carries the typed-artifact index, including an empty
+        // array, so import has one exact membership authority rather than a
+        // legacy absence fallback.
+        let path = format!("{TEXT_ARTIFACTS_DIR}/index.json");
+        write_redacted_json_member(
+            &mut zw,
+            opts,
+            &path,
+            &Value::Array(text_artifact_index.clone()),
+            export_redactor,
+        )?;
+        for (path, body) in &text_artifact_files {
+            write_prescrubbed_text_member(&mut zw, opts, path, body)?;
         }
 
         if !delegation_index.is_empty() {
@@ -1609,7 +1688,7 @@ fn build_manifest_conn(
         .collect::<Result<Vec<Value>>>()?;
 
     let mut manifest = json!({
-        "schema": "cockpit-session-export/2",
+        "schema": "cockpit-session-export/3",
         // The version of the cockpit binary producing THIS export — not
         // persisted per session, so a CLI export of an old session reflects
         // the exporting binary, not the one that created the session.
@@ -1972,6 +2051,68 @@ fn export_redaction_table_for_sessions(
     Ok(table.enforced())
 }
 
+/// Restore only the previews whose paired artifact sidecars have already been
+/// transformed through the /3 length-preserving path.  The ordinary export
+/// redactor is intentionally allowed to scrub the rest of the event state
+/// (including provenance), but it uses a configurable placeholder and must
+/// never alter a durable preview that rehydration compares with the imported
+/// immutable body.
+fn restore_exported_tool_artifact_previews(
+    value: &mut Value,
+    previews: &HashMap<(Uuid, i64, i64), (String, String)>,
+) -> Result<()> {
+    let Some(session_id) = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+    else {
+        return Ok(());
+    };
+    let Some(event_seq) = value.get("seq").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if let Some(projection) = data.get_mut("artifact_projection") {
+        restore_exported_tool_artifact_preview(projection, session_id, event_seq, previews)?;
+    }
+    if let Some(projections) = data.get_mut("artifact_projections") {
+        let projections = projections.as_array_mut().ok_or_else(|| {
+            anyhow::anyhow!("artifact projection array was not preserved by export")
+        })?;
+        for projection in projections {
+            restore_exported_tool_artifact_preview(projection, session_id, event_seq, previews)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_exported_tool_artifact_preview(
+    projection: &mut Value,
+    session_id: Uuid,
+    event_seq: i64,
+    previews: &HashMap<(Uuid, i64, i64), (String, String)>,
+) -> Result<()> {
+    let projection = projection
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("artifact projection was not an object during export"))?;
+    let slot = projection
+        .get("projection_slot")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("artifact projection lacks a stable slot during export"))?;
+    let Some((head, tail)) = previews.get(&(session_id, event_seq, slot)) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        projection.get("status").and_then(Value::as_str) == Some("available"),
+        "available text artifact sidecar has a non-available durable projection"
+    );
+    projection.insert("preview_head".to_owned(), json!(head));
+    projection.insert("preview_tail".to_owned(), json!(tail));
+    Ok(())
+}
+
 fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
     match value {
         Value::String(s) => {
@@ -2023,6 +2164,42 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
 
 fn redact_string_for_export(value: String, redactor: &RedactionTable) -> String {
     redactor.scrub(&value)
+}
+
+/// Deterministic archive-only redaction for immutable artifact bodies.
+///
+/// Ordinary export strings use the configurable placeholder, which may change
+/// byte length. Artifact manifests promise exact accounting, so we instead
+/// union every table-matched UTF-8 range and replace each matched *byte* with
+/// ASCII `*`. Replacing all bytes of a matched code point remains valid UTF-8;
+/// unmatched slices are copied unchanged. This is deliberately not a general
+/// egress redactor and never feeds a model-facing payload.
+fn redact_artifact_length_preserving(body: &str, redactor: &RedactionTable) -> String {
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for matched in crate::redact::match_sensitive_literals(redactor, body) {
+        if matched.literal.is_empty() {
+            continue;
+        }
+        for (start, _) in body.match_indices(&matched.literal) {
+            ranges.push((start, start + matched.literal.len()));
+        }
+    }
+    if ranges.is_empty() {
+        return body.to_string();
+    }
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, prior_end)) if start <= *prior_end => *prior_end = (*prior_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut bytes = body.as_bytes().to_vec();
+    for (start, end) in merged {
+        bytes[start..end].fill(b'*');
+    }
+    String::from_utf8(bytes).expect("replacing UTF-8 bytes with ASCII preserves UTF-8")
 }
 
 /// The scrub funnel for a JSON member whose content is collected RAW.

@@ -33,7 +33,8 @@ use noninteractive::*;
 use noninteractive::{
     BackgroundNoninteractiveCompletion, BackgroundNoninteractiveJob, BatchNoninteractiveTask,
     DelegationPartialProgress, NoninteractiveDelegationRegistry, PartialProgressCommand,
-    PartialProgressFileEdit, SingleNoninteractiveTask, handle_footer, stale_handle_error,
+    PartialProgressFileEdit, SingleNoninteractiveTask, VnextChildAdmissionRegistry, handle_footer,
+    stale_handle_error,
 };
 pub(crate) use noninteractive::{NoninteractiveSteerTarget, run_noninteractive};
 use queue::*;
@@ -54,7 +55,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Sleep};
 
@@ -461,6 +462,9 @@ pub struct AgentSession {
     /// buffer is never read (the root has no parent to defer to).
     pub deferred_log: crate::engine::deferred::DeferredLog,
     pub fallback_decision: Option<crate::engine::agent::BackupFallbackDecision>,
+    /// Reservation held by this child for the lifetime of its interactive
+    /// frame. Dropping the frame releases its parent's vNext child slot.
+    _vnext_child_admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +495,122 @@ enum UserMessageRecordOutcome {
     Recorded(i64),
     Untracked,
     RetryRequired,
+}
+
+#[derive(Debug, Clone)]
+struct ReservedOversizedUserSubmission {
+    reservation: crate::db::text_artifacts::TextArtifactReservation,
+    source_text: String,
+}
+
+/// Keeps a receipt-keyed oversized-input lease live while preflight and any
+/// utility-provider preprocessing are running.  The lease token rotates on
+/// renewal, so callers must obtain the final value through [`Self::finish`]
+/// before they reject or materialize.  Dropping the keeper always cancels the
+/// heartbeat; the durable lease itself then remains available for normal crash
+/// reconciliation rather than being modified by a detached task.
+struct OversizedArtifactLeaseKeeper {
+    cancel: tokio_util::sync::CancellationToken,
+    state: Arc<tokio::sync::Mutex<OversizedArtifactLeaseState>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+enum OversizedArtifactLeaseState {
+    Live(crate::db::text_artifacts::TextArtifactReservation),
+    Stale,
+    Failed(String),
+}
+
+impl OversizedArtifactLeaseKeeper {
+    /// A short cadence intentionally checks before the 5-minute renewal
+    /// boundary. The DB remains the authority for whether a rotation is due,
+    /// and compare-matches every identity/token/expiry field.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+    fn start(
+        db: crate::db::Db,
+        reservation: crate::db::text_artifacts::TextArtifactReservation,
+    ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(OversizedArtifactLeaseState::Live(
+            reservation,
+        )));
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(Self::HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` ticks immediately. The lease was just read/renewed by
+            // the owner, so start the actual cadence one period later.
+            heartbeat.tick().await;
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    _ = heartbeat.tick() => {
+                        let reservation = match &*task_state.lock().await {
+                            OversizedArtifactLeaseState::Live(reservation) => reservation.clone(),
+                            OversizedArtifactLeaseState::Stale | OversizedArtifactLeaseState::Failed(_) => break,
+                        };
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        match db
+                            .renew_text_artifact_reservation(reservation, now_ms)
+                            .await
+                        {
+                            Ok(Some(renewed)) => {
+                                *task_state.lock().await = OversizedArtifactLeaseState::Live(renewed);
+                            }
+                            Ok(None) => {
+                                *task_state.lock().await = OversizedArtifactLeaseState::Stale;
+                                break;
+                            }
+                            Err(error) => {
+                                *task_state.lock().await = OversizedArtifactLeaseState::Failed(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            cancel,
+            state,
+            task: Some(task),
+        }
+    }
+
+    async fn finish(
+        mut self,
+    ) -> Result<Option<crate::db::text_artifacts::TextArtifactReservation>> {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.await
+                .context("joining oversized artifact lease keeper")?;
+        }
+        match &*self.state.lock().await {
+            OversizedArtifactLeaseState::Live(reservation) => Ok(Some(reservation.clone())),
+            OversizedArtifactLeaseState::Stale => Ok(None),
+            OversizedArtifactLeaseState::Failed(error) => {
+                bail!("oversized artifact lease keeper failed: {error}")
+            }
+        }
+    }
+}
+
+impl Drop for OversizedArtifactLeaseKeeper {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+async fn finish_oversized_artifact_lease(
+    keeper: &mut Option<OversizedArtifactLeaseKeeper>,
+) -> Result<Option<crate::db::text_artifacts::TextArtifactReservation>> {
+    match keeper.take() {
+        Some(keeper) => keeper.finish().await,
+        None => Ok(None),
+    }
 }
 
 impl StackUnwindReason {
@@ -554,6 +674,13 @@ pub struct Driver {
     /// inline; this registry is the foundation for background completion,
     /// query snapshots, and turn-boundary steering.
     noninteractive_delegations: NoninteractiveDelegationRegistry,
+    /// Shared with background driver clones so child limits remain enforced
+    /// while a parent continues processing later turns.
+    vnext_child_admissions: VnextChildAdmissionRegistry,
+    /// Exact daemon-owned UUID bindings for daemon-local vNext definitions.
+    /// This arrives at root construction and is copied unchanged into every
+    /// child SpawnArgs; the driver never derives it from display names.
+    vnext_local_installation_resolver: crate::agents::LocalInstallationResolver,
     /// Job events drained at the turn boundary (loop-iteration-due,
     /// terminal completions). Same boundary as the user-input queue.
     job_event_rx: mpsc::Receiver<ScheduleEvent>,
@@ -857,8 +984,8 @@ pub struct Driver {
     /// Deterministically force a compaction to fail at prepare or apply so the
     /// `preCompact`/`postCompact` hook control-flow contract can be exercised
     /// (both error paths are genuinely reachable in production — a concurrent
-    /// history change makes apply `Stale`, a store error makes it
-    /// `StoreCompressedResults`, a cancelled/overflowing brief makes prepare
+    /// history change makes apply `Stale`, a durable composition failure makes
+    /// it `StoreTextArtifacts`, a cancelled/overflowing brief makes prepare
     /// fail — but are not reachable from a black-box unit test).
     #[cfg(test)]
     test_compact_force_failure: Option<CompactForceFailure>,
@@ -1305,6 +1432,10 @@ impl Driver {
                     answering: frame.answering.clone(),
                     deferred_log: crate::engine::deferred::DeferredLog::new(),
                     fallback_decision: frame.fallback_decision.clone(),
+                    // This clone represents work already owned by the foreground
+                    // frame, whose reservation remains held there. New children
+                    // admitted by the clone use the shared registry below.
+                    _vnext_child_admission: None,
                 })
                 .collect(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
@@ -1316,6 +1447,8 @@ impl Driver {
             unbounded_schedule_loops_approved: self.unbounded_schedule_loops_approved,
             schedule,
             noninteractive_delegations: NoninteractiveDelegationRegistry::default(),
+            vnext_child_admissions: self.vnext_child_admissions.clone(),
+            vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
             job_event_rx,
             job_cmd_rx,
             noninteractive_complete_tx: self.noninteractive_complete_tx.clone(),
@@ -1626,6 +1759,7 @@ impl Driver {
                 answering: None,
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
                 fallback_decision: None,
+                _vnext_child_admission: None,
             }],
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -1636,6 +1770,9 @@ impl Driver {
             unbounded_schedule_loops_approved: false,
             schedule,
             noninteractive_delegations: NoninteractiveDelegationRegistry::default(),
+            vnext_child_admissions: VnextChildAdmissionRegistry::default(),
+            vnext_local_installation_resolver:
+                crate::agents::LocalInstallationResolver::no_installations(),
             job_event_rx,
             job_cmd_rx,
             noninteractive_complete_tx,
@@ -2042,6 +2179,16 @@ impl Driver {
         self.assistant_identity_prefix = prefix;
     }
 
+    /// Install the daemon-owned local installation mapping captured at root
+    /// construction.  It is intentionally an explicit input rather than a
+    /// lookup by display name, and every delegated spawn reuses this snapshot.
+    pub fn set_vnext_local_installation_resolver(
+        &mut self,
+        resolver: crate::agents::LocalInstallationResolver,
+    ) {
+        self.vnext_local_installation_resolver = resolver;
+    }
+
     pub fn set_lsp_manager(&mut self, lsp: Arc<crate::daemon::lsp::LspManager>) {
         self.lsp = Some(lsp);
     }
@@ -2156,13 +2303,15 @@ impl Driver {
         if self.stack.len() != 1 || !self.stack[0].history.is_empty() {
             return Ok(None);
         }
-        let Some(rehydrated) = crate::engine::rehydrate::rehydrate_session_with_policy(
-            &self.session.db,
-            self.session.id,
-            root_agent,
-            policy,
-        )
-        .await?
+        let Some(rehydrated) =
+            crate::engine::rehydrate::rehydrate_session_with_policy_and_redaction(
+                &self.session.db,
+                self.session.id,
+                root_agent,
+                policy,
+                self.redact.clone(),
+            )
+            .await?
         else {
             return Ok(None);
         };
@@ -2201,15 +2350,34 @@ impl Driver {
     /// unclean daemon kill. Best-effort: a DB failure is logged, never
     /// propagated — auditing/continuity must not break a live turn.
     ///
-    /// Reuses [`prune::capture_ledger`], which derives the elided-id
-    /// set from the live wire history the same way [`prune::current_elided_ids`]
-    /// does (single marker format), so the ledger is always in lockstep
-    /// with what the model last saw.
+    /// Reuses the durable projection-owner set for the prune-boundary entries
+    /// in [`prune::capture_ledger_with_prune_boundary_calls`], so a tool body
+    /// that merely resembles an artifact frame cannot forge an elision into
+    /// the resumable ledger.
     async fn persist_prune_ledger(&self) {
         // Only the root frame's history is the resumable context.
         let history = &self.stack[0].history;
         let watermark = self.prune_watermark.get(&1).copied().unwrap_or(0);
-        let ledger = prune::capture_ledger(history, watermark);
+        let projection_calls = match self
+            .session
+            .db
+            .text_artifact_projection_call_ids(self.session.id)
+            .await
+        {
+            Ok(calls) => calls,
+            Err(error) => {
+                // Do not overwrite a prior durable ledger with a text-shaped
+                // guess when the owner-state read fails. The next successful
+                // boundary will reconcile it from the database.
+                tracing::warn!(%error, "loading durable text-artifact projection ids for prune ledger failed");
+                return;
+            }
+        };
+        let ledger = prune::capture_ledger_with_prune_boundary_calls(
+            history,
+            watermark,
+            &projection_calls.prune_boundary_calls,
+        );
         if let Err(e) = self
             .session
             .db
@@ -4727,13 +4895,13 @@ impl Driver {
     /// re-fire `userPromptSubmit`.
     fn stop_continuation_prompt(reason: String, additional_context: Option<String>) -> Message {
         let mut text = reason;
-        if let Some(ctx) = additional_context {
-            if !ctx.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&ctx);
+        if let Some(ctx) = additional_context
+            && !ctx.is_empty()
+        {
+            if !text.is_empty() {
+                text.push('\n');
             }
+            text.push_str(&ctx);
         }
         crate::engine::message::build_user_message(UserSubmission {
             expected_model_state_generation: None,
@@ -4902,6 +5070,15 @@ impl Driver {
         folded: &UserSubmission,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> std::result::Result<Option<i64>, ()> {
+        if matches!(
+            folded.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        ) {
+            tracing::error!("refusing to fold a receipt-keyed oversized text artifact submission");
+            return Err(());
+        }
         if folded.queue_item_ids.is_empty() {
             return Ok(None);
         }
@@ -4951,16 +5128,290 @@ impl Driver {
         Ok(seq)
     }
 
+    /// Loads the durable phase-one record for a submission. The queue's mutable
+    /// string is never trusted as source identity: FCM2 is decoded again and
+    /// compared with the receipt-keyed lease before any provider boundary.
+    async fn reserved_oversized_user_submission(
+        &self,
+        submission: &UserSubmission,
+        require_current_source_match: bool,
+    ) -> Result<Option<ReservedOversizedUserSubmission>> {
+        let Some(receipt) = submission.client_submissions.first() else {
+            return Ok(None);
+        };
+        if submission.client_submissions.len() != 1 || !submission.images.is_empty() {
+            return Ok(None);
+        }
+        let Some(stored) = self
+            .session
+            .db
+            .reserved_text_artifact_submission(self.session.id, *receipt.id.as_bytes())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let canonical =
+            crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                &stored.canonical_message,
+            )?;
+        anyhow::ensure!(
+            canonical.session_id == self.session.id,
+            "FCM2 session mismatch"
+        );
+        anyhow::ensure!(
+            canonical.request.client_submission_id == receipt.id,
+            "FCM2 client submission mismatch"
+        );
+        anyhow::ensure!(
+            canonical.request.attachments.is_empty(),
+            "oversized source carries media attachments"
+        );
+        anyhow::ensure!(
+            canonical.request.text.len() > 64 * 1024
+                && canonical.request.text.len()
+                    <= crate::proto_crate::send_user_message_v2::MAX_MESSAGE_TEXT_BYTES,
+            "oversized source violates FCM2 bounds"
+        );
+        anyhow::ensure!(
+            crate::db::text_artifacts::source_digest(&canonical.request.text)
+                == stored.reservation.source_digest
+                && canonical.request.text.len() == stored.reservation.source_bytes,
+            "FCM2 source differs from its reservation identity"
+        );
+        if require_current_source_match {
+            anyhow::ensure!(
+                canonical.request.text == submission.text,
+                "queued source differs from the reserved FCM2 source"
+            );
+        }
+        Ok(Some(ReservedOversizedUserSubmission {
+            reservation: stored.reservation,
+            source_text: canonical.request.text,
+        }))
+    }
+
+    async fn reject_reserved_oversized_user_submission(
+        &self,
+        reservation: crate::db::text_artifacts::TextArtifactReservation,
+        reason: crate::db::text_artifacts::TextArtifactRejectReason,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        match self
+            .session
+            .db
+            .reject_and_release_text_artifact_reservation(
+                reservation,
+                reason,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            Ok(crate::db::text_artifacts::TextArtifactReservationTransition::Applied(_)) => true,
+            Ok(crate::db::text_artifacts::TextArtifactReservationTransition::Stale) => {
+                // A renew/reaper/materializer won. Do not write a legacy
+                // terminal receipt over that durable winner.
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "reject-and-release of oversized user artifact failed");
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: "Saving oversized-message rejection failed; no provider will run and durable replay will reconcile it."
+                            .to_owned(),
+                    })
+                    .await;
+                false
+            }
+        }
+    }
+
+    /// A queued oversized FCM2 source is receipt-owned. Once its exact lease
+    /// is absent, this durable receipt state — never the queue's mutable text
+    /// or an in-memory marker — decides the only safe branch: do not execute
+    /// the source again. This helper is used at every no-lease race boundary
+    /// so a reaper/materializer winner cannot accidentally re-enter the
+    /// ordinary inline/provider path.
+    async fn oversized_artifact_no_lease_notice(
+        &self,
+        client_submission_id: Option<uuid::Uuid>,
+    ) -> String {
+        let Some(client_submission_id) = client_submission_id else {
+            return "Oversized message has no durable submission identity; it will not execute its source."
+                .to_owned();
+        };
+        match self
+            .session
+            .db
+            .text_artifact_submission_durable_state(
+                self.session.id,
+                *client_submission_id.as_bytes(),
+            )
+            .await
+        {
+            Ok(crate::db::text_artifacts::TextArtifactSubmissionDurableState::Terminal {
+                reason,
+            }) => {
+                format!(
+                    "Oversized message reached durable terminal outcome {}; it will not execute its source.",
+                    reason.as_str()
+                )
+            }
+            Ok(crate::db::text_artifacts::TextArtifactSubmissionDurableState::Materialized) => {
+                "Oversized message was already durably materialized; it will not execute its source again."
+                    .to_owned()
+            }
+            Ok(crate::db::text_artifacts::TextArtifactSubmissionDurableState::Accepted) => {
+                "Oversized message has an accepted durable receipt but no live lease; it will not execute its source."
+                    .to_owned()
+            }
+            Ok(crate::db::text_artifacts::TextArtifactSubmissionDurableState::Missing) => {
+                "Oversized message lost its durable receipt; it will not execute its source."
+                    .to_owned()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "loading durable oversized message receipt state failed");
+                "Oversized message outcome could not be loaded; it will not execute its source."
+                    .to_owned()
+            }
+        }
+    }
+
     async fn prepare_queued_user_submission(
         &mut self,
         mut submission: UserSubmission,
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Option<UserSubmission> {
+        let requires_durable_oversized_outcome = matches!(
+            submission.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        );
+        let initial_oversized_reservation = match self
+            .reserved_oversized_user_submission(&submission, true)
+            .await
+        {
+            Ok(Some(stored)) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                match self
+                    .session
+                    .db
+                    .renew_text_artifact_reservation(stored.reservation.clone(), now_ms)
+                    .await
+                {
+                    Ok(Some(reservation)) => Some(reservation),
+                    Ok(None) => {
+                        // A concurrent renew/reaper/materializer owns the
+                        // durable winner. This worker must not run security or
+                        // a utility provider until a replay has established it.
+                        let durable_notice = self
+                            .oversized_artifact_no_lease_notice(
+                                submission
+                                    .client_submissions
+                                    .first()
+                                    .map(|receipt| receipt.id),
+                            )
+                            .await;
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: durable_notice,
+                            })
+                            .await;
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "renewing oversized message reservation failed");
+                        return None;
+                    }
+                }
+            }
+            Ok(None) if requires_durable_oversized_outcome => {
+                // A durable FCM2 identity was queued, but its exact lease is
+                // no longer live. This is a terminal/replay-only branch (for
+                // example a reaper won); never reinterpret the original body
+                // as an ordinary inline submission and never run a provider.
+                // Consult the receipt itself rather than trusting the
+                // in-memory marker: a reaper/materializer can have won after
+                // the lookup, and an accepted-without-lease row is corruption
+                // that must remain non-executable too.
+                let durable_notice = self
+                    .oversized_artifact_no_lease_notice(
+                        submission
+                            .client_submissions
+                            .first()
+                            .map(|receipt| receipt.id),
+                    )
+                    .await;
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: durable_notice,
+                    })
+                    .await;
+                return None;
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, "loading oversized message reservation failed");
+                return None;
+            }
+        };
+        let has_oversized_artifact_lease = initial_oversized_reservation.is_some();
+        // Preflight and inbound translation may await utility providers. Keep
+        // the exact phase-one lease renewed for that entire interval, rather
+        // than discovering an expired token only when phase two starts.
+        let mut oversized_lease = initial_oversized_reservation.map(|reservation| {
+            OversizedArtifactLeaseKeeper::start(self.session.db.clone(), reservation)
+        });
         if matches!(
             submission.pending_terminal_disposition,
             Some(crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected)
         ) {
+            if oversized_lease.is_some() {
+                let reservation = match finish_oversized_artifact_lease(&mut oversized_lease).await
+                {
+                    Ok(Some(reservation)) => reservation,
+                    Ok(None) => {
+                        let durable_notice = self
+                            .oversized_artifact_no_lease_notice(
+                                submission
+                                    .client_submissions
+                                    .first()
+                                    .map(|receipt| receipt.id),
+                            )
+                            .await;
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: durable_notice,
+                            })
+                            .await;
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "finishing oversized message lease before pending rejection failed");
+                        return None;
+                    }
+                };
+                let client_submission_ids = submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id)
+                    .collect();
+                let _ = self
+                    .reject_reserved_oversized_user_submission(
+                        reservation,
+                        crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
+                        tx,
+                    )
+                    .await;
+                let _ = tx
+                    .send(TurnEvent::UserMessageRetracted {
+                        client_submission_ids,
+                    })
+                    .await;
+                self.emit_context_projection(tx).await;
+                return None;
+            }
             self.settle_preflight_rejection(submission, input_rx, tx)
                 .await;
             return None;
@@ -4996,6 +5447,52 @@ impl Driver {
             false
         };
         if injection_rejected {
+            if oversized_lease.is_some() {
+                let reservation = match finish_oversized_artifact_lease(&mut oversized_lease).await
+                {
+                    Ok(Some(reservation)) => reservation,
+                    Ok(None) => {
+                        let durable_notice = self
+                            .oversized_artifact_no_lease_notice(
+                                submission
+                                    .client_submissions
+                                    .first()
+                                    .map(|receipt| receipt.id),
+                            )
+                            .await;
+                        let _ = tx
+                            .send(TurnEvent::Notice {
+                                text: durable_notice,
+                            })
+                            .await;
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "finishing oversized message lease before rejection failed");
+                        return None;
+                    }
+                };
+                let client_submission_ids = submission
+                    .client_submissions
+                    .iter()
+                    .map(|receipt| receipt.id)
+                    .collect();
+                let rejection = if rejected_for_test {
+                    crate::db::text_artifacts::TextArtifactRejectReason::PreflightRejected
+                } else {
+                    crate::db::text_artifacts::TextArtifactRejectReason::SecurityRejected
+                };
+                let _ = self
+                    .reject_reserved_oversized_user_submission(reservation, rejection, tx)
+                    .await;
+                let _ = tx
+                    .send(TurnEvent::UserMessageRetracted {
+                        client_submission_ids,
+                    })
+                    .await;
+                self.emit_context_projection(tx).await;
+                return None;
+            }
             submission.pending_terminal_disposition = Some(
                 crate::engine::message::PendingSubmissionTerminalDisposition::PreflightRejected,
             );
@@ -5007,6 +5504,31 @@ impl Driver {
             .resolve_preflight_outcome(preflight, &submission.text, submission.forced_skill, tx)
             .await;
         let inbound_text = self.translate_inbound(&raw_text).await;
+        if oversized_lease.is_some() {
+            match finish_oversized_artifact_lease(&mut oversized_lease).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let durable_notice = self
+                        .oversized_artifact_no_lease_notice(
+                            submission
+                                .client_submissions
+                                .first()
+                                .map(|receipt| receipt.id),
+                        )
+                        .await;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: durable_notice,
+                        })
+                        .await;
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "finishing oversized message lease after preprocessing failed");
+                    return None;
+                }
+            }
+        }
         Some(UserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
@@ -5023,7 +5545,9 @@ impl Driver {
             queue_item_ids: submission.queue_item_ids,
             client_submissions: submission.client_submissions,
             queue_target: submission.queue_target,
-            pending_terminal_disposition: None,
+            pending_terminal_disposition: has_oversized_artifact_lease.then_some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
+            ),
             run_invocation_id: submission.run_invocation_id,
         })
     }
@@ -5091,6 +5615,23 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         if submissions.is_empty() {
+            return Ok(());
+        }
+        // A phase-one FCM2 lease is tied to exactly one user event and must
+        // survive to that event's phase-two materialization. Folding it into
+        // leading history would both lose the owner slot and let the old
+        // inline recording path run, so process every member independently.
+        if submissions.iter().any(|submission| {
+            matches!(
+                submission.pending_terminal_disposition,
+                Some(
+                    crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+                )
+            )
+        }) {
+            for submission in submissions {
+                self.run_user_input(submission, input_rx, tx).await?;
+            }
             return Ok(());
         }
         if submissions.len() == 1
@@ -6776,7 +7317,25 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        if submission.origin.advances_activity_epoch() {
+        let submission_has_oversized_artifact_lease = matches!(
+            submission.pending_terminal_disposition,
+            Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact
+            )
+        );
+        let oversized_artifact_submission_id = submission_has_oversized_artifact_lease
+            .then(|| {
+                submission
+                    .client_submissions
+                    .first()
+                    .map(|receipt| receipt.id)
+            })
+            .flatten();
+        // The ordinary path may expose the activity epoch as soon as the turn
+        // starts. A receipt-keyed oversized turn has not reached phase two
+        // yet, so advancing it here would make a rejected/expired source an
+        // accepted-turn side effect.
+        if submission.origin.advances_activity_epoch() && !submission_has_oversized_artifact_lease {
             self.auto_compact_gate.external_activity();
         }
         // Shadow drafting is utility work: a foreground user turn always wins.
@@ -6806,12 +7365,47 @@ impl Driver {
         // auto-continue / retry / tool-result / internal directives reach this
         // same path but must NOT (see `SubmissionOrigin::user_prompt_submit_source`).
         let user_prompt_source = submission.origin.user_prompt_submit_source();
+        // Re-read the FCM2-bound lease before moving any fields out of the
+        // structured submission. This is deliberately a typed receipt lookup,
+        // not a size check on the mutable queue text: a stale/reaped lease
+        // must fail closed rather than falling through to the legacy inline
+        // event path.
+        let oversized_artifact_submission = if submission_has_oversized_artifact_lease {
+            match self
+                .reserved_oversized_user_submission(&submission, false)
+                .await
+            {
+                Ok(Some(stored)) => Some(stored),
+                Ok(None) => {
+                    let durable_notice = self
+                        .oversized_artifact_no_lease_notice(oversized_artifact_submission_id)
+                        .await;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: durable_notice,
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "loading phase-two oversized message reservation failed");
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: "Could not verify oversized-message admission; no provider was called."
+                                .to_owned(),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let images = submission.images;
         let user_text = submission.text;
         let display_text = submission.display_text;
         let tag_expansions = submission.tag_expansions;
         let origin_principal = submission.origin_principal;
-        let raw_user_text = user_text.clone();
         // A user-issued skill slash command (`/<skill-name>` / `/skill <name>`,
         // implementation note): the skill body loads via a
         // synthesized `skill` tool call below, deterministically (not left to
@@ -6860,7 +7454,7 @@ impl Driver {
         let run_invocation_id = submission.run_invocation_id;
         // RAII: clear invocation approval override on every exit of this run.
         let mut _invocation_approval_guard: Option<InvocationApprovalGuard> = None;
-        if let Some(run_id) = run_invocation_id {
+        if !submission_has_oversized_artifact_lease && let Some(run_id) = run_invocation_id {
             let now = crate::daemon::server::run_invocation_wall_ms_now();
             // Checkpoint remaining before any side effect (queue already done).
             if let Ok(Some(row)) = self.session.db.get_run_invocation(run_id).await {
@@ -6927,8 +7521,16 @@ impl Driver {
                     .await;
             }
         }
+        // The immutable authored source is the FCM2 text, never a preflight
+        // rewrite or translation. The ordinary path has no separate source,
+        // so its canonical event remains the model text exactly as before.
+        let canonical_user_text = oversized_artifact_submission
+            .as_ref()
+            .map(|stored| stored.source_text.clone())
+            .unwrap_or_else(|| user_text.clone());
+        let raw_user_text = canonical_user_text.clone();
         let event_data = user_message_event_data(UserMessageEventData {
-            text: &user_text,
+            text: &canonical_user_text,
             display_text: display_text.as_deref(),
             tag_expansions: &tag_expansions,
             job_id: job_id.as_deref(),
@@ -6938,79 +7540,441 @@ impl Driver {
             preflight_cleaned: preflight_cleaned.as_deref(),
         });
         let active_agent = self.active_agent().to_string();
-        match self
-            .record_user_message_event(
-                Some(active_agent.as_str()),
-                origin_principal.as_deref(),
-                &event_data,
-                &client_submissions,
-                tx,
-                user_prompt_source,
-            )
-            .await
-        {
-            UserMessageRecordOutcome::Recorded(seq) => {
-                // Carry the assigned `seq` (the message's stable id) back to the
-                // client so it can stamp the already-pushed user history row,
-                // letting a pin reference this message by id (`pinned-messages`).
-                // UI/DB-only — the seq never enters the model's context.
-                if !queue_item_ids.is_empty() {
+        // Resolve every model-bound textual addition before phase two.  The
+        // reservation is already durable, so utility selection is allowed;
+        // phase two persists the exact resulting composition before the first
+        // primary-provider handoff.
+        let prepared_auto_skill = if submission_has_oversized_artifact_lease {
+            let skill_probe =
+                crate::engine::text_artifact_frame::bounded_utf8_prefix(&user_text, 4 * 1024)
+                    .to_owned();
+            Some(self.prepare_auto_skill_injection(&skill_probe).await)
+        } else {
+            None
+        };
+        // Loading a forced skill is read-only, but applying it mutates active
+        // skills, history, audit rows and the skill-pair ledger.  For an
+        // oversized submission prepare that exact contribution before phase
+        // two, then apply it only after the reservation materializes.
+        let prepared_forced_skill = if submission_has_oversized_artifact_lease {
+            if let Some(skill_name) = forced_skill.as_deref() {
+                Some(self.prepare_forced_skill(skill_name).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // This exact ordering is durable phase-two composition: forced seed,
+        // auto-selected guidance, then the authored artifact slot.  The
+        // prepared values are pure; no active-skill/event/history mutation is
+        // permitted before materialization succeeds.
+        let accepted_oversized_guidance = if submission_has_oversized_artifact_lease {
+            let mut guidance = String::new();
+            if let Some(prepared) = prepared_auto_skill.as_ref() {
+                guidance.push_str(&prepared.guidance(
+                    crate::engine::text_artifact_frame::bounded_utf8_prefix(&user_text, 4 * 1024),
+                ));
+            }
+            Some(guidance)
+        } else {
+            None
+        };
+        let artifact_frame = if let Some(mut oversized) = oversized_artifact_submission {
+            // Long preprocessing can consume most of the original lease. Renew
+            // at this final boundary, rotating the token when required, before
+            // asking the one phase-two composition to own the event.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            match self
+                .session
+                .db
+                .renew_text_artifact_reservation(oversized.reservation.clone(), now_ms)
+                .await
+            {
+                Ok(Some(reservation)) => oversized.reservation = reservation,
+                Ok(None) => {
+                    let _ = self
+                        .session
+                        .db
+                        .reap_expired_text_artifact_reservations(now_ms)
+                        .await;
+                    let durable_notice = self
+                        .oversized_artifact_no_lease_notice(oversized_artifact_submission_id)
+                        .await;
                     let _ = tx
-                        .send(TurnEvent::QueuedUserMessagesFolded {
-                            text: user_text.clone(),
-                            display_text: display_text.clone(),
-                            tag_expansions: tag_expansions.clone(),
-                            queue_item_ids: queue_item_ids.clone(),
-                            target: queue_target
-                                .clone()
-                                .unwrap_or_else(|| self.active_queue_target()),
-                            seq: Some(seq),
+                        .send(TurnEvent::Notice {
+                            text: durable_notice,
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "renewing oversized message lease before materialization failed");
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: "Could not renew oversized-message admission; no provider was called."
+                                .to_owned(),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            }
+            let materialization = self
+                .session
+                .db
+                .materialize_reserved_user_text_artifacts(
+                    crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                        reservation: oversized.reservation.clone(),
+                        canonical_event_json: match serde_json::to_string(&event_data) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::warn!(%error, "serializing oversized canonical user event failed");
+                                let _ = self
+                                    .reject_reserved_oversized_user_submission(
+                                        oversized.reservation,
+                                        crate::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                        tx,
+                                    )
+                                    .await;
+                                return Ok(());
+                            }
+                        },
+                        // This is the accepted model-facing composition, not
+                        // a replay hint. Later restart rendering replaces only
+                        // its authored slot with the artifact frame.
+                        model_envelope_json: crate::engine::text_artifact_frame::accepted_user_envelope_from_parts(
+                            prepared_forced_skill.as_ref().and_then(crate::engine::driver::skills_seed::PreparedForcedSkill::envelope_prelude),
+                            &{
+                                let mut parts = Vec::new();
+                                if let Some(guidance) = accepted_oversized_guidance.as_deref().filter(|guidance| !guidance.is_empty()) {
+                                    parts.push(rig::message::UserContent::text(guidance));
+                                }
+                                parts.push(rig::message::UserContent::text(&user_text));
+                                parts
+                            },
+                            &user_text,
+                        ).expect("accepted oversized composition is constructed from closed host parts"),
+                        source_text: oversized.source_text.clone(),
+                        model_projection: (user_text != oversized.source_text)
+                            .then_some(user_text.clone()),
+                        agent: Some(active_agent.clone()),
+                        context: crate::db::text_artifacts::TextArtifactEventContext {
+                            origin_principal: origin_principal.clone(),
+                            ..Default::default()
+                        },
+                        now_ms,
+                    },
+                )
+                .await;
+            match materialization {
+                Ok(
+                    crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Materialized(
+                        materialized,
+                    ),
+                ) => {
+                    let crate::db::text_artifacts::ReservedUserArtifactMaterialized {
+                        event_seq,
+                        source_artifact,
+                        projection_artifact,
+                    } = *materialized;
+                    // From this point the turn is durably accepted. No rejected
+                    // source can advance activity/title/provider state.
+                    if submission_kind == UserSubmissionKind::User
+                        && user_prompt_source.is_some()
+                    {
+                        // The FCM2 scheduler epoch is intentionally advanced
+                        // only after phase two has atomically materialized the
+                        // source/event/receipt and released its reservation.
+                        // Dispatch handles the ordinary inline path earlier.
+                        if let Some(scheduler) = self.daemon_scheduler_handle() {
+                            scheduler.record_user_activity().await;
+                        }
+                        self.auto_compact_gate.external_activity();
+                    }
+                    if !queue_item_ids.is_empty() {
+                        let _ = tx
+                            .send(TurnEvent::QueuedUserMessagesFolded {
+                                text: canonical_user_text.clone(),
+                                display_text: display_text.clone(),
+                                tag_expansions: tag_expansions.clone(),
+                                queue_item_ids: queue_item_ids.clone(),
+                                target: queue_target
+                                    .clone()
+                                    .unwrap_or_else(|| self.active_queue_target()),
+                                seq: Some(event_seq),
+                                preflight_cleaned: preflight_cleaned.clone(),
+                            })
+                            .await;
+                    }
+                    let _ = tx
+                        .send(TurnEvent::UserMessageRecorded {
+                            seq: event_seq,
+                            client_submission_ids: client_submissions
+                                .iter()
+                                .map(|receipt| receipt.id)
+                                .collect(),
+                            preflight_cleaned: preflight_cleaned.clone(),
+                        })
+                        .await;
+                    if let Some(source) = user_prompt_source {
+                        self.fire_observe_hook(
+                            crate::config::extended::hooks::HookEvent::UserPromptSubmit,
+                            source,
+                            None,
+                            None,
+                            crate::engine::agent::hooks::ObserveFields {
+                                prompt_source: Some(source),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                    let effective = projection_artifact.as_ref().unwrap_or(&source_artifact);
+                    let outbound_content = self.redact.scrub(&effective.content);
+                    match crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
+                        effective,
+                        &outbound_content,
+                    ) {
+                        Ok(frame) => Some((event_seq, frame)),
+                        Err(error) => {
+                            // The materialized event is intentionally retained
+                            // for audit/replay, but malformed owner bindings may
+                            // never fall back to the source or inline text.
+                            tracing::error!(%error, event_seq, "materialized oversized user artifact binding is invalid");
+                            let _ = tx
+                                .send(TurnEvent::Notice {
+                                    text: "Oversized message was stored but its model projection is invalid; no provider was called."
+                                        .to_owned(),
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(
+                    crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::ProjectionTooLarge,
+                ) => {
+                    // The phase-two composition has already terminalized the
+                    // exact receipt triple and released its lease atomically.
+                    // Do not issue a second best-effort terminal update: a
+                    // renewed/replayed winner must remain untouched.
+                    let _ = tx
+                        .send(TurnEvent::UserMessageRetracted {
+                            client_submission_ids: client_submissions
+                                .iter()
+                                .map(|receipt| receipt.id)
+                                .collect(),
+                        })
+                        .await;
+                    self.emit_context_projection(tx).await;
+                    return Ok(());
+                }
+                Ok(
+                    crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Stale
+                    | crate::db::text_artifacts::ReservedUserArtifactMaterializationResult::Expired,
+                ) => {
+                    let _ = self
+                        .session
+                        .db
+                        .reap_expired_text_artifact_reservations(now_ms)
+                        .await;
+                    let durable_notice = self
+                        .oversized_artifact_no_lease_notice(oversized_artifact_submission_id)
+                        .await;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: durable_notice,
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "materializing oversized user artifacts failed");
+                    // A database fault rolls the whole phase-two transaction
+                    // back.  Preserve its accepted lease for the durable
+                    // replay/reaper path instead of attempting a separate
+                    // terminal write that could turn an injected statement
+                    // fault into a misleading partial rejection.
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: "Saving oversized-message artifacts failed; no provider was called and durable replay will reconcile it."
+                                .to_owned(),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            }
+        } else {
+            match self
+                .record_user_message_event(
+                    Some(active_agent.as_str()),
+                    origin_principal.as_deref(),
+                    &event_data,
+                    &client_submissions,
+                    tx,
+                    user_prompt_source,
+                )
+                .await
+            {
+                UserMessageRecordOutcome::Recorded(seq) => {
+                    // Carry the assigned `seq` (the message's stable id) back to
+                    // the client so it can stamp the already-pushed user history
+                    // row. UI/DB-only — the seq never enters model context.
+                    if !queue_item_ids.is_empty() {
+                        let _ = tx
+                            .send(TurnEvent::QueuedUserMessagesFolded {
+                                text: user_text.clone(),
+                                display_text: display_text.clone(),
+                                tag_expansions: tag_expansions.clone(),
+                                queue_item_ids: queue_item_ids.clone(),
+                                target: queue_target
+                                    .clone()
+                                    .unwrap_or_else(|| self.active_queue_target()),
+                                seq: Some(seq),
+                                preflight_cleaned: preflight_cleaned.clone(),
+                            })
+                            .await;
+                    }
+                    let _ = tx
+                        .send(TurnEvent::UserMessageRecorded {
+                            seq,
+                            client_submission_ids: client_submissions
+                                .iter()
+                                .map(|receipt| receipt.id)
+                                .collect(),
                             preflight_cleaned: preflight_cleaned.clone(),
                         })
                         .await;
                 }
-                let _ = tx
-                    .send(TurnEvent::UserMessageRecorded {
-                        seq,
-                        client_submission_ids: client_submissions
-                            .iter()
-                            .map(|receipt| receipt.id)
-                            .collect(),
-                        preflight_cleaned: preflight_cleaned.clone(),
-                    })
-                    .await;
-            }
-            UserMessageRecordOutcome::Untracked => {}
-            UserMessageRecordOutcome::RetryRequired => {
-                if let Some(top) = self.stack.last_mut() {
-                    top.history.extend(leading_history);
+                UserMessageRecordOutcome::Untracked => {}
+                UserMessageRecordOutcome::RetryRequired => {
+                    if let Some(top) = self.stack.last_mut() {
+                        top.history.extend(leading_history);
+                    }
+                    input_rx
+                        .requeue_front_after(
+                            UserSubmission {
+                                expected_model_state_generation: None,
+                                expected_model: None,
+                                kind: submission_kind,
+                                origin: crate::engine::message::SubmissionOrigin::Internal,
+                                text: user_text,
+                                display_text,
+                                tag_expansions,
+                                images,
+                                forced_skill,
+                                origin_principal,
+                                job_id,
+                                preflight_cleaned,
+                                queue_item_ids,
+                                client_submissions,
+                                queue_target,
+                                pending_terminal_disposition,
+                                run_invocation_id,
+                            },
+                            self.active_queue_target(),
+                            DURABLE_SUBMISSION_RETRY_BACKOFF,
+                        )
+                        .await;
+                    return Ok(());
                 }
-                input_rx
-                    .requeue_front_after(
-                        UserSubmission {
-                            expected_model_state_generation: None,
-                            expected_model: None,
-                            kind: submission_kind,
-                            origin: crate::engine::message::SubmissionOrigin::Internal,
-                            text: user_text,
-                            display_text,
-                            tag_expansions,
-                            images,
-                            forced_skill,
-                            origin_principal,
-                            job_id,
-                            preflight_cleaned,
-                            queue_item_ids,
-                            client_submissions,
-                            queue_target,
-                            pending_terminal_disposition,
-                            run_invocation_id,
-                        },
-                        self.active_queue_target(),
-                        DURABLE_SUBMISSION_RETRY_BACKOFF,
-                    )
-                    .await;
-                return Ok(());
+            }
+            None
+        };
+
+        // The worker accepted an invocation-marked oversized source only
+        // after phase one. Its runtime state/approval deadline must likewise
+        // begin only after phase two made the canonical event and artifacts
+        // durable, never while a reservation can still be rejected.
+        if submission_has_oversized_artifact_lease && let Some(run_id) = run_invocation_id {
+            let now = crate::daemon::server::run_invocation_wall_ms_now();
+            if let Ok(Some(row)) = self.session.db.get_run_invocation(run_id).await {
+                if let Ok(options) = serde_json::from_str::<
+                    crate::daemon::proto::RunInvocationOptions,
+                >(&row.options_json)
+                    && let Some(mode) = options.approval_mode
+                {
+                    self.session.set_invocation_approval_override(run_id, mode);
+                    _invocation_approval_guard = Some(InvocationApprovalGuard {
+                        session: self.session.clone(),
+                    });
+                }
+                if row.timeout_ms.is_some() {
+                    // Phase two starts this clock inside the same DB transaction
+                    // that materializes the FCM2 event. Account for the small
+                    // elapsed interval before arming the live watcher rather than
+                    // resetting it to the full configured budget on the driver
+                    // side. The ordinary (non-FCM2) branch above keeps its
+                    // historical acceptance-time behavior unchanged.
+                    let remaining =
+                        match crate::daemon::server::run_invocation_remaining_after_restart(
+                            &row, now,
+                        ) {
+                            crate::daemon::server::RunInvocationRemaining::ClockNotStarted => {
+                                // A materialized bound FCM2 row must have armed its
+                                // clock. Do not dispatch if the durable composition
+                                // is inconsistent.
+                                return Ok(());
+                            }
+                            crate::daemon::server::RunInvocationRemaining::Remaining(remaining) => {
+                                let Some(checkpointed) = self
+                                    .session
+                                    .db
+                                    .checkpoint_run_invocation_remaining(
+                                        run_id,
+                                        Some(remaining),
+                                        now,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                else {
+                                    return Ok(());
+                                };
+                                if checkpointed.terminal_at_wall_ms.is_some() {
+                                    return Ok(());
+                                }
+                                remaining
+                            }
+                            crate::daemon::server::RunInvocationRemaining::Expired
+                            | crate::daemon::server::RunInvocationRemaining::ClockRollback => {
+                                let _ = self
+                                    .session
+                                    .db
+                                    .fire_run_invocation_timeout(run_id, now)
+                                    .await;
+                                cancel.cancel();
+                                self.pending_idle_reason = Some(crate::engine::IdleReason::Error {
+                                    class: crate::engine::model::InferenceErrorClass::TimeoutIdle,
+                                });
+                                return Ok(());
+                            }
+                            crate::daemon::server::RunInvocationRemaining::Unbounded => {
+                                return Ok(());
+                            }
+                        };
+                    let deadline_cancel = cancel.clone();
+                    let db = self.session.db.clone();
+                    _run_deadline_task = Some(tokio::spawn(async move {
+                        tokio::select! {
+                            _ = deadline_cancel.cancelled() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(remaining)) => {
+                                deadline_cancel.cancel();
+                                let wall = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                let _ = db.fire_run_invocation_timeout(run_id, wall).await;
+                            }
+                        }
+                    }));
+                }
+                // `materialize_reserved_user_text_artifacts` already changed a
+                // bound oversized invocation from phase-one `accepted` to
+                // `running` and armed its timeout in that exact transaction.
+                // Do not overwrite it with the ordinary path's `queued`
+                // bookkeeping: doing so would make a materialized FCM2 run look
+                // like an unarmed pre-provider invocation after restart.
             }
         }
 
@@ -7023,10 +7987,21 @@ impl Driver {
         // The pass runs in a detached task so the driver loop isn't blocked
         // on a network round-trip; a genuine failure surfaces a one-per-
         // session Notice rather than aborting the turn.
-        let title_action = self.session.note_user_content(&user_text);
+        // The title accounting is based on the exact authored source, while
+        // the detached utility request gets only a bounded prefix. In
+        // particular it must not independently expand an 8MiB artifact.
+        let title_action = self.session.note_user_content(&canonical_user_text);
         if !matches!(title_action, crate::session::TitleAction::None) {
             let session = self.session.clone();
-            let content_prefix = user_text.clone();
+            let content_prefix = if artifact_frame.is_some() {
+                crate::engine::text_artifact_frame::bounded_utf8_prefix(
+                    &canonical_user_text,
+                    4 * 1024,
+                )
+                .to_owned()
+            } else {
+                user_text.clone()
+            };
             // Resolve auto-title config from the turn-pinned snapshot before the
             // detached task spawns, rather than re-reading disk inside it
             // (`engine-config-snapshot-adoption`).
@@ -7058,7 +8033,44 @@ impl Driver {
         // first inference carries it. Skipped gracefully (logged once)
         // when no utility model is configured — never falls back to the
         // main model.
-        let user_text = self.maybe_inject_skill(&user_text, tx).await;
+        // Skill selection is a utility-model boundary too. It may inspect a
+        // bounded authored prefix to choose guidance, but the assembled
+        // foreground prompt retains that guidance and swaps only authored text
+        // for the durable artifact frame.
+        let rendered_oversized_composition =
+            if let Some((event_seq, frame)) = artifact_frame.as_ref() {
+                let envelope = self
+                    .session
+                    .db
+                    .user_message_model_envelope(self.session.id, *event_seq)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("materialized oversized user event lacks accepted envelope")
+                    })?;
+                Some(
+                crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
+                    &envelope,
+                    frame,
+                    &self.redact,
+                )?,
+            )
+            } else {
+                None
+            };
+        let user_text = if rendered_oversized_composition.is_none() {
+            self.maybe_inject_skill(&user_text, tx).await
+        } else {
+            // The accepted envelope already carries the prepared guidance.
+            // Apply only its observable bookkeeping now that phase two won;
+            // never use the returned text or it would double-inject on live
+            // dispatch while restart rendering correctly uses the envelope.
+            if let Some(prepared) = prepared_auto_skill {
+                let _ = self
+                    .apply_prepared_auto_skill_injection(prepared, &user_text, tx)
+                    .await;
+            }
+            user_text
+        };
 
         // Seeded skill slash command (implementation note):
         // synthesize a real `skill` tool call now, before the first inference,
@@ -7067,7 +8079,14 @@ impl Driver {
         // path and the wire-vs-user transcript machinery — the call is recorded
         // and folded into history as a native call/result pair, then the user's
         // text (with any trailing args) drives the turn as the task input.
-        if let Some(skill_name) = forced_skill {
+        if let Some(prepared) = prepared_forced_skill {
+            self.apply_prepared_forced_skill(
+                prepared,
+                tx,
+                rendered_oversized_composition.is_none(),
+            )
+            .await;
+        } else if let Some(skill_name) = forced_skill {
             self.seed_forced_skill(&skill_name, tx).await;
         }
 
@@ -7128,6 +8147,17 @@ impl Driver {
                 pending_terminal_disposition: None,
                 run_invocation_id: None,
             })
+        } else if let Some(composition) = rendered_oversized_composition {
+            if !composition.leading.is_empty() {
+                self.stack
+                    .last_mut()
+                    .expect("stack never empty")
+                    .history
+                    .extend(composition.leading);
+            }
+            Message::User {
+                content: composition.content,
+            }
         } else {
             crate::engine::message::build_user_message(UserSubmission {
                 expected_model_state_generation: None,
@@ -7232,10 +8262,14 @@ impl Driver {
                             .checkpoint_run_invocation_remaining(
                                 run_id,
                                 match crate::daemon::server::run_invocation_remaining_after_restart(
-                                    row.remaining_ms,
-                                    row.last_observed_wall_ms,
-                                    now,
+                                    &row, now,
                                 ) {
+                                    crate::daemon::server::RunInvocationRemaining::ClockNotStarted => {
+                                        // A phase-one FCM2 reservation must be
+                                        // materialized before any provider turn
+                                        // can spend its configured timeout.
+                                        return Ok(());
+                                    }
                                     crate::daemon::server::RunInvocationRemaining::Remaining(ms) => {
                                         Some(ms)
                                     }
@@ -7277,7 +8311,8 @@ impl Driver {
                     }
                     Ok(
                         crate::db::run_invocations::ReserveTurnOutcome::AlreadyTerminal(_)
-                        | crate::db::run_invocations::ReserveTurnOutcome::CancelRequested(_),
+                        | crate::db::run_invocations::ReserveTurnOutcome::CancelRequested(_)
+                        | crate::db::run_invocations::ReserveTurnOutcome::ClockNotStarted(_),
                     ) => {
                         cancel.cancel();
                         return Ok(());
@@ -7775,18 +8810,25 @@ impl Driver {
                         }
                     };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
                     // Per-delegation tool grants (prompt `parent-granted-tools.md`):
                     // validate against the target's role invariants before the
                     // handoff. An invalid grant is rejected as this `task`
                     // call's result — the conversation stays with the parent.
-                    if let Some(err) = grant_rejection(
-                        &self.cwd,
-                        &self.config,
-                        &parent_agent,
-                        &child_agent,
-                        &granted_tools,
-                        &self.session.db,
-                    )
+                    if let Some(err) = grant_rejection(GrantRejectionInput {
+                        parent_cwd: &self.cwd,
+                        cwd: &self.cwd,
+                        config: &self.config,
+                        parent_agent: &parent_agent,
+                        parent_vnext_grant: parent_vnext_grant.as_ref(),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &self.session.db,
+                        local_installations: &self.vnext_local_installation_resolver,
+                    })
                     .await
                     {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -7798,6 +8840,23 @@ impl Driver {
                         );
                         continue;
                     }
+                    // Interactive children normally serialize their parent, but
+                    // they can overlap a previously backgrounded task. Reserve a
+                    // vNext direct-child slot here as well so that route cannot
+                    // bypass the same live-concurrency ceiling.
+                    let mut vnext_admissions = match self.admit_current_vnext_children(1) {
+                        Ok(permits) => permits,
+                        Err(err) => {
+                            next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id,
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(err, &repair_notes),
+                            );
+                            continue;
+                        }
+                    };
                     let task_args_json = serde_json::to_string(&serde_json::json!({
                         "child_agent": &child_agent,
                         "model": model_selector_json(&model),
@@ -7953,6 +9012,10 @@ impl Driver {
                         }),
                         deferred_log: crate::engine::deferred::DeferredLog::new(),
                         fallback_decision: None,
+                        // Exactly one permit was reserved above. Holding it on
+                        // the child frame releases the parent slot when this
+                        // interactive child returns or the stack unwinds.
+                        _vnext_child_admission: vnext_admissions.pop(),
                     });
                     // `subagentStart` observe hooks: the INTERACTIVE child
                     // session has just been pushed onto the stack (spawn mode 1
@@ -8069,14 +9132,21 @@ impl Driver {
                         }
                     };
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
-                    if let Some(err) = grant_rejection(
-                        &child_cwd.resolved,
-                        &self.config,
-                        &parent_agent,
-                        &child_agent,
-                        &granted_tools,
-                        &self.session.db,
-                    )
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
+                    if let Some(err) = grant_rejection(GrantRejectionInput {
+                        parent_cwd: &self.cwd,
+                        cwd: &child_cwd.resolved,
+                        config: &self.config,
+                        parent_agent: &parent_agent,
+                        parent_vnext_grant: parent_vnext_grant.as_ref(),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &self.session.db,
+                        local_installations: &self.vnext_local_installation_resolver,
+                    })
                     .await
                     {
                         next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
@@ -8158,16 +9228,23 @@ impl Driver {
                         continue;
                     }
                     let parent_agent = self.stack.last().unwrap().agent.name.clone();
+                    let parent_vnext_grant = self
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.clone());
                     let mut unknown_agent_error = None;
                     for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
-                        if let Some(err) = grant_rejection(
-                            &child_cwd.resolved,
-                            &self.config,
-                            &parent_agent,
-                            &entry.child_agent,
-                            &entry.granted_tools,
-                            &self.session.db,
-                        )
+                        if let Some(err) = grant_rejection(GrantRejectionInput {
+                            parent_cwd: &self.cwd,
+                            cwd: &child_cwd.resolved,
+                            config: &self.config,
+                            parent_agent: &parent_agent,
+                            parent_vnext_grant: parent_vnext_grant.as_ref(),
+                            child_agent: &entry.child_agent,
+                            grant: &entry.granted_tools,
+                            assistant_db: &self.session.db,
+                            local_installations: &self.vnext_local_installation_resolver,
+                        })
                         .await
                         {
                             unknown_agent_error = Some(format!(
@@ -8561,6 +9638,17 @@ impl Driver {
             delegation_model: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
+            // Keep the root's already-snapshotted daemon policy available for
+            // root replacement/handoff construction. Delegated vNext children
+            // use their parent's effective grant rather than re-reading this.
+            vnext_host_policy: self
+                .stack
+                .first()
+                .and_then(|frame| frame.agent.vnext_grant.as_ref())
+                .map(|grant| Arc::new(grant.host_policy.clone())),
+            vnext_local_installation_resolver: self.vnext_local_installation_resolver.clone(),
+            parent_vnext_grant: None,
             // The foreground frame's recursive-`Swarm` depth (GOALS §24).
             // Background `Swarm` children are spawned off-stack with an
             // explicit advanced depth (see `dispatch_spawn`); on-stack
@@ -8601,6 +9689,13 @@ impl Driver {
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            // The child factory consumes this immutable parent snapshot and
+            // derives the child grant under the same host ceilings. It never
+            // reinterprets the parent markdown declaration.
+            parent_vnext_grant: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.vnext_grant.clone()),
             model_override,
             ..self.spawn_args(interactive)
         }
@@ -8643,6 +9738,10 @@ impl Driver {
             delegation_model: model,
             delegated: true,
             delegation_recursion: recursion,
+            parent_vnext_grant: self
+                .stack
+                .last()
+                .and_then(|frame| frame.agent.vnext_grant.clone()),
             model_override,
             cwd: child_cwd.to_path_buf(),
             lock_identity: confinement.lock_identity,
@@ -8658,6 +9757,16 @@ impl Driver {
         model: &Option<crate::engine::model_roles::DelegationModelSelector>,
     ) -> Result<crate::engine::builtin::DelegationRecursionContext, String> {
         let parent = self.stack.last().expect("stack never empty").agent.as_ref();
+        if parent.vnext_grant.is_some() {
+            // v2 has no projection onto the legacy recursive-task context.
+            // The asynchronous task-admission seam resolves the selected child
+            // under this parent's EffectiveVnextGrant immediately before
+            // construction, including depth, targets, and the caller/child
+            // kind matrix. `remaining_depth` is legacy wire input and cannot
+            // widen a v2 grant.
+            let _ = (child_agent, requested_depth, model);
+            return Ok(crate::engine::builtin::DelegationRecursionContext::default());
+        }
         let cfg = self.config.extended().delegation;
         let root_parent_ctx = if parent.delegated {
             None

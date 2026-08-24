@@ -232,6 +232,14 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::TruncatedByCap,
     ),
+    // The source bytes are carried by `write_bulk_transfer_chunk`; this
+    // request is a typed transfer reference and stays below the application
+    // frame cap even for an 8 MiB message.
+    row(
+        "send_user_message_bulk",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::BulkReference,
+    ),
     row(
         "get_run_invocation_status",
         RemoteMessageClass::BoundedRequestResponse,
@@ -1325,6 +1333,26 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "agent_installation_begin",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_installation_submit_choice",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_installation_list",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "agent_installation_inspect",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Response` variant.
@@ -2062,6 +2090,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "agent_installation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Event` variant.
@@ -2711,8 +2744,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 216);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 144);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 220);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 145);
         assert_eq!(EVENT_CLASSIFICATION.len(), 83);
     }
 

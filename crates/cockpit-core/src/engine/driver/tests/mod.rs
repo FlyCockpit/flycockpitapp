@@ -111,6 +111,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         assistant_identity_prefix: None,
     });
@@ -200,7 +201,10 @@ fn learn_driver(
     std::fs::create_dir_all(&agents_dir).unwrap();
     std::fs::write(
         agents_dir.join("Build.md"),
-        "---\ndescription: Learn test primary\nmode: primary\ntools: [skill_manage, mcp]\ntoolTiers:\n  skill_manage: enabled\n---\n\nAuthor reusable skills from verified evidence.\n",
+        crate::agents::embedded_default("Build")
+            .expect("known built-in")
+            .to_markdown()
+            .expect("v2 bundled override"),
     )
     .unwrap();
 
@@ -255,6 +259,7 @@ fn learn_driver(
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         assistant_identity_prefix: None,
     });
@@ -667,6 +672,7 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        _vnext_child_admission: None,
     });
 }
 
@@ -734,6 +740,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         }),
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        _vnext_child_admission: None,
     });
 }
 
@@ -1261,6 +1268,7 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
         env_overlay: old.env_overlay.clone(),
         assistant_identity_prefix: None,
     });

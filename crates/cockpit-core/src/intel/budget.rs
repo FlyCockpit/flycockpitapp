@@ -11,20 +11,18 @@
 
 use crate::tokens;
 
-/// Maximum retained pre-truncation body stored for later retrieval.
-///
-/// This is intentionally much larger than the intel tools' 3k/4k token
-/// model-facing caps, so ordinary over-cap structural/search results are
-/// recoverable, but still bounded so a pathological repository cannot balloon
-/// the session database with unbounded tool output.
-pub const RETAINED_TRUNCATED_OUTPUT_BYTE_CAP: usize = 256 * 1024;
+/// Maximum source capture retained for a text artifact.  This is a host
+/// resource bound, deliberately aligned with the durable artifact limit.
+pub const TEXT_ARTIFACT_CAPTURE_BYTE_CAP: usize = 8 * 1024 * 1024;
 
-pub fn retained_truncated_body(body: &str) -> crate::engine::tool::RetainedTruncatedOutput {
-    let split = capped_prefix_len(body, RETAINED_TRUNCATED_OUTPUT_BYTE_CAP);
-    crate::engine::tool::RetainedTruncatedOutput {
+pub fn capture_text_artifact_body(body: &str) -> crate::engine::tool::TextArtifactCapture {
+    let split = capped_prefix_len(body, TEXT_ARTIFACT_CAPTURE_BYTE_CAP);
+    crate::engine::tool::TextArtifactCapture {
         content: body[..split].to_string(),
-        original_byte_len: body.len(),
-        partial: split < body.len(),
+        host_captured_bytes: split,
+        host_original_bytes: body.len(),
+        host_dropped_bytes: body.len().saturating_sub(split),
+        stored_source_bytes: split,
     }
 }
 
@@ -32,9 +30,9 @@ pub fn retained_truncated_body(body: &str) -> crate::engine::tool::RetainedTrunc
 /// records once the cap is reached.
 pub struct BudgetedWriter {
     buf: String,
-    retained: String,
-    retained_original_byte_len: usize,
-    retained_partial: bool,
+    captured: String,
+    captured_original_byte_len: usize,
+    captured_dropped: bool,
     /// Token cap; `None` means unbounded (only used in tests).
     cap: usize,
     /// Running cl100k count of `buf`. Recomputed incrementally: the cost
@@ -53,9 +51,9 @@ impl BudgetedWriter {
     pub fn new(cap: usize) -> Self {
         Self {
             buf: String::new(),
-            retained: String::new(),
-            retained_original_byte_len: 0,
-            retained_partial: false,
+            captured: String::new(),
+            captured_original_byte_len: 0,
+            captured_dropped: false,
             cap,
             tokens: 0,
             truncated: false,
@@ -98,25 +96,27 @@ impl BudgetedWriter {
         self.buf.is_empty()
     }
 
-    pub fn retained_truncated_output(
-        &self,
-    ) -> Option<crate::engine::tool::RetainedTruncatedOutput> {
-        if !self.truncated || self.retained.is_empty() {
+    pub fn text_artifact_capture(&self) -> Option<crate::engine::tool::TextArtifactCapture> {
+        if !self.truncated || self.captured.is_empty() {
             return None;
         }
-        Some(crate::engine::tool::RetainedTruncatedOutput {
-            content: self.retained.clone(),
-            original_byte_len: self.retained_original_byte_len,
-            partial: self.retained_partial,
+        Some(crate::engine::tool::TextArtifactCapture {
+            content: self.captured.clone(),
+            host_captured_bytes: self.captured.len(),
+            host_original_bytes: self.captured_original_byte_len,
+            host_dropped_bytes: self
+                .captured_original_byte_len
+                .saturating_sub(self.captured.len()),
+            stored_source_bytes: self.captured.len(),
         })
     }
 
-    /// Whether retained retrieval content is already a capped prefix.
+    /// Whether the bounded host capture dropped source bytes.
     ///
     /// Producers may keep feeding records after the model-facing token cap trips;
     /// once this turns true, no more retrievable bytes can be stored.
-    pub fn retention_is_partial(&self) -> bool {
-        self.retained_partial
+    pub fn capture_has_host_drops(&self) -> bool {
+        self.captured_dropped
     }
 
     /// Consume the writer, returning the accumulated buffer. The caller
@@ -127,20 +127,20 @@ impl BudgetedWriter {
     }
 
     fn retain(&mut self, record: &str) {
-        self.retained_original_byte_len += record.len();
-        let remaining = RETAINED_TRUNCATED_OUTPUT_BYTE_CAP.saturating_sub(self.retained.len());
+        self.captured_original_byte_len += record.len();
+        let remaining = TEXT_ARTIFACT_CAPTURE_BYTE_CAP.saturating_sub(self.captured.len());
         if remaining == 0 {
-            self.retained_partial = true;
+            self.captured_dropped = true;
             return;
         }
         if record.len() <= remaining {
-            self.retained.push_str(record);
+            self.captured.push_str(record);
             return;
         }
 
         let split = capped_prefix_len(record, remaining);
-        self.retained.push_str(&record[..split]);
-        self.retained_partial = true;
+        self.captured.push_str(&record[..split]);
+        self.captured_dropped = true;
     }
 }
 
@@ -188,62 +188,54 @@ mod tests {
         assert!(w.writeln("alpha beta"));
         assert!(!w.writeln("gamma delta epsilon zeta"));
 
-        let retained = w
-            .retained_truncated_output()
-            .expect("retained pre-truncation body");
-        assert!(retained.content.contains("alpha beta\n"));
-        assert!(retained.content.contains("gamma delta epsilon zeta\n"));
-        assert!(retained.original_byte_len > w.into_string().len());
-        assert!(!retained.partial);
+        let capture = w.text_artifact_capture().expect("captured source body");
+        assert!(capture.content.contains("alpha beta\n"));
+        assert!(capture.content.contains("gamma delta epsilon zeta\n"));
+        assert!(capture.host_original_bytes > w.into_string().len());
+        assert_eq!(capture.host_dropped_bytes, 0);
     }
 
     #[test]
-    fn writes_after_model_cap_still_extend_retention() {
+    fn writes_after_model_cap_still_extend_capture() {
         let mut w = BudgetedWriter::new(5);
         assert!(w.writeln("alpha beta"));
         assert!(!w.writeln("gamma delta epsilon zeta"));
         assert!(!w.writeln("later hidden record"));
 
-        let retained = w
-            .retained_truncated_output()
-            .expect("retained pre-truncation body");
-        assert!(retained.content.contains("alpha beta\n"));
-        assert!(retained.content.contains("gamma delta epsilon zeta\n"));
-        assert!(retained.content.contains("later hidden record\n"));
-        assert!(!retained.partial);
+        let capture = w.text_artifact_capture().expect("captured source body");
+        assert!(capture.content.contains("alpha beta\n"));
+        assert!(capture.content.contains("gamma delta epsilon zeta\n"));
+        assert!(capture.content.contains("later hidden record\n"));
+        assert_eq!(capture.host_dropped_bytes, 0);
     }
 
     #[test]
     fn pre_truncation_body_over_cap_is_marked_partial() {
         let mut w = BudgetedWriter::new(1);
-        assert!(!w.write(&"x".repeat(RETAINED_TRUNCATED_OUTPUT_BYTE_CAP + 10)));
+        assert!(!w.write(&"x".repeat(TEXT_ARTIFACT_CAPTURE_BYTE_CAP + 10)));
 
-        let retained = w
-            .retained_truncated_output()
-            .expect("retained pre-truncation body");
-        assert_eq!(retained.content.len(), RETAINED_TRUNCATED_OUTPUT_BYTE_CAP);
+        let capture = w.text_artifact_capture().expect("captured source body");
+        assert_eq!(capture.content.len(), TEXT_ARTIFACT_CAPTURE_BYTE_CAP);
         assert_eq!(
-            retained.original_byte_len,
-            RETAINED_TRUNCATED_OUTPUT_BYTE_CAP + 10
+            capture.host_original_bytes,
+            TEXT_ARTIFACT_CAPTURE_BYTE_CAP + 10
         );
-        assert!(retained.partial);
+        assert_eq!(capture.host_dropped_bytes, 10);
     }
 
     #[test]
-    fn original_len_keeps_counting_after_retention_cap() {
+    fn host_original_len_keeps_counting_after_capture_cap() {
         let mut w = BudgetedWriter::new(1);
-        assert!(!w.write(&"x".repeat(RETAINED_TRUNCATED_OUTPUT_BYTE_CAP + 10)));
+        assert!(!w.write(&"x".repeat(TEXT_ARTIFACT_CAPTURE_BYTE_CAP + 10)));
         assert!(!w.write("tail bytes"));
 
-        let retained = w
-            .retained_truncated_output()
-            .expect("retained pre-truncation body");
-        assert_eq!(retained.content.len(), RETAINED_TRUNCATED_OUTPUT_BYTE_CAP);
+        let capture = w.text_artifact_capture().expect("captured source body");
+        assert_eq!(capture.content.len(), TEXT_ARTIFACT_CAPTURE_BYTE_CAP);
         assert_eq!(
-            retained.original_byte_len,
-            RETAINED_TRUNCATED_OUTPUT_BYTE_CAP + 10 + "tail bytes".len()
+            capture.host_original_bytes,
+            TEXT_ARTIFACT_CAPTURE_BYTE_CAP + 10 + "tail bytes".len()
         );
-        assert!(retained.partial);
+        assert_eq!(capture.host_dropped_bytes, 10 + "tail bytes".len());
     }
 
     #[test]

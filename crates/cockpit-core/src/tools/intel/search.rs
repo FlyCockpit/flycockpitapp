@@ -207,7 +207,7 @@ impl Tool for SearchTool {
                 );
             }
             ToolOutput::truncated_text(content)
-                .with_truncated_retention(retained_truncated_body(&ranked_body))
+                .with_text_artifact_capture(capture_text_artifact_body(&ranked_body))
         } else {
             finish(
                 writer,

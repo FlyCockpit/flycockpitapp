@@ -7,8 +7,6 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
-use crate::agents::AgentMode;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "cockpit",
@@ -740,33 +738,152 @@ pub struct InvocationCancelArgs {
 
 // ---- agent subcommands ----
 
-#[derive(Debug, Subcommand)]
-pub enum AgentCommand {
-    /// Create a new agent file.
-    Create {
-        #[arg(long, value_name = "PATH")]
-        path: Option<PathBuf>,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long, value_parser = parse_agent_mode)]
-        mode: Option<AgentMode>,
-        /// Comma-separated tool list.
-        #[arg(long)]
-        tools: Option<String>,
-        #[arg(short, long)]
-        model: Option<String>,
-    },
-    /// List all available agents (project + global + extended `agent_dirs`).
-    List,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentScopeArg {
+    Global,
+    #[value(name = "workspace-private")]
+    WorkspacePrivate,
+    #[value(name = "workspace")]
+    Workspace,
 }
 
-fn parse_agent_mode(value: &str) -> Result<AgentMode, String> {
-    match value {
-        "all" => Ok(AgentMode::All),
-        "primary" => Ok(AgentMode::Primary),
-        "subagent" => Ok(AgentMode::Subagent),
-        _ => Err("expected one of: all, primary, subagent".to_string()),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentExecutionKindArg {
+    Assistant,
+    Coding,
+    Computer,
+}
+
+impl From<AgentExecutionKindArg> for cockpit_proto::AgentInstallationExecutionKindV1 {
+    fn from(value: AgentExecutionKindArg) -> Self {
+        match value {
+            AgentExecutionKindArg::Assistant => Self::Assistant,
+            AgentExecutionKindArg::Coding => Self::Coding,
+            AgentExecutionKindArg::Computer => Self::Computer,
+        }
     }
+}
+
+#[derive(Debug, Subcommand)]
+#[command(
+    after_help = "Agent operation exit codes:\n  3  daemon choice required\n  4  acknowledgement required\n  5  primary slot unusable\n  6  optional slot unbound\n  7  rebind required\n  8  conflict"
+)]
+pub enum AgentCommand {
+    /// Install a versioned agent definition through the daemon.
+    Install {
+        #[arg(value_name = "OWNER/REPO[@REV]:PATH")]
+        source: String,
+        /// Target scope. When omitted on an interactive terminal, Cockpit asks
+        /// before contacting the daemon; non-interactive callers must supply it.
+        #[arg(long, value_enum)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Reuse this opaque operation key to replay an interrupted request.
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Update an installed agent definition through the daemon.
+    Update {
+        #[arg(value_name = "INSTALLATION_ID")]
+        installation_id: String,
+        #[arg(long, value_name = "OWNER/REPO[@REV]:PATH")]
+        source: String,
+        #[arg(long, required = true)]
+        replace: bool,
+        #[arg(long, value_enum)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Bind a daemon-resolved installed agent slot.
+    Bind {
+        #[arg(value_name = "INSTALLATION_ID")]
+        installation_id: String,
+        #[arg(long, default_value = "primary")]
+        slot: String,
+        #[arg(long, value_enum)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+        /// Bind only the first exact author-suggested compatible model.
+        #[arg(long, conflicts_with_all = ["defer", "provider_profile", "model"])]
+        yes: bool,
+        /// Displayed daemon choice provider selector; never an opaque route handle.
+        #[arg(
+            long,
+            value_name = "PROFILE",
+            requires = "model",
+            conflicts_with = "defer"
+        )]
+        provider_profile: Option<String>,
+        /// Displayed daemon choice model selector; never a credential or route handle.
+        #[arg(
+            long,
+            value_name = "MODEL",
+            requires = "provider_profile",
+            conflicts_with = "defer"
+        )]
+        model: Option<String>,
+        /// Leave the requested slot unbound through the daemon continuation.
+        #[arg(long, conflicts_with_all = ["yes", "provider_profile", "model"])]
+        defer: bool,
+    },
+    /// Submit one daemon-issued agent binding choice.
+    SubmitChoice {
+        #[arg(value_name = "CONTINUATION_TOKEN")]
+        continuation_token: String,
+        #[arg(value_name = "CHOICE_ID", required_unless_present = "defer")]
+        choice_id: Option<String>,
+        /// Leave the selected slot unbound without exposing a provider route.
+        #[arg(long, conflicts_with = "choice_id")]
+        defer: bool,
+    },
+    /// Inspect one daemon-owned installed agent record.
+    Inspect {
+        #[arg(value_name = "INSTALLATION_ID")]
+        installation_id: String,
+        #[arg(long, value_enum)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new agent file.
+    Create {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long, value_enum, required = true)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_enum)]
+        execution_kind: AgentExecutionKindArg,
+        #[arg(long, default_value = "primary")]
+        primary_slot: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long, value_name = "KEY")]
+        operation_key: Option<String>,
+    },
+    /// List all available agents (project + global + extended `agent_dirs`).
+    List {
+        #[arg(long, value_enum)]
+        scope: Option<AgentScopeArg>,
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---- providers / models ----
@@ -1074,9 +1191,6 @@ pub struct ExportArgs {
 #[derive(Debug, clap::Args)]
 pub struct ImportArgs {
     pub file: PathBuf,
-    /// Import under fresh session IDs instead of refusing existing IDs.
-    #[arg(long)]
-    pub as_new: bool,
 }
 
 /// Scope toggle for `cockpit stats`.

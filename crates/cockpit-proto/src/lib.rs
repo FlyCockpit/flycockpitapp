@@ -24,7 +24,16 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod agent_installation;
 pub mod es256;
+pub use agent_installation::{
+    AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
+    AgentInstallationChoiceV1, AgentInstallationErrorCodeV1, AgentInstallationErrorV1,
+    AgentInstallationExecutionKindV1, AgentInstallationOperationKind, AgentInstallationReadV1,
+    AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
+    AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
+    AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
+};
 pub mod host_capabilities;
 pub mod image_control;
 pub use host_capabilities::{
@@ -973,14 +982,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version.
 ///
-/// Current wire schema version. v11 makes typed assistant display events
+/// Current wire schema version. v12 adds daemon-owned agent installation RPCs.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 11.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 12.
+pub const PROTOCOL_VERSION: u32 = 12;
 
-/// Oldest wire schema version this binary accepts. v11 is current-only: the
+/// Oldest wire schema version this binary accepts. v12 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 11;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 12;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2870,6 +2879,10 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
                 | "docs_ask"
+                | "agent_installation_begin"
+                | "agent_installation_submit_choice"
+                | "agent_installation_list"
+                | "agent_installation_inspect"
                 // The reclassified session export now returns the v10-only
                 // `redacted_export` bulk kind and requires the v10-only
                 // `ReadRedactedExportChunk` reader, so the WHOLE tag is v10: a v9
@@ -2942,6 +2955,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "media_reservation_repaired"
                 | "doctor_snapshot"
                 | "docs_answer"
+                | "agent_installation"
                 | "sealed_owner_operation_begun"
                 | "sealed_owner_operation_applied"
                 | "sealed_owner_operation_cancelled"
@@ -3272,7 +3286,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[11];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[12];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -3661,6 +3675,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "restart_if_idle",
         "resume_paused_work",
         "send_user_message",
+        "send_user_message_bulk",
         "session_live_status",
         "set_active_model",
         "set_workspace_trust",
@@ -6625,7 +6640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v11_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v12_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6676,13 +6691,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
-        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+        let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("v11 config_refreshed fixture")
+                .expect("v12 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6697,20 +6712,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 11);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 11);
-        let fixture = proto_fixture_tests::read_fixture_for(11, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
+        let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("v11 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("v12 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "v11 {response_name} must freeze the inclusive verification cap"
+                "v12 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone())
-                .unwrap_or_else(|error| panic!("v11 {response_name} must deserialize: {error}"));
+                .unwrap_or_else(|error| panic!("v12 {response_name} must deserialize: {error}"));
         }
     }
 }

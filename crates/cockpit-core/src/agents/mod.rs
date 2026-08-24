@@ -32,11 +32,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 mod builtin_defs;
 pub(crate) mod invariants;
+mod profile;
+mod vnext;
 
 pub(crate) use builtin_defs::embedded_internal_default;
 pub use builtin_defs::{
@@ -44,6 +46,25 @@ pub use builtin_defs::{
     is_builtin_primary, is_hidden_primary, is_removed_primary, resolve_primary_for_llm_mode,
 };
 pub use invariants::validate_invariants;
+pub use profile::{
+    AgentProfileDefinition, AgentProfileFallbackRoute, AgentProfileInstallationCatalog,
+    AgentProfileInstallationSource, AgentProfileModelOffering, AgentProfilePrepareRequest,
+    AgentProfileResolutionInput, ProfileQuestionOverride, ProfileVerificationReduction,
+    ReloadedAgentProfile, ResolvedAgentProfile, ResolvedModelSlot, ResolvedModelSlotChoice,
+    ranked_compatible_offerings, resolve_agent_profile,
+};
+use vnext::DefinitionScope;
+pub use vnext::{
+    AllowedChild, AutoAnswer, CompiledVerificationPolicy, CompiledVerificationRegion,
+    DelegationPolicy, DelegationTarget, EffectiveDelegationGrant, EffectiveQuestionPolicy,
+    EffectiveVnextGrant, ExecutionKind, LocalInstallationIdentity, LocalInstallationResolver,
+    ModelCapability, ModelLocality, ModelRecommendation, ModelSlot, OnBudgetExceeded,
+    ProhibitedQuestionClass, ProviderAlias, QuestionOverride, QuestionPolicy, ResolverOrder,
+    SCHEMA_VERSION, SelectorPredicate, ToolClass, VerificationAction, VerificationBudget,
+    VerificationDispatch, VerificationEstimate, VerificationPolicy, VerificationRule,
+    VerificationSelector, VerificationSessionReduction, VerificationSubject, VnextAgentDef,
+    VnextHostPolicy, delegation_kind_permitted, resolve_question_policy,
+};
 
 const MAX_MARKDOWN_BYTES: u64 = 1024 * 1024;
 
@@ -103,6 +124,12 @@ pub struct AgentDef {
     /// and user-authored agents do not inherit fork eligibility accidentally.
     #[serde(rename = "forkEligible", default)]
     pub fork_eligible: bool,
+    /// Parsed v2 declarative contract.  v2 never projects into the legacy
+    /// runtime fields: a host must calculate and snapshot an
+    /// [`EffectiveVnextGrant`] before a v2 definition can receive any
+    /// capability at all.
+    #[serde(skip)]
+    pub vnext: Option<VnextAgentDef>,
     /// Body of the markdown file (the agent's system prompt). Resolved
     /// through [`AgentDef::resolved_prompt`] / [`AgentDef::resolved_prompt_for`]
     /// rather than read directly so the per-`llm_mode` body variant threads
@@ -208,6 +235,11 @@ pub fn apply_tool_surface_override(
     def: &mut AgentDef,
     selection: &ToolSurfaceSelection,
 ) -> Result<()> {
+    if def.vnext.is_some() {
+        bail!(
+            "schemaVersion 2 definitions cannot apply legacy tool-surface overrides; tool authority is host-owned"
+        );
+    }
     let mut candidate = def.clone();
     candidate.tools = Some(selection.tools.clone());
     candidate.tool_tiers = selection.tool_tiers.clone();
@@ -550,9 +582,11 @@ where
         ) -> std::result::Result<Self::Value, A::Error> {
             let mut out = BTreeMap::new();
             while let Some(tool) = map.next_key::<String>()? {
-                let spec = map.next_value::<ToolDescriptionSpec>().map_err(|err| {
-                    serde::de::Error::custom(format!("tool_descriptions.{tool}: {err}"))
-                })?;
+                // `serde_yaml` already records the enclosing map key in its
+                // diagnostic path. Re-prefixing this error produces the
+                // confusing duplicate `tool_descriptions.<tool>` path while
+                // losing no useful validation context.
+                let spec = map.next_value::<ToolDescriptionSpec>()?;
                 out.insert(tool, spec);
             }
             Ok(out)
@@ -625,7 +659,13 @@ fn chat_ownable_primaries_with(cwd: &Path) -> Vec<String> {
         .into_iter()
         .filter(|listing| matches!(listing.kind, AgentKind::Custom))
         .filter_map(|listing| match listing.def {
-            Ok(def) if def.mode.is_chat_ownable() => Some(listing.name),
+            Ok(def)
+                if def.vnext.as_ref().is_some_and(|definition| {
+                    definition.execution_kind == ExecutionKind::Assistant
+                }) || def.vnext.is_none() && def.mode.is_chat_ownable() =>
+            {
+                Some(listing.name)
+            }
             _ => None,
         })
         .collect();
@@ -676,6 +716,11 @@ impl AgentDef {
     /// fence + the markdown body. Used by eject so a built-in's default
     /// materializes as a faithful, re-editable file.
     pub fn to_markdown(&self) -> Result<String> {
+        if self.vnext.is_some() {
+            let yaml = self.vnext_canonical_frontmatter()?;
+            let body = self.prompt.trim_end_matches('\n');
+            return Ok(format!("---\n{yaml}---\n\n{body}\n"));
+        }
         // Build an ordered frontmatter map so the emitted file is stable
         // and human-friendly (description, mode, model, temperature,
         // tools, permission — only the fields that carry a value).
@@ -726,6 +771,85 @@ impl AgentDef {
         let body = self.prompt.trim_end_matches('\n');
         Ok(format!("---\n{yaml}---\n\n{body}\n"))
     }
+
+    /// The exact UTF-8 frontmatter bytes that identify a vNext definition.
+    /// The caller that persists a definition digest hashes these bytes rather
+    /// than raw authored YAML, so mapping insertion order cannot change the
+    /// identity of an otherwise equivalent closed-schema definition.
+    pub fn vnext_digest_bytes(&self) -> Result<Vec<u8>> {
+        // The prompt body is part of the definition's authority-free but
+        // behaviorally material contract.  Hash the complete canonical
+        // markdown document rather than frontmatter alone.
+        self.to_markdown().map(String::into_bytes)
+    }
+
+    fn vnext_canonical_frontmatter(&self) -> Result<String> {
+        let vnext = self
+            .vnext
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("legacy agent definitions have no vNext digest"))?;
+        vnext.validate()?;
+        let mut fm = serde_yaml::Mapping::new();
+        fm.insert("schemaVersion".into(), (vnext.schema_version as u64).into());
+        fm.insert("agentId".into(), vnext.agent_id.clone().into());
+        fm.insert(
+            "executionKind".into(),
+            serde_yaml::to_value(vnext.execution_kind)?,
+        );
+        fm.insert(
+            "modelSlots".into(),
+            serde_yaml::to_value(&vnext.model_slots)?,
+        );
+        if !vnext.delegation.is_off() {
+            fm.insert(
+                "delegation".into(),
+                serde_yaml::to_value(&vnext.delegation)?,
+            );
+        }
+        if let Some(questions) = &vnext.questions {
+            fm.insert("questions".into(), serde_yaml::to_value(questions)?);
+        }
+        if let Some(verification) = &vnext.verification {
+            fm.insert("verification".into(), serde_yaml::to_value(verification)?);
+        }
+        // Description remains display metadata, never an authority input.
+        fm.insert("description".into(), self.description.clone().into());
+        let mut value = serde_yaml::Value::Mapping(fm);
+        canonicalize_yaml_mapping_keys(&mut value);
+        Ok(serde_yaml::to_string(&value)?)
+    }
+}
+
+/// serde's struct serializers preserve declaration order.  vNext stores only
+/// closed-schema values, so normalize every map recursively before emitting
+/// the definition's canonical digest/round-trip form.
+fn canonicalize_yaml_mapping_keys(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let mut entries: Vec<_> = mapping
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            for (_, nested) in &mut entries {
+                canonicalize_yaml_mapping_keys(nested);
+            }
+            entries.sort_by(|(left, _), (right, _)| {
+                left.as_str()
+                    .unwrap_or_default()
+                    .cmp(right.as_str().unwrap_or_default())
+            });
+            mapping.clear();
+            for (key, nested) in entries {
+                mapping.insert(key, nested);
+            }
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for nested in values {
+                canonicalize_yaml_mapping_keys(nested);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Split a `<frontmatter>\n---\n<body>` markdown document into the raw
@@ -762,10 +886,38 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
 /// YAML fails with the `source` path named so the user's mistake isn't
 /// hidden.
 pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> {
+    parse_agent_with_scope(text, name, source, DefinitionScope::Workspace)
+}
+
+/// Parse a definition with origin supplied by its trusted owner. The only
+/// daemon-local owner today is the persisted assistant loader; all ordinary
+/// workspace paths use [`parse_agent`] and cannot claim the `local` publisher.
+fn parse_agent_with_scope(
+    text: &str,
+    name: &str,
+    source: PathBuf,
+    scope: DefinitionScope,
+) -> Result<AgentDef> {
     let (fm_raw, body) = split_frontmatter(text);
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Frontmatter {
+        #[serde(rename = "schemaVersion", default)]
+        schema_version: Option<u8>,
+        #[serde(rename = "agentId", default)]
+        agent_id: Option<String>,
+        #[serde(rename = "executionKind", default)]
+        execution_kind: Option<ExecutionKind>,
+        #[serde(rename = "modelSlots", default)]
+        model_slots: Option<BTreeMap<String, ModelSlot>>,
+        #[serde(default)]
+        delegation: Option<DelegationPolicy>,
+        #[serde(default)]
+        questions: Option<QuestionPolicy>,
+        #[serde(default)]
+        verification: Option<VerificationPolicy>,
+        #[serde(default)]
         description: String,
         #[serde(default)]
         mode: AgentMode,
@@ -795,6 +947,47 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
             source.display()
         );
     }
+    // `questions` and `verification` are closed optional objects: omission is
+    // the only spelling for off.  Accepting YAML `null` would create a second,
+    // ambiguous wire representation that profile reduction could accidentally
+    // reinterpret as enabled later.
+    let raw_frontmatter: serde_yaml::Value = serde_yaml::from_str(fm_raw).map_err(|e| {
+        anyhow::anyhow!(
+            "agent `{name}` ({}) has invalid frontmatter: {e}",
+            source.display()
+        )
+    })?;
+    let raw_keys = if let serde_yaml::Value::Mapping(mapping) = &raw_frontmatter {
+        if mapping
+            .get(serde_yaml::Value::String("schemaVersion".to_string()))
+            .is_some_and(serde_yaml::Value::is_null)
+        {
+            bail!(
+                "agent `{name}` ({}) must declare schemaVersion: 2; null is not accepted",
+                source.display()
+            );
+        }
+        for key in ["delegation", "questions", "verification"] {
+            if mapping
+                .get(serde_yaml::Value::String(key.to_string()))
+                .is_some_and(serde_yaml::Value::is_null)
+            {
+                bail!(
+                    "agent `{name}` ({}) must omit `{key}` to disable it; null is not accepted",
+                    source.display()
+                );
+            }
+        }
+        mapping
+            .keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<BTreeSet<_>>()
+    } else {
+        bail!(
+            "agent `{name}` ({}) frontmatter must be a YAML mapping",
+            source.display()
+        );
+    };
     let fm: Frontmatter = serde_yaml::from_str(fm_raw).map_err(|e| {
         anyhow::anyhow!(
             "agent `{name}` ({}) has invalid frontmatter: {e}",
@@ -808,9 +1001,80 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         );
     }
 
+    let vnext = match fm.schema_version {
+        Some(SCHEMA_VERSION) => {
+            // Presence is the wire contract here, not the deserialized
+            // value.  In particular `mode: all`, `forkEligible: false`, and
+            // every `null` legacy spelling must be rejected rather than
+            // silently becoming a v2 default.
+            const LEGACY_V1_KEYS: &[&str] = &[
+                "mode",
+                "model",
+                "temperature",
+                "tools",
+                "toolTiers",
+                "tool_descriptions",
+                "toolDescriptions",
+                "scanToolResults",
+                "goalSupervision",
+                "permission",
+                "forkEligible",
+            ];
+            if let Some(field) = LEGACY_V1_KEYS.iter().find(|key| raw_keys.contains(*key)) {
+                bail!(
+                    "agent `{name}` ({}) is schemaVersion 2 and may not declare legacy field `{field}`",
+                    source.display(),
+                );
+            }
+            let definition = VnextAgentDef {
+                schema_version: SCHEMA_VERSION,
+                agent_id: fm.agent_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "agent `{name}` ({}) schemaVersion 2 requires agentId",
+                        source.display()
+                    )
+                })?,
+                execution_kind: fm.execution_kind.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "agent `{name}` ({}) schemaVersion 2 requires executionKind",
+                        source.display()
+                    )
+                })?,
+                model_slots: fm.model_slots.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "agent `{name}` ({}) schemaVersion 2 requires modelSlots",
+                        source.display()
+                    )
+                })?,
+                delegation: fm.delegation.unwrap_or_default(),
+                questions: fm.questions,
+                verification: fm.verification,
+            };
+            definition.validate_for_scope(scope).map_err(|error| {
+                anyhow::anyhow!(
+                    "agent `{name}` ({}) has invalid schemaVersion 2 definition: {error}",
+                    source.display()
+                )
+            })?;
+            Some(definition)
+        }
+        Some(version) => bail!(
+            "agent `{name}` ({}) has unsupported schemaVersion `{version}`; only 2 is accepted",
+            source.display()
+        ),
+        None => bail!(
+            "agent `{name}` ({}) must declare schemaVersion: 2; legacy schema-less user AgentDefs are no longer supported",
+            source.display()
+        ),
+    };
+
     Ok(AgentDef {
         name: name.to_string(),
         description: fm.description,
+        // `mode` belongs exclusively to the retired schema.  It remains as an
+        // internal field only while embedded legacy definitions exist; a v2
+        // document is classified from `executionKind` at every discovery and
+        // runtime reachability seam, never translated into a legacy mode.
         mode: fm.mode,
         model: fm.model,
         temperature: fm.temperature,
@@ -821,6 +1085,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         goal_supervision: fm.goal_supervision,
         permission: fm.permission,
         fork_eligible: fm.fork_eligible,
+        vnext,
         // Trim the blank line(s) the frontmatter fence leaves before the
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).
@@ -830,12 +1095,8 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
     })
 }
 
-pub fn default_scan_tool_results(name: &str, mode: AgentMode) -> bool {
-    match name {
-        "explore" | "scout" | "docs-answerer" => false,
-        _ if mode.is_chat_ownable() => true,
-        _ => true,
-    }
+pub fn default_scan_tool_results(name: &str) -> bool {
+    !matches!(name, "explore" | "scout" | "docs-answerer")
 }
 
 /// Load a single agent file from an arbitrary path. The file does not
@@ -855,11 +1116,113 @@ pub fn load_from_file(path: &Path) -> Result<AgentDef> {
 /// `<assistant-home>/assistant.md`: the file shape and validation stay exactly
 /// the same as agents, while the persisted assistant name remains the entity
 /// identity instead of the literal `assistant.md` stem.
-pub fn load_named_from_file(path: &Path, name: &str) -> Result<AgentDef> {
+pub fn load_workspace_named_from_file(path: &Path, name: &str) -> Result<AgentDef> {
     let text = read_agent_markdown(path)?;
     let def = parse_agent(&text, name, path.to_path_buf())?;
     validate_invariants(&def)?;
     Ok(def)
+}
+
+/// Load the on-disk override for one exact embedded definition.  Ejected
+/// built-ins retain their `cockpit/<name>` portable identity so child refs and
+/// the digest contract survive editing.  That publisher is never accepted by
+/// ordinary workspace discovery: this narrow loader is called only after the
+/// resolver has established that `name` is a built-in and `path` is its
+/// override path.
+fn load_builtin_override_from_file(path: &Path, name: &str) -> Result<AgentDef> {
+    let text = read_agent_markdown(path)?;
+    let def = parse_agent_with_scope(
+        &text,
+        name,
+        path.to_path_buf(),
+        DefinitionScope::BuiltinOverride,
+    )?;
+    let expected_id = format!("cockpit/{}", name.to_ascii_lowercase());
+    if def.vnext.as_ref().map(|vnext| vnext.agent_id.as_str()) != Some(expected_id.as_str()) {
+        bail!(
+            "built-in override `{name}` ({}) must retain its trusted agentId `{expected_id}`",
+            path.display()
+        );
+    }
+    validate_invariants(&def)?;
+    Ok(def)
+}
+
+/// Load an agent-shaped file from daemon-owned installation storage.  This is
+/// intentionally separate from the workspace named-file loader so a TUI
+/// display name can never confer daemon-local provenance on a checkout file.
+pub fn load_daemon_local_named_from_file(path: &Path, name: &str) -> Result<AgentDef> {
+    let text = read_agent_markdown(path)?;
+    let def = parse_agent_with_scope(
+        &text,
+        name,
+        path.to_path_buf(),
+        DefinitionScope::DaemonLocal,
+    )?;
+    validate_invariants(&def)?;
+    Ok(def)
+}
+
+/// Load exactly the daemon-owned path recorded for one selected installation
+/// into the profile catalog.  This deliberately takes the installation UUID
+/// and observation receipt from the installation service: display names are
+/// diagnostics only and are never used to rediscover a same-named candidate.
+///
+/// Built-ins remain on their protected override loader, which verifies the
+/// canonical `cockpit/<name>` identity before the definition can enter the
+/// catalog.  Every other source uses the supplied owned path exactly once.
+pub fn load_profile_definition_from_owned_path(
+    installation: cockpit_db::db::agent_installations::AgentInstallationRow,
+    observation: cockpit_db::db::agent_installations::AgentObservationRow,
+    source: AgentProfileInstallationSource,
+    owned_path: &Path,
+) -> Result<AgentProfileDefinition> {
+    ensure!(
+        observation.installation_id == installation.installation_id,
+        "profile observation belongs to a different installation"
+    );
+    let definition = match source {
+        AgentProfileInstallationSource::Builtin => {
+            let name = installation
+                .source_agent_id
+                .strip_prefix("cockpit/")
+                .filter(|name| is_builtin_agent(name))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "builtin installation has an unprotected source agent identity `{}`",
+                        installation.source_agent_id
+                    )
+                })?;
+            load_builtin_override_from_file(owned_path, name)?
+        }
+        AgentProfileInstallationSource::Global
+        | AgentProfileInstallationSource::WorkspacePrivate => {
+            // These records are daemon-local state.  In particular, they
+            // retain the local-installation child-reference contract and may
+            // not be parsed through ordinary workspace discovery.
+            load_daemon_local_named_from_file(owned_path, &installation.source_agent_id)?
+        }
+        AgentProfileInstallationSource::WorkspaceShared => {
+            // The logical parse name is daemon-owned source metadata, not a
+            // user-facing display name.  The vNext identity check below is
+            // the authority boundary.
+            load_workspace_named_from_file(owned_path, &installation.source_agent_id)?
+        }
+    };
+    let vnext = definition
+        .vnext
+        .as_ref()
+        .context("profile installation did not load a vNext AgentDef")?;
+    ensure!(
+        vnext.agent_id == installation.source_agent_id,
+        "owned profile path identity does not match its selected installation"
+    );
+    Ok(AgentProfileDefinition {
+        installation,
+        observation,
+        source,
+        definition,
+    })
 }
 
 /// Load a per-`llm_mode` directory-form agent
@@ -1109,10 +1472,22 @@ fn resolve_inner(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
         if candidate.is_dir() {
             // Per-`llm_mode` directory form: load every mode file present,
             // falling back to the flat sibling per mode.
+            // Built-ins use the flat eject form.  Do not accept a directory
+            // form here because its individual files would otherwise bypass
+            // the trusted builtin-override provenance check.
+            if is_builtin_agent(name) {
+                bail!(
+                    "built-in override `{name}` must be the ejected flat markdown file, not a mode directory"
+                );
+            }
             return Ok(Some(load_from_dir(&dir, name)?));
         }
         if candidate.is_file() {
-            return Ok(Some(load_from_file(&candidate)?));
+            return Ok(Some(if is_builtin_agent(name) {
+                load_builtin_override_from_file(&candidate, name)?
+            } else {
+                load_from_file(&candidate)?
+            }));
         }
     }
     if let Some(def) = embedded_default(name) {

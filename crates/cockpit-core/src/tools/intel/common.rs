@@ -13,7 +13,7 @@ pub(super) use crate::engine::tool::{
     Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input, typed_args,
 };
 pub(super) use crate::engine::{ToolProgress, TurnEvent};
-pub(super) use crate::intel::budget::{BudgetedWriter, retained_truncated_body};
+pub(super) use crate::intel::budget::{BudgetedWriter, capture_text_artifact_body};
 pub(super) use crate::intel::lang::{Language, regex_outline};
 pub(super) use crate::intel::thin::{ThinLimits, thin_line_output};
 pub(super) use crate::intel::{
@@ -85,11 +85,11 @@ pub(super) fn rel_path(arg: &str, ctx: &ToolCtx) -> String {
 
 pub(super) fn finish(writer: BudgetedWriter, note: &str) -> ToolOutput {
     if writer.is_truncated() {
-        let retention = writer.retained_truncated_output();
+        let capture = writer.text_artifact_capture();
         let mut out = writer.into_string();
         out.push_str(note);
-        match retention {
-            Some(retention) => ToolOutput::truncated_text(out).with_truncated_retention(retention),
+        match capture {
+            Some(capture) => ToolOutput::truncated_text(out).with_text_artifact_capture(capture),
             None => ToolOutput::truncated_text(out),
         }
     } else {

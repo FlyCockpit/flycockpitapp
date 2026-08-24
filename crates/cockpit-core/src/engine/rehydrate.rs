@@ -48,6 +48,7 @@ use rig::message::{
     ToolResultContent, UserContent,
 };
 use rusqlite::Connection;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::daemon::proto;
@@ -181,9 +182,37 @@ pub async fn rehydrate_session_with_policy(
     root_agent: &str,
     policy: RehydratePolicy,
 ) -> Result<Option<Rehydrated>> {
+    rehydrate_session_with_policy_and_redaction(
+        db,
+        session_id,
+        root_agent,
+        policy,
+        Arc::new(crate::redact::RedactionTable::empty()),
+    )
+    .await
+}
+
+/// Production rehydration supplies the session's current outbound redaction
+/// table. Imported artifact representation metadata is structural provenance,
+/// never a bypass for the current provider-safety boundary.
+pub(crate) async fn rehydrate_session_with_policy_and_redaction(
+    db: &Db,
+    session_id: Uuid,
+    root_agent: &str,
+    policy: RehydratePolicy,
+    redaction: Arc<crate::redact::RedactionTable>,
+) -> Result<Option<Rehydrated>> {
     let root_agent = root_agent.to_string();
-    db.read(move |conn| rehydrate_session_with_policy_conn(conn, session_id, &root_agent, policy))
-        .await
+    db.read(move |conn| {
+        rehydrate_session_with_policy_conn_with_redaction(
+            conn,
+            session_id,
+            &root_agent,
+            policy,
+            redaction.as_ref(),
+        )
+    })
+    .await
 }
 
 pub fn rehydrate_session_with_policy_conn(
@@ -191,6 +220,22 @@ pub fn rehydrate_session_with_policy_conn(
     session_id: Uuid,
     root_agent: &str,
     policy: RehydratePolicy,
+) -> Result<Option<Rehydrated>> {
+    rehydrate_session_with_policy_conn_with_redaction(
+        conn,
+        session_id,
+        root_agent,
+        policy,
+        &crate::redact::RedactionTable::empty(),
+    )
+}
+
+pub(crate) fn rehydrate_session_with_policy_conn_with_redaction(
+    conn: &Connection,
+    session_id: Uuid,
+    root_agent: &str,
+    policy: RehydratePolicy,
+    redaction: &crate::redact::RedactionTable,
 ) -> Result<Option<Rehydrated>> {
     let mut events = Db::list_session_events_conn(conn, session_id)
         .map_err(|e| anyhow!("loading session events for rehydration: {e}"))?;
@@ -227,6 +272,8 @@ pub fn rehydrate_session_with_policy_conn(
         // No recorded turns — a fresh session, nothing to rehydrate.
         return Ok(None);
     }
+
+    apply_text_artifact_user_projections(conn, session_id, &events, &mut history, redaction)?;
 
     // Heal pass (implementation note): stub honest
     // results for orphan tool_uses and drop orphan tool_results so the
@@ -266,12 +313,707 @@ pub fn rehydrate_session_with_policy_conn(
         None => (0, false),
     };
 
+    // The canonical `tool_call` event deliberately stores the capped
+    // delivered body, never a frame.  Apply typed projections only after the
+    // prune ledger has selected the current wire body: a prune-boundary frame
+    // then replaces its target deterministically instead of being copied into
+    // the ledger and accidentally retaining a stale source UUID.  A corrupt
+    // ledger's documented full-history fallback deliberately skips only
+    // prune-boundary projections; ordinary tool retention remains safe.
+    apply_text_artifact_tool_projections(
+        conn,
+        session_id,
+        &events,
+        &mut history,
+        !ledger_fallback,
+        redaction,
+    )?;
+
     Ok(Some(Rehydrated {
         history,
         watermark,
         ledger_fallback,
         heals,
     }))
+}
+
+fn apply_text_artifact_tool_projections(
+    conn: &Connection,
+    session_id: Uuid,
+    events: &[SessionEventRow],
+    history: &mut [Message],
+    include_prune_projections: bool,
+    redaction: &crate::redact::RedactionTable,
+) -> Result<()> {
+    use crate::db::text_artifacts::{TextArtifact, TextArtifactRelation};
+
+    let mut artifacts_by_owner = std::collections::BTreeMap::<(i64, i64), TextArtifact>::new();
+    for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, session_id)? {
+        if artifact.relation != TextArtifactRelation::ModelContextToolResult {
+            continue;
+        }
+        let slot = artifact
+            .projection_slot
+            .ok_or_else(|| anyhow!("tool artifact owner lacks a projection slot"))?;
+        if artifacts_by_owner
+            .insert((artifact.event_seq, slot), artifact)
+            .is_some()
+        {
+            return Err(anyhow!(
+                "multiple tool artifact owners share one event slot"
+            ));
+        }
+    }
+
+    // `false` means the prune ledger could not be applied cleanly. Preserve
+    // its established full-history fallback without treating the intentionally
+    // ignored prune-owner rows as an orphan/corruption signal.
+    if !include_prune_projections {
+        for event in events.iter().filter(|event| event.kind == "context_pruned") {
+            artifacts_by_owner.retain(|(event_seq, _), _| *event_seq != event.seq);
+        }
+    }
+
+    let mut projections_by_call = std::collections::BTreeMap::<String, (String, bool)>::new();
+    for event in events {
+        match event.kind.as_str() {
+            "tool_call" => {
+                let projection = event.data.get("artifact_projection");
+                let artifact = artifacts_by_owner.remove(&(event.seq, 0));
+                match (projection, artifact) {
+                    (None, None) => {}
+                    (Some(serde_json::Value::Object(projection)), artifact) => {
+                        let call_id = event
+                            .call_id
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("tool artifact event lacks a call_id"))?;
+                        let (projection_call_id, frame) = render_rehydrated_tool_artifact_frame(
+                            projection,
+                            artifact.as_ref(),
+                            0,
+                            redaction,
+                        )?;
+                        if projection_call_id != call_id {
+                            return Err(anyhow!(
+                                "tool artifact projection provenance does not match event call id"
+                            ));
+                        }
+                        if projections_by_call
+                            .insert(call_id.to_owned(), (frame, false))
+                            .is_some()
+                        {
+                            return Err(anyhow!(
+                                "multiple ordinary artifact projections share one tool call id"
+                            ));
+                        }
+                    }
+                    (Some(_), _) => {
+                        return Err(anyhow!("tool artifact projection must be an object"));
+                    }
+                    (None, Some(_)) => {
+                        return Err(anyhow!(
+                            "tool artifact owner has no durable projection state"
+                        ));
+                    }
+                }
+            }
+            "context_pruned" if include_prune_projections => {
+                let Some(states) = event.data.get("artifact_projections") else {
+                    if artifacts_by_owner
+                        .keys()
+                        .any(|(event_seq, _)| *event_seq == event.seq)
+                    {
+                        return Err(anyhow!(
+                            "prune artifact owner has no durable projection states"
+                        ));
+                    }
+                    continue;
+                };
+                let states = states
+                    .as_array()
+                    .ok_or_else(|| anyhow!("prune artifact projections must be an array"))?;
+                for (ordinal, state) in states.iter().enumerate() {
+                    let projection = state
+                        .as_object()
+                        .ok_or_else(|| anyhow!("prune artifact projection must be an object"))?;
+                    let slot: i64 = ordinal
+                        .try_into()
+                        .map_err(|_| anyhow!("prune projection slot overflows i64"))?;
+                    if projection
+                        .get("projection_slot")
+                        .and_then(serde_json::Value::as_i64)
+                        != Some(slot)
+                    {
+                        return Err(anyhow!("prune artifact projection slot is unstable"));
+                    }
+                    let artifact = artifacts_by_owner.remove(&(event.seq, slot));
+                    let (call_id, frame) = render_rehydrated_tool_artifact_frame(
+                        projection,
+                        artifact.as_ref(),
+                        slot,
+                        redaction,
+                    )?;
+                    match projections_by_call.insert(call_id.to_owned(), (frame, true)) {
+                        None | Some((_, false)) => {}
+                        Some((_, true)) => {
+                            return Err(anyhow!(
+                                "multiple prune artifact projections share one tool call id"
+                            ));
+                        }
+                    }
+                }
+                if artifacts_by_owner
+                    .keys()
+                    .any(|(event_seq, _)| *event_seq == event.seq)
+                {
+                    return Err(anyhow!(
+                        "prune artifact owner has no matching durable projection slot"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !artifacts_by_owner.is_empty() {
+        return Err(anyhow!(
+            "tool artifact relation is attached to a non-owning event or slot"
+        ));
+    }
+
+    let mut applied = std::collections::BTreeSet::new();
+    for message in history {
+        let Message::User { content } = message else {
+            continue;
+        };
+        for part in content {
+            let UserContent::ToolResult(result) = part else {
+                continue;
+            };
+            if let Some((frame, _)) = projections_by_call.get(result.call.as_str()) {
+                result.content = vec![ToolResultContent::text(frame.clone())];
+                applied.insert(result.call.to_string());
+            }
+        }
+    }
+    if projections_by_call
+        .keys()
+        .any(|call_id| !applied.contains(call_id))
+    {
+        return Err(anyhow!(
+            "artifact projection does not map to a rehydrated tool result"
+        ));
+    }
+    Ok(())
+}
+
+fn render_rehydrated_tool_artifact_frame<'a>(
+    projection: &'a serde_json::Map<String, serde_json::Value>,
+    artifact: Option<&crate::db::text_artifacts::TextArtifact>,
+    expected_slot: i64,
+    redaction: &crate::redact::RedactionTable,
+) -> Result<(&'a str, String)> {
+    if projection
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        != Some(1)
+        || projection
+            .get("projection_slot")
+            .and_then(serde_json::Value::as_i64)
+            != Some(expected_slot)
+    {
+        return Err(anyhow!(
+            "tool artifact projection has an invalid version or slot"
+        ));
+    }
+    let status = projection
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("tool artifact projection lacks status"))?;
+    let capture_reason = projection
+        .get("capture_reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("tool artifact projection lacks capture reason"))?;
+    let kind = projection
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("tool artifact projection lacks kind"))?;
+    if kind != "tool_result" || !matches!(capture_reason, "display_truncation" | "prune_boundary") {
+        return Err(anyhow!(
+            "tool artifact projection has an invalid kind or capture reason"
+        ));
+    }
+
+    let numeric = |field: &str| -> Result<usize> {
+        projection
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?
+            .try_into()
+            .map_err(|_| anyhow!("tool artifact projection {field} exceeds usize"))
+    };
+    let provenance = projection
+        .get("provenance")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("tool artifact projection lacks provenance"))?;
+    if provenance.len() != 3
+        || !provenance.contains_key("agent_id")
+        || !provenance.contains_key("tool")
+        || !provenance.contains_key("call_id")
+    {
+        return Err(anyhow!(
+            "tool artifact projection provenance has an invalid shape"
+        ));
+    }
+    let bounded = |key: &str| -> Result<&str> {
+        let value = provenance
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("tool artifact projection provenance lacks {key}"))?;
+        if value.is_empty()
+            || value.len() > 256
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(anyhow!(
+                "tool artifact projection provenance {key} is invalid"
+            ));
+        }
+        Ok(value)
+    };
+    if let Some(agent) = provenance.get("agent_id")
+        && !agent.is_null()
+        && !agent.as_str().is_some_and(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && !value.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err(anyhow!(
+            "tool artifact projection provenance agent_id is invalid"
+        ));
+    }
+    let _tool = bounded("tool")?;
+    let call_id = bounded("call_id")?;
+    let provenance_value = serde_json::Value::Object(provenance.clone());
+    let provenance_json = serde_json::to_string(&provenance_value)?;
+    let preview = |field: &str| -> Result<&str> {
+        let value = projection
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("tool artifact projection lacks {field}"))?;
+        if value.len() > 2 * 1024 {
+            return Err(anyhow!(
+                "tool artifact projection {field} exceeds preview cap"
+            ));
+        }
+        Ok(value)
+    };
+    let preview_head = preview("preview_head")?;
+    let preview_tail = preview("preview_tail")?;
+    let host_captured_bytes = numeric("host_captured_bytes")?;
+    let host_original_bytes = numeric("host_original_bytes")?;
+    let host_dropped_bytes = numeric("host_dropped_bytes")?;
+    let stored_source_bytes = numeric("stored_source_bytes")?;
+    let content_bytes = numeric("content_bytes")?;
+    let line_count = numeric("line_count")?;
+    if host_original_bytes < host_captured_bytes
+        || host_dropped_bytes != host_original_bytes - host_captured_bytes
+        || stored_source_bytes > host_captured_bytes
+    {
+        return Err(anyhow!(
+            "tool artifact projection has invalid byte accounting"
+        ));
+    }
+
+    match status {
+        "available" => {
+            let artifact = artifact
+                .ok_or_else(|| anyhow!("available tool projection lacks an artifact owner"))?;
+            if projection.get("reason") != Some(&serde_json::Value::Null)
+                || artifact.relation
+                    != crate::db::text_artifacts::TextArtifactRelation::ModelContextToolResult
+                || artifact.projection_slot != Some(expected_slot)
+                || artifact.capture_reason.as_str() != capture_reason
+                || artifact.host_captured_bytes != host_captured_bytes
+                || artifact.host_original_bytes != host_original_bytes
+                || artifact.host_dropped_bytes != host_dropped_bytes
+                || artifact.stored_source_bytes != stored_source_bytes
+                || artifact.content_bytes != content_bytes
+                || artifact.content.lines().count() != line_count
+            {
+                return Err(anyhow!("available tool artifact projection is malformed"));
+            }
+            let artifact_provenance: serde_json::Value =
+                serde_json::from_str(&artifact.provenance_json)
+                    .context("available tool artifact provenance is invalid")?;
+            if artifact_provenance != provenance_value {
+                return Err(anyhow!(
+                    "available tool artifact provenance differs from durable projection state"
+                ));
+            }
+            let outbound_content = redaction.scrub(&artifact.content);
+            let (preview_head, preview_tail) =
+                crate::engine::text_artifact_frame::utf8_preview_pair(&outbound_content);
+            // Locally captured artifacts have already passed this boundary and
+            // retain their durable previews. Imported (or newly matched)
+            // content is rendered from the current safe view instead of
+            // trusting its representation metadata.
+            if outbound_content == artifact.content
+                && (preview_head != preview("preview_head")?
+                    || preview_tail != preview("preview_tail")?)
+            {
+                return Err(anyhow!(
+                    "available tool artifact preview differs from durable projection state"
+                ));
+            }
+            Ok((
+                call_id,
+                crate::engine::text_artifact_frame::render_artifact_frame(
+                    &crate::engine::text_artifact_frame::ArtifactFrame {
+                        status,
+                        reason: None,
+                        artifact_id: Some(artifact.artifact_id),
+                        kind,
+                        capture_reason,
+                        provenance_json: &artifact.provenance_json,
+                        host_captured_bytes: artifact.host_captured_bytes,
+                        host_original_bytes: artifact.host_original_bytes,
+                        host_dropped_bytes: artifact.host_dropped_bytes,
+                        stored_source_bytes: artifact.stored_source_bytes,
+                        content_bytes: artifact.content_bytes,
+                        line_count: artifact.content.lines().count(),
+                        preview_head,
+                        preview_tail,
+                    },
+                ),
+            ))
+        }
+        "unavailable" => {
+            if artifact.is_some() {
+                return Err(anyhow!("unavailable tool projection has an artifact owner"));
+            }
+            let reason = projection
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| {
+                    matches!(
+                        *reason,
+                        "artifact_limit" | "session_quota" | "persistence_unavailable"
+                    )
+                })
+                .ok_or_else(|| {
+                    anyhow!("unavailable tool artifact projection has an invalid reason")
+                })?;
+            // An unavailable projection has no artifact body to join, but its
+            // persisted previews still originated in an archive/event payload.
+            // Treat them as untrusted outbound text just like an imported
+            // artifact body; accounting remains the immutable durable value.
+            let outbound_preview_head = redaction.scrub(preview_head);
+            let outbound_preview_tail = redaction.scrub(preview_tail);
+            Ok((
+                call_id,
+                crate::engine::text_artifact_frame::render_artifact_frame(
+                    &crate::engine::text_artifact_frame::ArtifactFrame {
+                        status,
+                        reason: Some(reason),
+                        artifact_id: None,
+                        kind,
+                        capture_reason,
+                        provenance_json: &provenance_json,
+                        host_captured_bytes,
+                        host_original_bytes,
+                        host_dropped_bytes,
+                        stored_source_bytes,
+                        content_bytes,
+                        line_count,
+                        preview_head: &outbound_preview_head,
+                        preview_tail: &outbound_preview_tail,
+                    },
+                ),
+            ))
+        }
+        _ => Err(anyhow!("tool artifact projection has an invalid status")),
+    }
+}
+
+/// Replace only the authored text part of materialized oversized-user events.
+/// The canonical event is still rebuilt first for transcript fidelity; this
+/// second relational pass turns its model-only representation into the exact
+/// shared artifact frame.  No frame text is parsed back into identity.
+fn apply_text_artifact_user_projections(
+    conn: &Connection,
+    session_id: Uuid,
+    events: &[SessionEventRow],
+    history: &mut Vec<Message>,
+    redaction: &crate::redact::RedactionTable,
+) -> Result<()> {
+    use crate::db::text_artifacts::{
+        CaptureReason, TextArtifact, TextArtifactKind, TextArtifactRelation,
+    };
+
+    let mut by_event = std::collections::BTreeMap::<i64, Vec<TextArtifact>>::new();
+    for artifact in crate::db::text_artifacts::list_text_artifacts_conn(conn, session_id)? {
+        if matches!(
+            artifact.relation,
+            TextArtifactRelation::SourceUserInput | TextArtifactRelation::ModelUserInputProjection
+        ) {
+            by_event
+                .entry(artifact.event_seq)
+                .or_default()
+                .push(artifact);
+        }
+    }
+
+    let mut frames = std::collections::BTreeMap::<i64, String>::new();
+    for event in events {
+        if event.kind != "user_message" {
+            continue;
+        }
+        let authored = event
+            .data
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("user artifact event lacks canonical text"))?;
+        // Oversized source artifacts are deliberately text-only. A
+        // media/file-bearing event cannot be materialized by the live ingress
+        // path, so fail closed before considering any artifact slots when an
+        // old or corrupt ledger claims otherwise.
+        if authored.len() > 64 * 1024 && user_event_has_media_or_file_parts(&event.data) {
+            return Err(anyhow!(
+                "oversized user event {} cannot carry media/file parts",
+                event.seq
+            ));
+        }
+        let slots = by_event.remove(&event.seq).unwrap_or_default();
+        let has_user_artifact = !slots.is_empty();
+        if !has_user_artifact && authored.len() <= 64 * 1024 {
+            continue;
+        }
+        // A long canonical event must be backed by exactly one source. This
+        // makes missing/deleted/swapped associations a resume failure instead
+        // of a silent full-text provider handoff.
+        let sources = slots
+            .iter()
+            .filter(|artifact| artifact.relation == TextArtifactRelation::SourceUserInput)
+            .collect::<Vec<_>>();
+        if sources.len() != 1 {
+            return Err(anyhow!(
+                "oversized user event {} must own exactly one source artifact",
+                event.seq
+            ));
+        }
+        let source = sources[0];
+        if source.kind != TextArtifactKind::UserInputSource
+            || source.capture_reason != CaptureReason::OversizedUserInput
+            || source.projection_slot.is_some()
+            || source.content != authored
+        {
+            return Err(anyhow!(
+                "user source artifact does not match its canonical event"
+            ));
+        }
+        let source_provenance: serde_json::Value = serde_json::from_str(&source.provenance_json)
+            .context("user source artifact provenance is invalid")?;
+        if source_provenance
+            .get("event_seq")
+            .and_then(serde_json::Value::as_i64)
+            != Some(event.seq)
+        {
+            return Err(anyhow!(
+                "user source artifact provenance does not own its event"
+            ));
+        }
+        let projections = slots
+            .iter()
+            .filter(|artifact| artifact.relation == TextArtifactRelation::ModelUserInputProjection)
+            .collect::<Vec<_>>();
+        if projections.len() > 1 || slots.len() != sources.len() + projections.len() {
+            return Err(anyhow!("user artifact event has invalid owner slots"));
+        }
+        let effective = if let Some(projection) = projections.first() {
+            let projection = *projection;
+            if projection.kind != TextArtifactKind::UserInputProjection
+                || projection.capture_reason != CaptureReason::OversizedUserInput
+                || projection.projection_slot != Some(0)
+                || projection.content == source.content
+            {
+                return Err(anyhow!(
+                    "user projection artifact has an invalid owner relation"
+                ));
+            }
+            let provenance: serde_json::Value =
+                serde_json::from_str(&projection.provenance_json)
+                    .context("user projection artifact provenance is invalid")?;
+            let expected_source_id = source.artifact_id.to_string();
+            if provenance
+                .get("source_artifact_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_source_id.as_str())
+                || provenance
+                    .get("preprocessing_version")
+                    .and_then(serde_json::Value::as_i64)
+                    != Some(1)
+            {
+                return Err(anyhow!(
+                    "user projection artifact does not derive from its source"
+                ));
+            }
+            projection
+        } else {
+            source
+        };
+        let outbound_content = redaction.scrub(&effective.content);
+        let frame = crate::engine::text_artifact_frame::render_user_input_artifact_frame_with_outbound_content(
+            effective,
+            &outbound_content,
+        )
+        .context("rendering rehydrated user artifact frame")?;
+        if frames.insert(event.seq, frame).is_some() {
+            return Err(anyhow!("multiple user artifact frames share one event"));
+        }
+    }
+    if !by_event.is_empty() {
+        return Err(anyhow!(
+            "user artifact relation is attached to a non-user event"
+        ));
+    }
+
+    let mut next_history = 0usize;
+    for event in events.iter().filter(|event| event.kind == "user_message") {
+        let authored = event
+            .data
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("user artifact event lacks canonical text"))?;
+        let Some((mut index, text)) =
+            history
+                .iter_mut()
+                .enumerate()
+                .skip(next_history)
+                .find_map(|(index, message)| match message {
+                    Message::User { content }
+                        if content.len() == 1
+                            && matches!(content.first(), Some(UserContent::Text(_))) =>
+                    {
+                        match content.first_mut() {
+                            Some(UserContent::Text(text)) => Some((index, text)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+        else {
+            return Err(anyhow!(
+                "rehydrated history lacks the user message for artifact event {}",
+                event.seq
+            ));
+        };
+        if text.text != authored {
+            return Err(anyhow!(
+                "rehydrated user message does not match artifact event {}",
+                event.seq
+            ));
+        }
+        if let Some(frame) = frames.remove(&event.seq) {
+            let envelope = Db::user_message_model_envelope_conn(conn, session_id, event.seq)?
+                .ok_or_else(|| anyhow!("oversized user event lacks accepted model envelope"))?;
+            let composition = crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
+                &envelope, &frame, redaction,
+            )?;
+            let leading_call_id = composition
+                .leading
+                .first()
+                .and_then(|message| match message {
+                    Message::Assistant { content, .. } => {
+                        content.iter().find_map(|part| match part {
+                            AssistantContent::ToolCall(call) => Some(call.id.to_string()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                });
+            history[index] = Message::User {
+                content: composition.content,
+            };
+            if let Some(call_id) = leading_call_id {
+                let existing = history.iter().any(|message| match message {
+                    Message::Assistant { content, .. } => content.iter().any(|part| {
+                        matches!(part, AssistantContent::ToolCall(call) if call.id.to_string() == call_id)
+                    }),
+                    _ => false,
+                });
+                if existing {
+                    // The later audit row is observability, not a second
+                    // model composition. Replace its reconstructed pair with
+                    // the persisted phase-two prelude, already rendered at
+                    // the current outbound-redaction boundary. This keeps
+                    // restart byte-identical to live dispatch even if audit
+                    // reconstruction changes independently.
+                    let matching_positions = history
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, message)| {
+                            let belongs_to_prelude = match message {
+                                Message::Assistant { content, .. } => matches!(
+                                    content.as_slice(),
+                                    [AssistantContent::ToolCall(call)] if call.id.to_string() == call_id
+                                ),
+                                Message::User { content } => matches!(
+                                    content.as_slice(),
+                                    [UserContent::ToolResult(result)] if result.call.to_string() == call_id
+                                ),
+                                _ => false,
+                            };
+                            belongs_to_prelude.then_some(position)
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(&insert_at) = matching_positions.first() {
+                        for position in matching_positions.into_iter().rev() {
+                            history.remove(position);
+                            if position < index {
+                                index -= 1;
+                            }
+                        }
+                        let leading_len = composition.leading.len();
+                        history.splice(insert_at..insert_at, composition.leading);
+                        if insert_at <= index {
+                            index += leading_len;
+                        }
+                    } else {
+                        // A malformed audit representation must not cause us
+                        // to drop unrelated batched tool content. Keep it and
+                        // add the authoritative persisted prelude instead.
+                        history.splice(index..index, composition.leading);
+                    }
+                } else {
+                    history.splice(index..index, composition.leading);
+                }
+            }
+        }
+        next_history = index + 1;
+    }
+    if !frames.is_empty() {
+        return Err(anyhow!(
+            "not every user artifact frame was applied to history"
+        ));
+    }
+    Ok(())
+}
+
+/// Returns true for a nonempty media/file part or for a malformed non-array
+/// declaration. The latter is deliberately fail-closed: a canonical user
+/// event has no scalar media/file representation.
+fn user_event_has_media_or_file_parts(data: &serde_json::Value) -> bool {
+    const MEDIA_OR_FILE_KEYS: [&str; 5] =
+        ["images", "image_refs", "attachments", "files", "file_refs"];
+
+    data.as_object().is_some_and(|object| {
+        MEDIA_OR_FILE_KEYS.iter().any(|key| match object.get(*key) {
+            Some(serde_json::Value::Array(parts)) => !parts.is_empty(),
+            Some(_) => true,
+            None => false,
+        })
+    })
 }
 
 /// Build the **wire history snapshot** the daemon sends in its `Attached`
@@ -1277,6 +2019,19 @@ fn rebuild_history(
                 let Some(call_id) = ev.call_id.as_deref() else {
                     return Err(anyhow!("tool_call event without a call_id (corrupt row)"));
                 };
+                // Oversized forced skills are durably accepted with the user
+                // envelope first, then their synthetic audit row is applied.
+                // Live dispatch still presents the native seed pair before
+                // that user message. Rebuild the pair at that same model-wire
+                // position; if a crash occurred after phase two but before this
+                // audit row, the envelope alone remains the complete handoff.
+                let postphase_skill_seed = ev
+                    .data
+                    .get("skill_slash")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    && matches!(history.last(), Some(Message::User { .. }));
+                let retained_user = postphase_skill_seed.then(|| history.pop()).flatten();
                 // Canonical wire form + result body from the tool-call row.
                 // A missing row means the call's result body never landed
                 // durably (an interrupted call): heal it with an honest
@@ -1366,6 +2121,10 @@ fn rebuild_history(
                             id: call_id.to_string(),
                         });
                     }
+                }
+                if let Some(user) = retained_user {
+                    std::mem::take(&mut pending).flush(&mut history);
+                    history.push(user);
                 }
             }
             "session_compacted" if ev.agent.as_deref() == Some(root_agent) => {
@@ -2237,6 +2996,53 @@ mod tests {
         .unwrap();
     }
 
+    /// Record the durable audit trail emitted after a forced `/skill` prelude
+    /// has already been accepted into an oversized user envelope.
+    async fn record_post_audit_forced_skill(s: &Session, call_id: &str, body: &str) {
+        s.record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".into(),
+            call_id: call_id.into(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::default(),
+            tool: "skill".into(),
+            path: None,
+            mcp_server: None,
+            original_input_json: json!({ "name": "review" }),
+            wire_input_json: json!({ "name": "review" }),
+            recovery: Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: body.into(),
+            truncated: false,
+            duration_ms: 1,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        })
+        .await
+        .unwrap();
+        s.record_event(
+            crate::db::session_log::SessionEventKind::ToolCall,
+            Some("Build"),
+            Some(call_id),
+            &json!({
+                "tool": "skill",
+                "original_input": { "name": "review" },
+                "wire_input": { "name": "review" },
+                "output": body,
+                "skill_slash": true,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn record_tool_with_identity(
         s: &Session,
         call_id: &str,
@@ -2416,6 +3222,270 @@ mod tests {
         assert_eq!(assistant_text(&h[1]), "hi there");
         assert_eq!(user_text(&h[2]), "bye");
         assert_eq!(assistant_text(&h[3]), "goodbye");
+    }
+
+    #[tokio::test]
+    async fn oversized_user_rehydrate_rejects_a_long_mixed_media_event_before_artifact_lookup() {
+        let s = root_session();
+        // This is the legacy shape that dispatch must now reject before it is
+        // durable. Rehydrate remains fail-closed for a corrupted/old archive:
+        // it must not silently hand the full body to a provider.
+        s.record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &json!({
+                "text": "x".repeat(64 * 1024 + 1),
+                "images": [{"id": Uuid::new_v4()}],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .expect_err("a long mixed-media user event is never artifact-eligible");
+        assert!(
+            error.to_string().contains("cannot carry media/file parts"),
+            "unexpected rehydrate error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_oversized_composition_rehydrates_one_forced_pair_and_ordered_parts() {
+        struct AllowJoin;
+        impl crate::db::message_attachments::MessageAcceptanceJoin for AllowJoin {
+            fn validate_and_join(
+                &self,
+                _: &rusqlite::Connection,
+                _: &crate::db::message_attachments::AcceptMessageInput,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let s = root_session();
+        let source = "x".repeat(65_537);
+        let operation_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
+        let reserved =
+            s.db.accept_message_with_text_artifact_reservation(
+                crate::db::message_attachments::AcceptMessageInput {
+                    session_id: s.id,
+                    operation_id: *operation_id.as_bytes(),
+                    actor: crate::db::message_attachments::MessageActor::LocalOwner,
+                    request_hash: [7; 32],
+                    message_request_digest: [8; 32],
+                    attachment_set_digest: [9; 32],
+                    client_submission_id: *submission_id.as_bytes(),
+                    queue_item_id: *submission_id.as_bytes(),
+                    canonical_message: b"FCM2\x02".to_vec(),
+                    attachments: Vec::new(),
+                    outbox_sequence: 0,
+                    now_ms: 10,
+                },
+                Arc::new(AllowJoin),
+                crate::db::text_artifacts::source_digest(&source),
+                source.len(),
+            )
+            .await
+            .unwrap();
+        let reservation = match reserved {
+            crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
+                reservation
+            }
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let typed =
+            UserContent::image_base64("YWJj", Some(rig::message::ImageMediaType::PNG), None);
+        let envelope = json!({
+            "version": 3,
+            "prelude": [{
+                "type": "forced_skill",
+                "call_id": "forced-1",
+                "name": "review",
+                "args": {"name":"review"},
+                "body": "FORCED",
+                "hard_fail": false
+            }],
+            "parts": [
+                {"type":"text","text":"AUTO\\n"},
+                {"type":"text","text":"TAG\\n"},
+                {"type":"image","payload": serde_json::to_value(&typed).unwrap()},
+                {"type":"authored_text_slot"}
+            ]
+        });
+        s.db.materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: envelope.to_string(),
+                source_text: source,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                now_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+
+        // This is the crash window: phase two is durable but the ordinary
+        // post-commit audit bookkeeping did not run. The envelope is therefore
+        // the sole source of the one forced pair.
+        let history = rehydrate_session(&s.db, s.id, "Build")
+            .await
+            .unwrap()
+            .unwrap()
+            .history;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            &history[0],
+            Message::Assistant { content, .. }
+                if matches!(content.as_slice(), [AssistantContent::ToolCall(call)]
+                    if call.function.name == "skill"
+                        && call.function.arguments == json!({"name":"review"}))
+        ));
+        assert!(matches!(
+            &history[1],
+            Message::User { content }
+                if matches!(content.as_slice(), [UserContent::ToolResult(result)]
+                    if result.name == "skill"
+                        && result.content == vec![ToolResultContent::text("FORCED")])
+        ));
+        assert!(matches!(
+            &history[2],
+            Message::User { content }
+                if content.len() == 4
+                    && matches!(&content[0], UserContent::Text(text) if text.text == "AUTO\\n")
+                    && matches!(&content[1], UserContent::Text(text) if text.text == "TAG\\n")
+                    && content[2] == typed
+                    && matches!(&content[3], UserContent::Text(text) if text.text.contains("<cockpit_artifact_v1 "))
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_audit_forced_prelude_is_redacted_identically_on_restart() {
+        struct AllowJoin;
+        impl crate::db::message_attachments::MessageAcceptanceJoin for AllowJoin {
+            fn validate_and_join(
+                &self,
+                _: &rusqlite::Connection,
+                _: &crate::db::message_attachments::AcceptMessageInput,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let s = root_session();
+        let source = "x".repeat(65_537);
+        let operation_id = Uuid::new_v4();
+        let submission_id = Uuid::new_v4();
+        let reserved =
+            s.db.accept_message_with_text_artifact_reservation(
+                crate::db::message_attachments::AcceptMessageInput {
+                    session_id: s.id,
+                    operation_id: *operation_id.as_bytes(),
+                    actor: crate::db::message_attachments::MessageActor::LocalOwner,
+                    request_hash: [17; 32],
+                    message_request_digest: [18; 32],
+                    attachment_set_digest: [19; 32],
+                    client_submission_id: *submission_id.as_bytes(),
+                    queue_item_id: *submission_id.as_bytes(),
+                    canonical_message: b"FCM2\x02".to_vec(),
+                    attachments: Vec::new(),
+                    outbox_sequence: 0,
+                    now_ms: 10,
+                },
+                Arc::new(AllowJoin),
+                crate::db::text_artifacts::source_digest(&source),
+                source.len(),
+            )
+            .await
+            .unwrap();
+        let reservation = match reserved {
+            crate::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
+                reservation
+            }
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let secret = "post-audit-forced-secret";
+        let envelope = json!({
+            "version": 3,
+            "prelude": [{
+                "type": "forced_skill",
+                "call_id": "forced-redaction",
+                "name": "review",
+                "args": {"name":"review"},
+                "body": secret,
+                "hard_fail": false
+            }],
+            "parts": [{"type":"authored_text_slot"}]
+        });
+        s.db.materialize_reserved_user_text_artifacts(
+            crate::db::text_artifacts::ReservedUserArtifactMaterialization {
+                reservation,
+                canonical_event_json: json!({"text": source.clone()}).to_string(),
+                model_envelope_json: envelope.to_string(),
+                source_text: source,
+                model_projection: None,
+                agent: Some("Build".to_owned()),
+                context: crate::db::text_artifacts::TextArtifactEventContext::default(),
+                now_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Phase two has committed; then the ordinary post-commit `/skill`
+        // audit bookkeeping lands. Resume must not trust its unredacted body
+        // over the same accepted-envelope prelude used by live dispatch.
+        record_post_audit_forced_skill(&s, "forced-redaction", secret).await;
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            denylist: vec![secret.to_owned()],
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let redaction = Arc::new(
+            crate::redact::RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap(),
+        );
+        let live_prelude =
+            crate::engine::text_artifact_frame::render_accepted_user_composition_with_redaction(
+                &envelope.to_string(),
+                "live artifact frame is irrelevant to the prelude assertion",
+                redaction.as_ref(),
+            )
+            .unwrap()
+            .leading;
+        let history = rehydrate_session_with_policy_and_redaction(
+            &s.db,
+            s.id,
+            "Build",
+            RehydratePolicy::heal(),
+            redaction,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .history;
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(&history[..2], live_prelude.as_slice());
+        assert!(matches!(
+            &history[0],
+            Message::Assistant { content, .. }
+                if matches!(content.as_slice(), [AssistantContent::ToolCall(call)]
+                    if call.function.name == "skill" && call.function.arguments == json!({"name":"review"}))
+        ));
+        assert!(matches!(
+            &history[1],
+            Message::User { content }
+                if matches!(content.as_slice(), [UserContent::ToolResult(result)]
+                    if result.name == "skill"
+                        && result.content == vec![ToolResultContent::text("***REDACT***")])
+        ));
+        assert!(format!("{history:?}").contains("***REDACT***"));
+        assert!(!format!("{history:?}").contains(secret));
     }
 
     #[tokio::test]

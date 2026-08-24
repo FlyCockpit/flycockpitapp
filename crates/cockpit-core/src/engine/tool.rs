@@ -567,10 +567,11 @@ pub struct ToolOutput {
     pub repeat_guard: Option<RepeatGuard>,
     /// True when [`content`] is capped (per the §10 truncation marker).
     pub truncated: bool,
-    /// Optional retained source body for a truncated result. This is present
-    /// only when the tool can supply bytes that were not delivered in
-    /// [`content`], so retrieval is useful rather than a no-op.
-    pub truncated_retention: Option<RetainedTruncatedOutput>,
+    /// Optional bounded source capture for a truncated result.  This carries
+    /// host-side capture accounting independently from the model-visible body;
+    /// the dispatcher turns it into an immutable text artifact together with
+    /// the owning event.
+    pub text_artifact_capture: Option<TextArtifactCapture>,
     /// Optional recovery annotation. `None` means the tool ran without
     /// any normalization. The dispatcher prefers this over any
     /// shape-repair recovery that fired earlier in the same call.
@@ -605,14 +606,19 @@ pub struct ToolOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetainedTruncatedOutput {
-    /// Retained pre-truncation bytes, capped by the producing tool.
+pub struct TextArtifactCapture {
+    /// Captured post-host-boundary bytes. This is never a hash or a path.
     pub content: String,
-    /// Full byte length of the pre-truncation body observed by the producer.
-    /// This may exceed `content.len()` when [`partial`] is true.
-    pub original_byte_len: usize,
-    /// True when [`content`] is only a capped prefix of the original body.
-    pub partial: bool,
+    /// Number of bytes retained at the host capture boundary.
+    pub host_captured_bytes: usize,
+    /// Number of bytes the source produced before that boundary.
+    pub host_original_bytes: usize,
+    /// Exact number of source bytes not captured at the host boundary.
+    pub host_dropped_bytes: usize,
+    /// Number of post-safety bytes eligible for durable retention.  Producers
+    /// set this to `content.len()`; the dispatcher refuses a capture if the
+    /// result safety boundary changed the delivered body.
+    pub stored_source_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -758,7 +764,7 @@ impl ToolOutput {
             content: content.into(),
             repeat_guard: None,
             truncated: false,
-            truncated_retention: None,
+            text_artifact_capture: None,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -773,7 +779,7 @@ impl ToolOutput {
             content: content.into(),
             repeat_guard: None,
             truncated: true,
-            truncated_retention: None,
+            text_artifact_capture: None,
             recovery: None,
             canonical_args: None,
             sandbox: None,
@@ -783,8 +789,8 @@ impl ToolOutput {
         }
     }
 
-    pub fn with_truncated_retention(mut self, retention: RetainedTruncatedOutput) -> Self {
-        self.truncated_retention = Some(retention);
+    pub fn with_text_artifact_capture(mut self, capture: TextArtifactCapture) -> Self {
+        self.text_artifact_capture = Some(capture);
         self
     }
 
@@ -2668,7 +2674,8 @@ mod llm_mode_tests {
             ("start_build", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),
             ("todo", ToolEffect::Dynamic),
-            ("tool_result_retrieve", ToolEffect::Dynamic),
+            ("artifact_read", ToolEffect::ReadOnly),
+            ("artifact_search", ToolEffect::ReadOnly),
             ("unlock", ToolEffect::Dynamic),
             ("use_sealed_value", ToolEffect::Dynamic),
             ("webfetch", ToolEffect::Dynamic),

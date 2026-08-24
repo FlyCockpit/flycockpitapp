@@ -168,8 +168,26 @@ pub fn remaining_after_restart(
     RemainingRestart::Remaining(remaining - elapsed)
 }
 
+/// Row-aware restart reconciliation. A bounded oversized FCM2 invocation is
+/// persisted in phase one with no remaining budget until phase two atomically
+/// materializes its source/event/artifacts; treating that durable shape as the
+/// ordinary `None = unbounded` case would hide the queued-clock distinction.
+pub fn remaining_after_restart_for_row(
+    row: &RunInvocationRow,
+    now_wall_ms: i64,
+) -> RemainingRestart {
+    if crate::db::run_invocations::timeout_clock_is_deferred(row) {
+        RemainingRestart::ClockNotStarted
+    } else {
+        remaining_after_restart(row.remaining_ms, row.last_observed_wall_ms, now_wall_ms)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemainingRestart {
+    /// Phase-one accepted oversized FCM2 invocation with a configured timeout
+    /// whose countdown has not begun. This is neither unbounded nor expired.
+    ClockNotStarted,
     Unbounded,
     Remaining(u64),
     Expired,
@@ -284,7 +302,8 @@ async fn reconcile_remaining_on_lookup(
     if row.terminal_at_wall_ms.is_some() || row.timeout_ms.is_none() {
         return Ok(row);
     }
-    match remaining_after_restart(row.remaining_ms, row.last_observed_wall_ms, now_wall_ms) {
+    match remaining_after_restart_for_row(&row, now_wall_ms) {
+        RemainingRestart::ClockNotStarted => Ok(row),
         RemainingRestart::Unbounded => Ok(row),
         RemainingRestart::Remaining(rem) => {
             if Some(rem) == row.remaining_ms && now_wall_ms == row.last_observed_wall_ms {
@@ -538,7 +557,8 @@ pub async fn checkpoint_before_side_effect(
     if row.terminal_at_wall_ms.is_some() || row.timeout_ms.is_none() {
         return Ok(Some(row));
     }
-    match remaining_after_restart(row.remaining_ms, row.last_observed_wall_ms, now_wall_ms) {
+    match remaining_after_restart_for_row(&row, now_wall_ms) {
+        RemainingRestart::ClockNotStarted => Ok(Some(row)),
         RemainingRestart::Unbounded => Ok(Some(row)),
         RemainingRestart::Remaining(rem) => db
             .checkpoint_run_invocation_remaining(client_submission_id, Some(rem), now_wall_ms)

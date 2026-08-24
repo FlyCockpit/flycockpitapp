@@ -2,6 +2,7 @@ use super::handle::*;
 use super::helpers::*;
 use super::lifecycle::*;
 use super::*;
+use anyhow::Context;
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
@@ -12,6 +13,13 @@ pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 /// caught promptly. Bounded work; the drain path force-aborts the worker at its
 /// own deadline regardless, so this never blocks shutdown indefinitely.
 const PARK_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// An accepted oversized source has a ten-minute DB-owned lease. Startup and
+/// individual dispatches reconcile it synchronously; this bounded worker tick
+/// also prevents an idle session from retaining an expired reservation until a
+/// later client submission happens to arrive.
+const TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 pub(super) fn persistent_llm_mode_control(
     mode: crate::config::extended::LlmMode,
@@ -312,9 +320,26 @@ pub(super) async fn persist_staged_terminal_removal(
 > {
     let removed = staged.removed().to_vec();
     let receipts = queue.accepted_receipts(staged.ids()).await;
-    if !receipts.is_empty()
+    let terminal_receipts = receipts
+        .iter()
+        .map(
+            |receipt| crate::db::session_log::ClientSubmissionTerminalReceipt {
+                client_submission_id: receipt.id,
+                fingerprint: receipt.fingerprint.clone(),
+                wire_fingerprint: receipt.wire_fingerprint.clone(),
+                origin_principal: receipt.origin_principal.clone(),
+                disposition,
+            },
+        )
+        .collect::<Vec<_>>();
+    if !terminal_receipts.is_empty()
         && let Err(error) = session
-            .record_terminal_client_submissions(&receipts, disposition)
+            .db
+            .terminalize_queued_text_artifact_submissions(
+                session.id,
+                terminal_receipts,
+                chrono::Utc::now().timestamp_millis(),
+            )
             .await
     {
         queue.mark_staged_removal_failed(&staged).await;
@@ -414,11 +439,16 @@ pub(crate) enum RemoteSendDecision {
 /// KNOWN NON-ATOMICITY (there is NO atomic durable-accept at the daemon accept
 /// path yet, and this lane deliberately does NOT try to build one). Three
 /// records that morally describe "this send was accepted" are committed
-/// SEPARATELY, not in one transaction: the run-invocation MARKER
-/// (`accept_run_if_marked`, committed in the dispatch arm before the worker
-/// dispatch — unchanged from main); this transactional LEDGER row (committed
+/// SEPARATELY, not in one transaction: for legacy inline/media sends, the
+/// run-invocation MARKER (`accept_run_if_marked`, committed in the dispatch
+/// arm before the worker dispatch); this transactional LEDGER row (committed
 /// here on the worker accept); and the durable MESSAGE itself (written only
 /// later when the driver folds it into `session_events`, post-inference).
+/// Oversized FCM2 text bypasses this *legacy remote-attachment* ledger because
+/// its atomic phase-one `message_operation_receipts` row is itself the durable
+/// remote operation ledger (actor, operation id, keyed FCOR hash, request
+/// digest, and replay-safe outcome), joined to its reservation and any bound
+/// run invocation in one transaction.
 /// The ledger DOES prevent a second ACCEPT and a normal-operation replay is
 /// idempotent (no double-enqueue). BUT because the three are not mutually atomic,
 /// a crash between any two of them leaves an inconsistent prefix: a committed
@@ -489,6 +519,367 @@ pub(crate) async fn reserve_remote_send_operation(
     }
 }
 
+struct TextArtifactReceiptJoin;
+
+impl crate::db::db::message_attachments::MessageAcceptanceJoin for TextArtifactReceiptJoin {
+    fn validate_and_join(
+        &self,
+        _: &rusqlite::Connection,
+        input: &crate::db::db::message_attachments::AcceptMessageInput,
+    ) -> anyhow::Result<()> {
+        // The FCM2 codec owns semantic validation. This local join is still an
+        // explicit transaction participant so the receipt/queue/reservation
+        // composition has the same shape as media admissions.
+        anyhow::ensure!(
+            input.attachments.is_empty(),
+            "oversized text artifact admission cannot carry attachments"
+        );
+        Ok(())
+    }
+}
+
+fn validate_oversized_artifact_admission(
+    session_id: Uuid,
+    submission: &crate::engine::message::UserSubmission,
+    admission: &OversizedTextArtifactAdmission,
+) -> anyhow::Result<crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2> {
+    let receipt = submission
+        .client_submissions
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("oversized admission lacks a client submission receipt"))?;
+    anyhow::ensure!(
+        submission.client_submissions.len() == 1,
+        "oversized artifact admission cannot fold multiple receipts"
+    );
+    anyhow::ensure!(
+        submission.images.is_empty(),
+        "oversized artifact admission cannot carry image parts"
+    );
+    match (
+        admission.model_fence.as_ref(),
+        submission.expected_model_state_generation,
+        submission.expected_model.as_ref(),
+    ) {
+        (None, None, None) => {}
+        (Some((generation, model)), Some(expected_generation), Some(expected_model))
+            if *generation == expected_generation && model == expected_model => {}
+        _ => {
+            anyhow::bail!("oversized artifact admission model fence does not match the submission")
+        }
+    }
+    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+        &admission.canonical_message,
+    )?;
+    anyhow::ensure!(
+        canonical.session_id == session_id,
+        "FCM2 session does not match worker"
+    );
+    anyhow::ensure!(
+        canonical.request.client_submission_id == receipt.id,
+        "FCM2 submission identity does not match queue receipt"
+    );
+    anyhow::ensure!(
+        canonical.request.text == submission.text,
+        "FCM2 source text does not match the transport-normalized submission"
+    );
+    anyhow::ensure!(
+        canonical.request.display_text == submission.display_text,
+        "FCM2 display text does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.forced_skill == submission.forced_skill,
+        "FCM2 forced skill does not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.attachments.is_empty(),
+        "FCM2 oversized-source admission unexpectedly contains media"
+    );
+    anyhow::ensure!(
+        canonical.request.tag_expansions.len() == submission.tag_expansions.len()
+            && canonical
+                .request
+                .tag_expansions
+                .iter()
+                .zip(&submission.tag_expansions)
+                .all(|(canonical, submitted)| {
+                    canonical.tool == submitted.tool
+                        && canonical.path == submitted.path
+                        && canonical.detail == submitted.detail
+                        && canonical.ok == submitted.ok
+                }),
+        "FCM2 tag expansions do not match the submission"
+    );
+    anyhow::ensure!(
+        canonical.request.text.len() > 64 * 1024,
+        "FCM2 artifact admission does not cross the inline threshold"
+    );
+    anyhow::ensure!(
+        canonical.message_request_digest()? == admission.message_request_digest
+            && canonical.attachment_set_digest()? == admission.attachment_set_digest,
+        "FCM2 receipt digests do not match admission evidence"
+    );
+    Ok(canonical)
+}
+
+fn text_artifact_terminal_error(
+    reason: crate::db::db::text_artifacts::TextArtifactRejectReason,
+) -> proto::ErrorPayload {
+    proto::ErrorPayload {
+        code: if reason
+            == crate::db::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict
+        {
+            proto::ErrorCode::IdempotencyConflict
+        } else {
+            proto::ErrorCode::UserMessageTerminated
+        },
+        message: format!("oversized user message is terminal ({})", reason.as_str()),
+    }
+}
+
+/// Map a fresh remote-ledger rejection to the closed FCM2 terminal domain.
+/// Once phase one owns a reservation, callers must not leave it accepted just
+/// because a later, independent in-memory/remote admission gate declined the
+/// message. The exact lease composition below owns the receipt, reservation,
+/// and any bound run invocation together.
+fn remote_send_rejection_reason(
+    error: &proto::ErrorPayload,
+) -> crate::db::db::text_artifacts::TextArtifactRejectReason {
+    match error.code {
+        proto::ErrorCode::Conflict | proto::ErrorCode::IdempotencyConflict => {
+            crate::db::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict
+        }
+        _ => crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+    }
+}
+
+/// Consume a phase-one lease only when this caller still owns its exact
+/// token/expiry pair.  A stale token is deliberately not treated as a
+/// rejection: another renewer, materializer, or reaper owns the durable
+/// outcome, so reload it and make the client retry rather than inventing a
+/// second terminal result.
+async fn reject_oversized_text_artifact_admission(
+    session: &Session,
+    reservation: crate::db::db::text_artifacts::TextArtifactReservation,
+    reason: crate::db::db::text_artifacts::TextArtifactRejectReason,
+) -> proto::ErrorPayload {
+    let replay_session_id = reservation.session_id;
+    let replay_operation_id = reservation.operation_id;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match session
+        .db
+        .reject_and_release_text_artifact_reservation(reservation, reason, now_ms)
+        .await
+    {
+        Ok(crate::db::db::text_artifacts::TextArtifactReservationTransition::Applied(reason)) => {
+            text_artifact_terminal_error(reason)
+        }
+        Ok(crate::db::db::text_artifacts::TextArtifactReservationTransition::Stale) => {
+            match session
+                .db
+                .text_artifact_reservation_replay(replay_session_id, replay_operation_id, now_ms)
+                .await
+            {
+                Ok(crate::db::db::text_artifacts::TextArtifactReservationReplay::Terminal {
+                    reason,
+                }) => text_artifact_terminal_error(reason),
+                Ok(_) => {
+                    tracing::warn!(%replay_session_id, operation_id = ?replay_operation_id,
+                        "oversized admission changed while terminalizing; retry will join its durable winner");
+                    proto::ErrorPayload {
+                        code: proto::ErrorCode::UserMessageNotAccepted,
+                        message: "oversized user message admission changed; retry".to_owned(),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %replay_session_id, operation_id = ?replay_operation_id,
+                        "could not reload stale oversized admission after terminalization");
+                    proto::ErrorPayload {
+                        code: proto::ErrorCode::UserMessageNotAccepted,
+                        message: "could not finalize oversized user message admission; retry"
+                            .to_owned(),
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, %replay_session_id, operation_id = ?replay_operation_id,
+                "failed to terminalize oversized user-message admission");
+            proto::ErrorPayload {
+                code: proto::ErrorCode::UserMessageNotAccepted,
+                message: "could not finalize oversized user message admission; retry".to_owned(),
+            }
+        }
+    }
+}
+
+/// Rebuild only phase-one FCM2 oversized text entries after startup
+/// reconciliation. The durable receipt/lease remains the authority; the
+/// in-memory queue is merely reconstituted so the driver can perform phase
+/// two. No security, preflight, translation, title, or provider work occurs
+/// here.
+pub(super) async fn replay_accepted_oversized_text_artifact_queue(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    target: crate::engine::message::QueueTarget,
+    authoritative_active_model_state: &Arc<RwLock<Option<proto::ActiveModelState>>>,
+) -> Result<usize> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    session
+        .db
+        .reap_expired_text_artifact_reservations(now_ms)
+        .await
+        .context("reconciling expired oversized text reservations")?;
+    let rows = session
+        .db
+        .accepted_message_queue(session.id)
+        .await
+        .context("loading accepted FCM2 message queue")?;
+    let mut replayed = 0usize;
+    for row in rows {
+        let canonical =
+            match crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2::decode(
+                &row.canonical_message,
+            ) {
+                Ok(canonical) => canonical,
+                // Accepted attachment rows can also carry FCM2. This replay path
+                // owns only text-artifact rows, so another attachment owner keeps
+                // responsibility for its own durable restart behavior.
+                Err(_) => continue,
+            };
+        if canonical.session_id != session.id
+            || !canonical.request.attachments.is_empty()
+            || canonical.request.text.len() <= 64 * 1024
+        {
+            continue;
+        }
+        let client_submission_id = Uuid::from_bytes(row.client_submission_id);
+        anyhow::ensure!(
+            canonical.request.client_submission_id == client_submission_id
+                && row.queue_item_id == row.client_submission_id,
+            "accepted oversized FCM2 queue identity is inconsistent"
+        );
+        let reservation = session
+            .db
+            .reserved_text_artifact_submission(session.id, row.client_submission_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("accepted oversized FCM2 queue row lacks its reservation")
+            })?;
+        let run_invocation_id =
+            if reservation.reservation.run_invocation_bound {
+                session
+                .db
+                .bound_text_artifact_run_invocation(session.id, row.client_submission_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "bound oversized FCM2 reservation lacks its exact run invocation binding"
+                ))
+                .map(Some)?
+            } else {
+                None
+            };
+        let durable_model_fence = match reservation.reservation.model_fence.as_ref() {
+            None => None,
+            Some(fence) => match decode_durable_model_fence(&fence.model_json) {
+                Ok(model) => Some((fence.generation, model)),
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %session.id, client_submission_id = %client_submission_id,
+                        "rejecting oversized replay with corrupt durable model fence");
+                    let _ = reject_oversized_text_artifact_admission(
+                        session,
+                        reservation.reservation.clone(),
+                        crate::db::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
+                    )
+                    .await;
+                    continue;
+                }
+            },
+        };
+        if let Some((generation, model)) = durable_model_fence.as_ref() {
+            let matches = {
+                let current = authoritative_active_model_state
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                model_fence_allows_insert(current.as_ref(), *generation, model)
+            };
+            if !matches {
+                tracing::info!(session_id = %session.id, client_submission_id = %client_submission_id,
+                    "rejecting oversized replay with stale durable model fence");
+                let _ = reject_oversized_text_artifact_admission(
+                    session,
+                    reservation.reservation.clone(),
+                    crate::db::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
+                )
+                .await;
+                continue;
+            }
+        }
+        let wire_fingerprint = format!(
+            "fcm2:{}",
+            crate::intel::hex_lower(&canonical.message_request_digest()?)
+        );
+        let mut submission = crate::engine::message::UserSubmission {
+            expected_model_state_generation: durable_model_fence
+                .as_ref()
+                .map(|(generation, _)| *generation),
+            expected_model: durable_model_fence.map(|(_, model)| model),
+            kind: crate::engine::message::UserSubmissionKind::User,
+            origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
+            text: canonical.request.text,
+            display_text: canonical.request.display_text,
+            tag_expansions: canonical
+                .request
+                .tag_expansions
+                .into_iter()
+                .map(|tag| proto::TagExpansionMeta {
+                    tool: tag.tool,
+                    path: tag.path,
+                    detail: tag.detail,
+                    ok: tag.ok,
+                })
+                .collect(),
+            images: Vec::new(),
+            forced_skill: canonical.request.forced_skill.clone(),
+            origin_principal: None,
+            job_id: None,
+            preflight_cleaned: None,
+            queue_item_ids: vec![client_submission_id],
+            client_submissions: Vec::new(),
+            queue_target: Some(target.clone()),
+            // This durable FCM2 queue row is an oversized lease owner.  Keep
+            // that identity on the reconstructed submission so a reaper or
+            // terminal receipt can never make it fall through the ordinary
+            // inline/provider path.
+            pending_terminal_disposition: Some(
+                crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
+            ),
+            run_invocation_id,
+        };
+        let fingerprint = submission.client_fingerprint();
+        submission
+            .client_submissions
+            .push(crate::engine::message::ClientSubmissionReceipt {
+                id: client_submission_id,
+                fingerprint,
+                wire_fingerprint,
+                origin_principal: None,
+            });
+        let (_, _, outcome) = queue
+            .push_idempotent(
+                submission.client_submissions[0].clone(),
+                submission,
+                target.clone(),
+            )
+            .await;
+        anyhow::ensure!(
+            matches!(outcome, crate::engine::message::IdempotentPush::Inserted),
+            "duplicate oversized FCM2 queue replay identity"
+        );
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
 struct RemoteQueueMutationCommit<'a> {
     session: &'a Session,
     queue: &'a crate::engine::message::UserSubmissionQueue,
@@ -554,15 +945,21 @@ async fn commit_remote_queue_mutation(
         removed_count,
     };
     let session_id = session.id;
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let outcome = session.db.execute_transactional_remote_operation(
         crate::db::remote_attachment_operations::ReserveRemoteOperation {
             logical_attachment_id: &operation.logical_attachment_id, operation_id: &operation.operation_id,
             authenticated_device_id: &operation.authenticated_device_id, authenticated_device_generation: operation.authenticated_device_generation,
             operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
-            request_hash: operation.request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+            request_hash: operation.request_hash, now_ms,
         },
         move |conn| {
-            crate::db::Db::insert_client_submission_terminal_receipts_conn(conn, session_id, &terminal_receipts)?;
+            crate::db::Db::terminalize_queued_text_artifact_submissions_conn(
+                conn,
+                session_id,
+                &terminal_receipts,
+                now_ms,
+            )?;
             receipt.validate()?;
             let safe_response = serde_json::to_vec(&receipt)?;
             Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: outbox_kind.into(), outbox_payload: safe_response })
@@ -822,11 +1219,42 @@ pub(super) async fn run_worker(
                     },
                     NoticeSource::DaemonDirect,
                 );
-                None
+                // Preserve the daemon-authenticated assistant-root marker
+                // even when optional SOUL/USER prompt material is malformed.
+                // Root definition resolution must still select the private
+                // installation snapshot ahead of a same-named workspace file.
+                Some(String::new())
             }
         },
         None => None,
     };
+    // Capture the daemon-owned installation table once for the entire
+    // session.  UUID child references select these authenticated definition
+    // snapshots directly; neither child preflight nor construction may fall
+    // back to a checkout name lookup.
+    let vnext_local_installation_resolver =
+        match crate::assistants::local_installation_resolver(&session.db).await {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                // The authenticated local-installation table is part of vNext
+                // launch authority.  Starting a session without it would make
+                // UUID children ambiguous (or invite a name-lookup fallback),
+                // so report a terminal worker failure and refuse the session.
+                let message =
+                    format!("could not load daemon-local agent installation bindings: {error:#}");
+                tracing::error!(%message, %session_id, "session startup refused");
+                let mut driver_failed = false;
+                emit_session_driver_failed_once(
+                    &event_tx,
+                    &turn_completions,
+                    &redaction,
+                    session_id,
+                    &mut driver_failed,
+                    message,
+                );
+                return;
+            }
+        };
     // The daemon's shared shutdown gate, captured before `model` is moved into
     // `spawn_args`. Reused when building model-comparison tandem (shadow)
     // models so a tandem request — itself a new provider round-trip — refuses
@@ -875,6 +1303,15 @@ pub(super) async fn run_worker(
             &root_agent_name,
             None,
         ),
+        vnext_grant: None,
+        // vNext definitions are declarative requests only; the daemon
+        // snapshots the core-owned host policy at root construction so their
+        // effective grants are both usable and bounded for the whole tree.
+        vnext_host_policy: Some(std::sync::Arc::new(
+            crate::agents::VnextHostPolicy::for_session_config(&extended_cfg),
+        )),
+        vnext_local_installation_resolver,
+        parent_vnext_grant: None,
         // Recursive-`Swarm` depth (GOALS §24): the `Swarm` root is depth 0;
         // each `bee` fan-out spawn advances it. The ceiling rides along so
         // the `spawn` description shows the remaining budget.
@@ -947,6 +1384,43 @@ pub(super) async fn run_worker(
     let foreground_input_target = Arc::new(Mutex::new(crate::engine::message::QueueTarget::root(
         root.name.clone(),
     )));
+    // Reconcile exact-expiry leases before rebuilding accepted FCM2 work. A
+    // worker restart must either enqueue the still-live owner once or observe
+    // its durable terminal/materialized winner; it never reruns preprocessing
+    // merely because the in-memory queue was lost.
+    let replay_target = foreground_input_target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match replay_accepted_oversized_text_artifact_queue(
+        &session,
+        &driver_input_queue,
+        replay_target,
+        &authoritative_active_model_state,
+    )
+    .await
+    {
+        Ok(replayed) if replayed > 0 => {
+            tracing::info!(%session_id, replayed, "replayed accepted oversized FCM2 queue entries");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, %session_id, "oversized FCM2 startup reconciliation failed; refusing provider dispatch");
+            send_current_session_event(
+                &session,
+                &event_tx,
+                &redaction,
+                proto::Event::Notice {
+                    session_id,
+                    text:
+                        "Oversized message recovery could not be verified; no provider was started."
+                            .to_owned(),
+                },
+                NoticeSource::DaemonDirect,
+            );
+            return;
+        }
+    }
     let (driver_control_tx, driver_control_rx) =
         mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
@@ -1120,6 +1594,11 @@ pub(super) async fn run_worker(
         project_root.clone(),
         root,
         max_concurrent_schedules,
+    );
+    // Keep the exact daemon-owned binding input for every descendant spawn;
+    // the driver never reconstructs local UUID references from display names.
+    driver.set_vnext_local_installation_resolver(
+        spawn_args.vnext_local_installation_resolver.clone(),
     );
     // Install the session config reader before the loop starts so the driver
     // and every `ToolCtx` it builds read config through the generationed
@@ -1516,8 +1995,9 @@ pub(super) async fn run_worker(
 
     // Main work loop.
     enum WorkerInput {
-        Work(SessionWork),
+        Work(Box<SessionWork>),
         ParkedReplay(ParkedReplayCompletion),
+        ReapExpiredTextArtifactReservations,
     }
     let (replay_completion_tx, mut replay_completion_rx) =
         mpsc::channel::<ParkedReplayCompletion>(WORK_QUEUE_CAPACITY);
@@ -1527,6 +2007,14 @@ pub(super) async fn run_worker(
     // Seeded by the initial snapshot's sweep and refined by the post-drain
     // park-drain loop; reported once after the driver quiesces (finding 2).
     let mut shutdown_park_committed = true;
+    let mut text_artifact_reservation_reaper =
+        tokio::time::interval(TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL);
+    text_artifact_reservation_reaper
+        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` ticks immediately. Startup reconciliation above already
+    // performed the required first sweep, so consume that instant rather than
+    // adding a redundant write before the work loop begins.
+    text_artifact_reservation_reaper.tick().await;
     let stop = loop {
         let input = tokio::select! {
             biased;
@@ -1538,9 +2026,12 @@ pub(super) async fn run_worker(
             }
             work = work_rx.recv() => {
                 match work {
-                    Some(work) => WorkerInput::Work(work),
+                    Some(work) => WorkerInput::Work(Box::new(work)),
                     None => break WorkerStop::WorkerStopped,
                 }
+            }
+            _ = text_artifact_reservation_reaper.tick() => {
+                WorkerInput::ReapExpiredTextArtifactReservations
             }
             outcome = &mut driver_handle => {
                 driver_joined = true;
@@ -1560,6 +2051,20 @@ pub(super) async fn run_worker(
             }
         };
         match input {
+            WorkerInput::ReapExpiredTextArtifactReservations => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(error) = session
+                    .db
+                    .reap_expired_text_artifact_reservations(now_ms)
+                    .await
+                {
+                    // This is an opportunistic reconciliation sweep. A failed
+                    // transaction leaves the durable accepted lease untouched,
+                    // so replay/dispatch can retry without inventing a terminal
+                    // outcome outside the DB composition.
+                    tracing::warn!(%error, %session_id, "periodic oversized text reservation reap failed");
+                }
+            }
             WorkerInput::ParkedReplay(completion) => {
                 finish_parked_replay_completion(
                     &session,
@@ -1571,7 +2076,7 @@ pub(super) async fn run_worker(
                 )
                 .await;
             }
-            WorkerInput::Work(work) => match work {
+            WorkerInput::Work(work) => match *work {
                 SessionWork::WakeGoal => {
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
@@ -1605,8 +2110,9 @@ pub(super) async fn run_worker(
                     let _ = respond_to.send(outcome);
                 }
                 SessionWork::UserMessage {
-                    submission,
+                    mut submission,
                     remote_operation,
+                    artifact_admission,
                     respond_to,
                 } => {
                     let client_submission_id = submission
@@ -1618,36 +2124,273 @@ pub(super) async fn run_worker(
                         .client_submissions
                         .first()
                         .expect("wire user submissions carry a client receipt");
-                    let terminal_receipt = match session
-                        .db
-                        .client_submission_terminal_receipt(session_id, receipt.id)
-                        .await
+                    // A repair-locked session cannot ever hand this source to
+                    // phase two. Check before phase one so an oversized retry
+                    // does not create a receipt/lease which the repair gate
+                    // would immediately strand.
+                    if artifact_admission.is_some()
+                        && let Some(state) = repair_required
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
                     {
-                        Ok(receipt) => receipt,
-                        Err(error) => {
-                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
-                                "terminal client submission lookup failed; refusing ambiguous enqueue");
+                        let ids = if state.failing_tool_call_ids.is_empty() {
+                            "unknown tool id".to_string()
+                        } else {
+                            state.failing_tool_call_ids.join(", ")
+                        };
+                        send_current_session_event(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            proto::Event::Notice {
+                                session_id,
+                                text: format!(
+                                    "Read-only resume: refusing to send model context until Responses repair is resolved ({}: {}). Use the resume repair dialog, fork, or export a debug bundle.",
+                                    state.failure_kind, ids
+                                ),
+                            },
+                            NoticeSource::DaemonDirect,
+                        );
+                        let _ = respond_to.send(Err(proto::ErrorPayload {
+                            code: proto::ErrorCode::UserMessageNotAccepted,
+                            message: format!(
+                                "session resume requires explicit repair before accepting message {client_submission_id}"
+                            ),
+                        }));
+                        continue;
+                    }
+                    // The oversized text path owns a durable FCM2 receipt and
+                    // quota lease before any legacy queue, security/preflight,
+                    // utility model, title, or primary-model side effect. It is
+                    // intentionally handled before the old client-submission
+                    // receipt probe: the two receipt families have different
+                    // ownership and must never be used as compatibility aliases.
+                    let mut phase_one_reservation = None;
+                    if let Some(admission) = artifact_admission.as_ref() {
+                        if let Err(error) = session.persist_if_needed() {
+                            tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
+                                "persisting session before FCM2 artifact admission failed");
                             let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageNotAccepted,
+                                message:
+                                    "session persistence failed before oversized message admission"
+                                        .to_owned(),
+                            }));
+                            continue;
+                        }
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if let Err(error) = session
+                            .db
+                            .reap_expired_text_artifact_reservations(now_ms)
+                            .await
+                        {
+                            tracing::warn!(%error, %session_id,
+                                "reconciling expired oversized reservations before admission failed");
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageNotAccepted,
+                                message: "could not reconcile oversized message admission; retry"
+                                    .to_owned(),
+                            }));
+                            continue;
+                        }
+                        let canonical = match validate_oversized_artifact_admission(
+                            session_id,
+                            &submission,
+                            admission,
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "rejecting malformed oversized artifact admission evidence");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::BadRequest,
+                                    message: "invalid oversized user-message admission".to_owned(),
+                                }));
+                                continue;
+                            }
+                        };
+                        let accept_input = crate::db::db::message_attachments::AcceptMessageInput {
+                            session_id,
+                            operation_id: admission.operation_id,
+                            actor: admission.actor,
+                            request_hash: admission.request_hash,
+                            message_request_digest: admission.message_request_digest,
+                            attachment_set_digest: admission.attachment_set_digest,
+                            client_submission_id: *receipt.id.as_bytes(),
+                            queue_item_id: *receipt.id.as_bytes(),
+                            canonical_message: admission.canonical_message.clone(),
+                            attachments: Vec::new(),
+                            outbox_sequence: 0,
+                            now_ms,
+                        };
+                        let source_digest =
+                            crate::db::db::text_artifacts::source_digest(&canonical.request.text);
+                        let model_fence = match admission
+                            .model_fence
+                            .as_ref()
+                            .map(|(generation, model)| -> anyhow::Result<_> {
+                                Ok(crate::db::db::text_artifacts::TextArtifactModelFence {
+                                    generation: *generation,
+                                    model_json: encode_durable_model_fence(model)?,
+                                })
+                            })
+                            .transpose()
+                            .map_err(|error: anyhow::Error| proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: format!("invalid oversized model fence: {error}"),
+                            }) {
+                            Ok(model_fence) => model_fence,
+                            Err(error) => {
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
+                        };
+                        let accepted = match admission.run_invocation.as_ref() {
+                            Some(run_invocation) => session
+                                .db
+                                .accept_message_with_text_artifact_reservation_and_run_invocation_with_model_fence(
+                                    accept_input,
+                                    std::sync::Arc::new(TextArtifactReceiptJoin),
+                                    source_digest,
+                                    canonical.request.text.len(),
+                                    crate::db::db::text_artifacts::TextArtifactRunInvocationInput {
+                                        origin_principal_digest: run_invocation
+                                            .origin_principal_digest
+                                            .clone(),
+                                        options_json: run_invocation.options_json.clone(),
+                                        options_digest: run_invocation.options_digest.clone(),
+                                        content_digest: run_invocation.content_digest.clone(),
+                                        max_turns: run_invocation.max_turns,
+                                        timeout_ms: run_invocation.timeout_ms,
+                                    },
+                                    model_fence,
+                                )
+                                .await,
+                            None => {
+                                session
+                                    .db
+                                    .accept_message_with_text_artifact_reservation_with_model_fence(
+                                        accept_input,
+                                        std::sync::Arc::new(TextArtifactReceiptJoin),
+                                        source_digest,
+                                        canonical.request.text.len(),
+                                        model_fence,
+                                    )
+                                    .await
+                            }
+                        };
+                        let acquired_phase_one_reservation = match accepted {
+                            Ok(crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation)) => reservation,
+                            Ok(crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Materialized { .. }) => {
+                                // Exact durable replay: never enqueue a second
+                                // copy or re-run preprocessing/providers.
+                                let queue = driver_input_queue
+                                    .snapshot()
+                                    .await
+                                    .into_iter()
+                                    .map(queue_item_to_proto)
+                                    .collect();
+                                let target = foreground_input_target
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                let _ = respond_to.send(Ok((
+                                    proto::QueueItem {
+                                        id: receipt.id,
+                                        status: proto::QueueItemStatus::Folding,
+                                        text: submission.text.clone(),
+                                        display_text: submission.display_text.clone(),
+                                        target: queue_target_to_proto(target),
+                                    },
+                                    queue,
+                                )));
+                                continue;
+                            }
+                            Ok(crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Terminal { reason }) => {
+                                let _ = respond_to.send(Err(text_artifact_terminal_error(reason)));
+                                continue;
+                            }
+                            Ok(crate::db::db::text_artifacts::TextArtifactPhaseOneResult::RunInvocationRejected(reason)) => {
+                                let error = match reason {
+                                    crate::db::db::text_artifacts::TextArtifactRunInvocationReject::IdempotencyConflict => proto::ErrorPayload {
+                                        code: proto::ErrorCode::IdempotencyConflict,
+                                        message: "client_submission_id was already used with different content".to_owned(),
+                                    },
+                                    crate::db::db::text_artifacts::TextArtifactRunInvocationReject::ClientSubmissionIdUnavailable => proto::ErrorPayload {
+                                        code: proto::ErrorCode::ClientSubmissionIdUnavailable,
+                                        message: "client_submission_id is unavailable".to_owned(),
+                                    },
+                                    crate::db::db::text_artifacts::TextArtifactRunInvocationReject::CapacityExceeded => proto::ErrorPayload {
+                                        code: proto::ErrorCode::InvocationCapacityExceeded,
+                                        message: "invocation capacity exceeded".to_owned(),
+                                    },
+                                };
+                                let _ = respond_to.send(Err(error));
+                                continue;
+                            }
+                            Ok(crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Conflict) => {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::IdempotencyConflict,
+                                    message: "client submission id conflicts with an existing oversized message"
+                                        .to_owned(),
+                                }));
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "oversized FCM2 receipt/reservation composition failed");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::UserMessageNotAccepted,
+                                    message: "could not durably admit oversized user message; retry".to_owned(),
+                                }));
+                                continue;
+                            }
+                        };
+                        phase_one_reservation = Some(acquired_phase_one_reservation);
+                        // The in-memory queue is deliberately not an authority
+                        // for this path. Preserve the receipt-keyed durable
+                        // identity through every enqueue/requeue so a later
+                        // reservation lookup returning None is terminal, not
+                        // permission to use the legacy inline route.
+                        submission.pending_terminal_disposition = Some(
+                            crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact,
+                        );
+                    }
+                    // FCM2 artifact admissions use the message receipt triple
+                    // above as their sole durable authority. Never consult the
+                    // legacy client-submission receipt family for them.
+                    if artifact_admission.is_none() {
+                        let terminal_receipt = match session
+                            .db
+                            .client_submission_terminal_receipt(session_id, receipt.id)
+                            .await
+                        {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                "terminal client submission lookup failed; refusing ambiguous enqueue");
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::Internal,
                                 message: "could not verify whether this message was already terminated; retry"
                                     .to_string(),
                             }));
-                            continue;
-                        }
-                    };
-                    if let Some(terminal) = terminal_receipt {
-                        if terminal.origin_principal != receipt.origin_principal
-                            || terminal.fingerprint != receipt.fingerprint
-                        {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                continue;
+                            }
+                        };
+                        if let Some(terminal) = terminal_receipt {
+                            if terminal.origin_principal != receipt.origin_principal
+                                || terminal.fingerprint != receipt.fingerprint
+                            {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::BadRequest,
                                 message: format!(
                                     "client_submission_id {} was already used for a different payload",
                                     receipt.id
                                 ),
                             }));
-                        } else {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                            } else {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::UserMessageTerminated,
                                 message: format!(
                                     "client_submission_id {} is terminal ({}) and will not be executed",
@@ -1655,13 +2398,15 @@ pub(super) async fn run_worker(
                                     terminal.disposition.as_str()
                                 ),
                             }));
+                            }
+                            continue;
                         }
-                        continue;
                     }
-                    if let Some(state) = repair_required
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
+                    if artifact_admission.is_none()
+                        && let Some(state) = repair_required
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
                     {
                         let ids = if state.failing_tool_call_ids.is_empty() {
                             "unknown tool id".to_string()
@@ -1711,12 +2456,21 @@ pub(super) async fn run_worker(
                                     error: error.clone(),
                                 },
                             );
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::UserMessageNotAccepted,
-                                message: format!(
-                                    "session persistence failed before accepting message {client_submission_id}: {error}"
-                                ),
-                            }));
+                            let rejection = match phase_one_reservation.take() {
+                                Some(reservation) => reject_oversized_text_artifact_admission(
+                                    &session,
+                                    reservation,
+                                    crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                                )
+                                .await,
+                                None => proto::ErrorPayload {
+                                    code: proto::ErrorCode::UserMessageNotAccepted,
+                                    message: format!(
+                                        "session persistence failed before accepting message {client_submission_id}: {error}"
+                                    ),
+                                },
+                            };
+                            let _ = respond_to.send(Err(rejection));
                             continue;
                         }
                     }
@@ -1756,12 +2510,21 @@ pub(super) async fn run_worker(
                             &mut driver_failed,
                             "driver control channel closed".to_string(),
                         );
-                        let _ = respond_to.send(Err(proto::ErrorPayload {
-                            code: proto::ErrorCode::UserMessageNotAccepted,
-                            message: format!(
-                                "session driver became unavailable before accepting message {client_submission_id} while refreshing redaction"
-                            ),
-                        }));
+                        let rejection = match phase_one_reservation.take() {
+                            Some(reservation) => reject_oversized_text_artifact_admission(
+                                &session,
+                                reservation,
+                                crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            )
+                            .await,
+                            None => proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageNotAccepted,
+                                message: format!(
+                                    "session driver became unavailable before accepting message {client_submission_id} while refreshing redaction"
+                                ),
+                            },
+                        };
+                        let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
                     }
                     let max_primary_rounds = {
@@ -1783,12 +2546,21 @@ pub(super) async fn run_worker(
                     )
                     .await
                     {
-                        let _ = respond_to.send(Err(proto::ErrorPayload {
-                            code: proto::ErrorCode::UserMessageNotAccepted,
-                            message: format!(
-                                "session driver became unavailable before accepting message {client_submission_id} while applying round limits"
-                            ),
-                        }));
+                        let rejection = match phase_one_reservation.take() {
+                            Some(reservation) => reject_oversized_text_artifact_admission(
+                                &session,
+                                reservation,
+                                crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
+                            )
+                            .await,
+                            None => proto::ErrorPayload {
+                                code: proto::ErrorCode::UserMessageNotAccepted,
+                                message: format!(
+                                    "session driver became unavailable before accepting message {client_submission_id} while applying round limits"
+                                ),
+                            },
+                        };
+                        let _ = respond_to.send(Err(rejection));
                         break WorkerStop::DriverFailed;
                     }
                     let target = foreground_input_target
@@ -1800,88 +2572,101 @@ pub(super) async fn run_worker(
                         .first()
                         .cloned()
                         .expect("wire user submissions carry a client receipt");
-                    let durable_receipt = match session
-                        .db
-                        .client_submission_receipt(session_id, receipt.id)
-                        .await
-                    {
-                        Ok(receipt) => receipt,
-                        Err(error) => {
-                            tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                    if artifact_admission.is_none() {
+                        let durable_receipt = match session
+                            .db
+                            .client_submission_receipt(session_id, receipt.id)
+                            .await
+                        {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
                                 "client submission dedupe lookup failed; refusing ambiguous enqueue");
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::Internal,
                                 message: "could not verify whether this message was already accepted; retry"
                                     .to_string(),
                             }));
-                            continue;
-                        }
-                    };
-                    if let Some(durable_receipt) = durable_receipt {
-                        if durable_receipt.origin_principal != receipt.origin_principal
-                            || durable_receipt.fingerprint != receipt.fingerprint
-                        {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                continue;
+                            }
+                        };
+                        if let Some(durable_receipt) = durable_receipt {
+                            if durable_receipt.origin_principal != receipt.origin_principal
+                                || durable_receipt.fingerprint != receipt.fingerprint
+                            {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
                                 code: proto::ErrorCode::BadRequest,
                                 message: format!(
                                     "client_submission_id {} was already used for a different payload",
                                     receipt.id
                                 ),
                             }));
-                            continue;
-                        }
-                        // The submission is already durable. For an authenticated
-                        // remote send, still resolve its operation identity through
-                        // the transactional ledger (#3) — record a fresh operation,
-                        // replay an already-committed one, or reject an
-                        // operation/actor conflict — but NEVER enqueue a second copy.
-                        if let Some(remote) = remote_operation.as_ref() {
-                            match reserve_remote_send_operation(&session.db, remote).await {
-                                RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {}
-                                RemoteSendDecision::Rejected(error) => {
-                                    let _ = respond_to.send(Err(error));
-                                    continue;
+                                continue;
+                            }
+                            // The submission is already durable. For an authenticated
+                            // remote send, still resolve its operation identity through
+                            // the transactional ledger (#3) — record a fresh operation,
+                            // replay an already-committed one, or reject an
+                            // operation/actor conflict — but NEVER enqueue a second copy.
+                            if let Some(remote) = remote_operation.as_ref() {
+                                match reserve_remote_send_operation(&session.db, remote).await {
+                                    RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
+                                    }
+                                    RemoteSendDecision::Rejected(error) => {
+                                        let _ = respond_to.send(Err(error));
+                                        continue;
+                                    }
                                 }
                             }
+                            let queue = driver_input_queue
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .map(queue_item_to_proto)
+                                .collect();
+                            let _ = respond_to.send(Ok((
+                                proto::QueueItem {
+                                    id: receipt.id,
+                                    status: proto::QueueItemStatus::Folding,
+                                    text: submission.text.clone(),
+                                    display_text: submission.display_text.clone(),
+                                    target: queue_target_to_proto(target),
+                                },
+                                queue,
+                            )));
+                            continue;
                         }
-                        let queue = driver_input_queue
-                            .snapshot()
-                            .await
-                            .into_iter()
-                            .map(queue_item_to_proto)
-                            .collect();
-                        let _ = respond_to.send(Ok((
-                            proto::QueueItem {
-                                id: receipt.id,
-                                status: proto::QueueItemStatus::Folding,
-                                text: submission.text.clone(),
-                                display_text: submission.display_text.clone(),
-                                target: queue_target_to_proto(target),
-                            },
-                            queue,
-                        )));
-                        continue;
                     }
-                    let already_accepted = driver_input_queue.has_accepted(receipt.id).await;
                     if let (Some(expected_generation), Some(expected_model)) = (
                         submission.expected_model_state_generation,
                         submission.expected_model.as_ref(),
                     ) {
                         let current = authoritative_active_model_state
                             .read()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
                         let matches = model_fence_allows_insert(
-                            already_accepted,
                             current.as_ref(),
                             expected_generation,
                             expected_model,
                         );
                         if !matches {
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::ModelGenerationStale,
-                                message: "captured model generation is no longer active"
-                                    .to_string(),
-                            }));
+                            let rejection = match phase_one_reservation.take() {
+                                Some(reservation) => {
+                                    reject_oversized_text_artifact_admission(
+                                        &session,
+                                        reservation,
+                                        crate::db::db::text_artifacts::TextArtifactRejectReason::PreflightRejected,
+                                    )
+                                    .await
+                                }
+                                None => proto::ErrorPayload {
+                                    code: proto::ErrorCode::ModelGenerationStale,
+                                    message: "captured model generation is no longer active"
+                                        .to_string(),
+                                },
+                            };
+                            let _ = respond_to.send(Err(rejection));
                             continue;
                         }
                     }
@@ -1905,13 +2690,24 @@ pub(super) async fn run_worker(
                             .await;
                         match peek {
                             crate::engine::message::IdempotentPush::Conflict => {
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
-                                    code: proto::ErrorCode::BadRequest,
-                                    message: format!(
-                                        "client_submission_id {} was already used for a different payload",
-                                        receipt.id
-                                    ),
-                                }));
+                                let rejection = match phase_one_reservation.take() {
+                                    Some(reservation) => {
+                                        reject_oversized_text_artifact_admission(
+                                            &session,
+                                            reservation,
+                                            crate::db::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict,
+                                        )
+                                        .await
+                                    }
+                                    None => proto::ErrorPayload {
+                                        code: proto::ErrorCode::BadRequest,
+                                        message: format!(
+                                            "client_submission_id {} was already used for a different payload",
+                                            receipt.id
+                                        ),
+                                    },
+                                };
+                                let _ = respond_to.send(Err(rejection));
                                 continue;
                             }
                             crate::engine::message::IdempotentPush::Duplicate => {
@@ -1948,7 +2744,23 @@ pub(super) async fn run_worker(
                                     RemoteSendDecision::Accepted | RemoteSendDecision::Replayed => {
                                     }
                                     RemoteSendDecision::Rejected(error) => {
-                                        let _ = respond_to.send(Err(error));
+                                        // This is a fresh in-memory insertion
+                                        // owner. Unlike Duplicate above, it
+                                        // still owns the phase-one FCM2 lease
+                                        // and must atomically reject/release it
+                                        // (including a bound run invocation).
+                                        let rejection = match phase_one_reservation.take() {
+                                            Some(reservation) => {
+                                                reject_oversized_text_artifact_admission(
+                                                    &session,
+                                                    reservation,
+                                                    remote_send_rejection_reason(&error),
+                                                )
+                                                .await
+                                            }
+                                            None => error,
+                                        };
+                                        let _ = respond_to.send(Err(rejection));
                                         continue;
                                     }
                                 }
@@ -1959,13 +2771,22 @@ pub(super) async fn run_worker(
                         .push_idempotent(receipt, *submission, target)
                         .await;
                     if matches!(outcome, crate::engine::message::IdempotentPush::Conflict) {
-                        let _ = respond_to.send(Err(proto::ErrorPayload {
-                            code: proto::ErrorCode::BadRequest,
-                            message: format!(
-                                "client_submission_id {} was already used for a different payload",
-                                id
-                            ),
-                        }));
+                        let rejection = match phase_one_reservation.take() {
+                            Some(reservation) => reject_oversized_text_artifact_admission(
+                                &session,
+                                reservation,
+                                crate::db::db::text_artifacts::TextArtifactRejectReason::IdempotencyConflict,
+                            )
+                            .await,
+                            None => proto::ErrorPayload {
+                                code: proto::ErrorCode::BadRequest,
+                                message: format!(
+                                    "client_submission_id {} was already used for a different payload",
+                                    id
+                                ),
+                            },
+                        };
+                        let _ = respond_to.send(Err(rejection));
                         continue;
                     }
                     let queue: Vec<proto::QueueItem> =
@@ -2069,6 +2890,7 @@ pub(super) async fn run_worker(
                             reason,
                             removed_count: u32::from(staged.is_some()),
                         };
+                        let now_ms = chrono::Utc::now().timestamp_millis();
                         let outcome = session.db.execute_transactional_remote_operation(
                             crate::db::remote_attachment_operations::ReserveRemoteOperation {
                                 logical_attachment_id: &operation.logical_attachment_id,
@@ -2077,10 +2899,15 @@ pub(super) async fn run_worker(
                                 authenticated_device_generation: operation.authenticated_device_generation,
                                 operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
                                 request_hash: operation.request_hash,
-                                now_ms: chrono::Utc::now().timestamp_millis(),
+                                now_ms,
                             },
                             move |conn| {
-                                crate::db::Db::insert_client_submission_terminal_receipts_conn(conn, session_id, &terminal_receipts)?;
+                                crate::db::Db::terminalize_queued_text_artifact_submissions_conn(
+                                    conn,
+                                    session_id,
+                                    &terminal_receipts,
+                                    now_ms,
+                                )?;
                                 receipt.validate()?;
                                 let safe_response = serde_json::to_vec(&receipt)?;
                                 Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
@@ -3545,12 +4372,71 @@ pub(super) fn model_expectation_matches(
 }
 
 pub(super) fn model_fence_allows_insert(
-    already_accepted: bool,
     current: Option<&proto::ActiveModelState>,
     expected_generation: u64,
     expected_model: &cockpit_config::providers::ActiveModelRef,
 ) -> bool {
-    already_accepted || model_expectation_matches(current, expected_generation, expected_model)
+    model_expectation_matches(current, expected_generation, expected_model)
+}
+
+const DURABLE_ACTIVE_MODEL_FENCE_KEYS: [&str; 5] = [
+    "provider",
+    "model",
+    "reasoning_effort",
+    "thinking_mode",
+    "prompt_cache_retention",
+];
+
+fn decode_durable_model_fence(
+    model_json: &str,
+) -> anyhow::Result<cockpit_config::providers::ActiveModelRef> {
+    let value: serde_json::Value =
+        serde_json::from_str(model_json).context("decoding durable oversized model fence")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("durable oversized model fence must be an object"))?;
+    anyhow::ensure!(
+        object
+            .keys()
+            .all(|key| DURABLE_ACTIVE_MODEL_FENCE_KEYS.contains(&key.as_str())),
+        "durable oversized model fence has unknown fields"
+    );
+    let model: cockpit_config::providers::ActiveModelRef =
+        serde_json::from_value(value).context("decoding typed durable oversized model fence")?;
+    model
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("validating durable oversized model fence")?;
+    anyhow::ensure!(
+        canonical_durable_model_fence_json(&model)? == model_json,
+        "durable oversized model fence is not canonical"
+    );
+    Ok(model)
+}
+
+/// Match the database leaf's canonical JSON representation: serialize the
+/// typed DTO into a JSON value first, then render that value.  Direct struct
+/// serialization preserves declaration order while the DB validates the
+/// parsed `Value` representation, so using the latter on both sides makes a
+/// durable fence replay-stable.
+fn canonical_durable_model_fence_json(
+    model: &cockpit_config::providers::ActiveModelRef,
+) -> anyhow::Result<String> {
+    serde_json::to_string(&serde_json::to_value(model)?)
+        .context("encoding canonical durable oversized model fence")
+}
+
+pub(super) fn encode_durable_model_fence(
+    model: &cockpit_config::providers::ActiveModelRef,
+) -> anyhow::Result<String> {
+    model.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let encoded = canonical_durable_model_fence_json(model)?;
+    let decoded = decode_durable_model_fence(&encoded)?;
+    anyhow::ensure!(
+        decoded == *model,
+        "durable model fence round-trip changed model"
+    );
+    Ok(encoded)
 }
 
 fn update_authoritative_active_model_state(

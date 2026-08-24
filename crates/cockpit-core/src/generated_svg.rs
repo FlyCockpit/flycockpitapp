@@ -1842,7 +1842,7 @@ fn canonical_path(v: &str) -> Result<(String, usize)> {
             return Err(SvgSanitizeError::new(SvgSanitizeCode::PathCommands, "path"));
         }
     }
-    if !subpath_drawn && !out.last().is_some_and(|command| command == "Z") {
+    if !subpath_drawn && out.last().is_none_or(|command| command != "Z") {
         return Err(SvgSanitizeError::new(
             SvgSanitizeCode::Path,
             "empty-subpath",

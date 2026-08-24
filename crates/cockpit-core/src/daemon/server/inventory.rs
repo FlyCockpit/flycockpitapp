@@ -13,7 +13,6 @@ use cockpit_config::config::providers::{ModelEntry, ProviderEntry, ProvidersConf
 use cockpit_config::config::trust::WorkspaceTrustPolicy;
 use uuid::Uuid;
 
-use crate::agents::AgentMode;
 use crate::daemon::proto::{
     AgentSummary, ErrorCode, ErrorPayload, ModelSummary, Response, SkillSummary,
 };
@@ -211,11 +210,16 @@ fn inventory_too_large(message: String) -> ErrorPayload {
     }
 }
 
-fn agent_mode_summary(mode: AgentMode) -> &'static str {
-    match mode {
-        AgentMode::Primary => "primary",
-        AgentMode::Subagent => "subagent",
-        AgentMode::All => "all",
+fn agent_mode_summary(definition: &crate::agents::AgentDef) -> &'static str {
+    match definition.vnext.as_ref().map(|vnext| vnext.execution_kind) {
+        Some(crate::agents::ExecutionKind::Assistant) => "assistant",
+        Some(crate::agents::ExecutionKind::Coding) => "coding",
+        Some(crate::agents::ExecutionKind::Computer) => "computer",
+        None => match definition.mode {
+            crate::agents::AgentMode::Primary => "primary",
+            crate::agents::AgentMode::Subagent => "subagent",
+            crate::agents::AgentMode::All => "all",
+        },
     }
 }
 
@@ -247,11 +251,12 @@ fn project_agents(snapshot: &InventorySourceSnapshot) -> Result<Vec<AgentSummary
             code: ErrorCode::Internal,
             message: format!("chat-ownable agent `{name}` did not resolve"),
         })?;
+        let mode = agent_mode_summary(&def).to_string();
         agents.push(AgentSummary {
             builtin: crate::agents::is_builtin_agent(name),
             name: name.clone(),
             description: def.description,
-            mode: agent_mode_summary(def.mode).to_string(),
+            mode,
             source: def.source.display().to_string(),
         });
     }

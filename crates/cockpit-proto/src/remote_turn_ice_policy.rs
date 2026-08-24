@@ -1545,7 +1545,7 @@ mod tests {
         let servers = resp["iceServers"].as_array().unwrap();
         assert_eq!(servers.len(), 1);
         assert!(servers[0]["urls"].is_array());
-        assert!(!servers[0].get("stunUrls").is_some_and(|v| !v.is_null()));
+        assert!(servers[0].get("stunUrls").is_none_or(|v| v.is_null()));
         // No host/srflx/STUN-direct in relay-only.
         let text = serde_json::to_string(&resp).unwrap();
         assert!(!text.contains("stun:"));

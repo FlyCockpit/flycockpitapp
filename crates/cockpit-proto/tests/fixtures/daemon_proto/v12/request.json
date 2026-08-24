@@ -468,7 +468,6 @@
   },
   "import_session_archive": {
     "params": {
-      "as_new": true,
       "transfer": {
         "mime_class": "archive",
         "sha256": "abababababababababababababababababababababababababababababababab",
@@ -759,6 +758,37 @@
       "text": "text-fixture"
     },
     "request": "send_user_message"
+  },
+  "send_user_message_bulk": {
+    "params": {
+      "client_submission_id": "11111111-1111-4111-8111-111111111111",
+      "display_transfer": {
+        "mime_class": "opaque",
+        "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "total_length": "65537",
+        "transfer_id": "AgMEBQYHCAkKCwwNDg8QEQ"
+      },
+      "forced_skill": "forced_skill-fixture",
+      "run_invocation_options": {
+        "max_turns": 3,
+        "timeout_ms": 60000
+      },
+      "tag_expansions": [
+        {
+          "detail": "142 lines",
+          "ok": true,
+          "path": "src/lib.rs",
+          "tool": "read"
+        }
+      ],
+      "transfer": {
+        "mime_class": "opaque",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "total_length": "65537",
+        "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
+      }
+    },
+    "request": "send_user_message_bulk"
   },
   "get_run_invocation_status": {
     "params": {
@@ -1778,6 +1808,40 @@
       "idempotency_key": "key"
     },
     "request": "repair_media_reservation"
+  },
+  "agent_installation_begin": {
+    "params": {
+      "dto_version": 1,
+      "idempotency_key": "agent-installation-fixture",
+      "operation": "create",
+      "scope": "global",
+      "source_locator": "authored/helper",
+      "replace_acknowledged": false
+    },
+    "request": "agent_installation_begin"
+  },
+  "agent_installation_submit_choice": {
+    "params": {
+      "dto_version": 1,
+      "continuation_token": "11111111-1111-4111-8111-111111111111",
+      "choice_id": "choice-a"
+    },
+    "request": "agent_installation_submit_choice"
+  },
+  "agent_installation_list": {
+    "params": {
+      "dto_version": 1,
+      "scope": "global"
+    },
+    "request": "agent_installation_list"
+  },
+  "agent_installation_inspect": {
+    "params": {
+      "dto_version": 1,
+      "scope": "global",
+      "installation_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "request": "agent_installation_inspect"
   },
   "get_doctor_snapshot": {
     "params": {

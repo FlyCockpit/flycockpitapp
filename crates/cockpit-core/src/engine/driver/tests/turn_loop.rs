@@ -14,6 +14,18 @@ fn event_harness() -> (
     (queue, turn_tx, turn_rx)
 }
 
+struct AllowOversizedTextArtifactJoin;
+
+impl crate::db::db::message_attachments::MessageAcceptanceJoin for AllowOversizedTextArtifactJoin {
+    fn validate_and_join(
+        &self,
+        _: &rusqlite::Connection,
+        _: &crate::db::db::message_attachments::AcceptMessageInput,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 fn drain_events(rx: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -53,6 +65,7 @@ fn scripted_read_driver(provider: &ScriptedProvider) -> (Driver, tempfile::TempD
         write_scope: None,
         delegated: old.delegated,
         delegation_recursion: old.delegation_recursion.clone(),
+        vnext_grant: old.vnext_grant.clone(),
         env_overlay: old.env_overlay.clone(),
         assistant_identity_prefix: None,
     });
@@ -305,6 +318,209 @@ async fn turn_loop_text_only_turn_pushes_history_and_emits_events() {
         .find(|event| event.kind == "assistant_message")
         .expect("assistant_message event");
     assert_eq!(assistant.data["text"], "plain assistant reply");
+}
+
+#[tokio::test]
+async fn terminalized_oversized_submission_without_a_lease_never_reaches_provider() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("must not run".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let source = "x".repeat(65_537);
+    let operation_id = uuid::Uuid::new_v4();
+    let client_submission_id = uuid::Uuid::new_v4();
+    let queue_item_id = uuid::Uuid::new_v4();
+    let accepted = driver
+        .session
+        .db
+        .accept_message_with_text_artifact_reservation(
+            crate::db::db::message_attachments::AcceptMessageInput {
+                session_id: driver.session.id,
+                operation_id: *operation_id.as_bytes(),
+                actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
+                request_hash: [11; 32],
+                message_request_digest: [12; 32],
+                attachment_set_digest: [13; 32],
+                client_submission_id: *client_submission_id.as_bytes(),
+                queue_item_id: *queue_item_id.as_bytes(),
+                canonical_message: b"FCM2\x02".to_vec(),
+                attachments: Vec::new(),
+                outbox_sequence: 0,
+                now_ms: 1_000,
+            },
+            std::sync::Arc::new(AllowOversizedTextArtifactJoin),
+            crate::db::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    let reservation = match accepted {
+        crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(reservation) => {
+            reservation
+        }
+        other => panic!("expected accepted oversized reservation, got {other:?}"),
+    };
+    driver
+        .session
+        .db
+        .reap_expired_text_artifact_reservations(reservation.expires_at)
+        .await
+        .unwrap();
+
+    let mut submission = UserSubmission::text(source);
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+    submission
+        .client_submissions
+        .push(crate::engine::message::ClientSubmissionReceipt {
+            id: client_submission_id,
+            fingerprint: "terminalized-oversized-source".to_owned(),
+            wire_fingerprint: "terminalized-oversized-wire".to_owned(),
+            origin_principal: None,
+        });
+    submission.pending_terminal_disposition =
+        Some(crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact);
+    let (queue, tx, mut rx) = event_harness();
+    driver
+        .run_user_input(submission, &queue, &tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        provider_posts(&provider).len(),
+        0,
+        "the terminal receipt, not the mutable source text, owns the no-provider branch"
+    );
+    assert!(
+        drain_events(&mut rx).iter().any(|event| {
+            matches!(event, TurnEvent::Notice { text }
+                if text.contains("artifact_reservation_expired")
+                    && text.contains("will not execute its source"))
+        }),
+        "the phase-two no-lease branch reports the durable terminal outcome"
+    );
+    assert!(
+        session_events(&driver)
+            .await
+            .iter()
+            .all(|event| event.kind != "user_message"),
+        "a terminalized oversized source must not fall through to an inline user event"
+    );
+}
+
+#[tokio::test]
+async fn oversized_user_provider_projection_replaces_the_full_source_with_its_typed_frame() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("artifact-aware reply".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    // `tag_expansions` is UI metadata; the resolved tag/context bytes are
+    // already folded into the model-bound submission text and must therefore
+    // survive the accepted envelope around the authored artifact slot.
+    let source = format!(
+        "RESOLVED TAG CONTEXT: src/lib.rs\noversized provider source line\n{}",
+        "oversized provider source line\n".repeat(3_000)
+    );
+    assert!(source.len() > 64 * 1024);
+    let operation_id = uuid::Uuid::new_v4();
+    let client_submission_id = uuid::Uuid::new_v4();
+    let canonical = crate::proto_crate::send_user_message_v2::CanonicalSendUserMessageV2 {
+        session_id: driver.session.id,
+        canonical_project_digest: [1; 32],
+        model_config_generation: 0,
+        canonical_model_digest: [2; 32],
+        request: crate::proto_crate::send_user_message_v2::SendUserMessageV2 {
+            client_submission_id,
+            text: source.clone(),
+            display_text: None,
+            tag_expansions: Vec::new(),
+            forced_skill: None,
+            attachments: Vec::new(),
+        },
+    }
+    .encode()
+    .unwrap();
+    let accepted = driver
+        .session
+        .db
+        .accept_message_with_text_artifact_reservation(
+            crate::db::db::message_attachments::AcceptMessageInput {
+                session_id: driver.session.id,
+                operation_id: *operation_id.as_bytes(),
+                actor: crate::db::db::message_attachments::MessageActor::LocalOwner,
+                request_hash: [3; 32],
+                message_request_digest: [4; 32],
+                attachment_set_digest: [5; 32],
+                client_submission_id: *client_submission_id.as_bytes(),
+                queue_item_id: *client_submission_id.as_bytes(),
+                canonical_message: canonical,
+                attachments: Vec::new(),
+                outbox_sequence: 0,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            std::sync::Arc::new(AllowOversizedTextArtifactJoin),
+            crate::db::db::text_artifacts::source_digest(&source),
+            source.len(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        crate::db::db::text_artifacts::TextArtifactPhaseOneResult::Reserved(_)
+    ));
+
+    let mut submission = UserSubmission::text(source.clone());
+    submission.origin = crate::engine::message::SubmissionOrigin::ExternalRoot;
+    submission.tag_expansions = vec![crate::daemon::proto::TagExpansionMeta {
+        tool: "read".to_owned(),
+        path: "src/lib.rs".to_owned(),
+        detail: "resolved context".to_owned(),
+        ok: true,
+    }];
+    let fingerprint = submission.client_fingerprint();
+    submission
+        .client_submissions
+        .push(crate::engine::message::ClientSubmissionReceipt {
+            id: client_submission_id,
+            fingerprint,
+            wire_fingerprint: "fcm2-oversized-provider-projection".to_owned(),
+            origin_principal: None,
+        });
+    submission.pending_terminal_disposition =
+        Some(crate::engine::message::PendingSubmissionTerminalDisposition::OversizedTextArtifact);
+    let (queue, tx, _rx) = event_harness();
+    driver
+        .run_user_input(submission, &queue, &tx)
+        .await
+        .unwrap();
+
+    let posts = provider_posts(&provider);
+    assert_eq!(posts.len(), 1);
+    let model_user_text = chat_messages(&posts[0])
+        .iter()
+        .filter(|message| message_role(message) == "user")
+        .map(message_content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(model_user_text.contains("<cockpit_artifact_v1 "));
+    assert!(model_user_text.contains("RESOLVED TAG CONTEXT: src/lib.rs"));
+    assert!(
+        !model_user_text.contains(&source),
+        "the full oversized source must never be appended after the durable frame"
+    );
+    let artifacts = driver
+        .session
+        .db
+        .list_text_artifacts(driver.session.id)
+        .await
+        .unwrap();
+    assert!(artifacts.iter().any(|artifact| {
+        artifact.kind == crate::db::db::text_artifacts::TextArtifactKind::UserInputSource
+            && artifact.content == source
+    }));
 }
 
 #[tokio::test(start_paused = true)]

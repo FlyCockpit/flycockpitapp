@@ -2091,6 +2091,16 @@
     },
     "response": "media_reservation_repaired"
   },
+  "agent_installation": {
+    "data": {
+      "outcome": "receipt",
+      "operation_id": "11111111-1111-4111-8111-111111111111",
+      "status": "created",
+      "installation_id": "22222222-2222-4222-8222-222222222222",
+      "source_revision": null
+    },
+    "response": "agent_installation"
+  },
   "doctor_snapshot": {
     "data": {
       "rendered": "",

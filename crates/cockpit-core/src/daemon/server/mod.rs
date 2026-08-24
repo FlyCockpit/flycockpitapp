@@ -217,6 +217,10 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // must be neutralized before it crosses the socket, exactly like the
         // sibling rendered-doctor / transcript free-text responses above.
         proto::Response::DocsAnswer { answer } => scrub_string(answer, redact),
+        // This DTO is constructed from canonical identifiers and fixed
+        // redacted diagnostics only; it intentionally excludes workspace
+        // paths, source URLs, provider handles, and credentials.
+        proto::Response::AgentInstallation(_) => {}
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
         | proto::Response::RetainedHttpsMedia(..)
@@ -2045,6 +2049,13 @@ pub struct DaemonContext {
     /// provider/extended config. Shared with the registry so attach-create,
     /// resume, and worker startup all consult the same source.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// A debug-build-only scripted agent-installation coordinator.  It is
+    /// built once at daemon boot from an explicit non-secret fixture file and
+    /// reused by every agent RPC so a Begin continuation and SubmitChoice
+    /// always see the identical fetcher/catalog/workspace authority.
+    #[cfg(debug_assertions)]
+    agent_installation_fixture:
+        Option<Arc<crate::daemon::agent_installation::AgentInstallationService>>,
     /// Daemon-owned native secure key actor (`native-secure-key-store`).
     /// Started under the single-instance lock after installation identity
     /// is loaded; process-global keyring registration is drained on drop.
@@ -2217,6 +2228,13 @@ impl DaemonContext {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }));
+        #[cfg(debug_assertions)]
+        let agent_installation_fixture =
+            crate::daemon::agent_installation::debug_fixture_daemon_service(db.clone(), &paths)
+                .unwrap_or_else(|error| {
+                    panic!("invalid debug agent-installation fixture: {error:#}")
+                })
+                .map(Arc::new);
         let terminal_host = terminal_factory.build(
             global_events.clone(),
             global_redaction.clone(),
@@ -2350,6 +2368,8 @@ impl DaemonContext {
             )),
             oauth_flows: Arc::new(dispatch::OAuthFlowStore::new()),
             config_source,
+            #[cfg(debug_assertions)]
+            agent_installation_fixture,
             secure_key: None,
             _secure_key_actor: None,
             redaction_key_resolver,
@@ -2487,6 +2507,31 @@ impl DaemonContext {
     /// `~/.config/cockpit`.
     pub(crate) fn config_source(&self) -> &crate::daemon::config_source::ConfigSource {
         &self.config_source
+    }
+
+    /// Return the one debug-fixture coordinator when explicitly enabled, or
+    /// construct the normal daemon-owned service.  The fixture branch is
+    /// absent from release builds, so setting its environment variable there
+    /// has no effect.
+    pub(crate) fn agent_installation_service(
+        &self,
+    ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
+        #[cfg(debug_assertions)]
+        if let Some(service) = &self.agent_installation_fixture {
+            return Ok(service.clone());
+        }
+        Ok(Arc::new(
+            crate::daemon::agent_installation::default_daemon_service(
+                self.db.clone(),
+                &self.paths,
+                self.secret_vault.clone(),
+                self.config_source()
+                    .load(&self.canonical_cwd)
+                    .context("loading daemon provider configuration")?
+                    .0,
+                vec![self.canonical_cwd.clone()],
+            )?,
+        ))
     }
 
     #[cfg(test)]
@@ -5315,7 +5360,7 @@ mod sealed_capabilities;
 pub use run_invocation::{
     RemainingRestart as RunInvocationRemaining,
     principal_digest as run_invocation_principal_digest,
-    remaining_after_restart as run_invocation_remaining_after_restart,
+    remaining_after_restart_for_row as run_invocation_remaining_after_restart,
     wall_ms_now as run_invocation_wall_ms_now,
 };
 #[cfg(test)]

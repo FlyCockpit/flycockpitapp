@@ -5,11 +5,12 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use crate::send_user_message_v2::MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES;
+
 pub const FCOR_MAGIC: [u8; 4] = *b"FCOR";
 pub const FCOR_SCHEMA_VERSION: u8 = 1;
 pub const MAX_FCOR_V1_BYTES: u64 = u32::MAX as u64;
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
-pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 2_631_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalParamErrorCode {
@@ -1927,6 +1928,49 @@ mod tests {
                 &FoundationDecoder,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_operation_fcm2_limit_rejects_oversized_opaque_bytes_before_decoder() {
+        struct RecordingFoundationDecoder(std::sync::atomic::AtomicBool);
+
+        impl OpaqueCanonicalParamsDecoder for RecordingFoundationDecoder {
+            fn owner(&self) -> &'static str {
+                "message-attachment-protocol-foundation"
+            }
+
+            fn validate(&self, bytes: &[u8]) -> Result<()> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                ensure!(bytes.starts_with(&FCM2_MAGIC), "decoder saw invalid FCM2");
+                Ok(())
+            }
+        }
+
+        let decoder = RecordingFoundationDecoder(std::sync::atomic::AtomicBool::new(false));
+        let mut exact = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES];
+        exact[..FCM2_MAGIC.len()].copy_from_slice(&FCM2_MAGIC);
+        validate_registered_opaque_params(SEND_USER_MESSAGE_V2_REGISTRATION, &exact, &decoder)
+            .expect("the exact registered FCM2 allocation boundary reaches its owner decoder");
+        assert!(decoder.0.load(std::sync::atomic::Ordering::SeqCst));
+        let fcor = encode_fcor_v1("send_user_message", &[], &exact).unwrap();
+        assert!(fcor.ends_with(&exact), "FCOR preserves FCM2 bytes exactly");
+
+        decoder.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut oversized = vec![0_u8; MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES + 1];
+        oversized[..FCM2_MAGIC.len()].copy_from_slice(&FCM2_MAGIC);
+        assert!(
+            validate_registered_opaque_params(
+                SEND_USER_MESSAGE_V2_REGISTRATION,
+                &oversized,
+                &decoder,
+            )
+            .is_err(),
+            "the remote-operation boundary rejects FCM2 before owner decoding"
+        );
+        assert!(
+            !decoder.0.load(std::sync::atomic::Ordering::SeqCst),
+            "over-limit opaque bytes cannot reach a decoder/ledger side effect"
         );
     }
 

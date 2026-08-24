@@ -624,6 +624,7 @@ mod agent_tiering {
             goal_supervision: Default::default(),
             permission: None,
             fork_eligible: false,
+            vnext: None,
             prompt: String::new(),
             prompt_variants: std::collections::HashMap::new(),
             source: std::path::PathBuf::new(),

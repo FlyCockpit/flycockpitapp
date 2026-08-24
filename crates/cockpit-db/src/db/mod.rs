@@ -36,9 +36,11 @@
 //! Database path: `~/.local/share/cockpit/cockpit.db`
 //! (XDG-canonical via [`crate::config::resolve::cockpit_data_dir`]).
 
+pub mod agent_installations;
+pub mod agent_tree_decisions;
 pub mod app_flags;
+pub mod archive_import;
 pub mod assistants;
-pub mod compressed_results;
 pub mod connector;
 pub mod execution_containments;
 pub mod external_journal;
@@ -49,6 +51,7 @@ pub mod image_generation_plan;
 pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
+pub mod installation_operations;
 pub mod lang;
 pub mod locks;
 pub mod media_attachments;
@@ -88,10 +91,13 @@ pub mod tandem;
 pub mod task_delegation_payloads;
 pub mod task_delegations;
 pub mod task_todos;
+pub mod text_artifacts;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;
+pub mod verification_ledger;
 pub mod wire;
+pub mod workspace_lease_artifacts;
 pub mod workspace_trust;
 pub mod write_scope_leases;
 

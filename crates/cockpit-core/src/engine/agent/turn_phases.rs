@@ -543,7 +543,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    if context == TaskContext::Fresh
+                    if agent.vnext_grant.is_none()
+                        && context == TaskContext::Fresh
                         && cwd.is_none()
                         && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
                             &session.project_root,
@@ -566,7 +567,9 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             format!("batch entry `{label}`: {message}"),
                         ));
                     }
-                    if !crate::engine::builtin::is_noninteractive(child) {
+                    if agent.vnext_grant.is_none()
+                        && !crate::engine::builtin::is_noninteractive(child)
+                    {
                         return_structural!(task_refusal(
                             &tc.id,
                             tc.provider
@@ -713,7 +716,8 @@ pub(crate) async fn phase_10_dispatch_one_call(
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
                 let context = TaskContext::from_value(args.get("context"));
-                if context == TaskContext::Fresh
+                if agent.vnext_grant.is_none()
+                    && context == TaskContext::Fresh
                     && cwd.is_none()
                     && let Some(message) = crate::engine::builtin::unknown_agent_rejection(
                         &session.project_root,
@@ -754,7 +758,13 @@ pub(crate) async fn phase_10_dispatch_one_call(
                         ));
                     }
                 };
-                let noninteractive = resolve_interactivity(mode, &child, resume_handle.is_some());
+                // A vNext tree uses the structural noninteractive task path.
+                // That path carries the requested cwd and write_scope through
+                // every recursive launch and applies the live grant against
+                // the resolved target.  The legacy interactive handoff loses
+                // those authority inputs, so it is not a vNext runtime path.
+                let noninteractive = agent.vnext_grant.is_some()
+                    || resolve_interactivity(mode, &child, resume_handle.is_some());
                 if context == TaskContext::Fork
                     && let Some(err) = fork_context_refusal(
                         session,
@@ -2395,6 +2405,7 @@ mod tests {
             write_scope: None,
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+            vnext_grant: None,
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             assistant_identity_prefix: None,
         }

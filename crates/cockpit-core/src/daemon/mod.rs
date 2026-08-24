@@ -22,7 +22,9 @@
 //!   to the freshly spawned daemon. `cockpit daemon {start, stop,
 //!   status}` lets the user manage the lifecycle explicitly.
 
+pub mod agent_installation;
 pub mod bulk_staging;
+pub mod bulk_upload;
 pub mod caffeinate;
 pub mod client;
 pub(crate) mod config_refresh;

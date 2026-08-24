@@ -502,6 +502,8 @@ mod tests {
             "command table should enumerate Request rows"
         );
         let expected = std::collections::BTreeSet::from([
+            "agent_installation_inspect",
+            "agent_installation_list",
             "daemon_status",
             "export_policy",
             "export_session_data",

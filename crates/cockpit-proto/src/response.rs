@@ -820,6 +820,9 @@ pub enum Response {
         answer: String,
     },
 
+    /// Typed, redacted daemon-owned agent installation operation outcome.
+    AgentInstallation(crate::AgentInstallationResultV1),
+
     #[serde(other)]
     Unknown,
 }
@@ -1179,6 +1182,7 @@ macro_rules! response_variants {
             (Response::MediaReservationRepaired { .. }, "media_reservation_repaired");
             (Response::DoctorSnapshot { .. }, "doctor_snapshot");
             (Response::DocsAnswer { .. }, "docs_answer");
+            (Response::AgentInstallation(..), "agent_installation");
             (Response::Unknown, "__unknown");
         ] }
     };

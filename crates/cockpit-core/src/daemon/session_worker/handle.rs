@@ -1506,6 +1506,36 @@ pub struct RemoteQueueOperation {
     pub request_hash: [u8; 32],
 }
 
+/// FCM2 admission evidence for a text-only oversized user submission. The
+/// worker validates these opaque bytes against the queued `UserSubmission`,
+/// then asks the DB to create the receipt triple and quota lease atomically
+/// before the driver can invoke any provider.
+#[derive(Debug, Clone)]
+pub struct OversizedTextArtifactAdmission {
+    pub canonical_message: Vec<u8>,
+    pub operation_id: [u8; 16],
+    pub actor: crate::db::db::message_attachments::MessageActor,
+    pub request_hash: [u8; 32],
+    pub message_request_digest: [u8; 32],
+    pub attachment_set_digest: [u8; 32],
+    /// Durable outside-FCM2 fence; the canonical FCM2 v2 bytes remain frozen.
+    pub model_fence: Option<(u64, cockpit_config::config::providers::ActiveModelRef)>,
+    /// Optional run-invocation barrier carried as immutable client input. The
+    /// worker creates it only after phase one has reserved the FCM2 source and
+    /// before it makes the submission visible to the driver.
+    pub run_invocation: Option<OversizedRunInvocationAdmission>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OversizedRunInvocationAdmission {
+    pub origin_principal_digest: String,
+    pub options_json: String,
+    pub options_digest: String,
+    pub content_digest: String,
+    pub max_turns: Option<u32>,
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteQueueMutationReceiptV1 {
@@ -1554,6 +1584,10 @@ pub enum SessionWork {
         /// than a second accept. Owner/local sends pass `None` and take the
         /// unchanged in-memory accept path.
         remote_operation: Option<RemoteQueueOperation>,
+        /// Present only for text-only sources above 64KiB. Unlike the legacy
+        /// in-memory acceptance path, this branch has a durable FCM2 receipt
+        /// and exact artifact lease before it reaches the driver.
+        artifact_admission: Option<Box<OversizedTextArtifactAdmission>>,
         respond_to: oneshot::Sender<
             std::result::Result<(proto::QueueItem, Vec<proto::QueueItem>), proto::ErrorPayload>,
         >,

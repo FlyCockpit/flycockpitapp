@@ -243,6 +243,84 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationRegistry {
         std::collections::HashMap<NoninteractiveDelegationKey, NoninteractiveDelegationEntry>,
 }
 
+/// Session-local, parent-instance-scoped admission authority for vNext direct
+/// children.  The key is the stable allocation identity of the parent `Arc<Agent>`:
+/// clones of a driver used by background tasks retain that same parent frame, while
+/// two independently-built agents with the same display name cannot consume one
+/// another's child budget.
+#[derive(Clone, Default)]
+pub(in crate::engine::driver) struct VnextChildAdmissionRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, VnextChildAdmission>>>,
+}
+
+struct VnextChildAdmission {
+    capacity: usize,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl VnextChildAdmissionRegistry {
+    /// Atomically reserve `children` live direct-child slots for this parent.
+    /// A reservation is deliberately non-waiting: exceeding an agent's declared
+    /// bound is a task-call refusal, not a queue whose eventual launch could
+    /// surprise the parent after its turn has moved on.
+    pub(in crate::engine::driver) fn try_admit(
+        &self,
+        parent: &std::sync::Arc<crate::engine::agent::Agent>,
+        children: usize,
+    ) -> std::result::Result<Vec<tokio::sync::OwnedSemaphorePermit>, String> {
+        let Some(delegation) = parent
+            .vnext_grant
+            .as_ref()
+            .and_then(|grant| grant.delegation.as_ref())
+        else {
+            return Ok(Vec::new());
+        };
+        let capacity = usize::from(delegation.max_concurrent_children);
+        let key = std::sync::Arc::as_ptr(parent) as usize;
+        self.try_admit_with_key(key, capacity, children).map_err(|()| {
+            format!(
+                "Error: `{}` has reached its vNext limit of {capacity} concurrent child task(s); wait for an active child to finish before delegating again",
+                parent.name
+            )
+        })
+    }
+
+    fn try_admit_with_key(
+        &self,
+        key: usize,
+        capacity: usize,
+        children: usize,
+    ) -> std::result::Result<Vec<tokio::sync::OwnedSemaphorePermit>, ()> {
+        if children == 0 {
+            return Ok(Vec::new());
+        }
+        let permits = {
+            let mut admissions = self.inner.lock().expect("vNext admission lock poisoned");
+            let admission = admissions
+                .entry(key)
+                .or_insert_with(|| VnextChildAdmission {
+                    capacity,
+                    permits: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
+                });
+            // A parent frame's effective grant is immutable. Treat a mismatch as
+            // a refusal rather than accidentally widening an existing semaphore.
+            if admission.capacity != capacity {
+                return Err(());
+            }
+            admission.permits.clone()
+        };
+
+        let mut reservations = Vec::with_capacity(children);
+        for _ in 0..children {
+            match permits.clone().try_acquire_owned() {
+                Ok(permit) => reservations.push(permit),
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(reservations)
+    }
+}
+
 #[allow(dead_code)]
 impl NoninteractiveDelegationRegistry {
     pub(in crate::engine::driver) fn register_running(
@@ -679,6 +757,68 @@ fn resolve_write_scope(
     Ok(Some(effective))
 }
 
+/// Resolve the next vNext structural child's requested cwd against the
+/// current child's cwd, while retaining the session workspace boundary. The
+/// effective-grant check that follows decides whether the real target is
+/// same-root or a permitted subdirectory.
+fn resolve_recursive_vnext_child_cwd(
+    requested: Option<&str>,
+    parent_cwd: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let parent = parent_cwd.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve parent cwd `{}`: {error}",
+            parent_cwd.display()
+        )
+    })?;
+    let workspace = workspace.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve trusted workspace `{}`: {error}",
+            workspace.display()
+        )
+    })?;
+    let Some(raw) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(parent);
+    };
+    let candidate = crate::tools::common::resolve(raw, &parent);
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| format!("cwd `{raw}` does not exist or is not a directory"))?;
+    if !resolved.is_dir() {
+        return Err(format!("cwd `{raw}` does not exist or is not a directory"));
+    }
+    if !crate::path_containment::contained_under(&workspace, &resolved) {
+        return Err(format!(
+            "cwd `{raw}` resolves outside trusted workspace `{}`",
+            workspace.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Recursive batches bypass the driver's durable completion queue, but their
+/// parent-facing result keeps the exact same stable input-order contract as a
+/// driver-owned batch. Completion order is deliberately not observable.
+fn render_recursive_vnext_batch_result(
+    mut reports: Vec<(usize, String, String, String)>,
+) -> String {
+    reports.sort_by_key(|(idx, _, _, _)| *idx);
+    serde_json::json!({
+        "status": "completed",
+        "children": reports
+            .into_iter()
+            .map(|(_, label, child_agent, report)| serde_json::json!({
+                "label": label,
+                "agent": child_agent,
+                "failed": report.starts_with("Error:"),
+                "report": report,
+            }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 fn overlapping_write_scope_pair(
     scopes: &[(String, std::path::PathBuf)],
 ) -> Option<(String, std::path::PathBuf, String, std::path::PathBuf)> {
@@ -913,6 +1053,20 @@ impl Driver {
         Ok(())
     }
 
+    /// Reserve live-child capacity at the sole task-launch authority. The
+    /// returned permits must stay owned by the spawned task/frame until each
+    /// child exits; dropping them is the release path for success, refusal,
+    /// cancellation, and panic alike.
+    pub(super) fn admit_current_vnext_children(
+        &self,
+        children: usize,
+    ) -> std::result::Result<Vec<tokio::sync::OwnedSemaphorePermit>, String> {
+        self.vnext_child_admissions.try_admit(
+            &self.stack.last().expect("stack never empty").agent,
+            children,
+        )
+    }
+
     pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
         &mut self,
         mut task: SingleNoninteractiveTask,
@@ -936,6 +1090,20 @@ impl Driver {
                 ),
             );
         }
+        let vnext_admissions = match self.admit_current_vnext_children(1) {
+            Ok(permits) => permits,
+            Err(err) => {
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task.task_call_id.clone(),
+                        task.task_provider_item_id.clone(),
+                        task.task_function_call_id.clone(),
+                        "task",
+                        prepend_task_repair_notes(err, &task.repair_notes),
+                    ),
+                );
+            }
+        };
         let task_call_id = task.task_call_id.clone();
         let task_provider_item_id = task.task_provider_item_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
@@ -1036,6 +1204,9 @@ impl Driver {
         let completion_task_provider_item_id = task_provider_item_id.clone();
         let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
+            // Keep the reservation alive for the full background child
+            // lifetime, including time spent after the foreground has moved on.
+            let _vnext_admissions = vnext_admissions;
             let result = runner
                 .execute_single_noninteractive_task(task, &tx_for_task, cancel)
                 .await;
@@ -1215,14 +1386,21 @@ impl Driver {
         // loader.  This is also the last point before any delegation state is
         // registered, so a refusal has no child lifecycle side effect.
         let parent_agent = self.stack.last().unwrap().agent.name.clone();
-        if let Some(err) = grant_rejection(
-            &child_cwd.resolved,
-            &self.config,
-            &parent_agent,
-            &child_agent,
-            &granted_tools,
-            &self.session.db,
-        )
+        let parent_vnext_grant = self
+            .stack
+            .last()
+            .and_then(|frame| frame.agent.vnext_grant.clone());
+        if let Some(err) = grant_rejection(GrantRejectionInput {
+            parent_cwd: &self.cwd,
+            cwd: &child_cwd.resolved,
+            config: &self.config,
+            parent_agent: &parent_agent,
+            parent_vnext_grant: parent_vnext_grant.as_ref(),
+            child_agent: &child_agent,
+            grant: &granted_tools,
+            assistant_db: &self.session.db,
+            local_installations: &self.vnext_local_installation_resolver,
+        })
         .await
         {
             return Ok(SingleNoninteractiveCompletion {
@@ -1693,6 +1871,7 @@ impl Driver {
                         self.resource_scheduler.clone(),
                         self.loop_guard_threshold,
                         EXPLORE_MAX_TURNS,
+                        self.vnext_local_installation_resolver.clone(),
                         Some(self.tandem_set.clone()),
                         Some(tx.clone()),
                         Some(NoninteractiveSteerTarget::new(
@@ -2009,9 +2188,8 @@ impl Driver {
             .ok()
             .flatten()
             .map(|def| {
-                def.scan_tool_results.unwrap_or_else(|| {
-                    crate::agents::default_scan_tool_results(&def.name, def.mode)
-                })
+                def.scan_tool_results
+                    .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name))
             })
             .unwrap_or_else(|| !matches!(child_agent, "explore" | "scout" | "docs-answerer"));
         if !crate::engine::agent::should_scan_tool_result(
@@ -2962,6 +3140,23 @@ impl Driver {
                 );
             }
         }
+        // Reserve the whole batch before it is persisted or registered. The
+        // non-waiting registry either admits every direct child together or
+        // refuses the call with no partial batch lifecycle side effect.
+        let vnext_admissions = match self.admit_current_vnext_children(task.entries.len()) {
+            Ok(permits) => permits,
+            Err(err) => {
+                return Ok(
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(err, &task.repair_notes),
+                    ),
+                );
+            }
+        };
         let child_todo_json = task
             .entries
             .iter()
@@ -3102,7 +3297,12 @@ impl Driver {
         let completion_task_function_call_id = task_function_call_id.clone();
         let handle = tokio::spawn(async move {
             let result = runner
-                .execute_batch_noninteractive_task(task, &tx_for_task, cancel)
+                .execute_batch_noninteractive_task_with_admissions(
+                    task,
+                    vnext_admissions,
+                    &tx_for_task,
+                    cancel,
+                )
                 .await;
             let _ = complete_tx
                 .send(BackgroundNoninteractiveCompletion::Batch {
@@ -3215,9 +3415,21 @@ impl Driver {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::engine::driver) async fn execute_batch_noninteractive_task(
         &mut self,
         task: BatchNoninteractiveTask,
+        tx: &mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<BatchNoninteractiveCompletion> {
+        self.execute_batch_noninteractive_task_with_admissions(task, Vec::new(), tx, cancel)
+            .await
+    }
+
+    async fn execute_batch_noninteractive_task_with_admissions(
+        &mut self,
+        task: BatchNoninteractiveTask,
+        mut vnext_admissions: Vec<tokio::sync::OwnedSemaphorePermit>,
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<BatchNoninteractiveCompletion> {
@@ -3585,7 +3797,12 @@ impl Driver {
 
             let child_cancel = cancel.clone();
             let child_admission_lock = admission_lock.clone();
+            // Each batch child owns one live-child reservation. It is released
+            // as soon as that child exits, rather than waiting for slower batch
+            // siblings to finish.
+            let vnext_admission = vnext_admissions.pop();
             let child_fut = async move {
+                let _vnext_admission = vnext_admission;
                 // Surface-gated concurrency (RAII, released on completion / error
                 // / panic): an admissible child holds a SHARED read guard (runs
                 // with other admissible children); a NON-admissible child holds the
@@ -3656,14 +3873,20 @@ impl Driver {
                 // admissible.
                 let held_read = _read_guard.is_some();
                 let mut snapshot = NoninteractiveDelegationSnapshot::empty();
-                let outcome = if let Some(err) = grant_rejection(
-                    &child_cwd.resolved,
-                    &pinned,
-                    &parent,
-                    &entry.child_agent,
-                    &entry.granted_tools,
-                    &driver.session.db,
-                )
+                let outcome = if let Some(err) = grant_rejection(GrantRejectionInput {
+                    parent_cwd: &driver.cwd,
+                    cwd: &child_cwd.resolved,
+                    config: &pinned,
+                    parent_agent: &parent,
+                    parent_vnext_grant: driver
+                        .stack
+                        .last()
+                        .and_then(|frame| frame.agent.vnext_grant.as_ref()),
+                    child_agent: &entry.child_agent,
+                    grant: &entry.granted_tools,
+                    assistant_db: &driver.session.db,
+                    local_installations: &driver.vnext_local_installation_resolver,
+                })
                 .await
                 {
                     DelegationChildOutcome::failed(err)
@@ -3905,6 +4128,7 @@ impl Driver {
                         driver.resource_scheduler.clone(),
                         driver.loop_guard_threshold,
                         EXPLORE_MAX_TURNS,
+                        driver.vnext_local_installation_resolver.clone(),
                         Some(driver.tandem_set.clone()),
                         Some(tx.clone()),
                         Some(NoninteractiveSteerTarget::new(
@@ -4610,6 +4834,7 @@ pub(crate) async fn run_noninteractive(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     loop_guard_threshold: u32,
     max_turns: usize,
+    local_installations: crate::agents::LocalInstallationResolver,
     // Model-comparison tandem (shadow) set, forwarded so the `docs` pipeline's
     // resolver/answerer turns are shadowed when the feature is on.
     tandem: Option<crate::engine::schedule::TandemSet>,
@@ -4633,6 +4858,7 @@ pub(crate) async fn run_noninteractive(
         resource_scheduler,
         loop_guard_threshold,
         max_turns,
+        local_installations,
         tandem,
         event_tx,
         steer_target,
@@ -4979,6 +5205,7 @@ pub(crate) async fn run_noninteractive_resumable(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     loop_guard_threshold: u32,
     max_turns: usize,
+    local_installations: crate::agents::LocalInstallationResolver,
     // Model-comparison tandem (shadow) set (`model-comparison-tandem-
     // inference.md`). `Some(set)` when the session has model-comparison on, so
     // this leaf subagent's (`builder`/`explore`/`docs`) substantive turns are
@@ -4990,9 +5217,16 @@ pub(crate) async fn run_noninteractive_resumable(
     use crate::engine::agent::turn_with_backup;
 
     let (child_tx, child_rx) = mpsc::channel::<TurnEvent>(64);
-    let forwarder = spawn_noninteractive_event_forwarder(child_rx, event_tx, steer_target.clone());
+    // Recursive vNext structural tasks need the original sender for their
+    // own nested forwarder.  The current child's forwarder owns only a clone.
+    let forwarder =
+        spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
 
     let agent = Arc::new(child);
+    // A resumable vNext child is itself a delegation parent. Keep its direct
+    // child admission state for this whole invocation, so a nested batch has
+    // the same atomic, live-child accounting as a driver-owned batch.
+    let recursive_vnext_admissions = VnextChildAdmissionRegistry::default();
     // Per-turn backup-model fallback for the subagent (`per-model-
     // backup-fallback.md`): subagents inherit the *mechanism*, resolved by the
     // same model→provider→none order against the model the subagent runs on
@@ -5142,6 +5376,359 @@ pub(crate) async fn run_noninteractive_resumable(
                     fallback_decision,
                 });
             }
+            TurnOutcome::SpawnNoninteractive {
+                child_agent,
+                prompt,
+                model,
+                remaining_depth: _,
+                why: _,
+                resume_handle: _,
+                cwd: requested_cwd,
+                write_scope,
+                context: _,
+                granted_tools,
+                todo_ids: _,
+                repair_notes,
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+            } if agent.vnext_grant.is_some() => {
+                // A v2 child can itself be a noninteractive orchestrator.
+                // vNext task parsing routes here rather than through the
+                // legacy interactive handoff, preserving cwd and write_scope
+                // for the recursive child admission.
+                let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
+                let _vnext_admission = match recursive_vnext_admissions.try_admit(&agent, 1) {
+                    Ok(permits) => permits,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id.clone(),
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(error, &repair_notes),
+                        );
+                        continue;
+                    }
+                };
+                let child_cwd = match resolve_recursive_vnext_child_cwd(
+                    requested_cwd.as_deref(),
+                    &cwd,
+                    &session.project_root,
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id.clone(),
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
+                        );
+                        continue;
+                    }
+                };
+                if let Some(error) = super::delegation_helpers::grant_rejection(
+                    super::delegation_helpers::GrantRejectionInput {
+                        parent_cwd: &cwd,
+                        cwd: &child_cwd,
+                        config: &config,
+                        parent_agent: &agent.name,
+                        parent_vnext_grant: Some(&parent_grant),
+                        child_agent: &child_agent,
+                        grant: &granted_tools,
+                        assistant_db: &session.db,
+                        local_installations: &local_installations,
+                    },
+                )
+                .await
+                {
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id.clone(),
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(error, &repair_notes),
+                    );
+                    continue;
+                }
+                let resolved_write_scope = match resolve_write_scope(
+                    write_scope.as_deref(),
+                    &child_cwd,
+                    &session.project_root,
+                ) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                            task_call_id,
+                            task_provider_item_id.clone(),
+                            task_function_call_id,
+                            "task",
+                            prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
+                        );
+                        continue;
+                    }
+                };
+                let child_args = crate::engine::builtin::SpawnArgs {
+                    model: agent.model.clone(),
+                    params: crate::engine::model::ModelParams {
+                        prompt_cache_key: None,
+                        prompt_cache_retention: None,
+                        ..agent.params.clone()
+                    },
+                    env_overlay: agent.env_overlay.clone(),
+                    cwd: child_cwd.clone(),
+                    config: config.clone(),
+                    session_short_id: session.short_id.clone(),
+                    assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
+                    model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                    interactive: false,
+                    llm_mode: agent.llm_mode,
+                    model_override: None,
+                    delegation_model: model,
+                    delegated: true,
+                    delegation_recursion:
+                        crate::engine::builtin::DelegationRecursionContext::default(),
+                    vnext_grant: None,
+                    vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
+                    vnext_local_installation_resolver: local_installations.clone(),
+                    parent_vnext_grant: Some(parent_grant),
+                    swarm_depth: 0,
+                    swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+                    granted_tools,
+                    lock_identity: None,
+                    write_scope: resolved_write_scope,
+                    credential_store: session.provider_credential_store(&config.providers()).ok(),
+                };
+                let result = match crate::engine::builtin::load(&child_agent, &child_args) {
+                    Ok(nested_child) => Box::pin(run_noninteractive_resumable(
+                        nested_child,
+                        prompt,
+                        Vec::new(),
+                        session.clone(),
+                        locks.clone(),
+                        redact.clone(),
+                        child_cwd,
+                        config.clone(),
+                        interrupts.clone(),
+                        cancel.clone(),
+                        approver.clone(),
+                        resource_scheduler.clone(),
+                        loop_guard_threshold,
+                        max_turns,
+                        local_installations.clone(),
+                        tandem.clone(),
+                        event_tx.clone(),
+                        steer_target.clone(),
+                    ))
+                    .await
+                    .map(|outcome| outcome.report)
+                    .unwrap_or_else(|error| format!("Error: {error}")),
+                    Err(error) => format!("Error: {error:#}"),
+                };
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(result, &repair_notes),
+                    );
+            }
+            TurnOutcome::SpawnNoninteractiveBatch {
+                entries,
+                why: _,
+                repair_notes,
+                task_call_id,
+                task_provider_item_id,
+                task_function_call_id,
+            } if agent.vnext_grant.is_some() => {
+                // Recursive v2 batches stay in-process rather than re-entering
+                // the driver background lifecycle.  Preflight every entry before
+                // admitting any slot or starting any inference, then keep the
+                // whole reservation alive until each direct child completes.
+                // This mirrors the driver-owned batch's all-or-nothing admission
+                // while preserving the nested parent's live effective grant.
+                let parent_grant = agent.vnext_grant.as_ref().expect("guarded above").clone();
+                let mut prepared = Vec::with_capacity(entries.len());
+                let mut rejection = None;
+
+                for (idx, entry) in entries.into_iter().enumerate() {
+                    let child_cwd = match resolve_recursive_vnext_child_cwd(
+                        entry.cwd.as_deref(),
+                        &cwd,
+                        &session.project_root,
+                    ) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            rejection = Some(format!("batch entry `{}`: {error}", entry.label));
+                            break;
+                        }
+                    };
+                    if let Some(error) = super::delegation_helpers::grant_rejection(
+                        super::delegation_helpers::GrantRejectionInput {
+                            parent_cwd: &cwd,
+                            cwd: &child_cwd,
+                            config: &config,
+                            parent_agent: &agent.name,
+                            parent_vnext_grant: Some(&parent_grant),
+                            child_agent: &entry.child_agent,
+                            grant: &entry.granted_tools,
+                            assistant_db: &session.db,
+                            local_installations: &local_installations,
+                        },
+                    )
+                    .await
+                    {
+                        rejection = Some(format!("batch entry `{}`: {error}", entry.label));
+                        break;
+                    }
+                    let resolved_write_scope = match resolve_write_scope(
+                        entry.write_scope.as_deref(),
+                        &child_cwd,
+                        &session.project_root,
+                    ) {
+                        Ok(scope) => scope,
+                        Err(error) => {
+                            rejection = Some(format!("batch entry `{}`: {error}", entry.label));
+                            break;
+                        }
+                    };
+                    let child_args = crate::engine::builtin::SpawnArgs {
+                        model: agent.model.clone(),
+                        params: crate::engine::model::ModelParams {
+                            prompt_cache_key: None,
+                            prompt_cache_retention: None,
+                            ..agent.params.clone()
+                        },
+                        env_overlay: agent.env_overlay.clone(),
+                        cwd: child_cwd.clone(),
+                        config: config.clone(),
+                        session_short_id: session.short_id.clone(),
+                        assistant_identity_prefix: agent.assistant_identity_prefix.clone(),
+                        model_system_prompt_snapshot: session.model_system_prompt_snapshot(),
+                        interactive: false,
+                        llm_mode: agent.llm_mode,
+                        model_override: None,
+                        delegation_model: entry.model.clone(),
+                        delegated: true,
+                        delegation_recursion:
+                            crate::engine::builtin::DelegationRecursionContext::default(),
+                        vnext_grant: None,
+                        vnext_host_policy: Some(Arc::new(parent_grant.host_policy.clone())),
+                        vnext_local_installation_resolver: local_installations.clone(),
+                        parent_vnext_grant: Some(parent_grant.clone()),
+                        swarm_depth: 0,
+                        swarm_max_depth: crate::config::extended::DEFAULT_RECURSIVE_SPAWN_MAX_DEPTH,
+                        granted_tools: entry.granted_tools.clone(),
+                        lock_identity: None,
+                        write_scope: resolved_write_scope,
+                        credential_store: session
+                            .provider_credential_store(&config.providers())
+                            .ok(),
+                    };
+                    let child = match crate::engine::builtin::load(&entry.child_agent, &child_args)
+                    {
+                        Ok(child) => child,
+                        Err(error) => {
+                            rejection = Some(format!(
+                                "batch entry `{}`: could not load `{}`: {error:#}",
+                                entry.label, entry.child_agent
+                            ));
+                            break;
+                        }
+                    };
+                    prepared.push((idx, entry, child, child_cwd));
+                }
+
+                if let Some(error) = rejection {
+                    next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id.clone(),
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(format!("Error: {error}"), &repair_notes),
+                    );
+                    continue;
+                }
+                let mut vnext_admissions = match recursive_vnext_admissions
+                    .try_admit(&agent, prepared.len())
+                {
+                    Ok(permits) => permits,
+                    Err(error) => {
+                        next_prompt = crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                                task_call_id,
+                                task_provider_item_id.clone(),
+                                task_function_call_id,
+                                "task",
+                                prepend_task_repair_notes(error, &repair_notes),
+                            );
+                        continue;
+                    }
+                };
+
+                use futures::StreamExt as _;
+                let mut runs = futures::stream::FuturesUnordered::new();
+                for (idx, entry, child, child_cwd) in prepared {
+                    let admission = vnext_admissions
+                        .pop()
+                        .expect("one vNext admission per prepared child");
+                    let session = session.clone();
+                    let locks = locks.clone();
+                    let redact = redact.clone();
+                    let config = config.clone();
+                    let interrupts = interrupts.clone();
+                    let cancel = cancel.clone();
+                    let approver = approver.clone();
+                    let resource_scheduler = resource_scheduler.clone();
+                    let local_installations = local_installations.clone();
+                    let tandem = tandem.clone();
+                    let event_tx = event_tx.clone();
+                    let steer_target = steer_target.clone();
+                    runs.push(async move {
+                        // RAII releases each slot as soon as its child ends,
+                        // including cancellation, errors, and panics.
+                        let _admission = admission;
+                        let report = Box::pin(run_noninteractive_resumable(
+                            child,
+                            entry.prompt,
+                            Vec::new(),
+                            session,
+                            locks,
+                            redact,
+                            child_cwd,
+                            config,
+                            interrupts,
+                            cancel,
+                            approver,
+                            resource_scheduler,
+                            loop_guard_threshold,
+                            max_turns,
+                            local_installations,
+                            tandem,
+                            event_tx,
+                            steer_target,
+                        ))
+                        .await
+                        .map(|outcome| outcome.report)
+                        .unwrap_or_else(|error| format!("Error: {error}"));
+                        (idx, entry.label, entry.child_agent, report)
+                    });
+                }
+                let mut reports = Vec::new();
+                while let Some(report) = runs.next().await {
+                    reports.push(report);
+                }
+                let result = render_recursive_vnext_batch_result(reports);
+                next_prompt =
+                    crate::engine::message::synthetic_tool_result_message_with_provider_identity(
+                        task_call_id,
+                        task_provider_item_id,
+                        task_function_call_id,
+                        "task",
+                        prepend_task_repair_notes(result, &repair_notes),
+                    );
+            }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
             | TurnOutcome::SpawnNoninteractiveBatch { .. }
@@ -5178,4 +5765,129 @@ pub(crate) async fn run_noninteractive_resumable(
         fallback_decision,
         fallback_tried,
     ))
+}
+
+#[cfg(test)]
+mod vnext_child_admission_tests {
+    use super::*;
+
+    #[test]
+    fn agent_vnext_batch_child_admission_is_atomic_and_reusable() {
+        let admissions = VnextChildAdmissionRegistry::default();
+        let first = admissions.try_admit_with_key(7, 2, 1).unwrap();
+
+        // A two-child batch cannot consume the one remaining slot and leave a
+        // partial child launch behind.
+        assert!(admissions.try_admit_with_key(7, 2, 2).is_err());
+        let second = admissions.try_admit_with_key(7, 2, 1).unwrap();
+        assert!(admissions.try_admit_with_key(7, 2, 1).is_err());
+
+        drop(first);
+        drop(second);
+        assert_eq!(admissions.try_admit_with_key(7, 2, 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn agent_vnext_child_admission_race_never_exceeds_limit_and_releases() {
+        let admissions = VnextChildAdmissionRegistry::default();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let admissions = admissions.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                admissions.try_admit_with_key(23, 3, 1).ok()
+            }));
+        }
+        barrier.wait();
+
+        let held = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(held.len(), 3);
+        assert!(admissions.try_admit_with_key(23, 3, 1).is_err());
+
+        drop(held);
+        assert_eq!(admissions.try_admit_with_key(23, 3, 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn agent_vnext_nested_batch_reports_children_in_input_order() {
+        let rendered = render_recursive_vnext_batch_result(vec![
+            (
+                2,
+                "third".to_string(),
+                "child-c".to_string(),
+                "c".to_string(),
+            ),
+            (
+                0,
+                "first".to_string(),
+                "child-a".to_string(),
+                "a".to_string(),
+            ),
+            (
+                1,
+                "second".to_string(),
+                "child-b".to_string(),
+                "Error: b".to_string(),
+            ),
+        ]);
+        let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["children"][0]["label"], "first");
+        assert_eq!(body["children"][1]["label"], "second");
+        assert_eq!(body["children"][2]["label"], "third");
+        assert_eq!(body["children"][1]["failed"], true);
+    }
+
+    #[test]
+    fn agent_vnext_nested_batch_cwd_is_resolved_per_entry_and_stays_in_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = workspace.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_recursive_vnext_child_cwd(Some("child"), &parent, workspace.path()).unwrap(),
+            child.canonicalize().unwrap()
+        );
+        let error = resolve_recursive_vnext_child_cwd(
+            Some(outside.path().to_str().unwrap()),
+            &parent,
+            workspace.path(),
+        )
+        .unwrap_err();
+        assert!(error.contains("outside trusted workspace"), "{error}");
+    }
+
+    #[test]
+    fn agent_vnext_nested_batch_applies_live_same_root_target_to_each_entry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let child = workspace.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let definition = crate::agents::embedded_default("Build").unwrap();
+        let grant = definition
+            .vnext
+            .unwrap()
+            .resolve_grant(&crate::agents::VnextHostPolicy::for_session_config(
+                &crate::config::extended::ExtendedConfig::default(),
+            ))
+            .unwrap();
+
+        let same_root =
+            resolve_recursive_vnext_child_cwd(None, workspace.path(), workspace.path()).unwrap();
+        let subdirectory =
+            resolve_recursive_vnext_child_cwd(Some("child"), workspace.path(), workspace.path())
+                .unwrap();
+        assert!(grant.permits_target(workspace.path(), &same_root));
+        assert!(
+            !grant.permits_target(workspace.path(), &subdirectory),
+            "the parent grant, not a raw child cwd, is the target authority"
+        );
+    }
 }

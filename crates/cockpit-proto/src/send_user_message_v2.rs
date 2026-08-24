@@ -8,9 +8,14 @@ use uuid::Uuid;
 
 pub const FCM2_MAGIC: [u8; 4] = *b"FCM2";
 pub const FCM2_SCHEMA_VERSION: u8 = 2;
-pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 2_631_500;
-pub const MAX_MESSAGE_TEXT_BYTES: usize = 1_048_576;
-pub const MAX_MESSAGE_TEXT_SCALARS: usize = 262_144;
+/// Closed outer allocation bound for an FCM2 envelope.  This deliberately
+/// leaves 128 KiB of prerelease headroom above the largest encoding accepted
+/// by the current field limits; it is not a field-level budget.
+pub const MAX_CANONICAL_SEND_USER_MESSAGE_V2_BYTES: usize = 17_439_564;
+pub const MAX_MESSAGE_TEXT_BYTES: usize = 8_388_608;
+pub const MAX_MESSAGE_TEXT_SCALARS: usize = 8_388_608;
+/// The exact largest encoding admitted by the current FCM2 field layout.
+pub const MAX_CURRENT_FCM2_ENCODING_BYTES: usize = 17_311_564;
 pub const MAX_TAG_EXPANSIONS: usize = 64;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 16;
 const MESSAGE_DIGEST_DOMAIN: &[u8] = b"flycockpit-send-user-message-v2\0";

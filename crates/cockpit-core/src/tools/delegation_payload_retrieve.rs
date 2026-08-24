@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 use crate::tools::common::OUTPUT_BYTE_CAP;
-use crate::tools::tool_result_retrieve::{optional_line, render_capped_line_range};
 
 pub struct DelegationPayloadRetrieveTool;
 
@@ -90,7 +89,7 @@ impl Tool for DelegationPayloadRetrieveTool {
             ));
         }
 
-        Ok(render_capped_line_range(
+        Ok(render_capped_payload_range(
             &payload.body,
             start.unwrap_or(1),
             end.unwrap_or(usize::MAX),
@@ -98,6 +97,55 @@ impl Tool for DelegationPayloadRetrieveTool {
             self.name(),
             hash,
         ))
+    }
+}
+
+fn optional_line(value: Option<&Value>, name: &str) -> Result<Option<usize>> {
+    match value {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(0) => Err(invalid_input(format!("`{name}` must be >= 1"))),
+            Some(value) => Ok(Some(value as usize)),
+            None => Err(invalid_input(format!("`{name}` must be an integer"))),
+        },
+    }
+}
+
+fn render_capped_payload_range(
+    content: &str,
+    start: usize,
+    end: usize,
+    cap: usize,
+    tool_name: &str,
+    hash: &str,
+) -> ToolOutput {
+    let mut output = String::new();
+    let mut next = None;
+    for (index, line) in content.lines().enumerate() {
+        let number = index + 1;
+        if number < start || number > end {
+            continue;
+        }
+        let remaining = cap.saturating_sub(output.len());
+        if remaining == 0 {
+            next = Some(number);
+            break;
+        }
+        let line = crate::tools::artifact_read::utf8_prefix(line, remaining.saturating_sub(1));
+        output.push_str(line);
+        output.push('\n');
+        if line.len() < content.lines().nth(index).unwrap_or_default().len() {
+            next = Some(number);
+            break;
+        }
+    }
+    if let Some(next) = next {
+        output.push_str(&format!(
+            "... [{tool_name} continuation hash={hash} start_line={next}]\n"
+        ));
+        ToolOutput::truncated_text(output)
+    } else {
+        ToolOutput::text(output)
     }
 }
 
@@ -223,37 +271,10 @@ mod tests {
         assert!(!output.content.contains("delegation_payload_retrieve"));
     }
 
-    #[tokio::test]
-    async fn delegation_payload_retrieve_output_is_not_restored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ctx, _db) = crate::tools::common::test_ctx_with_db(tmp.path());
-        let retained = crate::engine::tool::RetainedTruncatedOutput {
-            content: "hidden delegation payload page".to_string(),
-            original_byte_len: "hidden delegation payload page".len(),
-            partial: false,
-        };
-        let mut delivered = "visible delegation payload page".to_string();
-
-        let stored = crate::engine::agent::maybe_store_retrievable_truncated_tool_result(
-            &ctx.session,
-            "Build",
-            "delegation_payload_retrieve",
-            "call-1",
-            &mut delivered,
-            Some(&retained),
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(stored.is_none());
-        assert!(
-            ctx.session
-                .db
-                .list_compressed_tool_results(ctx.session.id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+    #[test]
+    fn delegation_payload_pages_are_not_artifact_capture_eligible() {
+        assert!(!crate::engine::agent::text_artifact_capture_is_eligible(
+            "delegation_payload_retrieve"
+        ));
     }
 }

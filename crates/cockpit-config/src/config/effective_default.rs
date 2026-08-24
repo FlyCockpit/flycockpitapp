@@ -685,12 +685,13 @@ fn ensure_target_writable(target: &ResolvedTarget) -> Result<(), EffectiveDefaul
 /// accepts a replacement from this process.
 fn probe_directory_writable(dir: &Path) -> Result<()> {
     let probe = dir.join(format!(
-        ".cockpit-write-probe-{}-{}",
+        ".cockpit-write-probe-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        Uuid::new_v4(),
     ));
     write_private_file(&probe, b"")?;
     let _ = remove_file_nofollow(&probe);

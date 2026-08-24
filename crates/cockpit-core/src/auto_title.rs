@@ -347,7 +347,11 @@ async fn accumulated_user_content(session: &Session, content_prefix: &str) -> St
     };
     let mut acc = String::new();
     for turn in turns.iter().filter(|t| t.role == "user") {
-        let text = turn.text.trim();
+        // A materialized oversized source remains exact in the transcript, but
+        // title refinement is a utility-model boundary.  Do not let a later
+        // refresh silently re-expand an artifact-backed turn merely because it
+        // was read from the durable transcript rather than the live prompt.
+        let text = title_context_projection(turn.text.trim());
         if text.is_empty() {
             continue;
         }
@@ -363,6 +367,19 @@ async fn accumulated_user_content(session: &Session, content_prefix: &str) -> St
         content_prefix.to_string()
     } else {
         acc
+    }
+}
+
+/// The title utility never needs an entire retained user artifact.  Keep this
+/// local and deterministic so both the live eager path and transcript-backed
+/// refinement obey the same outbound-size rule.
+fn title_context_projection(text: &str) -> &str {
+    const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
+    const UTILITY_PREFIX_BYTES: usize = 4 * 1024;
+    if text.len() > INLINE_USER_TEXT_BYTES {
+        crate::engine::text_artifact_frame::bounded_utf8_prefix(text, UTILITY_PREFIX_BYTES)
+    } else {
+        text
     }
 }
 
@@ -1177,5 +1194,17 @@ mod tests {
             s_early.agent_rename_session_invoke_allowed(true),
             "an armed recovery nudge makes rename invocable despite the threshold"
         );
+    }
+
+    #[test]
+    fn title_context_projection_never_expands_an_oversized_turn() {
+        let oversized = format!("prefix{}tail", "é".repeat(40 * 1024));
+        let projection = title_context_projection(&oversized);
+        assert!(projection.len() <= 4 * 1024);
+        assert!(projection.is_char_boundary(projection.len()));
+        assert!(oversized.starts_with(projection));
+
+        let inline = "x".repeat(64 * 1024);
+        assert_eq!(title_context_projection(&inline), inline);
     }
 }

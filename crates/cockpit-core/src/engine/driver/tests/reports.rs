@@ -147,6 +147,7 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        vnext_grant: None,
         env_overlay: driver.stack[0].agent.env_overlay.clone(),
         assistant_identity_prefix: None,
     };

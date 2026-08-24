@@ -1687,7 +1687,7 @@ mod tests {
         std::fs::write(guard.path().unwrap(), b"pixels").unwrap();
         assert!(guard.path().unwrap().exists());
         guard.cleanup().unwrap();
-        assert!(!guard.path.is_some());
+        assert!(guard.path.is_none());
         assert!(guard.is_cleaned());
     }
 

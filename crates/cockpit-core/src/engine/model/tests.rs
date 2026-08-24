@@ -698,7 +698,7 @@ fn strip_reasoning_keeps_text_drops_reasoning() {
     let Message::Assistant { content, .. } = stripped else {
         panic!("expected an assistant message");
     };
-    assert_eq!(content.iter().count(), 1);
+    assert_eq!(content.len(), 1);
     assert!(matches!(
         content.first(),
         Some(AssistantContent::Text(t)) if t.text == "the visible answer"
@@ -716,7 +716,7 @@ fn strip_reasoning_keeps_tool_call_drops_reasoning() {
     let Message::Assistant { content, .. } = stripped else {
         panic!("expected an assistant message");
     };
-    assert_eq!(content.iter().count(), 1);
+    assert_eq!(content.len(), 1);
     assert!(matches!(
         content.first(),
         Some(AssistantContent::ToolCall(tc)) if tc.id == "tc-1"
@@ -737,7 +737,7 @@ fn strip_reasoning_dropped_turn_preserves_pairing() {
         Message::user("do the thing"),
         tool_turn,
         crate::engine::message::tool_result_message(
-            &crate::engine::message::collect_tool_calls(&vec![tool_call("tc-keep")])[0],
+            &crate::engine::message::collect_tool_calls(&[tool_call("tc-keep")])[0],
             "ok".into(),
         ),
         reasoning_only,

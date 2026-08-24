@@ -1,4 +1,9 @@
-export const FCM2_MAX_BYTES = 2_631_500;
+/** Closed outer allocation bound; current legal field encodings top out at
+ * `FCM2_MAX_CURRENT_ENCODING_BYTES`, leaving intentional protocol headroom. */
+export const FCM2_MAX_BYTES = 17_439_564;
+export const FCM2_MAX_CURRENT_ENCODING_BYTES = 17_311_564;
+export const FCM2_MAX_TEXT_BYTES = 8_388_608;
+export const FCM2_MAX_TEXT_SCALARS = 8_388_608;
 export const FCM2_SCHEMA_VERSION = 2;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -162,11 +167,11 @@ function validate(v: CanonicalSendUserMessageV2) {
   if (!v.canonical_project_digest.some(Boolean)) throw new Error("zero project digest");
   if (v.canonical_model_digest.length !== 32) throw new Error("invalid model digest");
   if (!v.canonical_model_digest.some(Boolean)) throw new Error("zero model digest");
-  const text = bytes(v.request.text, 1048576, "text");
-  if (scalars(v.request.text) > 262144) throw new Error("text exceeds scalar limit");
+  const text = bytes(v.request.text, FCM2_MAX_TEXT_BYTES, "text");
+  if (scalars(v.request.text) > FCM2_MAX_TEXT_SCALARS) throw new Error("text exceeds scalar limit");
   if (v.request.display_text !== null) {
-    bytes(v.request.display_text, 1048576, "display text");
-    if (scalars(v.request.display_text) > 262144)
+    bytes(v.request.display_text, FCM2_MAX_TEXT_BYTES, "display text");
+    if (scalars(v.request.display_text) > FCM2_MAX_TEXT_SCALARS)
       throw new Error("display text exceeds scalar limit");
   }
   if (!hasMessageText(v.request.text) && v.request.attachments.length === 0)
@@ -249,7 +254,7 @@ export function encodeCanonicalSendUserMessageV2(v: CanonicalSendUserMessageV2) 
   validate(v);
   const w = new Writer();
   w.raw(Uint8Array.of(70, 67, 77, 50));
-  w.u8(2);
+  w.u8(FCM2_SCHEMA_VERSION);
   w.raw(uuid(v.request.client_submission_id));
   w.raw(uuid(v.session_id));
   w.raw(v.canonical_project_digest);
@@ -326,13 +331,14 @@ class Reader {
 export function decodeCanonicalSendUserMessageV2(b: Uint8Array): CanonicalSendUserMessageV2 {
   validateFcm2Length(b.length);
   const r = new Reader(b);
-  if (r.text(4) !== "FCM2" || r.u8() !== 2) throw new Error("invalid FCM2 header");
+  if (r.text(4) !== "FCM2" || r.u8() !== FCM2_SCHEMA_VERSION)
+    throw new Error("invalid FCM2 header");
   const client_submission_id = uuidString(r.raw(16)),
     session_id = uuidString(r.raw(16)),
     canonical_project_digest = r.raw(32),
     model_config_generation = r.u64(),
-    canonical_model_digest = r.raw(32),
-    text = r.text32();
+    canonical_model_digest = r.raw(32);
+  const text = r.text32();
   const dp = r.u8();
   if (dp > 1) throw new Error("invalid display presence");
   const display_text = dp ? r.text32() : null;

@@ -22,6 +22,7 @@ pub struct AgentInventoryEntry {
     pub name: String,
     pub kind: AgentEntryKind,
     pub overridden: bool,
+    pub description: Option<String>,
     pub model: Option<String>,
     pub valid: bool,
     pub diagnostic: Option<String>,
@@ -39,15 +40,25 @@ pub struct AgentEditSnapshot {
     pub revision: String,
     pub goal_supervision_json: Option<String>,
     pub editable: bool,
+    pub supports_goal_supervision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mutation", rename_all = "snake_case")]
 pub enum AgentMutation {
-    EjectBuiltin { name: String },
-    SaveDefinition { name: String, markdown: String },
-    DeleteCustom { name: String },
-    ResetBuiltin { name: String },
+    EjectBuiltin {
+        name: String,
+    },
+    SaveDefinition {
+        name: String,
+        markdown: String,
+    },
+    DeleteCustom {
+        name: String,
+    },
+    ResetBuiltin {
+        name: String,
+    },
     ResetAllBuiltins,
     SaveGoalSupervision {
         name: String,

@@ -18,6 +18,9 @@ pub(super) struct AgentEditor {
     pub(super) name: String,
     /// The on-disk file the buffer will be written back to.
     pub(super) path: std::path::PathBuf,
+    /// Opaque daemon revision captured with the editable snapshot. `None` is
+    /// reserved for daemon-local assistant definitions on their separate RPC.
+    pub(super) revision: Option<String>,
     editor: VimEditor,
 }
 
@@ -44,10 +47,12 @@ impl AgentEditor {
         path: std::path::PathBuf,
         text: &str,
         vim_enabled: bool,
+        revision: Option<String>,
     ) -> Self {
         Self {
             name,
             path,
+            revision,
             editor: VimEditor::new(text, vim_enabled),
         }
     }
@@ -124,6 +129,7 @@ mod tests {
             std::path::PathBuf::from("builder.md"),
             text,
             vim,
+            None,
         )
     }
 

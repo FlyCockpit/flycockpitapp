@@ -13,7 +13,7 @@
 //!     agent.
 //!   - `e` — **raw edit** the highlighted agent's on-disk
 //!     `.cockpit/agents/<name>.md`. A non-overridden built-in is
-//!     auto-ejected first (existing [`cockpit_core::agents::eject_builtin`] path).
+//!     auto-ejected first through the daemon-owned agent mutation RPC.
 //!     The editor is chosen by precedence: `$EDITOR` (external, the event
 //!     loop suspends/restores the TUI) → in-TUI vim editor (when vim mode
 //!     is on) → in-TUI plain editor. On return the file is re-read from
@@ -30,7 +30,7 @@
 //! model stay accurate.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -44,7 +44,13 @@ use crate::tui::tool_surface_picker::{
     ToolSurfaceDraft, ToolSurfaceEditOutcome, ToolSurfacePicker, ToolSurfaceRender,
     tool_surface_lines,
 };
-use cockpit_core::agents::{AgentDef, AgentKind, AgentListing, is_builtin_agent, list_all};
+use cockpit_core::agents::AgentDef;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentKind {
+    Builtin { overridden: bool },
+    Custom,
+}
 
 use super::agent_editor::{AgentEditor, EditorOutcome};
 use super::reset::{ResetButton, ResetOutcome};
@@ -88,12 +94,10 @@ pub(super) struct AgentsPage {
 pub(super) struct AgentExternalEdit {
     pub(super) id: PointerOperationId,
     pub(super) agent: super::pointer_actions::AgentId,
-    pub(super) path: PathBuf,
-    /// Same-directory staging file. The real path is replaced only after a
-    /// matching typed `Saved` completion.
+    /// Host-owned staging file. The authoritative agent path never leaves the
+    /// daemon; completion returns the edited bytes under this lease.
     staging: tempfile::TempPath,
-    original_contents: Vec<u8>,
-    original_metadata: AgentFileMetadata,
+    lease_id: String,
     /// Buffer write owned by the injected host effect.
     pub(super) text_before_launch: String,
     /// Raw draft retained until the effect reaches a terminal outcome. A
@@ -113,113 +117,16 @@ pub(crate) struct AgentExternalEditEffect {
 
 struct AgentExternalEditStaging {
     path: tempfile::TempPath,
-    original_contents: Vec<u8>,
-    original_metadata: AgentFileMetadata,
 }
 
-struct AgentFileMetadata {
-    permissions: std::fs::Permissions,
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    mode: u32,
-    #[cfg(unix)]
-    uid: u32,
-    #[cfg(unix)]
-    gid: u32,
-}
-
-impl AgentFileMetadata {
-    fn capture(metadata: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        Self {
-            permissions: metadata.permissions(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            mode: metadata.mode(),
-            #[cfg(unix)]
-            uid: metadata.uid(),
-            #[cfg(unix)]
-            gid: metadata.gid(),
-        }
-    }
-
-    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        self.len == metadata.len()
-            && self.modified == metadata.modified().ok()
-            && self.permissions.readonly() == metadata.permissions().readonly()
-            && {
-                #[cfg(unix)]
-                {
-                    self.device == metadata.dev()
-                        && self.inode == metadata.ino()
-                        && self.mode == metadata.mode()
-                        && self.uid == metadata.uid()
-                        && self.gid == metadata.gid()
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            }
-    }
-}
-
-fn agent_external_edit_staging(
-    target: &std::path::Path,
-) -> Result<AgentExternalEditStaging, String> {
-    let metadata = std::fs::symlink_metadata(target)
-        .map_err(|error| format!("failed to inspect external-edit target: {error}"))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to externally edit symbolic link {}",
-            target.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(format!(
-            "refusing to externally edit non-file {}",
-            target.display()
-        ));
-    }
-    let mut original = std::fs::File::open(target)
-        .map_err(|error| format!("failed to open external-edit target: {error}"))?;
-    let opened_metadata = original
-        .metadata()
-        .map_err(|error| format!("failed to inspect opened external-edit target: {error}"))?;
-    let original_metadata = AgentFileMetadata::capture(&metadata);
-    if !original_metadata.matches(&opened_metadata) {
-        return Err("external-edit target changed while it was being opened".into());
-    }
-    let mut original_contents = Vec::new();
-    std::io::Read::read_to_end(&mut original, &mut original_contents)
-        .map_err(|error| format!("failed to read external-edit target: {error}"))?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("external edit target has no parent: {}", target.display()))?;
+fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     let path = tempfile::Builder::new()
-        .prefix(".cockpit-agent-edit-")
-        .suffix(".stage")
-        .tempfile_in(parent)
+        .prefix("cockpit-agent-edit-")
+        .suffix(".md")
+        .tempfile()
         .map(|file| file.into_temp_path())
         .map_err(|error| format!("failed to create external-edit staging file: {error}"))?;
-    Ok(AgentExternalEditStaging {
-        path,
-        original_contents,
-        original_metadata,
-    })
+    Ok(AgentExternalEditStaging { path })
 }
 
 /// A flattened, render-ready view of one [`AgentListing`]. We snapshot the
@@ -251,6 +158,7 @@ pub(super) struct AgentDetail {
     name: String,
     path: PathBuf,
     original_text: String,
+    revision: Option<String>,
     def: AgentDef,
     draft: Box<ToolSurfaceDraft>,
     picker: ToolSurfacePicker,
@@ -377,66 +285,20 @@ impl AgentsPage {
             super::pointer_actions::ExternalEditOutcome::Saved => {
                 let draft = pending.draft.take();
                 let commit = (|| -> Result<(), String> {
-                    let current_metadata = std::fs::symlink_metadata(&pending.path)
-                        .map_err(|error| format!("failed to revalidate agent path: {error}"))?;
-                    if current_metadata.file_type().is_symlink() {
-                        return Err("agent path became a symbolic link during external edit".into());
+                    let markdown = std::fs::read_to_string(&pending.staging)
+                        .map_err(|error| format!("failed to read editor staging file: {error}"))?;
+                    match crate::tui::agent_runner::daemon_request_blocking(
+                        cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                            project_root: cwd.to_string_lossy().into_owned(),
+                            lease_id: pending.lease_id.clone(),
+                            markdown: Some(markdown),
+                        },
+                    )? {
+                        cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(_) => {
+                            Ok(())
+                        }
+                        other => Err(format!("unexpected editor completion response: {other:?}")),
                     }
-                    if !current_metadata.is_file() {
-                        return Err("agent path is no longer a regular file".into());
-                    }
-                    if !pending.original_metadata.matches(&current_metadata) {
-                        return Err(
-                            "agent file metadata changed during external edit; refusing overwrite"
-                                .into(),
-                        );
-                    }
-                    let mut current_file = std::fs::File::open(&pending.path)
-                        .map_err(|error| format!("failed to re-open agent path: {error}"))?;
-                    let opened_metadata = current_file
-                        .metadata()
-                        .map_err(|error| format!("failed to inspect opened agent path: {error}"))?;
-                    if !pending.original_metadata.matches(&opened_metadata) {
-                        return Err(
-                            "agent file changed while commit was being validated; refusing overwrite"
-                                .into(),
-                        );
-                    }
-                    let mut current = Vec::new();
-                    std::io::Read::read_to_end(&mut current_file, &mut current)
-                        .map_err(|error| format!("failed to re-read agent path: {error}"))?;
-                    if current != pending.original_contents {
-                        return Err(
-                            "agent file changed during external edit; refusing overwrite".into(),
-                        );
-                    }
-                    std::fs::set_permissions(
-                        pending.staging.as_ref() as &std::path::Path,
-                        pending.original_metadata.permissions.clone(),
-                    )
-                    .map_err(|error| {
-                        format!("failed to preserve agent-file permissions: {error}")
-                    })?;
-                    // Keep the pathname check adjacent to the atomic rename. The
-                    // descriptor above binds content validation to the opened
-                    // file; this final no-follow check catches a pathname swap
-                    // during that read or while staging permissions were set.
-                    let final_metadata = std::fs::symlink_metadata(&pending.path)
-                        .map_err(|error| format!("failed final agent-path validation: {error}"))?;
-                    if final_metadata.file_type().is_symlink()
-                        || !final_metadata.is_file()
-                        || !pending.original_metadata.matches(&final_metadata)
-                    {
-                        return Err(
-                            "agent path changed before atomic replacement; refusing overwrite"
-                                .into(),
-                        );
-                    }
-                    pending
-                        .staging
-                        .persist(&pending.path)
-                        .map(|_| ())
-                        .map_err(|error| format!("atomic replacement failed: {error}"))
                 })();
                 match commit {
                     Ok(_) => {
@@ -454,10 +316,24 @@ impl AgentsPage {
                 }
             }
             super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                let _ = crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        lease_id: pending.lease_id.clone(),
+                        markdown: None,
+                    },
+                );
                 self.editing = pending.draft.take();
                 self.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
             }
             super::pointer_actions::ExternalEditOutcome::Failed => {
+                let _ = crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        lease_id: pending.lease_id.clone(),
+                        markdown: None,
+                    },
+                );
                 self.editing = pending.draft.take();
                 self.status = Some(detail.unwrap_or_else(|| "external edit failed".into()));
             }
@@ -467,26 +343,49 @@ impl AgentsPage {
 
 /// Build the per-row view models for `cwd`, including the effective model.
 fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
-    let mut rows: Vec<AgentRow> = list_all(cwd)
-        .into_iter()
-        .map(|l: AgentListing| {
-            let (detail, model) = match l.def {
-                Ok(def) => (Ok(def.description), normalize_model(def.model)),
-                Err(e) => (Err(format!("{e}")), None),
-            };
-            AgentRow {
-                name: l.name,
-                kind: l.kind,
-                detail,
-                model,
-                source: AgentRowSource::Agent,
-            }
-        })
-        .collect();
+    let response = crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::GetAgentInventory {
+            project_root: cwd.to_string_lossy().into_owned(),
+        },
+    );
+    let (mut rows, inventory_status) = match response {
+        Ok(cockpit_core::daemon::proto::Response::AgentInventory { entries, .. }) => (
+            entries
+                .into_iter()
+                .map(|entry| AgentRow {
+                    name: entry.name,
+                    kind: match entry.kind {
+                        cockpit_core::daemon::proto::AgentEntryKind::Builtin => {
+                            AgentKind::Builtin {
+                                overridden: entry.overridden,
+                            }
+                        }
+                        cockpit_core::daemon::proto::AgentEntryKind::Custom => AgentKind::Custom,
+                    },
+                    detail: if entry.valid {
+                        Ok(entry.description.unwrap_or_default())
+                    } else {
+                        Err(entry.diagnostic.unwrap_or_else(|| "invalid agent".into()))
+                    },
+                    model: normalize_model(entry.model),
+                    source: AgentRowSource::Agent,
+                })
+                .collect(),
+            None,
+        ),
+        Ok(other) => (
+            Vec::new(),
+            Some(format!("unexpected agent inventory response: {other:?}")),
+        ),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("Agents Unavailable — {error}; Retry")),
+        ),
+    };
     match assistant_rows() {
         Ok(assistants) => {
             rows.extend(assistants);
-            (rows, None)
+            (rows, inventory_status)
         }
         Err(error) => (
             rows,
@@ -494,6 +393,78 @@ fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
                 "Assistants Unavailable — {error}; Retry by reopening Agents"
             )),
         ),
+    }
+}
+
+fn agent_snapshot(
+    cwd: &std::path::Path,
+    name: &str,
+) -> Result<cockpit_core::daemon::proto::AgentEditSnapshot, String> {
+    match crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            project_root: cwd.to_string_lossy().into_owned(),
+            name: name.to_string(),
+        },
+    )? {
+        cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) => Ok(snapshot),
+        other => Err(format!("unexpected agent snapshot response: {other:?}")),
+    }
+}
+
+fn mutate_agent(
+    cwd: &std::path::Path,
+    mutation: cockpit_core::daemon::proto::AgentMutation,
+    expected_revision: Option<String>,
+) -> Result<cockpit_core::daemon::proto::AgentMutationResult, String> {
+    match crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::MutateAgent {
+            project_root: cwd.to_string_lossy().into_owned(),
+            mutation,
+            expected_revision,
+        },
+    )? {
+        cockpit_core::daemon::proto::Response::AgentMutated(result) => Ok(result),
+        other => Err(format!("unexpected agent mutation response: {other:?}")),
+    }
+}
+
+fn editable_agent_snapshot(
+    cwd: &std::path::Path,
+    name: &str,
+) -> Result<cockpit_core::daemon::proto::AgentEditSnapshot, String> {
+    let snapshot = agent_snapshot(cwd, name)?;
+    if snapshot.editable {
+        return Ok(snapshot);
+    }
+    match mutate_agent(
+        cwd,
+        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin {
+            name: name.to_string(),
+        },
+        Some(snapshot.revision),
+    )? {
+        cockpit_core::daemon::proto::AgentMutationResult {
+            snapshot: Some(snapshot),
+            ..
+        } => Ok(snapshot),
+        _ => Err("daemon did not return the ejected agent snapshot".into()),
+    }
+}
+
+fn begin_agent_editor_lease(
+    cwd: &std::path::Path,
+    name: &str,
+    expected_revision: String,
+) -> Result<cockpit_core::daemon::proto::AgentEditorLease, String> {
+    match crate::tui::agent_runner::daemon_request_blocking(
+        cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+            project_root: cwd.to_string_lossy().into_owned(),
+            name: name.to_string(),
+            expected_revision,
+        },
+    )? {
+        cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => Ok(lease),
+        other => Err(format!("unexpected editor lease response: {other:?}")),
     }
 }
 
@@ -558,26 +529,6 @@ impl AgentDetail {
     }
 }
 
-fn backticked_tool(message: &str) -> Option<String> {
-    let known: BTreeSet<&str> = cockpit_core::agents::known_tool_names()
-        .iter()
-        .copied()
-        .collect();
-    let mut rest = message;
-    while let Some(start) = rest.find('`') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('`') else {
-            break;
-        };
-        let candidate = &after[..end];
-        if known.contains(candidate) {
-            return Some(candidate.to_string());
-        }
-        rest = &after[end + 1..];
-    }
-    None
-}
-
 impl SettingsCx {
     /// The cwd agents are discovered against: the picker's cwd when the
     /// dialog was opened from one, else the directory holding the config
@@ -600,13 +551,6 @@ impl SettingsCx {
     /// The config directory eject writes into: the directory holding the
     /// `config.json` this settings dialog is editing (the `.cockpit/`
     /// layer the user selected in the picker).
-    fn agents_config_dir(&self) -> PathBuf {
-        self.config_path
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    }
-
     fn handle_agents_page_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
         // ── In-TUI editor (vim or plain) ────────────────────────────
         if p.external_edit_confirmation.is_some() {
@@ -625,14 +569,30 @@ impl SettingsCx {
                 EditorOutcome::Stay => {}
                 EditorOutcome::Save => {
                     let path = editor.path.clone();
+                    let revision = editor.revision.clone();
                     let text = editor.text().to_string();
                     // Ensure a single trailing newline like a real editor.
                     let text = format!("{}\n", text.trim_end_matches('\n'));
                     let name = editor.name.clone();
                     p.editing = None;
-                    match std::fs::write(&path, &text) {
+                    let cwd = self.agents_cwd();
+                    let saved = match revision {
+                        Some(revision) => mutate_agent(
+                            &cwd,
+                            cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                                name: name.clone(),
+                                markdown: text,
+                            },
+                            Some(revision),
+                        )
+                        .map(|_| ()),
+                        None => Err(
+                            "assistant definitions must be edited through their daemon-owned settings flow"
+                                .to_string(),
+                        ),
+                    };
+                    match saved {
                         Ok(()) => {
-                            let cwd = self.agents_cwd();
                             p.refresh_after_edit(&cwd, Some(&name));
                         }
                         Err(e) => {
@@ -667,11 +627,15 @@ impl SettingsCx {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     p.confirm_reset = false;
                     let cwd = self.agents_cwd();
-                    match cockpit_core::agents::reset_all_builtins(&cwd) {
-                        Ok(removed) => {
+                    match mutate_agent(
+                        &cwd,
+                        cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
+                        None,
+                    ) {
+                        Ok(result) => {
                             p.status = Some(format!(
                                 "reset {} built-in override(s) to default",
-                                removed.len()
+                                result.affected
                             ));
                         }
                         Err(e) => p.status = Some(format!("reset failed: {e}")),
@@ -712,6 +676,12 @@ impl SettingsCx {
             KeyCode::Char('d') => self.delete_selected(p),
             KeyCode::Char('r') => self.reset_one_selected(p),
             KeyCode::Char('e') => {
+                if detail.revision.is_none() {
+                    detail.status = Some(
+                        "assistant raw editing is unavailable from the agent-file editor".into(),
+                    );
+                    return Nav::Stay;
+                }
                 p.disarm_guards();
                 self.edit_selected(p);
             }
@@ -736,9 +706,20 @@ impl SettingsCx {
         if editor.name != expected.0 || p.pending_external_edit.is_some() {
             return;
         }
-        let path = editor.path.clone();
+        let Some(revision) = editor.revision.clone() else {
+            p.status = Some("external editing is unavailable for assistant definitions".into());
+            return;
+        };
+        let cwd = self.agents_cwd();
+        let lease = match begin_agent_editor_lease(&cwd, &editor.name, revision) {
+            Ok(lease) => lease,
+            Err(error) => {
+                p.status = Some(format!("external edit lease failed: {error}"));
+                return;
+            }
+        };
         let text = format!("{}\n", editor.text().trim_end_matches('\n'));
-        let staging = match agent_external_edit_staging(&path) {
+        let staging = match agent_external_edit_staging() {
             Ok(staging) => staging,
             Err(error) => {
                 p.status = Some(error);
@@ -750,10 +731,8 @@ impl SettingsCx {
         p.pending_external_edit = Some(AgentExternalEdit {
             id,
             agent: expected,
-            path,
-            original_contents: staging.original_contents,
-            original_metadata: staging.original_metadata,
             staging: staging.path,
+            lease_id: lease.lease_id,
             text_before_launch: text,
             draft,
             servicing: false,
@@ -796,7 +775,7 @@ impl SettingsCx {
                 let text = detail.original_text.clone();
                 p.detail = None;
                 let vim = self.extended.tui.vim_mode.vim_enabled();
-                p.editing = Some(AgentEditor::new(name, path, &text, vim));
+                p.editing = Some(AgentEditor::new(name, path, &text, vim, None));
             }
             _ => {}
         }
@@ -817,29 +796,37 @@ impl SettingsCx {
         let name = row.name.clone();
         let source = row.source.clone();
         let cwd = self.agents_cwd();
-        let path = match &source {
-            AgentRowSource::Agent => match self.agent_edit_path(&cwd, &name) {
-                Ok(path) => path,
-                Err(e) => {
-                    p.status = Some(format!("edit failed: {e}"));
+        let (path, original_text, revision) = match &source {
+            AgentRowSource::Agent => match editable_agent_snapshot(&cwd, &name) {
+                Ok(snapshot) => (
+                    cwd.join(".cockpit/agents").join(format!("{name}.md")),
+                    snapshot.markdown,
+                    Some(snapshot.revision),
+                ),
+                Err(error) => {
+                    p.status = Some(format!("edit failed: {error}"));
                     return;
                 }
             },
             AgentRowSource::Assistant { home_dir, .. } => {
-                cockpit_core::assistants::assistant_definition_path(home_dir)
-            }
-        };
-        let original_text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                p.status = Some(format!("edit failed: reading {}: {e}", path.display()));
-                return;
+                let path = cockpit_core::assistants::assistant_definition_path(home_dir);
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        p.status =
+                            Some(format!("edit failed: reading {}: {error}", path.display()));
+                        return;
+                    }
+                };
+                (path, text, None)
             }
         };
         let load_result = match &source {
-            AgentRowSource::Agent => {
-                cockpit_core::agents::load_workspace_named_from_file(&path, &name)
-            }
+            AgentRowSource::Agent => cockpit_core::agents::parse_agent(
+                &original_text,
+                &name,
+                PathBuf::from("<daemon-agent-snapshot>"),
+            ),
             AgentRowSource::Assistant { .. } => {
                 cockpit_core::agents::load_daemon_local_named_from_file(&path, &name)
             }
@@ -866,6 +853,7 @@ impl SettingsCx {
             name,
             path,
             original_text,
+            revision,
             def,
             draft: Box::new(draft),
             picker: ToolSurfacePicker::default(),
@@ -881,30 +869,24 @@ impl SettingsCx {
             return;
         };
         detail.row_errors.clear();
-        let current = match std::fs::read_to_string(&detail.path) {
-            Ok(text) => text,
-            Err(e) => {
-                detail.status = Some(format!(
-                    "save failed: reading {}: {e}",
-                    detail.path.display()
-                ));
+        if detail.revision.is_none() {
+            let current = match std::fs::read_to_string(&detail.path) {
+                Ok(text) => text,
+                Err(e) => {
+                    detail.status = Some(format!(
+                        "save failed: reading {}: {e}",
+                        detail.path.display()
+                    ));
+                    return;
+                }
+            };
+            if current != detail.original_text {
+                detail.status =
+                    Some("conflict: file changed on disk; raw editor can reconcile it".into());
                 return;
             }
-        };
-        if current != detail.original_text {
-            detail.status =
-                Some("conflict: file changed on disk; raw editor can reconcile it".into());
-            return;
         }
         detail.draft.write_to_def(&mut detail.def);
-        if let Err(error) = cockpit_core::agents::validate_invariants(&detail.def) {
-            let message = error.to_string();
-            if let Some(tool) = backticked_tool(&message) {
-                detail.row_errors.insert(tool, message.clone());
-            }
-            detail.status = Some(message);
-            return;
-        }
         let cleanup_notice = detail
             .status
             .clone()
@@ -916,9 +898,43 @@ impl SettingsCx {
                 return;
             }
         };
-        if let Err(e) = std::fs::write(&detail.path, &markdown) {
-            detail.status = Some(format!("write failed: {e}"));
-            return;
+        if let Some(revision) = detail.revision.clone() {
+            match mutate_agent(
+                &self.agents_cwd(),
+                cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                    name: detail.name.clone(),
+                    markdown: markdown.clone(),
+                },
+                Some(revision),
+            ) {
+                Ok(result) => {
+                    detail.revision = result.snapshot.map(|snapshot| snapshot.revision);
+                }
+                Err(error) => {
+                    detail.status = Some(format!("save failed: {error}"));
+                    return;
+                }
+            }
+        } else {
+            let AgentRowSource::Assistant { home_dir, .. } = &detail.source else {
+                detail.status = Some("save failed: missing daemon agent revision".into());
+                return;
+            };
+            let Some(file_name) = detail.path.file_name().and_then(|name| name.to_str()) else {
+                detail.status = Some("save failed: assistant definition has no filename".into());
+                return;
+            };
+            let base_hash = cockpit_core::assistants::markdown_content_hash(&detail.original_text);
+            let request = cockpit_core::daemon::proto::Request::FsWrite {
+                project_root: home_dir.to_string_lossy().into_owned(),
+                path: file_name.to_string(),
+                content: markdown.clone(),
+                base_hash: Some(base_hash),
+            };
+            if let Err(error) = crate::tui::agent_runner::daemon_request_blocking(request) {
+                detail.status = Some(format!("save Unavailable — {error}; Retry"));
+                return;
+            }
         }
         if let AgentRowSource::Assistant {
             home_dir,
@@ -958,16 +974,23 @@ impl SettingsCx {
             return;
         };
         let name = row.name.clone();
+        if matches!(&row.source, AgentRowSource::Assistant { .. }) {
+            p.status =
+                Some("assistant raw editing is unavailable from the agent-file editor".into());
+            return;
+        }
         let cwd = self.agents_cwd();
 
-        // Resolve (auto-ejecting a pristine built-in) the file to edit.
-        let path = match self.agent_edit_path(&cwd, &name) {
-            Ok(path) => path,
+        let snapshot = match editable_agent_snapshot(&cwd, &name) {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 p.status = Some(format!("edit failed: {e}"));
                 return;
             }
         };
+        // This path is presentation metadata only. The editor never writes it;
+        // the daemon resolves and owns the authoritative destination.
+        let path = cwd.join(".cockpit/agents").join(format!("{name}.md"));
 
         // 1. `$EDITOR` -> external process, serviced by the event loop.
         if std::env::var_os("EDITOR").is_some() {
@@ -975,14 +998,15 @@ impl SettingsCx {
             // marked overridden under the cursor; the loop will re-read the
             // file after the external editor returns.
             p.rows = rows_for(&cwd).0;
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
+            let text = snapshot.markdown.clone();
+            let lease = match begin_agent_editor_lease(&cwd, &name, snapshot.revision.clone()) {
+                Ok(lease) => lease,
                 Err(error) => {
-                    p.status = Some(format!("edit failed: reading {}: {error}", path.display()));
+                    p.status = Some(format!("external edit lease failed: {error}"));
                     return;
                 }
             };
-            let staging = match agent_external_edit_staging(&path) {
+            let staging = match agent_external_edit_staging() {
                 Ok(staging) => staging,
                 Err(error) => {
                     p.status = Some(error);
@@ -993,10 +1017,8 @@ impl SettingsCx {
             p.pending_external_edit = Some(AgentExternalEdit {
                 id,
                 agent: super::pointer_actions::AgentId(name.clone()),
-                path,
-                original_contents: staging.original_contents,
-                original_metadata: staging.original_metadata,
                 staging: staging.path,
+                lease_id: lease.lease_id,
                 text_before_launch: text,
                 draft: None,
                 servicing: false,
@@ -1006,18 +1028,18 @@ impl SettingsCx {
         }
 
         // 2/3. In-TUI editor: vim when enabled, else plain. No dead end.
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                p.status = Some(format!("edit failed: reading {}: {e}", path.display()));
-                return;
-            }
-        };
+        let text = snapshot.markdown;
         // Refresh rows so an auto-ejected built-in is marked overridden
         // while the in-TUI editor is open.
         p.rows = rows_for(&cwd).0;
         let vim = self.extended.tui.vim_mode.vim_enabled();
-        p.editing = Some(AgentEditor::new(name, path, &text, vim));
+        p.editing = Some(AgentEditor::new(
+            name,
+            path,
+            &text,
+            vim,
+            Some(snapshot.revision),
+        ));
         p.status = None;
     }
 
@@ -1028,49 +1050,30 @@ impl SettingsCx {
             return;
         };
         let name = row.name.clone();
+        if matches!(&row.source, AgentRowSource::Assistant { .. }) {
+            p.status =
+                Some("assistant raw editing is unavailable from the agent-file editor".into());
+            return;
+        }
         let cwd = self.agents_cwd();
-        let path = match self.agent_edit_path(&cwd, &name) {
-            Ok(path) => path,
+        let snapshot = match editable_agent_snapshot(&cwd, &name) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 p.status = Some(format!("edit failed: {error}"));
                 return;
             }
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                p.status = Some(format!("edit failed: reading {}: {error}", path.display()));
-                return;
-            }
-        };
+        let path = cwd.join(".cockpit/agents").join(format!("{name}.md"));
+        let text = snapshot.markdown;
         p.rows = rows_for(&cwd).0;
         p.editing = Some(AgentEditor::new(
             name,
             path,
             &text,
             self.extended.tui.vim_mode.vim_enabled(),
+            Some(snapshot.revision),
         ));
         p.status = None;
-    }
-
-    /// Resolve the on-disk file to edit for `name` in the current cwd's
-    /// agents layer, auto-ejecting a non-overridden built-in first. Custom
-    /// agents (and already-overridden built-ins) already live on disk; we
-    /// return their existing path so we never touch another layer.
-    fn agent_edit_path(&self, cwd: &std::path::Path, name: &str) -> anyhow::Result<PathBuf> {
-        if is_builtin_agent(name) {
-            // eject is a no-clobber no-op when an override already exists,
-            // returning the existing path; otherwise it writes the embedded
-            // default to this layer's `.cockpit/agents/<name>.md`.
-            let config_dir = self.agents_config_dir();
-            let (path, _newly) = cockpit_core::agents::eject_builtin(cwd, &config_dir, name)?;
-            Ok(path)
-        } else {
-            // Custom agent — edit its existing file in whatever layer it
-            // resolves from.
-            cockpit_core::agents::find_override(cwd, name)
-                .ok_or_else(|| anyhow::anyhow!("custom agent `{name}` has no on-disk file"))
-        }
     }
 
     /// Delete the highlighted **custom** agent (arm→confirm). Built-ins are
@@ -1091,12 +1094,15 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
-        match cockpit_core::agents::find_override(&cwd, &name) {
-            Some(path) => match std::fs::remove_file(&path) {
-                Ok(()) => p.status = Some(format!("deleted custom agent `{name}`")),
-                Err(e) => p.status = Some(format!("delete failed: {e}")),
-            },
-            None => p.status = Some(format!("delete failed: `{name}` has no on-disk file")),
+        match agent_snapshot(&cwd, &name).and_then(|snapshot| {
+            mutate_agent(
+                &cwd,
+                cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name: name.clone() },
+                Some(snapshot.revision),
+            )
+        }) {
+            Ok(_) => p.status = Some(format!("deleted custom agent `{name}`")),
+            Err(error) => p.status = Some(format!("delete failed: {error}")),
         }
         p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
@@ -1122,12 +1128,15 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
-        match cockpit_core::agents::find_override(&cwd, &name) {
-            Some(path) => match std::fs::remove_file(&path) {
-                Ok(()) => p.status = Some(format!("reset `{name}` to default")),
-                Err(e) => p.status = Some(format!("reset failed: {e}")),
-            },
-            None => p.status = Some(format!("reset: `{name}` has no override")),
+        match agent_snapshot(&cwd, &name).and_then(|snapshot| {
+            mutate_agent(
+                &cwd,
+                cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name: name.clone() },
+                Some(snapshot.revision),
+            )
+        }) {
+            Ok(_) => p.status = Some(format!("reset `{name}` to default")),
+            Err(error) => p.status = Some(format!("reset failed: {error}")),
         }
         p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
@@ -3146,20 +3155,12 @@ pub(super) mod tests {
         // for v1 agents; v2 agents redirect to the raw editor instead.
     }
 
-    #[cfg(unix)]
     #[test]
-    fn external_editor_rejects_initial_symlink_target() {
-        use std::os::unix::fs::symlink;
-        let tmp = TempDir::new().unwrap();
-        let real = tmp.path().join("real.md");
-        let link = tmp.path().join("link.md");
-        fs::write(&real, "real").unwrap();
-        symlink(&real, &link).unwrap();
-        let error = agent_external_edit_staging(&link)
-            .err()
-            .expect("symlink target must be rejected");
-        assert!(error.contains("symbolic link"), "{error}");
-        assert_eq!(fs::read_to_string(&real).unwrap(), "real");
+    fn external_editor_staging_is_a_private_regular_file() {
+        let staging = agent_external_edit_staging().expect("create isolated staging file");
+        let metadata = fs::symlink_metadata(&staging.path).unwrap();
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
     }
 
     #[cfg(not(unix))]

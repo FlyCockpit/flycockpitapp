@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use cockpit_core::agents::{AgentDef, GoalSettingsOverride};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -44,28 +43,62 @@ struct GoalSettingsDraft {
 }
 
 impl GoalSettingsDraft {
-    fn from_override(override_: &GoalSettingsOverride) -> Self {
-        Self {
-            cold_skeptic_count: override_.cold_skeptic_count,
-            cold_skeptic_model: override_.cold_skeptic_model.clone(),
-            max_verification_attempts: override_.max_verification_attempts,
-        }
+    fn from_json(raw: Option<&str>) -> Result<Self> {
+        let value = raw
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()?
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        Ok(Self {
+            cold_skeptic_count: value
+                .get("coldSkepticCount")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize),
+            cold_skeptic_model: value
+                .get("coldSkepticModel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            max_verification_attempts: value
+                .get("maxVerificationAttempts")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32),
+        })
     }
 
-    fn to_override(&self) -> GoalSettingsOverride {
-        GoalSettingsOverride {
-            default_token_budget: None,
-            planner_model: None,
-            evaluator_model: None,
-            gatekeeper_model: None,
-            cold_skeptic_count: self.cold_skeptic_count,
-            cold_skeptic_model: self
-                .cold_skeptic_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            max_verification_attempts: self.max_verification_attempts,
+    fn to_json(&self) -> Result<Option<String>> {
+        if self
+            .cold_skeptic_count
+            .is_some_and(|value| !(1..=5).contains(&value))
+        {
+            anyhow::bail!("skeptic count must be between 1 and 5");
+        }
+        if self.max_verification_attempts == Some(0) {
+            anyhow::bail!("max rounds must be at least 1");
+        }
+        let mut object = serde_json::Map::new();
+        if let Some(value) = self.cold_skeptic_count {
+            object.insert("coldSkepticCount".into(), value.into());
+        }
+        if let Some(value) = self
+            .cold_skeptic_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let valid = value
+                .split_once('/')
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty());
+            if !valid {
+                anyhow::bail!("skeptic model must use provider/model form");
+            }
+            object.insert("coldSkepticModel".into(), value.into());
+        }
+        if let Some(value) = self.max_verification_attempts {
+            object.insert("maxVerificationAttempts".into(), value.into());
+        }
+        if object.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(serde_json::to_string(&object)?))
         }
     }
 
@@ -82,7 +115,8 @@ pub(crate) struct GoalSettingsPane {
     agent_name: String,
     cwd: PathBuf,
     root_foreground: bool,
-    def: AgentDef,
+    revision: String,
+    supports_agent_save: bool,
     draft: GoalSettingsDraft,
     cursor: usize,
     status: Option<String>,
@@ -91,9 +125,17 @@ pub(crate) struct GoalSettingsPane {
 
 impl GoalSettingsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
-        let def = cockpit_core::agents::resolve(cwd, agent_name)?
-            .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
-        let draft = GoalSettingsDraft::from_override(&def.goal_supervision);
+        let response = crate::tui::agent_runner::daemon_request_blocking(
+            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                project_root: cwd.to_string_lossy().into_owned(),
+                name: agent_name.to_string(),
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
+            anyhow::bail!("daemon returned an unexpected agent snapshot");
+        };
+        let draft = GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())?;
         let status = (!root_foreground).then(|| {
             "Apply is disabled while an interactive subagent holds the foreground.".to_string()
         });
@@ -101,7 +143,8 @@ impl GoalSettingsPane {
             agent_name: agent_name.to_string(),
             cwd: cwd.to_path_buf(),
             root_foreground,
-            def,
+            revision: snapshot.revision,
+            supports_agent_save: snapshot.supports_goal_supervision,
             draft,
             cursor: 0,
             status,
@@ -270,39 +313,38 @@ impl GoalSettingsPane {
     }
 
     fn build_save(&mut self, target: GoalSettingsSaveTarget) -> Result<GoalSettingsOutcome> {
-        let override_ = self.draft.to_override();
-        override_.validate()?;
-        let override_json = if override_.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&override_)?)
-        };
+        let override_json = self.draft.to_json()?;
         if target == GoalSettingsSaveTarget::Agent {
             // vNext documents deliberately reject `goalSupervision` as a
             // retired legacy field.  Do not report a successful agent save
             // when canonical vNext serialization would omit the override.
-            if self.def.vnext.is_some() {
+            if !self.supports_agent_save {
                 anyhow::bail!(
                     "agent-scoped goal settings are unavailable for vNext agents; save them for this session instead"
                 );
             }
-            let mut def = self.def.clone();
-            def.goal_supervision = override_;
-            cockpit_core::agents::validate_invariants(&def)?;
-            self.write_agent_def(&def)?;
-            self.def = def;
+            let response = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::MutateAgent {
+                    project_root: self.cwd.to_string_lossy().into_owned(),
+                    mutation: cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
+                        name: self.agent_name.clone(),
+                        goal_supervision_json: override_json.clone(),
+                    },
+                    expected_revision: Some(self.revision.clone()),
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
+                anyhow::bail!("daemon returned an unexpected goal-settings response");
+            };
+            if let Some(snapshot) = result.snapshot {
+                self.revision = snapshot.revision;
+            }
         }
         Ok(GoalSettingsOutcome::Apply {
             override_json,
             persist_session: target == GoalSettingsSaveTarget::Session,
         })
-    }
-
-    fn write_agent_def(&self, def: &AgentDef) -> Result<()> {
-        let path = agent_edit_path(&self.cwd, &self.agent_name)?;
-        let markdown = def.to_markdown()?;
-        std::fs::write(&path, markdown).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -392,17 +434,6 @@ fn adjust_positive(current: i64, delta: i32) -> i64 {
     (current + i64::from(delta)).max(1)
 }
 
-fn agent_edit_path(cwd: &Path, name: &str) -> Result<PathBuf> {
-    if cockpit_core::agents::is_builtin_agent(name) {
-        let config_dir = cwd.join(".cockpit");
-        let (path, _newly) = cockpit_core::agents::eject_builtin(cwd, &config_dir, name)?;
-        Ok(path)
-    } else {
-        cockpit_core::agents::find_override(cwd, name)
-            .ok_or_else(|| anyhow::anyhow!("custom agent `{name}` has no on-disk file"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +453,7 @@ mod tests {
             pane.field_labels(),
             vec!["skeptic count", "skeptic model", "max rounds"]
         );
-        assert!(pane.draft.to_override().is_empty());
+        assert!(pane.draft.to_json().unwrap().is_none());
     }
 
     #[test]

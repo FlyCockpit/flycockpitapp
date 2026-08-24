@@ -153,9 +153,9 @@ fn inventory_sync(root: &Path) -> Result<Response, ErrorPayload> {
     let entries = crate::agents::list_all(root)
         .into_iter()
         .map(|entry| {
-            let (model, valid, diagnostic) = match entry.def {
-                Ok(def) => (def.model, true, None),
-                Err(error) => (None, false, Some(format!("{error:#}"))),
+            let (description, model, valid, diagnostic) = match entry.def {
+                Ok(def) => (Some(def.description), def.model, true, None),
+                Err(error) => (None, None, false, Some(format!("{error:#}"))),
             };
             AgentInventoryEntry {
                 name: entry.name,
@@ -167,6 +167,7 @@ fn inventory_sync(root: &Path) -> Result<Response, ErrorPayload> {
                     entry.kind,
                     crate::agents::AgentKind::Builtin { overridden: true }
                 ),
+                description,
                 model,
                 valid,
                 diagnostic,
@@ -203,6 +204,7 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         revision,
         goal_supervision_json,
         editable: overridden || !crate::agents::is_builtin_agent(name),
+        supports_goal_supervision: def.vnext.is_none(),
     })
 }
 
@@ -212,7 +214,8 @@ fn mutate_sync(
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     let lock_target = root.join(".cockpit/config.json");
-    let _guard = cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
+    let _guard =
+        cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
     let generation = crate::daemon::server::inventory::compare_and_bump_config_generation(
         crate::daemon::server::inventory::current_config_generation(),
     )
@@ -243,12 +246,9 @@ fn mutate_sync(
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
-            let parsed = crate::agents::parse_agent(
-                &markdown,
-                &name,
-                PathBuf::from("<daemon-agent-edit>"),
-            )
-            .map_err(bad_config)?;
+            let parsed =
+                crate::agents::parse_agent(&markdown, &name, PathBuf::from("<daemon-agent-edit>"))
+                    .map_err(bad_config)?;
             crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
             let target = project_agent_path(root, &name)?;
             std::fs::create_dir_all(target.parent().expect("agent path has parent"))
@@ -266,7 +266,9 @@ fn mutate_sync(
             ensure_revision(&current.revision, expected_revision.as_deref())?;
             let target = project_agent_path(root, &name)?;
             if !target.is_file() {
-                return Err(bad_request("custom agent is not owned by this workspace layer"));
+                return Err(bad_request(
+                    "custom agent is not owned by this workspace layer",
+                ));
             }
             cockpit_config::config::remove_config_file_atomic(&target).map_err(internal)?;
             (true, 1, None)
@@ -319,8 +321,9 @@ fn mutate_sync(
                 ));
             }
             def.goal_supervision = match goal_supervision_json {
-                Some(raw) => crate::agents::parse_goal_settings_override_json(&raw)
-                    .map_err(bad_config)?,
+                Some(raw) => {
+                    crate::agents::parse_goal_settings_override_json(&raw).map_err(bad_config)?
+                }
                 None => crate::agents::GoalSettingsOverride::default(),
             };
             crate::agents::validate_invariants(&def).map_err(bad_config)?;

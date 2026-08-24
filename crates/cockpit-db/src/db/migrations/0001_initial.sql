@@ -19,7 +19,10 @@ CREATE TABLE assistants (
     name         TEXT    PRIMARY KEY,
     created_at   INTEGER NOT NULL,
     home_dir     TEXT    NOT NULL,
-    config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(config_json)),
+    config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (
+        json_valid(config_json) AND json_type(config_json) = 'object'
+        AND length(CAST(config_json AS BLOB)) <= 1048576
+    ),
     content_hash TEXT    NOT NULL CHECK (
         length(content_hash) = 64
         AND content_hash = lower(content_hash)
@@ -32,15 +35,26 @@ CREATE TABLE assistants (
 CREATE TABLE scheduled_jobs (
     id                TEXT    PRIMARY KEY,
     owner             TEXT    NOT NULL,
-    schedule_json     TEXT    NOT NULL CHECK (json_valid(schedule_json)),
-    payload_json      TEXT    NOT NULL CHECK (json_valid(payload_json)),
+    schedule_json     TEXT    NOT NULL CHECK (
+        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
+        AND length(CAST(schedule_json AS BLOB)) <= 65536
+    ),
+    payload_json      TEXT    NOT NULL CHECK (
+        json_valid(payload_json)
+        AND length(CAST(payload_json AS BLOB)) <= 1048576
+    ),
     enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
     last_run_at       INTEGER,
     next_run_at       INTEGER,
-    last_result_json  TEXT CHECK (last_result_json IS NULL OR json_valid(last_result_json)),
+    last_result_json  TEXT CHECK (
+        last_result_json IS NULL OR (
+            json_valid(last_result_json)
+            AND length(CAST(last_result_json AS BLOB)) <= 1048576
+        )
+    ),
     failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
     backoff_until     INTEGER,
     disabled_notice   TEXT
@@ -64,16 +78,28 @@ CREATE TABLE sessions (
     provider        TEXT,
     model           TEXT,
     model_selection_json TEXT CHECK (
-        model_selection_json IS NULL OR json_valid(model_selection_json)
+        model_selection_json IS NULL OR (
+            json_valid(model_selection_json)
+            AND json_type(model_selection_json) = 'object'
+            AND length(CAST(model_selection_json AS BLOB)) <= 65536
+        )
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0,
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     tool_surface_override_json TEXT CHECK (
-        tool_surface_override_json IS NULL OR json_valid(tool_surface_override_json)
+        tool_surface_override_json IS NULL OR (
+            json_valid(tool_surface_override_json)
+            AND json_type(tool_surface_override_json) = 'object'
+            AND length(CAST(tool_surface_override_json AS BLOB)) <= 1048576
+        )
     ),
     goal_settings_override_json TEXT CHECK (
-        goal_settings_override_json IS NULL OR json_valid(goal_settings_override_json)
+        goal_settings_override_json IS NULL OR (
+            json_valid(goal_settings_override_json)
+            AND json_type(goal_settings_override_json) = 'object'
+            AND length(CAST(goal_settings_override_json AS BLOB)) <= 65536
+        )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
     assistant_name  TEXT,
@@ -105,11 +131,21 @@ CREATE TABLE sessions (
     -- Accumulated session egress redaction table. Stores literal redaction
     -- candidates so resumed raw transcripts remain covered even if the
     -- original env/dotenv source has changed or disappeared.
-    redaction_table_json TEXT,
+    redaction_table_json TEXT CHECK (
+        redaction_table_json IS NULL OR (
+            json_valid(redaction_table_json)
+            AND json_type(redaction_table_json) IN ('array', 'object')
+            AND length(CAST(redaction_table_json AS BLOB)) <= 8388608
+        )
+    ),
 
     -- Frozen model-specific system-prompt snapshot for this conversation
     -- lineage. JSON object keyed provider id -> model id -> prompt body.
-    model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    model_system_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(model_system_prompt_snapshot_json)
+        AND json_type(model_system_prompt_snapshot_json) = 'object'
+        AND length(CAST(model_system_prompt_snapshot_json AS BLOB)) <= 8388608
+    ),
 
     -- 1 for hidden side-conversation forks. Legacy `/side` rows are
     -- throwaway and swept on daemon boot; BTW rows carry
@@ -1476,7 +1512,11 @@ CREATE TABLE session_events (
     call_id     TEXT,                              -- correlation key, when applicable
     task_call_id TEXT,                             -- owning delegation run, when inside a child
     label       TEXT,                              -- delegation label paired with task_call_id
-    data_json   TEXT    NOT NULL DEFAULT '{}',     -- per-type payload
+    data_json   TEXT    NOT NULL DEFAULT '{}' CHECK (
+        json_valid(data_json)
+        AND json_type(data_json) = 'object'
+        AND length(CAST(data_json AS BLOB)) <= 8388608
+    ),                                             -- per-type payload
     -- assistant-turn reasoning projected out of `data_json` so queries and
     -- exports can read it column-wise without parsing JSON (the same idiom
     -- the FTS triggers use against `$.text`). VIRTUAL: computed on read.

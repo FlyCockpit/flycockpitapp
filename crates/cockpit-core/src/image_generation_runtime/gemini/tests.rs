@@ -896,13 +896,13 @@ fn gemini_adapter_parse_rejects_auth_failure_status() {
         connection: super::super::ConnectionProof {
             authority: "generativelanguage.googleapis.com:443".into(),
             connected_ip: ip,
-            location: super::super::AddressClass::PublicRemote,
+            location: super::super::AddressClass::PublicNetwork,
             established_at: 0,
             hops: vec![ConnectionHop {
                 authority: "generativelanguage.googleapis.com:443".into(),
                 hostname: "generativelanguage.googleapis.com".into(),
                 connected_ip: ip,
-                location: super::super::AddressClass::PublicRemote,
+                location: super::super::AddressClass::PublicNetwork,
             }],
         },
     };
@@ -947,13 +947,13 @@ fn gemini_adapter_parse_success_returns_healthy() {
         connection: super::super::ConnectionProof {
             authority: "generativelanguage.googleapis.com:443".into(),
             connected_ip: ip,
-            location: super::super::AddressClass::PublicRemote,
+            location: super::super::AddressClass::PublicNetwork,
             established_at: 0,
             hops: vec![ConnectionHop {
                 authority: "generativelanguage.googleapis.com:443".into(),
                 hostname: "generativelanguage.googleapis.com".into(),
                 connected_ip: ip,
-                location: super::super::AddressClass::PublicRemote,
+                location: super::super::AddressClass::PublicNetwork,
             }],
         },
     };

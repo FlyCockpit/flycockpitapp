@@ -2017,7 +2017,7 @@ impl OpenrouterImagesTransport for OpenrouterImagesHttpTransport {
         header_map.insert(AUTHORIZATION, self.authorization.clone());
         header_map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        VettedHttpClient::new(self.dns.clone(), AddressClass::PublicRemote)
+        VettedHttpClient::new(self.dns.clone(), AddressClass::PublicNetwork)
             .execute(Method::POST, &url, header_map, Some(body), self.body_limit)
             .await
     }

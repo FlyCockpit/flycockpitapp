@@ -212,7 +212,7 @@ impl std::error::Error for RuntimeError {}
 pub enum AddressClass {
     Loopback,
     PrivateLan,
-    PublicRemote,
+    PublicNetwork,
     Forbidden,
 }
 impl AddressClass {
@@ -223,7 +223,7 @@ impl AddressClass {
         match self {
             AddressClass::Loopback => "loopback",
             AddressClass::PrivateLan => "private_lan",
-            AddressClass::PublicRemote => "public_remote",
+            AddressClass::PublicNetwork => "public_network",
             AddressClass::Forbidden => "forbidden",
         }
     }
@@ -275,14 +275,14 @@ pub fn classify_address(ip: IpAddr) -> AddressClass {
     } {
         AddressClass::PrivateLan
     } else {
-        AddressClass::PublicRemote
+        AddressClass::PublicNetwork
     }
 }
 pub(crate) fn declared_class(class: ImageLocationClass) -> AddressClass {
     match class {
         ImageLocationClass::Local => AddressClass::Loopback,
         ImageLocationClass::PrivateNetwork => AddressClass::PrivateLan,
-        ImageLocationClass::PublicCloud => AddressClass::PublicRemote,
+        ImageLocationClass::PublicCloud => AddressClass::PublicNetwork,
     }
 }
 fn origin_authority(url: &reqwest::Url, hostname: &str) -> String {

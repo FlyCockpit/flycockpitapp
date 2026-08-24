@@ -49,13 +49,13 @@ fn response(status: reqwest::StatusCode) -> BoundProbeResponse {
         connection: ConnectionProof {
             authority: "openrouter.ai:443".into(),
             connected_ip: ip,
-            location: AddressClass::PublicRemote,
+            location: AddressClass::PublicNetwork,
             established_at: 0,
             hops: vec![ConnectionHop {
                 authority: "openrouter.ai:443".into(),
                 hostname: "openrouter.ai".into(),
                 connected_ip: ip,
-                location: AddressClass::PublicRemote,
+                location: AddressClass::PublicNetwork,
             }],
         },
     }

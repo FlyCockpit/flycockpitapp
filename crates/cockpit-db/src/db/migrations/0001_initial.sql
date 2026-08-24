@@ -5183,7 +5183,7 @@ CREATE TABLE image_generation_attempts (
     dispatch_proof_config_generation INTEGER CHECK(dispatch_proof_config_generation IS NULL OR dispatch_proof_config_generation >= 0),
     dispatch_proof_refresh_epoch INTEGER CHECK(dispatch_proof_refresh_epoch IS NULL OR dispatch_proof_refresh_epoch >= 0),
     dispatch_proof_connected_ip TEXT,
-    dispatch_proof_location_class TEXT CHECK(dispatch_proof_location_class IS NULL OR dispatch_proof_location_class IN ('loopback','private_lan','public_remote','forbidden')),
+    dispatch_proof_location_class TEXT CHECK(dispatch_proof_location_class IS NULL OR dispatch_proof_location_class IN ('loopback','private_lan','public_network','forbidden')),
     dispatch_proof_hops_digest TEXT CHECK(dispatch_proof_hops_digest IS NULL OR length(dispatch_proof_hops_digest)=64),
     PRIMARY KEY(job_id,slot_id,attempt_number),
     UNIQUE(provider_request_identity),

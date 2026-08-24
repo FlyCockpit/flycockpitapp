@@ -3214,9 +3214,9 @@ mod tests {
 
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Pre-release: `migrations/` is exactly `0001_initial.sql`. The
-        // expected list is an independent literal so a stray file (or a
-        // deletion) is caught rather than mirrored from `MIGRATIONS`.
+        // Pre-release: the directory contains the local base plus the opt-in
+        // remote profile extension. The independent literal catches stray or
+        // deleted schema inputs without deriving expectations from MIGRATIONS.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -3228,6 +3228,12 @@ mod tests {
             .collect();
         migrations.sort();
 
-        assert_eq!(migrations, vec!["0001_initial.sql".to_string()]);
+        assert_eq!(
+            migrations,
+            vec![
+                "0001_initial.sql".to_string(),
+                "0001_remote_profile.sql".to_string(),
+            ]
+        );
     }
 }

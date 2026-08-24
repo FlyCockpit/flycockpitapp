@@ -127,7 +127,7 @@ impl GeminiImagesTransport for GeminiImagesHttpTransport {
             self.api_key.clone(),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        VettedHttpClient::new(self.dns.clone(), AddressClass::PublicRemote)
+        VettedHttpClient::new(self.dns.clone(), AddressClass::PublicNetwork)
             .execute(Method::POST, &url, headers, Some(body), self.body_limit)
             .await
     }

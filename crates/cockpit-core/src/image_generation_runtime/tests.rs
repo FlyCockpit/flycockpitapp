@@ -104,7 +104,7 @@ impl BoundConnector for MismatchedConnector {
                 connection: ConnectionProof {
                     authority: format!("wrong.{authority}"),
                     connected_ip: "1.1.1.1".parse().unwrap(),
-                    location: AddressClass::PublicRemote,
+                    location: AddressClass::PublicNetwork,
                     established_at: 0,
                     hops: vec![],
                 },
@@ -770,14 +770,14 @@ fn image_generation_runtime_revalidates_every_redirect_hop() {
     let proof = ConnectionProof {
         authority: "example.com:443".into(),
         connected_ip: "8.8.8.8".parse().unwrap(),
-        location: AddressClass::PublicRemote,
+        location: AddressClass::PublicNetwork,
         established_at: 0,
         hops: vec![
             ConnectionHop {
                 authority: "example.com:443".into(),
                 hostname: "example.com".into(),
                 connected_ip: "8.8.8.8".parse().unwrap(),
-                location: AddressClass::PublicRemote,
+                location: AddressClass::PublicNetwork,
             },
             ConnectionHop {
                 authority: "redirect.example:443".into(),
@@ -790,7 +790,7 @@ fn image_generation_runtime_revalidates_every_redirect_hop() {
     assert!(matches!(
         ImageRuntimeRegistry::validate_connection_hops(
             &proof,
-            AddressClass::PublicRemote,
+            AddressClass::PublicNetwork,
             &["8.8.8.8".parse().unwrap()],
         ),
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
@@ -800,7 +800,7 @@ fn image_generation_runtime_revalidates_every_redirect_hop() {
     assert!(matches!(
         ImageRuntimeRegistry::validate_connection_hops(
             &too_many,
-            AddressClass::PublicRemote,
+            AddressClass::PublicNetwork,
             &["8.8.8.8".parse().unwrap()],
         ),
         Err(error) if error.code == RuntimeErrorCode::RedirectLimit

@@ -1,6 +1,5 @@
 //! Bounded, no-follow normalization for browser typed-file paste paths.
 
-use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Cursor, Read};
 use std::path::Path;
 
@@ -265,7 +264,7 @@ fn skip_gif_sub_blocks(bytes: &[u8], cursor: &mut usize) -> bool {
     }
 }
 
-fn validate_metadata(metadata: &Metadata) -> Result<(), ImageProbeError> {
+fn validate_metadata(metadata: &std::fs::Metadata) -> Result<(), ImageProbeError> {
     if !metadata.is_file() || metadata.len() > MAX_INPUT_BYTES {
         return Err(ImageProbeError::PasteUnavailable);
     }
@@ -273,9 +272,9 @@ fn validate_metadata(metadata: &Metadata) -> Result<(), ImageProbeError> {
 }
 
 #[cfg(unix)]
-fn open_no_follow(path: &Path) -> Result<File, ImageProbeError> {
+fn open_no_follow(path: &Path) -> Result<std::fs::File, ImageProbeError> {
     use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
+    std::fs::OpenOptions::new() // Unix no-follow read-only handle.
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
@@ -283,10 +282,10 @@ fn open_no_follow(path: &Path) -> Result<File, ImageProbeError> {
 }
 
 #[cfg(windows)]
-fn open_no_follow(path: &Path) -> Result<File, ImageProbeError> {
+fn open_no_follow(path: &Path) -> Result<std::fs::File, ImageProbeError> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    OpenOptions::new()
+    std::fs::OpenOptions::new() // Windows reparse-point read-only handle.
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
@@ -294,12 +293,12 @@ fn open_no_follow(path: &Path) -> Result<File, ImageProbeError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_no_follow(_path: &Path) -> Result<File, ImageProbeError> {
+fn open_no_follow(_path: &Path) -> Result<std::fs::File, ImageProbeError> {
     Err(ImageProbeError::PasteUnavailable)
 }
 
 #[cfg(unix)]
-fn same_file(before: &Metadata, after: &Metadata) -> bool {
+fn same_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     before.dev() == after.dev()
         && before.ino() == after.ino()
@@ -310,13 +309,13 @@ fn same_file(before: &Metadata, after: &Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn same_file(before: &Metadata, after: &Metadata) -> bool {
+fn same_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     before.file_size() == after.file_size() && before.last_write_time() == after.last_write_time()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file(_before: &Metadata, _after: &Metadata) -> bool {
+fn same_file(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
     false
 }
 

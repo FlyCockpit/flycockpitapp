@@ -9,6 +9,25 @@ fn read(relative: &str) -> String {
     fs::read_to_string(repo_root().join(relative)).unwrap()
 }
 
+/// A `*_tests.rs` spelling is not evidence that a module is test-only. Accept
+/// the exclusion only when its owning module declaration is itself cfg(test).
+fn is_explicit_cfg_test_module(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let declarations = [parent.join("mod.rs"), parent.with_extension("rs")];
+    declarations.into_iter().any(|owner| {
+        let Ok(source) = fs::read_to_string(owner) else {
+            return false;
+        };
+        let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        compact.contains(&format!("#[cfg(test)]mod{stem};"))
+    })
+}
+
 fn tui_sources() -> String {
     fn collect(path: &Path, out: &mut String) {
         for entry in fs::read_dir(path).unwrap() {
@@ -144,10 +163,7 @@ fn full_production_tree_rejects_agent_and_config_authority() {
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
                 || path.components().any(|part| part.as_os_str() == "tests")
-                || path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.ends_with("_tests.rs"))
+                || is_explicit_cfg_test_module(&path)
             {
                 continue;
             }
@@ -241,10 +257,7 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
                 || path.components().any(|part| part.as_os_str() == "tests")
-                || path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.ends_with("_tests.rs"))
+                || is_explicit_cfg_test_module(&path)
             {
                 continue;
             }
@@ -301,6 +314,28 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
                     ));
                 }
             }
+            let compact: String = production
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            for statement in compact
+                .split(';')
+                .filter(|statement| statement.starts_with("use"))
+            {
+                let authority = statement.contains("std::process")
+                    || statement.contains("tokio::process")
+                    || statement.contains("std::net")
+                    || statement.contains("tokio::net")
+                    || statement.contains("std::{process")
+                    || statement.contains("tokio::{process")
+                    || statement.contains("std::{net")
+                    || statement.contains("tokio::{net");
+                if authority && statement.contains("as") {
+                    findings.push(format!(
+                        "{relative}: grouped/renamed process or network import obscures audit: {statement}"
+                    ));
+                }
+            }
         }
     }
 
@@ -345,7 +380,13 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "std::fs::File::create",
         "File::create",
         "std::fs::OpenOptions",
+        "OpenOptions::new(",
         "std::fs::File::options",
+        ".write(true)",
+        ".append(true)",
+        ".truncate(true)",
+        ".create(true)",
+        ".create_new(true)",
         ".set_len(",
         "file.write(",
         "temp.write(",
@@ -378,6 +419,15 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
             "let mut file = std::fs::OpenOptions::new()",
+        ),
+        ("crates/cockpit-tui/src/tui/async_action.rs", ".write(true)"),
+        (
+            "crates/cockpit-tui/src/tui/image_path_probe.rs",
+            "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/image_path_probe.rs",
+            "std::fs::OpenOptions::new() // Windows reparse-point read-only handle.",
         ),
         (
             "crates/cockpit-tui/src/tui/async_action.rs",
@@ -453,10 +503,7 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             }
             if path.extension().and_then(|value| value.to_str()) != Some("rs")
                 || path.components().any(|part| part.as_os_str() == "tests")
-                || path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.ends_with("_tests.rs"))
+                || is_explicit_cfg_test_module(&path)
             {
                 continue;
             }
@@ -471,18 +518,22 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                for mutation in MUTATIONS {
-                    if !line.contains(mutation) {
-                        continue;
-                    }
+                let matched: Vec<_> = MUTATIONS
+                    .iter()
+                    .filter(|mutation| line.contains(**mutation))
+                    .collect();
+                if !matched.is_empty() {
                     let allowed = ALLOWED_LINES
                         .iter()
                         .find(|(file, exact)| relative == *file && line.trim() == *exact);
                     if let Some(allowed) = allowed {
                         *allowed_hits.entry(*allowed).or_default() += 1;
-                    }
-                    if allowed.is_none() {
-                        findings.push(format!("{relative}:{}: {mutation}", line_number + 1));
+                    } else {
+                        findings.push(format!(
+                            "{relative}:{}: {}",
+                            line_number + 1,
+                            matched.into_iter().copied().collect::<Vec<_>>().join(", ")
+                        ));
                     }
                 }
             }
@@ -518,6 +569,36 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                 {
                     findings.push(format!(
                         "{relative}: filesystem mutation import/alias obscures authority audit: {line}"
+                    ));
+                }
+            }
+            let compact: String = production
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect();
+            for statement in compact
+                .split(';')
+                .filter(|statement| statement.starts_with("use"))
+            {
+                let authority_import = statement.contains("std::fs")
+                    || statement.contains("tokio::fs")
+                    || statement.contains("std::{fs")
+                    || statement.contains("tokio::{fs");
+                let mutation_import = [
+                    "write",
+                    "remove_file",
+                    "remove_dir",
+                    "rename",
+                    "create_dir",
+                    "create_dir_all",
+                    "set_permissions",
+                    "OpenOptions",
+                ]
+                .iter()
+                .any(|name| statement.contains(name));
+                if authority_import && (statement.contains("as") || mutation_import) {
+                    findings.push(format!(
+                        "{relative}: grouped/renamed filesystem authority import obscures audit: {statement}"
                     ));
                 }
             }

@@ -123,7 +123,8 @@ pub fn assistant_definition_path(home_dir: &Path) -> PathBuf {
     home_dir.join("assistant.md")
 }
 
-pub fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
+#[cfg(test)]
+fn load_from_home(name: &str, home_dir: &Path) -> Result<AssistantDef> {
     validate_assistant_name(name)?;
     let path = assistant_definition_path(home_dir);
     let agent = crate::agents::load_daemon_local_named_from_file(&path, name)
@@ -904,9 +905,16 @@ fn delete_registration_sync(db: &Db, name: &str, expected_revision: &str) -> Res
     let row = get_assistant_blocking(db, name)?
         .context("assistant disappeared during delete recovery")?;
     validate_row_home(&row)?;
-    recover_definition_journal_locked(db, &row)?;
     if registration_revision(&row) != expected_revision {
         bail!("assistant registration changed since delete confirmation");
+    }
+    // Explicit unregister supersedes an unfinished definition save. The
+    // definition/home are intentionally retained, but the private recovery
+    // journal must not remain able to influence a later registration. This is
+    // also what makes a missing or corrupt definition safely unregisterable.
+    let definition_journal = definition_journal_path(&home);
+    if cockpit_config::config::read_config_file_nofollow(&definition_journal)?.is_some() {
+        cockpit_config::config::remove_config_file_atomic(&definition_journal)?;
     }
     db.write_blocking(move |conn| {
         let changed = conn.execute(

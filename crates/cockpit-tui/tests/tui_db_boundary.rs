@@ -160,7 +160,13 @@ fn full_production_tree_rejects_agent_and_config_authority() {
                 "cockpit_core::agents::resolve(",
                 "cockpit_core::agents::list_all(",
                 "cockpit_core::agents::eject_builtin(",
+                "cockpit_core::agents::find_override(",
                 "cockpit_core::agents::reset_all_builtins(",
+                "cockpit_core::agents::load_workspace_named_from_file(",
+                "cockpit_core::agents::load_daemon_local_named_from_file(",
+                "cockpit_core::assistants::load_from_home(",
+                "cockpit_core::assistants::load_verified(",
+                "cockpit_config::config::extended::ExtendedConfigDoc::load(",
                 "Request::SaveExtendedConfig",
                 "patch_json:",
             ] {
@@ -172,6 +178,115 @@ fn full_production_tree_rejects_agent_and_config_authority() {
     }
     let mut findings = Vec::new();
     visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    assert!(
+        findings.is_empty(),
+        "authority leaks:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn production_process_and_network_authority_is_exactly_allowlisted() {
+    const AUTHORITY: &[&str] = &[
+        "std::process::Command::new(",
+        "tokio::process::Command::new(",
+        "std::net::TcpStream::connect(",
+        "tokio::net::TcpStream::connect(",
+        "tokio::net::TcpListener::bind(",
+        "tokio::net::UdpSocket::bind(",
+        "reqwest::Client::",
+        "tokio_tungstenite::",
+    ];
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/cockpit-tui/src/clipboard/service.rs",
+            "let mut child = std::process::Command::new(\"tmux\")",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/terminal_suspend.rs",
+            "let mut child = tokio::process::Command::new(&editor)",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/terminal_suspend.rs",
+            "std::process::Command::new(\"true\")",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/events.rs",
+            "command = std::process::Command::new(\"cmd\");",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/events.rs",
+            "command = std::process::Command::new(shell);",
+        ),
+        (
+            "crates/cockpit-tui/src/tui/app/events.rs",
+            "let mut command = std::process::Command::new(\"git\");",
+        ),
+    ];
+
+    fn visit(
+        path: &Path,
+        findings: &mut Vec<String>,
+        hits: &mut std::collections::HashMap<(&'static str, &'static str), usize>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, findings, hits);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path.components().any(|part| part.as_os_str() == "tests")
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with("_tests.rs"))
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(&source);
+            let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
+            for (line_number, line) in production.lines().enumerate() {
+                for authority in AUTHORITY {
+                    if !line.contains(authority) {
+                        continue;
+                    }
+                    if let Some(allowed) = ALLOWED
+                        .iter()
+                        .find(|(file, exact)| relative == *file && line.trim() == *exact)
+                    {
+                        *hits.entry(*allowed).or_default() += 1;
+                    } else {
+                        findings.push(format!(
+                            "{relative}:{}: unowned authority {authority}",
+                            line_number + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    let mut hits = std::collections::HashMap::new();
+    visit(
+        &repo_root().join("crates/cockpit-tui/src"),
+        &mut findings,
+        &mut hits,
+    );
+    for allowed in ALLOWED {
+        let count = hits.get(allowed).copied().unwrap_or_default();
+        if count != 1 {
+            findings.push(format!(
+                "allowlisted host integration must occur exactly once: {}: {:?} (found {count})",
+                allowed.0, allowed.1
+            ));
+        }
+    }
     assert!(
         findings.is_empty(),
         "authority leaks:\n{}",
@@ -199,17 +314,26 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "std::fs::OpenOptions",
         "std::fs::File::options",
         ".set_len(",
-        ".write(",
+        "file.write(",
+        "temp.write(",
+        "stdin.write(",
+        "out.write(",
+        "lock.write(",
         "tokio::fs::write",
         "tokio::fs::remove_file",
         "tokio::fs::create_dir_all",
         "tokio::fs::set_permissions",
+        "cockpit_config::config::write_config_bytes_atomic",
         ".write_all(",
     ];
     // Every exception is a single reviewed source line, not a whole-file
     // exemption. Adding a second mutation in an allowed host-integration file
     // must therefore update this inventory explicitly.
     const ALLOWED_LINES: &[(&str, &str)] = &[
+        (
+            "crates/cockpit-tui/src/tui/settings/agents_page.rs",
+            "cockpit_config::config::write_config_bytes_atomic(&staging.path, text.as_bytes())",
+        ),
         (
             "crates/cockpit-tui/src/tui/app/panes.rs",
             "if let Err(error) = std::fs::write(&path, effect.text_before_launch) {",

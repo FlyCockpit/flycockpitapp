@@ -4241,10 +4241,10 @@ async fn handle_serialized_request_impl(
             }
             let home_dir = crate::assistants::default_home_dir(&name)
                 .map_err(|error| bad_request(error.to_string()))?;
-            let row = crate::assistants::create_assistant(
+            crate::assistants::create_assistant(
                 &ctx.db,
                 crate::assistants::CreateAssistantSpec {
-                    name,
+                    name: name.clone(),
                     description,
                     prompt,
                     home_dir,
@@ -4252,8 +4252,12 @@ async fn handle_serialized_request_impl(
             )
             .await
             .map_err(|error| bad_request(error.to_string()))?;
+            let snapshot = crate::assistants::snapshot(&ctx.db, &name)
+                .await
+                .map_err(internal)?
+                .context("assistant disappeared after creation")?;
             let response = Response::AssistantUpserted {
-                assistant: assistant_to_proto(row),
+                assistant: assistant_snapshot_to_proto(snapshot),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "upsert_assistant", response)
         }
@@ -9007,13 +9011,17 @@ fn agent_editor_lease_owner(state: &MutableClientState) -> String {
     // exact revision in the daemon registry; this stable authenticated
     // principal digest prevents another principal from claiming it without
     // tying it to one short-lived socket connection.
-    principal_digest(&state.principal)
+    stable_authenticated_principal(state)
 }
 
 fn settings_capability_owner(state: &MutableClientState) -> String {
     // Settings dialogs use short-lived daemon connections.  Bind the
     // unguessable capability to the authenticated principal, while the
     // capability record itself binds root, target identity and revision.
+    stable_authenticated_principal(state)
+}
+
+fn stable_authenticated_principal(state: &MutableClientState) -> String {
     principal_digest(&state.principal)
 }
 

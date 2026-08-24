@@ -33,13 +33,12 @@ pub(super) struct AgentEditor {
 pub(super) enum EditorOutcome {
     /// Stay in the editor; the keystroke was consumed (or ignored).
     Stay,
-    /// Save and close: write the buffer back to disk. The page re-reads +
-    /// re-parses afterwards.
+    /// Save and close through the source-specific revisioned daemon RPC.
     Save,
     /// Cancel without writing.
     Cancel,
-    /// Defer to `$EDITOR` for the same file after preserving the current
-    /// buffer to disk.
+    /// Defer a workspace-agent draft to `$EDITOR` through a private,
+    /// identity-checked staging directory and daemon lease.
     ExternalEdit,
 }
 

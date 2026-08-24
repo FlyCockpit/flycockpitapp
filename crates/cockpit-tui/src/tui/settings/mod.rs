@@ -988,11 +988,12 @@ pub struct SettingsCx {
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
-    /// Snapshot loaded when the dialog opened or last saved. Used to merge only
-    /// keys this dialog changed over a fresh disk read.
+    /// Daemon-redacted snapshot loaded when the dialog opened or last saved.
+    /// Used to construct a typed patch; the daemon re-reads and merges the
+    /// authoritative raw document under its revisioned capability.
     original_config: ProvidersConfig,
-    /// Cached cockpit-only `config.json` state. Read by the UI page and the
-    /// Tools page; written back on each edit.
+    /// Cached secret-free cockpit-only settings projection. Read by the UI and
+    /// Tools pages; mutations are committed only by the daemon.
     pub(super) extended: ExtendedConfig,
     /// Safe daemon snapshot used to calculate a minimal typed merge patch.
     extended_base: serde_json::Value,

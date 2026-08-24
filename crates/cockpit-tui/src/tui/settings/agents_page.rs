@@ -21,9 +21,9 @@
 //!     embedded default (arm→confirm), deleting just that one override.
 //!   - `R` — **reset all** built-in overrides (the existing confirm flow).
 //!
-//! The page reads agents fresh from disk on entry and after each
-//! edit/eject/delete/reset so the overridden/custom markers + effective
-//! model stay accurate.
+//! The page refreshes daemon-returned snapshots on entry and after each
+//! edit/eject/delete/reset so the overridden/custom markers, revisions, and
+//! effective model stay accurate. It never discovers authoritative files.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -94,6 +94,10 @@ pub(super) struct AgentExternalEdit {
     /// daemon; completion returns the edited bytes under this lease.
     staging_dir: tempfile::TempDir,
     staging_path: PathBuf,
+    #[cfg(unix)]
+    staging_dir_handle: std::fs::File,
+    #[cfg(unix)]
+    staging_dir_identity: (u64, u64),
     lease_id: String,
     /// Buffer write owned by the injected host effect.
     pub(super) text_before_launch: String,
@@ -115,6 +119,10 @@ pub(crate) struct AgentExternalEditEffect {
 struct AgentExternalEditStaging {
     directory: tempfile::TempDir,
     path: PathBuf,
+    #[cfg(unix)]
+    directory_handle: std::fs::File,
+    #[cfg(unix)]
+    directory_identity: (u64, u64),
 }
 
 fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
@@ -125,7 +133,24 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     cockpit_core::private_fs::ensure_private_dir(directory.path())
         .map_err(|error| format!("failed to secure external-edit directory: {error:#}"))?;
     let path = directory.path().join("assistant.md");
-    Ok(AgentExternalEditStaging { directory, path })
+    #[cfg(unix)]
+    let (directory_handle, directory_identity) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let handle = std::fs::File::open(directory.path())
+            .map_err(|error| format!("failed to retain external-edit directory: {error}"))?;
+        let metadata = handle
+            .metadata()
+            .map_err(|error| format!("failed to identify external-edit directory: {error}"))?;
+        (handle, (metadata.dev(), metadata.ino()))
+    };
+    Ok(AgentExternalEditStaging {
+        directory,
+        path,
+        #[cfg(unix)]
+        directory_handle,
+        #[cfg(unix)]
+        directory_identity,
+    })
 }
 
 fn seed_agent_external_edit_staging(
@@ -144,6 +169,21 @@ fn read_agent_external_edit_staging(pending: &AgentExternalEdit) -> Result<Strin
         .map_err(|error| format!("external-edit directory disappeared: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("external-edit staging directory identity is invalid".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = pending
+            .staging_dir_handle
+            .metadata()
+            .map_err(|error| format!("failed to revalidate held staging directory: {error}"))?;
+        if (held.dev(), held.ino()) != pending.staging_dir_identity
+            || (metadata.dev(), metadata.ino()) != pending.staging_dir_identity
+        {
+            return Err(
+                "external-edit staging directory was replaced during editor handoff".into(),
+            );
+        }
     }
     let bytes = cockpit_config::config::read_config_file_nofollow(&pending.staging_path)
         .map_err(|error| format!("failed to validate editor staging file: {error:#}"))?
@@ -365,7 +405,7 @@ impl AgentsPage {
                     Ok(_) => {
                         self.refresh_after_edit(cwd, Some(&agent));
                         if let Some(detail) = detail {
-                            self.status = Some(format!("saved `{}`; {detail}", agent.0));
+                            self.status = Some(format!("saved `{}`; {detail}", agent.name()));
                         }
                     }
                     Err(error) => {
@@ -704,7 +744,6 @@ impl SettingsCx {
             match editor.handle_key(key) {
                 EditorOutcome::Stay => {}
                 EditorOutcome::Save => {
-                    let path = editor.path.clone();
                     let revision = editor.revision.clone();
                     let text = editor.text().to_string();
                     // Ensure a single trailing newline like a real editor.
@@ -903,6 +942,10 @@ impl SettingsCx {
             agent: expected,
             staging_path: staging.path,
             staging_dir: staging.directory,
+            #[cfg(unix)]
+            staging_dir_handle: staging.directory_handle,
+            #[cfg(unix)]
+            staging_dir_identity: staging.directory_identity,
             lease_id: lease.lease_id,
             text_before_launch: text,
             draft,
@@ -1239,6 +1282,10 @@ impl SettingsCx {
                 agent: super::pointer_actions::AgentId::workspace(&name),
                 staging_path: staging.path,
                 staging_dir: staging.directory,
+                #[cfg(unix)]
+                staging_dir_handle: staging.directory_handle,
+                #[cfg(unix)]
+                staging_dir_identity: staging.directory_identity,
                 lease_id: lease.lease_id,
                 text_before_launch: text,
                 draft: Some(draft),
@@ -3475,6 +3522,10 @@ pub(super) mod tests {
     #[test]
     fn external_editor_staging_is_a_private_regular_file() {
         let staging = agent_external_edit_staging().expect("create isolated staging file");
+        seed_agent_external_edit_staging(&staging, "draft").unwrap();
+        let directory = fs::symlink_metadata(staging.directory.path()).unwrap();
+        assert!(directory.is_dir());
+        assert!(!directory.file_type().is_symlink());
         let metadata = fs::symlink_metadata(&staging.path).unwrap();
         assert!(metadata.is_file());
         assert!(!metadata.file_type().is_symlink());

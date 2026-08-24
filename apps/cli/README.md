@@ -429,13 +429,19 @@ Each hook receives a Cockpit-native JSON envelope on stdin (camelCase). It
 contains `hookEventName`, `sessionId`, `workspaceRoot`, `timestamp`, and
 event-specific fields: `toolName`, `toolCallId`, `toolInput`,
 `toolInputTruncated`, `toolResult`, `toolResultTruncated`, `toolError`,
-`subagentId`, `subagentType`, `source`, and `reason`. Only fields relevant to
-the event are present.
+`subagentId`, `subagentType`, `source`, and `reason`. Typed lifecycle
+discriminators are first-class camelCase fields rather than overloads of the
+generic `source`/`reason`: `startSource` (`sessionStart`), `promptSource`
+(`userPromptSubmit`), `permissionKind` (`permissionDenied`), `errorClass`
+(`stopFailure`), `compactSource` (`preCompact`/`postCompact`), `endReason`
+(`subagentStop`/`sessionEnd`), and `stopReason` / `stopHookActive` (`stop`).
+Only fields relevant to the event are present.
 
 Envelope bounds: `toolInput` and `toolResult` values are serialized to a
 maximum of 128 KiB each; excess is replaced with a UTF-8-safe prefix and the
 corresponding `toolInputTruncated` / `toolResultTruncated` boolean is set. The
-hook's stdout and stderr are each independently capped at 64 KiB.
+hook's stdout is captured and capped at 64 KiB; stderr is not captured by
+Cockpit.
 
 Cockpit does not persist raw hook input or output. It does not pass the ambient
 daemon environment. The envelope is the bounded event payload; configured `env`
@@ -480,19 +486,38 @@ failed run; otherwise the run is a success.
 
 Only an explicit, parseable `preToolUse` `{"decision":"deny",...}` blocks a
 tool. Every other failure mode is **fail-open**: the run is recorded as
-`failed` in the audit ledger and the agent continues. Fail-open conditions are:
+`failed` in the audit ledger and the agent continues. The `reason` written to
+the ledger is one of these exact runner strings:
 
-- crash (process exited with a signal / non-zero status other than a parseable
-  deny)
-- timeout (the command did not finish within `timeoutSecs`)
-- spawn-failure (the executable could not be launched)
-- malformed-output (stdout was not valid JSON or not a JSON object)
-- oversized-output (stdout/stderr exceeded the 64 KiB cap)
-- nonzero-exit (a non-zero exit code with no parseable deny)
-- missing-command (the executable was not found on PATH)
+- `spawn failed` — the child process could not be launched.
+- `executable not found` — a bare command could not be resolved before the
+  clean environment was built.
+- `hook timed out` — the command did not finish within `timeoutSecs`.
+- `malformed JSON output` — stdout was not valid JSON.
+- `output is not a JSON object` — stdout parsed but was not a JSON object.
+- `malformed hook output` — the object did not match the closed output shape.
+- `hook exited with non-zero status` — a non-zero exit with no parseable deny
+  (a crash), followed by the numeric status.
+- `unexpected decision 'block' for pre-tool event`,
+  `unexpected decision 'deny' for stop event`, or `unknown or missing decision`
+  — a gate used the wrong decision vocabulary.
+- `descendant_containment_unsupported` — the platform could not prove
+  descendant containment before spawn, so the handler body never runs.
+- `descendant_containment_uncertain` — after the child ran, the same-generation
+  empty oracle could not prove the descendant group empty; the durable
+  containment recovery row is retained and Cockpit does not claim the child is
+  gone.
+- `descendant_containment_failed` — the containment actor itself errored while
+  terminating or awaiting empty.
 
-Exit status alone never denies. Post and observe-only hooks never block; they
-run sequentially even if an earlier observer fails.
+On Windows, a hook whose parent process has no `SystemRoot` also fails open with
+a `missing SystemRoot` clean-environment construction error rather than being
+launched into an unbootable environment.
+
+Exit status alone never denies. Oversized stdout is truncated at the 64 KiB cap
+(see the envelope bounds above), not treated as a distinct failure. Post and
+observe-only hooks never block; they run sequentially even if an earlier
+observer fails.
 
 #### Stop continuation cap
 

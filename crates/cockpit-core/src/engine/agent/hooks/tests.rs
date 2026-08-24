@@ -45,7 +45,6 @@ struct FakeProcessEnv {
 
 impl FakeProcessEnv {
     /// A fake env that resolves any bare name to `/fake/bin/<name>`.
-    #[allow(dead_code)]
     fn with_default_resolution() -> Self {
         Self {
             resolved: None,
@@ -71,7 +70,6 @@ impl ProcessEnv for FakeProcessEnv {
 
 /// A captured command invocation for test assertions.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct CapturedInvocation {
     executable: PathBuf,
     args: Vec<String>,
@@ -618,6 +616,468 @@ fn build_child_env_no_comspec_no_pathext_on_windows() {
 
     assert!(!env.contains_key("ComSpec"));
     assert!(!env.contains_key("PATHEXT"));
+}
+
+// ---------------------------------------------------------------------------
+// AC6: envelope bounds + reserved / clean environment (real runner paths)
+// ---------------------------------------------------------------------------
+
+/// Drive `run_observe_hooks` for one event through a capturing fake runner and
+/// return (captured invocation, parsed stdin envelope). The hook always carries
+/// a configured `MY_HOOK_VAR` and a spoofed `COCKPIT_HOOK_EVENT`, so every
+/// caller can prove configured-env delivery AND reserved-key overwrite through
+/// the production runner (not just `build_child_env` in isolation).
+async fn observe_capture(
+    process_env: &dyn ProcessEnv,
+    event: HookEvent,
+    match_value: &str,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    subagent_type: Option<&str>,
+    subagent_id: Option<&str>,
+    fields: ObserveFields<'_>,
+) -> (CapturedInvocation, Value) {
+    let (db, sid) = db_session().await;
+    let mut env_map = BTreeMap::new();
+    env_map.insert("MY_HOOK_VAR".to_string(), "value123".to_string());
+    // A handler must never be able to spoof a reserved key.
+    env_map.insert("COCKPIT_HOOK_EVENT".to_string(), "spoofed".to_string());
+    let hook = test_hook(
+        event,
+        vec!["obs".to_string()],
+        Some(vec![match_value.to_string()]),
+        env_map,
+        5,
+    );
+    let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+    run_observe_hooks(
+        &runner,
+        process_env,
+        &registry(vec![hook]),
+        event,
+        match_value,
+        sid,
+        workspace(),
+        &db,
+        tool_name,
+        tool_call_id,
+        subagent_type,
+        subagent_id,
+        fields,
+    )
+    .await;
+    let inv = runner
+        .invocations()
+        .first()
+        .cloned()
+        .expect("observe hook invoked exactly once");
+    let envelope: Value = serde_json::from_str(&inv.stdin).expect("observe envelope is valid JSON");
+    (inv, envelope)
+}
+
+#[tokio::test]
+async fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
+    let process_env = FakeProcessEnv::with_default_resolution();
+
+    // Documented byte caps (the README contract states these exact sizes).
+    assert_eq!(
+        ENVELOPE_VALUE_MAX_BYTES,
+        128 * 1024,
+        "envelope value cap is 128 KiB"
+    );
+    assert_eq!(OUTPUT_CAP_BYTES, 64 * 1024, "captured stdout cap is 64 KiB");
+
+    // --- sessionStart: full clean-environment + resolution + camelCase proof.
+    let (inv, env) = observe_capture(
+        &process_env,
+        HookEvent::SessionStart,
+        "fresh",
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            start_source: Some("fresh"),
+            ..Default::default()
+        },
+    )
+    .await;
+    // Bare executable resolved to an ABSOLUTE path via the ProcessEnv seam.
+    assert_eq!(inv.executable, PathBuf::from("/fake/bin/obs"));
+    assert!(inv.executable.is_absolute());
+    // CWD is the session workspace root.
+    assert_eq!(inv.cwd, workspace());
+    // Configured env delivered; reserved key overwrites the handler's spoof.
+    assert_eq!(inv.env["MY_HOOK_VAR"], "value123");
+    assert_eq!(inv.env["COCKPIT_HOOK_EVENT"], "sessionStart");
+    assert_eq!(inv.env["COCKPIT_WORKSPACE_ROOT"], "/tmp/hooks-test");
+    assert!(inv.env.contains_key("COCKPIT_SESSION_ID"));
+    // No inherited Unix ambient variables leak into the clean child env.
+    for ambient in ["PATH", "HOME", "USER", "LD_PRELOAD", "SHELL"] {
+        assert!(
+            !inv.env.contains_key(ambient),
+            "ambient variable `{ambient}` must not reach the hook child"
+        );
+    }
+    // No Windows host variables were synthesized on this (or any) host env map.
+    assert!(!inv.env.contains_key("ComSpec"));
+    assert!(!inv.env.contains_key("PATHEXT"));
+    // camelCase envelope, typed discriminator NOT overloaded onto source/reason.
+    assert_eq!(env["hookEventName"], "sessionStart");
+    assert_eq!(env["workspaceRoot"], "/tmp/hooks-test");
+    assert!(env.get("sessionId").is_some());
+    assert!(env.get("timestamp").is_some());
+    assert_eq!(env["startSource"], "fresh");
+    assert!(
+        env.get("source").is_none() && env.get("reason").is_none(),
+        "typed discriminators must not be overloaded onto generic source/reason"
+    );
+
+    // EVERY reserved key is overwritten after configured env (not just the one
+    // spoofed above). Drives the single `build_child_env` funnel all runners use
+    // with a tool-applicable event so the tool keys are also exercised.
+    {
+        let mut spoof = BTreeMap::new();
+        for key in RESERVED_ENV_KEYS {
+            spoof.insert((*key).to_string(), "SPOOFED".to_string());
+        }
+        let hook = test_hook(
+            HookEvent::PreToolUse,
+            vec!["/bin/x".to_string()],
+            None,
+            spoof,
+            5,
+        );
+        let sid = uuid::Uuid::new_v4();
+        let built = build_child_env(
+            &hook,
+            &process_env,
+            HookEvent::PreToolUse,
+            sid,
+            Path::new("/ws"),
+            Some("bash"),
+            Some("call_9"),
+        )
+        .unwrap();
+        assert_eq!(built["COCKPIT_HOOK_EVENT"], "preToolUse");
+        assert_eq!(built["COCKPIT_HOOK_NAME"], "project:abcdef0123456789:0");
+        assert_eq!(built["COCKPIT_SESSION_ID"], sid.to_string());
+        assert_eq!(built["COCKPIT_WORKSPACE_ROOT"], "/ws");
+        assert_eq!(built["COCKPIT_TOOL_NAME"], "bash");
+        assert_eq!(built["COCKPIT_TOOL_CALL_ID"], "call_9");
+        for key in RESERVED_ENV_KEYS {
+            assert_ne!(
+                built[*key], "SPOOFED",
+                "reserved key `{key}` must be overwritten after configured env"
+            );
+        }
+    }
+
+    // --- Every remaining observe discriminator is a first-class camelCase field.
+    let (_, env) = observe_capture(
+        &process_env,
+        HookEvent::UserPromptSubmit,
+        "queued",
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            prompt_source: Some("queued"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(env["promptSource"], "queued");
+
+    let (_, env) = observe_capture(
+        &process_env,
+        HookEvent::PermissionDenied,
+        "bash",
+        Some("bash"),
+        Some("call_pd"),
+        None,
+        None,
+        ObserveFields {
+            permission_kind: Some("approval_denied"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(env["permissionKind"], "approval_denied");
+    assert_eq!(env["toolName"], "bash");
+
+    let (_, env) = observe_capture(
+        &process_env,
+        HookEvent::StopFailure,
+        "network",
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            error_class: Some("network"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(env["errorClass"], "network");
+
+    let (_, env) = observe_capture(
+        &process_env,
+        HookEvent::PreCompact,
+        "auto",
+        None,
+        None,
+        None,
+        None,
+        ObserveFields {
+            compact_source: Some("auto"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(env["compactSource"], "auto");
+
+    let (_, env) = observe_capture(
+        &process_env,
+        HookEvent::SubagentStart,
+        "reviewer",
+        None,
+        None,
+        Some("reviewer"),
+        Some("sub-1"),
+        ObserveFields::default(),
+    )
+    .await;
+    assert_eq!(env["subagentType"], "reviewer");
+    assert_eq!(env["subagentId"], "sub-1");
+
+    // --- stop / subagentStop stop-gate camelCase fields via run_stop_hooks.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        let mut state = StopGateState::default();
+        run_stop_hooks(
+            &runner,
+            &process_env,
+            &registry(vec![test_hook(
+                HookEvent::Stop,
+                vec!["obs".to_string()],
+                Some(vec!["end_turn".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            None,
+            None,
+            None,
+            &mut state,
+        )
+        .await;
+        let stdin: Value =
+            serde_json::from_str(&runner.invocations()[0].stdin).expect("stop envelope JSON");
+        assert_eq!(stdin["hookEventName"], "stop");
+        assert_eq!(stdin["stopReason"], "end_turn");
+        assert_eq!(stdin["stopHookActive"], Value::Bool(false));
+    }
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        let mut state = StopGateState::default();
+        run_stop_hooks(
+            &runner,
+            &process_env,
+            &registry(vec![test_hook(
+                HookEvent::SubagentStop,
+                vec!["obs".to_string()],
+                Some(vec!["reviewer".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            HookEvent::SubagentStop,
+            "reviewer",
+            sid,
+            workspace(),
+            &db,
+            Some("reviewer"),
+            Some("sub-9"),
+            Some("completed"),
+            &mut state,
+        )
+        .await;
+        let stdin: Value =
+            serde_json::from_str(&runner.invocations()[0].stdin).expect("subagentStop envelope");
+        assert_eq!(stdin["hookEventName"], "subagentStop");
+        assert_eq!(stdin["subagentType"], "reviewer");
+        assert_eq!(stdin["subagentId"], "sub-9");
+        assert_eq!(stdin["endReason"], "completed");
+    }
+
+    // --- 128 KiB envelope clipping flags: preToolUse toolInput.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        let big = json!({ "data": "x".repeat(200 * 1024) });
+        run_pre_tool_hooks(
+            &runner,
+            &process_env,
+            &registry(vec![test_hook(
+                HookEvent::PreToolUse,
+                vec!["obs".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            "bash",
+            &big,
+            "call_big",
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
+        assert_eq!(stdin["hookEventName"], "preToolUse");
+        assert_eq!(stdin["toolName"], "bash");
+        assert_eq!(stdin["toolCallId"], "call_big");
+        assert_eq!(
+            stdin["toolInputTruncated"],
+            Value::Bool(true),
+            "an over-cap toolInput must set toolInputTruncated"
+        );
+        assert!(
+            serde_json::to_string(&stdin["toolInput"]).unwrap().len() <= ENVELOPE_VALUE_MAX_BYTES,
+            "clipped toolInput serialized form must not exceed the hard 128 KiB cap"
+        );
+    }
+    // A small toolInput sets no truncation flag (distinguishing input).
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        run_pre_tool_hooks(
+            &runner,
+            &process_env,
+            &registry(vec![test_hook(
+                HookEvent::PreToolUse,
+                vec!["obs".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            "bash",
+            &json!({ "small": true }),
+            "call_small",
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
+        assert!(
+            stdin.get("toolInputTruncated").is_none(),
+            "a small toolInput must not set the truncated flag"
+        );
+    }
+
+    // --- 128 KiB envelope clipping flags: postToolUse toolResult.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        let big_text = "y".repeat(200 * 1024);
+        let ok: anyhow::Result<crate::engine::tool::ToolOutput> =
+            Ok(crate::engine::tool::ToolOutput::text(&big_text));
+        run_post_tool_hooks(
+            &runner,
+            &process_env,
+            &registry(vec![test_hook(
+                HookEvent::PostToolUse,
+                vec!["obs".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            HookEvent::PostToolUse,
+            "bash",
+            &json!({ "cmd": "ls" }),
+            "call_post",
+            &ok,
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        let stdin: Value = serde_json::from_str(&runner.invocations()[0].stdin).unwrap();
+        assert_eq!(stdin["hookEventName"], "postToolUse");
+        assert_eq!(
+            stdin["toolResultTruncated"],
+            Value::Bool(true),
+            "an over-cap toolResult must set toolResultTruncated"
+        );
+    }
+
+    // --- Windows SystemRoot/WINDIR construction + missing-SystemRoot fail-open,
+    // proved host-independently through the ProcessEnv-seam-backed pure helper.
+    let win = windows_clean_env_additions(Some("C:\\Windows".to_string()))
+        .expect("present SystemRoot constructs the clean Windows additions");
+    assert!(
+        win.iter()
+            .any(|(k, v)| *k == "SystemRoot" && v == "C:\\Windows")
+    );
+    assert!(
+        win.iter()
+            .any(|(k, v)| *k == "WINDIR" && v == "C:\\Windows")
+    );
+    assert!(
+        !win.iter().any(|(k, _)| *k == "ComSpec" || *k == "PATHEXT"),
+        "Windows additions must not include ComSpec/PATHEXT"
+    );
+    let missing = windows_clean_env_additions(None);
+    assert!(
+        missing.is_err(),
+        "a missing parent SystemRoot must fail open, not fabricate a value"
+    );
+    assert!(missing.unwrap_err().contains("SystemRoot"));
+
+    // --- Bare executable that cannot be resolved: the runner is never invoked
+    // and a failed row is recorded (executable-not-found fail-open).
+    {
+        let (db, sid) = db_session().await;
+        let no_resolve = FakeProcessEnv::default(); // resolves nothing
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+        run_observe_hooks(
+            &runner,
+            &no_resolve,
+            &registry(vec![observe_hook(HookEvent::SessionStart, "fresh")]),
+            HookEvent::SessionStart,
+            "fresh",
+            sid,
+            workspace(),
+            &db,
+            None,
+            None,
+            None,
+            None,
+            ObserveFields {
+                start_source: Some("fresh"),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            runner.invocations().is_empty(),
+            "an unresolved bare executable must not reach the command runner"
+        );
+        let rows = hook_run_events(&db, sid).await;
+        assert_eq!(
+            rows,
+            vec![("sessionStart".to_string(), "failed".to_string())]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2830,14 +3290,24 @@ impl HookDocumentationContract {
             stop_block_decision: "block",
             stop_continue_false: "continue",
             stop_additional_context_field: "hookSpecificOutput.additionalContext",
+            // The machine-checked fail-open needles are the SAME single-sourced
+            // runner reason constants written to `hook_run.reason` (Decision #6
+            // / #9), not hand-typed slugs. If a constant's value drifts from the
+            // README prose, `hooks_documentation_matches_typed_contract` fails.
             fail_open_conditions: vec![
-                "crash",
-                "timeout",
-                "spawn-failure",
-                "malformed-output",
-                "oversized-output",
-                "nonzero-exit",
-                "missing-command",
+                REASON_SPAWN_FAILED,
+                REASON_EXECUTABLE_NOT_FOUND,
+                REASON_HOOK_TIMED_OUT,
+                REASON_MALFORMED_JSON_OUTPUT,
+                REASON_OUTPUT_NOT_JSON_OBJECT,
+                REASON_MALFORMED_HOOK_OUTPUT,
+                REASON_NONZERO_EXIT_PREFIX,
+                REASON_UNEXPECTED_PRE_TOOL_BLOCK,
+                REASON_UNEXPECTED_STOP_DENY,
+                REASON_UNKNOWN_OR_MISSING_DECISION,
+                REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+                REASON_DESCENDANT_CONTAINMENT_UNCERTAIN,
+                REASON_DESCENDANT_CONTAINMENT_FAILED,
             ],
             unsupported_formats: vec![
                 "toml",
@@ -3009,17 +3479,221 @@ fn assert_contract_block_matches(block: &str, contract: &HookDocumentationContra
     }
 }
 
+/// Strip `#[cfg(test)]`-guarded `mod` blocks from a source file so a lifecycle
+/// event referenced only from an inline unit-test module is NOT counted as a
+/// production call site. Only `#[cfg(test)]` immediately followed by a `mod`
+/// item is stripped (via brace matching); a `#[cfg(test)]` on a `use`/`fn` is
+/// left in place so unrelated production code is never accidentally removed.
+fn strip_cfg_test_modules(src: &str) -> String {
+    const NEEDLE: &str = "#[cfg(test)]";
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i..].starts_with(NEEDLE) {
+            let after = &src[i + NEEDLE.len()..];
+            let trimmed = after.trim_start();
+            let is_mod = trimmed.starts_with("mod ")
+                || trimmed.starts_with("pub mod ")
+                || trimmed.starts_with("pub(crate) mod ");
+            // Only strip an INLINE braced module (`mod foo { ... }`). An external
+            // module DECLARATION (`mod tests;`) has a `;` before any `{`, so we
+            // must not treat the next unrelated `{` as its body and delete real
+            // production source after it.
+            let brace_before_semi = {
+                let semi = src[i..].find(';');
+                let brace = src[i..].find('{');
+                matches!((brace, semi), (Some(b), Some(s)) if b < s)
+                    || matches!((brace, semi), (Some(_), None))
+            };
+            if is_mod
+                && brace_before_semi
+                && let Some(brace_rel) = src[i..].find('{')
+            {
+                // Skip from the opening brace to its matching close brace.
+                let mut depth = 0isize;
+                let mut j = i + brace_rel;
+                while j < src.len() {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Read every production (non-test) `cockpit-core` source file, excluding the
+/// hooks runner-definition file (`engine/agent/hooks.rs`, which defines the
+/// dispatch functions rather than calling them), with `#[cfg(test)]` modules
+/// stripped. Returns per-file `(path, stripped_text)` so reachability can be
+/// asserted at file granularity (a lifecycle event must be constructed in a
+/// file that also *dispatches* hooks).
+fn production_dispatch_files() -> Vec<(PathBuf, String)> {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let runner_defs = src_root.join("engine").join("agent").join("hooks.rs");
+    let mut files = Vec::new();
+    let mut stack = vec![src_root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "tests") {
+                    continue; // whole test-only directory
+                }
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name == "tests.rs" || name.ends_with("_tests.rs") || name.ends_with("_test.rs") {
+                continue;
+            }
+            if path == runner_defs {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            files.push((path, strip_cfg_test_modules(&text)));
+        }
+    }
+    files
+}
+
+/// True if `text` contains a real, non-comment construction of `needle`
+/// (`HookEvent::<Variant>`) that is passed to a hook dispatch/fire call — proved
+/// by the construction line sitting within a small line window of a dispatch
+/// marker (one of the four canonical runners or an observe/subagent fire helper
+/// that wraps them). A mention inside a `//` comment, a doc string, or a dead
+/// construction far from any dispatch call does NOT count.
+fn event_dispatched_in(text: &str, needle: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "run_observe_hooks(",
+        "run_stop_hooks(",
+        "run_pre_tool_hooks(",
+        "run_post_tool_hooks(",
+        "fire_observe_hook(",
+        "fire_subagent_hook(",
+    ];
+    // Window spans a multi-line call argument list (event and runner call are a
+    // few lines apart, in either order).
+    const WINDOW: usize = 12;
+    let lines: Vec<&str> = text.lines().collect();
+    let is_comment = |l: &str| l.trim_start().starts_with("//");
+    let ctor_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(needle) && !is_comment(l))
+        .map(|(i, _)| i)
+        .collect();
+    if ctor_lines.is_empty() {
+        return false;
+    }
+    let marker_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| MARKERS.iter().any(|m| l.contains(m)))
+        .map(|(i, _)| i)
+        .collect();
+    ctor_lines
+        .iter()
+        .any(|&c| marker_lines.iter().any(|&m| c.abs_diff(m) <= WINDOW))
+}
+
+/// AC11 reachability: every `HookEvent::ALL` entry must have a REAL production
+/// call site, not merely an entry in a hand-maintained table. A lifecycle event
+/// is reachable only if it is CONSTRUCTED (`HookEvent::<Variant>`) inside a
+/// production, non-test cockpit-core file that also dispatches hooks. Because
+/// the `HookEvent` enum is defined in `cockpit-config` (a different crate) and
+/// the runner definitions in `engine/agent/hooks.rs` are excluded, the only
+/// remaining `HookEvent::<Variant>` construction in this corpus IS the dispatch
+/// or fire-call argument — so deleting an event's dispatch call removes its only
+/// production reference and fails this test.
+///
+/// `preToolUse` is dispatched with an implicit event argument inside
+/// `run_pre_tool_hooks`, so its reachable call site is the production call to
+/// that runner (in `tool_dispatch`), which this check requires directly.
+///
+/// The construction must also sit within a small line window of a dispatch/fire
+/// marker (see [`event_dispatched_in`]), so a bare mention in a comment or a
+/// dead construction far from any runner call does not keep an event green.
+///
+/// What this catches: a newly-added-but-unwired event (no dispatched
+/// construction at all) and the removal of any wired event's only dispatch/fire
+/// call. What it does not catch: a deliberately-retained dead `HookEvent::X`
+/// construction placed adjacent to an unrelated hook call — which
+/// `cargo clippy -D warnings` independently rejects as an unused value in the
+/// CI gate.
+fn assert_every_event_has_production_call_site() {
+    let files = production_dispatch_files();
+    // Guard against a vacuous scan: the corpus must actually contain the
+    // dispatch entry points.
+    let has_any = |m: &str| files.iter().any(|(_, t)| t.contains(m));
+    for marker in [
+        "run_observe_hooks(",
+        "run_stop_hooks(",
+        "run_post_tool_hooks(",
+        "run_pre_tool_hooks(",
+    ] {
+        assert!(
+            has_any(marker),
+            "reachability corpus is missing dispatch call `{marker}` — the scan would be vacuous"
+        );
+    }
+
+    for event in HookEvent::ALL {
+        if matches!(event, HookEvent::PreToolUse) {
+            assert!(
+                has_any("run_pre_tool_hooks("),
+                "`preToolUse` has no production `run_pre_tool_hooks(` call site"
+            );
+            continue;
+        }
+        let needle = format!("HookEvent::{event:?}");
+        let reachable = files
+            .iter()
+            .any(|(_, text)| event_dispatched_in(text, &needle));
+        assert!(
+            reachable,
+            "lifecycle event `{}` has no production dispatch call site: no non-test \
+             cockpit-core file (excluding the runner definitions) both constructs \
+             `{needle}` and dispatches hooks. Wire it at its boundary, or the README \
+             must stop describing it as supported.",
+            event.key()
+        );
+    }
+}
+
 /// `hooks_documentation_matches_typed_contract` verifies that the public
 /// `apps/cli/README.md` `## Hooks` contract block matches the typed
 /// config/runtime constants. It fails on a missing marker, any
-/// missing/extra/wrong normative value, or an unsupported format presented
-/// as supported.
+/// missing/extra/wrong normative value, an unsupported format presented as
+/// supported, a fail-open needle that diverges from the single-sourced runner
+/// reason constants, or a lifecycle event lacking a real production call site.
 #[test]
 fn hooks_documentation_matches_typed_contract() {
     let block = read_hooks_contract_block();
     assert!(!block.trim().is_empty(), "hooks-contract block is empty");
     let contract = HookDocumentationContract::from_typed_constants();
     assert_contract_block_matches(&block, &contract);
+    // (b) every documented event must actually be reachable in production.
+    assert_every_event_has_production_call_site();
 }
 
 // ---------------------------------------------------------------------------

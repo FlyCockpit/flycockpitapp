@@ -134,10 +134,15 @@ where
             serde_json::from_slice(&bytes).map_err(internal)
         }
         TransactionalRemoteOperationOutcome::OperationConflict
-        | TransactionalRemoteOperationOutcome::OperationActorConflict
-        | TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload {
+        | TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "remote operation conflict".into(),
+        }),
+        TransactionalRemoteOperationOutcome::ExistingIndeterminate => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "remote operation has an indeterminate persisted outcome; it will not be retried"
+                    .into(),
         }),
         TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity
         | TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity => Err(ErrorPayload {

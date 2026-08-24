@@ -129,6 +129,18 @@ pub enum TransactionalRemoteOperationOutcome<T> {
     AttachmentOutboxCapacity,
 }
 
+/// Internal transaction-abort marker. Capacity is a typed protocol outcome,
+/// but it must travel through the writer as an error so `Db::transaction`
+/// rolls back the domain mutation and reservation before the public outcome is
+/// reconstructed outside the transaction boundary.
+#[derive(Debug, thiserror::Error)]
+enum RemoteOperationCapacityAbort {
+    #[error("remote attachment operation ledger capacity reached")]
+    Ledger,
+    #[error("remote attachment outbox capacity reached")]
+    Outbox,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginNonrepeatableRemoteOperationOutcome {
     Dispatch {
@@ -499,6 +511,21 @@ impl Db {
                         .safe_response
                         .context("committed operation missing safe response")?,
                 ))
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
+                let (operation_seq, dispatch_generation) = conn.query_row(
+                    "UPDATE remote_attachment_operations
+                     SET dispatch_generation=dispatch_generation+1, updated_at_ms=?3
+                     WHERE logical_attachment_id=?1 AND operation_id=?2
+                       AND state='dispatched' AND operation_class='idempotent_adapter_mutation'
+                     RETURNING operation_seq,dispatch_generation",
+                    params![owned.logical_attachment_id, owned.operation_id, owned.now_ms],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )?;
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                    operation_seq: operation_seq.try_into()?,
+                    dispatch_generation: dispatch_generation.try_into()?,
+                })
             }
             ReserveRemoteOperationOutcome::Replay(_) => {
                 Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate)
@@ -911,7 +938,7 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+        let outcome = self.transaction(move |conn| match reserve_conn(conn, &owned)? {
             ReserveRemoteOperationOutcome::Reserved(_) => {
                 let result = mutation(conn)?;
                 let delivery_id = Uuid::now_v7().to_string();
@@ -932,10 +959,10 @@ impl Db {
                         Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
                     }
                     CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                        Err(RemoteOperationCapacityAbort::Ledger.into())
                     }
                     CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+                        Err(RemoteOperationCapacityAbort::Outbox.into())
                     }
                 }
             }
@@ -958,8 +985,21 @@ impl Db {
             ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-        })
-        .await
+        }).await;
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
+                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
+                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read-only lookup of a transactional operation identity (no reserve, no
@@ -1072,7 +1112,7 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+        let outcome = self.transaction(move |conn| match reserve_conn(conn, &owned)? {
             ReserveRemoteOperationOutcome::Reserved(_) => {
                 let result = mutation(conn)?;
                 let delivery_id = Uuid::now_v7().to_string();
@@ -1092,10 +1132,10 @@ impl Db {
                         Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
                     }
                     CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
-                        Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+                        Err(RemoteOperationCapacityAbort::Ledger.into())
                     }
                     CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
-                        Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+                        Err(RemoteOperationCapacityAbort::Outbox.into())
                     }
                 }
             }
@@ -1118,8 +1158,21 @@ impl Db {
             ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
                 Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
             }
-        })
-        .await
+        }).await;
+        match outcome {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
+                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Ledger)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+            Err(error) if error.downcast_ref::<RemoteOperationCapacityAbort>()
+                .is_some_and(|abort| matches!(abort, RemoteOperationCapacityAbort::Outbox)) =>
+            {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentOutboxCapacity)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Atomically commits a bounded safe outcome and its authoritative outbox
@@ -2536,7 +2589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_dispatch_is_indeterminate_until_durable_commit_then_replays() {
+    async fn adapter_dispatch_reclaims_with_a_new_generation_then_replays() {
         let db = Db::open_in_memory().unwrap();
         let operation = "01890f3e-4c00-7000-8000-00000000009d";
         let request = || ReserveRemoteOperation {
@@ -2556,7 +2609,10 @@ mod tests {
             db.begin_idempotent_adapter_remote_operation(request())
                 .await
                 .unwrap(),
-            BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate
+            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 2,
+                ..
+            }
         ));
         db.commit_remote_attachment_operation(CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,

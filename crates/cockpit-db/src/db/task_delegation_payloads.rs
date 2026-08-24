@@ -327,7 +327,10 @@ impl Db {
         let Some(_db_path) = self.path() else {
             return Ok((Some(body.to_string()), None));
         };
-        let rel = delegation_payload_relative_path(session_id, hash);
+        // Each durable payload gets a non-reusable pathname. Cleanup can then
+        // never unlink a freshly prepared row which happens to have the same
+        // content hash as a deleted predecessor.
+        let rel = delegation_payload_relative_path(session_id, hash, Uuid::now_v7());
         let abs = self.delegation_payload_base_dir()?.join(&rel);
         crate::db::files::ensure_parent_dir_private(&abs)?;
         if abs.exists() {
@@ -379,10 +382,10 @@ impl Db {
     }
 }
 
-fn delegation_payload_relative_path(session_id: Uuid, hash: &str) -> PathBuf {
+fn delegation_payload_relative_path(session_id: Uuid, hash: &str, generation: Uuid) -> PathBuf {
     Path::new(PAYLOAD_DIR)
         .join(session_id.to_string())
-        .join(format!("{hash}.txt"))
+        .join(format!("{hash}-{generation}.txt"))
 }
 
 fn rel_to_string(path: &Path) -> String {

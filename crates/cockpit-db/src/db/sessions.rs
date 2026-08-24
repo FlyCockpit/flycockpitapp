@@ -1840,23 +1840,39 @@ impl Db {
         let base = self.delegation_payload_base_dir()?;
         let mut completed = 0;
         for relative in rows {
-            let path = base.join(&relative);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(%error, path=%path.display(), "delegation sidecar cleanup remains pending");
-                    continue;
-                }
-            }
+            let cleanup_base = base.clone();
+            let cleanup_relative = relative.clone();
             let removed = self
                 .transaction(move |conn| {
+                    // This read and the intent deletion share the writer
+                    // transaction. A payload insertion cannot race between
+                    // the reference proof and unlink. Non-reusable sidecar
+                    // generations also cover the prepare-before-insert gap.
+                    let referenced: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM task_delegation_payloads WHERE sidecar_path=?1)",
+                        [&cleanup_relative],
+                        |row| row.get(0),
+                    )?;
+                    if referenced {
+                        return Ok(false);
+                    }
+                    crate::db::files::delete_relative_file_durable_nofollow(
+                        &cleanup_base,
+                        std::path::Path::new(&cleanup_relative),
+                    )?;
                     Ok(conn.execute(
                         "DELETE FROM task_delegation_sidecar_cleanup_intents WHERE sidecar_path=?1",
-                        [relative],
+                        [cleanup_relative],
                     )? == 1)
                 })
-                .await?;
+                .await;
+            let removed = match removed {
+                Ok(removed) => removed,
+                Err(error) => {
+                    tracing::warn!(%error, sidecar_path=%relative, "delegation sidecar cleanup remains pending");
+                    continue;
+                }
+            };
             completed += usize::from(removed);
         }
         Ok(completed)

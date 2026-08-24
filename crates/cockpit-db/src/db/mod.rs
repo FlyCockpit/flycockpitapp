@@ -3267,6 +3267,74 @@ mod tests {
         assert!(!sidecar.exists());
     }
 
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_refuses_a_current_payload_reference() {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let session_id = Uuid::new_v4();
+        let id = session_id.to_string();
+        let relative = format!("delegation_payloads/{id}/generation.txt");
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "current").unwrap();
+        db.write({
+            let id = id.clone();
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/p',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_jobs(task_call_id,parent_session_id,parent_agent,status,created_at,updated_at) VALUES('task',?1,'agent','completed',1,1)",[&id])?;
+                conn.execute("INSERT INTO task_delegation_payloads(task_call_id,label,payload_hash,parent_session_id,parent_agent,child_agent,prompt_byte_len,sidecar_path,created_at) VALUES('task','default','hash',?1,'agent','child',7,?2,1)",rusqlite::params![id,relative])?;
+                conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,id])?;
+                Ok(())
+            }
+        }).await.unwrap();
+
+        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 0);
+        assert!(sidecar.exists(), "a current payload reference protects its sidecar");
+        db.write(move |conn| {
+            conn.execute("DELETE FROM task_delegation_payloads WHERE sidecar_path=?1",[relative])?;
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+        assert!(!sidecar.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_sidecar_cleanup_retains_intent_when_parent_fsync_fails() {
+        struct ResetSyncFailure;
+        impl Drop for ResetSyncFailure {
+            fn drop(&mut self) {
+                crate::db::files::force_sidecar_parent_sync_failure_for_test(None);
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let relative = "delegation_payloads/orphan/generation.txt".to_string();
+        let sidecar = tmp.path().join(&relative);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "orphan").unwrap();
+        db.write({
+            let relative = relative.clone();
+            move |conn| {
+                conn.execute("INSERT INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms) VALUES(?1,?2,2)",rusqlite::params![relative,Uuid::new_v4().to_string()])?;
+                Ok(())
+            }
+        }).await.unwrap();
+
+        let _reset = ResetSyncFailure;
+        crate::db::files::force_sidecar_parent_sync_failure_for_test(
+            Some(sidecar.parent().unwrap().to_path_buf()),
+        );
+        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 0);
+        let pending = db.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM task_delegation_sidecar_cleanup_intents",[],|row|row.get::<_,i64>(0))?)).await.unwrap();
+        assert_eq!(pending, 1, "uncertain unlink durability retains the intent");
+
+        crate::db::files::force_sidecar_parent_sync_failure_for_test(None);
+        assert_eq!(db.reconcile_delegation_sidecar_cleanup_intents().await.unwrap(), 1);
+    }
+
     #[test]
     fn migration_files_on_disk_match_expected_set() {
         // Pre-release: the directory contains the local base plus the opt-in

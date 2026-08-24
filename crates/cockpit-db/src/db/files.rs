@@ -5,6 +5,33 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+#[cfg(test)]
+static SIDECAR_SYNC_FAILURE_PATH: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn force_sidecar_parent_sync_failure_for_test(path: Option<PathBuf>) {
+    *SIDECAR_SYNC_FAILURE_PATH
+        .lock()
+        .expect("sidecar sync failure hook poisoned") = path;
+}
+
+fn sidecar_parent_sync_forced_failure(path: &Path) -> bool {
+    #[cfg(test)]
+    {
+        return SIDECAR_SYNC_FAILURE_PATH
+            .lock()
+            .expect("sidecar sync failure hook poisoned")
+            .as_deref()
+            == Some(path);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Process-independent guard for database boot, backup, and migration.
 ///
 /// The lock file is persistent, but ownership is held by the kernel on this
@@ -241,6 +268,123 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
     file.write_all(bytes)?;
     Ok(())
+}
+
+/// Unlink a DB-owned sidecar beneath `base` without following any path
+/// component, then durably commit the directory-entry change. Missing is
+/// success, but still syncs the parent directory so a retry after an uncertain
+/// prior unlink cannot discard its durable cleanup intent prematurely.
+#[cfg(unix)]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    anyhow::ensure!(!components.is_empty(), "sidecar cleanup path is empty");
+    anyhow::ensure!(
+        components
+            .iter()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "sidecar cleanup path must be relative and normalized"
+    );
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(base)
+        .with_context(|| format!("opening sidecar cleanup base {}", base.display()))?;
+    let mut durable_parent = base.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("components were validated")
+        };
+        durable_parent.push(name);
+        let name = CString::new(name.as_bytes()).context("sidecar directory contains NUL")?;
+        // SAFETY: `directory` is a live directory fd and `name` contains one
+        // validated normal component. O_NOFOLLOW refuses a raced symlink.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("opening sidecar cleanup directory beneath {}", base.display())
+            });
+        }
+        // SAFETY: successful `openat` returned a newly owned descriptor.
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let std::path::Component::Normal(name) = components.last().expect("nonempty validated path")
+    else {
+        unreachable!("components were validated")
+    };
+    let name = CString::new(name.as_bytes()).context("sidecar filename contains NUL")?;
+    // SAFETY: held parent fd plus a single literal filename; unlinkat never
+    // follows a symlink in the final component.
+    let rc = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("unlinking delegation payload sidecar");
+        }
+    }
+    anyhow::ensure!(
+        !sidecar_parent_sync_forced_failure(&durable_parent),
+        "injected delegation payload sidecar parent fsync failure"
+    );
+    directory
+        .sync_all()
+        .context("fsyncing delegation payload sidecar parent")
+}
+
+#[cfg(windows)]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let components = relative.components().collect::<Vec<_>>();
+    anyhow::ensure!(
+        !components.is_empty()
+            && components
+                .iter()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "sidecar cleanup path must be relative and normalized"
+    );
+    let path = base.join(relative);
+    for ancestor in path.ancestors().take_while(|candidate| *candidate != base) {
+        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
+            anyhow::ensure!(!metadata.file_type().is_symlink(), "sidecar cleanup path contains symlink");
+        }
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("unlinking delegation payload sidecar"),
+    }
+    let parent = path.parent().context("sidecar path has no parent")?;
+    anyhow::ensure!(
+        !sidecar_parent_sync_forced_failure(parent),
+        "injected delegation payload sidecar parent fsync failure"
+    );
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: open directory handle.
+        .open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("fsyncing delegation payload sidecar parent")
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn delete_relative_file_durable_nofollow(base: &Path, relative: &Path) -> Result<()> {
+    let path = base.join(relative);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("unlinking delegation payload sidecar"),
+    }
 }
 
 #[cfg(not(unix))]

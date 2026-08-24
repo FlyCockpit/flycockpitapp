@@ -19,6 +19,32 @@ pub(crate) struct RemoteOperationContext {
     _identity_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
+#[cfg(test)]
+impl RemoteOperationContext {
+    /// Construct a test identity with the same owned serialization guard held
+    /// by live ingress. Tests must not manufacture an authority value which
+    /// omits the production guard invariant.
+    pub(crate) async fn for_test(
+        request_id: Uuid,
+        logical_attachment_id: Uuid,
+        operation_id: Uuid,
+        authenticated_device_id: Uuid,
+        authenticated_device_generation: u64,
+    ) -> Self {
+        let identity_guard = Arc::new(tokio::sync::Mutex::new(()))
+            .lock_owned()
+            .await;
+        Self {
+            request_id,
+            logical_attachment_id,
+            operation_id,
+            authenticated_device_id,
+            authenticated_device_generation,
+            _identity_guard: identity_guard,
+        }
+    }
+}
+
 fn denied() -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Authorization,

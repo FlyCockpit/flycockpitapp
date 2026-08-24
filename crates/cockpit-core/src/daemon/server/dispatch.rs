@@ -239,6 +239,7 @@ fn is_local_owner_action(
 /// remote-operation ledger dispatch. A remoted owner (an owner principal
 /// carrying a remote-operation context) is NOT a local-owner action, so it is
 /// refused the raw `--include-sensitive` export exactly like any other remote.
+#[cfg(feature = "remote")]
 fn is_local_owner_action_shared(
     shared: &SharedClientState,
     remote_operation: Option<&super::RemoteOperationContext>,
@@ -323,6 +324,7 @@ fn workspace_trust_mode_from_db(
     }
 }
 
+#[cfg(feature = "remote")]
 fn org_disclosure_to_proto(
     value: crate::db::org_sync::OrgSyncDisclosure,
 ) -> proto::OrgSyncDisclosure {
@@ -333,6 +335,7 @@ fn org_disclosure_to_proto(
     }
 }
 
+#[cfg(feature = "remote")]
 fn connector_disclosure_to_proto(
     value: crate::db::connector::ConnectorDisclosure,
 ) -> proto::ConnectorDisclosure {
@@ -858,9 +861,10 @@ async fn handle_send_user_message(
 /// `SendUserMessageBulk` consumer use distinct request operation UUIDs, so the
 /// stable authenticated attachment/device binding (plus principal) is the
 /// operation identity that can safely span the whole transfer.
-pub(super) fn bulk_user_message_transfer_owner(
+fn bulk_user_message_transfer_owner_impl(
     principal: &ClientPrincipal,
     session_id: Uuid,
+    #[cfg(feature = "remote")]
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
     let mut identity = Vec::with_capacity(128);
@@ -871,21 +875,26 @@ pub(super) fn bulk_user_message_transfer_owner(
             .unwrap_or_else(|| "local-owner".to_owned())
             .as_bytes(),
     );
-    match remote_operation {
-        Some(operation) => {
-            identity.extend_from_slice(b"\0remote-actor:");
-            identity.extend_from_slice(operation.logical_attachment_id.as_bytes());
-            identity.extend_from_slice(operation.authenticated_device_id.as_bytes());
-            identity.extend_from_slice(&operation.authenticated_device_generation.to_be_bytes());
-        }
-        None if principal.is_owner() => identity.extend_from_slice(b"\0local-owner"),
-        None => {
-            return Err(ErrorPayload {
-                code: ErrorCode::Authorization,
-                message: "bulk user-message transfers require an authenticated operation actor"
-                    .to_owned(),
-            });
-        }
+    #[cfg(feature = "remote")]
+    if let Some(operation) = remote_operation {
+        identity.extend_from_slice(b"\0remote-actor:");
+        identity.extend_from_slice(operation.logical_attachment_id.as_bytes());
+        identity.extend_from_slice(operation.authenticated_device_id.as_bytes());
+        identity.extend_from_slice(&operation.authenticated_device_generation.to_be_bytes());
+        return Ok(
+            crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
+                session_id, &identity,
+            ),
+        );
+    }
+    if principal.is_owner() {
+        identity.extend_from_slice(b"\0local-owner");
+    } else {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "bulk user-message transfers require an authenticated operation actor"
+                .to_owned(),
+        });
     }
     Ok(
         crate::daemon::bulk_staging::BulkTransferOwner::for_attached_identity(
@@ -894,28 +903,61 @@ pub(super) fn bulk_user_message_transfer_owner(
     )
 }
 
+pub(super) fn bulk_user_message_transfer_owner_local(
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
+    bulk_user_message_transfer_owner_impl(principal, session_id)
+}
+
+#[cfg(feature = "remote")]
+pub(super) fn bulk_user_message_transfer_owner(
+    principal: &ClientPrincipal,
+    session_id: Uuid,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<crate::daemon::bulk_staging::BulkTransferOwner, ErrorPayload> {
+    bulk_user_message_transfer_owner_impl(principal, session_id, remote_operation)
+}
+
 /// The durable FCM2 replay gate parallel to [`bulk_user_message_transfer_owner`].
 /// A consumed/expired reference may only be reconstructed for the same stored
 /// message actor, never merely because another client knows its transfer id and
 /// client submission id.
+fn bulk_user_message_replay_actor_impl(
+    principal: &ClientPrincipal,
+    #[cfg(feature = "remote")]
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
+    #[cfg(feature = "remote")]
+    if let Some(operation) = remote_operation {
+        return Ok(crate::db::message_attachments::MessageActor::ExternalPrincipal {
+            id: *operation.authenticated_device_id.as_bytes(),
+            generation: operation.authenticated_device_generation,
+        });
+    }
+    if principal.is_owner() {
+        Ok(crate::db::message_attachments::MessageActor::LocalOwner)
+    } else {
+        Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "bulk user-message transfers require an authenticated operation actor"
+                .to_owned(),
+        })
+    }
+}
+
+pub(super) fn bulk_user_message_replay_actor_local(
+    principal: &ClientPrincipal,
+) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
+    bulk_user_message_replay_actor_impl(principal)
+}
+
+#[cfg(feature = "remote")]
 pub(super) fn bulk_user_message_replay_actor(
     principal: &ClientPrincipal,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<crate::db::message_attachments::MessageActor, ErrorPayload> {
-    match remote_operation {
-        Some(operation) => Ok(crate::db::message_attachments::MessageActor::ExternalPrincipal {
-            id: *operation.authenticated_device_id.as_bytes(),
-            generation: operation.authenticated_device_generation,
-        }),
-        None if principal.is_owner() => {
-            Ok(crate::db::message_attachments::MessageActor::LocalOwner)
-        }
-        None => Err(ErrorPayload {
-            code: ErrorCode::Authorization,
-            message: "bulk user-message transfers require an authenticated operation actor"
-                .to_owned(),
-        }),
-    }
+    bulk_user_message_replay_actor_impl(principal, remote_operation)
 }
 
 pub(super) fn unavailable_bulk_user_message_transfer() -> ErrorPayload {
@@ -1164,6 +1206,7 @@ pub(super) async fn handle_serialized_request(
     .await
 }
 
+#[cfg(feature = "remote")]
 async fn begin_remote_nonrepeatable(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -1309,6 +1352,7 @@ fn build_remote_session_ledger(
     Ok(RemoteSessionLedger::new(operation, request_hash))
 }
 
+#[cfg(feature = "remote")]
 async fn commit_remote_nonrepeatable(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
@@ -1365,6 +1409,7 @@ async fn commit_remote_nonrepeatable(
 /// filesystem.  Close the reserved operation as unknown in that case: a
 /// retry must never run the mutation again and turn an indeterminate write
 /// into a second provider-layer change.
+#[cfg(feature = "remote")]
 pub(super) async fn finish_remote_provider_mutation<F>(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
@@ -1402,6 +1447,7 @@ where
 // context, and the response together so the whole thing commits atomically;
 // bundling them into a params struct would only obscure that hot security path
 // for a purely cosmetic lint, so allow the count here.
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 async fn mutate_owner_vault_item_with_remote_ledger(
     ctx: &DaemonContext,
@@ -1485,6 +1531,7 @@ async fn mutate_owner_vault_item_with_remote_ledger(
     Ok(response)
 }
 
+#[cfg(feature = "remote")]
 async fn begin_remote_idempotent_adapter(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -1523,6 +1570,7 @@ async fn begin_remote_idempotent_adapter(
     }
 }
 
+#[cfg(feature = "remote")]
 async fn commit_remote_idempotent_adapter(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
@@ -1560,7 +1608,7 @@ async fn commit_remote_idempotent_adapter(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 fn db_filesystem_identity(
     value: crate::external_journal::HeldEntryIdentity,
 ) -> crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
@@ -1575,7 +1623,7 @@ fn db_filesystem_identity(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 async fn cleanup_remote_rename_artifacts(
     _ctx: &DaemonContext,
     journal: &crate::external_journal::ExternalJournal,
@@ -1585,7 +1633,7 @@ async fn cleanup_remote_rename_artifacts(
     let _ = journal.drain_remote_rename_artifact_cleanup().await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 async fn close_remote_rename_effect_unknown(
     ctx: &DaemonContext,
     journal: &crate::external_journal::ExternalJournal,
@@ -1611,7 +1659,7 @@ async fn close_remote_rename_effect_unknown(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 pub(crate) async fn execute_remote_staged_rename(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -1621,7 +1669,7 @@ pub(crate) async fn execute_remote_staged_rename(
     execute_remote_staged_rename_with_hook(request, authorized, operation, ctx, |_| Ok(())).await
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(feature = "remote", any(target_os = "linux", target_os = "macos")))]
 pub(super) async fn execute_remote_staged_rename_with_hook(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -8949,12 +8997,14 @@ pub(super) async fn delete_leak_report(
     Ok(Response::LeakReportDeleted { report_id })
 }
 
-pub(super) async fn handle_concurrent_request_with_remote_operation(
+async fn handle_concurrent_request_impl(
     request: Request,
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
+    #[cfg(feature = "remote")]
     remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    #[cfg(feature = "remote")]
     if let Some(operation) = &remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -9143,8 +9193,11 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             include_generated_artifacts,
             include_sensitive,
         } => {
+            #[cfg(feature = "remote")]
             let local_owner_action =
                 is_local_owner_action_shared(&shared, remote_operation.as_ref());
+            #[cfg(not(feature = "remote"))]
+            let local_owner_action = shared.principal.is_owner();
             export_session_data(
                 &ctx,
                 session_id,
@@ -9173,11 +9226,21 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                         code: ErrorCode::NotAttached,
                         message: "request requires an attached session".to_owned(),
                     })?;
-                Some(bulk_user_message_transfer_owner(
-                    &shared.principal,
-                    session_id,
-                    remote_operation.as_ref(),
-                )?)
+                #[cfg(feature = "remote")]
+                {
+                    Some(bulk_user_message_transfer_owner(
+                        &shared.principal,
+                        session_id,
+                        remote_operation.as_ref(),
+                    )?)
+                }
+                #[cfg(not(feature = "remote"))]
+                {
+                    Some(bulk_user_message_transfer_owner_local(
+                        &shared.principal,
+                        session_id,
+                    )?)
+                }
             } else {
                 None
             };
@@ -9604,7 +9667,17 @@ pub(super) async fn handle_concurrent_request(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    handle_concurrent_request_with_remote_operation(request, shared, ctx, None).await
+    handle_concurrent_request_impl(request, shared, ctx).await
+}
+
+#[cfg(feature = "remote")]
+pub(super) async fn handle_concurrent_request_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    handle_concurrent_request_impl(request, shared, ctx, remote_operation).await
 }
 
 fn current_host_capability_snapshot(ctx: &DaemonContext) -> cockpit_proto::HostCapabilitySnapshot {

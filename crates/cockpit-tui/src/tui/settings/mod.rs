@@ -205,11 +205,12 @@ fn apply_settings_patch_via_daemon(
     revision: &str,
 ) -> Result<(), String> {
     let desired_value = serde_json::to_value(desired).map_err(|error| error.to_string())?;
-    let fields = changed_extended_fields(base, &desired_value)?;
+    let (fields, unset_fields) = changed_extended_fields(base, &desired_value)?;
     let denylist = denylist_mutations(base, &desired.redact.denylist)?;
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
         candidate: desired.clone(),
         fields,
+        unset_fields,
         materialize: false,
         denylist,
     };
@@ -252,11 +253,12 @@ pub(super) fn apply_typed_settings_document_edit(
     let desired: ExtendedConfig = serde_json::from_value(document)
         .map_err(|error| format!("invalid typed settings edit: {error}"))?;
     let desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
-    let fields = changed_extended_fields(&authority_base, &desired_value)?;
+    let (fields, unset_fields) = changed_extended_fields(&authority_base, &desired_value)?;
     let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
     let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
         candidate: desired,
         fields,
+        unset_fields,
         materialize: true,
         denylist,
     };
@@ -308,7 +310,13 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
 fn changed_extended_fields(
     base: &serde_json::Value,
     desired: &serde_json::Value,
-) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigField>, String> {
+) -> Result<
+    (
+        Vec<cockpit_core::daemon::proto::ExtendedConfigField>,
+        Vec<cockpit_core::daemon::proto::ExtendedConfigField>,
+    ),
+    String,
+> {
     use cockpit_core::daemon::proto::ExtendedConfigField as F;
     let all = [
         F::ResponseMetricsTokenizer,
@@ -382,10 +390,19 @@ fn changed_extended_fields(
     let desired = desired
         .as_object()
         .ok_or_else(|| "settings candidate is not an object".to_string())?;
-    Ok(all
-        .into_iter()
-        .filter(|field| base.get(field.json_key()) != desired.get(field.json_key()))
-        .collect())
+    let mut set = Vec::new();
+    let mut unset = Vec::new();
+    for field in all {
+        if base.get(field.json_key()) == desired.get(field.json_key()) {
+            continue;
+        }
+        if desired.contains_key(field.json_key()) {
+            set.push(field);
+        } else {
+            unset.push(field);
+        }
+    }
+    Ok((set, unset))
 }
 
 fn denylist_mutations(

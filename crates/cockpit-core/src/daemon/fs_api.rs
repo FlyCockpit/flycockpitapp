@@ -35,9 +35,18 @@ struct SettingsCapability {
     denylist_ids: Vec<String>,
     /// Exact values replaced by opaque per-occurrence placeholders in the
     /// typed owner projection. These bytes never cross the daemon boundary.
-    redacted_occurrences: std::collections::HashMap<String, String>,
+    redacted_occurrences: std::collections::HashMap<String, RedactedSettingOccurrence>,
     issued_at: Instant,
     expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct RedactedSettingOccurrence {
+    original: String,
+    /// RFC 6901 JSON pointer in the typed projection. A token is valid only at
+    /// this exact occurrence; equal secret values still receive distinct
+    /// tokens and entries.
+    pointer: String,
 }
 
 fn settings_capabilities() -> &'static Mutex<std::collections::HashMap<Uuid, SettingsCapability>> {
@@ -371,32 +380,40 @@ fn redact_extended_config_projection(
 ) -> Result<
     (
         cockpit_config::config::extended::ExtendedConfig,
-        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, RedactedSettingOccurrence>,
     ),
     ErrorPayload,
 > {
     fn scrub_value(
         value: &mut serde_json::Value,
         redaction: &crate::redact::RedactionTable,
-        occurrences: &mut std::collections::HashMap<String, String>,
+        occurrences: &mut std::collections::HashMap<String, RedactedSettingOccurrence>,
+        pointer: &str,
     ) {
         match value {
             serde_json::Value::String(text) => {
                 if redaction.scrub(text) != *text {
                     let placeholder =
                         format!("{SETTINGS_REDACTED_OCCURRENCE_PREFIX}{}__", Uuid::new_v4());
-                    occurrences.insert(placeholder.clone(), std::mem::take(text));
+                    occurrences.insert(
+                        placeholder.clone(),
+                        RedactedSettingOccurrence {
+                            original: std::mem::take(text),
+                            pointer: pointer.to_string(),
+                        },
+                    );
                     *text = placeholder;
                 }
             }
             serde_json::Value::Array(values) => {
-                for value in values {
-                    scrub_value(value, redaction, occurrences);
+                for (index, value) in values.iter_mut().enumerate() {
+                    scrub_value(value, redaction, occurrences, &format!("{pointer}/{index}"));
                 }
             }
             serde_json::Value::Object(values) => {
-                for value in values.values_mut() {
-                    scrub_value(value, redaction, occurrences);
+                for (key, value) in values.iter_mut() {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    scrub_value(value, redaction, occurrences, &format!("{pointer}/{key}"));
                 }
             }
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
@@ -406,7 +423,7 @@ fn redact_extended_config_projection(
 
     let mut value = serde_json::to_value(config).map_err(internal)?;
     let mut occurrences = std::collections::HashMap::new();
-    scrub_value(&mut value, redaction, &mut occurrences);
+    scrub_value(&mut value, redaction, &mut occurrences, "");
     // Type-preserving deserialization is the fail-closed boundary: if a
     // secret literal occupied an enum/discriminator or otherwise made the
     // projection invalid, do not emit a subtly altered authority document.
@@ -422,29 +439,60 @@ const SETTINGS_REDACTED_OCCURRENCE_PREFIX: &str = "__cockpit_redacted_setting_v1
 
 fn restore_redacted_occurrences(
     value: &mut serde_json::Value,
-    occurrences: &std::collections::HashMap<String, String>,
+    occurrences: &std::collections::HashMap<String, RedactedSettingOccurrence>,
+    selected_fields: &std::collections::HashSet<&str>,
 ) -> Result<(), ErrorPayload> {
-    match value {
-        serde_json::Value::String(text) => {
-            if let Some(original) = occurrences.get(text) {
-                *text = original.clone();
-            } else if text.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX) {
-                return Err(bad_request(
-                    "redacted settings placeholders may be preserved exactly or replaced, but not edited",
-                ));
+    fn visit(
+        value: &mut serde_json::Value,
+        pointer: &str,
+        occurrences: &std::collections::HashMap<String, RedactedSettingOccurrence>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ErrorPayload> {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Some(occurrence) = occurrences.get(text) {
+                    if occurrence.pointer != pointer || !seen.insert(text.clone()) {
+                        return Err(bad_request(
+                            "redacted settings placeholder moved or was duplicated",
+                        ));
+                    }
+                    *text = occurrence.original.clone();
+                } else if text.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX) {
+                    return Err(bad_request(
+                        "redacted settings placeholder is unknown or altered",
+                    ));
+                }
             }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                restore_redacted_occurrences(value, occurrences)?;
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    visit(value, &format!("{pointer}/{index}"), occurrences, seen)?;
+                }
             }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                restore_redacted_occurrences(value, occurrences)?;
+            serde_json::Value::Object(values) => {
+                for (key, value) in values.iter_mut() {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    visit(value, &format!("{pointer}/{key}"), occurrences, seen)?;
+                }
             }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
         }
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        Ok(())
+    }
+    let mut seen = std::collections::HashSet::new();
+    visit(value, "", occurrences, &mut seen)?;
+    for (token, occurrence) in occurrences {
+        let top_level = occurrence
+            .pointer
+            .strip_prefix('/')
+            .and_then(|pointer| pointer.split('/').next())
+            .unwrap_or("")
+            .replace("~1", "/")
+            .replace("~0", "~");
+        if !seen.contains(token) && !selected_fields.contains(top_level.as_str()) {
+            return Err(bad_request(
+                "redacted settings placeholder was removed outside an explicitly selected field",
+            ));
+        }
     }
     Ok(())
 }
@@ -504,7 +552,24 @@ pub async fn apply_extended_config_patch(
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
             let current_typed = serde_json::to_value(current_typed).map_err(internal)?;
             let mut candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
-            restore_redacted_occurrences(&mut candidate, &capability.redacted_occurrences)?;
+            let mut selected_fields = std::collections::HashSet::new();
+            for field in patch.fields.iter().chain(&patch.unset_fields) {
+                if !selected_fields.insert(field.json_key()) {
+                    return Err(bad_request(
+                        "a settings field may be selected exactly once",
+                    ));
+                }
+                if *field == cockpit_proto::ExtendedConfigField::ImageGeneration {
+                    return Err(bad_request(
+                        "image generation settings require the dedicated daemon API",
+                    ));
+                }
+            }
+            restore_redacted_occurrences(
+                &mut candidate,
+                &capability.redacted_occurrences,
+                &selected_fields,
+            )?;
             let object = document.as_object_mut().ok_or_else(|| {
                 bad_request("extended config root must be a JSON object")
             })?;
@@ -512,11 +577,6 @@ pub async fn apply_extended_config_patch(
             let current_typed = current_typed.as_object()
                 .expect("ExtendedConfig serializes as object");
             for field in patch.fields {
-                if field == cockpit_proto::ExtendedConfigField::ImageGeneration {
-                    return Err(bad_request(
-                        "image generation settings require the dedicated daemon API",
-                    ));
-                }
                 let key = field.json_key();
                 let value = candidate.get(key).cloned().ok_or_else(|| {
                     bad_request(format!("typed settings candidate omitted `{key}`"))
@@ -543,6 +603,9 @@ pub async fn apply_extended_config_patch(
                     merge_changed_known_value(
                         object.entry(key).or_insert(serde_json::Value::Null), current, value);
                 }
+            }
+            for field in patch.unset_fields {
+                object.remove(field.json_key());
             }
             apply_denylist_mutations(object, patch.denylist, &capability.denylist_ids)?;
             let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;

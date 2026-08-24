@@ -32,7 +32,13 @@ pub struct ExtendedConfigLayerSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfigPatch {
     pub candidate: cockpit_config::config::extended::ExtendedConfig,
+    /// Selected fields whose serialized value is present in `candidate`.
     pub fields: Vec<ExtendedConfigField>,
+    /// Selected optional/default-valued fields that must be removed from this
+    /// layer. This distinguishes an intentional clear from serde's
+    /// `skip_serializing_if` omission.
+    #[serde(default)]
+    pub unset_fields: Vec<ExtendedConfigField>,
     /// Create the selected layer even when typed values are unchanged.
     #[serde(default)]
     pub materialize: bool,

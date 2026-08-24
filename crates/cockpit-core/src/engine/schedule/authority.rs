@@ -597,6 +597,11 @@ impl ScheduleAuthority {
     /// task. In-context loops remove themselves before emitting completion;
     /// this is primarily for background, forked-loop, and swarm tasks.
     pub fn mark_completed(&mut self, job_id: &str) {
+        // A terminal event is sent from inside the task, so receiving it does
+        // not prove that the task has returned. Reap only handles Tokio has
+        // independently marked finished; retain the current handle otherwise
+        // so teardown still owns and joins it.
+        self.swarm_tasks.retain(|_, task| !task.is_finished());
         if let Some(mut entry) = self.registry.remove(job_id) {
             if let Some(ic) = &mut entry.in_context
                 && let Some(t) = ic.timer_abort.take()
@@ -605,7 +610,6 @@ impl ScheduleAuthority {
             }
             entry.abort.take();
         }
-        self.swarm_tasks.remove(job_id);
     }
 
     /// Cooperatively stop and join every recursive child task. This must run

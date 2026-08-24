@@ -859,12 +859,12 @@ impl CommandRunner for TokioCommandRunner {
             .clone()
             .unwrap_or_else(tokio_util::sync::CancellationToken::new);
         let cancellation_enabled = self.cancellation.is_some();
-        // Allocation is part of the hook deadline.  Once the request has been
-        // accepted by the containment actor, however, cancellation cannot
-        // simply drop the reply: the actor may already have spawned.  Keep
-        // ownership of the reply until it proves either that no lease was
-        // published or that the published generation has been terminated and
-        // observed empty.
+        // Allocation is part of the hook deadline. Enqueuing the operation is
+        // the cleanup-ticket handoff: the actor owns the request and, if this
+        // reply receiver is dropped after a spawn, `reply.send` failure moves
+        // the unpublished lease directly into actor reconciliation. Therefore
+        // timeout/cancellation may stop awaiting without detaching either the
+        // allocation future or an opaque platform handle.
         let mut allocation = Box::pin(allocation);
         let allocation_deadline = tokio::time::sleep(timeout);
         tokio::pin!(allocation_deadline);
@@ -889,15 +889,7 @@ impl CommandRunner for TokioCommandRunner {
                     AllocationBoundary::TimedOut => (true, None),
                     AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
                 };
-                if let Ok((lease, _io)) = allocation.await {
-                    let mut guard = HookContainmentDropGuard {
-                        handle: containment.clone(),
-                        lease: Some(lease.clone()),
-                    };
-                    if terminate_and_prove_empty(containment, &lease).await.is_ok() {
-                        guard.disarm();
-                    }
-                }
+                drop(allocation);
                 return HookRawOutput {
                     stdout: String::new(),
                     exit_code: None,

@@ -320,13 +320,20 @@ async fn run_swarm_loop(
     // This task also publishes Completed, preserving FIFO start-before-terminal
     // order on the same authority channel.
     if !spec.worker.is_goal_control() {
-        let _ = event_tx
-            .send(ScheduleEvent::SwarmChildStarted {
+        let started = ScheduleEvent::SwarmChildStarted {
                 job_id: job_id.to_string(),
                 subagent_type: spec.worker.agent_name().to_string(),
                 lifecycle_event_emitted: lifecycle_event_emitted.clone(),
-            })
-            .await;
+            };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("swarm subagent cancelled before lifecycle start publication"),
+            result = event_tx.send(started) => {
+                result.map_err(|_| anyhow::anyhow!(
+                    "swarm lifecycle authority closed before child start could be published"
+                ))?;
+            }
+        }
     }
     let agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
@@ -521,6 +528,7 @@ async fn run_swarm_loop(
                     model,
                     cmd_tx,
                     turn_tx,
+                    &cancel,
                 )
                 .await;
                 next_prompt =
@@ -607,6 +615,7 @@ async fn route_child_spawn(
     model: Option<String>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
     turn_tx: &mpsc::Sender<TurnEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
     let child_depth = spec.depth + 1;
     if child_depth > spec.max_depth {
@@ -667,22 +676,27 @@ async fn route_child_spawn(
         job_id: spec_label(spec),
     });
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    match cmd_tx
-        .send(ScheduleCommand::Spawn {
+    let command = ScheduleCommand::Spawn {
             spec: child,
             result_tx: Some(result_tx),
-        })
-        .await
-    {
-        Ok(()) => match result_rx.await {
+        };
+    let sent = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        result = cmd_tx.send(command) => result.is_ok(),
+    };
+    if !sent {
+        return "could not schedule the deeper subagent (the session is shutting down); do this slice's work yourself.".to_string();
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => "could not schedule the deeper subagent (the parent was cancelled); do this slice's work yourself.".to_string(),
+        result = result_rx => match result {
             Ok(result) => result,
             Err(_) => "could not schedule the deeper subagent (the scheduler dropped the result); \
                  do this slice's work yourself."
                 .to_string(),
-        },
-        Err(_) => "could not schedule the deeper subagent (the session is shutting down); do this \
-             slice's work yourself."
-            .to_string(),
+        }
     }
 }
 
@@ -1301,6 +1315,7 @@ mod tests {
                 child_model.map(str::to_string),
                 &cmd_tx,
                 &turn_tx,
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await;
             handle.await.expect("spawn command observed")
@@ -1370,6 +1385,7 @@ mod tests {
             None,
             &cmd_tx,
             &turn_tx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(out.contains("refused"), "got {out}");
@@ -1391,6 +1407,7 @@ mod tests {
         // barrier (see `route_child_spawn_refuses_writable_delegation`).
         s.worker = SpawnWorkerKind::Scout;
         let ws = workspace();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let routed = route_child_spawn(
             &s,
             "city slice",
@@ -1399,6 +1416,7 @@ mod tests {
             None,
             &cmd_tx,
             &turn_tx,
+            &cancel,
         );
         tokio::pin!(routed);
         let result_tx = tokio::select! {
@@ -1419,12 +1437,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_child_spawn_cancellation_bounds_command_and_result_waits() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(1);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(1);
+        let mut parent = spec(1, 3);
+        parent.worker = SpawnWorkerKind::Scout;
+        let ws = workspace();
+
+        let cancelled_before_send = tokio_util::sync::CancellationToken::new();
+        cancelled_before_send.cancel();
+        let result = route_child_spawn(
+            &parent,
+            "nested",
+            "slice",
+            ws.path(),
+            None,
+            &cmd_tx,
+            &turn_tx,
+            &cancelled_before_send,
+        )
+        .await;
+        assert!(result.contains("shutting down"));
+        assert!(cmd_rx.try_recv().is_err());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = route_child_spawn(
+            &parent,
+            "nested",
+            "slice",
+            ws.path(),
+            None,
+            &cmd_tx,
+            &turn_tx,
+            &cancel,
+        );
+        tokio::pin!(waiting);
+        let held_reply = tokio::select! {
+            command = cmd_rx.recv() => match command {
+                Some(ScheduleCommand::Spawn { result_tx, .. }) => result_tx,
+                other => panic!("expected nested spawn, got {other:?}"),
+            },
+            result = &mut waiting => panic!("returned before scheduler reply: {result}"),
+        };
+        cancel.cancel();
+        let result = waiting.await;
+        assert!(result.contains("parent was cancelled"));
+        assert!(held_reply.expect("reply sender").send("late".into()).is_err());
+    }
+
+    #[tokio::test]
     async fn route_child_spawn_preserves_scout_worker_and_model() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ScheduleCommand>(8);
         let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
         let mut s = spec(1, 3);
         s.worker = SpawnWorkerKind::Scout;
         let ws = workspace();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let routed = route_child_spawn(
             &s,
             "adjudicate claim",
@@ -1433,6 +1501,7 @@ mod tests {
             Some("openrouter/reviewer".into()),
             &cmd_tx,
             &turn_tx,
+            &cancel,
         );
         tokio::pin!(routed);
         let result_tx = tokio::select! {
@@ -1471,6 +1540,7 @@ mod tests {
             None,
             &cmd_tx,
             &turn_tx,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(out.contains("refused"), "got {out}");

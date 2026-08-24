@@ -5149,19 +5149,23 @@ async fn send_wrapped_noninteractive_event(
     tx: &mpsc::Sender<TurnEvent>,
     target: &NoninteractiveSteerTarget,
     event: TurnEvent,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> bool {
-    tx.send(wrap_noninteractive_child_event(target, event))
-        .await
-        .is_ok()
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        result = tx.send(wrap_noninteractive_child_event(target, event)) => result.is_ok(),
+    }
 }
 
 async fn flush_nested_deltas(
     tx: &mpsc::Sender<TurnEvent>,
     target: &NoninteractiveSteerTarget,
     pending: &mut PendingNestedDeltas,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> bool {
     for event in pending.drain() {
-        if !send_wrapped_noninteractive_event(tx, target, event).await {
+        if !send_wrapped_noninteractive_event(tx, target, event, cancel).await {
             return false;
         }
     }
@@ -5172,6 +5176,7 @@ pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
     mut rx: mpsc::Receiver<TurnEvent>,
     event_tx: Option<mpsc::Sender<TurnEvent>>,
     target: Option<NoninteractiveSteerTarget>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (Some(event_tx), Some(target)) = (event_tx, target) else {
@@ -5185,9 +5190,11 @@ pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
 
         loop {
             tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
                 maybe_event = rx.recv() => {
                     let Some(event) = maybe_event else {
-                        let _ = flush_nested_deltas(&event_tx, &target, &mut pending).await;
+                        let _ = flush_nested_deltas(&event_tx, &target, &mut pending, &cancel).await;
                         break;
                     };
                     match event {
@@ -5212,17 +5219,17 @@ pub(in crate::engine::driver) fn spawn_noninteractive_event_forwarder(
                             pending.push_display_reasoning(agent, attempt_id, delta);
                         }
                         other => {
-                            if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                            if !flush_nested_deltas(&event_tx, &target, &mut pending, &cancel).await {
                                 break;
                             }
-                            if !send_wrapped_noninteractive_event(&event_tx, &target, other).await {
+                            if !send_wrapped_noninteractive_event(&event_tx, &target, other, &cancel).await {
                                 break;
                             }
                         }
                     }
                 }
                 _ = flush_interval.tick() => {
-                    if !flush_nested_deltas(&event_tx, &target, &mut pending).await {
+                    if !flush_nested_deltas(&event_tx, &target, &mut pending, &cancel).await {
                         break;
                     }
                 }
@@ -5420,7 +5427,12 @@ pub(crate) async fn run_noninteractive_resumable(
     // Recursive vNext structural tasks need the original sender for their
     // own nested forwarder.  The current child's forwarder owns only a clone.
     let forwarder =
-        spawn_noninteractive_event_forwarder(child_rx, event_tx.clone(), steer_target.clone());
+        spawn_noninteractive_event_forwarder(
+            child_rx,
+            event_tx.clone(),
+            steer_target.clone(),
+            cancel.clone(),
+        );
 
     let agent = Arc::new(child);
     // A resumable vNext child is itself a delegation parent. Keep its direct

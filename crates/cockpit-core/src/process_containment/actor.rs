@@ -424,7 +424,10 @@ fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
                 op = returned;
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => return,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                retain_actor_join(join);
+                return;
+            }
         }
     }
     let mut rx = rx;
@@ -439,9 +442,24 @@ fn shutdown_actor_thread(tx: mpsc::Sender<Op>, join: thread::JoinHandle<()>) {
             {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => return,
+            Err(_) => {
+                retain_actor_join(join);
+                return;
+            }
         }
     }
+}
+
+/// A shutdown deadline bounds the caller, not actor ownership. If the actor
+/// has not exited, move its opaque join handle to a dedicated reaper instead
+/// of dropping (detaching) it. The actor continues owning every live adapter
+/// handle and durable reconciliation item until its loop actually finishes.
+fn retain_actor_join(join: thread::JoinHandle<()>) {
+    let _ = thread::Builder::new()
+        .name("process-containment-reaper".into())
+        .spawn(move || {
+            let _ = join.join();
+        });
 }
 
 fn wall_ms() -> i64 {
@@ -544,23 +562,12 @@ async fn actor_loop(
         let Some(op) = op else { break };
         match op {
             Op::Shutdown { reply } => {
-                // Shutdown is bounded. If platform truth cannot be proven in
-                // time, the durable non-empty/stopping rows intentionally
-                // survive for the next startup recovery pass; we never rewrite
-                // uncertainty into a false Empty result merely to exit.
-                if tokio::time::timeout(
-                    ACTOR_SHUTDOWN_DEADLINE,
-                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        pending = state.pending_reconciliation.len(),
-                        live = state.live.len(),
-                        "process containment shutdown drain timed out; durable recovery remains required"
-                    );
-                }
+                // The synchronous caller has a deadline, but the ownership
+                // task does not: cancelling this drain would drop opaque live
+                // handles. If the caller times out it transfers the JoinHandle
+                // to a reaper, while this actor continues until every accepted
+                // cleanup has reached proven empty.
+                drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
                 let _ = reply.send(());
                 break;
             }
@@ -730,6 +737,10 @@ async fn drain_shutdown_reconciliation(
     reconciliation_rx: &mut mpsc::UnboundedReceiver<ReconciliationRequest>,
 ) {
     state.intake_closed = true;
+    // Freeze cleanup intake before taking the live snapshot. `close` rejects
+    // later ownership transfers; all requests accepted before this boundary
+    // remain readable and are drained below.
+    reconciliation_rx.close();
     while let Ok(request) = reconciliation_rx.try_recv() {
         enqueue_pending_reconciliation(state, request);
     }
@@ -939,14 +950,23 @@ async fn create_native(
         }
     };
 
+    // Adapter success transfers an opaque live handle to the actor. Install
+    // rollback ownership before any fallible validation/reduction/persistence;
+    // no early return below may silently detach that allocation.
+    let rollback_index = state.pending_unpublished.len();
+    reclaim_unpublished_allocation(
+        state,
+        allocated.handle.clone(),
+        record.clone(),
+        generation,
+    );
+
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, allocated.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven native allocation".into(),
         });
     }
 
-    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -958,10 +978,8 @@ async fn create_native(
         ReduceResult::Applied(r) => *r,
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
-    if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(state, allocated.handle, creating_record, generation);
-        return Err(error);
-    }
+    persist_cas_from_creating(state, &record).await?;
+    state.pending_unpublished.swap_remove(rollback_index);
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(
@@ -1099,14 +1117,20 @@ async fn create_native_with_io(
         }
     };
 
+    let rollback_index = state.pending_unpublished.len();
+    reclaim_unpublished_allocation(
+        state,
+        allocated.allocation.handle.clone(),
+        record.clone(),
+        generation,
+    );
+
     if require_proven && allocated.allocation.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, allocated.allocation.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven IO allocation".into(),
         });
     }
 
-    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -1118,15 +1142,8 @@ async fn create_native_with_io(
         ReduceResult::Applied(record) => *record,
         other => return Err(ContainmentError::Internal(format!("{other:?}"))),
     };
-    if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(
-            state,
-            allocated.allocation.handle,
-            creating_record,
-            generation,
-        );
-        return Err(error);
-    }
+    persist_cas_from_creating(state, &record).await?;
+    state.pending_unpublished.swap_remove(rollback_index);
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(
         containment_id,
@@ -1250,14 +1267,20 @@ async fn create_container(
         }
     };
 
+    let rollback_index = state.pending_unpublished.len();
+    reclaim_unpublished_allocation(
+        state,
+        allocated.handle.clone(),
+        record.clone(),
+        generation,
+    );
+
     if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
-        reclaim_unpublished_allocation(state, allocated.handle, record, generation);
         return Err(ContainmentError::DescendantContainmentUnavailable {
             reason: "adapter returned a non-proven container allocation".into(),
         });
     }
 
-    let creating_record = record.clone();
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -1269,10 +1292,8 @@ async fn create_container(
         ReduceResult::Applied(r) => *r,
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
-    if let Err(error) = persist_cas_from_creating(state, &record).await {
-        reclaim_unpublished_allocation(state, allocated.handle, creating_record, generation);
-        return Err(error);
-    }
+    persist_cas_from_creating(state, &record).await?;
+    state.pending_unpublished.swap_remove(rollback_index);
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(

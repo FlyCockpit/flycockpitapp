@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::adapter::{
     AdapterHandle, AllocatedContainment, AllocatedNativeIo, NativeChildIo,
@@ -37,6 +38,7 @@ const MAX_ENVIRONMENT_ENTRIES: usize = 4096;
 const MAX_ARGUMENTS: usize = 4096;
 const MAX_STRING_BYTES: usize = 128 * 1024;
 const SPAWN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_DIRECTORY: &str = "/run/flycockpit";
 
 #[derive(Debug, Clone)]
@@ -123,6 +125,10 @@ enum Request {
         args: Vec<String>,
         cwd: Vec<u8>,
         env: BTreeMap<String, String>,
+        /// SHA-256 over the canonical, length-delimited spawn request. This is
+        /// persisted with the operation identity so an idempotency key can
+        /// never be replayed with different executable inputs.
+        request_digest: String,
     },
     CommitSpawn { version: u32, session_id: String, operation_id: String },
     CancelOperation { version: u32, session_id: String, operation_id: String },
@@ -148,10 +154,21 @@ enum Response {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum OperationStatus { Prepared, Committing, Committed, Cancelled, Exited }
+enum OperationStatus {
+    Prepared,
+    Committing,
+    Committed,
+    /// Kill has been requested but kernel-proven emptiness has not yet been
+    /// observed. This durable state is retryable and must never be reported as
+    /// cancellation success.
+    CleanupRequired,
+    Cancelled,
+    Exited,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GuardAttestation {
+    pid: i32,
     clone_into_cgroup: bool,
     private_mount_ns: bool,
     private_cgroup_ns: bool,
@@ -181,6 +198,7 @@ pub(crate) struct LinuxBrokerClient {
     // same uid can race the daemon. Production remains Unsupported until the
     // installer supplies a root-delivered capability fd to both endpoints.
     stream: Arc<Mutex<UnixStream>>,
+    capability: Arc<OwnedFd>,
     authenticated: bool,
 }
 
@@ -193,39 +211,51 @@ impl LinuxBrokerClient {
         if unsafe { libc::fcntl(capability_raw, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let mut attempts = 0_u16;
-        let stream = loop {
-            match UnixStream::connect(&config.socket_path) {
-                Ok(stream) => break stream,
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
-                    attempts += 1;
-                    if attempts >= 500 {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-            // The broker and daemon are ordered systemd units, but Type=simple
-            // activation can expose a short bind race. Bound it at startup.
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+        let stream = connect_authenticated_stream(&config, capability.as_fd())?;
         unsafe { libc::close(capability_raw) };
-        verify_peer_uid(&stream, config.expected_broker_uid)?;
-        let request = Request::Authenticate { version: PROTOCOL_VERSION };
-        let body = serde_json::to_vec(&request).map_err(invalid)?;
-        send_with_fds(stream.as_raw_fd(), &body, &[capability.as_raw_fd()])?;
-        let (response, fds) = recv_response_with_fds(&stream)?;
-        if !fds.is_empty() || !matches!(response, Response::Ready { version: PROTOCOL_VERSION, exclusive_delegation: true }) {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "broker rejected containment capability"));
-        }
-        Ok(Self { config, stream: Arc::new(Mutex::new(stream)), authenticated: true })
+        Ok(Self { config, stream: Arc::new(Mutex::new(stream)), capability: Arc::new(capability), authenticated: true })
     }
 
     fn transact(&self, request: &Request) -> std::io::Result<(Response, Vec<OwnedFd>)> {
         let mut stream = self.stream.lock().map_err(|_| std::io::Error::other("broker connection poisoned"))?;
-        write_frame(&mut stream, request)?;
-        recv_response_with_fds(&stream)
+        let result = write_frame(&mut stream, request)
+            .and_then(|()| recv_response_with_fds(&stream));
+        if result.is_err() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            if let Ok(reconnected) = connect_authenticated_stream(&self.config, self.capability.as_fd()) {
+                *stream = reconnected;
+            }
+        }
+        result
     }
+}
+
+fn connect_authenticated_stream(
+    config: &LinuxBrokerConfig,
+    capability: BorrowedFd<'_>,
+) -> std::io::Result<UnixStream> {
+    let mut attempts = 0_u16;
+    let stream = loop {
+        match UnixStream::connect(&config.socket_path) {
+            Ok(stream) => break stream,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+                attempts += 1;
+                if attempts >= 500 { return Err(error); }
+            }
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    verify_peer_uid(&stream, config.expected_broker_uid)?;
+    stream.set_read_timeout(Some(FRAME_TIMEOUT))?;
+    stream.set_write_timeout(Some(FRAME_TIMEOUT))?;
+    let body = serde_json::to_vec(&Request::Authenticate { version: PROTOCOL_VERSION }).map_err(invalid)?;
+    send_with_fds(stream.as_raw_fd(), &body, &[capability.as_raw_fd()])?;
+    let (response, fds) = recv_response_with_fds(&stream)?;
+    if !fds.is_empty() || !matches!(response, Response::Ready { version: PROTOCOL_VERSION, exclusive_delegation: true }) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "broker rejected containment capability"));
+    }
+    Ok(stream)
 }
 
 #[async_trait]
@@ -251,16 +281,29 @@ impl ManagementBroker for LinuxBrokerClient {
         let containment_id = request.containment_id;
         let session_id = request.session_id.to_string();
         let operation_id = request.operation_id.clone();
+        let program = request.program.as_os_str().as_bytes().to_vec();
+        let cwd = request.cwd.as_os_str().as_bytes().to_vec();
+        let request_digest = canonical_spawn_digest(
+            &containment_id.to_string(),
+            &session_id,
+            generation,
+            &operation_id,
+            &program,
+            &request.args,
+            &cwd,
+            &request.env,
+        );
         let wire = Request::PrepareSpawn {
             version: PROTOCOL_VERSION,
             containment_id: containment_id.to_string(),
             session_id: session_id.clone(),
             generation,
             operation_id: operation_id.clone(),
-            program: request.program.as_os_str().as_bytes().to_vec(),
+            program,
             args: request.args,
-            cwd: request.cwd.as_os_str().as_bytes().to_vec(),
+            cwd,
             env: request.env,
+            request_digest,
         };
         let (response, mut fds) = tokio::task::spawn_blocking(move || client.transact(&wire))
             .await
@@ -280,7 +323,7 @@ impl ManagementBroker for LinuxBrokerClient {
             }
             _ => return Err(unavailable()),
         };
-        if !guard.proven() || fds.len() != 4 {
+        if !guard.proven() || !verify_client_guard(&guard, &key) || fds.len() != 4 {
             let cancel = Request::CancelOperation { version: PROTOCOL_VERSION, session_id, operation_id };
             let client = self.clone();
             let _ = tokio::task::spawn_blocking(move || client.transact(&cancel)).await;
@@ -296,10 +339,28 @@ impl ManagementBroker for LinuxBrokerClient {
             operation_id: operation_id.clone(),
         };
         let commit_client = self.clone();
-        let committed = tokio::task::spawn_blocking(move || commit_client.transact(&commit))
-            .await
-            .map_err(|error| ContainmentError::Internal(error.to_string()))?
-            .map_err(|_| unavailable())?;
+        let committed = match tokio::task::spawn_blocking(move || commit_client.transact(&commit)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => {
+                // The commit response may be lost after the broker durably
+                // crossed the release boundary. Reconcile the operation; do
+                // not blindly cancel a child which may already be running.
+                let status_client = self.clone();
+                let status = Request::OperationStatus {
+                    version: PROTOCOL_VERSION,
+                    session_id: session_id.clone(),
+                    operation_id: operation_id.clone(),
+                };
+                match tokio::task::spawn_blocking(move || status_client.transact(&status)).await {
+                    Ok(Ok((Response::Operation { version: PROTOCOL_VERSION, state: OperationStatus::Committed | OperationStatus::Exited, key: Some(status_key) }, fds)))
+                        if status_key == key && fds.is_empty() =>
+                    {
+                        (Response::Committed { version: PROTOCOL_VERSION, key: status_key }, Vec::new())
+                    }
+                    _ => return Err(unavailable()),
+                }
+            }
+        };
         let commit_valid = matches!(
             &committed,
             (Response::Committed { version: PROTOCOL_VERSION, key: committed_key }, extra)
@@ -388,6 +449,9 @@ fn unavailable() -> ContainmentError {
 /// Runs the blocking privileged broker. Service managers must start this as a
 /// dedicated root identity with a private mount namespace and no network.
 pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let broker_capability = duplicate_valid_capability(config.capability_fd)?;
     unsafe { libc::close(config.capability_fd) };
     let recovered_empty = verify_server_installation(&config)?;
@@ -402,7 +466,8 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
         if verify_peer_uid(&candidate, config.allowed_uid).is_ok()
             && authenticate_connection(&mut candidate, &broker_capability).is_ok()
         {
-            candidate.set_read_timeout(None)?;
+            candidate.set_read_timeout(Some(FRAME_TIMEOUT))?;
+            candidate.set_write_timeout(Some(FRAME_TIMEOUT))?;
             break candidate;
         }
     };
@@ -447,6 +512,7 @@ struct BrokerOperation {
     status: OperationStatus,
     key: String,
     generation: u64,
+    request_digest: String,
     prepared: Option<Spawned>,
 }
 
@@ -457,6 +523,7 @@ struct DurableOperation {
     status: OperationStatus,
     key: String,
     generation: u64,
+    request_digest: String,
 }
 
 impl BrokerState {
@@ -489,6 +556,7 @@ fn serve_one(
             args,
             cwd,
             env,
+            request_digest,
         } if version == PROTOCOL_VERSION => {
             if uuid::Uuid::parse_str(&session_id).is_err() || !valid_operation_id(&operation_id) {
                 return send_response(
@@ -501,9 +569,25 @@ fn serve_one(
                 );
             }
             let operation_key = (session_id.clone(), operation_id.clone());
+            let expected_digest = canonical_spawn_digest(
+                &containment_id,
+                &session_id,
+                generation,
+                &operation_id,
+                &program,
+                &args,
+                &cwd,
+                &env,
+            );
+            if request_digest != expected_digest {
+                return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "request_digest_mismatch".into() }, &[]);
+            }
             if let Some(existing) = state.operations.get(&operation_key) {
                 let requested_key = containment_key(&containment_id, generation)?;
-                if existing.key != requested_key || existing.generation != generation {
+                if existing.key != requested_key
+                    || existing.generation != generation
+                    || existing.request_digest != request_digest
+                {
                     return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_identity_conflict".into() }, &[]);
                 }
                 return match (&existing.status, &existing.prepared) {
@@ -519,7 +603,7 @@ fn serve_one(
             match spawned {
                 Ok(spawned) => {
                     let key = spawned.key.clone();
-                    persist_operation(config, &session_id, &operation_id, OperationStatus::Prepared, &key, generation)?;
+                    persist_operation(config, &session_id, &operation_id, OperationStatus::Prepared, &key, generation, &request_digest)?;
                     let result = send_response(
                         &stream,
                         &Response::Prepared {
@@ -534,10 +618,11 @@ fn serve_one(
                             status: OperationStatus::Prepared,
                             key,
                             generation,
+                            request_digest,
                             prepared: Some(spawned),
                         });
                     } else {
-                        rollback_generation(&config.cgroup_root.join(&key), spawned.pid);
+                        let _ = rollback_generation(&config.cgroup_root.join(&key), spawned.pid);
                     }
                     result
                 }
@@ -562,11 +647,11 @@ fn serve_one(
                 return send_response(stream, &Response::Error { version: PROTOCOL_VERSION, code: "operation_cancelled".into() }, &[]);
             }
             let mut spawned = operation.prepared.take().ok_or_else(|| invalid("prepared operation has no child"))?;
-            persist_operation(config, &session_id, &operation_id, OperationStatus::Committing, &operation.key, operation.generation)?;
+            persist_operation(config, &session_id, &operation_id, OperationStatus::Committing, &operation.key, operation.generation, &operation.request_digest)?;
             release_child(&mut spawned)?;
             operation.status = OperationStatus::Committed;
             state.children.insert(operation.key.clone(), spawned.pid);
-            persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &operation.key, operation.generation)?;
+            persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &operation.key, operation.generation, &operation.request_digest)?;
             send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key: operation.key.clone() }, &[])
         }
         Request::CancelOperation { version, session_id, operation_id }
@@ -574,13 +659,21 @@ fn serve_one(
             if let Some(operation) = state.operations.get_mut(&(session_id, operation_id)) {
                 if matches!(operation.status, OperationStatus::Prepared) {
                     if let Some(spawned) = operation.prepared.take() {
-                        rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid);
+                        operation.status = OperationStatus::CleanupRequired;
+                        persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &operation.key, operation.generation, &operation.request_digest)?;
+                        rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid)?;
                     }
                     operation.status = OperationStatus::Cancelled;
-                    persist_operation(config, &session_id, &operation_id, OperationStatus::Cancelled, &operation.key, operation.generation)?;
+                    persist_operation(config, &session_id, &operation_id, OperationStatus::Cancelled, &operation.key, operation.generation, &operation.request_digest)?;
                 } else if matches!(operation.status, OperationStatus::Committing | OperationStatus::Committed) {
+                    operation.status = OperationStatus::CleanupRequired;
+                    persist_operation(config, &session_id, &operation_id, OperationStatus::CleanupRequired, &operation.key, operation.generation, &operation.request_digest)?;
                     let path = resolve_key(config, &operation.key, operation.generation)?;
                     fs::write(path.join("cgroup.kill"), b"1")?;
+                    wait_cgroup_empty(&path, std::time::Duration::from_secs(5))?;
+                    fs::remove_dir(&path)?;
+                    operation.status = OperationStatus::Cancelled;
+                    persist_operation(config, &session_id, &operation_id, OperationStatus::Cancelled, &operation.key, operation.generation, &operation.request_digest)?;
                 }
             }
             send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
@@ -767,11 +860,11 @@ fn spawn_atomic(
     match read_exec_handshake(status.as_raw_fd(), &mut errno, SPAWN_HANDSHAKE_TIMEOUT) {
         Ok(1) if errno[0] == 1 => {}
         Ok(4) => {
-            rollback_generation(&group, pid);
+            let _ = rollback_generation(&group, pid);
             return Err(std::io::Error::from_raw_os_error(i32::from_ne_bytes(errno)));
         }
         Ok(_) | Err(_) => {
-            rollback_generation(&group, pid);
+            let _ = rollback_generation(&group, pid);
             return Err(std::io::Error::other("child exec handshake failed"));
         }
     }
@@ -786,6 +879,7 @@ fn spawn_atomic(
         pidfd,
         release: release_write,
         guard: GuardAttestation {
+            pid,
             clone_into_cgroup: true,
             private_mount_ns: true,
             private_cgroup_ns: true,
@@ -817,7 +911,7 @@ unsafe fn child_exec(
     cwd: &CString,
     argv: &[*const libc::c_char],
     env: &[*const libc::c_char],
-    seccomp: &[libc::sock_filter; 18],
+    seccomp: &[libc::sock_filter],
     cap_last: u32,
 ) -> ! {
     if unsafe { libc::dup2(stdin, libc::STDIN_FILENO) } < 0
@@ -887,11 +981,11 @@ impl Drop for GenerationDirGuard {
     }
 }
 
-fn rollback_generation(group: &Path, pid: libc::pid_t) {
-    let _ = fs::write(group.join("cgroup.kill"), b"1");
-    let _ = reap_child(pid);
-    let _ = wait_cgroup_empty(group, std::time::Duration::from_secs(5));
-    let _ = fs::remove_dir(group);
+fn rollback_generation(group: &Path, pid: libc::pid_t) -> std::io::Result<()> {
+    fs::write(group.join("cgroup.kill"), b"1")?;
+    reap_child(pid)?;
+    wait_cgroup_empty(group, std::time::Duration::from_secs(5))?;
+    fs::remove_dir(group)
 }
 
 fn reap_child(pid: libc::pid_t) -> std::io::Result<Option<i32>> {
@@ -972,9 +1066,12 @@ fn wait_cgroup_empty(group: &Path, timeout: std::time::Duration) -> std::io::Res
 fn cleanup_connection_children(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
     for ((session_id, operation_id), operation) in &mut state.operations {
         if let Some(spawned) = operation.prepared.take() {
-            rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid);
-            operation.status = OperationStatus::Cancelled;
-            let _ = persist_operation(config, session_id, operation_id, OperationStatus::Cancelled, &operation.key, operation.generation);
+            operation.status = OperationStatus::CleanupRequired;
+            let _ = persist_operation(config, session_id, operation_id, OperationStatus::CleanupRequired, &operation.key, operation.generation, &operation.request_digest);
+            if rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid).is_ok() {
+                operation.status = OperationStatus::Cancelled;
+                let _ = persist_operation(config, session_id, operation_id, OperationStatus::Cancelled, &operation.key, operation.generation, &operation.request_digest);
+            }
         }
     }
     let children = std::mem::take(&mut state.children);
@@ -1005,7 +1102,7 @@ fn mark_operation_terminal(
         let operation = state.operations.get_mut(&(session_id.clone(), operation_id.clone()))
             .expect("operation identity came from map");
         operation.status = status;
-        persist_operation(config, &session_id, &operation_id, status, &operation.key, operation.generation)?;
+        persist_operation(config, &session_id, &operation_id, status, &operation.key, operation.generation, &operation.request_digest)?;
     }
     Ok(())
 }
@@ -1020,43 +1117,54 @@ fn decode_wait_status(status: i32) -> Option<i32> {
     }
 }
 
-fn seccomp_guard_program() -> [libc::sock_filter; 18] {
+fn seccomp_guard_program() -> Vec<libc::sock_filter> {
     // Deny namespace/mount mutation after the broker has installed the private,
     // read-only cgroup view. Everything else remains governed by the ordinary
     // hook sandbox and no_new_privs.
-    let denied = [
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        libc::SYS_unshare,
-        libc::SYS_setns,
-        libc::SYS_clone,
-        libc::SYS_clone3,
+    let mut filter = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, 4),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch(), 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
-    let mut filter = [stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW); 18];
-    filter[0] = stmt(BPF_LD | BPF_W | BPF_ABS, 4);
-    filter[1] = jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch(), 1, 0);
-    filter[2] = stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-    filter[3] = stmt(BPF_LD | BPF_W | BPF_ABS, 0);
     #[cfg(target_arch = "x86_64")]
     {
         // Reject the x32 syscall ABI before comparing syscall numbers. Its
         // high-bit encoding otherwise bypasses a native-number deny list.
-        filter[4] = jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1);
-        filter[5] = stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+        filter.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        filter[4] = stmt(BPF_JMP | BPF_JA, 1);
-        filter[5] = stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+        filter.push(stmt(BPF_JMP | BPF_JA, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
     }
-    for (index, syscall) in denied.into_iter().enumerate() {
-        filter[6 + index * 2] = jump(BPF_JMP | BPF_JEQ | BPF_K, syscall as u32, 0, 1);
-        filter[7 + index * 2] = stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::EPERM as u32);
+    for syscall in [libc::SYS_mount, libc::SYS_umount2, libc::SYS_unshare, libc::SYS_setns] {
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, syscall as u32, 0, 1));
+        filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     }
+    // glibc transparently falls back from clone3(2) on ENOSYS. Classic clone
+    // exposes flags directly to seccomp, allowing ordinary threads/forks while
+    // rejecting every namespace-creating flag.
+    filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone3 as u32, 0, 1));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
+    filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone as u32, 0, 3));
+    filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, 16));
+    let namespace_flags = (libc::CLONE_NEWNS
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUTS) as u32
+        | 0x80; // CLONE_NEWTIME
+    filter.push(jump(BPF_JMP | BPF_JSET | BPF_K, namespace_flags, 0, 1));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     filter
 }
 
-unsafe fn install_seccomp_guard(filter: &[libc::sock_filter; 18]) -> std::io::Result<()> {
+unsafe fn install_seccomp_guard(filter: &[libc::sock_filter]) -> std::io::Result<()> {
     let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
     let result = unsafe { libc::prctl(libc::PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) };
     if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
@@ -1168,6 +1276,67 @@ fn valid_operation_id(operation_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
+fn canonical_spawn_digest(
+    containment_id: &str,
+    session_id: &str,
+    generation: u64,
+    operation_id: &str,
+    program: &[u8],
+    args: &[String],
+    cwd: &[u8],
+    env: &BTreeMap<String, String>,
+) -> String {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"flycockpit-linux-broker-spawn-v1");
+    field(&mut hasher, containment_id.as_bytes());
+    field(&mut hasher, session_id.as_bytes());
+    field(&mut hasher, &generation.to_be_bytes());
+    field(&mut hasher, operation_id.as_bytes());
+    field(&mut hasher, program);
+    field(&mut hasher, cwd);
+    field(&mut hasher, &(args.len() as u64).to_be_bytes());
+    for argument in args {
+        field(&mut hasher, argument.as_bytes());
+    }
+    field(&mut hasher, &(env.len() as u64).to_be_bytes());
+    for (key, value) in env {
+        field(&mut hasher, key.as_bytes());
+        field(&mut hasher, value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn verify_client_guard(guard: &GuardAttestation, key: &str) -> bool {
+    if guard.pid <= 0 {
+        return false;
+    }
+    let proc_root = PathBuf::from(format!("/proc/{}", guard.pid));
+    let status = match fs::read_to_string(proc_root.join("status")) {
+        Ok(status) => status,
+        Err(_) => return false,
+    };
+    let expected_uid = unsafe { libc::geteuid() };
+    let uid_matches = status.lines().find_map(|line| line.strip_prefix("Uid:\t"))
+        .and_then(|ids| ids.split_whitespace().next())
+        .and_then(|uid| uid.parse::<u32>().ok()) == Some(expected_uid);
+    let cgroup_matches = fs::read_to_string(proc_root.join("cgroup"))
+        .ok()
+        .is_some_and(|membership| membership.lines().any(|line| {
+            line.strip_prefix("0::").is_some_and(|path| {
+                path.split('/').next_back() == Some(key)
+            })
+        }));
+    let distinct_mount_ns = fs::read_link(proc_root.join("ns/mnt")).ok()
+        != fs::read_link("/proc/self/ns/mnt").ok();
+    let distinct_cgroup_ns = fs::read_link(proc_root.join("ns/cgroup")).ok()
+        != fs::read_link("/proc/self/ns/cgroup").ok();
+    uid_matches && cgroup_matches && distinct_mount_ns && distinct_cgroup_ns
+}
+
 fn parse_populated(events: &str) -> std::io::Result<bool> {
     events
         .lines()
@@ -1183,16 +1352,14 @@ fn verify_server_installation(config: &LinuxBrokerServerConfig) -> std::io::Resu
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
         return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "cgroup v2 unavailable"));
     }
-    let expected_cgroup_root = Path::new(DEFAULT_CGROUP_ROOT).join(format!("u{}", config.allowed_uid));
-    if config.cgroup_root != expected_cgroup_root {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "broker cgroup root is not the canonical installation root",
-        ));
-    }
-    verify_cgroup2_filesystem(&config.cgroup_root)?;
     verify_state_root(config)?;
+    // The delegated root cannot be stat'ed before it exists. Validate the
+    // actual parent mount first, create the root, then attest the resulting
+    // directory and its kernel-generated control files.
+    let parent = config.cgroup_root.parent().ok_or_else(|| invalid("cgroup root has no parent"))?;
+    verify_cgroup2_filesystem(parent)?;
     fs::create_dir_all(&config.cgroup_root)?;
+    verify_cgroup2_filesystem(&config.cgroup_root)?;
     set_mode(&config.cgroup_root, 0o755)?;
     verify_root_owned_migration_file(Path::new("/sys/fs/cgroup/cgroup.procs"))?;
     verify_root_owned_migration_file(&config.cgroup_root.join("cgroup.procs"))?;
@@ -1254,6 +1421,7 @@ fn persist_operation(
     status: OperationStatus,
     key: &str,
     generation: u64,
+    request_digest: &str,
 ) -> std::io::Result<()> {
     let destination = operation_record_path(config, session_id, operation_id)?;
     let record = DurableOperation {
@@ -1262,6 +1430,7 @@ fn persist_operation(
         status,
         key: key.to_owned(),
         generation,
+        request_digest: request_digest.to_owned(),
     };
     let bytes = serde_json::to_vec(&record).map_err(invalid)?;
     let temporary = config.state_root.join(format!(".operation-{}.tmp", uuid::Uuid::new_v4()));
@@ -1295,12 +1464,13 @@ fn recover_operation_records(config: &LinuxBrokerServerConfig) -> std::io::Resul
             status => status,
         };
         if !matches!(record.status, OperationStatus::Cancelled | OperationStatus::Exited) {
-            persist_operation(config, &record.session_id, &record.operation_id, recovered_status, &record.key, record.generation)?;
+            persist_operation(config, &record.session_id, &record.operation_id, recovered_status, &record.key, record.generation, &record.request_digest)?;
         }
         operations.insert((record.session_id, record.operation_id), BrokerOperation {
             status: recovered_status,
             key: record.key,
             generation: record.generation,
+            request_digest: record.request_digest,
             prepared: None,
         });
     }
@@ -1350,8 +1520,7 @@ fn remove_owned_socket(path: &Path) -> std::io::Result<()> {
 }
 
 fn verify_cgroup2_filesystem(path: &Path) -> std::io::Result<()> {
-    let existing = Path::new("/sys/fs/cgroup");
-    let existing = CString::new(existing.as_os_str().as_bytes())
+    let existing = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| invalid("path contains NUL"))?;
     let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(existing.as_ptr(), &mut stats) } != 0 {
@@ -1379,7 +1548,7 @@ fn verify_kernel_spawn_contract(config: &LinuxBrokerServerConfig) -> std::io::Re
         &BTreeMap::new(),
     )?;
     if !spawned.guard.proven() {
-        rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid);
+        let _ = rollback_generation(&config.cgroup_root.join(&spawned.key), spawned.pid);
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "kernel guard attestation incomplete",
@@ -1392,7 +1561,7 @@ fn verify_kernel_spawn_contract(config: &LinuxBrokerServerConfig) -> std::io::Re
     drop(spawned.pidfd);
     let group = config.cgroup_root.join(&spawned.key);
     if let Err(error) = reap_child(spawned.pid) {
-        rollback_generation(&group, spawned.pid);
+        let _ = rollback_generation(&group, spawned.pid);
         return Err(error);
     }
     wait_cgroup_empty(&group, std::time::Duration::from_secs(5))?;
@@ -1707,6 +1876,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             key: format!("fc-{}-g3", "b".repeat(32)),
             guard: GuardAttestation {
+                pid: std::process::id() as i32,
                 clone_into_cgroup: true,
                 private_mount_ns: true,
                 private_cgroup_ns: true,
@@ -1728,12 +1898,13 @@ mod tests {
     #[test]
     fn seccomp_guard_checks_architecture_and_denies_namespace_mutation() {
         let filter = seccomp_guard_program();
-        assert_eq!(filter.len(), 18);
+        assert_eq!(filter.len(), 19);
         assert_eq!(filter[0].k, 4);
         assert_eq!(filter[1].k, audit_arch());
         assert_eq!(filter[2].k, SECCOMP_RET_KILL_PROCESS);
-        for index in [7_usize, 9, 11, 13, 15, 17] {
+        for index in [7_usize, 9, 11, 13, 17] {
             assert_eq!(filter[index].k, SECCOMP_RET_ERRNO | libc::EPERM as u32);
         }
+        assert_eq!(filter[15].k, 16, "clone flags are inspected");
     }
 }

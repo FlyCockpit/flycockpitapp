@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod agent_installation;
+#[cfg(feature = "remote")]
 pub mod es256;
 pub use agent_installation::{
     AGENT_INSTALLATION_DTO_VERSION, AgentInstallationBeginV1, AgentInstallationBindingOutcomeV1,
@@ -47,11 +48,13 @@ pub mod remote_connection_metadata;
 pub mod remote_device_identity_enrollment;
 #[cfg(feature = "remote")]
 pub mod remote_enterprise_connection_policy;
+#[cfg(feature = "remote")]
 pub mod remote_identity_protocol;
 #[cfg(feature = "remote")]
 pub mod remote_ip_consent;
 pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
+#[cfg(feature = "remote")]
 pub mod remote_public_service_policy;
 #[cfg(feature = "remote")]
 pub mod remote_session_continuity;
@@ -64,6 +67,7 @@ pub mod remote_transport;
 pub mod remote_transport_selection;
 #[cfg(feature = "remote")]
 pub mod remote_turn_ice_policy;
+#[cfg(feature = "remote")]
 pub mod remote_version;
 #[cfg(feature = "remote")]
 pub mod remote_wire_magic_registry;

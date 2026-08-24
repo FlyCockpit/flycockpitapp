@@ -1081,6 +1081,7 @@ impl RedactionTable {
             }
         }
 
+        #[cfg(feature = "remote")]
         if let Some(token) = crate::auth::flycockpit::stored_instance_token_for_redaction() {
             candidates.push(Candidate::forced(
                 token,

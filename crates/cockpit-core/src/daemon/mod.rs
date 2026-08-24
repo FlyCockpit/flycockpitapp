@@ -36,6 +36,7 @@ pub mod connector;
 pub mod control_replay;
 pub(crate) mod diagnostics_probe;
 pub mod effective_default_recovery;
+#[cfg(feature = "remote")]
 pub mod egress;
 pub mod ephemeral_guard;
 pub mod fs_api;
@@ -47,17 +48,20 @@ pub mod leak_reveal_frame;
 #[cfg(unix)]
 pub mod leak_reveal_socket;
 pub mod lsp;
+#[cfg(feature = "remote")]
 pub mod org_sync;
 pub mod principal;
 pub mod proto;
 pub mod registry;
-#[cfg(any(test, feature = "remote"))]
+#[cfg(feature = "remote")]
 pub mod relay_envelope;
 #[cfg(feature = "remote")]
 pub mod remote_attempt;
 #[cfg(feature = "remote")]
 pub mod remote_audit_upload;
+#[cfg(feature = "remote")]
 pub(crate) mod remote_outbox_worker;
+#[cfg(feature = "remote")]
 pub mod remote_project_resolver;
 pub mod scheduler;
 pub mod server;

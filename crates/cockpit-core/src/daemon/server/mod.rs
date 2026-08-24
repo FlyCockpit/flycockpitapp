@@ -2549,6 +2549,7 @@ impl DaemonContext {
         self
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn load_flycockpit_credential(
         &self,
     ) -> Result<Option<crate::auth::flycockpit::StoredFlycockpitCredential>> {
@@ -2561,7 +2562,7 @@ impl DaemonContext {
             .map(Some)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "remote"))]
     pub(crate) fn store_flycockpit_credential(
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,

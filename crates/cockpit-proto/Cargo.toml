@@ -13,7 +13,13 @@ workspace = true
 # Remote signaling, tenant authority, continuity, and transport wire contracts
 # are opt-in and propagate the same capability to their persistence DTOs.
 default = []
-remote = ["cockpit-db/remote"]
+remote = [
+    "cockpit-db/remote",
+    "dep:hmac",
+    "dep:p256",
+    "dep:sha1",
+    "dep:zeroize",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -22,11 +28,11 @@ cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 chrono = { workspace = true }
 futures = { workspace = true }
-hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
-p256 = { workspace = true }
+hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"], optional = true }
+p256 = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha1 = "=0.11.0"
+sha1 = { version = "=0.11.0", optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
@@ -34,7 +40,7 @@ tokio-util = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 quote = "1"

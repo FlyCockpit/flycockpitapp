@@ -2564,6 +2564,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/engine/model/outbound_guard.rs",
         "crates/cockpit-core/src/engine/model/redact.rs",
         "crates/cockpit-core/src/engine/model_roles.rs",
+        "crates/cockpit-core/src/engine/rehydrate.rs",
         "crates/cockpit-core/src/harness/run.rs",
         "crates/cockpit-core/src/knowledge.rs",
         "crates/cockpit-core/src/mcp/builtin.rs",
@@ -2571,6 +2572,8 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/session/export/mod.rs",
         "crates/cockpit-core/src/session/recording.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
+        "crates/cockpit-core/src/tools/artifact_read.rs",
+        "crates/cockpit-core/src/tools/artifact_search.rs",
         "crates/cockpit-core/src/tools/read.rs",
         "crates/cockpit-core/src/tools/skill.rs",
     ];

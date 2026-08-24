@@ -1410,19 +1410,18 @@ mod tests {
                 "images": [{"id": Uuid::new_v4()}],
             },
         });
-        let archive = read_archive_bytes(&archive_bytes(
+        let error = read_archive_bytes(&archive_bytes(
             vec![session(source_session_id, None)],
             vec![malformed_event],
             false,
         ))
-        .unwrap();
-        let error = import_archive(&db, archive)
-            .await
-            .expect_err("an archive cannot reintroduce an artifact-ineligible long media event");
+        .expect_err("an archive cannot reintroduce an artifact-ineligible long media event");
         assert!(
             error.to_string().contains("cannot carry media/file parts"),
             "unexpected import error: {error:#}"
         );
+        // The rejection happens during archive parsing (before import), so no
+        // destination rows can ever be written.
         let sessions: i64 = db
             .read(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))

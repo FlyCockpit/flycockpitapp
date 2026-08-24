@@ -2462,6 +2462,35 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     }
+                    // Early durable-receipt conflict check: a same-UUID
+                    // different-content conflict must be rejected with
+                    // BadRequest before any driver interaction (persist,
+                    // redaction refresh, round limits). Otherwise a driver
+                    // availability failure masks the conflict with
+                    // UserMessageNotAccepted instead of the correct BadRequest.
+                    // Duplicate detection remains at the original post-driver
+                    // check below so the full duplicate path (remote operation
+                    // resolution, queue snapshot) is unchanged.
+                    if artifact_admission.is_none() {
+                        if let Ok(Some(durable)) = session
+                            .db
+                            .client_submission_receipt(session_id, receipt.id)
+                            .await
+                        {
+                            if durable.origin_principal != receipt.origin_principal
+                                || durable.fingerprint != receipt.fingerprint
+                            {
+                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                                    code: proto::ErrorCode::BadRequest,
+                                    message: format!(
+                                        "client_submission_id {} was already used for a different payload",
+                                        receipt.id
+                                    ),
+                                }));
+                                continue;
+                            }
+                        }
+                    }
                     if artifact_admission.is_none()
                         && let Some(state) = repair_required
                             .read()

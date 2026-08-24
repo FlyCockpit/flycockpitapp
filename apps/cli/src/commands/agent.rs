@@ -679,8 +679,9 @@ fn record_line(record: &crate::daemon::proto::AgentInstallationRecordV1) -> Stri
     let bindings = if record.bindings.is_empty() {
         "unbound".to_owned()
     } else {
-        record
-            .bindings
+        let mut sorted = record.bindings.clone();
+        sorted.sort_by(|a, b| slot_order(&a.slot_id).cmp(&slot_order(&b.slot_id)));
+        sorted
             .iter()
             .map(|binding| {
                 format!(
@@ -707,6 +708,16 @@ fn record_line(record: &crate::daemon::proto::AgentInstallationRecordV1) -> Stri
         record.installation_revision,
         binding,
     )
+}
+
+/// Sort key for model-slot bindings so `primary` always appears first in
+/// rendered output, followed by other slots in alphabetical order.
+fn slot_order(slot_id: &str) -> (u8, &str) {
+    if slot_id == "primary" {
+        (0, slot_id)
+    } else {
+        (1, slot_id)
+    }
 }
 
 fn scope_request(

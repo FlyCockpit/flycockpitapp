@@ -1429,7 +1429,6 @@ fn record_event_with_text_artifacts_conn(
             "version": 1,
             "status": "unavailable",
             "reason": unavailable.reason.as_str(),
-            "artifact_id": serde_json::Value::Null,
             "projection_slot": candidate.projection_slot,
             "kind": candidate.kind.as_str(),
             "capture_reason": candidate.capture_reason.as_str(),
@@ -4772,7 +4771,7 @@ mod tests {
         db.transaction(|conn| {
             conn.execute_batch(
                 "CREATE TRIGGER text_artifact_test_fail_run_terminalization
-                   BEFORE UPDATE OF run_invocations
+                   BEFORE UPDATE OF terminal_at_wall_ms ON run_invocations
                    WHEN NEW.terminal_at_wall_ms IS NOT NULL
                    BEGIN SELECT RAISE(ABORT, 'injected run terminalization fault'); END;",
             )?;

@@ -2892,12 +2892,8 @@ async fn oversized_user_export_keeps_a_legacy_mixed_media_corruption_unimportabl
         .await
         .unwrap();
     let destination = Db::open_in_memory().unwrap();
-    let error = crate::session::import::import_archive(
-        &destination,
-        crate::session::import::read_archive_bytes(&archive).unwrap(),
-    )
-    .await
-    .expect_err("a long mixed-media event must remain artifact-ineligible after export");
+    let error = crate::session::import::read_archive_bytes(&archive)
+        .expect_err("a long mixed-media event must remain artifact-ineligible after export");
     assert!(
         error.to_string().contains("cannot carry media/file parts"),
         "unexpected import error: {error:#}"

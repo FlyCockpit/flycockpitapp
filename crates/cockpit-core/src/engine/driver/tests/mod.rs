@@ -49,6 +49,72 @@ fn test_driver_without_network(max_schedules: usize) -> (Driver, tempfile::TempD
     test_driver_with_url(max_schedules, "http://127.0.0.1:1/v1".to_string())
 }
 
+/// Construct a vNext `EffectiveVnextGrant` for the test "Build" primary.
+///
+/// The grant carries a broad `allowed_children` list so tests that delegate
+/// to workspace-authored vNext children (using `authored/` prefixed agent IDs)
+/// and built-in children (using `cockpit/` prefixed agent IDs) both pass the
+/// vNext/legacy delegation boundary check.  The test "Build" agent is created
+/// directly (not via `agent_from_def`), so `vnext_reachable_subagents` is not
+/// called and the broad list cannot cause a resolution bail.
+fn test_vnext_build_grant(
+    root: &std::path::Path,
+) -> crate::agents::EffectiveVnextGrant {
+    use crate::agents::{
+        AllowedChild, DelegationPolicy, DelegationTarget, ExecutionKind, ModelCapability,
+        ModelLocality, ModelSlot, VnextAgentDef,
+    };
+    let children = [
+        "cockpit/builder",
+        "cockpit/explore",
+        "cockpit/history",
+        "cockpit/deepthink",
+        "cockpit/scout",
+        "authored/explore",
+        "authored/probe",
+        "authored/readonly-probe",
+        "authored/custom-writer",
+        "authored/reviewer",
+        "authored/active-frame-helper",
+        "authored/model-failure-helper",
+    ];
+    let definition = VnextAgentDef {
+        schema_version: crate::agents::SCHEMA_VERSION,
+        agent_id: "cockpit/build".to_string(),
+        execution_kind: ExecutionKind::Coding,
+        model_slots: std::collections::BTreeMap::from([(
+            "primary".to_string(),
+            ModelSlot {
+                purpose: "Primary model for this built-in role.".to_string(),
+                min_context_tokens: 1,
+                required_capabilities: vec![ModelCapability::TextGeneration],
+                locality: ModelLocality::Any,
+                allow_default_fallback: true,
+                suggested_models: Vec::new(),
+            },
+        )]),
+        delegation: DelegationPolicy {
+            allowed_children: children
+                .iter()
+                .map(|child| AllowedChild::PortableRef {
+                    portable_agent_ref: child.to_string(),
+                })
+                .collect(),
+            max_descendant_depth: Some(4),
+            max_concurrent_children: Some(8),
+            targets: vec![DelegationTarget::SameRoot],
+        },
+        questions: None,
+        verification: None,
+    };
+    let host = crate::agents::VnextHostPolicy::for_session_config(
+        &crate::config::extended::load_for_cwd(root),
+    );
+    definition
+        .resolve_grant(&host)
+        .expect("test vNext Build grant must resolve")
+}
+
 fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, tempfile::TempDir) {
     use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig, WireApi};
     use std::collections::BTreeMap;
@@ -111,7 +177,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
         write_scope: None,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
-        vnext_grant: None,
+        vnext_grant: Some(test_vnext_build_grant(&root)),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         assistant_identity_prefix: None,
     });

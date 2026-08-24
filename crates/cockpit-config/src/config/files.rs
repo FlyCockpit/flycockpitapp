@@ -1804,6 +1804,17 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
                 source.display()
             );
         }
+        let entry_identity = super::TerminalIngressFileIdentity {
+            volume: stat.st_dev as u64,
+            file: stat.st_ino as u64,
+            links: stat.st_nlink.try_into().unwrap_or(u32::MAX),
+        };
+        if entry_identity != expected_identity {
+            anyhow::bail!(
+                "rename source identity changed after its parent was retained: {}",
+                source.display()
+            );
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // SAFETY: both retained directory descriptors and component
@@ -1881,7 +1892,7 @@ pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<
         };
         if actual_identity != expected_identity {
             anyhow::bail!(
-                "rename source identity changed during no-replace move from {} to {}",
+                "rename namespace changed during no-replace move from {} to {}; durable caller recovery must reconcile both names",
                 source.display(),
                 destination.display()
             );

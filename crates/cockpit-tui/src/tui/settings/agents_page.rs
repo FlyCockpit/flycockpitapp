@@ -595,8 +595,10 @@ fn agent_inventory_revision(cwd: &std::path::Path) -> Result<String, String> {
         },
     )? {
         cockpit_core::daemon::proto::Response::AgentInventory {
-            inventory_revision, ..
-        } if !inventory_revision.is_empty() => Ok(inventory_revision),
+            entries,
+            inventory_revision,
+            ..
+        } if valid_agent_inventory(cwd, &entries, &inventory_revision) => Ok(inventory_revision),
         other => Err(format!("unexpected agent inventory response: {other:?}")),
     }
 }

@@ -821,7 +821,11 @@ pub async fn apply_extended_config_patch(
                 publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: denylist_values
                     .iter()
-                    .map(|(id, value)| redacted_denylist_entry(id, value))
+                    .map(|(id, client_nonce, value)| cockpit_proto::CommittedDenylistEntry {
+                        entry_id: id.clone(),
+                        client_nonce: client_nonce.clone(),
+                        display_mask: format!("•••• ({} bytes)", value.len()),
+                    })
                     .collect(),
             })
         }),
@@ -918,13 +922,8 @@ fn read_optional_config(
 }
 
 fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-redacted-denylist-entry-v1\0");
-    digest.update((value.len() as u64).to_le_bytes());
-    digest.update(value.as_bytes());
     cockpit_proto::RedactedDenylistEntry {
         entry_id: id.to_owned(),
-        fingerprint: format!("{:x}", digest.finalize()),
         display_mask: format!("•••• ({} bytes)", value.len()),
     }
 }
@@ -933,7 +932,7 @@ fn apply_denylist_sequence(
     document: &mut serde_json::Map<String, serde_json::Value>,
     desired: Vec<cockpit_proto::DesiredDenylistEntry>,
     occurrence_ids: &[String],
-) -> Result<Vec<(String, String)>, ErrorPayload> {
+) -> Result<Vec<(String, Option<String>, String)>, ErrorPayload> {
     let redact = document
         .entry("redact")
         .or_insert_with(|| serde_json::json!({}))
@@ -962,6 +961,7 @@ fn apply_denylist_sequence(
         .cloned()
         .collect::<std::collections::HashMap<_, _>>();
     let mut used = std::collections::HashSet::new();
+    let mut nonces = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(desired.len());
     for entry in desired {
         match entry {
@@ -973,11 +973,22 @@ fn apply_denylist_sequence(
                     .get(&entry_id)
                     .cloned()
                     .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
-                result.push((entry_id, value));
+                result.push((entry_id, None, value));
             }
-            cockpit_proto::DesiredDenylistEntry::New { value } => {
-                validate_new_denylist_literal(&value)?;
-                result.push((Uuid::new_v4().to_string(), value));
+            cockpit_proto::DesiredDenylistEntry::New {
+                client_nonce,
+                literal,
+            } => {
+                if client_nonce.is_empty()
+                    || client_nonce.len() > 128
+                    || !nonces.insert(client_nonce.clone())
+                {
+                    return Err(bad_request(
+                        "new denylist occurrence nonce is invalid or duplicated",
+                    ));
+                }
+                validate_new_denylist_literal(&literal)?;
+                result.push((Uuid::new_v4().to_string(), Some(client_nonce), literal));
             }
         }
     }
@@ -986,7 +997,7 @@ fn apply_denylist_sequence(
         serde_json::Value::Array(
             result
                 .iter()
-                .map(|(_, value)| serde_json::Value::String(value.clone()))
+                .map(|(_, _, value)| serde_json::Value::String(value.clone()))
                 .collect(),
         ),
     );
@@ -2322,5 +2333,49 @@ mod tests {
             after_noop, after_write,
             "an unchanged save must not bump the generation (no bump-without-write)"
         );
+    }
+
+    #[test]
+    fn denylist_occurrence_ids_disambiguate_equal_masks_and_preserve_order() {
+        let mut document = serde_json::json!({
+            "redact": { "denylist": ["same", "same"] }
+        });
+        let object = document.as_object_mut().unwrap();
+        let result = apply_denylist_sequence(
+            object,
+            vec![
+                cockpit_proto::DesiredDenylistEntry::Existing {
+                    entry_id: "second".into(),
+                },
+                cockpit_proto::DesiredDenylistEntry::New {
+                    client_nonce: "replacement-occurrence".into(),
+                    literal: "new-value".into(),
+                },
+            ],
+            &["first".into(), "second".into()],
+        )
+        .unwrap();
+        assert_eq!(result[0], ("second".into(), None, "same".into()));
+        assert_eq!(result[1].1.as_deref(), Some("replacement-occurrence"));
+        assert_ne!(result[1].0, "first");
+        assert_eq!(
+            document["redact"]["denylist"],
+            serde_json::json!(["same", "new-value"])
+        );
+    }
+
+    #[test]
+    fn denylist_rejects_typed_display_mask_literal() {
+        let mut document = serde_json::json!({"redact": {"denylist": []}});
+        let error = apply_denylist_sequence(
+            document.as_object_mut().unwrap(),
+            vec![cockpit_proto::DesiredDenylistEntry::New {
+                client_nonce: "typed-mask".into(),
+                literal: "•••• (4 bytes)".into(),
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
     }
 }

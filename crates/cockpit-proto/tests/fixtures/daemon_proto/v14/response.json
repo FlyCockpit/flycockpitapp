@@ -1912,7 +1912,10 @@
       "result_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "status": "committed",
       "publication": "published",
-      "denylist": []
+      "denylist": [
+        {"entry_id":"deny-entry-a","client_nonce":null,"display_mask":"•••• (4 bytes)"},
+        {"entry_id":"deny-entry-b","client_nonce":"client-occurrence-b","display_mask":"•••• (14 bytes)"}
+      ]
     },
     "response": "extended_config_saved"
   },

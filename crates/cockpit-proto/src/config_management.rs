@@ -304,13 +304,27 @@ impl ExtendedConfigField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum DesiredDenylistEntry {
-    Existing { entry_id: String },
-    New { value: String },
+    Existing {
+        entry_id: String,
+    },
+    New {
+        client_nonce: String,
+        literal: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedDenylistEntry {
     pub entry_id: String,
-    pub fingerprint: String,
+    pub display_mask: String,
+}
+
+/// One occurrence in a committed denylist receipt. A nonce is echoed only for
+/// a newly-created occurrence, binding its server-assigned ID to the exact
+/// request occurrence without exposing a value-derived equality oracle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedDenylistEntry {
+    pub entry_id: String,
+    pub client_nonce: Option<String>,
     pub display_mask: String,
 }

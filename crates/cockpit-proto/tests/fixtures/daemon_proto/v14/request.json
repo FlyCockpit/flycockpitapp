@@ -1850,7 +1850,10 @@
           }
         ],
         "materialize": false,
-        "denylist": [],
+        "denylist": [
+          {"source":"existing","entry_id":"deny-entry-a"},
+          {"source":"new","client_nonce":"client-occurrence-b","literal":"fixture-secret"}
+        ],
         "redacted_mutations": []
       },
       "expected_revision": "revision",

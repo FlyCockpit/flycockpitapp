@@ -180,6 +180,51 @@ fn settings_config_mutations_stay_daemon_owned() {
     assert!(source.contains("settings_daemon_request(Request::ApplyExtendedConfigPatch"));
 }
 
+#[test]
+fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
+    let entries = vec![
+        cockpit_core::daemon::proto::RedactedDenylistEntry {
+            entry_id: "first".into(),
+            display_mask: "•••• (4 bytes)".into(),
+        },
+        cockpit_core::daemon::proto::RedactedDenylistEntry {
+            entry_id: "second".into(),
+            display_mask: "•••• (4 bytes)".into(),
+        },
+    ];
+    let mut base = serde_json::json!({});
+    base.as_object_mut().unwrap().insert(
+        "__cockpit_denylist_entries".into(),
+        serde_json::to_value(entries).unwrap(),
+    );
+    let desired = vec![
+        super::existing_denylist_draft("second"),
+        super::existing_denylist_draft("first"),
+    ];
+    let planned = super::denylist_mutations(&base, &desired).unwrap();
+    assert!(matches!(
+        &planned[0],
+        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+            if entry_id == "second"
+    ));
+    assert!(matches!(
+        &planned[1],
+        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+            if entry_id == "first"
+    ));
+}
+
+#[test]
+fn typed_mask_text_is_new_and_cannot_alias_an_existing_occurrence() {
+    let mut base = serde_json::json!({});
+    base.as_object_mut().unwrap().insert(
+        "__cockpit_denylist_entries".into(),
+        serde_json::json!([{"entry_id":"first","display_mask":"•••• (4 bytes)"}]),
+    );
+    let error = super::denylist_mutations(&base, &["•••• (4 bytes)".into()]).unwrap_err();
+    assert!(error.contains("display masks are reserved"));
+}
+
 fn entry(id_models: &[&str]) -> ProviderEntry {
     ProviderEntry {
         url: "https://x.example/v1".into(),

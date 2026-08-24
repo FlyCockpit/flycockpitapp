@@ -266,19 +266,33 @@ pub fn agent_definition_revision(
 }
 
 pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), &'static str> {
+    fn lower_hex_digest(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
     if snapshot.name.is_empty()
-        || snapshot.source_identity.len() != 64
-        || !snapshot
-            .source_identity
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || snapshot.name.len() > MAX_AGENT_NAME_BYTES
+        || snapshot.markdown.len() > MAX_AGENT_MARKDOWN_BYTES
+        || snapshot.canonical_preview.len() > MAX_AGENT_MARKDOWN_BYTES
+        || !lower_hex_digest(&snapshot.source_identity)
+        || !lower_hex_digest(&snapshot.revision)
+        || !lower_hex_digest(&snapshot.projection_digest)
     {
         return Err("agent snapshot identity is missing");
     }
-    if snapshot.revision.is_empty()
-        || snapshot.projection_digest != agent_edit_projection_digest(snapshot)
-    {
+    if snapshot.projection_digest != agent_edit_projection_digest(snapshot) {
         return Err("agent snapshot projection digest is invalid");
+    }
+    if snapshot
+        .goal_supervision_json
+        .as_ref()
+        .is_some_and(|value| {
+            value.len() > 64 * 1024 || serde_json::from_str::<serde_json::Value>(value).is_err()
+        })
+    {
+        return Err("agent goal supervision projection is invalid");
     }
     if snapshot.overridden != (snapshot.source_layer != AgentSourceLayer::Embedded)
         || snapshot.editable != (snapshot.source_layer == AgentSourceLayer::Workspace)

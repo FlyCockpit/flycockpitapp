@@ -46,8 +46,8 @@ pub use agent_management::{
     validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
-    CockpitConfigLayer, ConfigCommitStatus, ConfigPublicationStatus, DesiredDenylistEntry,
-    ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
+    CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
+    DesiredDenylistEntry, ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
     ExtendedConfigPathMutation, RedactedDenylistEntry, RedactedOccurrenceMutation,
 };
 pub mod bulk_transfer;
@@ -1017,10 +1017,9 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version.
-///
 /// Current wire schema version. v14 adds exact identity-bearing settings,
-/// workspace-agent, and assistant-definition authority RPCs.
+/// workspace-agent, and assistant-definition authority RPCs, including
+/// occurrence-bound denylist edits with nonce-bound committed receipts.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
 /// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
 pub const PROTOCOL_VERSION: u32 = 14;
@@ -2206,14 +2205,16 @@ pub struct AssistantSummary {
     pub home_dir: String,
     pub config_json: String,
     pub content_hash: String,
-    /// Opaque CAS token for the registry binding itself. Unlike the editable
-    /// definition revision this remains available when definition bytes are
-    /// missing or corrupt, so the user can still unregister a damaged row.
+    /// Opaque CAS token for the raw registry binding itself. It is request-bound
+    /// through projection and consumed-revision receipts and is deliberately
+    /// not recomputable from this potentially redacted summary.
     pub registration_revision: String,
     /// Daemon-read exact authored definition; absent when the registered file
     /// cannot be safely opened or parsed.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_markdown: Option<String>,
+    /// Opaque CAS token for the raw definition authority. Clients validate its
+    /// format and receipt binding, not equality to redacted presentation bytes.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_revision: Option<String>,
     #[serde(deserialize_with = "deserialize_present_option")]
@@ -2228,7 +2229,16 @@ pub struct AssistantSummary {
 /// but every client can enforce revision/diagnostic coherence and the exact
 /// content hash without depending on `cockpit-core`.
 pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'static str> {
-    if summary.name.is_empty() || summary.registration_revision.is_empty() {
+    fn lower_hex_digest(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+    if summary.name.is_empty()
+        || !lower_hex_digest(&summary.content_hash)
+        || !lower_hex_digest(&summary.registration_revision)
+    {
         return Err("assistant summary has no name or registration revision");
     }
     match (
@@ -2236,7 +2246,7 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
         summary.definition_revision.as_deref(),
         summary.definition_diagnostic.as_deref(),
     ) {
-        (Some(_), Some(revision), None) if !revision.is_empty() => {}
+        (Some(_), Some(revision), None) if lower_hex_digest(revision) => {}
         (None, None, Some(diagnostic)) if !diagnostic.trim().is_empty() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
     }
@@ -2278,16 +2288,9 @@ fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {
     digest.update(value.as_bytes());
 }
 
-pub fn assistant_registration_revision(summary: &AssistantSummary) -> String {
-    calculate_assistant_registration_revision(
-        summary.created_at,
-        &summary.name,
-        &summary.home_dir,
-        &summary.config_json,
-        &summary.content_hash,
-    )
-}
-
+/// Mint the daemon's opaque registration CAS token from the authoritative raw
+/// row. Clients cannot recompute it from a redacted `AssistantSummary`; they
+/// bind it through the projection digest and consumed-revision receipts.
 pub fn calculate_assistant_registration_revision(
     created_at: i64,
     name: &str,
@@ -2305,16 +2308,8 @@ pub fn calculate_assistant_registration_revision(
     format!("{:x}", digest.finalize())
 }
 
-pub fn assistant_definition_revision(summary: &AssistantSummary, markdown: &str) -> String {
-    calculate_assistant_definition_revision(
-        &summary.name,
-        &summary.home_dir,
-        &summary.config_json,
-        &summary.content_hash,
-        markdown,
-    )
-}
-
+/// Mint the daemon's opaque definition CAS token from raw registry fields and
+/// exact authored markdown. A redacted client projection cannot recompute it.
 pub fn calculate_assistant_definition_revision(
     name: &str,
     home_dir: &str,
@@ -6965,7 +6960,7 @@ mod tests {
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v14 assistant inventory must carry exact revisions");
+            .expect("current v14 assistant inventory must carry bounded opaque revisions");
     }
 
     #[test]

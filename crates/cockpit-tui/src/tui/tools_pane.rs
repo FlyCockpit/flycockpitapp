@@ -57,6 +57,13 @@ impl ToolsPane {
         let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
             anyhow::bail!("daemon returned an unexpected agent snapshot");
         };
+        cockpit_proto::validate_agent_source_identity(&snapshot, cwd.to_string_lossy().as_ref())
+            .map_err(anyhow::Error::msg)?;
+        if snapshot.name != agent_name
+            || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+        {
+            anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
+        }
         let def = cockpit_core::agents::parse_agent(
             &snapshot.markdown,
             agent_name,

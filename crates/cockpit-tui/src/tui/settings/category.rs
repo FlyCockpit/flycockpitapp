@@ -2355,7 +2355,7 @@ impl SettingsCx {
             .to_string();
         let id = pending.id;
         match self.commit_category_text(id, &text) {
-            Ok(()) => {
+            Ok(super::SettingsSaveOutcome::Saved) => {
                 p.editing = None;
                 p.text_editor = None;
                 p.path_editor = None;
@@ -2364,6 +2364,9 @@ impl SettingsCx {
                 if let Some(detail) = detail {
                     p.status = Some(format!("saved; {detail}"));
                 }
+            }
+            Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
+                p.status = Some(format!("committed; refresh needed: {warning}"));
             }
             Err(reason) => {
                 self.restore_category_external_edit(p, id, text, pending.source, reason);
@@ -3144,7 +3147,7 @@ impl SettingsCx {
 
     fn finish_category_save(&mut self, id: SettingId, p: &mut CategoryPage) {
         match self.save_extended() {
-            Ok(()) => {
+            Ok(super::SettingsSaveOutcome::Saved) => {
                 if id == SettingId::SandboxEscalationEnabled {
                     self.pending_daemon_request =
                         Some(cockpit_core::daemon::proto::Request::SetSandboxEscalation {
@@ -3160,6 +3163,9 @@ impl SettingsCx {
                 } else {
                     p.status = Some("saved".into());
                 }
+            }
+            Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
+                p.status = Some(format!("committed; refresh needed: {warning}"));
             }
             Err(e) => p.status = Some(format!("save failed: {e}")),
         }
@@ -3507,7 +3513,7 @@ fn remove_project_shadow_path(
     for parent in parents.iter().rev() {
         patch = serde_json::json!({ (parent): patch });
     }
-    super::apply_typed_settings_document_edit(project_config, None, patch)?;
+    let _committed = super::apply_typed_settings_document_edit(project_config, None, patch)?;
     Ok(true)
 }
 

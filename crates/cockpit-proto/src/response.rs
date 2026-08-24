@@ -569,9 +569,9 @@ pub enum Response {
         result_revision: String,
         status: crate::ConfigCommitStatus,
         publication: crate::ConfigPublicationStatus,
-        /// Exact safe post-commit order, with opaque server IDs and digests
-        /// but never denylist literals.
-        denylist: Vec<crate::RedactedDenylistEntry>,
+        /// Exact safe post-commit order. New occurrence nonces bind assigned
+        /// IDs to this request; no value-derived digest or literal is exposed.
+        denylist: Vec<crate::CommittedDenylistEntry>,
     },
 
     /// Legacy whole-document writer receipt. Daemon-connected settings UI

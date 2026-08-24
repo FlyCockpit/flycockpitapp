@@ -3245,6 +3245,23 @@ CREATE UNIQUE INDEX idx_task_delegation_payloads_session_hash_label
 CREATE INDEX idx_task_delegation_payloads_session_created
     ON task_delegation_payloads(parent_session_id, created_at ASC);
 
+-- Filesystem deletion cannot participate in the session-row transaction.
+-- Copy the relative sidecar identity here before cascading payload rows so a
+-- crash after commit leaves durable, boot-replayable cleanup work.
+CREATE TABLE task_delegation_sidecar_cleanup_intents (
+    sidecar_path TEXT PRIMARY KEY CHECK (
+        length(sidecar_path) BETWEEN 1 AND 4096
+        AND sidecar_path NOT LIKE '/%'
+        AND sidecar_path NOT LIKE '\\%'
+        AND sidecar_path NOT LIKE '%..%'
+    ),
+    session_id TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
+);
+
+CREATE INDEX idx_task_delegation_sidecar_cleanup_created
+    ON task_delegation_sidecar_cleanup_intents(created_at_unix_ms, sidecar_path);
+
 -- ---- paused_session_work ----------------------------------------------------------------------
 -- Sessions the daemon paused mid-work (e.g. across an upgrade restart)
 -- and must resume or resolve on next boot.

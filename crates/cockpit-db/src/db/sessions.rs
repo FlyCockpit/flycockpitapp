@@ -1792,12 +1792,74 @@ impl Db {
     /// cascading relationship; the pre-delete walk only discovers sidecar
     /// files that must be removed after the transaction commits.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<()> {
-        let sidecars = self.session_delegation_sidecar_paths(session_id).await?;
-        // One transaction so the tombstone and the deletion commit together.
-        self.transaction(move |conn| delete_session_conn(conn, session_id))
-            .await?;
-        Self::remove_delegation_sidecars(sidecars)?;
+        let now_ms = Utc::now().timestamp_millis();
+        self.transaction(move |conn| {
+            Self::enqueue_delegation_sidecar_cleanup_conn(conn, session_id, now_ms)?;
+            delete_session_conn(conn, session_id)
+        })
+        .await?;
+        self.reconcile_delegation_sidecar_cleanup_intents().await?;
         Ok(())
+    }
+
+    /// Persist sidecar cleanup identities in the same transaction which will
+    /// cascade their source payload rows.
+    pub fn enqueue_delegation_sidecar_cleanup_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(now_unix_ms >= 0, "cleanup intent timestamp must be nonnegative");
+        conn.execute(
+            "WITH RECURSIVE subtree(session_id) AS (
+                 SELECT ?1 UNION ALL
+                 SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id
+             )
+             INSERT OR IGNORE INTO task_delegation_sidecar_cleanup_intents(sidecar_path,session_id,created_at_unix_ms)
+             SELECT p.sidecar_path,p.parent_session_id,?2
+             FROM task_delegation_payloads p JOIN subtree s ON s.session_id=p.parent_session_id
+             WHERE p.sidecar_path IS NOT NULL",
+            params![session_id.to_string(), now_unix_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Replay durable filesystem cleanup. The intent is removed only after a
+    /// successful unlink (or proof the file is already absent).
+    pub async fn reconcile_delegation_sidecar_cleanup_intents(&self) -> Result<usize> {
+        let rows = self
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT sidecar_path FROM task_delegation_sidecar_cleanup_intents ORDER BY created_at_unix_ms,sidecar_path",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        let base = self.delegation_payload_base_dir()?;
+        let mut completed = 0;
+        for relative in rows {
+            let path = base.join(&relative);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%error, path=%path.display(), "delegation sidecar cleanup remains pending");
+                    continue;
+                }
+            }
+            let removed = self
+                .transaction(move |conn| {
+                    Ok(conn.execute(
+                        "DELETE FROM task_delegation_sidecar_cleanup_intents WHERE sidecar_path=?1",
+                        [relative],
+                    )? == 1)
+                })
+                .await?;
+            completed += usize::from(removed);
+        }
+        Ok(completed)
     }
 
     /// Absolute sidecar payload paths owned by `session_id` and its fork

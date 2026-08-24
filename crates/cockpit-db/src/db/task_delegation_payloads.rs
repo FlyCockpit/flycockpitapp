@@ -369,7 +369,7 @@ impl Db {
         Ok(body)
     }
 
-    fn delegation_payload_base_dir(&self) -> Result<PathBuf> {
+    pub(crate) fn delegation_payload_base_dir(&self) -> Result<PathBuf> {
         if let Some(path) = self.path()
             && let Some(parent) = path.parent()
         {

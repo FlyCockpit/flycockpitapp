@@ -264,9 +264,19 @@ pub(super) async fn discard_session(
     ledger: &RemoteSessionLedger,
 ) -> Result<Response, ErrorPayload> {
     if let Some(cached) = ledger.committed_replay(ctx).await? {
+        // Durable replay does not replay connection-local state. A client
+        // which reissues discard on a new connection must still detach its
+        // own handle before observing the cached success.
+        if state
+            .attached
+            .as_ref()
+            .is_some_and(|att| att.handle.session_id == session_id)
+        {
+            state.attached = None;
+        }
         return Ok(cached);
     }
-    // The reservation above makes this worker stop exclusive with every
+    // The ingress identity guard makes this worker stop exclusive with every
     // same-identity contender. The client-local detach remains post-commit.
     ctx.registry
         .interrupt_and_stop(session_id)
@@ -394,19 +404,19 @@ pub(super) async fn delete_session(
     }
     super::sessions::prepare_session_deletion(ctx, session_id).await?;
     let now_wall_ms = super::run_invocation::wall_ms_now();
-    let sidecars = ctx
-        .db
-        .session_delegation_sidecar_paths(session_id)
-        .await
-        .map_err(internal)?;
     let response = commit_session_remote_mutation(ctx, ledger, "delete_session", move |conn| {
         crate::db::Db::terminalize_session_run_invocations_conn(conn, session_id, now_wall_ms)?;
+        crate::db::Db::enqueue_delegation_sidecar_cleanup_conn(
+            conn,
+            session_id,
+            now_wall_ms,
+        )?;
         let existed = crate::db::Db::delete_existing_session_row_conn(conn, session_id)?;
         require_mutated(existed, session_id)?;
         Ok(Response::Ack)
     })
     .await?;
-    if let Err(error) = crate::db::Db::remove_delegation_sidecars(sidecars) {
+    if let Err(error) = ctx.db.reconcile_delegation_sidecar_cleanup_intents().await {
         tracing::warn!(%error, %session_id, "post-commit delegation sidecar cleanup failed; ledgered delete stands");
     }
     Ok(response)

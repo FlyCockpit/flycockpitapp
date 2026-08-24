@@ -3147,6 +3147,9 @@ pub(crate) async fn boot_with_db(
     timer.phase("prune_and_sweep");
     #[cfg_attr(test, allow(unused_mut))]
     let mut ctx = DaemonContext::new(db.clone(), locks, paths, terminal_factory, config_source);
+    db.reconcile_delegation_sidecar_cleanup_intents()
+        .await
+        .context("reconciling delegation sidecar cleanup intents")?;
     if let Some(storage) = &ctx.media_storage_recovery {
         storage
             .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())

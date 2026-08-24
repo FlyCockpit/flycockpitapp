@@ -111,7 +111,7 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
     assert_eq!(
         ci.matches("if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance")
             .count(),
-        2
+        3
     );
     let release = source(".github/workflows/release.yml");
     assert!(release.contains("FLYCOCKPIT_RELEASE_PROFILE: local-v0.1"));

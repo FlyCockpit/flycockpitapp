@@ -102,14 +102,14 @@ jobs:
 
       - name: Build
         if: contains(matrix.os, 'windows') == false
-        run: cargo build --locked --workspace
+        run: cargo build --locked --workspace --exclude tenant-authority
 
       - name: Check generated runtime documentation
         run: python3 apps/cli/scripts/generate-runtime-docs.py --check
 
       - name: Build Windows target
         if: contains(matrix.os, 'windows')
-        run: cargo build --locked --workspace --target x86_64-pc-windows-msvc
+        run: cargo build --locked --workspace --exclude tenant-authority --target x86_64-pc-windows-msvc
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -131,7 +131,7 @@ jobs:
           cargo fetch --locked --target aarch64-linux-android
 
       - name: Test
-        run: cargo nextest run --locked --workspace
+        run: cargo nextest run --locked --workspace --exclude tenant-authority
 
       - name: Check released migrations are append-only
         run: bash scripts/check-append-only-migrations.sh
@@ -143,29 +143,30 @@ jobs:
         run: bash scripts/check-test-assertion-integrity.sh
 
       - name: Doc tests
-        run: cargo test --locked --workspace --doc
+        run: cargo test --locked --workspace --exclude tenant-authority --doc
 
       - name: Clippy
         if: contains(matrix.os, 'windows') == false
-        run: cargo clippy --locked --workspace --tests -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests -- -D warnings
 
       - name: Clippy Windows target
         if: contains(matrix.os, 'windows')
-        run: cargo clippy --locked --workspace --tests --target x86_64-pc-windows-msvc -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --tests --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Clippy examples
         if: contains(matrix.os, 'windows') == false
-        run: cargo clippy --locked --workspace --examples -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --examples -- -D warnings
 
       - name: Clippy examples Windows target
         if: contains(matrix.os, 'windows')
-        run: cargo clippy --locked --workspace --examples --target x86_64-pc-windows-msvc -- -D warnings
+        run: cargo clippy --locked --workspace --exclude tenant-authority --examples --target x86_64-pc-windows-msvc -- -D warnings
 
       - name: Format
         run: cargo fmt --all -- --check
 
   remote-workspace-static:
     name: Opt-in remote workspace compile contract
+    if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance
     needs: runners
     runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     steps:

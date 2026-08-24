@@ -3570,7 +3570,7 @@ pub(super) mod tests {
         for agent in &identities {
             let tmp = TempDir::new().unwrap();
             let mut dialog = populated_pointer_agents_dialog(&tmp);
-            focus(&mut dialog, &agent.0);
+            focus(&mut dialog, agent.name());
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Edit(agent.clone()),
             );

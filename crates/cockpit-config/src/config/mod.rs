@@ -197,8 +197,12 @@ pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::
 /// Move an authority-bearing regular file between two retained, no-follow
 /// parent directory handles. Both parent identities are fixed before the
 /// source name is resolved, so a concurrent pathname-component replacement
-/// cannot redirect the move.
+/// cannot redirect the move. The required cross-process mutation guard makes
+/// the daemon the sole cooperating namespace writer for the whole validation
+/// and publication interval; callers cannot accidentally perform a bare
+/// check/rename sequence.
 pub fn rename_config_file_nofollow(
+    _mutation_lock: &HeldConfigMutationLock,
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> anyhow::Result<()> {

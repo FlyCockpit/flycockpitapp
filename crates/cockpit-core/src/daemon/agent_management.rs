@@ -704,6 +704,16 @@ fn sync_dir(path: &Path) -> Result<(), ErrorPayload> {
 /// and the journal is removed, so boot/request recovery never exposes a
 /// silently partial reset as success.
 fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
+    let guard =
+        cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
+            .map_err(internal)?;
+    recover_reset_all_locked(root, &guard)
+}
+
+fn recover_reset_all_locked(
+    root: &Path,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+) -> Result<(), ErrorPayload> {
     let journal_path = reset_journal_path(root);
     let Some(raw) = nofollow_read(&journal_path)? else {
         return Ok(());
@@ -718,7 +728,7 @@ fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
                 let staged_exists = nofollow_read(&staged)?.is_some();
                 let target_exists = nofollow_read(&target)?.is_some();
                 match (staged_exists, target_exists) {
-                    (true, false) => rename_config_noreplace(&staged, &target)?,
+                    (true, false) => rename_config_noreplace(guard, &staged, &target)?,
                     // This entry was not staged yet, or an earlier recovery
                     // pass already restored it.
                     (false, true) => {}
@@ -837,7 +847,10 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
 }
 
 fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
-    recover_reset_all(root)?;
+    let guard =
+        cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
+            .map_err(internal)?;
+    recover_reset_all_locked(root, &guard)?;
     let operation_id = Uuid::new_v4();
     let trash = root
         .join(".cockpit/.agent-reset-trash")
@@ -879,10 +892,10 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     for name in &journal.entries {
         let source = project_agent_path(root, name)?;
         let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = rename_config_noreplace(&source, &staged) {
+        if let Err(error) = rename_config_noreplace(&guard, &source, &staged) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
-            let _ = recover_reset_all(root);
+            let _ = recover_reset_all_locked(root, &guard);
             return Err(error);
         }
     }
@@ -897,7 +910,7 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     let encoded = serde_json::to_vec_pretty(&committed).map_err(internal)?;
     cockpit_config::config::write_config_bytes_atomic(&reset_journal_path(root), &encoded)
         .map_err(internal)?;
-    recover_reset_all(root)?;
+    recover_reset_all_locked(root, &guard)?;
     Ok(committed.entries.len() as u32)
 }
 
@@ -909,22 +922,28 @@ fn ensure_revision(current: &str, expected: Option<&str>) -> Result<(), ErrorPay
     }
 }
 
-fn rename_config_noreplace(source: &Path, destination: &Path) -> Result<(), ErrorPayload> {
-    cockpit_config::config::rename_config_file_nofollow(source, destination).map_err(|error| {
-        let destination_exists = error.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
-        });
-        if destination_exists {
-            conflict(format!(
-                "agent reset destination already exists: {}",
-                destination.display()
-            ))
-        } else {
-            internal(error)
-        }
-    })
+fn rename_config_noreplace(
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ErrorPayload> {
+    cockpit_config::config::rename_config_file_nofollow(guard, source, destination).map_err(
+        |error| {
+            let destination_exists = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+            });
+            if destination_exists {
+                conflict(format!(
+                    "agent reset destination already exists: {}",
+                    destination.display()
+                ))
+            } else {
+                internal(error)
+            }
+        },
+    )
 }
 
 fn bad_request(message: impl Into<String>) -> ErrorPayload {

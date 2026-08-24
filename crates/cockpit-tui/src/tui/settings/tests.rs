@@ -184,12 +184,12 @@ fn settings_config_mutations_stay_daemon_owned() {
 fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
     let entries = vec![
         cockpit_core::daemon::proto::RedactedDenylistEntry {
-            entry_id: "first".into(),
-            display_mask: "•••• (4 bytes)".into(),
+            entry_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
         cockpit_core::daemon::proto::RedactedDenylistEntry {
-            entry_id: "second".into(),
-            display_mask: "•••• (4 bytes)".into(),
+            entry_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
     ];
     let mut base = serde_json::json!({});
@@ -198,19 +198,23 @@ fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
         serde_json::to_value(entries).unwrap(),
     );
     let desired = vec![
-        super::existing_denylist_draft("second"),
-        super::existing_denylist_draft("first"),
+        super::existing_denylist_draft(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        super::existing_denylist_draft(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
     ];
     let planned = super::denylist_mutations(&base, &desired).unwrap();
     assert!(matches!(
         &planned[0],
         cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
-            if entry_id == "second"
+            if entry_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ));
     assert!(matches!(
         &planned[1],
         cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
-            if entry_id == "first"
+            if entry_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
 }
 
@@ -219,9 +223,9 @@ fn typed_mask_text_is_new_and_cannot_alias_an_existing_occurrence() {
     let mut base = serde_json::json!({});
     base.as_object_mut().unwrap().insert(
         "__cockpit_denylist_entries".into(),
-        serde_json::json!([{"entry_id":"first","display_mask":"•••• (4 bytes)"}]),
+        serde_json::json!([{"entry_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","display_mask":"••••"}]),
     );
-    let error = super::denylist_mutations(&base, &["•••• (4 bytes)".into()]).unwrap_err();
+    let error = super::denylist_mutations(&base, &["••••".into()]).unwrap_err();
     assert!(error.contains("display masks are reserved"));
 }
 

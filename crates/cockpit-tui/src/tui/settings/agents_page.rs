@@ -538,16 +538,24 @@ fn valid_agent_inventory(
     revision: &str,
 ) -> bool {
     let mut names = std::collections::HashSet::new();
-    revision == cockpit_proto::agent_inventory_revision(entries)
+    cockpit_proto::is_opaque_authority_token(revision)
         && entries.iter().all(|entry| {
             let builtin = cockpit_core::agents::is_builtin_agent(&entry.name);
             !entry.name.is_empty()
                 && entry.name.len() <= cockpit_core::daemon::proto::MAX_AGENT_NAME_BYTES
                 && names.insert(entry.name.as_str())
+                && [
+                    entry.description.as_deref(),
+                    entry.model.as_deref(),
+                    entry.diagnostic.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|value| value.len() <= cockpit_proto::MAX_AGENT_METADATA_BYTES)
                 && (entry.kind == cockpit_core::daemon::proto::AgentEntryKind::Builtin) == builtin
                 && (!entry.overridden || builtin)
-                && is_lower_hex_digest(&entry.source_identity)
-                && is_lower_hex_digest(&entry.revision)
+                && cockpit_proto::is_opaque_authority_token(&entry.source_identity)
+                && cockpit_proto::is_opaque_authority_token(&entry.revision)
                 && entry.projection_digest
                     == cockpit_proto::agent_inventory_entry_projection_digest(entry)
                 && if entry.valid {

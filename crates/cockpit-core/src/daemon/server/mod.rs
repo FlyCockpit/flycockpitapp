@@ -1554,7 +1554,7 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         created_at: _,
         home_dir,
         config_json,
-        content_hash: _,
+        definition_presentation_hash: _,
         registration_revision: _,
         definition_markdown,
         definition_revision: _,
@@ -1562,7 +1562,28 @@ fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &Red
         projection_digest: _,
     } = assistant;
     scrub_string(home_dir, redact);
-    scrub_string(config_json, redact);
+    if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(config_json) {
+        fn scrub_json(value: &mut serde_json::Value, redact: &RedactionTable) {
+            match value {
+                serde_json::Value::String(value) => scrub_string(value, redact),
+                serde_json::Value::Array(values) => {
+                    values
+                        .iter_mut()
+                        .for_each(|value| scrub_json(value, redact));
+                }
+                serde_json::Value::Object(values) => {
+                    values
+                        .values_mut()
+                        .for_each(|value| scrub_json(value, redact));
+                }
+                _ => {}
+            }
+        }
+        scrub_json(&mut config, redact);
+        if let Ok(redacted) = serde_json::to_string(&config) {
+            *config_json = redacted;
+        }
+    }
     scrub_option_string(definition_markdown, redact);
     scrub_option_string(definition_diagnostic, redact);
 }
@@ -1584,6 +1605,10 @@ fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &R
 /// into a post-commit response error.
 fn finalize_response_projections(response: &mut proto::Response) {
     fn assistant(value: &mut proto::AssistantSummary) {
+        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(markdown.as_bytes()))
+        });
         value.projection_digest = proto::assistant_projection_digest(value);
     }
     fn agent(value: &mut proto::AgentEditSnapshot) {

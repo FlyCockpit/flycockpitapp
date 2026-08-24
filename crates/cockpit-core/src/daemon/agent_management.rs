@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -242,7 +241,7 @@ fn inventory_sync(
 ) -> Result<Response, ErrorPayload> {
     recover_reset_all_locked(root, guard)?;
     let entries = inventory_entries(root)?;
-    let inventory_revision = cockpit_proto::agent_inventory_revision(&entries);
+    let inventory_revision = inventory_revision(&entries);
     Ok(Response::AgentInventory {
         entries,
         inventory_revision,
@@ -283,7 +282,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 ),
             };
             let (source_layer, source_identity, markdown, target_exists) = source?;
-            let revision = cockpit_proto::agent_definition_revision(
+            let revision = definition_revision(
                 &entry.name,
                 source_layer,
                 &source_identity,
@@ -322,7 +321,7 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
     let canonical_preview = def.to_markdown().map_err(bad_config)?;
     let (source_layer, source_identity, markdown, target_exists) =
         source_snapshot_parts(root, name)?;
-    let revision = cockpit_proto::agent_definition_revision(
+    let revision = definition_revision(
         name,
         source_layer,
         &source_identity,
@@ -670,18 +669,15 @@ fn ensure_workspace_source_or_embedded(snapshot: &AgentEditSnapshot) -> Result<(
     }
 }
 
-fn digest_identity_field(digest: &mut Sha256, value: &[u8]) {
-    digest.update((value.len() as u64).to_le_bytes());
-    digest.update(value);
-}
-
 fn embedded_source_identity(root: &Path, name: &str, content: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-source-occurrence-v2\0embedded\0");
-    digest_identity_field(&mut digest, root.as_os_str().as_encoded_bytes());
-    digest_identity_field(&mut digest, name.as_bytes());
-    digest_identity_field(&mut digest, content);
-    format!("{digest:x}")
+    crate::daemon::authority_token::mint(
+        b"agent-source/embedded/v1",
+        &[
+            root.as_os_str().as_encoded_bytes(),
+            name.as_bytes(),
+            content,
+        ],
+    )
 }
 
 fn opaque_source_identity(
@@ -696,33 +692,76 @@ fn opaque_source_identity(
             "agent source became a symlink while minting its identity",
         ));
     }
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-source-occurrence-v2\0");
-    digest.update([layer as u8]);
-    digest_identity_field(&mut digest, root.as_os_str().as_encoded_bytes());
-    digest_identity_field(&mut digest, source.as_os_str().as_encoded_bytes());
-    digest_identity_field(&mut digest, content);
-    digest.update(metadata.len().to_le_bytes());
+    let layer = [layer as u8];
+    let length = metadata.len().to_le_bytes();
+    let mut platform_identity = Vec::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        digest.update(metadata.dev().to_le_bytes());
-        digest.update(metadata.ino().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.dev().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.ino().to_le_bytes());
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        digest.update(metadata.file_attributes().to_le_bytes());
-        digest.update(metadata.creation_time().to_le_bytes());
-        digest.update(metadata.last_write_time().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.file_attributes().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.creation_time().to_le_bytes());
+        platform_identity.extend_from_slice(&metadata.last_write_time().to_le_bytes());
     }
-    Ok(format!("{digest:x}"))
+    Ok(crate::daemon::authority_token::mint(
+        b"agent-source/file/v1",
+        &[
+            &layer,
+            root.as_os_str().as_encoded_bytes(),
+            source.as_os_str().as_encoded_bytes(),
+            content,
+            &length,
+            &platform_identity,
+        ],
+    ))
 }
 
 fn current_inventory_revision(root: &Path) -> Result<String, ErrorPayload> {
-    Ok(cockpit_proto::agent_inventory_revision(&inventory_entries(
-        root,
-    )?))
+    Ok(inventory_revision(&inventory_entries(root)?))
+}
+
+fn definition_revision(
+    name: &str,
+    source_layer: AgentSourceLayer,
+    source_identity: &str,
+    source_content_hash: &str,
+    target_exists: bool,
+) -> String {
+    let layer = [source_layer as u8];
+    let exists = [u8::from(target_exists)];
+    crate::daemon::authority_token::mint(
+        b"agent-definition-revision/v1",
+        &[
+            name.as_bytes(),
+            &layer,
+            source_identity.as_bytes(),
+            source_content_hash.as_bytes(),
+            &exists,
+        ],
+    )
+}
+
+fn inventory_revision(entries: &[AgentInventoryEntry]) -> String {
+    let mut ordered = entries.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut canonical = Vec::new();
+    for entry in ordered {
+        for value in [&entry.name, &entry.source_identity, &entry.revision] {
+            canonical.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            canonical.extend_from_slice(value.as_bytes());
+        }
+        canonical.extend_from_slice(&[
+            entry.kind as u8,
+            u8::from(entry.overridden),
+            u8::from(entry.editable),
+        ]);
+    }
+    crate::daemon::authority_token::mint(b"agent-inventory-revision/v1", &[&canonical])
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

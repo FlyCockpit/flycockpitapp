@@ -201,6 +201,19 @@ fn settings_snapshot_session_id() -> &'static str {
 
 const DENYLIST_EXISTING_DRAFT_PREFIX: &str = "__cockpit_existing_denylist_occurrence_v1:";
 
+enum DenylistDraftEntry<'a> {
+    Existing(&'a str),
+    New(&'a str),
+}
+
+fn denylist_draft_entry(value: &str) -> Result<DenylistDraftEntry<'_>, String> {
+    match value.strip_prefix(DENYLIST_EXISTING_DRAFT_PREFIX) {
+        Some("") => Err("denylist draft contains an empty occurrence token".into()),
+        Some(entry_id) => Ok(DenylistDraftEntry::Existing(entry_id)),
+        None => Ok(DenylistDraftEntry::New(value)),
+    }
+}
+
 fn existing_denylist_draft(entry_id: &str) -> String {
     format!("{DENYLIST_EXISTING_DRAFT_PREFIX}{entry_id}")
 }
@@ -223,59 +236,84 @@ fn extended_config_layer_snapshot(
                 .into_iter()
                 .find(|layer| layer.display_path == requested_path)
                 .ok_or_else(|| "settings target is not a daemon-discovered layer".to_string())?;
-            let mut config = *layer.config;
-            let denylist = layer.denylist;
-            let revision = layer.revision;
-            let authored_paths = layer.authored_paths;
-            config.redact.denylist = denylist
-                .iter()
-                .map(|entry| existing_denylist_draft(&entry.entry_id))
-                .collect();
-            let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
-            value
-                .as_object_mut()
-                .expect("ExtendedConfig serializes as object")
-                .insert(
-                    "__cockpit_denylist_entries".into(),
-                    serde_json::to_value(denylist).map_err(|error| error.to_string())?,
-                );
-            value
-                .as_object_mut()
-                .expect("ExtendedConfig serializes as object")
-                .insert(
-                    "__cockpit_settings_authored_paths".into(),
-                    serde_json::to_value(authored_paths).map_err(|error| error.to_string())?,
-                );
-            value
-                .as_object_mut()
-                .expect("ExtendedConfig serializes as object")
-                .insert(
-                    "__cockpit_settings_layer_kind".into(),
-                    serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
-                );
-            value
-                .as_object_mut()
-                .expect("ExtendedConfig serializes as object")
-                .insert(
-                    "__cockpit_settings_generation".into(),
-                    serde_json::Value::Number(config_generation.into()),
-                );
-            value
-                .as_object_mut()
-                .expect("ExtendedConfig serializes as object")
-                .insert(
-                    "__cockpit_settings_layer_id".into(),
-                    serde_json::Value::String(layer.layer_id),
-                );
-            Ok((config, value, revision))
+            decode_extended_layer(layer, config_generation)
         }
         other => Err(format!("unexpected settings snapshot response: {other:?}")),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn decode_extended_layer(
+    layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+    config_generation: u64,
+) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
+    let layer_uuid = uuid::Uuid::parse_str(&layer.layer_id)
+        .map_err(|_| "settings layer capability is malformed".to_string())?;
+    if layer_uuid.to_string() != layer.layer_id
+        || !cockpit_proto::is_opaque_authority_token(&layer.revision)
+    {
+        return Err("settings layer authority tokens are malformed".into());
+    }
+    let mut denylist_ids = std::collections::HashSet::new();
+    if layer.denylist.iter().any(|entry| {
+        !cockpit_proto::is_opaque_authority_token(&entry.entry_id)
+            || entry.display_mask != cockpit_proto::REDACTED_DENYLIST_MASK
+            || !denylist_ids.insert(entry.entry_id.as_str())
+    }) {
+        return Err("settings denylist snapshot contains invalid occurrence tokens".into());
+    }
+    let mut config = *layer.config;
+    let denylist = layer.denylist;
+    let revision = layer.revision;
+    let authored_paths = layer.authored_paths;
+    config.redact.denylist = denylist
+        .iter()
+        .map(|entry| existing_denylist_draft(&entry.entry_id))
+        .collect();
+    let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_denylist_entries".into(),
+            serde_json::to_value(denylist).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_authored_paths".into(),
+            serde_json::to_value(authored_paths).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_layer_kind".into(),
+            serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_generation".into(),
+            serde_json::Value::Number(config_generation.into()),
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_layer_id".into(),
+            serde_json::Value::String(layer.layer_id),
+        );
+    Ok((config, value, revision))
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum SettingsPatchOutcome {
-    Reconciled,
+    Reconciled {
+        layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+        config_generation: u64,
+    },
     CommittedRefreshNeeded {
         result_revision: String,
         config_generation: u64,
@@ -346,6 +384,7 @@ fn apply_settings_patch_via_daemon(
             && layer == expected_layer
             && consumed_revision == expected_revision
             && hash == result_revision
+            && cockpit_proto::is_opaque_authority_token(&result_revision)
             && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
             && (config_generation == expected_generation
                 || config_generation == expected_generation.saturating_add(1)) =>
@@ -372,8 +411,9 @@ fn apply_settings_patch_via_daemon(
             layers,
             config_generation,
         }) if warning.is_none()
-            && config_generation == result_generation
-            && layers.iter().any(|layer| {
+            && config_generation == result_generation =>
+        {
+            let layer = layers.into_iter().find(|layer| {
                 layer.display_path == requested_path
                     && layer.kind == expected_layer
                     && layer.revision == result_revision
@@ -382,11 +422,16 @@ fn apply_settings_patch_via_daemon(
                         &operations,
                         &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
                         &layer.authored_paths,
-                    )
-                    .is_ok()
-            }) =>
-        {
-            Ok(SettingsPatchOutcome::Reconciled)
+                    ).is_ok()
+            });
+            match layer {
+                Some(layer) => Ok(SettingsPatchOutcome::Reconciled { layer, config_generation }),
+                None => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+                    result_revision,
+                    config_generation: result_generation,
+                    warning: "settings committed, but the authoritative refresh did not contain the exact committed layer; reload before editing again".into(),
+                }),
+            }
         }
         other => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
             result_revision,
@@ -461,6 +506,7 @@ pub(super) fn apply_typed_settings_document_edit(
             && layer == expected_layer
             && consumed_revision == revision
             && hash == result_revision
+            && cockpit_proto::is_opaque_authority_token(&result_revision)
             && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
             && (config_generation == expected_generation
                 || config_generation == expected_generation.saturating_add(1)) =>
@@ -487,8 +533,8 @@ pub(super) fn apply_typed_settings_document_edit(
             layers,
             config_generation,
         }) if warning.is_none()
-            && config_generation == result_generation
-            && layers.iter().any(|layer| {
+            && config_generation == result_generation => {
+            let layer = layers.into_iter().find(|layer| {
                 layer.display_path == requested_path
                     && layer.kind == expected_layer
                     && layer.revision == result_revision
@@ -499,9 +545,15 @@ pub(super) fn apply_typed_settings_document_edit(
                         &layer.authored_paths,
                     )
                     .is_ok()
-            }) =>
-        {
-            Ok(SettingsPatchOutcome::Reconciled)
+            });
+            match layer {
+                Some(layer) => Ok(SettingsPatchOutcome::Reconciled { layer, config_generation }),
+                None => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+                    result_revision,
+                    config_generation: result_generation,
+                    warning: "settings committed, but the authoritative refresh did not contain the exact committed layer; reload before editing again".into(),
+                }),
+            }
         }
         other => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
             result_revision,
@@ -670,26 +722,29 @@ fn denylist_mutations(
     let mut used = std::collections::HashSet::new();
     let mut target = Vec::new();
     for value in desired {
-        if let Some(entry_id) = value.strip_prefix(DENYLIST_EXISTING_DRAFT_PREFIX) {
-            if entry_id.is_empty() || !by_id.contains_key(entry_id) || !used.insert(entry_id) {
-                return Err("denylist draft contains a missing or duplicated occurrence".into());
+        match denylist_draft_entry(value)? {
+            DenylistDraftEntry::Existing(entry_id) => {
+                if !cockpit_proto::is_opaque_authority_token(entry_id)
+                    || !by_id.contains_key(entry_id)
+                    || !used.insert(entry_id)
+                {
+                    return Err("denylist draft contains a missing or duplicated occurrence".into());
+                }
+                target.push(D::Existing {
+                    entry_id: entry_id.to_owned(),
+                });
             }
-            target.push(D::Existing {
-                entry_id: entry_id.to_owned(),
-            });
-        } else {
-            if value.starts_with(DENYLIST_EXISTING_DRAFT_PREFIX) {
-                return Err("denylist literal uses a reserved occurrence marker".into());
+            DenylistDraftEntry::New(value) => {
+                if value == cockpit_proto::REDACTED_DENYLIST_MASK {
+                    return Err(
+                        "denylist display masks are reserved and cannot be literal values".into(),
+                    );
+                }
+                target.push(D::New {
+                    client_nonce: uuid::Uuid::new_v4().to_string(),
+                    literal: value.to_owned(),
+                });
             }
-            if value.starts_with("•••• (") && value.ends_with(" bytes)") {
-                return Err(
-                    "denylist display masks are reserved and cannot be literal values".into(),
-                );
-            }
-            target.push(D::New {
-                client_nonce: uuid::Uuid::new_v4().to_string(),
-                literal: value.clone(),
-            });
         }
     }
     Ok(target)
@@ -702,16 +757,25 @@ fn validate_committed_denylist(
     if planned.len() != committed.len() {
         return Err("denylist receipt has the wrong length".into());
     }
+    let mut ids = std::collections::HashSet::new();
     for (planned, committed) in planned.iter().zip(committed) {
+        if !cockpit_proto::is_opaque_authority_token(&committed.entry_id)
+            || committed.display_mask != cockpit_proto::REDACTED_DENYLIST_MASK
+            || !ids.insert(committed.entry_id.as_str())
+        {
+            return Err(
+                "denylist receipt contains an invalid or duplicated occurrence token".into(),
+            );
+        }
         match planned {
-            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
-                if entry_id == &committed.entry_id && committed.client_nonce.is_none() => {}
+            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { .. }
+                if committed.client_nonce.is_none() => {}
             cockpit_core::daemon::proto::DesiredDenylistEntry::New {
                 client_nonce,
-                literal,
+                literal: _,
             } if committed.client_nonce.as_ref() == Some(client_nonce)
-                && committed.display_mask == format!("•••• ({} bytes)", literal.len())
-                && !committed.entry_id.is_empty() => {}
+                && uuid::Uuid::parse_str(client_nonce)
+                    .is_ok_and(|nonce| nonce.to_string() == *client_nonce) => {}
             _ => {
                 return Err("denylist receipt reordered or replaced an existing occurrence".into());
             }
@@ -3024,8 +3088,15 @@ impl SettingsDialog {
             revision,
         )?;
         match outcome {
-            SettingsPatchOutcome::Reconciled => {
-                self.reload_extended();
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
                 return Ok(SettingsSaveOutcome::Saved);
             }
             SettingsPatchOutcome::CommittedRefreshNeeded {
@@ -4230,8 +4301,15 @@ impl SettingsCx {
             revision,
         )?;
         match outcome {
-            SettingsPatchOutcome::Reconciled => {
-                self.reload_extended();
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
                 return Ok(SettingsSaveOutcome::Saved);
             }
             SettingsPatchOutcome::CommittedRefreshNeeded {
@@ -5464,11 +5542,16 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 
 fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
     let config_path = dir.join(CONFIG_FILE);
-    let _committed = apply_typed_settings_document_edit(
+    match apply_typed_settings_document_edit(
         &config_path,
         None,
         serde_json::json!({ "agents": {}, "tools": {} }),
-    )?;
+    )? {
+        SettingsPatchOutcome::Reconciled { .. } => {}
+        SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
+            return Err(format!("committed; refresh needed: {warning}"));
+        }
+    }
     Ok(config_path)
 }
 

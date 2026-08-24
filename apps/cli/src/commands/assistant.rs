@@ -268,7 +268,9 @@ async fn show(name: &str) -> Result<()> {
     println!("description: {}", def.description);
     println!("home_dir: {}", def.home_dir.display());
     println!("definition: {}", def.agent.source.display());
-    println!("content_hash: {}", assistant.content_hash);
+    if let Some(hash) = &assistant.definition_presentation_hash {
+        println!("presentation_hash: {hash}");
+    }
     println!(
         "agent_id: {}",
         def.agent.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)

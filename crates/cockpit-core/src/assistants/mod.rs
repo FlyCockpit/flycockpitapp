@@ -449,22 +449,28 @@ pub fn markdown_content_hash(markdown: &str) -> String {
 }
 
 pub fn definition_revision(row: &AssistantRow, markdown: &str) -> String {
-    cockpit_proto::calculate_assistant_definition_revision(
-        &row.name,
-        &row.home_dir,
-        &row.config_json,
-        &row.content_hash,
-        markdown,
+    crate::daemon::authority_token::mint(
+        b"assistant-definition-revision/v1",
+        &[
+            row.name.as_bytes(),
+            row.home_dir.as_bytes(),
+            row.config_json.as_bytes(),
+            row.content_hash.as_bytes(),
+            markdown.as_bytes(),
+        ],
     )
 }
 
 pub fn registration_revision(row: &AssistantRow) -> String {
-    cockpit_proto::calculate_assistant_registration_revision(
-        row.created_at,
-        &row.name,
-        &row.home_dir,
-        &row.config_json,
-        &row.content_hash,
+    crate::daemon::authority_token::mint(
+        b"assistant-registration-revision/v1",
+        &[
+            &row.created_at.to_le_bytes(),
+            row.name.as_bytes(),
+            row.home_dir.as_bytes(),
+            row.config_json.as_bytes(),
+            row.content_hash.as_bytes(),
+        ],
     )
 }
 
@@ -966,8 +972,15 @@ struct UnregisterJournal {
     home_dir: String,
     config_json: String,
     content_hash: String,
-    registration_revision: String,
     artifacts: Vec<UnregisterArtifact>,
+}
+
+fn row_matches_unregister_journal(row: &AssistantRow, journal: &UnregisterJournal) -> bool {
+    row.name == journal.name
+        && row.created_at == journal.created_at
+        && row.home_dir == journal.home_dir
+        && row.config_json == journal.config_json
+        && row.content_hash == journal.content_hash
 }
 
 const UNREGISTER_ARTIFACT_NAMES: [(&str, &str); 2] = [
@@ -1057,7 +1070,6 @@ fn build_unregister_journal(
         home_dir: row.home_dir.clone(),
         config_json: row.config_json.clone(),
         content_hash: row.content_hash.clone(),
-        registration_revision: registration_revision(row),
         artifacts,
     })
 }
@@ -1177,16 +1189,7 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
         }
         validate_assistant_name(&journal.name)?;
         let expected_home = default_home_dir(&journal.name)?;
-        if Path::new(&journal.home_dir) != expected_home
-            || journal.registration_revision
-                != cockpit_proto::calculate_assistant_registration_revision(
-                    journal.created_at,
-                    &journal.name,
-                    &journal.home_dir,
-                    &journal.config_json,
-                    &journal.content_hash,
-                )
-        {
+        if Path::new(&journal.home_dir) != expected_home {
             bail!("assistant unregister journal identity is invalid");
         }
         validate_unregister_artifacts(&journal.artifacts)?;
@@ -1196,7 +1199,7 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
         let current = get_assistant_blocking(db, &journal.name)?;
         match (&journal.phase, current) {
             (UnregisterPhase::Prepared, Some(row))
-                if registration_revision(&row) == journal.registration_revision =>
+                if row_matches_unregister_journal(&row, &journal) =>
             {
                 quarantine_unregister_journals(&guard, &expected_home, &journal)?;
                 journal.phase = UnregisterPhase::Quarantined;
@@ -1216,7 +1219,7 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
                 remove_unregister_journal(&journal)?;
             }
             (UnregisterPhase::Quarantined, Some(row))
-                if registration_revision(&row) == journal.registration_revision =>
+                if row_matches_unregister_journal(&row, &journal) =>
             {
                 quarantine_unregister_journals(&guard, &expected_home, &journal)?;
                 if !delete_registered_row_cas(db, &journal)? {

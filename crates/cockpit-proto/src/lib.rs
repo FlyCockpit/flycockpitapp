@@ -40,15 +40,16 @@ pub use agent_installation::{
 };
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES, agent_definition_revision,
+    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     agent_edit_projection_digest, agent_inventory_entry_projection_digest,
-    agent_inventory_revision, validate_agent_edit_snapshot, validate_agent_mutation_envelope,
-    validate_agent_source_identity, validate_goal_supervision_projection,
+    validate_agent_edit_snapshot, validate_agent_mutation_envelope, validate_agent_source_identity,
+    validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
     DesiredDenylistEntry, ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
-    ExtendedConfigPathMutation, RedactedDenylistEntry, RedactedOccurrenceMutation,
+    ExtendedConfigPathMutation, OPAQUE_AUTHORITY_TOKEN_BYTES, REDACTED_DENYLIST_MASK,
+    RedactedDenylistEntry, RedactedOccurrenceMutation, is_opaque_authority_token,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
@@ -2204,7 +2205,10 @@ pub struct AssistantSummary {
     pub created_at: i64,
     pub home_dir: String,
     pub config_json: String,
-    pub content_hash: String,
+    /// Digest of the already-redacted definition presentation. This is a UI
+    /// integrity hint only, never the daemon's raw file-integrity hash.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub definition_presentation_hash: Option<String>,
     /// Opaque CAS token for the raw registry binding itself. It is request-bound
     /// through projection and consumed-revision receipts and is deliberately
     /// not recomputable from this potentially redacted summary.
@@ -2227,7 +2231,7 @@ pub struct AssistantSummary {
 /// Validate the self-contained invariants of a daemon assistant snapshot.
 /// Parsing the agent markdown remains an application-layer responsibility,
 /// but every client can enforce revision/diagnostic coherence and the exact
-/// content hash without depending on `cockpit-core`.
+/// redacted presentation digest without depending on `cockpit-core`.
 pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'static str> {
     fn lower_hex_digest(value: &str) -> bool {
         value.len() == 64
@@ -2235,20 +2239,56 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
+    const MAX_ASSISTANT_HOME_BYTES: usize = 16 * 1024;
+    const MAX_ASSISTANT_CONFIG_BYTES: usize = 256 * 1024;
+    const MAX_ASSISTANT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
     if summary.name.is_empty()
-        || !lower_hex_digest(&summary.content_hash)
+        || summary.name.len() > MAX_AGENT_NAME_BYTES
+        || summary.home_dir.len() > MAX_ASSISTANT_HOME_BYTES
+        || summary.config_json.len() > MAX_ASSISTANT_CONFIG_BYTES
         || !lower_hex_digest(&summary.registration_revision)
     {
         return Err("assistant summary has no name or registration revision");
+    }
+    if !serde_json::from_str::<serde_json::Value>(&summary.config_json)
+        .is_ok_and(|value| value.is_object())
+    {
+        return Err("assistant config projection is not a JSON object");
+    }
+    if summary
+        .definition_markdown
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_AGENT_MARKDOWN_BYTES)
+        || summary
+            .definition_diagnostic
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_ASSISTANT_DIAGNOSTIC_BYTES)
+        || summary
+            .definition_presentation_hash
+            .as_deref()
+            .is_some_and(|value| !lower_hex_digest(value))
+    {
+        return Err("assistant definition projection exceeds its wire bounds");
     }
     match (
         summary.definition_markdown.as_deref(),
         summary.definition_revision.as_deref(),
         summary.definition_diagnostic.as_deref(),
     ) {
-        (Some(_), Some(revision), None) if lower_hex_digest(revision) => {}
-        (None, None, Some(diagnostic)) if !diagnostic.trim().is_empty() => {}
+        (Some(_), Some(revision), None)
+            if lower_hex_digest(revision) && summary.definition_presentation_hash.is_some() => {}
+        (None, None, Some(diagnostic))
+            if !diagnostic.trim().is_empty() && summary.definition_presentation_hash.is_none() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
+    }
+    if let (Some(markdown), Some(presentation_hash)) = (
+        summary.definition_markdown.as_deref(),
+        summary.definition_presentation_hash.as_deref(),
+    ) {
+        use sha2::Digest as _;
+        if format!("{:x}", sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
+            return Err("assistant definition presentation hash is invalid");
+        }
     }
     if summary.projection_digest != assistant_projection_digest(summary) {
         return Err("assistant projection digest is invalid");
@@ -2265,7 +2305,7 @@ pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
         Some(summary.name.as_str()),
         Some(summary.home_dir.as_str()),
         Some(summary.config_json.as_str()),
-        Some(summary.content_hash.as_str()),
+        summary.definition_presentation_hash.as_deref(),
         Some(summary.registration_revision.as_str()),
         summary.definition_markdown.as_deref(),
         summary.definition_revision.as_deref(),
@@ -2286,44 +2326,6 @@ fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {
     use sha2::Digest as _;
     digest.update((value.len() as u64).to_le_bytes());
     digest.update(value.as_bytes());
-}
-
-/// Mint the daemon's opaque registration CAS token from the authoritative raw
-/// row. Clients cannot recompute it from a redacted `AssistantSummary`; they
-/// bind it through the projection digest and consumed-revision receipts.
-pub fn calculate_assistant_registration_revision(
-    created_at: i64,
-    name: &str,
-    home_dir: &str,
-    config_json: &str,
-    content_hash: &str,
-) -> String {
-    use sha2::Digest as _;
-    let mut digest = sha2::Sha256::new();
-    digest.update(b"cockpit-assistant-registration-revision-v1\0");
-    digest.update(created_at.to_le_bytes());
-    for value in [name, home_dir, config_json, content_hash] {
-        assistant_revision_field(&mut digest, value);
-    }
-    format!("{:x}", digest.finalize())
-}
-
-/// Mint the daemon's opaque definition CAS token from raw registry fields and
-/// exact authored markdown. A redacted client projection cannot recompute it.
-pub fn calculate_assistant_definition_revision(
-    name: &str,
-    home_dir: &str,
-    config_json: &str,
-    content_hash: &str,
-    markdown: &str,
-) -> String {
-    use sha2::Digest as _;
-    let mut digest = sha2::Sha256::new();
-    digest.update(b"cockpit-assistant-definition-revision-v2\0");
-    for value in [name, home_dir, config_json, content_hash, markdown] {
-        assistant_revision_field(&mut digest, value);
-    }
-    format!("{:x}", digest.finalize())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

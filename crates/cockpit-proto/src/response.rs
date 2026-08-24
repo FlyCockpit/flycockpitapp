@@ -558,8 +558,8 @@ pub enum Response {
     },
 
     /// Result of a daemon-owned extended config mutation. The target path is
-    /// intentionally not echoed; callers only receive the committed content
-    /// hash and can reload their own safe view.
+    /// intentionally not echoed; callers receive only an opaque committed
+    /// revision and can reload their own safe view.
     ExtendedConfigSaved {
         hash: String,
         config_generation: u64,

@@ -238,20 +238,30 @@ impl ToolsPane {
 
     fn write_agent_def(&mut self, def: &AgentDef) -> Result<()> {
         let markdown = def.to_markdown()?;
+        let prior_revision = self.revision.clone();
+        let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+            name: self.agent_name.clone(),
+            markdown,
+        };
         let response = crate::tui::agent_runner::daemon_request_blocking(
             cockpit_core::daemon::proto::Request::MutateAgent {
                 project_root: self.cwd.to_string_lossy().into_owned(),
-                mutation: cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                    name: self.agent_name.clone(),
-                    markdown,
-                },
-                expected_revision: Some(self.revision.clone()),
+                mutation: mutation.clone(),
+                expected_revision: Some(prior_revision.clone()),
             },
         )
         .map_err(anyhow::Error::msg)?;
         let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
             anyhow::bail!("daemon returned an unexpected agent-save response");
         };
+        crate::tui::settings::agents_page::validate_agent_mutation_result(
+            &result,
+            &self.cwd,
+            &mutation,
+            Some(&prior_revision),
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
         let snapshot = result
             .snapshot
             .ok_or_else(|| anyhow::anyhow!("daemon omitted the saved snapshot"))?;

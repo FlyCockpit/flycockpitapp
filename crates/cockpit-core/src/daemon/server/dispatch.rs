@@ -13784,7 +13784,7 @@ pub(super) fn assistant_to_proto(
         created_at: row.created_at,
         home_dir: row.home_dir,
         config_json: row.config_json,
-        content_hash: row.content_hash,
+        definition_presentation_hash: None,
         definition_markdown: None,
         definition_revision: None,
         definition_diagnostic: None,

@@ -33,6 +33,7 @@ struct SettingsCapability {
     target: PathBuf,
     kind: cockpit_proto::CockpitConfigLayer,
     revision: String,
+    raw_revision: String,
     identity: Option<cockpit_config::config::TerminalIngressFileIdentity>,
     denylist_ids: Vec<String>,
     /// Exact values replaced by opaque per-occurrence placeholders in the
@@ -314,7 +315,8 @@ pub async fn get_extended_config_snapshot(
                 let guard =
                     cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
                 let (raw, identity) = read_optional_config(&target)?;
-                let revision = content_hash(&raw);
+                let raw_revision = content_hash(&raw);
+                let revision = settings_revision(kind, &target, &raw_revision);
                 let raw_document: serde_json::Value =
                     serde_json::from_slice(&raw).map_err(bad_request_config)?;
                 let authored_paths = authored_typed_paths(&raw_document);
@@ -324,7 +326,8 @@ pub async fn get_extended_config_snapshot(
                     .redact
                     .denylist
                     .iter()
-                    .map(|_| Uuid::new_v4().to_string())
+                    .enumerate()
+                    .map(|(index, value)| denylist_occurrence_id(kind, &target, &revision, index, value))
                     .collect();
                 let denylist = config
                     .redact
@@ -349,6 +352,7 @@ pub async fn get_extended_config_snapshot(
                         target: target.clone(),
                         kind,
                         revision: revision.clone(),
+                        raw_revision,
                         identity,
                         denylist_ids,
                         redacted_occurrences,
@@ -681,12 +685,10 @@ pub async fn apply_extended_config_patch(
             }
             let materialize = patch.materialize;
             let current_hash = content_hash(&raw);
-            if current_hash != expected_revision {
+            if current_hash != capability.raw_revision {
                 return Err(ErrorPayload {
                     code: ErrorCode::HashMismatch,
-                    message: format!(
-                        "configuration changed before patch; current revision is {current_hash}"
-                    ),
+                    message: "configuration changed before patch; reload its authoritative snapshot".into(),
                 });
             }
             let mut document: serde_json::Value =
@@ -792,13 +794,14 @@ pub async fn apply_extended_config_patch(
                 }
             }
             let desired_hash = content_hash(&merged);
+            let result_revision = settings_revision(capability.kind, &target, &desired_hash);
             let config_generation = if desired_hash != current_hash || (materialize && !existed) {
                 // Re-open immediately before publication while the real
                 // per-target cross-process lock is held. Both identity and
                 // bytes must still describe the exact capability snapshot.
                 let (precommit, precommit_identity) = read_optional_config(&target)?;
                 if precommit_identity != capability.identity
-                    || content_hash(&precommit) != expected_revision
+                    || content_hash(&precommit) != capability.raw_revision
                 {
                     return Err(conflict(
                         "configuration target changed immediately before commit",
@@ -811,20 +814,21 @@ pub async fn apply_extended_config_patch(
                 crate::daemon::server::inventory::current_config_generation()
             };
             Ok(Response::ExtendedConfigSaved {
-                hash: desired_hash.clone(),
+                hash: result_revision.clone(),
                 config_generation,
                 layer_id,
                 layer: capability.kind,
                 consumed_revision: expected_revision,
-                result_revision: desired_hash,
+                result_revision: result_revision.clone(),
                 status: cockpit_proto::ConfigCommitStatus::Committed,
                 publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: denylist_values
                     .iter()
-                    .map(|(id, client_nonce, value)| cockpit_proto::CommittedDenylistEntry {
-                        entry_id: id.clone(),
+                    .enumerate()
+                    .map(|(index, (_, client_nonce, value))| cockpit_proto::CommittedDenylistEntry {
+                        entry_id: denylist_occurrence_id(capability.kind, &target, &result_revision, index, value),
                         client_nonce: client_nonce.clone(),
-                        display_mask: format!("•••• ({} bytes)", value.len()),
+                        display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
                     })
                     .collect(),
             })
@@ -921,10 +925,44 @@ fn read_optional_config(
     )
 }
 
-fn redacted_denylist_entry(id: &str, value: &str) -> cockpit_proto::RedactedDenylistEntry {
+fn denylist_occurrence_id(
+    kind: cockpit_proto::CockpitConfigLayer,
+    target: &Path,
+    revision: &str,
+    index: usize,
+    value: &str,
+) -> String {
+    crate::daemon::authority_token::mint(
+        b"settings-denylist-occurrence/v1",
+        &[
+            &[kind as u8],
+            target.as_os_str().as_encoded_bytes(),
+            revision.as_bytes(),
+            &index.to_le_bytes(),
+            value.as_bytes(),
+        ],
+    )
+}
+
+fn settings_revision(
+    kind: cockpit_proto::CockpitConfigLayer,
+    target: &Path,
+    raw_revision: &str,
+) -> String {
+    crate::daemon::authority_token::mint(
+        b"settings-layer-revision/v1",
+        &[
+            &[kind as u8],
+            target.as_os_str().as_encoded_bytes(),
+            raw_revision.as_bytes(),
+        ],
+    )
+}
+
+fn redacted_denylist_entry(id: &str, _value: &str) -> cockpit_proto::RedactedDenylistEntry {
     cockpit_proto::RedactedDenylistEntry {
         entry_id: id.to_owned(),
-        display_mask: format!("•••• ({} bytes)", value.len()),
+        display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
     }
 }
 
@@ -979,8 +1017,10 @@ fn apply_denylist_sequence(
                 client_nonce,
                 literal,
             } => {
-                if client_nonce.is_empty()
-                    || client_nonce.len() > 128
+                let parsed_nonce = Uuid::parse_str(&client_nonce).ok();
+                if parsed_nonce
+                    .as_ref()
+                    .is_none_or(|nonce| nonce.to_string() != client_nonce)
                     || !nonces.insert(client_nonce.clone())
                 {
                     return Err(bad_request(
@@ -988,7 +1028,9 @@ fn apply_denylist_sequence(
                     ));
                 }
                 validate_new_denylist_literal(&literal)?;
-                result.push((Uuid::new_v4().to_string(), Some(client_nonce), literal));
+                // The post-commit occurrence ID is derived only after the
+                // resulting document revision is known.
+                result.push((String::new(), Some(client_nonce), literal));
             }
         }
     }

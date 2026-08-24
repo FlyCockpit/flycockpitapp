@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const OPAQUE_AUTHORITY_TOKEN_BYTES: usize = 64;
+pub const REDACTED_DENYLIST_MASK: &str = "••••";
+
+pub fn is_opaque_authority_token(value: &str) -> bool {
+    value.len() == OPAQUE_AUTHORITY_TOKEN_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CockpitConfigLayer {

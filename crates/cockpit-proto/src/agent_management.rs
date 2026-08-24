@@ -18,6 +18,7 @@ where
 
 pub const MAX_AGENT_NAME_BYTES: usize = 128;
 pub const MAX_AGENT_MARKDOWN_BYTES: usize = 256 * 1024;
+pub const MAX_AGENT_METADATA_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +162,18 @@ pub fn validate_agent_mutation_envelope(
     expected_completed_lease_id: Option<&str>,
     inventory_wide: bool,
 ) -> Result<(), &'static str> {
+    let token = |value: &str| crate::is_opaque_authority_token(value);
+    if result
+        .consumed_revision
+        .as_deref()
+        .is_some_and(|value| !token(value))
+        || result
+            .inventory_revision
+            .as_deref()
+            .is_some_and(|value| !token(value))
+    {
+        return Err("agent mutation contains a malformed authority token");
+    }
     if result.consumed_revision.as_deref() != expected_consumed_revision {
         return Err("agent mutation consumed the wrong revision");
     }
@@ -227,44 +240,6 @@ fn digest_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-pub fn agent_inventory_revision(entries: &[AgentInventoryEntry]) -> String {
-    let mut ordered = entries.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-inventory-revision-v1\0");
-    for entry in ordered {
-        for value in [
-            entry.name.as_str(),
-            entry.source_identity.as_str(),
-            entry.revision.as_str(),
-        ] {
-            digest_field(&mut digest, value.as_bytes());
-        }
-        digest.update([
-            entry.kind as u8,
-            u8::from(entry.overridden),
-            u8::from(entry.editable),
-        ]);
-    }
-    format!("{:x}", digest.finalize())
-}
-
-pub fn agent_definition_revision(
-    name: &str,
-    source_layer: AgentSourceLayer,
-    source_identity: &str,
-    source_content_hash: &str,
-    target_exists: bool,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-definition-revision-v1\0");
-    digest.update([source_layer as u8, u8::from(target_exists)]);
-    for value in [name, source_identity, source_content_hash] {
-        digest_field(&mut digest, value.as_bytes());
-    }
-    format!("{:x}", digest.finalize())
-}
-
 pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), &'static str> {
     fn lower_hex_digest(value: &str) -> bool {
         value.len() == 64
@@ -279,6 +254,10 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
         || !lower_hex_digest(&snapshot.source_identity)
         || !lower_hex_digest(&snapshot.revision)
         || !lower_hex_digest(&snapshot.projection_digest)
+        || snapshot
+            .goal_supervision_json
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_AGENT_METADATA_BYTES)
     {
         return Err("agent snapshot identity is missing");
     }
@@ -288,9 +267,7 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
     if snapshot
         .goal_supervision_json
         .as_ref()
-        .is_some_and(|value| {
-            value.len() > 64 * 1024 || serde_json::from_str::<serde_json::Value>(value).is_err()
-        })
+        .is_some_and(|value| serde_json::from_str::<serde_json::Value>(value).is_err())
     {
         return Err("agent goal supervision projection is invalid");
     }

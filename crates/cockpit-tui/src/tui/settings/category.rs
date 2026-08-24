@@ -2355,7 +2355,7 @@ impl SettingsCx {
             .to_string();
         let id = pending.id;
         match self.commit_category_text(id, &text) {
-            Ok(super::SettingsSaveOutcome::Saved) => {
+            Ok(()) => {
                 p.editing = None;
                 p.text_editor = None;
                 p.path_editor = None;
@@ -2364,9 +2364,6 @@ impl SettingsCx {
                 if let Some(detail) = detail {
                     p.status = Some(format!("saved; {detail}"));
                 }
-            }
-            Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
-                p.status = Some(format!("committed; refresh needed: {warning}"));
             }
             Err(reason) => {
                 self.restore_category_external_edit(p, id, text, pending.source, reason);
@@ -3513,7 +3510,12 @@ fn remove_project_shadow_path(
     for parent in parents.iter().rev() {
         patch = serde_json::json!({ (parent): patch });
     }
-    let _committed = super::apply_typed_settings_document_edit(project_config, None, patch)?;
+    match super::apply_typed_settings_document_edit(project_config, None, patch)? {
+        super::SettingsPatchOutcome::Reconciled { .. } => {}
+        super::SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
+            return Err(format!("committed; refresh needed: {warning}"));
+        }
+    }
     Ok(true)
 }
 

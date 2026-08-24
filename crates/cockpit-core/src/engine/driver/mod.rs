@@ -3012,7 +3012,7 @@ impl Driver {
         input_rx: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<ParkedReplayOutcome> {
         let mut next_prompt = {
             let frame = self.stack.last_mut().context("driver stack is empty")?;
             frame
@@ -3115,7 +3115,7 @@ impl Driver {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
                         code: "parked_interrupt".to_string(),
                     });
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::ParkedAgain);
                 }
                 Err(e) if crate::engine::model::is_cancelled(&e) => {
                     self.pending_idle_reason = Some(crate::engine::IdleReason::Interrupted);
@@ -3125,7 +3125,7 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::is_gated(&e) => {
                     self.unwind_stack_to_root_and_discard_pending_input(
@@ -3134,7 +3134,7 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) if crate::engine::model::as_inference_failure(&e).is_some() => {
                     let f = crate::engine::model::as_inference_failure(&e)
@@ -3161,7 +3161,7 @@ impl Driver {
                         tx,
                     )
                     .await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 Err(e) => return Err(e),
             };
@@ -3191,7 +3191,7 @@ impl Driver {
                             .await?
                         {
                             self.acknowledge_interrupted_turns_after_progress().await;
-                            return Ok(());
+                            return Ok(ParkedReplayOutcome::Completed);
                         }
                         if primary_rounds_in_chunk >= max_primary_rounds {
                             primary_rounds_in_chunk = 0;
@@ -3215,7 +3215,7 @@ impl Driver {
                                 tx,
                             )
                             .await;
-                            return Ok(());
+                            return Ok(ParkedReplayOutcome::Completed);
                         }
                         if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                             reason,
@@ -3258,12 +3258,12 @@ impl Driver {
                                 tx,
                             )
                             .await;
-                            return Ok(());
+                            return Ok(ParkedReplayOutcome::Completed);
                         }
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 TurnOutcome::Return { fields } => {
                     if self.stack.len() > 1 {
@@ -3275,7 +3275,7 @@ impl Driver {
                                 tx,
                             )
                             .await;
-                            return Ok(());
+                            return Ok(ParkedReplayOutcome::Completed);
                         }
                         if let crate::engine::agent::hooks::StopHookOutcome::Continue {
                             reason,
@@ -3293,7 +3293,7 @@ impl Driver {
                     }
                     self.acknowledge_interrupted_turns_after_progress().await;
                     self.maybe_spawn_self_improvement_review(tx).await;
-                    return Ok(());
+                    return Ok(ParkedReplayOutcome::Completed);
                 }
                 _ => bail!("parked interrupt replay continuation produced unsupported outcome"),
             }
@@ -3711,15 +3711,11 @@ impl Driver {
                     ),
                 ))
                 .await;
-                let resumed_result = match replay_result {
+                let result = match replay_result {
                     Ok(()) => {
                         self.continue_after_parked_interrupt_replay(input_queue, tx, cancel)
                             .await
                     }
-                    Err(error) => Err(error),
-                };
-                let result = match resumed_result {
-                    Ok(()) => Ok(ParkedReplayOutcome::Completed),
                     Err(error) if crate::engine::interrupt::is_parked(&error) => {
                         Ok(ParkedReplayOutcome::ParkedAgain)
                     }
@@ -3729,8 +3725,8 @@ impl Driver {
                         self.parked_root_stop_gate = None;
                         Err(error)
                     }
-                }
-                .map_err(|error| format!("{error:#}"));
+                };
+                let result = result.map_err(|error| format!("{error:#}"));
                 let _ = respond_to.send(result);
             }
             DriverControl::SwapPrimary { name } => {

@@ -169,26 +169,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         cancel,
     } = run;
 
-    // Announce the child START to the driver as this task's FIRST action, on the
-    // same channel and by the same task that sends its terminal `Completed`
-    // below — so the driver drains the start before the paired completion (FIFO
-    // by program order) even under channel backpressure. The driver fires
-    // `subagentStart` and records the child so the paired `subagentStop` fires
-    // on completion. GENUINE swarm children (`bee` / `scout`) only: goal-
-    // supervision control workers (Planner/Evaluator/Gatekeeper/ColdSkeptic)
-    // share this runner but are never user-facing subagents (guidance L22), so
-    // the `is_goal_control` check is the single closed exclusion predicate and
-    // they emit neither lifecycle event.
     let lifecycle_event_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if !spec.worker.is_goal_control() {
-        let _ = event_tx
-            .send(ScheduleEvent::SwarmChildStarted {
-                job_id: job_id.clone(),
-                subagent_type: spec.worker.agent_name().to_string(),
-                lifecycle_event_emitted: lifecycle_event_emitted.clone(),
-            })
-            .await;
-    }
 
     // AC7: capability + execution-wide permit + containment are acquired here,
     // immediately BEFORE the child's first turn — i.e. before any native spawn
@@ -225,6 +206,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         &spec,
         &ctx,
         &turn_tx,
+        &event_tx,
         &cmd_tx,
         cancel.clone(),
         lifecycle_event_emitted.clone(),
@@ -306,6 +288,7 @@ async fn run_swarm_loop(
     spec: &SpawnSpec,
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
+    event_tx: &mpsc::Sender<ScheduleEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
     cancel: tokio_util::sync::CancellationToken,
     lifecycle_event_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -315,6 +298,21 @@ async fn run_swarm_loop(
         custody,
         pinned,
     } = build_swarm_child(spec, ctx)?;
+
+    // Construction and write-authority preflight have both succeeded, so this
+    // is the first point at which a child lifecycle truly exists.  Publishing
+    // earlier would pair start/stop around a refusal that never ran a child.
+    // This task also publishes Completed, preserving FIFO start-before-terminal
+    // order on the same authority channel.
+    if !spec.worker.is_goal_control() {
+        let _ = event_tx
+            .send(ScheduleEvent::SwarmChildStarted {
+                job_id: job_id.to_string(),
+                subagent_type: spec.worker.agent_name().to_string(),
+                lifecycle_event_emitted: lifecycle_event_emitted.clone(),
+            })
+            .await;
+    }
     let agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
     let brief = swarm_child_brief(spec, &custody);
@@ -355,7 +353,10 @@ async fn run_swarm_loop(
     // Detached children own their continuation budget for their complete job
     // lifetime. Nested jobs receive their own `run_swarm_loop` invocation and
     // cannot consume or reopen this latch.
-    let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
+    let mut stop_gate = crate::engine::agent::hooks::StopGateState {
+        lifecycle_event_latch: Some(lifecycle_event_emitted.clone()),
+        ..Default::default()
+    };
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome_result = crate::engine::agent::turn_with_backup(
@@ -1191,6 +1192,7 @@ mod tests {
         assert!(composed.contains(SECRET), "the composed brief carries it");
 
         let (turn_tx, mut turn_rx) = mpsc::channel(256);
+        let (event_tx, _event_rx) = mpsc::channel(8);
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         tokio::spawn(async move { while turn_rx.recv().await.is_some() {} });
 
@@ -1201,6 +1203,7 @@ mod tests {
                 &spec,
                 &ctx,
                 &turn_tx,
+                &event_tx,
                 &cmd_tx,
                 tokio_util::sync::CancellationToken::new(),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

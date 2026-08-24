@@ -867,20 +867,55 @@ impl CommandRunner for TokioCommandRunner {
             .clone()
             .unwrap_or_else(tokio_util::sync::CancellationToken::new);
         let cancellation_enabled = self.cancellation.is_some();
-        let allocation_result = tokio::select! {
+        // Allocation is part of the hook deadline.  Once the request has been
+        // accepted by the containment actor, however, cancellation cannot
+        // simply drop the reply: the actor may already have spawned.  Keep
+        // ownership of the reply until it proves either that no lease was
+        // published or that the published generation has been terminated and
+        // observed empty.
+        let mut allocation = Box::pin(allocation);
+        let allocation_deadline = tokio::time::sleep(timeout);
+        tokio::pin!(allocation_deadline);
+        enum AllocationBoundary {
+            Ready(Result<(crate::process_containment::ContainmentLease, crate::process_containment::NativeChildIo), crate::process_containment::ContainmentError>),
+            Cancelled,
+            TimedOut,
+        }
+        let allocation_boundary = tokio::select! {
             biased;
             _ = cancellation.cancelled(), if cancellation_enabled => {
+                AllocationBoundary::Cancelled
+            }
+            _ = &mut allocation_deadline => AllocationBoundary::TimedOut,
+            result = &mut allocation => AllocationBoundary::Ready(result),
+        };
+        let allocation_result = match allocation_boundary {
+            AllocationBoundary::Ready(result) => result,
+            boundary @ (AllocationBoundary::Cancelled | AllocationBoundary::TimedOut) => {
+                let (timed_out, failure_reason) = match boundary {
+                    AllocationBoundary::Cancelled => (false, Some(REASON_HOOK_CANCELLED)),
+                    AllocationBoundary::TimedOut => (true, None),
+                    AllocationBoundary::Ready(_) => unreachable!("matched terminal allocation boundary"),
+                };
+                if let Ok((lease, _io)) = allocation.await {
+                    let mut guard = HookContainmentDropGuard {
+                        handle: containment.clone(),
+                        lease: Some(lease.clone()),
+                    };
+                    if terminate_and_prove_empty(containment, &lease).await.is_ok() {
+                        guard.disarm();
+                    }
+                }
                 return HookRawOutput {
                     stdout: String::new(),
                     exit_code: None,
                     duration_ms: start.elapsed().as_millis() as u64,
                     spawn_failed: false,
-                    timeout: false,
-                    failure_reason: Some(REASON_HOOK_CANCELLED),
+                    timeout: timed_out,
+                    failure_reason,
                     output_truncated: false,
                 };
             }
-            result = allocation => result,
         };
         let (lease, mut io) = match allocation_result {
             Ok(created) => created,
@@ -1005,7 +1040,7 @@ impl CommandRunner for TokioCommandRunner {
                 biased;
                 _ = cancellation.cancelled(), if cancellation_enabled => (false, None, false, false, false, None, false, false, true),
                 Some(()) = overflow_rx.recv() => (false, None, false, false, false, None, false, true, false),
-                completed = tokio::time::timeout(timeout, operation) => match completed {
+                completed = tokio::time::timeout(timeout.saturating_sub(start.elapsed()), operation) => match completed {
                 Ok((stdin_result, (stdout_result, stdout_pipe_failed), (stderr_truncated, stderr_pipe_failed), wait_result)) => (
                     stdin_result.is_err(),
                     stdout_result,
@@ -1553,6 +1588,11 @@ pub struct StopGateState {
     /// Child teardown uses this to avoid emitting a second observe-only
     /// `subagentStop` when cancellation races an in-flight consultation.
     pub lifecycle_event_emitted: bool,
+    /// Shared child-lifecycle latch owned by the scheduler/driver.  Publishing
+    /// through this pointer at handler entry closes the race where teardown
+    /// could otherwise emit an observe-only duplicate while a stop handler was
+    /// still awaiting its process result.
+    pub lifecycle_event_latch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl StopGateState {
@@ -1741,6 +1781,9 @@ pub(crate) async fn run_stop_hooks_cancellable(
         // even when executable resolution or process launch subsequently
         // fails (those failures are durably recorded below).
         state.lifecycle_event_emitted = true;
+        if let Some(latch) = &state.lifecycle_event_latch {
+            latch.store(true, std::sync::atomic::Ordering::Release);
+        }
         let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {

@@ -2622,6 +2622,50 @@ impl Driver {
         });
     }
 
+    /// Cooperatively settle every live background child before the driver is
+    /// torn down.  Dropping/aborting the join handles would race child-owned
+    /// stop gates and strand completion reconciliation in the foreground
+    /// registry.  Cancellation is broadcast first, then every task is joined,
+    /// and finally every terminal message is reconciled while this driver still
+    /// owns the registry and hook dispatcher.
+    pub(crate) async fn settle_noninteractive_jobs_for_teardown(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let jobs = std::mem::take(&mut self.noninteractive_jobs);
+        let task_ids: Vec<String> = jobs.keys().cloned().collect();
+        for job in jobs.values() {
+            job.cancel.cancel();
+        }
+        for (task_call_id, job) in jobs {
+            if let Err(error) = job.handle.await {
+                tracing::warn!(%error, %task_call_id, "background child failed while joining teardown");
+            }
+        }
+
+        let mut completions: Vec<BackgroundNoninteractiveCompletion> =
+            self.pending_noninteractive_completions.drain(..).collect();
+        while let Ok(completion) = self.noninteractive_complete_rx.try_recv() {
+            completions.push(completion);
+        }
+        // The job map was deliberately taken so Drop cannot abort a joined
+        // child. Pair every child whose controlling gate did not publish its
+        // shared latch before consuming completion payloads; finalization sees
+        // NoJob and therefore cannot emit a duplicate.
+        for task_call_id in &task_ids {
+            self.fire_noninteractive_subagent_stops(task_call_id, "aborted")
+                .await;
+        }
+        for completion in completions {
+            if let Err(error) = self
+                .finalize_background_noninteractive_completion(Some(completion), tx)
+                .await
+            {
+                tracing::warn!(%error, "background child completion reconciliation failed during teardown");
+            }
+        }
+    }
+
     pub(in crate::engine::driver) async fn release_noninteractive_child_locks(
         &self,
         rows: &[crate::db::task_delegations::DelegationChildDetail],
@@ -5310,7 +5354,12 @@ pub(crate) async fn run_noninteractive_resumable(
     // process. Rehydrated follow-ups are new originating task calls and
     // therefore receive a fresh budget; every continuation of this run shares
     // the same state.
-    let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
+    let mut stop_gate = crate::engine::agent::hooks::StopGateState {
+        lifecycle_event_latch: child_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.lifecycle_event_emitted.clone()),
+        ..Default::default()
+    };
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). Agents
     // that hold `defer_to_orchestrator` get their deferred items folded into
     // the leaf report they return up; agents without it keep this buffer empty.

@@ -89,7 +89,7 @@ pub enum ScheduleEvent {
     LoopIterationDue { job_id: String, prompt: String },
     /// A genuine recursive-`Swarm` child subagent (`bee` / `scout`) has just
     /// STARTED its background task. Emitted by the runner ([`super::swarm::run_swarm`])
-    /// as its FIRST action — on the SAME authority→driver channel and by the
+    /// after all before-first-turn refusal gates — on the SAME authority→driver channel and by the
     /// SAME task that later sends this child's terminal [`ScheduleEvent::Completed`],
     /// both via `event_tx.send().await`. Because one task's sequential awaited
     /// sends enqueue in program order, the driver always drains this start
@@ -1292,7 +1292,7 @@ mod tests {
     /// L22 exclusion at its single emission site ([`super::swarm::run_swarm`]):
     /// a genuine swarm child (`bee` / `scout`) emits a
     /// [`ScheduleEvent::SwarmChildStarted`] carrying its agent type as the
-    /// runner's FIRST event, while every goal-supervision control worker
+    /// runner's first lifecycle event, while every goal-supervision control worker
     /// (Planner/Evaluator/Gatekeeper/ColdSkeptic) emits NONE — so the driver
     /// fires `subagentStart`/`subagentStop` for real subagents only and never
     /// for a supervision worker. This test FAILS if the `is_goal_control`

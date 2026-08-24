@@ -1975,6 +1975,12 @@ pub(super) async fn run_worker(
                 &engine_event_tx,
             ));
             let outcome = driver_loop.await;
+            // Background children own controlling stop gates and durable
+            // delegation state.  Cancel, join, and reconcile them before any
+            // driver-owned lifecycle maps are drained or the driver is dropped.
+            driver
+                .settle_noninteractive_jobs_for_teardown(&engine_event_tx)
+                .await;
             // Pairing teardown: a driver-loop exit that still holds interactive
             // child frames (only reachable via a fatal `Err` — every clean /
             // cancel / gate / interrupt / inference-failure path already

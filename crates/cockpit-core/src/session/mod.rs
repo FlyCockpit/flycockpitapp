@@ -195,6 +195,12 @@ pub struct Session {
     /// (a sync, execution-free lookup). Absent in isolated unit sessions, where
     /// command-backed secrets simply resolve as missing.
     command_secret_cache: Mutex<Option<Arc<crate::secret_command::CommandSecretCache>>>,
+    /// Daemon-owned descendant process-containment handle. Late-installed by the
+    /// registry / daemon before the worker starts (like [`Self::external_journal`]),
+    /// so every lifecycle hook this session spawns runs its child under a proven
+    /// containment lease. Absent in isolated unit sessions and non-daemon paths,
+    /// where hook spawns fail open as `descendant_containment_unsupported`.
+    process_containment: Mutex<Option<crate::process_containment::ProcessContainmentHandle>>,
     /// Required key resolver for protected redaction-history journaling.
     /// Installed at construction by the registry / daemon (production) or the
     /// shared test helper (tests) — never `Option`, never lazily set (decision
@@ -468,6 +474,26 @@ impl Session {
         &self,
     ) -> Option<Arc<crate::secret_command::CommandSecretCache>> {
         self.command_secret_cache.lock().unwrap().clone()
+    }
+
+    /// Install (or inherit) the daemon's descendant process-containment handle.
+    /// Late-installed like [`Self::set_external_journal`] before the worker /
+    /// fork / scheduled session spawns any lifecycle hook. Takes an `Option` so
+    /// a derived session copies a parent's handle verbatim
+    /// (`child.set_process_containment(parent.process_containment())`).
+    pub(crate) fn set_process_containment(
+        &self,
+        handle: Option<crate::process_containment::ProcessContainmentHandle>,
+    ) {
+        *self.process_containment.lock().unwrap() = handle;
+    }
+
+    /// The daemon containment handle for this session's hook spawns, if
+    /// installed. `None` in isolated / non-daemon sessions.
+    pub(crate) fn process_containment(
+        &self,
+    ) -> Option<crate::process_containment::ProcessContainmentHandle> {
+        self.process_containment.lock().unwrap().clone()
     }
 
     /// The session's protected redaction-history key resolver. Required and

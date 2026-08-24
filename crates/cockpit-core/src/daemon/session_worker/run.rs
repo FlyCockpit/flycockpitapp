@@ -1853,7 +1853,9 @@ pub(super) async fn run_worker(
             .hooks()
             .clone();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                session.process_containment(),
+            ),
             &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
             crate::config::extended::hooks::HookEvent::SessionStart,
@@ -4293,7 +4295,9 @@ pub(super) async fn run_worker(
             .hooks()
             .clone();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &crate::engine::agent::hooks::TokioCommandRunner::with_optional_containment(
+                session.process_containment(),
+            ),
             &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
             crate::config::extended::hooks::HookEvent::SessionEnd,

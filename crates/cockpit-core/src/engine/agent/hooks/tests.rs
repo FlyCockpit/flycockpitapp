@@ -112,6 +112,7 @@ impl CommandRunner for FakeCommandRunner {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        _session_id: Uuid,
     ) -> HookRawOutput {
         self.invocations.lock().unwrap().push(CapturedInvocation {
             executable: executable.to_path_buf(),
@@ -159,6 +160,7 @@ fn successful_output(stdout: &str) -> HookRawOutput {
         duration_ms: 10,
         spawn_failed: false,
         timeout: false,
+        failure_reason: None,
     }
 }
 
@@ -169,6 +171,7 @@ fn failed_output() -> HookRawOutput {
         duration_ms: 10,
         spawn_failed: false,
         timeout: false,
+        failure_reason: None,
     }
 }
 
@@ -179,6 +182,7 @@ fn timeout_output() -> HookRawOutput {
         duration_ms: 1000,
         spawn_failed: false,
         timeout: true,
+        failure_reason: None,
     }
 }
 
@@ -189,6 +193,23 @@ fn spawn_failed_output() -> HookRawOutput {
         duration_ms: 0,
         spawn_failed: true,
         timeout: false,
+        failure_reason: None,
+    }
+}
+
+/// A raw output carrying a closed containment failure reason, as the production
+/// containment path produces it. Used to prove the pre-tool fail-open matrix
+/// includes `descendant_containment_unsupported` at the decision boundary.
+fn containment_unsupported_output() -> HookRawOutput {
+    HookRawOutput {
+        stdout: String::new(),
+        exit_code: None,
+        duration_ms: 0,
+        spawn_failed: false,
+        timeout: false,
+        failure_reason: Some(
+            crate::engine::agent::hooks::REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+        ),
     }
 }
 
@@ -1597,6 +1618,7 @@ async fn fake_command_runner_captures_invocation() {
             Path::new("/workspace"),
             "stdin data",
             Duration::from_secs(5),
+            uuid::Uuid::new_v4(),
         )
         .await;
     assert_eq!(result.exit_code, Some(0));
@@ -1766,6 +1788,13 @@ async fn pre_tool_hook_failures_are_fail_open() {
             "oversized malformed stdout",
             successful_output(&big_malformed),
         ),
+        // The process-containment path (increment 2C): an unsupported-before-
+        // spawn outcome is fail-open with a bounded failed row, exactly like the
+        // other runner failure modes.
+        (
+            "descendant containment unsupported",
+            containment_unsupported_output(),
+        ),
     ];
     for (label, output) in failure_cases {
         let (outcome, statuses) = run_case(&resolves, output).await;
@@ -1774,6 +1803,47 @@ async fn pre_tool_hook_failures_are_fail_open() {
             statuses,
             vec!["failed".to_string()],
             "{label} must record one failed row"
+        );
+    }
+
+    // The containment-unsupported reason must reach the durable ledger VERBATIM
+    // (not collapsed to a generic "spawn failed"), so a later audit can tell a
+    // containment fail-open apart from an ordinary spawn failure.
+    {
+        let (db, sid) = db_session().await;
+        let reg = registry(vec![test_hook(
+            HookEvent::PreToolUse,
+            vec!["h".to_string()],
+            Some(vec!["bash".to_string()]),
+            BTreeMap::new(),
+            5,
+        )]);
+        let runner = FakeCommandRunner::new(containment_unsupported_output());
+        let outcome = run_pre_tool_hooks(
+            &runner,
+            &resolves,
+            &reg,
+            "bash",
+            &json!({}),
+            "call-1",
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        assert_eq!(outcome, PreHookOutcome::Allow);
+        let events: Vec<_> = db
+            .list_session_events(sid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "hook_run")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data["reason"].as_str(),
+            Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+            "containment-unsupported fail-open must record the exact reason constant"
         );
     }
 
@@ -2950,4 +3020,287 @@ fn hooks_documentation_matches_typed_contract() {
     assert!(!block.trim().is_empty(), "hooks-contract block is empty");
     let contract = HookDocumentationContract::from_typed_constants();
     assert_contract_block_matches(&block, &contract);
+}
+
+// ---------------------------------------------------------------------------
+// Process-containment runner orchestration (increment 2C, AC7)
+//
+// These drive the REAL `run_hook_child_contained` orchestration against a REAL
+// `ProcessContainmentActor` (backed by a fake adapter), with an injected fake
+// hook child so no external executable is spawned. They prove: a proven lease
+// is created and the child runs under it; timeout/cancel settle ONLY on
+// `EmptyOutcome::ProvenEmpty`; the three single-sourced fail-open reasons are
+// emitted verbatim; the body never runs when containment is unsupported; and a
+// dropped run future still terminates the lease.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+use crate::process_containment::{
+    FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter, PlatformKind, ProcessContainmentActor,
+};
+
+/// Drive `run_hook_child_contained` with a real containment actor backed by
+/// `adapter` and a fake hook child that returns `outcome`. Returns the produced
+/// `HookRawOutput` and whether the (fake) hook body actually ran.
+async fn drive_contained_hook(
+    adapter: crate::process_containment::SharedAdapter,
+    outcome: super::ChildRunOutcome,
+) -> (HookRawOutput, bool) {
+    let (db, sid) = db_session().await;
+    let actor = ProcessContainmentActor::start(db.clone(), adapter);
+    let handle = actor.handle();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_child = ran.clone();
+    let result = super::run_hook_child_contained(
+        &handle,
+        sid,
+        PathBuf::from("/fake/bin/hook"),
+        vec!["--literal".to_string(), "arg with spaces".to_string()],
+        PathBuf::from("/tmp/hooks-test"),
+        std::time::Instant::now(),
+        move |_lease| async move {
+            ran_child.store(true, AtomicOrdering::SeqCst);
+            outcome
+        },
+    )
+    .await;
+    (result, ran.load(AtomicOrdering::SeqCst))
+}
+
+fn child_timed_out() -> super::ChildRunOutcome {
+    super::ChildRunOutcome {
+        stdout: String::new(),
+        exit_code: None,
+        spawn_failed: false,
+        timed_out: true,
+    }
+}
+
+fn child_completed(stdout: &str) -> super::ChildRunOutcome {
+    super::ChildRunOutcome {
+        stdout: stdout.to_string(),
+        exit_code: Some(0),
+        spawn_failed: false,
+        timed_out: false,
+    }
+}
+
+#[tokio::test]
+async fn tool_hook_runner_argv_timeout_and_proven_empty() {
+    // A timed-out hook child under a PROVEN lease settles as a timeout ONLY
+    // after the same-generation empty oracle proves the group empty.
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    let (result, ran) = drive_contained_hook(Arc::new(fake.clone()), child_timed_out()).await;
+    assert!(ran, "a proven lease must actually run the hook child");
+    assert!(
+        result.timeout,
+        "a timed-out child settles as a timeout on ProvenEmpty"
+    );
+    assert_eq!(
+        result.failure_reason, None,
+        "proven-empty settlement carries no containment failure reason"
+    );
+    assert!(
+        !fake.spawn_log().is_empty(),
+        "a real containment lease was created for the child"
+    );
+    assert!(
+        !fake.terminate_log().is_empty(),
+        "the lease was terminated before the timeout settled"
+    );
+
+    // Distinguishing case: the SAME timed-out child under an adapter whose empty
+    // oracle returns Uncertain must NOT settle as a timeout — it fails open as
+    // `descendant_containment_uncertain`. This proves settlement is gated on
+    // ProvenEmpty, not merely on the child future finishing.
+    let uncertain = FakeProvenAdapter::new(PlatformKind::Fake);
+    uncertain.set_empty_mode(FakeEmptyMode::Uncertain);
+    let (result, ran) = drive_contained_hook(Arc::new(uncertain), child_timed_out()).await;
+    assert!(ran);
+    assert!(
+        !result.timeout,
+        "an unproven-empty outcome must not report a settled timeout"
+    );
+    assert_eq!(
+        result.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_UNCERTAIN)
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_runner_unsupported_before_spawn_skips_body() {
+    // Unsupported-before-spawn (DescendantContainmentUnavailable): fail open as
+    // `descendant_containment_unsupported` and NEVER run the hook body.
+    let (result, ran) = drive_contained_hook(
+        Arc::new(FakeUnsupportedAdapter::management_boundary()),
+        child_completed(r#"{"decision":"deny","reason":"should never run"}"#),
+    )
+    .await;
+    assert!(
+        !ran,
+        "the hook body must NOT run when containment is unsupported before spawn"
+    );
+    assert_eq!(
+        result.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED)
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_runner_uncertain_after_spawn_fails_open() {
+    // Uncertain after spawn: the child ran, but the group could not be proven
+    // empty. Fail open as `descendant_containment_uncertain`; the child's own
+    // decision must NOT settle, and the lease is still terminated.
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_empty_mode(FakeEmptyMode::Uncertain);
+    let (result, ran) = drive_contained_hook(
+        Arc::new(fake.clone()),
+        child_completed(r#"{"decision":"allow"}"#),
+    )
+    .await;
+    assert!(
+        ran,
+        "the child ran (distinguishes uncertain-after-spawn from unsupported-before-spawn)"
+    );
+    assert_eq!(
+        result.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_UNCERTAIN),
+        "a non-proven-empty outcome fails open as uncertain instead of honoring the hook decision"
+    );
+    assert!(
+        !fake.terminate_log().is_empty(),
+        "the lease was terminated even though empty could not be proven"
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_runner_actor_terminate_error_is_failed() {
+    // A terminate/await actor error fails open as `descendant_containment_failed`.
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    fake.set_kill_fail_once(true);
+    let (result, ran) = drive_contained_hook(Arc::new(fake.clone()), child_completed("{}")).await;
+    assert!(ran);
+    assert_eq!(
+        result.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_FAILED),
+        "a terminate actor error fails open as descendant_containment_failed"
+    );
+}
+
+#[test]
+fn descendant_containment_reason_constants_are_stable() {
+    // Independent literals (NOT the constants) — the exact `hook_run.reason`
+    // strings are a durable-ledger + docs contract; a changed VALUE must fail.
+    assert_eq!(
+        REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+        "descendant_containment_unsupported"
+    );
+    assert_eq!(
+        REASON_DESCENDANT_CONTAINMENT_UNCERTAIN,
+        "descendant_containment_uncertain"
+    );
+    assert_eq!(
+        REASON_DESCENDANT_CONTAINMENT_FAILED,
+        "descendant_containment_failed"
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_runner_without_handle_is_unsupported() {
+    // Drive the REAL production entry point `CommandRunner::run` on a runner with
+    // no containment handle: it must fail open as unsupported and never raw-spawn
+    // the executable. A runner that bypassed containment would instead try to
+    // spawn `/fake/bin/hook` and report a plain spawn failure (reason None), so
+    // this fails against a non-contained runner.
+    let runner = TokioCommandRunner::new();
+    let out = runner
+        .run(
+            Path::new("/fake/bin/hook"),
+            &[],
+            &BTreeMap::new(),
+            Path::new("/tmp/hooks-test"),
+            "{}",
+            Duration::from_secs(5),
+            uuid::Uuid::new_v4(),
+        )
+        .await;
+    assert_eq!(
+        out.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no child output when containment is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_runner_dropped_future_terminates_lease() {
+    // Drop an ACTUAL pending `run_hook_child_contained` future while its hook
+    // child is running (the closure hangs). The in-run guard must still
+    // terminate the lease via its detached cleanup rather than orphaning the
+    // child's containment. This exercises the real orchestration future, so it
+    // would fail if the guard were missing or misplaced.
+    let (db, sid) = db_session().await;
+    let fake = FakeProvenAdapter::new(PlatformKind::Fake);
+    let actor = ProcessContainmentActor::start(db.clone(), Arc::new(fake.clone()));
+    let handle = actor.handle();
+    // Keep the sender alive so the child future stays pending (hangs).
+    let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+    // Set inside the child closure, which runs ONLY after the in-run guard has
+    // been armed — so observing it guarantees the guard exists before we abort.
+    let child_running = Arc::new(AtomicBool::new(false));
+    let child_running_set = child_running.clone();
+    let run_handle = handle.clone();
+    let task = tokio::spawn(async move {
+        super::run_hook_child_contained(
+            &run_handle,
+            sid,
+            PathBuf::from("/fake/bin/hook"),
+            vec![],
+            PathBuf::from("/tmp/hooks-test"),
+            std::time::Instant::now(),
+            move |_lease| async move {
+                child_running_set.store(true, AtomicOrdering::SeqCst);
+                // Hang so the run future is dropped WHILE the child is running.
+                let _ = hold_rx.await;
+                super::ChildRunOutcome {
+                    stdout: String::new(),
+                    exit_code: Some(0),
+                    spawn_failed: false,
+                    timed_out: false,
+                }
+            },
+        )
+        .await
+    });
+    // Wait until the child is running under an armed guard.
+    let mut spawned = false;
+    for _ in 0..5000 {
+        if child_running.load(AtomicOrdering::SeqCst) {
+            spawned = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        spawned,
+        "the child should be running under an armed guard before being dropped"
+    );
+    // Drop the pending run future while the child is running.
+    task.abort();
+    // Bounded, wall-clock-free wait for the guard's detached terminate to land.
+    let mut terminated = false;
+    for _ in 0..5000 {
+        if !fake.terminate_log().is_empty() {
+            terminated = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        terminated,
+        "dropping a pending contained-run future must terminate its lease via the guard"
+    );
 }

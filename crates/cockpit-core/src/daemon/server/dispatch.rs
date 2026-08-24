@@ -5017,6 +5017,30 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        Request::GetExtendedConfigSnapshot { project_root, path } => {
+            crate::daemon::fs_api::get_extended_config_snapshot(project_root, path).await
+        }
+
+        Request::ApplyExtendedConfigPatch {
+            project_root,
+            path,
+            patch_json,
+            expected_revision,
+        } => {
+            let response = crate::daemon::fs_api::apply_extended_config_patch(
+                project_root,
+                path,
+                patch_json,
+                expected_revision,
+            )
+            .await?;
+            if let Err(error) = ctx.refresh_redaction_table() {
+                ctx.poison_redaction_publication(&error);
+                return Err(internal(error));
+            }
+            Ok(response)
+        }
+
         Request::SaveExtendedConfig {
             project_root,
             path,
@@ -9745,6 +9769,9 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
+        }
+        Request::GetExtendedConfigSnapshot { project_root, path } => {
+            crate::daemon::fs_api::get_extended_config_snapshot(project_root, path).await
         }
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx

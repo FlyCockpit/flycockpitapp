@@ -2919,6 +2919,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "mutate_agent"
                 | "begin_agent_editor_lease"
                 | "complete_agent_editor_lease"
+                | "get_extended_config_snapshot"
+                | "apply_extended_config_patch"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"

@@ -258,6 +258,129 @@ pub async fn save_extended_config(
     .await
 }
 
+/// Return the safe client projection of one settings layer and an opaque
+/// revision of the authoritative raw bytes.
+pub async fn get_extended_config_snapshot(
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "get_extended_config_snapshot",
+        tokio::task::spawn_blocking(move || {
+            let root = canonical_project_root(&project_root)?;
+            let target = resolve_for_write(&root, &path)?;
+            if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
+                return Err(bad_request("extended config target must be config.json"));
+            }
+            let _guard =
+                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+            let raw = match std::fs::read(&target) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}\n".to_vec(),
+                Err(error) => return Err(internal(error)),
+            };
+            let mut config: cockpit_config::config::extended::ExtendedConfig =
+                serde_json::from_slice(&raw).map_err(bad_request_config)?;
+            config.redact.denylist = config
+                .redact
+                .denylist
+                .iter()
+                .map(|_| "[redacted]".to_string())
+                .collect();
+            config.image_generation = config.image_generation.redacted_for_snapshot();
+            let config_json = serde_json::to_string(&config).map_err(internal)?;
+            Ok(Response::ExtendedConfigSnapshot {
+                config_json,
+                revision: content_hash(&raw),
+                config_generation: crate::daemon::server::inventory::current_config_generation(),
+            })
+        }),
+    )
+    .await
+}
+
+/// Apply a client-generated JSON merge patch under the daemon's config lock.
+/// Unknown and secret-bearing keys absent from the patch remain byte-for-byte
+/// represented in the parsed document; the final typed render validates all
+/// known settings and preserves the daemon-owned image registry.
+pub async fn apply_extended_config_patch(
+    project_root: String,
+    path: String,
+    patch_json: String,
+    expected_revision: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "apply_extended_config_patch",
+        tokio::task::spawn_blocking(move || {
+            let root = canonical_project_root(&project_root)?;
+            let target = resolve_for_write(&root, &path)?;
+            if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
+                return Err(bad_request("extended config target must be config.json"));
+            }
+            let _guard =
+                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+            let raw = match std::fs::read(&target) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{}\n".to_vec(),
+                Err(error) => return Err(internal(error)),
+            };
+            let current_hash = content_hash(&raw);
+            if current_hash != expected_revision {
+                return Err(ErrorPayload {
+                    code: ErrorCode::HashMismatch,
+                    message: format!(
+                        "configuration changed before patch; current revision is {current_hash}"
+                    ),
+                });
+            }
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(bad_request_config)?;
+            let patch: serde_json::Value =
+                serde_json::from_str(&patch_json).map_err(bad_request_config)?;
+            apply_json_merge_patch(&mut document, patch);
+            let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;
+            let merged = cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
+                &patched,
+                &raw,
+            )
+            .map_err(bad_request_config)?;
+            let desired_hash = content_hash(&merged);
+            if desired_hash != current_hash {
+                let generation =
+                    crate::daemon::server::inventory::current_config_generation();
+                crate::daemon::server::inventory::compare_and_bump_config_generation(generation)
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "configuration generation changed concurrently; retry the patch"
+                            .into(),
+                    })?;
+                cockpit_config::config::write_config_bytes_atomic(&target, &merged)
+                    .map_err(internal)?;
+            }
+            Ok(Response::ExtendedConfigSaved { hash: desired_hash })
+        }),
+    )
+    .await
+}
+
+fn apply_json_merge_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let target = target.as_object_mut().expect("target normalized to object");
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(&key);
+        } else {
+            apply_json_merge_patch(target.entry(key).or_insert(serde_json::Value::Null), value);
+        }
+    }
+}
+
 fn save_extended_config_sync(
     project_root: &str,
     path: &str,

@@ -559,6 +559,12 @@ pub enum Response {
         hash: String,
     },
 
+    ExtendedConfigSnapshot {
+        config_json: String,
+        revision: String,
+        config_generation: u64,
+    },
+
     AgentInventory {
         entries: Vec<crate::AgentInventoryEntry>,
         config_generation: u64,
@@ -1171,6 +1177,7 @@ macro_rules! response_variants {
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
+            (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
             (Response::AgentInventory { .. }, "agent_inventory");
             (Response::AgentEditSnapshot(..), "agent_edit_snapshot");
             (Response::AgentMutated(..), "agent_mutated");

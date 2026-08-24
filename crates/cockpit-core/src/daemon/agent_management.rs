@@ -38,10 +38,10 @@ pub async fn inventory(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     tokio::task::spawn_blocking(move || {
-        let _guard =
+        let guard =
             cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
                 .map_err(internal)?;
-        inventory_sync(&root)
+        inventory_sync(&root, &guard)
     })
     .await
     .map_err(join_error)?
@@ -54,10 +54,10 @@ pub async fn edit_snapshot(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     tokio::task::spawn_blocking(move || {
-        let _guard =
+        let guard =
             cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
                 .map_err(internal)?;
-        recover_reset_all(&root)?;
+        recover_reset_all_locked(&root, &guard)?;
         snapshot_sync(&root, &name).map(Response::AgentEditSnapshot)
     })
     .await
@@ -88,11 +88,11 @@ pub async fn begin_editor_lease(
         let root = root.clone();
         let name = name.clone();
         move || {
-            let _guard = cockpit_config::config::hold_config_mutation_lock(
+            let guard = cockpit_config::config::hold_config_mutation_lock(
                 &root.join(".cockpit/config.json"),
             )
             .map_err(internal)?;
-            recover_reset_all(&root)?;
+            recover_reset_all_locked(&root, &guard)?;
             snapshot_sync(&root, &name)
         }
     })
@@ -230,8 +230,11 @@ async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorP
     Ok(root)
 }
 
-fn inventory_sync(root: &Path) -> Result<Response, ErrorPayload> {
-    recover_reset_all(root)?;
+fn inventory_sync(
+    root: &Path,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+) -> Result<Response, ErrorPayload> {
+    recover_reset_all_locked(root, guard)?;
     let entries = crate::agents::list_all(root)
         .into_iter()
         .map(|entry| {
@@ -331,9 +334,9 @@ fn mutate_sync(
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     let lock_target = root.join(".cockpit/config.json");
-    let _guard =
+    let guard =
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
-    recover_reset_all(root)?;
+    recover_reset_all_locked(root, &guard)?;
     let generation_before = crate::daemon::server::inventory::current_config_generation();
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
@@ -460,7 +463,7 @@ fn mutate_sync(
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            let affected = reset_all_builtins_atomic(root)?;
+            let affected = reset_all_builtins_atomic_locked(root, &guard)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
@@ -703,13 +706,6 @@ fn sync_dir(path: &Path) -> Result<(), ErrorPayload> {
 /// override. A reset is externally committed only after every rename lands
 /// and the journal is removed, so boot/request recovery never exposes a
 /// silently partial reset as success.
-fn recover_reset_all(root: &Path) -> Result<(), ErrorPayload> {
-    let guard =
-        cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
-            .map_err(internal)?;
-    recover_reset_all_locked(root, &guard)
-}
-
 fn recover_reset_all_locked(
     root: &Path,
     guard: &cockpit_config::config::HeldConfigMutationLock,
@@ -836,9 +832,9 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
     tokio::task::spawn_blocking(move || {
         for root in trusted_roots {
             let lock_target = root.join(".cockpit/config.json");
-            let _guard = cockpit_config::config::hold_config_mutation_lock(&lock_target)
+            let guard = cockpit_config::config::hold_config_mutation_lock(&lock_target)
                 .map_err(internal)?;
-            recover_reset_all(&root)?;
+            recover_reset_all_locked(&root, &guard)?;
         }
         Ok(())
     })
@@ -846,11 +842,11 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
     .map_err(join_error)?
 }
 
-fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
-    let guard =
-        cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
-            .map_err(internal)?;
-    recover_reset_all_locked(root, &guard)?;
+fn reset_all_builtins_atomic_locked(
+    root: &Path,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+) -> Result<u32, ErrorPayload> {
+    recover_reset_all_locked(root, guard)?;
     let operation_id = Uuid::new_v4();
     let trash = root
         .join(".cockpit/.agent-reset-trash")
@@ -892,10 +888,10 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     for name in &journal.entries {
         let source = project_agent_path(root, name)?;
         let staged = staged_agent_path(&trash, name)?;
-        if let Err(error) = rename_config_noreplace(&guard, &source, &staged) {
+        if let Err(error) = rename_config_noreplace(guard, &source, &staged) {
             // The durable journal makes rollback retryable if this immediate
             // recovery itself encounters an I/O failure.
-            let _ = recover_reset_all_locked(root, &guard);
+            let _ = recover_reset_all_locked(root, guard);
             return Err(error);
         }
     }
@@ -910,7 +906,7 @@ fn reset_all_builtins_atomic(root: &Path) -> Result<u32, ErrorPayload> {
     let encoded = serde_json::to_vec_pretty(&committed).map_err(internal)?;
     cockpit_config::config::write_config_bytes_atomic(&reset_journal_path(root), &encoded)
         .map_err(internal)?;
-    recover_reset_all_locked(root, &guard)?;
+    recover_reset_all_locked(root, guard)?;
     Ok(committed.entries.len() as u32)
 }
 

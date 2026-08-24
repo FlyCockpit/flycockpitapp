@@ -29916,15 +29916,7 @@ async fn dispatch_sealed_owner(
 ) -> std::result::Result<Response, ErrorPayload> {
     let shared = state.shared_snapshot();
     let mut effects = ClientRequestEffects::default();
-    handle_serialized_request_with_remote_operation(
-        request,
-        state,
-        &shared,
-        ctx,
-        &mut effects,
-        None,
-    )
-    .await
+    handle_serialized_request(request, state, &shared, ctx, &mut effects).await
 }
 
 /// Create a project-scoped sealed value end-to-end and return its record id.

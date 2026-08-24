@@ -506,7 +506,7 @@ mod helpers;
 mod lifecycle;
 mod run;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use self::helpers::queue_target_to_proto;
 

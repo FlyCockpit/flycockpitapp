@@ -1656,6 +1656,10 @@ pub enum SessionWork {
     },
     RepublishQueue,
     Cancel,
+    /// Explicitly cancel all accepted work and terminally close the session.
+    /// Unlike `Cancel` (which only aborts the current turn), this carries the
+    /// typed teardown cause through the worker's single `sessionEnd` boundary.
+    CancelAndStop,
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,

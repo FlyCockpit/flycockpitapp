@@ -20,6 +20,7 @@ fn main() -> std::io::Result<()> {
     let mut socket = None;
     let mut capability_fd = None;
     let mut doctor = false;
+    let mut prepare_cgroup_root = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -28,10 +29,14 @@ fn main() -> std::io::Result<()> {
             Some("--socket") => socket = args.next().map(PathBuf::from),
             Some("--capability-fd") => capability_fd = Some(parse_id(args.next(), "--capability-fd")? as i32),
             Some("--doctor") => doctor = true,
+            Some("--prepare-cgroup-root") => prepare_cgroup_root = true,
             _ => return Err(invalid("unknown or non-UTF-8 argument")),
         }
     }
     let uid = uid.ok_or_else(|| invalid("--allowed-uid is required"))?;
+    if doctor && prepare_cgroup_root {
+        return Err(invalid("--doctor and --prepare-cgroup-root are mutually exclusive"));
+    }
     if doctor {
         let config = cockpit_core::process_containment::LinuxBrokerConfig {
             socket_path: socket.ok_or_else(|| invalid("--socket is required for --doctor"))?,
@@ -45,6 +50,12 @@ fn main() -> std::io::Result<()> {
         None => primary_gid(uid)?,
     };
     let mut config = cockpit_core::process_containment::LinuxBrokerServerConfig::production(uid, gid);
+    if prepare_cgroup_root {
+        if socket.is_some() || capability_fd.is_some() {
+            return Err(invalid("cgroup preparation accepts only --allowed-uid and --allowed-gid"));
+        }
+        return cockpit_core::process_containment::prepare_linux_containment_broker_cgroup_root(&config);
+    }
     if let Some(path) = socket {
         config.socket_path = path;
     }

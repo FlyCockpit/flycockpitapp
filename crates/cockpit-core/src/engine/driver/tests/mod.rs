@@ -1,13 +1,13 @@
 use super::*;
 use cockpit_test_support::provider::{ScriptedProvider, Turn, Usage, WireDialect};
 
-mod context;
+pub(crate) mod context;
 mod delegation;
 mod goals;
 mod inbound;
 mod learn;
 mod llm_mode;
-mod misc;
+pub(crate) mod misc;
 mod model_switch;
 mod noninteractive;
 mod primary_swap;
@@ -15,7 +15,7 @@ mod recursion;
 mod reports;
 mod schedule;
 mod skills_preflight;
-mod turn_loop;
+pub(crate) mod turn_loop;
 
 fn test_provider_base_url() -> String {
     static PROVIDER: std::sync::OnceLock<&'static ScriptedProvider> = std::sync::OnceLock::new();
@@ -736,7 +736,8 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         history: vec![],
         answering: Some(PendingTaskCall {
             call_id: call_id.to_string(),
-            lifecycle_id: crate::db::task_delegations::delegation_child_lifecycle_id(
+            lifecycle_id: crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                uuid::Uuid::nil(),
                 call_id,
                 "default",
             ),

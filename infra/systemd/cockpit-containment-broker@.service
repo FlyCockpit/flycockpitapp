@@ -10,6 +10,7 @@ Type=simple
 User=root
 Group=root
 OpenFile=/etc/flycockpit/containment-capability-%i:flycockpit-containment-capability:read-only
+ExecStartPre=+/usr/libexec/flycockpit/cockpit-containment-broker --prepare-cgroup-root --allowed-uid %i
 ExecStart=/usr/libexec/flycockpit/cockpit-containment-broker --allowed-uid %i --socket /run/flycockpit/containment-broker-%i.sock
 RuntimeDirectory=flycockpit
 RuntimeDirectoryMode=0755

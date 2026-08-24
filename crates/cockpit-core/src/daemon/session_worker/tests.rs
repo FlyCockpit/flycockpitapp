@@ -4802,6 +4802,68 @@ async fn queue_item_carries_display_text() {
 // `sessionEnd` hook matcher: closed deterministic WorkerStop -> matcher map.
 // ---------------------------------------------------------------------------
 
+pub(crate) async fn production_worker_lifecycle_hook_probe(
+) -> [crate::config::extended::hooks::HookEvent; 2] {
+    use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+
+    async fn run(event: HookEvent, actual: &str, configured: &str) -> usize {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create_for_test(
+            db,
+            root.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let registry = HookRegistry {
+            hooks: vec![ResolvedHook {
+                event,
+                matcher: Some([configured.to_string()].into_iter().collect()),
+                command: vec!["cockpit-worker-hook-does-not-exist".to_string()],
+                timeout_secs: 5,
+                env: std::collections::BTreeMap::new(),
+                origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+                source_config_path: root.path().join("config.json"),
+                source_directory: root.path().to_path_buf(),
+            }],
+            warnings: Vec::new(),
+        };
+        super::run::fire_worker_lifecycle_hook(
+            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &registry,
+            match event {
+                HookEvent::SessionStart => super::run::WorkerLifecycleHook::Start(actual),
+                HookEvent::SessionEnd => super::run::WorkerLifecycleHook::End(actual),
+                _ => unreachable!("worker probe only owns session lifecycle events"),
+            },
+            &session,
+            root.path(),
+        )
+        .await;
+        session
+            .db
+            .list_session_events(session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == "hook_run")
+            .count()
+    }
+
+    assert_eq!(run(HookEvent::SessionStart, "fresh", "fresh").await, 1);
+    assert_eq!(run(HookEvent::SessionStart, "fresh", "resume").await, 0);
+    assert_eq!(run(HookEvent::SessionEnd, "completed", "completed").await, 1);
+    assert_eq!(run(HookEvent::SessionEnd, "completed", "error").await, 0);
+    [HookEvent::SessionStart, HookEvent::SessionEnd]
+}
+
+#[tokio::test]
+async fn production_worker_lifecycle_hooks_fire_at_worker_seams() {
+    let events = production_worker_lifecycle_hook_probe().await;
+    assert_eq!(events.len(), 2);
+}
+
 #[test]
 fn session_end_matcher_maps_worker_stop() {
     // Expectations are INDEPENDENT literals (Decision 3), not re-derived from

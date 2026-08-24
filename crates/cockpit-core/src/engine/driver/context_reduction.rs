@@ -347,11 +347,6 @@ impl Driver {
 
     pub(in crate::engine::driver) async fn load_compaction_shadow_from_store(&mut self) {
         let ctx_cfg = self.resolve_context_config();
-        if !ctx_cfg.compact_shadow {
-            self.shadow_brief = None;
-            self.delete_durable_shadow_brief().await;
-            return;
-        }
         let row = match self.session.db.compaction_shadow(self.session.id).await {
             Ok(row) => row,
             Err(error) => {
@@ -372,10 +367,19 @@ impl Driver {
                 return;
             }
         };
-        let DurableCompactionShadow::ReadyBrief(record) = payload else {
-            self.shadow_brief = None;
-            return;
+        let record = match payload {
+            DurableCompactionShadow::ReadyBrief(record) => record,
+            DurableCompactionShadow::PreparedCompaction(prepared) => {
+                self.shadow_brief = None;
+                self.recovered_compaction_intent = Some(*prepared);
+                return;
+            }
         };
+        if !ctx_cfg.compact_shadow {
+            self.shadow_brief = None;
+            self.delete_durable_shadow_brief().await;
+            return;
+        }
         if record.generation < self.shadow_brief_generation {
             self.shadow_brief = None;
             self.delete_durable_shadow_brief().await;
@@ -1207,9 +1211,10 @@ impl Driver {
 
     /// Compaction lifecycle hooks are transactional with the requested
     /// compaction: preparation or validation failure fires neither hook. Once
-    /// validation succeeds, `preCompact` runs immediately before the
-    /// infallible in-memory commit and `postCompact` after the successor is
-    /// durable. No failed compaction can leave an orphaned lifecycle pair.
+    /// validation succeeds, a recovery-only intent is persisted, `preCompact`
+    /// runs immediately before the atomic durable successor commit, the live
+    /// projection follows that commit, and `postCompact` follows projection.
+    /// A storage failure retains the intent for bootstrap recovery.
     pub(in crate::engine::driver) async fn do_compact_with_source(
         &mut self,
         tx: &mpsc::Sender<TurnEvent>,
@@ -1232,7 +1237,7 @@ impl Driver {
                 return;
             }
         };
-        if let Err(error) = self.stage_prepared_compaction(&prepared).await {
+        if let Err(error) = self.validate_prepared_compaction(&prepared) {
             let text = match error {
                 PreparedCompactionApplyError::Stale { .. } => {
                     "/compact: prepared compaction is stale; history was left unchanged"
@@ -1247,9 +1252,50 @@ impl Driver {
             let _ = tx.send(TurnEvent::Notice { text }).await;
             return;
         }
-        // Validation and all fallible preparation are complete. No other task
-        // can mutate this driver through the exclusive borrow while hooks run,
-        // so the commit immediately below cannot become stale.
+        // Persist the fully prepared successor as a recovery intent before the
+        // lifecycle boundary. This is not the durable successor commit and is
+        // ignored by transcript rehydration; it only gives restart recovery
+        // enough information to finish a request whose pre hook began.
+        let intent_json = match serde_json::to_string(
+            &DurableCompactionShadow::PreparedCompaction(Box::new(prepared.clone())),
+        ) {
+            Ok(intent_json) => intent_json,
+            Err(error) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "/compact: recording recovery intent failed: {error}; history was left unchanged"
+                        ),
+                    })
+                    .await;
+                return;
+            }
+        };
+        match self
+            .session
+            .db
+            .upsert_compaction_shadow(self.session.id, &intent_json)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                // Scratch/ephemeral sessions have no durable recovery surface;
+                // they may still commit atomically in this live driver.
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: format!(
+                            "/compact: recording recovery intent failed: {error}; history was left unchanged"
+                        ),
+                    })
+                    .await;
+                return;
+            }
+        }
+        // Validation and all fallible preparation are complete. `preCompact`
+        // is the last lifecycle action before the atomic durable successor
+        // record; the live projection is installed only after that commit.
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PreCompact,
             source,
@@ -1261,6 +1307,17 @@ impl Driver {
             },
         )
         .await;
+        if let Err(error) = self.stage_prepared_compaction(&prepared).await {
+            tracing::warn!(%error, "compaction durable commit failed; recovery intent retained");
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "/compact: durable successor commit failed: {error}; recovery will finish the prepared compaction"
+                    ),
+                })
+                .await;
+            return;
+        }
         self.commit_prepared_compaction(prepared, tx).await;
         self.fire_observe_hook(
             crate::config::extended::hooks::HookEvent::PostCompact,
@@ -1273,6 +1330,54 @@ impl Driver {
             },
         )
         .await;
+        self.delete_durable_shadow_brief().await;
+    }
+
+    /// Complete a crash-retained compaction intent before the driver accepts
+    /// new work. The durable `session_compacted` record remains the commit
+    /// point; live projection and `postCompact` follow it in that order.
+    pub(in crate::engine::driver) async fn recover_compaction_intent(
+        &mut self,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        let Some(prepared) = self.recovered_compaction_intent.take() else {
+            return;
+        };
+        if let Err(error) = self.validate_prepared_compaction(&prepared) {
+            tracing::warn!(%error, "discarding stale recovered compaction intent");
+            self.delete_durable_shadow_brief().await;
+            return;
+        }
+        let source = prepared.source.clone();
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PreCompact,
+            &source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(&source),
+                ..Default::default()
+            },
+        )
+        .await;
+        if let Err(error) = self.stage_prepared_compaction(&prepared).await {
+            tracing::warn!(%error, "recovered compaction durable commit still unavailable");
+            self.recovered_compaction_intent = Some(prepared);
+            return;
+        }
+        self.commit_prepared_compaction(prepared, tx).await;
+        self.fire_observe_hook(
+            crate::config::extended::hooks::HookEvent::PostCompact,
+            &source,
+            None,
+            None,
+            crate::engine::agent::hooks::ObserveFields {
+                compact_source: Some(&source),
+                ..Default::default()
+            },
+        )
+        .await;
+        self.delete_durable_shadow_brief().await;
     }
 
     pub(in crate::engine::driver) async fn prepare_compaction_with_source(
@@ -1483,6 +1588,7 @@ impl Driver {
         prepared: PreparedCompaction,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<(), PreparedCompactionApplyError> {
+        self.validate_prepared_compaction(&prepared)?;
         self.stage_prepared_compaction(&prepared).await?;
         self.commit_prepared_compaction(prepared, tx).await;
         Ok(())
@@ -1492,7 +1598,6 @@ impl Driver {
         &self,
         prepared: &PreparedCompaction,
     ) -> Result<(), PreparedCompactionApplyError> {
-        self.validate_prepared_compaction(prepared)?;
         let compaction_frame = (!prepared.authoring_provider_id.is_empty()
             && !prepared.authoring_model_id.is_empty())
         .then_some(crate::session::SessionEventModelFrame {

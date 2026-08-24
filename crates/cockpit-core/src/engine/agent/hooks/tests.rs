@@ -1121,7 +1121,7 @@ fn observe_hook(event: HookEvent, matcher: &str) -> ResolvedHook {
 }
 
 #[tokio::test]
-async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
+async fn hook_dispatcher_matches_typed_lifecycle_envelopes() {
     // Scripted per-event acceptance harness. Together with the typed
     // PRODUCTION_HOOK_BOUNDARIES ownership table, it covers every member of
     // HookEvent::ALL at its production matcher vocabulary:
@@ -1459,6 +1459,48 @@ async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
     assert!(
         rows.is_empty(),
         "an error-only sessionEnd hook must not fire on a clean completion"
+    );
+}
+
+/// Aggregate production-boundary harness. The individual probes own their
+/// setup beside the Worker/Driver/DispatchEnv boundary they exercise; this
+/// orchestrator never calls a hook dispatcher or a Driver hook helper.
+#[tokio::test(start_paused = true)]
+async fn hook_event_table_dispatches_each_native_lifecycle_boundary() {
+    tokio::time::resume();
+
+    let [session_start, session_end] =
+        crate::daemon::session_worker::tests::production_worker_lifecycle_hook_probe().await;
+    let mut observed = vec![session_start];
+
+    crate::engine::driver::tests::misc::probe_user_prompt_submit_boundary().await;
+    observed.push(HookEvent::UserPromptSubmit);
+
+    observed.extend(
+        crate::engine::agent::tool_dispatch::tests::production_tool_lifecycle_hook_probe().await,
+    );
+
+    crate::engine::driver::tests::turn_loop::probe_root_stop_boundary().await;
+    crate::engine::driver::tests::turn_loop::probe_root_stop_lookalike_boundary().await;
+    observed.push(HookEvent::Stop);
+
+    crate::engine::driver::tests::misc::probe_stop_failure_boundary().await;
+    observed.push(HookEvent::StopFailure);
+
+    crate::engine::driver::tests::misc::probe_subagent_start_boundary().await;
+    observed.push(HookEvent::SubagentStart);
+
+    crate::engine::driver::tests::misc::probe_subagent_stop_boundary().await;
+    observed.push(HookEvent::SubagentStop);
+
+    crate::engine::driver::tests::context::probe_compact_boundaries().await;
+    observed.extend([HookEvent::PreCompact, HookEvent::PostCompact]);
+    observed.push(session_end);
+
+    assert_eq!(
+        observed.as_slice(),
+        HookEvent::ALL.as_slice(),
+        "every typed lifecycle event must be exercised exactly once in normative order"
     );
 }
 

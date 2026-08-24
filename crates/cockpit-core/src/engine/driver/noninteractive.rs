@@ -370,8 +370,26 @@ impl VnextChildAdmissionRegistry {
 
 #[allow(dead_code)]
 impl NoninteractiveDelegationRegistry {
+    #[cfg(test)]
     pub(in crate::engine::driver) fn register_running(
         &mut self,
+        task_call_id: &str,
+        label: &str,
+        child_agent: String,
+        snapshot: NoninteractiveDelegationSnapshot,
+    ) {
+        self.register_running_for_session(
+            uuid::Uuid::nil(),
+            task_call_id,
+            label,
+            child_agent,
+            snapshot,
+        );
+    }
+
+    pub(in crate::engine::driver) fn register_running_for_session(
+        &mut self,
+        session_id: uuid::Uuid,
         task_call_id: &str,
         label: &str,
         child_agent: String,
@@ -388,7 +406,8 @@ impl NoninteractiveDelegationRegistry {
             .map(|entry| entry.lifecycle.clone())
             .unwrap_or_else(|| {
                 ChildHookLifecycle::already_started(
-                    crate::db::task_delegations::delegation_child_lifecycle_id(
+                    crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                        session_id,
                         task_call_id,
                         label,
                     ),
@@ -1253,7 +1272,8 @@ impl Driver {
                 );
             }
         }
-        self.noninteractive_delegations.register_running(
+        self.noninteractive_delegations.register_running_for_session(
+            self.session.id,
             &task_call_id,
             "default",
             task.child_agent.clone(),
@@ -1267,7 +1287,13 @@ impl Driver {
         // `subagentType` is the child agent type, `subagentId` is the delegating
         // `task` call id. Paired with exactly one `subagentStop` at delegation
         // delivery (`finalize_background_noninteractive_completion`).
-        self.fire_subagent_hook(&task.child_agent, Some(&task_call_id))
+        let child_lifecycle_id =
+            crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                self.session.id,
+                &task_call_id,
+                "default",
+            );
+        self.fire_subagent_hook(&task.child_agent, Some(&child_lifecycle_id))
         .await;
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
@@ -1569,7 +1595,8 @@ impl Driver {
         };
         let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
 
-        self.noninteractive_delegations.register_running(
+        self.noninteractive_delegations.register_running_for_session(
+            self.session.id,
             &task_call_id,
             "default",
             child_agent.clone(),
@@ -3404,7 +3431,8 @@ impl Driver {
             }
         }
         for entry in &task.entries {
-            self.noninteractive_delegations.register_running(
+            self.noninteractive_delegations.register_running_for_session(
+                self.session.id,
                 &task_call_id,
                 &entry.label,
                 entry.child_agent.clone(),
@@ -3417,7 +3445,13 @@ impl Driver {
             // matcher / `subagentType` is the child agent type, `subagentId` is the
             // shared delegating `task` call id. Each is paired with exactly one
             // `subagentStop` at delegation delivery.
-            self.fire_subagent_hook(&entry.child_agent, Some(&task_call_id))
+            let child_lifecycle_id =
+                crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                    self.session.id,
+                    &task_call_id,
+                    &entry.label,
+                );
+            self.fire_subagent_hook(&entry.child_agent, Some(&child_lifecycle_id))
             .await;
         }
         let mut runner = self.clone_for_background_noninteractive(tx);
@@ -3767,7 +3801,8 @@ impl Driver {
         // guard, so a mid-wait generation move never records a lingering
         // write-scope grant for a child that then fails closed.
         for entry in &entries {
-            self.noninteractive_delegations.register_running(
+            self.noninteractive_delegations.register_running_for_session(
+                self.session.id,
                 &task_call_id,
                 &entry.label,
                 entry.child_agent.clone(),
@@ -4982,6 +5017,15 @@ pub(crate) async fn run_noninteractive(
 ) -> Result<String> {
     // The docs pipeline (the only other caller) neither rehydrates nor needs
     // transcript context: it only needs the report text.
+    let child_lifecycle = steer_target.as_ref().map(|target| {
+        ChildHookLifecycle::new(
+            crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                session.id,
+                &target.task_call_id,
+                &target.label,
+            ),
+        )
+    });
     let out = run_noninteractive_resumable(
         child,
         brief,
@@ -4992,16 +5036,7 @@ pub(crate) async fn run_noninteractive(
         cwd,
         config,
         None,
-        steer_target
-            .as_ref()
-            .map(|target| {
-                ChildHookLifecycle::new(
-                    crate::db::task_delegations::delegation_child_lifecycle_id(
-                        &target.task_call_id,
-                        &target.label,
-                    ),
-                )
-            }),
+        child_lifecycle,
         interrupts,
         cancel,
         approver,
@@ -5892,7 +5927,8 @@ pub(crate) async fn run_noninteractive_resumable(
                         config.clone(),
                         process_containment.clone(),
                         Some(ChildHookLifecycle::new(
-                            crate::db::task_delegations::delegation_child_lifecycle_id(
+                            crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                                session.id,
                                 &task_call_id,
                                 "default",
                             ),
@@ -6078,7 +6114,8 @@ pub(crate) async fn run_noninteractive_resumable(
                     // stable lifecycle key so concurrent start/stop pairs can
                     // never collapse onto the shared batch call id.
                     let child_hook_id =
-                        crate::db::task_delegations::delegation_child_lifecycle_id(
+                        crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                            session.id,
                             &task_call_id,
                             &entry.label,
                         );
@@ -6184,7 +6221,8 @@ mod vnext_child_admission_tests {
         let ids = (0..3)
             .map(|idx| {
                 ChildHookLifecycle::new(
-                    crate::db::task_delegations::delegation_child_lifecycle_id(
+                    crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                        uuid::Uuid::nil(),
                         parent,
                         &format!("child-{idx}"),
                     ),

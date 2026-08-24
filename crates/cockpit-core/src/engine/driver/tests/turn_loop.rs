@@ -1764,9 +1764,7 @@ fn stop_and_stop_failure_registry() -> crate::config::extended::hooks::HookRegis
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn root_stop_gate_fires_on_genuine_done() {
-    tokio::time::resume();
+pub(crate) async fn probe_root_stop_boundary() {
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("all finished".into()))
@@ -1792,8 +1790,12 @@ async fn root_stop_gate_fires_on_genuine_done() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn root_stop_gate_not_fired_for_lookalike_matcher() {
+async fn root_stop_gate_fires_on_genuine_done() {
     tokio::time::resume();
+    probe_root_stop_boundary().await;
+}
+
+pub(crate) async fn probe_root_stop_lookalike_boundary() {
     let provider = ScriptedProvider::builder()
         .dialect(WireDialect::ChatCompletions)
         .turn(Turn::Text("all finished".into()))
@@ -1817,6 +1819,12 @@ async fn root_stop_gate_not_fired_for_lookalike_matcher() {
         observe_hook_events(&driver, "stop").await.is_empty(),
         "a lookalike-matcher stop hook must not fire on end_turn"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn root_stop_gate_not_fired_for_lookalike_matcher() {
+    tokio::time::resume();
+    probe_root_stop_lookalike_boundary().await;
 }
 
 #[tokio::test]

@@ -148,7 +148,14 @@ pub enum UserSubmissionKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionOrigin {
+    /// Externally authored root submission accepted without earlier work in
+    /// the worker queue. This immutable acceptance disposition is preserved
+    /// across preparation/retry and emits `userPromptSubmit(user)`.
     ExternalRoot,
+    /// Externally authored root submission that had to wait behind an already
+    /// accepted/started submission. The queue assigns this exactly once at
+    /// insertion; folding must never reconstruct it from mutable queue state.
+    ExternalRootQueued,
     GoalContinuation,
     ScheduledJob,
     AutoContinue,
@@ -161,7 +168,7 @@ pub enum SubmissionOrigin {
 
 impl SubmissionOrigin {
     pub fn advances_activity_epoch(self) -> bool {
-        matches!(self, Self::ExternalRoot)
+        matches!(self, Self::ExternalRoot | Self::ExternalRootQueued)
     }
 
     /// The `userPromptSubmit` hook `promptSource` for a root turn driven by a
@@ -177,6 +184,7 @@ impl SubmissionOrigin {
     pub fn user_prompt_submit_source(self) -> Option<&'static str> {
         match self {
             Self::ExternalRoot => Some("user"),
+            Self::ExternalRootQueued => Some("queued"),
             Self::GoalContinuation
             | Self::ScheduledJob
             | Self::AutoContinue
@@ -354,6 +362,11 @@ impl UserSubmissionQueue {
                     IdempotentPush::Duplicate
                 };
                 return (id, snapshot_pending(&state), outcome);
+            }
+            if matches!(submission.origin, SubmissionOrigin::ExternalRoot)
+                && (!state.pending.is_empty() || !state.started.is_empty())
+            {
+                submission.origin = SubmissionOrigin::ExternalRootQueued;
             }
             state.accepted.insert(
                 id,
@@ -1549,8 +1562,9 @@ mod tests {
     }
 
     #[test]
-    fn submission_origin_only_external_root_advances_compaction_activity() {
+    fn submission_origin_only_external_root_acceptances_advance_compaction_activity() {
         assert!(SubmissionOrigin::ExternalRoot.advances_activity_epoch());
+        assert!(SubmissionOrigin::ExternalRootQueued.advances_activity_epoch());
         for origin in [
             SubmissionOrigin::GoalContinuation,
             SubmissionOrigin::ScheduledJob,
@@ -2428,6 +2442,45 @@ mod tests {
         assert_eq!(
             queue.recv_for(Some(&target.id)).await.expect("second").text,
             "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_acceptance_disposition_is_immutable_across_start_and_retry() {
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = UserSubmissionQueue::new(updates_tx);
+        let target = QueueTarget::root("Build");
+
+        queue
+            .push(
+                UserSubmission {
+                    origin: SubmissionOrigin::ExternalRoot,
+                    ..UserSubmission::text("direct")
+                },
+                target.clone(),
+            )
+            .await;
+        let direct = queue.recv().await.expect("direct submission");
+        assert_eq!(direct.origin.user_prompt_submit_source(), Some("user"));
+
+        queue
+            .push(
+                UserSubmission {
+                    origin: SubmissionOrigin::ExternalRoot,
+                    ..UserSubmission::text("waited")
+                },
+                target.clone(),
+            )
+            .await;
+        let waited = queue.recv().await.expect("waited submission");
+        assert_eq!(waited.origin.user_prompt_submit_source(), Some("queued"));
+
+        queue.requeue_front(waited, target).await;
+        let retried = queue.recv().await.expect("retried waited submission");
+        assert_eq!(
+            retried.origin.user_prompt_submit_source(),
+            Some("queued"),
+            "retry must preserve the acceptance-time direct/waited disposition"
         );
     }
 

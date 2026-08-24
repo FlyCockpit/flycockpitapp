@@ -14,6 +14,8 @@ daemon_user=$1
 payload_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 payload_cli="$payload_root/cockpit"
 payload_broker="$payload_root/cockpit-containment-broker"
+status_cli=$payload_cli
+if [ -x /usr/bin/cockpit ]; then status_cli=/usr/bin/cockpit; fi
 daemon_uid=$(id -u "$daemon_user")
 daemon_gid=$(id -g "$daemon_user")
 case "$daemon_uid:$daemon_gid" in
@@ -40,20 +42,55 @@ broker_unit="cockpit-containment-broker@$daemon_uid.service"
 daemon_unit="cockpit-daemon@$daemon_uid.service"
 broker_was_active=0
 daemon_was_active=0
-broker_was_enabled=0
-daemon_was_enabled=0
+broker_enablement=$(systemctl is-enabled "$broker_unit" 2>/dev/null || true)
+daemon_enablement=$(systemctl is-enabled "$daemon_unit" 2>/dev/null || true)
 detached_was_active=0
 if systemctl is-active --quiet "$broker_unit"; then broker_was_active=1; fi
 if systemctl is-active --quiet "$daemon_unit"; then daemon_was_active=1; fi
-if systemctl is-enabled --quiet "$broker_unit"; then broker_was_enabled=1; fi
-if systemctl is-enabled --quiet "$daemon_unit"; then daemon_was_enabled=1; fi
 if [ "$daemon_was_active" -eq 0 ] \
-  && runuser -u "$daemon_user" -- "$payload_cli" daemon status --json >/dev/null 2>&1
+  && runuser -u "$daemon_user" -- "$status_cli" daemon status --json >/dev/null 2>&1
 then
   detached_was_active=1
 fi
 transaction=$(mktemp -d /tmp/flycockpit-containment-install.XXXXXX)
 committed=0
+
+restore_enablement() {
+  unit=$1
+  state=$2
+  case "$state" in
+    enabled|linked) systemctl enable "$unit" 2>/dev/null || true ;;
+    enabled-runtime|linked-runtime) systemctl enable --runtime "$unit" 2>/dev/null || true ;;
+    alias|static|indirect|generated|transient) : ;;
+    masked) systemctl mask "$unit" 2>/dev/null || true ;;
+    masked-runtime) systemctl mask --runtime "$unit" 2>/dev/null || true ;;
+    disabled|not-found|bad|'') systemctl disable "$unit" 2>/dev/null || true ;;
+  esac
+}
+
+retry() {
+  attempts=$1
+  shift
+  while ! "$@"; do
+    attempts=$((attempts - 1))
+    if [ "$attempts" -le 0 ]; then return 1; fi
+    sleep 1
+  done
+}
+
+socket_contract_ready() {
+  [ -S "$socket" ] \
+    && [ "$(stat -c '%F:%u:%g:%a' "$socket")" = "socket:0:$daemon_gid:660" ]
+}
+
+broker_protocol_ready() {
+  systemd-run --quiet --wait --collect --pipe --service-type=exec \
+    --unit="flycockpit-containment-doctor-$daemon_uid-$$" \
+    --property="User=$daemon_uid" --property="Group=$daemon_gid" \
+    --property="OpenFile=$capability:flycockpit-containment-capability:read-only" \
+    /usr/libexec/flycockpit/cockpit-containment-broker \
+      --doctor --allowed-uid "$daemon_uid" --socket "$socket" --capability-fd 3
+}
 
 rollback() {
   status=$?
@@ -73,16 +110,8 @@ rollback() {
       fi
     done
     systemctl daemon-reload 2>/dev/null || true
-    if [ "$broker_was_enabled" -eq 1 ]; then
-      systemctl enable "$broker_unit" 2>/dev/null || true
-    else
-      systemctl disable "$broker_unit" 2>/dev/null || true
-    fi
-    if [ "$daemon_was_enabled" -eq 1 ]; then
-      systemctl enable "$daemon_unit" 2>/dev/null || true
-    else
-      systemctl disable "$daemon_unit" 2>/dev/null || true
-    fi
+    restore_enablement "$broker_unit" "$broker_enablement"
+    restore_enablement "$daemon_unit" "$daemon_enablement"
     if [ -f "$transaction/capability.created" ]; then
       rm -f "/etc/flycockpit/containment-capability-$daemon_uid"
     fi
@@ -103,11 +132,20 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-systemctl stop "$daemon_unit" "$broker_unit" 2>/dev/null || true
+if [ "$daemon_was_active" -eq 1 ]; then systemctl stop "$daemon_unit"; fi
+if [ "$broker_was_active" -eq 1 ]; then systemctl stop "$broker_unit"; fi
 if [ "$detached_was_active" -eq 1 ]; then
   # Address the daemon through its canonical runtime endpoint. This also finds
   # installs whose launching executable lived outside Cargo home or /usr/bin.
-  runuser -u "$daemon_user" -- "$payload_cli" daemon stop --grace 30
+  runuser -u "$daemon_user" -- "$status_cli" daemon stop --grace 30
+fi
+if systemctl is-active --quiet "$daemon_unit" || systemctl is-active --quiet "$broker_unit"; then
+  echo "refusing to install while an old managed service remains active" >&2
+  exit 1
+fi
+if runuser -u "$daemon_user" -- "$status_cli" daemon status --json >/dev/null 2>&1; then
+  echo "refusing to install while a detached daemon remains active" >&2
+  exit 1
 fi
 
 install -d -m 0755 /etc/flycockpit /usr/libexec/flycockpit /usr/lib/systemd/system /usr/lib/tmpfiles.d
@@ -158,21 +196,22 @@ systemd-tmpfiles --create flycockpit-containment.conf
 systemctl daemon-reload
 systemctl enable "$broker_unit" "$daemon_unit"
 systemctl start "$broker_unit"
-systemctl is-active --quiet "$broker_unit"
 socket="/run/flycockpit/containment-broker-$daemon_uid.sock"
-if [ "$(stat -c '%F:%u:%g:%a' "$socket")" != "socket:0:$daemon_gid:660" ]; then
+if ! retry 30 socket_contract_ready; then
   echo "containment broker did not publish the authenticated socket contract" >&2
   exit 1
 fi
-# Authenticate the actual protocol and require the broker's Proven readiness
-# attestation. FD 9 is opened by this root installer and never exposed by path
-# to the daemon user.
-/usr/libexec/flycockpit/cockpit-containment-broker \
-  --doctor --allowed-uid "$daemon_uid" --socket "$socket" \
-  --capability-fd 9 9<"/etc/flycockpit/containment-capability-$daemon_uid"
+# Run the protocol doctor under the exact daemon UID/GID and descriptor setup.
+# The transient unit receives the root-only capability as the same named FD as
+# the managed daemon; success therefore proves socket access, authentication,
+# and the broker's Proven readiness from the daemon's security context.
+if ! retry 30 broker_protocol_ready; then
+  echo "containment broker did not become authenticated and Proven ready" >&2
+  exit 1
+fi
 systemctl start "$daemon_unit"
-systemctl is-active --quiet "$daemon_unit"
-runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null
+retry 30 systemctl is-active --quiet "$daemon_unit"
+retry 30 runuser -u "$daemon_user" -- /usr/bin/cockpit daemon status --json >/dev/null
 
 committed=1
 trap - EXIT HUP INT TERM

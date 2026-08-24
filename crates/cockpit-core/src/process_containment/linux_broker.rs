@@ -169,7 +169,7 @@ enum Response {
     Operation { version: u32, state: OperationStatus, key: Option<String> },
     Killed { version: u32 },
     Population { version: u32, populated: bool },
-    Exited { version: u32, exit_code: Option<i32> },
+    Exited { version: u32, status: OperationStatus, exit_code: Option<i32> },
     Error { version: u32, code: String },
 }
 
@@ -507,7 +507,7 @@ impl ManagementBroker for LinuxBrokerClient {
                 generation,
             };
             tokio::task::spawn_blocking(move || match wait_client.transact(&request)? {
-                (Response::Exited { version: PROTOCOL_VERSION, exit_code }, fds)
+                (Response::Exited { version: PROTOCOL_VERSION, status: OperationStatus::Exited, exit_code }, fds)
                     if fds.is_empty() => Ok(exit_code),
                 _ => Err(invalid("invalid broker exit-status response")),
             })
@@ -658,6 +658,37 @@ pub fn run_linux_containment_broker(config: LinuxBrokerServerConfig) -> std::io:
     }
 }
 
+/// Creates and attests only the canonical per-UID cgroup root. This narrow
+/// service-manager preflight makes a clean-host start possible before a
+/// `ReadWritePaths=` bind is established, without interpolating an unparsed
+/// instance name into a privileged filesystem command.
+pub fn prepare_linux_containment_broker_cgroup_root(
+    config: &LinuxBrokerServerConfig,
+) -> std::io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker cgroup preparation must run as root",
+        ));
+    }
+    verify_canonical_cgroup_root(config)?;
+    let parent = config.cgroup_root.parent().ok_or_else(|| invalid("cgroup root has no parent"))?;
+    let mount_root = parent.parent().ok_or_else(|| invalid("cgroup parent has no mount root"))?;
+    if mount_root != Path::new("/sys/fs/cgroup") {
+        return Err(invalid("invalid canonical cgroup parent"));
+    }
+    if !mount_root.join("cgroup.controllers").is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cgroup v2 unavailable",
+        ));
+    }
+    verify_cgroup2_filesystem(mount_root)?;
+    ensure_root_owned_cgroup_directory(parent)?;
+    ensure_root_owned_cgroup_directory(&config.cgroup_root)?;
+    verify_cgroup2_filesystem(&config.cgroup_root)
+}
+
 fn accept_authenticated_connection(
     listener: &UnixListener,
     allowed_uid: u32,
@@ -731,7 +762,7 @@ impl ReplayTombstones {
         let path = config.state_root.join(REPLAY_TOMBSTONE_FILE);
         let epoch = broker_epoch()?;
         let bits = match fs::read(&path) {
-            Ok(stored) if stored.len() == 37 + REPLAY_TOMBSTONE_BYTES => {
+            Ok(stored) if stored.len() == 37 + REPLAY_TOMBSTONE_BYTES + 32 => {
                 let metadata = fs::symlink_metadata(&path)?;
                 if !metadata.file_type().is_file()
                     || metadata.uid() != 0
@@ -748,8 +779,15 @@ impl ReplayTombstones {
                 let stored_epoch = std::str::from_utf8(&stored[..36]).map_err(invalid)?;
                 uuid::Uuid::parse_str(stored_epoch)
                     .map_err(|_| invalid("invalid replay tombstone epoch"))?;
+                let payload_end = 37 + REPLAY_TOMBSTONE_BYTES;
+                let mut checksum = Sha256::new();
+                checksum.update(b"flycockpit-replay-tombstone-file-v1\0");
+                checksum.update(&stored[..payload_end]);
+                if checksum.finalize().as_slice() != &stored[payload_end..] {
+                    return Err(invalid("replay tombstone checksum mismatch"));
+                }
                 if stored_epoch == epoch {
-                    stored[37..].to_vec()
+                    stored[37..payload_end].to_vec()
                 } else {
                     // A boot boundary is the explicit replay horizon: no pid,
                     // pidfd, or cgroup generation can survive the recovery
@@ -794,12 +832,27 @@ impl ReplayTombstones {
         }
     }
 
+    fn can_insert_all<'a>(&self, identities: impl Iterator<Item = &'a (String, String)>) -> bool {
+        let mut projected = self.bits.clone();
+        for (session_id, operation_id) in identities {
+            for index in Self::indexes(session_id, operation_id) {
+                projected[index / 8] |= 1 << (index % 8);
+            }
+        }
+        projected.iter().map(|byte| byte.count_ones() as usize).sum::<usize>()
+            <= REPLAY_TOMBSTONE_BYTES * 8 / 2
+    }
+
     fn persist(&self, config: &LinuxBrokerServerConfig) -> std::io::Result<()> {
         let destination = config.state_root.join(REPLAY_TOMBSTONE_FILE);
-        let mut bytes = Vec::with_capacity(37 + self.bits.len());
+        let mut bytes = Vec::with_capacity(37 + self.bits.len() + 32);
         bytes.extend_from_slice(self.epoch.as_bytes());
         bytes.push(b'\n');
         bytes.extend_from_slice(&self.bits);
+        let mut checksum = Sha256::new();
+        checksum.update(b"flycockpit-replay-tombstone-file-v1\0");
+        checksum.update(&bytes);
+        bytes.extend_from_slice(&checksum.finalize());
         atomic_replace_named_state(config, &destination, &bytes, ".replay-tombstones")
     }
 }
@@ -1043,11 +1096,21 @@ fn serve_one(
                     operation.request_digest.clone(),
                 )
             };
+            let decision = {
+                let operation = state.operations.get(&identity).expect("operation exists");
+                let spawned = operation.prepared.as_ref()
+                    .ok_or_else(|| invalid("prepared operation has no child"))?;
+                match reopen_fd(spawned.cancellation.as_fd()) {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Prepared;
+                        return Err(error);
+                    }
+                }
+            };
             let mut spawned = state.operations.get_mut(&identity)
-                .expect("operation exists")
-                .prepared.take()
-                .ok_or_else(|| invalid("prepared operation has no child"))?;
-            let decision = reopen_fd(spawned.cancellation.as_fd())?;
+                .expect("operation exists").prepared.take()
+                .expect("prepared child checked above");
             match durably_choose_commit(decision.as_fd(), || {
                 persist_operation(
                     config,
@@ -1096,11 +1159,13 @@ fn serve_one(
             // cleanup_connection_children still kills and proves this child
             // empty instead of orphaning an untracked running generation.
             state.children.insert(key.clone(), spawned.pid);
-            {
+            if let Err(error) = persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &key, generation, &digest) {
                 let operation = state.operations.get_mut(&identity).expect("operation exists");
-                operation.status = OperationStatus::Committed;
+                operation.status = OperationStatus::DisconnectCleanupRequired;
+                let _ = persist_operation(config, &session_id, &operation_id, OperationStatus::DisconnectCleanupRequired, &key, generation, &digest);
+                return Err(error);
             }
-            persist_operation(config, &session_id, &operation_id, OperationStatus::Committed, &key, generation, &digest)?;
+            state.operations.get_mut(&identity).expect("operation exists").status = OperationStatus::Committed;
             send_response(stream, &Response::Committed { version: PROTOCOL_VERSION, key }, &[])
         }
         Request::CancelOperation { version, session_id, operation_id }
@@ -1133,19 +1198,18 @@ fn serve_one(
             if let Some(pid) = pid {
                 state.children.insert(key.clone(), pid);
             }
-            if let Err(error) = cleanup_generation(config, &key, generation, pid, REAP_TIMEOUT) {
-                // CleanupRequired plus children ownership remains retryable;
-                // never acknowledge cancellation without ProvenEmpty.
-                return Err(error);
-            }
-            if let Some(pid) = state.children.remove(&key) {
-                let status = reap_child(pid)?;
-                state.exit_statuses.insert(key.clone(), status);
-            }
+            let cleanup_exit = match cleanup_generation(config, &key, generation, pid, REAP_TIMEOUT) {
+                Ok(status) => status,
+                Err(error) => {
+                    // CleanupRequired plus children ownership remains retryable;
+                    // never acknowledge cancellation without ProvenEmpty.
+                    return Err(error);
+                }
+            };
+            state.children.remove(&key);
+            state.exit_statuses.insert(key.clone(), cleanup_exit);
             state.remember_empty(key.clone());
-            let operation = state.operations.get_mut(&identity).expect("operation exists");
-            operation.status = OperationStatus::Cancelled;
-            persist_operation(config, &session_id, &operation_id, OperationStatus::Cancelled, &key, generation, &digest)?;
+            persist_terminal_for_key(config, state, &key, OperationStatus::Cancelled)?;
             send_response(stream, &Response::Cancelled { version: PROTOCOL_VERSION }, &[])
         }
         Request::OperationStatus { version, session_id, operation_id }
@@ -1197,8 +1261,7 @@ fn serve_one(
                 }
                 fs::remove_dir(&path)?;
                 state.remember_empty(key.clone());
-                mark_operation_terminal(config, state, &key, OperationStatus::Exited)?;
-                persist_exit_status_for_key(config, state, &key)?;
+                persist_terminal_for_key(config, state, &key, OperationStatus::Exited)?;
             }
             send_response(&stream, &Response::Population { version: PROTOCOL_VERSION, populated }, &[])
         }
@@ -1215,9 +1278,16 @@ fn serve_one(
                 state.exit_statuses.insert(key.clone(), exit_code);
                 exit_code
             };
-            mark_operation_terminal(config, state, &key, OperationStatus::Exited)?;
-            persist_exit_status_for_key(config, state, &key)?;
-            send_response(&stream, &Response::Exited { version: PROTOCOL_VERSION, exit_code }, &[])
+            let status = state.operations.values().find(|operation| operation.key == key)
+                .map(|operation| operation.status)
+                .ok_or_else(|| invalid("exit status has no durable operation identity"))?;
+            let terminal = if matches!(status, OperationStatus::Committed | OperationStatus::Exited) {
+                OperationStatus::Exited
+            } else {
+                status
+            };
+            persist_terminal_for_key(config, state, &key, terminal)?;
+            send_response(&stream, &Response::Exited { version: PROTOCOL_VERSION, status: terminal, exit_code }, &[])
         }
         _ => send_response(
             &stream,
@@ -1646,19 +1716,16 @@ fn cleanup_generation(
     generation: u64,
     pid: Option<libc::pid_t>,
     timeout: std::time::Duration,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<i32>> {
     let Some(group) = resolve_key_if_present(config, key, generation)? else {
-        if let Some(pid) = pid {
-            let _ = reap_child_bounded(pid, timeout)?;
-        }
-        return Ok(());
+        return pid.map(|pid| reap_child_bounded(pid, timeout)).transpose()
+            .map(Option::flatten);
     };
     fs::write(group.join("cgroup.kill"), b"1")?;
-    if let Some(pid) = pid {
-        let _ = reap_child_bounded(pid, timeout)?;
-    }
     wait_cgroup_empty(&group, timeout)?;
-    fs::remove_dir(group)
+    fs::remove_dir(group)?;
+    pid.map(|pid| reap_child_bounded(pid, timeout)).transpose()
+        .map(Option::flatten)
 }
 
 fn reap_child(pid: libc::pid_t) -> std::io::Result<Option<i32>> {
@@ -1806,35 +1873,32 @@ fn cleanup_connection_children(config: &LinuxBrokerServerConfig, state: &mut Bro
         let _ = persist_operation(config, &session_id, &operation_id, pending, &key, generation, &digest);
         let pid = prepared.as_ref().map(|spawned| spawned.pid)
             .or_else(|| state.children.get(&key).copied());
-        if cleanup_generation(config, &key, generation, pid, std::time::Duration::ZERO).is_err() {
-            if let Some(pid) = pid {
-                state.children.insert(key, pid);
+        let cleanup_exit = match cleanup_generation(config, &key, generation, pid, std::time::Duration::ZERO) {
+            Ok(status) => status,
+            Err(_) => {
+                if let Some(pid) = pid {
+                    state.children.insert(key, pid);
+                }
+                continue;
             }
-            continue;
-        }
-        if let Some(pid) = state.children.remove(&key) {
-            if let Ok(exit_status) = reap_child(pid) {
-                state.exit_statuses.insert(key.clone(), exit_status);
-            }
-        }
+        };
+        state.children.remove(&key);
+        state.exit_statuses.insert(key.clone(), cleanup_exit);
         state.remember_empty(key.clone());
-        if let Some(operation) = state.operations.get_mut(&identity) {
-            operation.status = terminal;
-            let _ = persist_operation(config, &session_id, &operation_id, terminal, &key, generation, &digest);
-        }
+        let _ = persist_terminal_for_key(config, state, &key, terminal);
     }
 }
 
 fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &mut BrokerState) {
-    let pending = state.operations.iter().filter_map(|(identity, operation)| {
+    let pending = state.operations.values().filter_map(|operation| {
         let terminal = match operation.status {
             OperationStatus::CleanupRequired => OperationStatus::Cancelled,
             OperationStatus::DisconnectCleanupRequired => OperationStatus::DisconnectAborted,
             _ => return None,
         };
-        Some((identity.clone(), operation.key.clone(), operation.generation, operation.request_digest.clone(), terminal))
+        Some((operation.key.clone(), operation.generation, terminal))
     }).collect::<Vec<_>>();
-    for ((session_id, operation_id), key, generation, digest, terminal) in pending {
+    for (key, generation, terminal) in pending {
         if cleanup_generation(config, &key, generation, None, std::time::Duration::ZERO).is_err() {
             continue;
         }
@@ -1844,14 +1908,11 @@ fn retry_pending_cleanups(config: &LinuxBrokerServerConfig, state: &mut BrokerSt
             }
         }
         state.remember_empty(key.clone());
-        if let Some(operation) = state.operations.get_mut(&(session_id.clone(), operation_id.clone())) {
-            operation.status = terminal;
-            let _ = persist_operation(config, &session_id, &operation_id, terminal, &key, generation, &digest);
-        }
+        let _ = persist_terminal_for_key(config, state, &key, terminal);
     }
 }
 
-fn mark_operation_terminal(
+fn persist_terminal_for_key(
     config: &LinuxBrokerServerConfig,
     state: &mut BrokerState,
     key: &str,
@@ -1860,12 +1921,22 @@ fn mark_operation_terminal(
     let identity = state.operations.iter()
         .find(|(_, operation)| operation.key == key)
         .map(|(identity, _)| identity.clone());
-    if let Some((session_id, operation_id)) = identity {
-        let operation = state.operations.get_mut(&(session_id.clone(), operation_id.clone()))
-            .expect("operation identity came from map");
-        operation.status = status;
-        persist_operation(config, &session_id, &operation_id, status, &operation.key, operation.generation, &operation.request_digest)?;
-    }
+    let (session_id, operation_id) = identity
+        .ok_or_else(|| invalid("terminal status has no durable operation identity"))?;
+    let exit_code = state.exit_statuses.get(key).copied().flatten();
+    let operation = state.operations.get_mut(&(session_id.clone(), operation_id.clone()))
+        .expect("operation identity came from map");
+    let destination = operation_record_path(config, &session_id, &operation_id)?;
+    let record = DurableOperation {
+        broker_epoch: broker_epoch()?, session_id, operation_id, status,
+        key: operation.key.clone(), generation: operation.generation,
+        request_digest: operation.request_digest.clone(),
+        exit_code,
+    };
+    let bytes = serde_json::to_vec(&record).map_err(invalid)?;
+    atomic_replace_operation_record(config, &destination, &bytes)?;
+    operation.status = status;
+    operation.exit_code = record.exit_code;
     gc_terminal_operations(config, &mut state.operations, &mut state.tombstones)?;
     Ok(())
 }
@@ -2024,12 +2095,19 @@ fn resolve_key_if_present(
 }
 
 fn valid_key(key: &str, generation: u64) -> bool {
+    if generation == 0 {
+        return false;
+    }
     let suffix = format!("-g{generation}");
     let bytes = key.as_bytes();
+    let canonical_id = bytes.get(3..35)
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .and_then(|id| uuid::Uuid::parse_str(id).ok().map(|uuid| uuid.simple().to_string() == id))
+        .unwrap_or(false);
     bytes.len() == 3 + 32 + suffix.len()
         && bytes.starts_with(b"fc-")
         && bytes.ends_with(suffix.as_bytes())
-        && bytes.get(3..35).is_some_and(|id| id.iter().all(u8::is_ascii_hexdigit))
+        && canonical_id
 }
 
 fn validate_environment(env: &[(Vec<u8>, Vec<u8>)]) -> std::io::Result<()> {
@@ -2374,24 +2452,6 @@ fn atomic_replace_named_state(
     result
 }
 
-fn persist_exit_status_for_key(
-    config: &LinuxBrokerServerConfig,
-    state: &BrokerState,
-    key: &str,
-) -> std::io::Result<()> {
-    let Some(((session_id, operation_id), _)) = state.operations.iter()
-        .find(|(_, operation)| operation.key == key)
-    else {
-        return Err(invalid("exit status has no durable operation identity"));
-    };
-    let destination = operation_record_path(config, session_id, operation_id)?;
-    let mut record: DurableOperation = serde_json::from_slice(&fs::read(&destination)?)
-        .map_err(invalid)?;
-    record.exit_code = state.exit_statuses.get(key).copied().flatten();
-    let bytes = serde_json::to_vec(&record).map_err(invalid)?;
-    atomic_replace_operation_record(config, &destination, &bytes)
-}
-
 fn broker_epoch() -> std::io::Result<String> {
     let epoch = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let epoch = epoch.trim();
@@ -2483,7 +2543,7 @@ fn is_owned_state_temporary(entry: &fs::DirEntry) -> std::io::Result<bool> {
         return Ok(false);
     }
     let max_len = if name.as_bytes().starts_with(b".replay-tombstones-") {
-        (37 + REPLAY_TOMBSTONE_BYTES) as u64
+        (37 + REPLAY_TOMBSTONE_BYTES + 32) as u64
     } else {
         MAX_FRAME as u64
     };
@@ -2525,6 +2585,9 @@ fn gc_terminal_operations(
         .map(|(identity, _)| identity.clone())
         .collect();
     if retired.is_empty() {
+        return Ok(());
+    }
+    if !tombstones.can_insert_all(retired.iter()) {
         return Ok(());
     }
     // Publish the fail-closed probabilistic tombstones before removing exact
@@ -3030,6 +3093,8 @@ mod tests {
         assert!(!valid_key("../escape-g7", 7));
         assert!(!valid_key(&format!("fc-{}-g7/child", "a".repeat(32)), 7));
         assert!(!valid_key(&format!("fc-{}é-g7", "a".repeat(30)), 7));
+        assert!(!valid_key(&format!("fc-{}-g7", "A".repeat(32)), 7));
+        assert!(!valid_key(&format!("fc-{}-g0", "a".repeat(32)), 0));
     }
 
     #[test]
@@ -3052,6 +3117,16 @@ mod tests {
         tombstones.insert("session", "operation");
         assert!(tombstones.contains("session", "operation"));
         assert!(!tombstones.contains("session", "different-operation"));
+    }
+
+    #[test]
+    fn replay_tombstones_stop_compacting_before_saturation() {
+        let tombstones = ReplayTombstones {
+            epoch: uuid::Uuid::nil().to_string(),
+            bits: vec![u8::MAX; REPLAY_TOMBSTONE_BYTES],
+        };
+        let identities = [("session".to_owned(), "operation".to_owned())];
+        assert!(!tombstones.can_insert_all(identities.iter()));
     }
 
     #[test]
@@ -3144,6 +3219,13 @@ mod tests {
     fn disconnect_terminal_is_not_a_successful_exit() {
         assert!(!matches!(OperationStatus::DisconnectAborted, OperationStatus::Exited));
         assert!(!matches!(OperationStatus::DisconnectCleanupRequired, OperationStatus::Committed));
+        let response = Response::Exited {
+            version: PROTOCOL_VERSION,
+            status: OperationStatus::DisconnectAborted,
+            exit_code: Some(137),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("\"status\":\"disconnect_aborted\""));
     }
 
     #[test]

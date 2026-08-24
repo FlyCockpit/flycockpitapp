@@ -226,38 +226,31 @@ jobs:
       - name: Build artifacts
         shell: bash
         run: |
-          rm -f target/dist/cockpit-containment-broker
-          contains_linux=0
-          contains_other=0
           for target in ${{ join(matrix.targets, ' ') }}; do
             case "$target" in
               *linux*)
-                contains_linux=1
                 cargo build --locked --release --target "$target" -p cockpit-cli \
                   --bin cockpit-containment-broker --features linux-containment-broker-bin
-                cp "target/$target/release/cockpit-containment-broker" \
-                  target/dist/cockpit-containment-broker
                 ;;
-              *) contains_other=1 ;;
+              *) ;;
             esac
           done
-          if [ "$contains_linux" -eq 1 ] && [ "$contains_other" -eq 1 ]; then
-            echo "::error::cargo-dist must not co-build Linux and non-Linux archives when staging the privileged broker"
-            exit 1
-          fi
-          # The broker is now a normal cargo-dist include. Dist reads it while
-          # constructing the archive, so its archive digest, checksum sidecar,
-          # installer metadata, and manifest all describe the same immutable
-          # bytes. No release-owned archive is rewritten after this command.
           dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > target/distrib/dist-manifest.json
           echo "dist ran successfully"
 
-      - name: Verify target-specific containment archives
+      - name: Assemble and verify target-specific containment bundles
         shell: bash
         run: |
-          case "${{ join(matrix.targets, ' ') }}" in
-            *linux*) python3 apps/cli/scripts/verify-linux-containment-archive.py target/distrib ;;
-          esac
+          for target in ${{ join(matrix.targets, ' ') }}; do
+            case "$target" in
+              *linux*)
+                apps/cli/scripts/assemble-linux-containment-bundle.sh \
+                  "$target" "${{ needs.plan-cli-release.outputs.tag }}" target/distrib
+                python3 apps/cli/scripts/verify-linux-containment-archive.py \
+                  target/distrib "$target" "${{ needs.plan-cli-release.outputs.tag }}"
+                ;;
+            esac
+          done
 
       - id: cargo-dist
         name: Post-build
@@ -265,6 +258,9 @@ jobs:
         run: |
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest target/distrib/dist-manifest.json >> "$GITHUB_OUTPUT"
+          find target/distrib -maxdepth 1 -type f \
+            \( -name 'flycockpit-containment-*.tar.gz' -o -name 'flycockpit-containment-*.tar.gz.sha256' \) \
+            -print >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp target/distrib/dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -381,6 +377,18 @@ jobs:
         shell: bash
         run: |
           dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > target/distrib/dist-manifest.json
+          containment_assets=$(find target/distrib -maxdepth 1 -type f \
+            \( -name 'flycockpit-containment-*.tar.gz' -o -name 'flycockpit-containment-*.tar.gz.sha256' \) \
+            -print | sort)
+          if [ "$(printf '%s\n' "$containment_assets" | sed '/^$/d' | wc -l)" -ne 4 ]; then
+            echo "::error::expected two target-specific containment bundles and two checksums"
+            exit 1
+          fi
+          # These independently checksummed Linux-only bundles deliberately do
+          # not enter cargo-dist's cross-platform include graph.
+          printf '%s\n' "$containment_assets" | while IFS= read -r asset; do
+            gh release upload "${{ needs.plan-cli-release.outputs.tag }}" "$asset" --clobber
+          done
           echo "artifacts uploaded and released successfully"
           cat target/distrib/dist-manifest.json
           echo "manifest=$(jq -c "." target/distrib/dist-manifest.json)" >> "$GITHUB_OUTPUT"

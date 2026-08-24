@@ -2876,11 +2876,11 @@ async fn no_context_length_makes_ctx_gated_paths_inert() {
 /// A registry with BOTH `preCompact` and `postCompact` hooks matched on the
 /// `manual` compact source. Commands are unresolvable (fail-open) so no real
 /// process spawns; each firing still records one `hook_run` row.
-fn compact_manual_registry() -> crate::config::extended::hooks::HookRegistry {
+fn compact_registry(matcher: &str) -> crate::config::extended::hooks::HookRegistry {
     use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
     let hook = |event: HookEvent| ResolvedHook {
         event,
-        matcher: Some(["manual".to_string()].into_iter().collect()),
+        matcher: Some([matcher.to_string()].into_iter().collect()),
         command: vec!["cockpit-compact-hook-does-not-exist".to_string()],
         timeout_secs: 5,
         env: std::collections::BTreeMap::new(),
@@ -2892,6 +2892,10 @@ fn compact_manual_registry() -> crate::config::extended::hooks::HookRegistry {
         hooks: vec![hook(HookEvent::PreCompact), hook(HookEvent::PostCompact)],
         warnings: Vec::new(),
     }
+}
+
+fn compact_manual_registry() -> crate::config::extended::hooks::HookRegistry {
+    compact_registry("manual")
 }
 
 /// The ordered event keys of the `preCompact` / `postCompact` `hook_run` rows.
@@ -2909,8 +2913,7 @@ async fn compact_hook_event_order(driver: &Driver) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
-async fn compact_hooks_fire_pre_before_post_only_on_success() {
+pub(crate) async fn probe_compact_boundaries() {
     // Pin the transactional preCompact/postCompact contract over the
     // real `do_compact_with_source` boundary:
     //   prepare-fail → 0 pre + 0 post (no compaction attempted)
@@ -2973,5 +2976,65 @@ async fn compact_hooks_fire_pre_before_post_only_on_success() {
         compact_hook_event_order(&driver).await,
         vec!["preCompact".to_string(), "postCompact".to_string()],
         "preCompact must be recorded strictly before postCompact"
+    );
+
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_registry("auto"));
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    driver.do_compact_with_source(&tx, "manual").await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    assert!(
+        compact_hook_event_order(&driver).await.is_empty(),
+        "auto-only compact hooks must not fire at the manual production boundary"
+    );
+}
+
+#[tokio::test]
+async fn compact_hooks_fire_pre_before_post_only_on_success() {
+    probe_compact_boundaries().await;
+}
+
+#[tokio::test]
+async fn compact_recovery_intent_commits_before_projection_and_posts_once() {
+    let (mut driver, _tmp) = prepare_apply_fixture().await;
+    inject_hooks(&mut driver, compact_manual_registry());
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let prepared = driver
+        .prepare_compaction_with_source(&tx, "manual")
+        .await
+        .expect("prepare succeeds");
+    let expected_history = prepared.history.clone();
+    let intent = DurableCompactionShadow::PreparedCompaction(Box::new(prepared));
+    driver
+        .session
+        .db
+        .upsert_compaction_shadow(
+            driver.session.id,
+            &serde_json::to_string(&intent).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    driver.load_compaction_shadow_from_store().await;
+    assert!(driver.recovered_compaction_intent.is_some());
+    driver.recover_compaction_intent(&tx).await;
+    drop(tx);
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(driver.stack[0].history, expected_history);
+    assert_eq!(
+        compact_hook_event_order(&driver).await,
+        vec!["preCompact".to_string(), "postCompact".to_string()]
+    );
+    assert!(
+        driver
+            .session
+            .db
+            .compaction_shadow(driver.session.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "successful recovery clears its durable intent"
     );
 }

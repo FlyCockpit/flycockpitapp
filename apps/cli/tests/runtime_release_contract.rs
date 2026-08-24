@@ -9,6 +9,8 @@ const CATALOG: &str = include_str!("../../../crates/cockpit-core/src/external_ru
 const GENERATOR: &str = include_str!("../scripts/generate-release-assets.sh");
 const CONTAINMENT_INSTALLER: &str = include_str!("../scripts/install-linux-containment-broker.sh");
 const CONTAINMENT_ARCHIVE_CHECK: &str = include_str!("../scripts/verify-linux-containment-archive.py");
+const CONTAINMENT_BUNDLE_ASSEMBLER: &str =
+    include_str!("../scripts/assemble-linux-containment-bundle.sh");
 const BROKER_UNIT: &str = include_str!("../../../infra/systemd/cockpit-containment-broker@.service");
 const DAEMON_UNIT: &str = include_str!("../../../infra/systemd/cockpit-daemon@.service");
 const SHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.sh");
@@ -97,8 +99,8 @@ fn runtime_release_contract_tests() {
 #[test]
 fn containment_installer_is_transactional_and_units_support_reconnect() {
     for needle in [
-        "broker_was_enabled",
-        "daemon_was_enabled",
+        "broker_enablement",
+        "daemon_enablement",
         "detached_was_active",
         "payload_root=",
         "trap 'exit 129' HUP",
@@ -107,21 +109,26 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
         "daemon status --json",
         "containment broker did not publish the authenticated socket contract",
         "--doctor --allowed-uid",
+        "systemd-run --quiet --wait --collect",
+        "retry 30 broker_protocol_ready",
     ] {
         assert!(CONTAINMENT_INSTALLER.contains(needle), "missing installer contract: {needle}");
     }
     assert!(DAEMON_UNIT.contains("Wants=cockpit-containment-broker@%i.service"));
     assert!(!DAEMON_UNIT.contains("BindsTo=cockpit-containment-broker@%i.service"));
+    assert!(DAEMON_UNIT.contains("ExecStartPost=/usr/libexec/flycockpit/cockpit-containment-broker --doctor"));
+    assert!(DAEMON_UNIT.contains("--capability-fd 3"));
     assert!(!BROKER_UNIT.contains("ProcSubset=pid"));
-    assert!(WORKFLOW.contains("Verify target-specific containment archives"));
-    assert!(DIST.contains("target/dist/cockpit-containment-broker"));
-    assert!(WORKFLOW.contains("No release-owned archive is rewritten"));
+    assert!(WORKFLOW.contains("Assemble and verify target-specific containment bundles"));
+    assert!(WORKFLOW.contains("gh release upload"));
+    assert!(WORKFLOW.contains("expected two target-specific containment bundles and two checksums"));
+    assert!(!DIST.contains("cockpit-containment-broker"));
+    assert!(!DIST.contains("install-linux-containment-broker.sh"));
     assert!(!WORKFLOW.contains("assemble-linux-containment-archive.py"));
     assert!(WORKFLOW.contains("--features linux-containment-broker-bin"));
-    let broker_stage = WORKFLOW.find("target/dist/cockpit-containment-broker").unwrap();
     let dist_build = WORKFLOW.find("dist build ${{ needs.plan-cli-release.outputs.tag-flag }}").unwrap();
     let archive_verify = WORKFLOW.find("verify-linux-containment-archive.py").unwrap();
-    assert!(broker_stage < dist_build && dist_build < archive_verify);
+    assert!(dist_build < archive_verify);
     let binary_stage = CONTAINMENT_INSTALLER.find("stage_install \"$payload_cli\"").unwrap();
     let unit_verify = CONTAINMENT_INSTALLER.find("systemd-analyze verify /usr/lib").unwrap();
     assert!(binary_stage < unit_verify);
@@ -135,7 +142,50 @@ fn containment_installer_is_transactional_and_units_support_reconnect() {
     }
     for payload in ["cockpit", "cockpit-containment-broker", "install-linux-containment-broker.sh"] {
         assert!(CONTAINMENT_ARCHIVE_CHECK.contains(payload));
+        assert!(CONTAINMENT_BUNDLE_ASSEMBLER.contains(payload));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_containment_bundle_fixture_has_exact_target_checksum_and_payload() {
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/distrib")
+        .join(format!("containment-bundle-fixture-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let binaries = root.join("binaries/x86_64-unknown-linux-gnu/release");
+    let output = root.join("output");
+    fs::create_dir_all(&binaries).unwrap();
+    for binary in ["cockpit", "cockpit-containment-broker"] {
+        let path = binaries.join(binary);
+        let mut elf = vec![0_u8; 20];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4..6].copy_from_slice(b"\x02\x01");
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        fs::write(&path, elf).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let assembler = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/assemble-linux-containment-bundle.sh");
+    let verifier = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/verify-linux-containment-archive.py");
+    assert!(Command::new("sh")
+        .arg(assembler)
+        .args(["x86_64-unknown-linux-gnu", "v-fixture"])
+        .arg(&output)
+        .env("FLYCOCKPIT_BUNDLE_BINARY_ROOT", root.join("binaries"))
+        .status().unwrap().success());
+    assert!(Command::new("python3")
+        .arg(&verifier).arg(&output)
+        .args(["x86_64-unknown-linux-gnu", "v-fixture"])
+        .status().unwrap().success());
+    assert!(!Command::new("python3")
+        .arg(verifier).arg(&output)
+        .args(["x86_64-apple-darwin", "v-fixture"])
+        .status().unwrap().success());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

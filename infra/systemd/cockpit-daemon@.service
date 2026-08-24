@@ -9,6 +9,10 @@ Type=simple
 User=%i
 OpenFile=/etc/flycockpit/containment-capability-%i:flycockpit-containment-capability:read-only
 ExecStart=/usr/bin/cockpit daemon start --foreground
+# A daemon unit is not ready merely because its process exists. Run the same
+# authenticated broker handshake under User=%i with the service-manager-opened
+# capability before systemd may classify this unit as active.
+ExecStartPost=/usr/libexec/flycockpit/cockpit-containment-broker --doctor --allowed-uid %i --socket /run/flycockpit/containment-broker-%i.sock --capability-fd 3
 Restart=on-failure
 RestartSec=1s
 NoNewPrivileges=yes

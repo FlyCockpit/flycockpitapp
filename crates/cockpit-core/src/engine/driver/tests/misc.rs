@@ -258,6 +258,10 @@ fn submission_origin_user_prompt_source_only_fires_for_external_user() {
     // fire as `"user"` for a goal or scheduled auto-turn.
     use crate::engine::message::SubmissionOrigin as O;
     assert_eq!(O::ExternalRoot.user_prompt_submit_source(), Some("user"));
+    assert_eq!(
+        O::ExternalRootQueued.user_prompt_submit_source(),
+        Some("queued")
+    );
     for host in [
         O::GoalContinuation,
         O::ScheduledJob,
@@ -275,8 +279,7 @@ fn submission_origin_user_prompt_source_only_fires_for_external_user() {
     }
 }
 
-#[tokio::test]
-async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
+pub(crate) async fn probe_user_prompt_submit_boundary() {
     // Drive the record boundary directly with each resolved source. `user`
     // fires one row; a `queued`-only hook does not fire for `user` (exact
     // matcher); and `None` (a host/goal/scheduled origin) fires ZERO rows even
@@ -344,7 +347,11 @@ async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
 }
 
 #[tokio::test]
-async fn stop_failure_hook_fires_on_inference_error_class() {
+async fn user_prompt_submit_hook_fires_only_for_external_user_source() {
+    probe_user_prompt_submit_boundary().await;
+}
+
+pub(crate) async fn probe_stop_failure_boundary() {
     // The production `run_stop_failure_hooks` helper (the exact call the two
     // inference-failure arms make before unwinding) fires a `stopFailure` hook
     // matched on the error-class token, and does not fire on a lookalike class.
@@ -383,6 +390,11 @@ async fn stop_failure_hook_fires_on_inference_error_class() {
     );
 }
 
+#[tokio::test]
+async fn stop_failure_hook_fires_on_inference_error_class() {
+    probe_stop_failure_boundary().await;
+}
+
 // ---------------------------------------------------------------------------
 // Interactive subagent lifecycle observe-hook boundary wiring
 // (subagentStart / subagentStop). These drive the REAL driver production
@@ -394,8 +406,7 @@ async fn stop_failure_hook_fires_on_inference_error_class() {
 // pushes a child whose agent name is `builder`.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
+pub(crate) async fn probe_subagent_stop_boundary() {
     // Drive the real success-pop boundary: a `subagentStop` hook matched on the
     // child agent type fires exactly once when the child frame is popped.
     let (mut driver, _tmp) = test_driver_without_network(8);
@@ -440,6 +451,11 @@ async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
 }
 
 #[tokio::test]
+async fn subagent_stop_hook_fires_on_interactive_child_success_pop() {
+    probe_subagent_stop_boundary().await;
+}
+
+#[tokio::test]
 async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
     // Drive the real abort/teardown boundary: a cancelled parent turn unwinds
     // the child stack, which must STILL fire `subagentStop` so every started
@@ -471,8 +487,7 @@ async fn subagent_stop_hook_fires_on_interactive_child_abort_unwind() {
     while rx.recv().await.is_some() {}
 }
 
-#[tokio::test]
-async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
+pub(crate) async fn probe_subagent_start_boundary() {
     // The production `fire_subagent_hook` helper (the exact call the interactive
     // spawn boundary makes) fires a `subagentStart` hook matched on the child
     // agent type, and does not fire on a different-agent-type lookalike.
@@ -510,6 +525,11 @@ async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
             .is_empty(),
         "an explore-only hook must not fire on a builder child spawn"
     );
+}
+
+#[tokio::test]
+async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
+    probe_subagent_start_boundary().await;
 }
 
 #[tokio::test]

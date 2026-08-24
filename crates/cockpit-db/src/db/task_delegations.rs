@@ -115,7 +115,11 @@ impl From<TaskDelegationJobUpsert<'_>> for TaskDelegationJobWrite {
                 .iter()
                 .map(|child| DelegationChildInitOwned {
                     label: child.label.to_owned(),
-                    child_uuid: delegation_child_lifecycle_id(&task_call_id, child.label),
+                    child_uuid: delegation_child_lifecycle_id_for_session(
+                        value.session_id,
+                        &task_call_id,
+                        child.label,
+                    ),
                     child_agent: child.child_agent.to_owned(),
                     model: child.model.map(str::to_owned),
                     output_dir: child.output_dir.map(str::to_owned),
@@ -131,9 +135,15 @@ impl From<TaskDelegationJobUpsert<'_>> for TaskDelegationJobWrite {
 /// Canonical durable identity for one concrete child of a task call. The
 /// value is stable across retries/recovery and unique within a batch; callers
 /// use this same id for lifecycle start, stop and recovery correlation.
-pub fn delegation_child_lifecycle_id(task_call_id: &str, label: &str) -> String {
+pub fn delegation_child_lifecycle_id_for_session(
+    session_id: Uuid,
+    task_call_id: &str,
+    label: &str,
+) -> String {
     const NAMESPACE: Uuid = Uuid::from_u128(0x8a4d_56a9_87bf_4f55_aa4d_aeb1_536e_96f0);
-    let mut name = Vec::with_capacity(task_call_id.len() + label.len() + 1);
+    let mut name = Vec::with_capacity(16 + task_call_id.len() + label.len() + 2);
+    name.extend_from_slice(session_id.as_bytes());
+    name.push(0);
     name.extend_from_slice(task_call_id.as_bytes());
     name.push(0);
     name.extend_from_slice(label.as_bytes());
@@ -1012,14 +1022,35 @@ mod tests {
 
     #[test]
     fn child_lifecycle_identity_is_stable_and_label_scoped() {
-        let first = delegation_child_lifecycle_id("task-call", "left");
+        let test_session = Uuid::nil();
+        let first =
+            delegation_child_lifecycle_id_for_session(test_session, "task-call", "left");
         assert_eq!(
             first,
-            delegation_child_lifecycle_id("task-call", "left")
+            delegation_child_lifecycle_id_for_session(test_session, "task-call", "left")
         );
-        assert_ne!(first, delegation_child_lifecycle_id("task-call", "right"));
-        assert_ne!(first, delegation_child_lifecycle_id("other-call", "left"));
+        assert_ne!(
+            first,
+            delegation_child_lifecycle_id_for_session(test_session, "task-call", "right")
+        );
+        assert_ne!(
+            first,
+            delegation_child_lifecycle_id_for_session(test_session, "other-call", "left")
+        );
         assert!(Uuid::parse_str(&first).is_ok());
+
+        let session_a = Uuid::from_u128(1);
+        let session_b = Uuid::from_u128(2);
+        let scoped = delegation_child_lifecycle_id_for_session(session_a, "task-call", "left");
+        assert_eq!(
+            scoped,
+            delegation_child_lifecycle_id_for_session(session_a, "task-call", "left")
+        );
+        assert_ne!(
+            scoped,
+            delegation_child_lifecycle_id_for_session(session_b, "task-call", "left"),
+            "lifecycle ids must remain globally unique when providers reuse call ids across sessions"
+        );
     }
 
     async fn seed_job(db: &Db, task_call_id: &str, children: &[&str]) -> Uuid {

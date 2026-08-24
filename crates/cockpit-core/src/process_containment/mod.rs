@@ -39,7 +39,7 @@ pub use linux::{
 #[cfg(target_os = "linux")]
 pub use linux_broker::{
     LinuxBrokerConfig, LinuxBrokerServerConfig, doctor_linux_containment_broker,
-    run_linux_containment_broker,
+    prepare_linux_containment_broker_cgroup_root, run_linux_containment_broker,
 };
 #[cfg(target_os = "linux")]
 pub fn inherited_linux_broker_capability_fd() -> Option<std::os::fd::RawFd> {

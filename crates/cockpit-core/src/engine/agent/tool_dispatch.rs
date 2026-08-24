@@ -1583,7 +1583,7 @@ fn render_unavailable_tool_artifact_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::approval::{Approver, store::GrantStore};
     use crate::config::extended::ApprovalMode;
@@ -2575,6 +2575,194 @@ mod tests {
             .filter(|e| e.kind == "hook_run" && e.data["event"] == "permissionDenied")
             .map(|e| e.data["tool_name"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    pub(crate) async fn production_tool_lifecycle_hook_probe(
+    ) -> [crate::config::extended::hooks::HookEvent; 4] {
+        use crate::config::extended::hooks::{HookEvent, HookOrigin, HookRegistry, ResolvedHook};
+
+        fn registry(entries: &[(HookEvent, &str)]) -> HookRegistry {
+            HookRegistry {
+                hooks: entries
+                    .iter()
+                    .map(|(event, matcher)| ResolvedHook {
+                        event: *event,
+                        matcher: Some([(*matcher).to_string()].into_iter().collect()),
+                        command: vec!["cockpit-tool-hook-does-not-exist".to_string()],
+                        timeout_secs: 5,
+                        env: std::collections::BTreeMap::new(),
+                        origin: HookOrigin::for_test("project:abcdef0123456789:0"),
+                        source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
+                        source_directory: std::path::PathBuf::from("/tmp/test"),
+                    })
+                    .collect(),
+                warnings: Vec::new(),
+            }
+        }
+
+        async fn rows(session: &Session) -> Vec<String> {
+            session
+                .db
+                .list_session_events(session.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.kind == "hook_run")
+                .filter_map(|row| row.data["event"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        async fn dispatch(
+            tool: Arc<dyn crate::engine::tool::Tool>,
+            registry: &HookRegistry,
+        ) -> Vec<String> {
+            let tmp = tempfile::tempdir().unwrap();
+            let name = tool.name().to_string();
+            let tools = ToolBox::new().with(tool);
+            let agent = test_agent(tools.clone());
+            let session = test_session(tmp.path());
+            let model = test_model();
+            let (tx, _rx) = mpsc::channel(8);
+            let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+            let env = DispatchEnv {
+                agent: &agent,
+                session: &session,
+                model: &model,
+                active_tools: &tools,
+                ctx: &ctx,
+                tx: &tx,
+                hint_corrections: false,
+                loop_guard_threshold: 10,
+                hooks: registry,
+                cwd: tmp.path(),
+            };
+            let args = if name == "echo" {
+                serde_json::json!({ "text": "ok" })
+            } else {
+                serde_json::json!({})
+            };
+            let call = tool_call(&name, args);
+            let mut history = Vec::new();
+            push_assistant_call(&mut history, &call);
+            execute_ordinary_call(&env, &mut history, &call, &name, Recovery::Clean, None)
+                .await
+                .unwrap();
+            rows(&session).await
+        }
+
+        let success = dispatch(
+            Arc::new(EchoTool),
+            &registry(&[
+                (HookEvent::PreToolUse, "echo"),
+                (HookEvent::PostToolUse, "echo"),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            success,
+            vec![
+                HookEvent::PreToolUse.key().to_string(),
+                HookEvent::PostToolUse.key().to_string(),
+            ]
+        );
+
+        let failure = dispatch(
+            Arc::new(FailTool),
+            &registry(&[(HookEvent::PostToolUseFailure, "fail")]),
+        )
+        .await;
+        assert_eq!(
+            failure,
+            vec![HookEvent::PostToolUseFailure.key().to_string()]
+        );
+
+        let failure_lookalike = dispatch(
+            Arc::new(FailTool),
+            &registry(&[(HookEvent::PostToolUseFailure, "echo")]),
+        )
+        .await;
+        assert!(failure_lookalike.is_empty());
+
+        let lookalike = dispatch(
+            Arc::new(EchoTool),
+            &registry(&[
+                (HookEvent::PreToolUse, "fail"),
+                (HookEvent::PostToolUse, "fail"),
+            ]),
+        )
+        .await;
+        assert!(lookalike.is_empty());
+
+        // Permission denial is driven through the same ordinary DispatchEnv
+        // review-cage branch used in production, not its hook helper.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let denied_registry = registry(&[(HookEvent::PermissionDenied, "echo")]);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &denied_registry,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "blocked" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&session).await,
+            vec![HookEvent::PermissionDenied.key().to_string()]
+        );
+
+        let session = test_session(tmp.path());
+        let (tx, _rx) = mpsc::channel(8);
+        let mut ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        ctx.review_cage = Some(crate::engine::tool::ReviewCage::skills_review());
+        let denied_lookalike_registry = registry(&[(HookEvent::PermissionDenied, "fail")]);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &denied_lookalike_registry,
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": "blocked" }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+        assert!(rows(&session).await.is_empty());
+
+        [
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::PostToolUseFailure,
+            HookEvent::PermissionDenied,
+        ]
+    }
+
+    #[tokio::test]
+    async fn production_tool_lifecycle_hooks_fire_at_dispatch_env_seams() {
+        assert_eq!(production_tool_lifecycle_hook_probe().await.len(), 4);
     }
 
     #[tokio::test]

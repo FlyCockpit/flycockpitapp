@@ -767,6 +767,11 @@ pub struct Driver {
     /// its cancellation token and task; dropping it aborts the utility work so
     /// no stale completion can publish after session teardown.
     shadow_brief: Option<ShadowBriefState>,
+    /// A validated compaction transaction recovered from the durable intent
+    /// slot. It is completed at driver-loop bootstrap before accepting new
+    /// work, so a crash after `preCompact` cannot expose the predecessor as if
+    /// no compaction had been requested.
+    recovered_compaction_intent: Option<PreparedCompaction>,
     shadow_brief_generation: u64,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
@@ -1500,6 +1505,7 @@ impl Driver {
             auto_compact_gate: self.auto_compact_gate.clone(),
             prune_effectiveness: self.prune_effectiveness.clone(),
             shadow_brief: None,
+            recovered_compaction_intent: None,
             shadow_brief_generation: 0,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
@@ -1826,6 +1832,7 @@ impl Driver {
             auto_compact_gate: AutoCompactGate::default(),
             prune_effectiveness: std::collections::VecDeque::new(),
             shadow_brief: None,
+            recovered_compaction_intent: None,
             shadow_brief_generation: 0,
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
@@ -3396,6 +3403,7 @@ impl Driver {
         // have `tx`. Done before the first message so no job can start
         // (and thus emit a started/progress signal) beforehand.
         self.schedule.set_turn_tx(tx.clone());
+        self.recover_compaction_intent(tx).await;
         self.emit_command_capability_notice_if_new(tx).await;
 
         // Resume rehydration (implementation note): if a
@@ -5380,7 +5388,7 @@ impl Driver {
                 // A fold is a genuine queued-USER submission — fire `queued`
                 // only when the folded submission is itself an external user
                 // origin, never for a host-driven origin that reached the batch.
-                folded.origin.user_prompt_submit_source().map(|_| "queued"),
+                folded.origin.user_prompt_submit_source(),
             )
             .await
         {
@@ -9122,7 +9130,8 @@ impl Driver {
                         answering: Some(PendingTaskCall {
                             call_id: task_call_id.clone(),
                             lifecycle_id:
-                                crate::db::task_delegations::delegation_child_lifecycle_id(
+                                crate::db::task_delegations::delegation_child_lifecycle_id_for_session(
+                                    self.session.id,
                                     &task_call_id,
                                     "default",
                                 ),
@@ -10105,4 +10114,4 @@ pub(crate) const EXPLORE_MAX_TURNS: usize = 64;
 pub(crate) const DELEGATION_RETRY_BUDGET_PER_TURN: usize = 4;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -21,6 +21,59 @@ const PARK_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 const TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// Single production-owned dispatch seam for the two Worker lifecycle edges.
+/// Keeping the matcher-to-envelope projection here lets the aggregate hook
+/// harness exercise the exact code called by Worker startup and teardown.
+pub(crate) enum WorkerLifecycleHook<'a> {
+    Start(&'a str),
+    End(&'a str),
+}
+
+pub(crate) async fn fire_worker_lifecycle_hook(
+    runner: &crate::engine::agent::hooks::TokioCommandRunner,
+    registry: &crate::config::extended::hooks::HookRegistry,
+    boundary: WorkerLifecycleHook<'_>,
+    session: &Session,
+    project_root: &std::path::Path,
+) {
+    use crate::config::extended::hooks::HookEvent;
+
+    let (event, matcher, fields) = match boundary {
+        WorkerLifecycleHook::Start(matcher) => (
+            HookEvent::SessionStart,
+            matcher,
+            crate::engine::agent::hooks::ObserveFields {
+                start_source: Some(matcher),
+                ..Default::default()
+            },
+        ),
+        WorkerLifecycleHook::End(matcher) => (
+            HookEvent::SessionEnd,
+            matcher,
+            crate::engine::agent::hooks::ObserveFields {
+                end_reason: Some(matcher),
+                ..Default::default()
+            },
+        ),
+    };
+    crate::engine::agent::hooks::run_observe_hooks(
+        runner,
+        &crate::engine::agent::hooks::DefaultProcessEnv,
+        registry,
+        event,
+        matcher,
+        session.id,
+        project_root,
+        &session.db,
+        None,
+        None,
+        None,
+        None,
+        fields,
+    )
+    .await;
+}
+
 pub(super) fn persistent_llm_mode_control(
     mode: crate::config::extended::LlmMode,
 ) -> crate::engine::driver::DriverControl {
@@ -1859,23 +1912,12 @@ pub(super) async fn run_worker(
             crate::engine::agent::hooks::TokioCommandRunner::new,
             crate::engine::agent::hooks::TokioCommandRunner::with_containment,
         );
-        crate::engine::agent::hooks::run_observe_hooks(
+        fire_worker_lifecycle_hook(
             &hook_runner,
-            &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
-            crate::config::extended::hooks::HookEvent::SessionStart,
-            start_source,
-            session.id,
+            WorkerLifecycleHook::Start(start_source),
+            &session,
             &project_root,
-            &session.db,
-            None,
-            None,
-            None,
-            None,
-            crate::engine::agent::hooks::ObserveFields {
-                start_source: Some(start_source),
-                ..Default::default()
-            },
         )
         .await;
     }
@@ -3215,6 +3257,40 @@ pub(super) async fn run_worker(
                     }
                     cancel_handle.cancel();
                 }
+                SessionWork::CancelAndStop => {
+                    tracing::info!(session_id = %session_id, "terminal session cancellation requested");
+                    if let Some(staged) = driver_input_queue.stage_discard_pending().await {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Cancelled;
+                        match persist_staged_terminal_removal(
+                            &session,
+                            &driver_input_queue,
+                            staged,
+                            disposition,
+                        )
+                        .await
+                        {
+                            Ok((_, _, receipts)) => send_terminal_receipts_event(
+                                &event_tx,
+                                &redaction,
+                                session_id,
+                                &receipts,
+                                disposition,
+                            ),
+                            Err(_) => send_current_event(
+                                &event_tx,
+                                &redaction,
+                                proto::Event::Notice {
+                                    session_id,
+                                    text: "Could not durably cancel queued messages; their exact payloads remain held. Retry cancellation after storage recovers."
+                                        .to_string(),
+                                },
+                            ),
+                        }
+                    }
+                    cancel_handle.cancel();
+                    break WorkerStop::Cancelled;
+                }
                 SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,
@@ -4314,23 +4390,12 @@ pub(super) async fn run_worker(
             crate::engine::agent::hooks::TokioCommandRunner::new,
             crate::engine::agent::hooks::TokioCommandRunner::with_containment,
         );
-        crate::engine::agent::hooks::run_observe_hooks(
+        fire_worker_lifecycle_hook(
             &hook_runner,
-            &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
-            crate::config::extended::hooks::HookEvent::SessionEnd,
-            end_matcher,
-            session.id,
+            WorkerLifecycleHook::End(end_matcher),
+            &session,
             &project_root,
-            &session.db,
-            None,
-            None,
-            None,
-            None,
-            crate::engine::agent::hooks::ObserveFields {
-                end_reason: Some(end_matcher),
-                ..Default::default()
-            },
         )
         .await;
     }

@@ -1505,6 +1505,52 @@ mod tests {
         }
     }
 
+    /// End-to-end teardown race: once the producer has published its start
+    /// marker it is not allowed to enter the child model loop until the driver
+    /// acknowledges that `subagentStart` is durably dispatched. Teardown must
+    /// cancel that rendezvous, join the producer, and leave one ordered
+    /// terminal for the driver without manufacturing a completed stop gate.
+    #[tokio::test]
+    async fn swarm_teardown_cancels_unacknowledged_start_and_joins_terminally() {
+        let (mut auth, mut events, _ui, _tmp) = test_authority(8);
+        auth.set_swarm_max_concurrency(1);
+        let mut spec = swarm_spec(1);
+        spec.worker = SpawnWorkerKind::Bee;
+        assert!(auth.spawn_swarm(spec).contains("scheduled"));
+
+        let first = events.recv().await.expect("swarm start marker");
+        let lifecycle_latch = match first {
+            ScheduleEvent::SwarmChildStarted {
+                lifecycle_event_emitted,
+                start_ack,
+                ..
+            } => {
+                // Keep the acknowledgement sender alive: this proves teardown
+                // is released by its cancellation token, not channel closure.
+                let _unreleased_ack = start_ack;
+                let latch = lifecycle_event_emitted;
+                auth.settle_swarm_for_teardown().await;
+                latch
+            }
+            other => panic!("expected SwarmChildStarted, got {other:?}"),
+        };
+
+        assert_eq!(auth.running_swarm, 0);
+        assert!(auth.swarm_tasks.is_empty());
+        assert!(
+            !lifecycle_latch.load(std::sync::atomic::Ordering::Acquire),
+            "a child cancelled before start acknowledgement cannot claim its stop gate"
+        );
+        match events.recv().await.expect("ordered teardown terminal") {
+            ScheduleEvent::Completed {
+                kind: ScheduleKind::Swarm,
+                failed: false,
+                ..
+            } => {}
+            other => panic!("expected cancelled swarm terminal, got {other:?}"),
+        }
+    }
+
     /// The global recursive-`Swarm` concurrency cap (GOALS §24) starts
     /// jobs up to the cap and queues the rest; a completion frees a slot and
     /// drains one queued spawn. Asserted synchronously right after each call

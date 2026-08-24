@@ -1678,12 +1678,7 @@ impl SessionRegistry {
         };
         let Some(mut join) = join else {
             let _ = handle
-                .send_work(crate::daemon::session_worker::SessionWork::Cancel)
-                .await;
-            let _ = handle
-                .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
-                    pause_for_resume: false,
-                })
+                .send_work(crate::daemon::session_worker::SessionWork::CancelAndStop)
                 .await;
             return self
                 .wait_for_missing_join_shutdown(session_id, generation, &handle, timeout)
@@ -1691,12 +1686,7 @@ impl SessionRegistry {
         };
 
         let _ = handle
-            .send_work(crate::daemon::session_worker::SessionWork::Cancel)
-            .await;
-        let _ = handle
-            .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
-                pause_for_resume: false,
-            })
+            .send_work(crate::daemon::session_worker::SessionWork::CancelAndStop)
             .await;
 
         match tokio::time::timeout(timeout, &mut join).await {

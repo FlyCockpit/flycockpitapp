@@ -146,6 +146,36 @@ struct TransactionRollbackFailed {
     rollback: rusqlite::Error,
 }
 
+#[cfg(test)]
+static FORCED_ROLLBACK_FAILURE_DB: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn force_rollback_failure_for_test(database: Option<String>) {
+    *FORCED_ROLLBACK_FAILURE_DB
+        .lock()
+        .expect("rollback failure hook poisoned") = database;
+}
+
+fn rollback_transaction(conn: &Connection) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    {
+        let database: String = conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut forced = FORCED_ROLLBACK_FAILURE_DB
+            .lock()
+            .expect("rollback failure hook poisoned");
+        if forced.as_deref() == Some(database.as_str()) {
+            *forced = None;
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    conn.execute_batch("ROLLBACK;")
+}
+
 #[derive(Clone)]
 struct Writer {
     inner: Arc<WriterInner>,
@@ -811,7 +841,7 @@ where
         Ok(Ok(value)) => {
             if let Err(error) = conn.execute_batch("COMMIT;") {
                 let primary = anyhow::Error::new(error).context("committing db transaction");
-                match conn.execute_batch("ROLLBACK;") {
+                match rollback_transaction(conn) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
                 }
@@ -820,14 +850,14 @@ where
             }
         }
         Ok(Err(error)) => {
-            match conn.execute_batch("ROLLBACK;") {
+            match rollback_transaction(conn) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(TransactionRollbackFailed { primary: error, rollback }.into()),
             }
         }
         Err(_) => {
             let primary = anyhow::anyhow!("db transaction job panicked");
-            match conn.execute_batch("ROLLBACK;") {
+            match rollback_transaction(conn) {
                 Ok(()) => Err(primary),
                 Err(rollback) => Err(TransactionRollbackFailed { primary, rollback }.into()),
             }
@@ -1542,6 +1572,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         migrate_with(conn, &migrations)
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_poison_closes_the_writer_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollback-poison.db");
+        let db = Db::open(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        force_rollback_failure_for_test(Some(canonical.to_string_lossy().into_owned()));
+
+        let first: Result<()> = db
+            .transaction(|_| anyhow::bail!("injected transaction failure"))
+            .await;
+        let error = first.unwrap_err();
+        assert!(
+            error.to_string().contains("rollback failed"),
+            "the initiating request receives the poisoned rollback: {error:#}"
+        );
+
+        let queued = db
+            .write(|conn| {
+                conn.execute_batch("CREATE TABLE must_not_run(value INTEGER)")?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            queued.to_string().contains("writer")
+                || queued.to_string().contains("channel")
+                || queued.to_string().contains("reply dropped"),
+            "later queued work must fail closed after writer poison: {queued:#}"
+        );
     }
 
     #[tokio::test]

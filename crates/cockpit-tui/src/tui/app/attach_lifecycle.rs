@@ -121,13 +121,16 @@ impl App {
     /// [`Self::try_attach_for_display`] instead, which never latches an
     /// error.
     pub(super) fn ensure_agent_runner(&mut self) {
-        if !self.startup_disclosures_ready {
-            self.start_startup_disclosures_fetch();
-            self.show_toast(
-                "Startup disclosures Unavailable — waiting for the daemon; Retry",
-                ToastKind::Warning,
-            );
-            return;
+        #[cfg(feature = "remote")]
+        {
+            if !self.startup_disclosures_ready {
+                self.start_startup_disclosures_fetch();
+                self.show_toast(
+                    "Startup disclosures Unavailable — waiting for the daemon; Retry",
+                    ToastKind::Warning,
+                );
+                return;
+            }
         }
         if matches!(self.agent_runner, Some(Ok(_))) {
             return;
@@ -410,8 +413,11 @@ impl App {
     /// `is_some()`), so the id shown in the welcome box is exactly the
     /// session persisted on first message.
     pub(super) fn try_attach_for_display(&mut self) {
-        if !self.startup_disclosures_ready {
-            return;
+        #[cfg(feature = "remote")]
+        {
+            if !self.startup_disclosures_ready {
+                return;
+            }
         }
         let runner =
             agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());

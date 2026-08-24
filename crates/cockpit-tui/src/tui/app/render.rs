@@ -4215,8 +4215,11 @@ impl App {
         // displaces a fixed slot, the same pattern as the ☕ glyph.
         let mut right = chrome::waiting_for_lock_spans(self.waiting_for_lock.as_ref());
         right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
-        right.extend(chrome::org_sync_spans(self.org_sync_disclosure.as_ref()));
-        right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
+        #[cfg(feature = "remote")]
+        {
+            right.extend(chrome::org_sync_spans(self.org_sync_disclosure.as_ref()));
+            right.extend(chrome::connector_spans(self.connector_disclosure.as_ref()));
+        }
         right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
         right.extend(chrome::status_line_spans(&self.launch));
         let status = chrome::left_status(

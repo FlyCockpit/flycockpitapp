@@ -16,8 +16,8 @@ use crate::tui::theme::{
     button_focus_style, button_hover_style, button_idle_style,
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
-use cockpit_core::daemon::proto::ConnectorDisclosure;
-use cockpit_core::daemon::proto::OrgSyncDisclosure;
+#[cfg(feature = "remote")]
+use cockpit_core::daemon::proto::{ConnectorDisclosure, OrgSyncDisclosure};
 use cockpit_core::git::repo_counts;
 use cockpit_core::welcome::LaunchInfo;
 
@@ -262,6 +262,7 @@ pub fn schedule_strip_spans(scheduled: &[(String, String, u64)]) -> Vec<Span<'st
 
 /// Persistent enterprise session-log sync disclosure. Rendered only while an
 /// org policy mandates sync for this instance. Additive to the fixed chrome.
+#[cfg(feature = "remote")]
 pub fn org_sync_spans(disclosure: Option<&OrgSyncDisclosure>) -> Vec<Span<'static>> {
     let Some(disclosure) = disclosure else {
         return Vec::new();
@@ -274,6 +275,7 @@ pub fn org_sync_spans(disclosure: Option<&OrgSyncDisclosure>) -> Vec<Span<'stati
 
 /// Persistent remote relay connector indicator. Rendered while remote access is
 /// enabled or the daemon has a non-off connector state. Additive to fixed chrome.
+#[cfg(feature = "remote")]
 pub fn connector_spans(disclosure: Option<&ConnectorDisclosure>) -> Vec<Span<'static>> {
     let Some(disclosure) = disclosure else {
         return Vec::new();
@@ -394,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "remote")]
     fn org_sync_spans_disclose_active_policy() {
         let spans = org_sync_spans(Some(&OrgSyncDisclosure {
             org_id: "org-1".to_string(),
@@ -668,6 +671,7 @@ mod connector_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "remote")]
     fn connector_spans_render_enabled_state() {
         let disclosure = ConnectorDisclosure {
             enabled: true,

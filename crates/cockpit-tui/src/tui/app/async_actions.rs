@@ -663,6 +663,7 @@ impl App {
                     self.container_availability = availability;
                 }
             }
+            #[cfg(feature = "remote")]
             AsyncActionKind::Internal("startup.remote_disclosures") => match result.payload {
                 Ok(AsyncActionPayload::RemoteDisclosures {
                     project_root,

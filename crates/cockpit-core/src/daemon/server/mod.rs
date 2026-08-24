@@ -2663,6 +2663,7 @@ impl DaemonContext {
     /// restoring both the exact vault row and the prior sync enablement. A
     /// failed compensation poisons the daemon rather than serving with an
     /// unverifiable secret/redaction state.
+    #[cfg(feature = "remote")]
     pub(crate) async fn mutate_owner_vault_item_with_org_sync_disabled(
         &self,
         kind: cockpit_db::secret_vault::SecretVaultKind,
@@ -4292,6 +4293,7 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
     handle_client_transport(stream, ctx).await
 }
 
+#[cfg(feature = "remote")]
 pub(crate) async fn handle_relay_channel_as_with_instance<S>(
     stream: S,
     ctx: Arc<DaemonContext>,

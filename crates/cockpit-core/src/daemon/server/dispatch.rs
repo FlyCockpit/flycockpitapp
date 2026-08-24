@@ -1200,9 +1200,7 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
-    Box::pin(handle_serialized_request_with_remote_operation(
-        request, state, shared, ctx, effects, None,
-    ))
+    Box::pin(handle_serialized_request_impl(request, state, shared, ctx, effects))
     .await
 }
 
@@ -1532,12 +1530,24 @@ async fn mutate_owner_vault_item_with_remote_ledger(
 }
 
 #[cfg(feature = "remote")]
+enum RemoteAdapterBegin {
+    Dispatch { generation: u64 },
+    Replay(Response),
+}
+
+#[cfg(feature = "remote")]
+fn remote_adapter_incarnation_id() -> Uuid {
+    static ID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+    *ID.get_or_init(Uuid::now_v7)
+}
+
+#[cfg(feature = "remote")]
 async fn begin_remote_idempotent_adapter(
     request: &Request,
     authorized: &AuthorizedRequestContext,
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
-) -> std::result::Result<Option<Response>, ErrorPayload> {
+) -> std::result::Result<RemoteAdapterBegin, ErrorPayload> {
     let params = request
         .canonical_remote_operation_params_v1()
         .map_err(internal)?;
@@ -1555,11 +1565,11 @@ async fn begin_remote_idempotent_adapter(
             operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
             request_hash,
             now_ms: chrono::Utc::now().timestamp_millis(),
-        },
+        }, remote_adapter_incarnation_id(), 30_000,
     ).await.map_err(internal)? {
-        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { dispatch_generation, .. } => Ok(RemoteAdapterBegin::Dispatch { generation: dispatch_generation }),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Replay(bytes) =>
-            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+            serde_json::from_slice(&bytes).map(RemoteAdapterBegin::Replay).map_err(internal),
         crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict
         | crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict =>
             Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
@@ -1575,6 +1585,7 @@ async fn commit_remote_idempotent_adapter(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
     kind: &str,
+    expected_dispatch_generation: u64,
     response: Response,
 ) -> std::result::Result<Response, ErrorPayload> {
     let attachment = operation.logical_attachment_id.to_string();
@@ -1583,7 +1594,7 @@ async fn commit_remote_idempotent_adapter(
     let delivery = Uuid::now_v7().to_string();
     match ctx
         .db
-        .commit_remote_attachment_operation(
+        .commit_idempotent_adapter_remote_operation(
             crate::db::remote_attachment_operations::CommitRemoteOperation {
                 logical_attachment_id: &attachment,
                 operation_id: &operation_id,
@@ -1592,7 +1603,7 @@ async fn commit_remote_idempotent_adapter(
                 outbox_kind: kind,
                 outbox_payload: &bytes,
                 now_ms: chrono::Utc::now().timestamp_millis(),
-            },
+            }, expected_dispatch_generation,
         )
         .await
         .map_err(internal)?
@@ -2219,13 +2230,13 @@ async fn dispatch_image_control_read(
     }
 }
 
-pub(super) async fn handle_serialized_request_with_remote_operation(
+async fn handle_serialized_request_impl(
     request: Request,
     state: &mut MutableClientState,
     shared: &Arc<SharedClientState>,
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
-    remote_operation: Option<&super::RemoteOperationContext>,
+    #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
@@ -2233,6 +2244,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             message: "daemon is shutting down after a redaction publication failure".into(),
         });
     }
+    #[cfg(feature = "remote")]
     if let Some(operation) = remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -4821,12 +4833,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     content: content.clone(),
                     base_hash: base_hash.clone(),
                 };
-                if let Some(response) =
-                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
-                        .await?
-                {
-                    return Ok(response);
-                }
+                let generation = match begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx).await? {
+                    RemoteAdapterBegin::Replay(response) => return Ok(response),
+                    RemoteAdapterBegin::Dispatch { generation } => generation,
+                };
                 let response = crate::daemon::fs_api::fs_write_staged_remote(
                     ctx.clone(),
                     project_root,
@@ -4836,7 +4846,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     operation.operation_id.to_string(),
                 )
                 .await?;
-                return commit_remote_idempotent_adapter(operation, ctx, "fs_write", response)
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_write", generation, response)
                     .await;
             }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
@@ -5059,16 +5069,14 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     project_root: project_root.clone(),
                     path: path.clone(),
                 };
-                if let Some(response) =
-                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
-                        .await?
-                {
-                    return Ok(response);
-                }
+                let generation = match begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx).await? {
+                    RemoteAdapterBegin::Replay(response) => return Ok(response),
+                    RemoteAdapterBegin::Dispatch { generation } => generation,
+                };
                 let response =
                     crate::daemon::fs_api::fs_create_dir_reconciled_remote(project_root, path)
                         .await?;
-                return commit_remote_idempotent_adapter(operation, ctx, "fs_create_dir", response)
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_create_dir", generation, response)
                     .await;
             }
             crate::daemon::fs_api::fs_create_dir(project_root, path).await
@@ -8779,6 +8787,26 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             None,
         )),
     }
+}
+
+#[cfg(feature = "remote")]
+pub(super) async fn handle_serialized_request_with_remote_operation(
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    Box::pin(handle_serialized_request_impl(
+        request,
+        state,
+        shared,
+        ctx,
+        effects,
+        remote_operation,
+    ))
+    .await
 }
 
 // ---- `/leaks` dispatch helpers ---------------------------------------------

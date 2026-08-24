@@ -124,6 +124,15 @@ CREATE TABLE remote_attachment_operations (
         'reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'
     )),
     dispatch_generation            INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_generation >= 0),
+    dispatch_lease_owner           TEXT CHECK (
+        dispatch_lease_owner IS NULL OR (
+          length(dispatch_lease_owner) = 36 AND dispatch_lease_owner = lower(dispatch_lease_owner)
+          AND length(replace(dispatch_lease_owner, '-', '')) = 32
+          AND replace(dispatch_lease_owner, '-', '') NOT GLOB '*[^0-9a-f]*'
+          AND dispatch_lease_owner <> '00000000-0000-0000-0000-000000000000'
+        )
+    ),
+    dispatch_lease_expires_at_ms   INTEGER,
     request_hash                   BLOB    NOT NULL CHECK (length(request_hash) = 32),
     safe_response                  BLOB CHECK (safe_response IS NULL OR length(safe_response) <= 524288),
     event_high_water_mark          INTEGER CHECK (event_high_water_mark IS NULL OR event_high_water_mark >= 0),
@@ -135,6 +144,8 @@ CREATE TABLE remote_attachment_operations (
         OR (state IN ('committed', 'rejected') AND safe_response IS NOT NULL AND event_high_water_mark IS NOT NULL)
         OR (state = 'outcome_unknown' AND safe_response IS NOT NULL)
     ),
+    CHECK ((state = 'dispatched' AND operation_class = 'idempotent_adapter_mutation' AND operation_kind = 'generic') =
+           (dispatch_lease_owner IS NOT NULL AND dispatch_lease_expires_at_ms IS NOT NULL)),
     PRIMARY KEY (logical_attachment_id, operation_id),
     UNIQUE (logical_attachment_id, operation_seq)
 );
@@ -492,5 +503,3 @@ CREATE TABLE remote_daemon_custody_records (
     evidence_digest  BLOB    NOT NULL CHECK (length(evidence_digest) = 32),
     created_at       INTEGER NOT NULL
 );
-
-

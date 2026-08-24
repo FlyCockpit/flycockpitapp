@@ -474,11 +474,19 @@ impl Db {
     pub async fn begin_idempotent_adapter_remote_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
+        daemon_incarnation_id: Uuid,
+        lease_duration_ms: i64,
     ) -> Result<BeginIdempotentAdapterRemoteOperationOutcome> {
         ensure!(
             request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
             "adapter dispatcher requires idempotent_adapter_mutation class"
         );
+        ensure!(lease_duration_ms > 0, "adapter lease duration must be positive");
+        let lease_owner = daemon_incarnation_id.hyphenated().to_string();
+        let lease_expires_at_ms = request
+            .now_ms
+            .checked_add(lease_duration_ms)
+            .context("adapter lease expiry overflow")?;
         let owned = OwnedReserveRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.to_owned(),
             operation_id: request.operation_id.to_owned(),
@@ -492,11 +500,15 @@ impl Db {
             ReserveRemoteOperationOutcome::Reserved(reservation) => {
                 conn.execute(
                     "UPDATE remote_attachment_operations
-                     SET state='dispatched', dispatch_generation=1, updated_at_ms=?3
+                     SET state='dispatched', dispatch_generation=1,
+                         dispatch_lease_owner=?3, dispatch_lease_expires_at_ms=?4,
+                         updated_at_ms=?5
                      WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",
                     params![
                         owned.logical_attachment_id,
                         owned.operation_id,
+                        lease_owner,
+                        lease_expires_at_ms,
                         owned.now_ms
                     ],
                 )?;
@@ -513,19 +525,25 @@ impl Db {
                 ))
             }
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
-                let (operation_seq, dispatch_generation) = conn.query_row(
+                let reclaimed = conn.query_row(
                     "UPDATE remote_attachment_operations
-                     SET dispatch_generation=dispatch_generation+1, updated_at_ms=?3
+                     SET dispatch_generation=dispatch_generation+1,
+                         dispatch_lease_owner=?3, dispatch_lease_expires_at_ms=?4,
+                         updated_at_ms=?5
                      WHERE logical_attachment_id=?1 AND operation_id=?2
                        AND state='dispatched' AND operation_class='idempotent_adapter_mutation'
+                       AND dispatch_lease_expires_at_ms <= ?5
                      RETURNING operation_seq,dispatch_generation",
-                    params![owned.logical_attachment_id, owned.operation_id, owned.now_ms],
+                    params![owned.logical_attachment_id, owned.operation_id, lease_owner, lease_expires_at_ms, owned.now_ms],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )?;
-                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
-                    operation_seq: operation_seq.try_into()?,
-                    dispatch_generation: dispatch_generation.try_into()?,
-                })
+                ).optional()?;
+                match reclaimed {
+                    Some((operation_seq, dispatch_generation)) => Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                        operation_seq: operation_seq.try_into()?,
+                        dispatch_generation: dispatch_generation.try_into()?,
+                    }),
+                    None => Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate),
+                }
             }
             ReserveRemoteOperationOutcome::Replay(_) => {
                 Ok(BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate)
@@ -1194,6 +1212,40 @@ impl Db {
             .await
     }
 
+    /// Commits an idempotent adapter result only for the generation leased by
+    /// the caller. A superseded daemon incarnation can never publish a stale
+    /// terminal response or append an outbox event.
+    pub async fn commit_idempotent_adapter_remote_operation(
+        &self,
+        request: CommitRemoteOperation<'_>,
+        expected_dispatch_generation: u64,
+    ) -> Result<CommitRemoteOperationOutcome> {
+        ensure!(expected_dispatch_generation > 0, "adapter generation must be positive");
+        let owned = OwnedCommitRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            safe_response: request.safe_response.to_vec(),
+            outbox_delivery_id: request.outbox_delivery_id.to_owned(),
+            outbox_kind: request.outbox_kind.to_owned(),
+            outbox_payload: request.outbox_payload.to_vec(),
+            now_ms: request.now_ms,
+        };
+        let generation = i64::try_from(expected_dispatch_generation)?;
+        self.transaction(move |conn| {
+            let owns_generation: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND operation_id=?2
+                   AND operation_class='idempotent_adapter_mutation'
+                   AND operation_kind='generic' AND state='dispatched'
+                   AND dispatch_generation=?3)",
+                params![owned.logical_attachment_id, owned.operation_id, generation],
+                |row| row.get(0),
+            )?;
+            ensure!(owns_generation, "adapter commit lost dispatch generation authority");
+            commit_conn_with_policy(conn, &owned, false)
+        }).await
+    }
+
     /// Commits a staged rename only after its exact dispatch generation has
     /// crossed every filesystem durability barrier. The journal transition,
     /// safe response, and outbox append share one transaction.
@@ -1498,6 +1550,7 @@ fn commit_conn_with_policy(
     conn.execute(
         "UPDATE remote_attachment_operations
          SET state = 'committed', safe_response = ?3, event_high_water_mark = ?4,
+             dispatch_lease_owner = NULL, dispatch_lease_expires_at_ms = NULL,
              updated_at_ms = ?5
          WHERE logical_attachment_id = ?1 AND operation_id = ?2 AND state IN ('reserved','dispatched')",
         params![
@@ -2589,15 +2642,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_dispatch_reclaims_with_a_new_generation_then_replays() {
+    async fn adapter_dispatch_lease_rejects_live_duplicate_and_fences_stale_commit() {
         let db = Db::open_in_memory().unwrap();
         let operation = "01890f3e-4c00-7000-8000-00000000009d";
-        let request = || ReserveRemoteOperation {
+        let first_incarnation = Uuid::parse_str("00000000-0000-4000-8000-000000000111").unwrap();
+        let second_incarnation = Uuid::parse_str("00000000-0000-4000-8000-000000000112").unwrap();
+        let request = |now_ms| ReserveRemoteOperation {
             operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            now_ms,
             ..reserve(operation, [11; 32])
         };
         assert!(matches!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(10), first_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
@@ -2605,8 +2661,14 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            db.begin_idempotent_adapter_remote_operation(request(11), first_incarnation, 100)
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::ExistingIndeterminate
+        );
         assert!(matches!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(110), second_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
@@ -2614,19 +2676,21 @@ mod tests {
                 ..
             }
         ));
-        db.commit_remote_attachment_operation(CommitRemoteOperation {
+        let commit = || CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,
             operation_id: operation,
             safe_response: b"adapter-safe",
             outbox_delivery_id: "00000000-0000-4000-8000-00000000009e",
             outbox_kind: "adapter_test",
             outbox_payload: b"adapter-event",
-            now_ms: 12,
-        })
+            now_ms: 111,
+        };
+        assert!(db.commit_idempotent_adapter_remote_operation(commit(), 1).await.is_err());
+        db.commit_idempotent_adapter_remote_operation(commit(), 2)
         .await
         .unwrap();
         assert_eq!(
-            db.begin_idempotent_adapter_remote_operation(request())
+            db.begin_idempotent_adapter_remote_operation(request(112), second_incarnation, 100)
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Replay(b"adapter-safe".to_vec())

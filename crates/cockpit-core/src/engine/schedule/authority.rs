@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use futures::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -82,6 +83,14 @@ pub const MAX_SWARM_QUEUE_LEN: usize = 256;
 
 /// Maximum UTF-8 byte length accepted for a recursive `Swarm` spawn prompt.
 pub const MAX_SWARM_PROMPT_BYTES: usize = 256 * 1024;
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
 
 /// An event from the authority to the driver, drained at the turn
 /// boundary. These are the only signals that affect **main context**.
@@ -163,7 +172,7 @@ struct ScheduleEntry {
     /// Distinguishes an ordinary cooperative cancel (whose terminal event
     /// must backpressure until delivered) from driver teardown (which joins
     /// tasks and reconciles registry/lifecycle state directly).
-    teardown: Option<Arc<AtomicBool>>,
+    teardown: Option<tokio_util::sync::CancellationToken>,
     /// For in-context loops: the scheduler state needed to re-arm.
     in_context: Option<InContextLoop>,
     /// Handle the authority uses to talk to a background job (tail / kill).
@@ -542,7 +551,10 @@ impl ScheduleAuthority {
             tokio_util::sync::CancellationToken::new,
             |parent| parent.child_token(),
         );
-        let teardown = Arc::new(AtomicBool::new(false));
+        // A wakeable teardown signal is required here: the child may be
+        // backpressured in a terminal channel send when the driver begins
+        // joining it. A passive atomic flag cannot wake that pending send.
+        let teardown = tokio_util::sync::CancellationToken::new();
         let run_ctx = swarm::SwarmRunCtx {
             job_id: job_id.clone(),
             label: label.clone(),
@@ -554,7 +566,39 @@ impl ScheduleAuthority {
             cancel: cancel.clone(),
             teardown: teardown.clone(),
         };
-        let handle = tokio::spawn(swarm::run_swarm(run_ctx));
+        let panic_job_id = job_id.clone();
+        let panic_label = label.clone();
+        let panic_event_tx = self.event_tx.clone();
+        let panic_teardown = teardown.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(payload) = std::panic::AssertUnwindSafe(swarm::run_swarm(run_ctx))
+                .catch_unwind()
+                .await
+            {
+                // A panic/cancellation is otherwise invisible to the driver,
+                // which would strand the registry slot forever. The outer
+                // supervisor is the authoritative terminal producer for this
+                // exceptional path.
+                if !panic_teardown.is_cancelled() {
+                    swarm::send_swarm_terminal(
+                        &panic_event_tx,
+                        &panic_teardown,
+                        ScheduleEvent::Completed {
+                            job_id: panic_job_id,
+                            label: panic_label,
+                            kind: ScheduleKind::Swarm,
+                            result: format!(
+                                "swarm subagent task panicked: {}",
+                                panic_payload_message(payload.as_ref())
+                            ),
+                            failed: true,
+                            requests: Vec::new(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        });
         let entry = ScheduleEntry {
             job_id: job_id.clone(),
             label,
@@ -657,7 +701,7 @@ impl ScheduleAuthority {
             if entry.kind == ScheduleKind::Swarm
             {
                 if let Some(teardown) = entry.teardown.take() {
-                    teardown.store(true, std::sync::atomic::Ordering::Release);
+                    teardown.cancel();
                 }
                 if let Some(cancel) = entry.cancel.take() {
                     cancel.cancel();
@@ -813,10 +857,10 @@ impl ScheduleAuthority {
         // a synthetic success here would race that honest aborted result and
         // double-complete the registry slot.
         if cooperative {
-            // Keep the registry entry (and especially its teardown latch)
+            // Keep the registry entry (and especially its teardown signal)
             // authority-owned until the real terminal event is drained. If
             // driver teardown wins while that event is backpressured, the
-            // latch is how `settle_swarm_for_teardown` makes the producer's
+            // signal is how `settle_swarm_for_teardown` makes the producer's
             // final send nonblocking before joining it.
             self.registry.insert(job_id.to_string(), entry);
             return true;

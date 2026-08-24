@@ -60,7 +60,7 @@ pub struct SwarmRunCtx {
     /// Set before teardown cancellation. Ordinary cancellation must deliver
     /// its completion even through backpressure; teardown reconciles directly
     /// and therefore must never block its task join on the event queue.
-    pub teardown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub teardown: tokio_util::sync::CancellationToken,
 }
 
 /// Turn cap on one recursive-`Swarm` child's loop. Wide enough for real
@@ -183,7 +183,6 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     if cancel.is_cancelled() {
         send_swarm_terminal(
             &event_tx,
-            &cancel,
             &teardown,
             ScheduleEvent::Completed {
                 job_id,
@@ -211,7 +210,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         match begin_write_scope_transfer(&spec, &ctx).await {
             Ok(handle) => handle,
             Err(refusal) => {
-                send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
+                send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
                         job_id,
                         label,
                         kind: ScheduleKind::Swarm,
@@ -241,7 +240,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     if !spec.worker.is_goal_control()
         && lifecycle_event_emitted.load(std::sync::atomic::Ordering::Acquire)
     {
-        send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::SwarmChildStopGateCompleted {
+        send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::SwarmChildStopGateCompleted {
                 job_id: job_id.clone(),
             }).await;
     }
@@ -266,7 +265,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }
         Err(e) => {
             let cancelled = cancel.is_cancelled();
-            send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
+            send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
                     job_id,
                     label,
                     kind: ScheduleKind::Swarm,
@@ -290,7 +289,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     } else {
         budget_result(&label, &spec, &result)
     };
-    send_swarm_terminal(&event_tx, &cancel, &teardown, ScheduleEvent::Completed {
+    send_swarm_terminal(&event_tx, &teardown, ScheduleEvent::Completed {
             job_id,
             label,
             kind: ScheduleKind::Swarm,
@@ -300,30 +299,22 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         }).await;
 }
 
-async fn send_swarm_terminal(
+pub(super) async fn send_swarm_terminal(
     event_tx: &mpsc::Sender<ScheduleEvent>,
-    cancel: &tokio_util::sync::CancellationToken,
-    teardown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    teardown: &tokio_util::sync::CancellationToken,
     event: ScheduleEvent,
 ) {
-    if teardown.load(std::sync::atomic::Ordering::Acquire) {
+    if teardown.is_cancelled() {
         let _ = event_tx.try_send(event);
         return;
     }
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => {
-            if teardown.load(std::sync::atomic::Ordering::Acquire) {
-                // Teardown owns abnormal lifecycle reconciliation and is
-                // waiting to join this task. Never deadlock that join on a
-                // full channel the driver has stopped draining.
-                let _ = event_tx.try_send(event);
-            } else {
-                // Human/parent cancellation is an ordinary terminal outcome.
-                // The driver is alive and must receive this authority signal,
-                // so preserve backpressure instead of dropping completion.
-                let _ = event_tx.send(event).await;
-            }
+        _ = teardown.cancelled() => {
+            // Teardown owns abnormal lifecycle reconciliation and is waiting
+            // to join this task. The wakeable signal releases a send already
+            // blocked behind a full channel.
+            let _ = event_tx.try_send(event);
         }
         result = event_tx.send(event) => {
             let _ = result;
@@ -950,6 +941,46 @@ fn collect_final_text(history: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn teardown_wakes_a_backpressured_terminal_send() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(ScheduleEvent::Completed {
+                job_id: "filler".into(),
+                label: "filler".into(),
+                kind: ScheduleKind::Swarm,
+                result: String::new(),
+                failed: false,
+                requests: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let sender_teardown = teardown.clone();
+        let send = tokio::spawn(async move {
+            send_swarm_terminal(
+                &event_tx,
+                &sender_teardown,
+                ScheduleEvent::SwarmChildStopGateCompleted {
+                    job_id: "blocked".into(),
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "full channel must backpressure normally");
+
+        teardown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), send)
+            .await
+            .expect("teardown must wake the pending terminal send")
+            .expect("terminal sender task");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ScheduleEvent::Completed { job_id, .. }) if job_id == "filler"
+        ));
+    }
 
     #[test]
     fn background_swarm_spawn_responses_result_keeps_dual_identity_and_name() {

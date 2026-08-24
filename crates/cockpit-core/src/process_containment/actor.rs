@@ -419,14 +419,43 @@ impl ProcessContainmentActor {
         let Some(join) = self.join.take() else {
             return;
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // `blocking_send` panics from an async runtime. Keep the complete
-            // synchronous shutdown protocol on an ordinary helper thread;
-            // joining that helper preserves this method's explicit-shutdown
-            // guarantee without entering Tokio's blocking APIs here.
-            dispatch_actor_shutdown(self.handle.shutdown_tx.clone(), join, true);
-        } else {
-            shutdown_actor_thread(self.handle.shutdown_tx.clone(), join);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if matches!(
+                    handle.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                // Tell Tokio this worker is intentionally entering the sync
+                // compatibility contract so it can replace the worker.
+                tokio::task::block_in_place(|| {
+                    shutdown_actor_thread(self.handle.shutdown_tx.clone(), join);
+                });
+            }
+            Ok(_) => {
+                // A current-thread runtime cannot use `block_in_place`; retain
+                // the legacy sync contract via an ordinary helper. Async
+                // callers should use `shutdown_async` and avoid this cost.
+                dispatch_actor_shutdown(self.handle.shutdown_tx.clone(), join, true);
+            }
+            Err(_) => shutdown_actor_thread(self.handle.shutdown_tx.clone(), join),
+        }
+    }
+
+    /// Explicit shutdown for async callers. The actor join is a blocking OS
+    /// operation, so keep it off Tokio worker threads while preserving the
+    /// same synchronous ownership contract as [`Self::shutdown`].
+    pub async fn shutdown_async(mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let shutdown_tx = self.handle.shutdown_tx.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            shutdown_actor_thread(shutdown_tx, join);
+        })
+        .await
+        {
+            tracing::error!(%error, "process-containment shutdown worker failed");
         }
     }
 }
@@ -569,7 +598,7 @@ struct ActorState {
 
 struct PendingReconciliation {
     lease: ContainmentLease,
-    waiters: Vec<Reply<Result<(), ContainmentError>>>,
+    waiters: Vec<ReconciliationCompletion>,
     next_attempt: tokio::time::Instant,
     backoff: Duration,
 }
@@ -583,6 +612,21 @@ struct PendingUnpublished {
     generation: u64,
     next_attempt: tokio::time::Instant,
     backoff: Duration,
+    /// The create request is not resolved until this exact allocation has
+    /// reached same-generation ProvenEmpty and its durable row is terminal.
+    waiters: Vec<UnpublishedCompletion>,
+}
+
+type IoCreateReply = Reply<Result<(ContainmentLease, NativeChildIo), ContainmentError>>;
+
+enum ReconciliationCompletion {
+    Empty(Reply<Result<(), ContainmentError>>),
+    CancelledIo(IoCreateReply),
+}
+
+enum UnpublishedCompletion {
+    Lease(Reply<Result<ContainmentLease, ContainmentError>>, ContainmentError),
+    Io(IoCreateReply, ContainmentError),
 }
 
 const RECONCILIATION_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
@@ -606,31 +650,51 @@ async fn actor_loop(
         pending_reconciliation: Vec::new(),
         pending_unpublished: Vec::new(),
     };
+    let mut reconciliation_open = true;
     loop {
+        // `watch::changed` is edge-triggered, but shutdown is a level. Check
+        // it before selecting so a ready queued operation can never win after
+        // the owner has closed intake.
+        if *shutdown_rx.borrow_and_update() {
+            drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+            break;
+        }
         let op = if state.pending_reconciliation.is_empty() && state.pending_unpublished.is_empty() {
             tokio::select! {
-                op = rx.recv() => op,
-                _ = shutdown_rx.changed() => {
-                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
-                    break;
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow_and_update() {
+                        drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                        break;
+                    }
+                    continue;
                 }
-                request = reconciliation_rx.recv() => {
+                op = rx.recv() => op,
+                request = reconciliation_rx.recv(), if reconciliation_open => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
+                    } else {
+                        reconciliation_open = false;
                     }
                     continue;
                 }
             }
         } else {
             tokio::select! {
-                op = rx.recv() => op,
-                _ = shutdown_rx.changed() => {
-                    drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
-                    break;
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow_and_update() {
+                        drain_shutdown_reconciliation(&mut state, &mut reconciliation_rx).await;
+                        break;
+                    }
+                    continue;
                 }
-                request = reconciliation_rx.recv() => {
+                op = rx.recv() => op,
+                request = reconciliation_rx.recv(), if reconciliation_open => {
                     if let Some(request) = request {
                         enqueue_pending_reconciliation(&mut state, request);
+                    } else {
+                        reconciliation_open = false;
                     }
                     continue;
                 }
@@ -686,6 +750,7 @@ async fn actor_loop(
                 require_proven,
                 reply,
             } => {
+                let unpublished_before = state.pending_unpublished.len();
                 let result = create_native(
                     &mut state,
                     session_id,
@@ -696,6 +761,16 @@ async fn actor_loop(
                     require_proven,
                 )
                 .await;
+                if state.pending_unpublished.len() > unpublished_before {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => unreachable!("unpublished allocation cannot return a lease"),
+                    };
+                    state.pending_unpublished[unpublished_before]
+                        .waiters
+                        .push(UnpublishedCompletion::Lease(reply, error));
+                    continue;
+                }
                 if let Err(Ok(lease)) = reply.send(result) {
                     enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
                 }
@@ -711,7 +786,8 @@ async fn actor_loop(
                 cancellation,
                 reply,
             } => {
-                let mut result = if cancellation.is_cancelled() {
+                let unpublished_before = state.pending_unpublished.len();
+                let result = if cancellation.is_cancelled() {
                     Err(ContainmentError::Internal("allocation request cancelled".into()))
                 } else {
                     create_native_with_io(
@@ -726,25 +802,31 @@ async fn actor_loop(
                 )
                 .await
                 };
-                if cancellation.is_cancelled()
-                    && let Ok((lease, _)) = result.as_ref()
+                if let Ok((lease, _)) = result.as_ref()
+                    && cancellation.is_cancelled()
                 {
-                    let lease = lease.clone();
-                    reconcile_lease_to_proven_empty(&mut state, lease).await;
-                    result = Err(ContainmentError::Internal(
-                        "allocation request cancelled after cleanup".into(),
-                    ));
-                } else if cancellation.is_cancelled() {
-                    // A post-spawn durable-publication failure is represented
-                    // by `pending_unpublished`, not by a lease in `result`.
-                    // Do not acknowledge this accepted request until those
-                    // actor-owned native handles have also proved empty.
-                    while !state.pending_unpublished.is_empty() {
-                        reconcile_one_pending(&mut state).await;
-                        if !state.pending_unpublished.is_empty() {
-                            tokio::time::sleep(RECONCILIATION_INITIAL_BACKOFF).await;
-                        }
-                    }
+                    enqueue_pending_reconciliation_with_completion(
+                        &mut state,
+                        lease.clone(),
+                        ReconciliationCompletion::CancelledIo(reply),
+                    );
+                    continue;
+                }
+                if state.pending_unpublished.len() > unpublished_before {
+                    // Allocation crossed the spawn boundary but publication
+                    // failed. Attach this request to only the item created by
+                    // this operation; unrelated cleanup must not delay it.
+                    let error = match result {
+                        Err(_error) if cancellation.is_cancelled() => ContainmentError::Internal(
+                            "allocation request cancelled after cleanup".into(),
+                        ),
+                        Err(error) => error,
+                        Ok(_) => unreachable!("published allocation cannot remain unpublished"),
+                    };
+                    state.pending_unpublished[unpublished_before]
+                        .waiters
+                        .push(UnpublishedCompletion::Io(reply, error));
+                    continue;
                 }
                 if let Err(Ok((lease, _io))) = reply.send(result) {
                     // The requester was cancelled after allocation. Ownership
@@ -763,6 +845,7 @@ async fn actor_loop(
                 require_proven,
                 reply,
             } => {
+                let unpublished_before = state.pending_unpublished.len();
                 let result = create_container(
                     &mut state,
                     session_id,
@@ -774,6 +857,16 @@ async fn actor_loop(
                     require_proven,
                 )
                 .await;
+                if state.pending_unpublished.len() > unpublished_before {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => unreachable!("unpublished allocation cannot return a lease"),
+                    };
+                    state.pending_unpublished[unpublished_before]
+                        .waiters
+                        .push(UnpublishedCompletion::Lease(reply, error));
+                    continue;
+                }
                 if let Err(Ok(lease)) = reply.send(result) {
                     enqueue_pending_reconciliation(&mut state, ReconciliationRequest { lease, completion: None });
                 }
@@ -823,33 +916,35 @@ async fn actor_loop(
     }
 }
 
-async fn reconcile_lease_to_proven_empty(state: &mut ActorState, lease: ContainmentLease) {
-    let mut backoff = RECONCILIATION_INITIAL_BACKOFF;
-    loop {
-        let _ = terminate_one(state, lease.clone()).await;
-        if matches!(
-            await_empty_one(state, lease.clone()).await,
-            Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation
-        ) {
-            return;
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
-    }
+fn enqueue_pending_reconciliation(state: &mut ActorState, request: ReconciliationRequest) {
+    let completion = request.completion.map(ReconciliationCompletion::Empty);
+    enqueue_pending_reconciliation_inner(state, request.lease, completion);
 }
 
-fn enqueue_pending_reconciliation(state: &mut ActorState, request: ReconciliationRequest) {
+fn enqueue_pending_reconciliation_with_completion(
+    state: &mut ActorState,
+    lease: ContainmentLease,
+    completion: ReconciliationCompletion,
+) {
+    enqueue_pending_reconciliation_inner(state, lease, Some(completion));
+}
+
+fn enqueue_pending_reconciliation_inner(
+    state: &mut ActorState,
+    lease: ContainmentLease,
+    completion: Option<ReconciliationCompletion>,
+) {
     if let Some(pending) = state.pending_reconciliation.iter_mut().find(|pending| {
-        pending.lease.containment_id == request.lease.containment_id
-            && pending.lease.generation == request.lease.generation
+        pending.lease.containment_id == lease.containment_id
+            && pending.lease.generation == lease.generation
     }) {
-        if let Some(completion) = request.completion {
+        if let Some(completion) = completion {
             pending.waiters.push(completion);
         }
     } else {
         state.pending_reconciliation.push(PendingReconciliation {
-            lease: request.lease,
-            waiters: request.completion.into_iter().collect(),
+            lease,
+            waiters: completion.into_iter().collect(),
             next_attempt: tokio::time::Instant::now(),
             backoff: RECONCILIATION_INITIAL_BACKOFF,
         });
@@ -927,6 +1022,17 @@ async fn reconcile_one_pending(state: &mut ActorState) {
                 pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
                 pending.backoff = pending.backoff.saturating_mul(2).min(RECONCILIATION_MAX_BACKOFF);
                 state.pending_unpublished.push(pending);
+            } else {
+                for waiter in pending.waiters {
+                    match waiter {
+                        UnpublishedCompletion::Lease(reply, error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                        UnpublishedCompletion::Io(reply, error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
         } else {
             pending.next_attempt = tokio::time::Instant::now() + pending.backoff;
@@ -954,7 +1060,16 @@ async fn reconcile_one_pending(state: &mut ActorState) {
     match await_empty_one(state, lease.clone()).await {
         Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation => {
             for waiter in pending.waiters {
-                let _ = waiter.send(Ok(()));
+                match waiter {
+                    ReconciliationCompletion::Empty(waiter) => {
+                        let _ = waiter.send(Ok(()));
+                    }
+                    ReconciliationCompletion::CancelledIo(waiter) => {
+                        let _ = waiter.send(Err(ContainmentError::Internal(
+                            "allocation request cancelled after cleanup".into(),
+                        )));
+                    }
+                }
             }
         }
         // The actor remains the sole owner and retries later. Other actor
@@ -1135,6 +1250,7 @@ fn reclaim_unpublished_allocation(
         generation,
         next_attempt: tokio::time::Instant::now(),
         backoff: RECONCILIATION_INITIAL_BACKOFF,
+        waiters: Vec::new(),
     });
 }
 

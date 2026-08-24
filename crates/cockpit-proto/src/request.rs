@@ -3716,7 +3716,7 @@ mod tests {
         use crate::bulk_transfer::{
             BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
         };
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::MAX_NDJSON_FRAME_BYTES;
 
         // The retired inline shape fails to parse. This is the assertion the
         // pre-migration production code could not satisfy.
@@ -3737,10 +3737,7 @@ mod tests {
         assert!(serde_json::from_value::<Request>(huge).is_err());
 
         // The accepted shape is a bounded typed transfer reference.
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([9u8; 16])
-        .unwrap();
+        let transfer_id = crate::bulk_transfer::transfer_id_from_bytes([9u8; 16]).unwrap();
         let request = Request::ImportSessionArchive {
             transfer: RemoteBulkTransferRef::new(
                 transfer_id,
@@ -3759,7 +3756,7 @@ mod tests {
             "a transfer reference must stay small, got {} bytes",
             encoded.len()
         );
-        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < MAX_NDJSON_FRAME_BYTES);
         // No base64 blob field survives anywhere in the encoding.
         assert!(!encoded.contains("archive_base64"));
 
@@ -3887,18 +3884,17 @@ mod tests {
 
     #[test]
     fn bulk_user_message_is_reference_only_at_exact_transport_boundaries() {
-        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
         use crate::bulk_transfer::{
             BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
         };
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
 
         let request = |total_length, mime_class| Request::SendUserMessageBulk {
             client_submission_id: Uuid::new_v4(),
             expected_model_state_generation: None,
             expected_model: None,
             transfer: RemoteBulkTransferRef::new(
-                tag_protocol_id_bytes::<Transfer>([7; 16]).unwrap(),
+                transfer_id_from_bytes([7; 16]).unwrap(),
                 total_length,
                 [0xAB; 32],
                 mime_class,
@@ -3918,7 +3914,7 @@ mod tests {
                 .expect("exact bulk text boundary must be accepted");
             let encoded = serde_json::to_vec(&request).unwrap();
             assert!(
-                encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES,
+                encoded.len() < 1024 && encoded.len() < crate::MAX_NDJSON_FRAME_BYTES,
                 "the {boundary}-byte body must stay on the bulk lane"
             );
             assert!(
@@ -3937,21 +3933,20 @@ mod tests {
 
     #[test]
     fn bulk_user_message_can_stage_a_large_display_form_without_inline_frame_growth() {
-        use crate::remote_protocol_id::{kind::Transfer, tag_protocol_id_bytes};
         use crate::bulk_transfer::{
             BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
         };
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
 
         let transfer = RemoteBulkTransferRef::new(
-            tag_protocol_id_bytes::<Transfer>([8; 16]).unwrap(),
+            transfer_id_from_bytes([8; 16]).unwrap(),
             5,
             [0xAC; 32],
             RemoteBulkMimeClass::Opaque,
         )
         .unwrap();
         let display_transfer = RemoteBulkTransferRef::new(
-            tag_protocol_id_bytes::<Transfer>([9; 16]).unwrap(),
+            transfer_id_from_bytes([9; 16]).unwrap(),
             8 * 1024 * 1024,
             [0xBD; 32],
             RemoteBulkMimeClass::Opaque,
@@ -3972,7 +3967,7 @@ mod tests {
             .validate_semantics()
             .expect("a display transfer permits an inline-sized source transfer");
         let encoded = serde_json::to_vec(&request).unwrap();
-        assert!(encoded.len() < 1024 && encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < 1024 && encoded.len() < crate::MAX_NDJSON_FRAME_BYTES);
         assert!(!String::from_utf8_lossy(&encoded).contains("large remote preview"));
 
         let mut conflicting_inline = request.clone();

@@ -78,6 +78,9 @@ pub mod send_user_message_v2;
 pub mod terminal;
 pub mod wire_scalar;
 
+/// Payload ceiling for latency-sensitive local daemon RPC responses.
+pub const MAX_INTERACTIVE_RPC_PAYLOAD_BYTES: usize = 512 * 1024;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io;
@@ -5115,6 +5118,7 @@ mod tests {
     /// have caught the behaviour this prompt exists to fix. The corrected
     /// expectation is the lane cap itself, and the pre-migration constants fail
     /// it.
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_transport_correct_legacy_frame_tests_first() {
         use remote_transport::lane::{MAX_LOGICAL_PAYLOAD_BYTES, RemoteLane};
@@ -6167,6 +6171,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSessions {
                     project_id: None,
@@ -6181,6 +6186,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSessions {
                     project_id: None,
@@ -6208,6 +6214,7 @@ mod tests {
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: default_export,
             })
@@ -6217,15 +6224,13 @@ mod tests {
         );
 
         let reader = Request::ReadRedactedExportChunk {
-            transfer_id: crate::remote_protocol_id::tag_protocol_id_bytes::<
-                crate::remote_protocol_id::kind::Transfer,
-            >([3u8; 16])
-            .unwrap(),
+            transfer_id: crate::bulk_transfer::transfer_id_from_bytes([3u8; 16]).unwrap(),
             chunk_index: 0,
         };
         assert_eq!(
             body_required_protocol_version(&Body::Request {
                 id: Uuid::nil(),
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: reader,
             })
@@ -6233,21 +6238,18 @@ mod tests {
             10
         );
 
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([7u8; 16])
-        .unwrap();
+        let transfer_id = crate::bulk_transfer::transfer_id_from_bytes([7u8; 16]).unwrap();
         let response = Response::ExportSessionData {
             data: ExportSessionData {
                 session_id: Uuid::nil(),
                 kind: ExportSessionKind::TranscriptJson,
                 filename_extension: "json".into(),
                 mime: "application/json".into(),
-                transfer: crate::remote_transport::bulk::RemoteBulkTransferRef::new(
+                transfer: crate::bulk_transfer::BulkTransferRef::new(
                     transfer_id,
                     5,
                     [0u8; 32],
-                    crate::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
+                    crate::bulk_transfer::BulkMimeClass::RedactedExport,
                 )
                 .unwrap(),
                 session_count: Some(1),

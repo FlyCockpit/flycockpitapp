@@ -9,8 +9,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::daemon::client::DaemonClient;
 use crate::daemon::proto::{ErrorCode, Request, Response};
-use crate::proto_crate::remote_protocol_id::{kind, tag_protocol_id_bytes};
-use crate::proto_crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
+use crate::proto_crate::bulk_transfer::{
+    BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+    transfer_id_from_bytes,
+};
 
 /// Text above this boundary must use the FCM2 source-artifact path rather than
 /// an inline user-message request.  It is intentionally shared by the native
@@ -69,7 +71,7 @@ pub async fn stage_opaque_user_text(
         transfer_id_bytes[0] = 1;
     }
     let transfer_id =
-        tag_protocol_id_bytes::<kind::Transfer>(transfer_id_bytes).map_err(|error| {
+        transfer_id_from_bytes(transfer_id_bytes).map_err(|error| {
             BulkUserMessageUploadError::Daemon(format!("building bulk transfer id: {error}"))
         })?;
     let transfer = RemoteBulkTransferRef::new(
@@ -169,7 +171,7 @@ mod tests {
     async fn bulk_user_message_staging_uses_bounded_write_requests_and_exact_digest() {
         use crate::daemon::client::DaemonClient;
         use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
-        use crate::proto_crate::remote_transport::bulk::RemoteBulkMimeClass;
+        use crate::proto_crate::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
         use base64::Engine as _;
         use sha2::{Digest as _, Sha256};
         use tokio::net::UnixListener;
@@ -254,7 +256,7 @@ mod tests {
                         Response::BulkTransferChunkAccepted {
                             next_chunk_index: expected_index as u32 + 1,
                             received_bytes:
-                                crate::proto_crate::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                                crate::proto_crate::wire_scalar::CanonicalU64DecimalStringV1::from_u64(
                                     received_bytes,
                                 ),
                             complete: expected_index + 1 == expected_chunk_count,

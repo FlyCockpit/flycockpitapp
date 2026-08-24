@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use cockpit_proto::remote_transport::bulk::{
-    MAX_TRANSFER_BYTES, RemoteBulkMimeClass, RemoteBulkTransferRef,
+use cockpit_proto::bulk_transfer::{
+    MAX_TRANSFER_BYTES, BulkMimeClass as RemoteBulkMimeClass,
+    BulkTransferRef as RemoteBulkTransferRef,
 };
-use cockpit_proto::remote_transport::lane::BULK_MAX_PAYLOAD_BYTES;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -38,7 +38,7 @@ pub const MAX_STAGED_TRANSFERS: usize = 256;
 /// encoded frame inside one bulk-lane logical payload.
 pub const STAGED_CHUNK_BYTES: usize = 3 * (cockpit_proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4);
 
-const _: () = assert!(STAGED_CHUNK_BYTES < BULK_MAX_PAYLOAD_BYTES);
+const _: () = assert!(STAGED_CHUNK_BYTES <= cockpit_proto::bulk_transfer::MAX_BULK_CHUNK_PAYLOAD_BYTES);
 
 /// How long a staged transfer may sit untouched before it is reclaimed.
 ///
@@ -358,9 +358,7 @@ fn stage_with_owner(
     );
     drop(guard);
 
-    let transfer_id = cockpit_proto::remote_protocol_id::tag_protocol_id_bytes::<
-        cockpit_proto::remote_protocol_id::kind::Transfer,
-    >(transfer_id_bytes)
+    let transfer_id = cockpit_proto::bulk_transfer::transfer_id_from_bytes(transfer_id_bytes)
     .map_err(|_| BulkStagingError::UnknownTransfer)?;
     RemoteBulkTransferRef::new(transfer_id, total_length, sha256, mime_class)
         .map_err(|_| BulkStagingError::ClassLimit)
@@ -1376,7 +1374,7 @@ mod tests {
     #[test]
     fn bulk_staging_chunk_fits_one_bulk_lane_payload() {
         // Both sides are constants, so this is a compile-time assertion.
-        const { assert!(STAGED_CHUNK_BYTES < BULK_MAX_PAYLOAD_BYTES) };
+        const { assert!(STAGED_CHUNK_BYTES <= cockpit_proto::bulk_transfer::MAX_BULK_CHUNK_PAYLOAD_BYTES) };
         // Base64 of a full chunk stays within the advertised chunk bound.
         const {
             assert!(

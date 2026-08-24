@@ -444,7 +444,7 @@ pub enum Response {
     /// Acknowledgement for [`crate::Request::WriteBulkTransferChunk`].
     BulkTransferChunkAccepted {
         next_chunk_index: u32,
-        received_bytes: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+        received_bytes: crate::wire_scalar::CanonicalU64DecimalStringV1,
         /// True once the staged bytes match the reference's length and digest.
         complete: bool,
         /// How long the daemon will hold this transfer without further
@@ -1279,8 +1279,10 @@ mod tests {
     /// regardless of export size.
     #[test]
     fn export_session_data_uses_bulk_transfer() {
-        use crate::remote_transport::bulk::{RemoteBulkMimeClass, RemoteBulkTransferRef};
-        use crate::remote_transport::lane::MAX_LOGICAL_PAYLOAD_BYTES;
+        use crate::bulk_transfer::{
+            BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
+            transfer_id_from_bytes,
+        };
 
         // The retired inline shape fails to parse.
         let legacy = json!({
@@ -1300,10 +1302,7 @@ mod tests {
             "inline content_base64 must no longer be accepted"
         );
 
-        let transfer_id = crate::remote_protocol_id::tag_protocol_id_bytes::<
-            crate::remote_protocol_id::kind::Transfer,
-        >([7u8; 16])
-        .unwrap();
+        let transfer_id = transfer_id_from_bytes([7u8; 16]).unwrap();
         // A 300 MiB debug bundle: far beyond anything an 8 MiB frame allowed.
         let total_length = 300 * 1024 * 1024;
         let response = Response::ExportSessionData {
@@ -1331,7 +1330,7 @@ mod tests {
             "an export reference must stay small, got {} bytes",
             encoded.len()
         );
-        assert!(encoded.len() < MAX_LOGICAL_PAYLOAD_BYTES);
+        assert!(encoded.len() < crate::MAX_NDJSON_FRAME_BYTES);
         assert!(!encoded.contains("content_base64"));
 
         let round_tripped: Response = serde_json::from_str(&encoded).unwrap();

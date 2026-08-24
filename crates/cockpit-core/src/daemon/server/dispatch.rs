@@ -925,9 +925,9 @@ pub(super) struct BulkUserMessagePayloadRequest<'a> {
     pub owner: &'a crate::daemon::bulk_staging::BulkTransferOwner,
     pub replay_actor: crate::db::message_attachments::MessageActor,
     pub client_submission_id: Uuid,
-    pub transfer: &'a cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    pub transfer: &'a cockpit_proto::bulk_transfer::BulkTransferRef,
     pub display_text: &'a Option<String>,
-    pub display_transfer: &'a Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
+    pub display_transfer: &'a Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     pub tag_expansions: &'a [proto::TagExpansionMeta],
     pub forced_skill: &'a Option<String>,
 }
@@ -941,7 +941,7 @@ pub(super) async fn resolve_bulk_user_message_payload(
     ctx: &Arc<DaemonContext>,
     request: BulkUserMessagePayloadRequest<'_>,
 ) -> std::result::Result<(String, Option<String>), ErrorPayload> {
-    use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+    use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
 
     let BulkUserMessagePayloadRequest {
         session_id,
@@ -956,7 +956,7 @@ pub(super) async fn resolve_bulk_user_message_payload(
     } = request;
 
     let is_opaque_text_transfer =
-        |reference: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+        |reference: &cockpit_proto::bulk_transfer::BulkTransferRef,
          minimum_length: u64| {
             reference.mime_class == RemoteBulkMimeClass::Opaque
                 && (minimum_length
@@ -1103,9 +1103,9 @@ async fn handle_send_user_message_bulk(
     client_submission_id: Uuid,
     expected_model_state_generation: Option<u64>,
     expected_model: Option<cockpit_config::config::providers::ActiveModelRef>,
-    transfer: cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: cockpit_proto::bulk_transfer::BulkTransferRef,
     display_text: Option<String>,
-    display_transfer: Option<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef>,
+    display_transfer: Option<cockpit_proto::bulk_transfer::BulkTransferRef>,
     tag_expansions: Vec<proto::TagExpansionMeta>,
     forced_skill: Option<String>,
     run_invocation_options: Option<proto::RunInvocationOptions>,
@@ -4592,7 +4592,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             data_base64,
         } => {
             let owner = if transfer.mime_class
-                == cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque
+                == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque
             {
                 let session_id = require_attached(state)?.handle.session_id;
                 Some(bulk_user_message_transfer_owner(
@@ -9261,7 +9261,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             data_base64,
         } => {
             let owner = if transfer.mime_class
-                == cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque
+                == cockpit_proto::bulk_transfer::BulkMimeClass::Opaque
             {
                 let session_id = shared
                     .attached
@@ -10429,7 +10429,7 @@ pub(super) fn bounded_provider_response(
     response: Response,
 ) -> std::result::Result<Response, ErrorPayload> {
     let encoded = serde_json::to_vec(&response).map_err(internal)?;
-    if encoded.len() > proto::remote_transport::lane::INTERACTIVE_MAX_PAYLOAD_BYTES {
+    if encoded.len() > proto::MAX_INTERACTIVE_RPC_PAYLOAD_BYTES {
         return Err(bad_request(
             "provider response exceeds the interactive payload limit; narrow the provider or model selection",
         ));
@@ -14341,7 +14341,7 @@ fn staging_error(error: crate::daemon::bulk_staging::BulkStagingError) -> ErrorP
 
 /// Accept one pushed chunk of a bulk transfer into daemon-side staging.
 pub(super) async fn write_bulk_transfer_chunk(
-    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
     chunk_index: u32,
     data_base64: &str,
     owner: Option<&crate::daemon::bulk_staging::BulkTransferOwner>,
@@ -14359,7 +14359,7 @@ pub(super) async fn write_bulk_transfer_chunk(
             message: format!("invalid bulk transfer chunk encoding: {error}"),
         })?;
     let accepted = match transfer.mime_class {
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Opaque => {
+        cockpit_proto::bulk_transfer::BulkMimeClass::Opaque => {
             let owner = owner.ok_or_else(unavailable_bulk_user_message_transfer)?;
             crate::daemon::bulk_staging::write_chunk_owned(transfer, owner, chunk_index, &chunk)
                 .map_err(|error| match error {
@@ -14374,7 +14374,7 @@ pub(super) async fn write_bulk_transfer_chunk(
     };
     Ok(Response::BulkTransferChunkAccepted {
         next_chunk_index: accepted.next_chunk_index,
-        received_bytes: cockpit_proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+        received_bytes: cockpit_proto::wire_scalar::CanonicalU64DecimalStringV1::from_u64(
             accepted.received_bytes,
         ),
         complete: accepted.complete,
@@ -14390,13 +14390,13 @@ pub(super) async fn write_bulk_transfer_chunk(
 /// no session/actor proof on this request shape. User-message bodies are
 /// consumed exclusively by the owned `SendUserMessageBulk` path.
 pub(super) async fn read_bulk_transfer_chunk(
-    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    transfer_id: &cockpit_proto::bulk_transfer::BulkTransferId,
     chunk_index: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let (chunk, last) = crate::daemon::bulk_staging::read_chunk_of_kind(
         *transfer_id.as_bytes(),
         chunk_index,
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::Export,
+        cockpit_proto::bulk_transfer::BulkMimeClass::Export,
     )
     .map_err(staging_error)?;
     Ok(Response::BulkTransferChunk {
@@ -14408,7 +14408,7 @@ pub(super) async fn read_bulk_transfer_chunk(
 
 pub(super) async fn import_session_archive(
     ctx: &Arc<DaemonContext>,
-    transfer: &cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef,
+    transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The archive bytes were staged by prior WriteBulkTransferChunk calls; the
     // staging layer verified their length and SHA-256 before releasing them.
@@ -14437,8 +14437,8 @@ pub(super) async fn import_session_archive(
 /// single assemble funnel below, never by the caller streaming it back.
 fn stage_export_bytes(
     bytes: &[u8],
-    mime_class: cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass,
-) -> std::result::Result<cockpit_proto::remote_transport::bulk::RemoteBulkTransferRef, ErrorPayload>
+    mime_class: cockpit_proto::bulk_transfer::BulkMimeClass,
+) -> std::result::Result<cockpit_proto::bulk_transfer::BulkTransferRef, ErrorPayload>
 {
     use rand::RngExt as _;
     let mut transfer_id = [0u8; 16];
@@ -14459,13 +14459,13 @@ fn stage_export_bytes(
 /// This is what keeps the raw archive owner-local while a redacted export is
 /// downloadable over the wire.
 pub(super) async fn read_redacted_export_chunk(
-    transfer_id: &cockpit_proto::remote_protocol_id::RemoteTransferId,
+    transfer_id: &cockpit_proto::bulk_transfer::BulkTransferId,
     chunk_index: u32,
 ) -> std::result::Result<Response, ErrorPayload> {
     let (chunk, last) = crate::daemon::bulk_staging::read_chunk_of_kind(
         *transfer_id.as_bytes(),
         chunk_index,
-        cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass::RedactedExport,
+        cockpit_proto::bulk_transfer::BulkMimeClass::RedactedExport,
     )
     .map_err(staging_error)?;
     Ok(Response::BulkTransferChunk {
@@ -14483,7 +14483,7 @@ pub(super) async fn export_session_data(
     include_sensitive: bool,
     local_owner_action: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
-    use cockpit_proto::remote_transport::bulk::RemoteBulkMimeClass;
+    use cockpit_proto::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
     // AC1: the raw, unredacted export is owner-LOCAL only. A remoted caller (a
     // remote-operation ledger dispatch, or any non-owner principal) is refused
     // BEFORE any archive is assembled or staged, so the only remoted success

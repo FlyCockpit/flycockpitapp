@@ -4967,6 +4967,56 @@ async fn handle_serialized_request_impl(
                 .await
         }
 
+        Request::GetAgentInventory { project_root } => {
+            crate::daemon::agent_management::inventory(ctx, project_root).await
+        }
+
+        Request::GetAgentEditSnapshot { project_root, name } => {
+            crate::daemon::agent_management::edit_snapshot(ctx, project_root, name).await
+        }
+
+        Request::MutateAgent {
+            project_root,
+            mutation,
+            expected_revision,
+        } => {
+            crate::daemon::agent_management::mutate(
+                ctx,
+                project_root,
+                mutation,
+                expected_revision,
+            )
+            .await
+        }
+
+        Request::BeginAgentEditorLease {
+            project_root,
+            name,
+            expected_revision,
+        } => {
+            crate::daemon::agent_management::begin_editor_lease(
+                ctx,
+                project_root,
+                name,
+                expected_revision,
+            )
+            .await
+        }
+
+        Request::CompleteAgentEditorLease {
+            project_root,
+            lease_id,
+            markdown,
+        } => {
+            crate::daemon::agent_management::complete_editor_lease(
+                ctx,
+                project_root,
+                lease_id,
+                markdown,
+            )
+            .await
+        }
+
         Request::SaveExtendedConfig {
             project_root,
             path,
@@ -9689,6 +9739,12 @@ async fn handle_concurrent_request_impl(
             .map_err(internal)?
             .map_err(internal)?;
             Ok(Response::PolicyExported { bundle_json })
+        }
+        Request::GetAgentInventory { project_root } => {
+            crate::daemon::agent_management::inventory(&ctx, project_root).await
+        }
+        Request::GetAgentEditSnapshot { project_root, name } => {
+            crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx

@@ -559,6 +559,19 @@ pub enum Response {
         hash: String,
     },
 
+    AgentInventory {
+        entries: Vec<crate::AgentInventoryEntry>,
+        config_generation: u64,
+    },
+
+    AgentEditSnapshot(crate::AgentEditSnapshot),
+
+    AgentMutated(crate::AgentMutationResult),
+
+    AgentEditorLeaseBegun(crate::AgentEditorLease),
+
+    AgentEditorLeaseCompleted(crate::AgentMutationResult),
+
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {
         changed: bool,
@@ -1158,6 +1171,11 @@ macro_rules! response_variants {
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
+            (Response::AgentInventory { .. }, "agent_inventory");
+            (Response::AgentEditSnapshot(..), "agent_edit_snapshot");
+            (Response::AgentMutated(..), "agent_mutated");
+            (Response::AgentEditorLeaseBegun(..), "agent_editor_lease_begun");
+            (Response::AgentEditorLeaseCompleted(..), "agent_editor_lease_completed");
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");

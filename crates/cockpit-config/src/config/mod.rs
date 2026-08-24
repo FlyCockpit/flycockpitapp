@@ -68,6 +68,13 @@ pub fn write_config_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> anyhow
     files::atomic_write(path, bytes)
 }
 
+/// Durably remove one configuration file without following a final symlink.
+/// Callers must hold [`hold_config_mutation_lock`] while resolving and
+/// removing the target.
+pub fn remove_config_file_atomic(path: &std::path::Path) -> anyhow::Result<()> {
+    files::remove_file_nofollow(path)
+}
+
 /// Reuse the audited component-relative/no-follow private-file primitive for
 /// short-lived terminal ingress. Callers must still enforce their own root,
 /// filename, media, and lifecycle policy.

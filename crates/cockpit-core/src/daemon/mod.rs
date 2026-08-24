@@ -23,6 +23,7 @@
 //!   status}` lets the user manage the lifecycle explicitly.
 
 pub mod agent_installation;
+pub mod agent_management;
 pub mod bulk_staging;
 pub mod bulk_upload;
 pub mod caffeinate;

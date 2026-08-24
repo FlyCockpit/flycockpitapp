@@ -1622,6 +1622,49 @@ pub enum Request {
         cleanup_names_json: String,
     },
 
+    /// Discover the effective daemon-owned agent inventory for a workspace.
+    GetAgentInventory {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+    },
+
+    /// Resolve one agent to a safe editable projection and opaque revision.
+    GetAgentEditSnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        name: String,
+    },
+
+    /// Apply one typed agent mutation. `expected_revision` is mandatory for
+    /// mutations of one existing document and omitted only for reset-all.
+    MutateAgent {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        mutation: crate::AgentMutation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<String>,
+    },
+
+    /// Acquire a daemon-side lease before handing an agent draft to an
+    /// external editor. The editor works on a host-owned staging file, never
+    /// the authoritative agent path.
+    BeginAgentEditorLease {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        name: String,
+        expected_revision: String,
+    },
+
+    /// Complete or cancel an external-editor lease. On commit the daemon
+    /// validates and CAS-publishes the returned markdown.
+    CompleteAgentEditorLease {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        lease_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markdown: Option<String>,
+    },
+
     /// Atomically persist a rendered extended settings layer. The daemon
     /// validates the target as a config.json layer, reloads it under the
     /// config mutation lock, and rejects stale `base_hash` writes.
@@ -2603,6 +2646,76 @@ impl Request {
                     }
                 }
             }
+            Self::GetAgentInventory { project_root } => {
+                validate_owner_project_root(project_root)?;
+            }
+            Self::GetAgentEditSnapshot { project_root, name } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier(
+                    "agent name",
+                    name,
+                    crate::MAX_AGENT_NAME_BYTES,
+                )?;
+            }
+            Self::MutateAgent {
+                project_root,
+                mutation,
+                expected_revision,
+            } => {
+                validate_owner_project_root(project_root)?;
+                let name = match mutation {
+                    crate::AgentMutation::EjectBuiltin { name }
+                    | crate::AgentMutation::SaveDefinition { name, .. }
+                    | crate::AgentMutation::DeleteCustom { name }
+                    | crate::AgentMutation::ResetBuiltin { name }
+                    | crate::AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+                    crate::AgentMutation::ResetAllBuiltins => None,
+                };
+                if let Some(name) = name {
+                    validate_owner_identifier(
+                        "agent name",
+                        name,
+                        crate::MAX_AGENT_NAME_BYTES,
+                    )?;
+                }
+                if let crate::AgentMutation::SaveDefinition { markdown, .. } = mutation
+                    && markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES
+                {
+                    return Err("agent markdown exceeds maximum length".to_string());
+                }
+                if expected_revision.as_ref().is_some_and(|value| value.len() > 128) {
+                    return Err("agent revision exceeds maximum length".to_string());
+                }
+            }
+            Self::BeginAgentEditorLease {
+                project_root,
+                name,
+                expected_revision,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier(
+                    "agent name",
+                    name,
+                    crate::MAX_AGENT_NAME_BYTES,
+                )?;
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("agent revision is invalid".to_string());
+                }
+            }
+            Self::CompleteAgentEditorLease {
+                project_root,
+                lease_id,
+                markdown,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("agent editor lease", lease_id, 128)?;
+                if markdown
+                    .as_ref()
+                    .is_some_and(|value| value.len() > crate::MAX_AGENT_MARKDOWN_BYTES)
+                {
+                    return Err("agent markdown exceeds maximum length".to_string());
+                }
+            }
             Self::SaveExtendedConfig {
                 project_root,
                 path,
@@ -2869,6 +2982,11 @@ macro_rules! request_variants {
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
+            (Request::GetAgentInventory { .. }, "get_agent_inventory");
+            (Request::GetAgentEditSnapshot { .. }, "get_agent_edit_snapshot");
+            (Request::MutateAgent { .. }, "mutate_agent");
+            (Request::BeginAgentEditorLease { .. }, "begin_agent_editor_lease");
+            (Request::CompleteAgentEditorLease { .. }, "complete_agent_editor_lease");
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
             (Request::ImportPolicy { .. }, "import_policy");
@@ -3157,6 +3275,11 @@ macro_rules! command {
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
             (Request::SaveMcpConfig { project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
+            (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
+            (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
+            (Request::BeginAgentEditorLease { project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|name:String|expected_revision:String", [project_root: String => project_root, name: String => param, expected_revision: String => param]);
+            (Request::CompleteAgentEditorLease { project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|lease_id:String|markdown:Option<String>", [project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);

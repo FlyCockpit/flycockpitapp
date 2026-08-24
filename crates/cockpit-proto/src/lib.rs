@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod agent_installation;
+pub mod agent_management;
 pub mod capability_ceiling;
 #[cfg(feature = "remote")]
 pub mod es256;
@@ -35,6 +36,10 @@ pub use agent_installation::{
     AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
+};
+pub use agent_management::{
+    AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
+    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
@@ -2909,6 +2914,11 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "cancel_mcp_oauth"
                 | "setup_copilot_auth"
                 | "apply_setup_wizard"
+                | "get_agent_inventory"
+                | "get_agent_edit_snapshot"
+                | "mutate_agent"
+                | "begin_agent_editor_lease"
+                | "complete_agent_editor_lease"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"

@@ -1258,8 +1258,10 @@ pub(super) const REMOTELY_LEDGERED_TRANSACTIONAL_TAGS: &[&str] = &[
 #[cfg(any(unix, test))]
 pub(super) fn debug_assert_ledger_site_registry_consistent() {
     macro_rules! transactional_registry_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($tag, stringify!($authz), stringify!($remote_class)));)+
+            rows
         }};
     }
     let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_registry_rows);
@@ -2168,14 +2170,6 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
     effects: &mut ClientRequestEffects,
     remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    #[cfg(not(feature = "remote"))]
-    if request.requires_remote_feature() {
-        return Err(ErrorPayload {
-            code: ErrorCode::BadRequest,
-            message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"
-                .into(),
-        });
-    }
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
             code: ErrorCode::Internal,
@@ -2425,6 +2419,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::CancelRunInvocation {
             client_submission_id,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let canonical_request = Request::CancelRunInvocation {
                     client_submission_id,
@@ -2532,6 +2527,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             label,
             message,
         } => {
+            #[cfg(feature = "remote")]
             if let Some(operation) = remote_operation {
                 let request = Request::SteerDelegation {
                     session_id,
@@ -4392,7 +4388,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         // dispatched on the concurrent path; the serialized match is also
         // exhaustive over `Request`, so they delegate to the shared helpers.
         Request::ListPackages => list_packages_response(ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetOrgSyncStatus => get_org_sync_status_response(ctx).await,
         Request::ListFailedToolCalls {
             since_epoch,
@@ -4539,6 +4537,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             transfer_id,
             chunk_index,
         } => read_redacted_export_chunk(&transfer_id, chunk_index).await,
+        #[cfg(feature = "remote")]
         Request::OperationStatus { operation_id } => {
             let ClientPrincipal::Remote(remote) = &shared.principal else {
                 return Err(ErrorPayload {
@@ -6524,6 +6523,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::StoreFlycockpitCredential { credential, force } => {
             let request = Request::StoreFlycockpitCredential {
                 credential: credential.clone(),
@@ -6598,6 +6598,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             result
         }
 
+        #[cfg(feature = "remote")]
         Request::ClearFlycockpitCredential => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -6717,6 +6718,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             result
         }
 
+        #[cfg(feature = "remote")]
         Request::SetFlycockpitConnectorEnabled { enabled } => {
             let request = Request::SetFlycockpitConnectorEnabled { enabled };
             if ctx.paths.ephemeral {
@@ -6754,6 +6756,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::SyncFlycockpitOrgPolicy => {
             let request = Request::SyncFlycockpitOrgPolicy;
             if ctx.paths.ephemeral {
@@ -6809,6 +6812,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::EnrollFlycockpitOrgSync { org_id } => {
             let request = Request::EnrollFlycockpitOrgSync {
                 org_id: org_id.clone(),
@@ -7474,6 +7478,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
+        #[cfg(feature = "remote")]
         Request::GetFlycockpitAccount => ctx
             .flycockpit_account_view()
             .map(|account| Response::FlycockpitAccount { account })
@@ -9048,14 +9053,6 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     ctx: Arc<DaemonContext>,
     remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    #[cfg(not(feature = "remote"))]
-    if request.requires_remote_feature() {
-        return Err(ErrorPayload {
-            code: ErrorCode::BadRequest,
-            message: "FlyCockpit account, sync, and relay operations are unavailable in this local-only build"
-                .into(),
-        });
-    }
     if let Some(operation) = &remote_operation {
         tracing::debug!(
             request_id = %operation.request_id,
@@ -9647,7 +9644,9 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             provider_id,
         } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
         Request::ListPackages => list_packages_response(&ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(&ctx).await,
+        #[cfg(feature = "remote")]
         Request::GetOrgSyncStatus => get_org_sync_status_response(&ctx).await,
         Request::ListFailedToolCalls {
             since_epoch,

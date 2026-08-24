@@ -30,8 +30,10 @@ fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::Workspac
 }
 
 macro_rules! pin_registration_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        vec![$(($kind, stringify!($authz), stringify!($ordering))),+]
+    (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        let mut rows = Vec::new();
+        $($(#[$row_attr])* rows.push(($kind, stringify!($authz), stringify!($ordering)));)+
+        rows
     }};
 }
 
@@ -888,6 +890,7 @@ async fn list_packages_response_carries_no_planted_secret() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn get_connector_state_omits_credential_secret() {
     // AC3: the connector snapshot carries no secret bytes.
     let tmp = tempfile::tempdir().unwrap();
@@ -3920,6 +3923,7 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let ctx = test_ctx();
     let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222230").unwrap();
@@ -7518,6 +7522,7 @@ async fn trust_workspace_root(ctx: &DaemonContext, path: &Path) {
         .unwrap();
 }
 
+#[cfg(feature = "remote")]
 fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredential {
     crate::auth::flycockpit::StoredFlycockpitCredential {
         server_url: "https://app.example.test".to_string(),
@@ -7533,6 +7538,7 @@ fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredentia
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -7588,6 +7594,7 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -7642,6 +7649,7 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_projections() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9096,6 +9104,7 @@ async fn owner_provider_rpc_rejects_subscription_ack_namespace_before_failure_in
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9255,6 +9264,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -9320,6 +9330,7 @@ async fn clear_credential_full_cas_rejects_same_token_metadata_replacement() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_credential_finishes_when_local_revoke_server_stalls() {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -9371,6 +9382,7 @@ async fn clear_credential_finishes_when_local_revoke_server_stalls() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_credential_noops_commit_and_replay() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9512,6 +9524,7 @@ async fn remote_provider_mutation_error_closes_the_durable_replay_record_unknown
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn remote_owner_credential_mutations_commit_vault_policy_and_replay_ledger_together() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -9991,8 +10004,10 @@ async fn transactional_mutation_inventory_has_ledger_site() {
     // authorization layer denies a remote non-owner before dispatch, so they
     // never reserve a transactional remote-operation ledger row.
     macro_rules! transactional_inventory_rows {
-        (($($context:ident),*) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(($tag, stringify!($authz), stringify!($remote_class))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($tag, stringify!($authz), stringify!($remote_class)));)+
+            rows
         }};
     }
     let rows: Vec<(&str, &str, &str)> = proto::command!(transactional_inventory_rows);
@@ -10965,6 +10980,7 @@ async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -10991,6 +11007,7 @@ async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn ephemeral_daemon_rejects_persistent_secret_writes() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
@@ -11040,6 +11057,7 @@ async fn ephemeral_daemon_rejects_persistent_secret_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn owner_secret_rpcs_reject_non_owner_principal() {
     let ctx = persistent_test_ctx_with_credential_path(
         tempfile::tempdir().unwrap().path().join("credentials.json"),
@@ -11078,6 +11096,7 @@ async fn owner_secret_rpcs_reject_non_owner_principal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn store_without_force_returns_already_logged_in_without_token() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
@@ -11121,6 +11140,7 @@ async fn store_without_force_returns_already_logged_in_without_token() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn store_with_force_replaces_vault_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
@@ -11153,6 +11173,7 @@ async fn store_with_force_replaces_vault_credential() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn clear_revokes_from_daemon_vault() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -11234,6 +11255,7 @@ async fn clear_revokes_from_daemon_vault() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn credentials_json_is_not_read_or_written() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
@@ -13504,14 +13526,16 @@ struct DispatchMatrixRow {
 }
 
 macro_rules! dispatch_matrix_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            vec![$(
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(
                 DispatchMatrixRow {
                     kind: $kind,
                     class: dispatch_matrix_class_for_command($kind, stringify!($authz), $mutating),
                     authz: stringify!($authz),
                 },
-            )+]
+            );)+
+            rows
         }};
     }
 
@@ -21468,8 +21492,10 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! request_ordering_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        vec![$(($kind, command_request_ordering_value!($ordering))),+]
+    (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        let mut rows = Vec::new();
+        $($(#[$row_attr])* rows.push(($kind, command_request_ordering_value!($ordering)));)+
+        rows
     }};
 }
 
@@ -21587,6 +21613,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     }
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {

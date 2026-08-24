@@ -12,6 +12,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+remote = ["cockpit-core/remote", "cockpit-proto/remote"]
+
 [dependencies]
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }

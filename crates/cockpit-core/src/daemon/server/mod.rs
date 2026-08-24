@@ -185,12 +185,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::PackageImported { .. }
         | proto::Response::PackagesPruned { .. }
         | proto::Response::KclPackagesImported { .. }
-        | proto::Response::ConnectorState { .. }
-        | proto::Response::OrgSyncStatus { .. }
         | proto::Response::EndedSessionsPurged { .. }
         | proto::Response::AssistantDeleted { .. }
         | proto::Response::MediaReservationDiagnosis { .. }
         | proto::Response::MediaReservationRepaired { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::ConnectorState { .. } | proto::Response::OrgSyncStatus { .. } => {}
         // Free-text-bearing owner-remoted reads: the vaulted-secret redaction
         // backstop scrubs a value that later becomes a credential out of raw
         // tool I/O, compaction event payloads, assistant config, and rendered
@@ -393,6 +393,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        #[cfg(feature = "remote")]
         proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Assistants { assistants } => {
@@ -572,10 +573,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             config_generation: _,
         }
         | proto::Response::WorkspaceTrust { .. }
-        | proto::Response::FlycockpitStored
-        | proto::Response::FlycockpitNotLoggedIn
         | proto::Response::SecretInventory { .. }
-        | proto::Response::FlycockpitAccount { .. }
         | proto::Response::ProviderCatalogSnapshot { .. }
         | proto::Response::ProviderModelsFetched { .. }
         | proto::Response::ProviderUsageSnapshot { .. }
@@ -583,13 +581,20 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderCredentialDeleted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::FlycockpitStored
+        | proto::Response::FlycockpitNotLoggedIn
+        | proto::Response::FlycockpitAccount { .. } => {}
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitAlreadyLoggedIn { email, server_url } => {
             scrub_string(email, redact);
             scrub_string(server_url, redact);
         }
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitCleared { server_url } => {
             scrub_string(server_url, redact);
         }
+        #[cfg(feature = "remote")]
         proto::Response::FlycockpitOrgSync { outcome } => {
             if let proto::FlycockpitOrgSyncOutcome::EnrollmentRequired { org_id } = outcome {
                 scrub_string(org_id, redact);
@@ -629,11 +634,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
-        | proto::Response::RemoteOperationStatus { .. }
         | proto::Response::ProviderOAuthCompleted { .. }
         | proto::Response::McpOAuthCompleted { .. }
         | proto::Response::McpOAuthCancelled { .. }
         | proto::Response::McpConfigSaved { .. } => {}
+        #[cfg(feature = "remote")]
+        proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::ProviderOAuthStarted { authorize_url, .. } => {
             scrub_string(authorize_url, redact);
         }
@@ -1187,6 +1193,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             lid_close_guaranteed: _,
             message,
         } => scrub_option_string(message, redact),
+        #[cfg(feature = "remote")]
         proto::Event::ConnectorStatus {
             enabled: _,
             status: _,
@@ -2898,6 +2905,7 @@ impl DaemonContext {
         }
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) fn flycockpit_account_view(&self) -> Result<Option<proto::FlycockpitAccountView>> {
         let Some(credential) = self.load_flycockpit_credential()? else {
             return Ok(None);
@@ -4904,9 +4912,11 @@ async fn handle_envelope(
     match env.body {
         Body::Request {
             id,
+            #[cfg(feature = "remote")]
             operation,
             request,
         } => {
+            #[cfg(feature = "remote")]
             let remote_operation =
                 match admit_remote_operation(&state.principal, id, operation, &request) {
                     Ok(context) => context,
@@ -4916,6 +4926,8 @@ async fn handle_envelope(
                         return Ok(());
                     }
                 };
+            #[cfg(not(feature = "remote"))]
+            let remote_operation = None;
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());

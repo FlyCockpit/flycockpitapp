@@ -2662,8 +2662,10 @@ mod tests {
 
     /// Expand a `*_variants!` macro into the set of wire tags it declares.
     macro_rules! collect_tags {
-        (($($ctx:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {{
-            vec![$($tag),+]
+        (($($ctx:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+            let mut tags = Vec::new();
+            $($(#[$row_attr])* tags.push($tag);)+
+            tags
         }};
     }
 

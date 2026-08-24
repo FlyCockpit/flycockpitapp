@@ -336,9 +336,9 @@ fn canonical_if_exists(path: &str) -> PathBuf {
 }
 
 macro_rules! command_request_kind_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => $kind,)+
+            $($(#[$row_attr])* $pattern => $kind,)+
         }
     }};
 }
@@ -369,9 +369,9 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! command_request_ordering_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+    (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
-            $($pattern => command_request_ordering_value!($ordering),)+
+            $($(#[$row_attr])* $pattern => command_request_ordering_value!($ordering),)+
         }
     }};
 }
@@ -386,32 +386,38 @@ mod tests {
     use super::*;
 
     macro_rules! request_ordering_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            &[$(($kind, command_request_ordering_value!($ordering))),+]
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut rows = Vec::new();
+            $($(#[$row_attr])* rows.push(($kind, command_request_ordering_value!($ordering)));)+
+            rows
         }};
     }
 
     macro_rules! request_ordering_row_count_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            0usize $(+ {
+        (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            let mut count = 0usize;
+            $($(#[$row_attr])* {
                 let _ = stringify!($pattern);
-                1usize
+                count += 1;
             })+
+            count
         }};
     }
 
     macro_rules! request_ordering_no_wildcard_check {
-        (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        (($request:ident) [$($(#[$row_attr:meta])* ($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             let classify_without_wildcard: fn(&Request) -> RequestOrdering = |$request| {
                 match $request {
-                    $($pattern => command_request_ordering_value!($ordering),)+
+                    $($(#[$row_attr])* $pattern => command_request_ordering_value!($ordering),)+
                 }
             };
-            let names = &[$($kind),+];
+            let mut names = Vec::new();
+            $($(#[$row_attr])* names.push($kind);)+
             (classify_without_wildcard, names)
         }};
     }
 
+    #[cfg(feature = "remote")]
     fn remote(scope: PrincipalScope, project_root: Option<String>) -> ClientPrincipal {
         ClientPrincipal::from_verified_remote(
             "user-1".to_string(),
@@ -423,6 +429,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn agent_scope_allows_write_and_read_for_matching_project() {
         let principal = remote(PrincipalScope::Agent, Some("/workspace/app".to_string()));
@@ -431,6 +438,7 @@ mod tests {
         assert!(!principal.can_agent_write_project("/workspace/other"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn readonly_scope_allows_read_but_not_write() {
         let principal = remote(
@@ -441,6 +449,7 @@ mod tests {
         assert!(principal.can_agent_read_project("/workspace/app"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn instance_wide_grant_matches_any_project() {
         let principal = remote(PrincipalScope::ProjectFiles, None);
@@ -448,6 +457,7 @@ mod tests {
         assert!(principal.has_project_files("/elsewhere"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn image_generation_admin_scope_grants_no_terminal_agent_or_file_access() {
         // AC1: `ImageGenerationAdmin` must NEVER imply terminal, agent, or
@@ -478,6 +488,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn rootless_image_generation_admin_grant_does_not_wildcard_match() {
         // A directly-constructed `ImageGenerationAdmin` grant with no project
@@ -508,6 +519,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn from_verified_remote_is_the_only_remote_constructor() {
         // After the standalone relay cutover, the legacy

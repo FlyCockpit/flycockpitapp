@@ -1550,6 +1550,7 @@ pub enum Event {
     /// Remote relay connector state changed. **Daemon-global**: carries no
     /// session content and is broadcast to every connected client so status
     /// chrome can show connected/reconnecting/off without polling.
+    #[cfg(feature = "remote")]
     ConnectorStatus {
         enabled: bool,
         status: String,
@@ -1713,6 +1714,7 @@ macro_rules! event_variants {
             (Event::TandemState { .. }, "tandem_state");
             (Event::GitignoreAllow { .. }, "gitignore_allow");
             (Event::CaffeinateState { .. }, "caffeinate_state");
+            #[cfg(feature = "remote")]
             (Event::ConnectorStatus { .. }, "connector_status");
             (Event::TerminalOutput { .. }, "terminal_output");
             (Event::TerminalClipboard { .. }, "terminal_clipboard");
@@ -1731,9 +1733,9 @@ macro_rules! event_variants {
 impl Event {
     pub fn wire_tag(&self) -> &'static str {
         macro_rules! wire_tag {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {
                 match self {
-                    $($pattern => $tag,)+
+                    $($(#[$row_attr])* $pattern => $tag,)+
                 }
             };
         }

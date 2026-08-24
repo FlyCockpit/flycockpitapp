@@ -30,6 +30,7 @@ remote = [
     "cockpit-core/remote",
     "cockpit-db/remote",
     "cockpit-proto/remote",
+    "cockpit-tui/remote",
     "dep:tokio-tungstenite",
     "dep:flycockpit-relay-protocol",
 ]

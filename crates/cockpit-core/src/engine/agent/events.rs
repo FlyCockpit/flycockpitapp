@@ -732,6 +732,7 @@ pub enum TurnEvent {
     },
 
     /// Remote relay connector state changed — daemon-global and UI-only.
+    #[cfg(feature = "remote")]
     ConnectorStatus {
         enabled: bool,
         status: String,

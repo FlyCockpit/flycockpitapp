@@ -851,8 +851,12 @@ fn is_global_turn_event(event: &TurnEvent) -> bool {
             | TurnEvent::InterruptRaised { .. }
             | TurnEvent::InterruptResolved { .. }
             | TurnEvent::InterruptQueueChanged { .. }
-            | TurnEvent::ConnectorStatus { .. }
-    )
+    ) || {
+        #[cfg(feature = "remote")]
+        { matches!(event, TurnEvent::ConnectorStatus { .. }) }
+        #[cfg(not(feature = "remote"))]
+        { false }
+    }
 }
 
 fn push_incoming_turn_event(ctx: &IncomingEventContext<'_>, event: TurnEvent) {
@@ -1987,7 +1991,6 @@ fn is_global_event(event: &proto::Event) -> bool {
         event,
         proto::Event::CaffeinateState { .. }
             | proto::Event::DaemonDraining { .. }
-            | proto::Event::ConnectorStatus { .. }
             | proto::Event::LspNotice { .. }
             | proto::Event::EnvDriftWarning { .. }
             | proto::Event::InterruptRaised { .. }
@@ -1995,7 +1998,12 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptQueueChanged { .. }
             | proto::Event::HostCapabilitiesChanged { .. }
             | proto::Event::ImageControlConfigChanged { .. }
-    )
+    ) || {
+        #[cfg(feature = "remote")]
+        { matches!(event, proto::Event::ConnectorStatus { .. }) }
+        #[cfg(not(feature = "remote"))]
+        { false }
+    }
 }
 
 impl Drop for AgentRunner {
@@ -3413,9 +3421,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. }
-        | DaemonDraining { .. }
-        | ConnectorStatus { .. }
+        CaffeinateState { .. } | DaemonDraining { .. }
         // Image-control configuration changes are daemon-global: they are
         // keyed by project, not by an attached chat session.
         | ImageControlConfigChanged { .. }
@@ -3431,6 +3437,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         }
         | EnvDriftWarning { .. }
         | Unknown => return None,
+        #[cfg(feature = "remote")]
+        ConnectorStatus { .. } => return None,
     })
 }
 
@@ -4328,6 +4336,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             lid_close_guaranteed,
             message,
         },
+        #[cfg(feature = "remote")]
         ConnectorStatus {
             enabled,
             status,

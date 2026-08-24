@@ -54,6 +54,7 @@ pub mod remote_enterprise_connection_policy;
 pub mod remote_identity_protocol;
 #[cfg(feature = "remote")]
 pub mod remote_ip_consent;
+#[cfg(feature = "remote")]
 pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
 #[cfg(feature = "remote")]
@@ -1196,12 +1197,14 @@ impl Envelope {
             v,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request,
             },
         }
     }
 
+    #[cfg(feature = "remote")]
     pub fn remote_request(
         id: Uuid,
         operation: RemoteOperationIdentityV1,
@@ -1266,6 +1269,7 @@ pub enum Body {
     #[serde(rename = "req")]
     Request {
         id: Uuid,
+        #[cfg(feature = "remote")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         operation: Option<RemoteOperationIdentityV1>,
         #[serde(flatten)]
@@ -1422,6 +1426,7 @@ impl<'de> Deserialize<'de> for RemoteReplayLimit {
     }
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteOperationIdentityV1 {
@@ -1430,6 +1435,7 @@ pub struct RemoteOperationIdentityV1 {
     pub operation_id: Uuid,
 }
 
+#[cfg(feature = "remote")]
 impl RemoteOperationIdentityV1 {
     pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
         anyhow::ensure!(
@@ -1453,6 +1459,7 @@ impl RemoteOperationIdentityV1 {
     }
 }
 
+#[cfg(feature = "remote")]
 impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -1493,9 +1500,13 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, MAX_UUID_V7_UNIX_MS,
-    RemoteAdapterEvidenceV1, RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy,
-    RemoteOperationClass, Request, RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
+    UsageKind,
+};
+#[cfg(feature = "remote")]
+pub use request::{
+    MAX_UUID_V7_UNIX_MS, RemoteAdapterEvidenceV1, RemoteAdapterRecoveryContractV1,
+    RemoteAdapterRecoveryStrategy, RemoteOperationClass, UnknownRemoteOperationClass,
     canonical_remote_operation_fcor_schema_for_tag, remote_adapter_recovery_contract_for_tag,
     remote_adapter_recovery_strategy_for_tag, remote_operation_class_for_tag,
     remote_operation_fcor_schema_for_tag, remote_operation_uuid_v7_from_parts,
@@ -1652,11 +1663,12 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteGoalOutcomeV1,
-    RemoteOperationStateV1, RemoteOperationStatusV1, Response, RunInvocationCancelOutcome,
-    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
-    RunInvocationTerminalReason,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
+    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
+    RunInvocationStatusV1, RunInvocationTerminalReason,
 };
+#[cfg(feature = "remote")]
+pub use response::{RemoteGoalOutcomeV1, RemoteOperationStateV1, RemoteOperationStatusV1};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeRepairState {
@@ -2400,6 +2412,7 @@ const SEALED_LITERAL_FCOR_PLACEHOLDER: &[u8] = b"[sealed-literal-redacted-from-f
 // frees without zeroizing). This keeps the zeroization guarantee intact end to
 // end; the redacted disposition is reflected in the `option<redacted>` canonical
 // codec (see `canonical_fcor_codec_for_rust_type`).
+#[cfg(feature = "remote")]
 impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWireLiteral {
     fn encode_fcor_value_v1(
         &self,
@@ -2612,7 +2625,7 @@ pub struct ExportSessionData {
     pub filename_extension: String,
     pub mime: String,
     /// Typed bulk transfer reference; carries the length and SHA-256 digest.
-    pub transfer: remote_transport::bulk::RemoteBulkTransferRef,
+    pub transfer: bulk_transfer::BulkTransferRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_count: Option<usize>,
     #[serde(default)]
@@ -3305,7 +3318,7 @@ fn codec_error(err: LinesCodecError) -> io::Error {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod proto_fixture_tests {
     //! Protocol fixtures cover every version accepted by this build. When the
     //! supported range changes, add or remove the corresponding `vN/`
@@ -3529,27 +3542,33 @@ mod proto_fixture_tests {
 
     fn request_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::request_variants!(collect_tags)
     }
 
     fn response_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::response_variants!(collect_tags)
     }
 
     fn event_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::event_variants!(collect_tags)
     }
@@ -3648,7 +3667,7 @@ mod proto_fixture_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod golden_wire_fixtures {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -4530,9 +4549,11 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
 
     fn event_variant_tags() -> Vec<&'static str> {
         macro_rules! collect_tags {
-            (($($context:ident),*) [$(($pattern:pat, $tag:expr);)+]) => {
-                vec![$($tag),+]
-            };
+            (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:expr);)+]) => {{
+                let mut tags = Vec::new();
+                $($(#[$row_attr])* tags.push($tag);)+
+                tags
+            }};
         }
         crate::event_variants!(collect_tags)
     }
@@ -4752,6 +4773,7 @@ mod errorcode_forward_tests {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
         let fixture: Value = serde_json::from_str(include_str!(

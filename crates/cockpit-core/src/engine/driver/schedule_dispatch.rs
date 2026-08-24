@@ -32,6 +32,9 @@ impl Driver {
                 self.fire_swarm_subagent_start(&job_id, &subagent_type)
                     .await;
             }
+            ScheduleEvent::SwarmChildStopGateCompleted { job_id } => {
+                self.mark_swarm_subagent_stop_gate_completed(&job_id);
+            }
             ScheduleEvent::Completed {
                 job_id,
                 label,

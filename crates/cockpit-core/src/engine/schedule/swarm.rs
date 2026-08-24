@@ -213,7 +213,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
         None
     };
 
-    let loop_outcome = run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx).await;
+    let loop_outcome = run_swarm_loop(&job_id, &spec, &ctx, &turn_tx, &cmd_tx).await;
 
     // The child is terminal either way. Invalidate its token and drain the
     // return barrier before the parent is told anything, so the parent can
@@ -230,7 +230,14 @@ pub async fn run_swarm(run: SwarmRunCtx) {
     }
 
     let result = match loop_outcome {
-        Ok(text) => text,
+        Ok(text) => {
+            let _ = event_tx
+                .send(ScheduleEvent::SwarmChildStopGateCompleted {
+                    job_id: job_id.clone(),
+                })
+                .await;
+            text
+        }
         Err(e) => {
             let _ = event_tx
                 .send(ScheduleEvent::Completed {
@@ -266,6 +273,7 @@ pub async fn run_swarm(run: SwarmRunCtx) {
 /// Run the child's `Swarm` agent loop, intercepting its own
 /// `spawn` calls and routing them back to main.
 async fn run_swarm_loop(
+    job_id: &str,
     spec: &SpawnSpec,
     ctx: &ScheduleContext,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -314,6 +322,10 @@ async fn run_swarm_loop(
         &agent.model,
         &ctx.session,
     );
+    // Detached children own their continuation budget for their complete job
+    // lifetime. Nested jobs receive their own `run_swarm_loop` invocation and
+    // cannot consume or reopen this latch.
+    let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
@@ -359,7 +371,38 @@ async fn run_swarm_loop(
                     .pop()
                     .expect("Continue with empty history is unreachable");
             }
-            TurnOutcome::Done => return Ok(collect_final_text(&history)),
+            TurnOutcome::Done => {
+                let hook_snapshot = pinned.snapshot();
+                let hook_runner = ctx.process_containment.clone().map_or_else(
+                    crate::engine::agent::hooks::TokioCommandRunner::new,
+                    crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                );
+                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                    reason,
+                    additional_context,
+                } = crate::engine::agent::hooks::run_stop_hooks(
+                    &hook_runner,
+                    &crate::engine::agent::hooks::DefaultProcessEnv,
+                    hook_snapshot.hooks(),
+                    crate::config::extended::hooks::HookEvent::SubagentStop,
+                    spec.worker.agent_name(),
+                    ctx.session.id,
+                    &ctx.cwd,
+                    &ctx.session.db,
+                    Some(job_id),
+                    &mut stop_gate,
+                )
+                .await
+                    && !cancel.is_cancelled()
+                {
+                    next_prompt = crate::engine::driver::Driver::stop_continuation_prompt(
+                        reason,
+                        additional_context,
+                    );
+                    continue;
+                }
+                return Ok(collect_final_text(&history));
+            }
             // The child fanned out further. Route the spawn back to main (the
             // single authority) — or refuse it at the ceiling (clamp, don't
             // crash) — and feed the resulting pointer back as this call's
@@ -405,11 +448,40 @@ async fn run_swarm_loop(
             | TurnOutcome::ToolResult { .. }
             | TurnOutcome::ScheduleAction { .. }
             | TurnOutcome::Return { .. } => {
+                let hook_snapshot = pinned.snapshot();
+                let hook_runner = ctx.process_containment.clone().map_or_else(
+                    crate::engine::agent::hooks::TokioCommandRunner::new,
+                    crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                );
+                if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                    reason,
+                    additional_context,
+                } = crate::engine::agent::hooks::run_stop_hooks(
+                    &hook_runner,
+                    &crate::engine::agent::hooks::DefaultProcessEnv,
+                    hook_snapshot.hooks(),
+                    crate::config::extended::hooks::HookEvent::SubagentStop,
+                    spec.worker.agent_name(),
+                    ctx.session.id,
+                    &ctx.cwd,
+                    &ctx.session.db,
+                    Some(job_id),
+                    &mut stop_gate,
+                )
+                .await
+                    && !cancel.is_cancelled()
+                {
+                    next_prompt = crate::engine::driver::Driver::stop_continuation_prompt(
+                        reason,
+                        additional_context,
+                    );
+                    continue;
+                }
                 return Ok(collect_final_text(&history));
             }
         }
     }
-    Ok(collect_final_text(&history))
+    anyhow::bail!("swarm child reached its primary turn limit without a normal stop boundary")
 }
 
 /// Route a running child's own `spawn` to main, or refuse it at the
@@ -1010,6 +1082,7 @@ mod tests {
             redact: table.clone(),
             cwd: tmp.path().to_path_buf(),
             config,
+            process_containment: None,
             agent: Arc::new(parent),
             // This test drives `run_swarm_loop` directly to check brief
             // redaction; it never delegates write authority, so no coordinator
@@ -1029,7 +1102,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            run_swarm_loop(&spec, &ctx, &turn_tx, &cmd_tx),
+            run_swarm_loop("job-test", &spec, &ctx, &turn_tx, &cmd_tx),
         )
         .await
         .expect("the swarm loop must finish against the local endpoint");

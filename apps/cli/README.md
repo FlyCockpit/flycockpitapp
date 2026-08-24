@@ -482,14 +482,15 @@ Only an explicit, parseable `preToolUse` `{"decision":"deny",...}` blocks a
 tool. Every other failure mode is **fail-open**: the run is recorded as
 `failed` in the audit ledger and the agent continues. Fail-open conditions are:
 
-- crash (process exited with a signal / non-zero status other than a parseable
-  deny)
-- timeout (the command did not finish within `timeoutSecs`)
-- spawn-failure (the executable could not be launched)
-- malformed-output (stdout was not valid JSON or not a JSON object)
-- oversized-output (stdout/stderr exceeded the 64 KiB cap)
-- nonzero-exit (a non-zero exit code with no parseable deny)
-- missing-command (the executable was not found on PATH)
+- `spawn failed` (the executable could not be launched)
+- `executable not found` (a bare command could not be resolved before the clean environment was built)
+- `malformed JSON output` (stdout was not valid JSON)
+- `hook timed out`
+- `descendant_containment_unsupported` (the platform could not prove descendant containment before spawn)
+- `hook output exceeded limit` (stdout/stderr exceeded the 64 KiB cap)
+- `hook exited with non-zero status` (followed by the numeric exit status)
+- `hook exited without status` (the process crashed or its wait handle failed)
+- `descendant emptiness not proven` (the same-generation empty oracle was uncertain)
 
 Exit status alone never denies. Post and observe-only hooks never block; they
 run sequentially even if an earlier observer fails.

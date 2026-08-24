@@ -18,7 +18,10 @@ use uuid::Uuid;
 use crate::db::Db;
 use crate::db::execution_containments::{CasExecutionContainment, ExecutionContainmentRow};
 
-use super::adapter::{AdapterHandle, ContainerExecRequest, NativeSpawnRequest, SharedAdapter};
+use super::adapter::{
+    AdapterHandle, ContainerExecRequest, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest,
+    SharedAdapter,
+};
 use super::state_machine::reduce;
 use super::types::{
     ContainmentError, ContainmentEvent, ContainmentGuarantee, ContainmentLease, ContainmentRecord,
@@ -39,6 +42,16 @@ enum Op {
         cwd: PathBuf,
         require_proven: bool,
         reply: Reply<Result<ContainmentLease, ContainmentError>>,
+    },
+    CreateAndSpawnWithIo {
+        session_id: Uuid,
+        operation_id: String,
+        program: PathBuf,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        cwd: PathBuf,
+        require_proven: bool,
+        reply: Reply<Result<(ContainmentLease, NativeChildIo), ContainmentError>>,
     },
     CreateContainerAndExec {
         session_id: Uuid,
@@ -134,6 +147,33 @@ impl ProcessContainmentHandle {
             operation_id: operation_id.into(),
             program: program.into(),
             args,
+            cwd: cwd.into(),
+            require_proven,
+            reply,
+        })?;
+        Self::await_reply(rx).await?
+    }
+
+    /// Create Proven native containment and return bounded-IO endpoints for
+    /// the initial process. Command/env/stdio are transient and never durable.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_and_spawn_with_io(
+        &self,
+        session_id: Uuid,
+        operation_id: impl Into<String>,
+        program: impl Into<PathBuf>,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        cwd: impl Into<PathBuf>,
+        require_proven: bool,
+    ) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(Op::CreateAndSpawnWithIo {
+            session_id,
+            operation_id: operation_id.into(),
+            program: program.into(),
+            args,
+            env,
             cwd: cwd.into(),
             require_proven,
             reply,
@@ -386,7 +426,37 @@ async fn actor_loop(db: Db, adapter: SharedAdapter, rx: Receiver<Op>) {
                     require_proven,
                 )
                 .await;
-                let _ = reply.send(result);
+                if let Err(Ok(lease)) = reply.send(result) {
+                    reclaim_live_lease(&mut state, lease).await;
+                }
+            }
+            Op::CreateAndSpawnWithIo {
+                session_id,
+                operation_id,
+                program,
+                args,
+                env,
+                cwd,
+                require_proven,
+                reply,
+            } => {
+                let result = create_native_with_io(
+                    &mut state,
+                    session_id,
+                    operation_id,
+                    program,
+                    args,
+                    env,
+                    cwd,
+                    require_proven,
+                )
+                .await;
+                if let Err(Ok((lease, _io))) = reply.send(result) {
+                    // The requester was cancelled after allocation. Ownership
+                    // stays with the actor, so reclaim the unpublished lease
+                    // instead of leaving a live group with no external owner.
+                    reclaim_live_lease(&mut state, lease).await;
+                }
             }
             Op::CreateContainerAndExec {
                 session_id,
@@ -559,6 +629,13 @@ async fn create_native(
         }
     };
 
+    if require_proven && allocated.guarantee != ContainmentGuarantee::Proven {
+        reclaim_unpublished_allocation(state, &allocated.handle, generation).await;
+        return Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: "adapter returned a non-proven native allocation".into(),
+        });
+    }
+
     record = match reduce(
         Some(record.clone()),
         ContainmentEvent::MembershipProven {
@@ -570,7 +647,10 @@ async fn create_native(
         ReduceResult::Applied(r) => *r,
         o => return Err(ContainmentError::Internal(format!("{o:?}"))),
     };
-    persist_cas_from_creating(state, &record).await?;
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        reclaim_unpublished_allocation(state, &allocated.handle, generation).await;
+        return Err(error);
+    }
 
     let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
     state.live.insert(
@@ -588,6 +668,185 @@ async fn create_native(
         guarantee: allocated.guarantee,
         token,
     })
+}
+
+async fn reclaim_unpublished_allocation(
+    state: &ActorState,
+    handle: &AdapterHandle,
+    generation: u64,
+) {
+    // Allocation succeeded but durable/live ownership did not. The adapter
+    // handle is still available locally, so reclaim it directly and do not
+    // return until its same-generation oracle proves emptiness.
+    loop {
+        let _ = state.adapter.terminate(handle, generation).await;
+        if matches!(
+            state.adapter.await_empty(handle, generation).await,
+            Ok(EmptyOutcome::ProvenEmpty { generation: observed }) if observed == generation
+        ) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn reclaim_live_lease(state: &mut ActorState, lease: ContainmentLease) {
+    loop {
+        let _ = terminate_one(state, lease.clone()).await;
+        if matches!(
+            await_empty_one(state, lease.clone()).await,
+            Ok(EmptyOutcome::ProvenEmpty { generation }) if generation == lease.generation
+        ) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_native_with_io(
+    state: &mut ActorState,
+    session_id: Uuid,
+    operation_id: String,
+    program: PathBuf,
+    args: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+    cwd: PathBuf,
+    require_proven: bool,
+) -> Result<(ContainmentLease, NativeChildIo), ContainmentError> {
+    if state.intake_closed {
+        return Err(ContainmentError::ShutdownIntakeClosed);
+    }
+    if state.deleting_sessions.contains(&session_id)
+        || state
+            .db
+            .is_session_deleting(session_id)
+            .await
+            .map_err(|error| ContainmentError::Internal(error.to_string()))?
+    {
+        return Err(ContainmentError::SessionDeleting);
+    }
+
+    let containment_id = Uuid::new_v4();
+    let generation = 1;
+    let now = wall_ms();
+    let guarantee = state.adapter.guarantee();
+    let event = ContainmentEvent::BeginCreate {
+        containment_id,
+        session_id,
+        operation_id: operation_id.clone(),
+        generation,
+        platform_kind: state.adapter.platform_kind(),
+        guarantee,
+        now_wall_ms: now,
+    };
+    let mut record = match reduce(None, event) {
+        ReduceResult::Applied(record) => *record,
+        other => return Err(ContainmentError::Internal(format!("reduce: {other:?}"))),
+    };
+    persist_insert(state, &record).await?;
+
+    if require_proven && guarantee == ContainmentGuarantee::Unsupported {
+        let reason = state
+            .adapter
+            .safe_metadata()
+            .capability_reason
+            .unwrap_or_else(|| "unsupported".into());
+        let unsupported = match reduce(
+            Some(record.clone()),
+            ContainmentEvent::MarkUnsupported {
+                generation,
+                reason: reason.clone(),
+                now_wall_ms: wall_ms(),
+            },
+        ) {
+            ReduceResult::Applied(record) => *record,
+            other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+        };
+        persist_cas(state, &record, &unsupported).await?;
+        return Err(ContainmentError::DescendantContainmentUnavailable { reason });
+    }
+
+    let allocated = match state
+        .adapter
+        .create_and_spawn_with_io(NativeIoSpawnRequest {
+            containment_id,
+            session_id,
+            generation,
+            operation_id,
+            program,
+            args,
+            cwd,
+            env,
+            require_proven,
+        })
+        .await
+    {
+        Ok(allocated) => allocated,
+        Err(error) => {
+            let terminal = match &error {
+                ContainmentError::DescendantContainmentUnavailable { reason } => {
+                    ContainmentEvent::MarkUnsupported {
+                        generation,
+                        reason: reason.clone(),
+                        now_wall_ms: wall_ms(),
+                    }
+                }
+                _ => ContainmentEvent::CreateFailed {
+                    generation,
+                    now_wall_ms: wall_ms(),
+                },
+            };
+            let failed = match reduce(Some(record.clone()), terminal) {
+                ReduceResult::Applied(record) => *record,
+                other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+            };
+            persist_cas(state, &record, &failed).await?;
+            return Err(error);
+        }
+    };
+
+    if require_proven && allocated.allocation.guarantee != ContainmentGuarantee::Proven {
+        reclaim_unpublished_allocation(state, &allocated.allocation.handle, generation).await;
+        return Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: "adapter returned a non-proven IO allocation".into(),
+        });
+    }
+
+    record = match reduce(
+        Some(record.clone()),
+        ContainmentEvent::MembershipProven {
+            generation,
+            locator: allocated.allocation.locator.clone(),
+            now_wall_ms: wall_ms(),
+        },
+    ) {
+        ReduceResult::Applied(record) => *record,
+        other => return Err(ContainmentError::Internal(format!("{other:?}"))),
+    };
+    if let Err(error) = persist_cas_from_creating(state, &record).await {
+        reclaim_unpublished_allocation(state, &allocated.allocation.handle, generation).await;
+        return Err(error);
+    }
+    let token = Arc::new(LeaseToken::new(format!("lease-{containment_id}")));
+    state.live.insert(
+        containment_id,
+        LiveEntry {
+            record,
+            handle: Some(allocated.allocation.handle),
+            lease_token: token.clone(),
+        },
+    );
+    Ok((
+        ContainmentLease {
+            containment_id,
+            session_id,
+            generation,
+            guarantee: allocated.allocation.guarantee,
+            token,
+        },
+        allocated.io,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1030,7 +1289,7 @@ async fn persist_cas(
     from: &ContainmentRecord,
     to: &ContainmentRecord,
 ) -> Result<(), ContainmentError> {
-    let _ = state
+    let updated = state
         .db
         .cas_execution_containment_state(CasExecutionContainment {
             containment_id: to.containment_id,
@@ -1045,6 +1304,11 @@ async fn persist_cas(
         })
         .await
         .map_err(|e| ContainmentError::Internal(e.to_string()))?;
+    if updated.is_none() {
+        return Err(ContainmentError::Internal(
+            "containment state compare-and-swap did not apply".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1052,7 +1316,7 @@ async fn persist_cas_from_creating(
     state: &ActorState,
     to: &ContainmentRecord,
 ) -> Result<(), ContainmentError> {
-    let _ = state
+    let updated = state
         .db
         .cas_execution_containment_state(CasExecutionContainment {
             containment_id: to.containment_id,
@@ -1067,6 +1331,11 @@ async fn persist_cas_from_creating(
         })
         .await
         .map_err(|e| ContainmentError::Internal(e.to_string()))?;
+    if updated.is_none() {
+        return Err(ContainmentError::Internal(
+            "creating containment compare-and-swap did not apply".into(),
+        ));
+    }
     Ok(())
 }
 

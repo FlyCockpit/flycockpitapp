@@ -1135,6 +1135,7 @@ pub(super) async fn run_worker(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
+    process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     _global_bus: Option<EventSender>,
     park_commit: crate::engine::interrupt::ParkCommit,
 ) {
@@ -1603,7 +1604,9 @@ pub(super) async fn run_worker(
     // Install the session config reader before the loop starts so the driver
     // and every `ToolCtx` it builds read config through the generationed
     // snapshot rather than from disk (`engine-config-snapshot-adoption`).
-    driver.set_config_handle(SessionConfigHandle::new(config_snapshot.clone()));
+    let worker_config_handle = SessionConfigHandle::new(config_snapshot.clone());
+    driver.set_config_handle(worker_config_handle.clone());
+    driver.set_process_containment(process_containment);
     driver.set_assistant_identity_prefix(spawn_args.assistant_identity_prefix.clone());
     // Propagate any plan-level model override to the whole delegation tree
     // (`plan-duplication-and-model-override.md`): the root already runs under
@@ -1852,8 +1855,12 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let hook_runner = worker_config_handle.process_containment().map_or_else(
+            crate::engine::agent::hooks::TokioCommandRunner::new,
+            crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+        );
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &hook_runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
             crate::config::extended::hooks::HookEvent::SessionStart,
@@ -4292,8 +4299,12 @@ pub(super) async fn run_worker(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hooks()
             .clone();
+        let hook_runner = worker_config_handle.process_containment().map_or_else(
+            crate::engine::agent::hooks::TokioCommandRunner::new,
+            crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+        );
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &hook_runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
             &registry,
             crate::config::extended::hooks::HookEvent::SessionEnd,

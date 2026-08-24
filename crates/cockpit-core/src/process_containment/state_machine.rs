@@ -160,6 +160,25 @@ fn apply_to_existing(rec: &mut ContainmentRecord, event: ContainmentEvent) -> Re
             rec.pending_command = None;
             ReduceResult::Applied(Box::new(rec.clone()))
         }
+        ContainmentEvent::CreateFailed {
+            generation,
+            now_wall_ms,
+        } => {
+            if generation != rec.generation {
+                return ReduceResult::GenerationMismatch {
+                    expected: rec.generation,
+                    got: generation,
+                };
+            }
+            if rec.state != ContainmentState::Creating {
+                return illegal(rec, "create_failed");
+            }
+            rec.state = ContainmentState::Empty;
+            rec.emptied_at_wall_ms = Some(now_wall_ms);
+            rec.updated_at_wall_ms = now_wall_ms;
+            rec.pending_command = None;
+            ReduceResult::Applied(Box::new(rec.clone()))
+        }
         ContainmentEvent::RequestStop {
             generation,
             now_wall_ms,

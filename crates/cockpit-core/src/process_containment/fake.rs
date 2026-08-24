@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::adapter::{
-    AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
-    NativeSpawnRequest,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest,
+    ContainmentAdapter, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest,
 };
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
@@ -171,6 +171,33 @@ impl ContainmentAdapter for FakeProvenAdapter {
             locator,
             guarantee: ContainmentGuarantee::Proven,
             handle: AdapterHandle { key },
+        })
+    }
+
+    async fn create_and_spawn_with_io(
+        &self,
+        req: NativeIoSpawnRequest,
+    ) -> Result<AllocatedNativeIo, ContainmentError> {
+        let allocation = self
+            .create_and_spawn(NativeSpawnRequest {
+                containment_id: req.containment_id,
+                session_id: req.session_id,
+                generation: req.generation,
+                operation_id: req.operation_id,
+                program: req.program,
+                args: req.args,
+                cwd: req.cwd,
+                require_proven: req.require_proven,
+            })
+            .await?;
+        Ok(AllocatedNativeIo {
+            allocation,
+            io: NativeChildIo {
+                stdin: Some(Box::pin(tokio::io::sink())),
+                stdout: Some(Box::pin(tokio::io::empty())),
+                stderr: Some(Box::pin(tokio::io::empty())),
+                wait: Box::pin(std::future::ready(Ok(Some(0)))),
+            },
         })
     }
 

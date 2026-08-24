@@ -49,6 +49,49 @@ pub(crate) const REASON_MAX_CHARS: usize = 1_024;
 /// Default reason when a deny has a missing/blank reason.
 pub(crate) const DEFAULT_DENY_REASON: &str = "blocked by preToolUse hook";
 
+/// Closed, durable failure-reason vocabulary for hook execution.  Keep these
+/// human-readable: the exact values are written to `hook_run.reason`, exposed
+/// by the documentation contract, and asserted by import/rehydration tests.
+pub(crate) const REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED: &str =
+    "descendant_containment_unsupported";
+pub(crate) const REASON_HOOK_TIMED_OUT: &str = "hook timed out";
+pub(crate) const REASON_SPAWN_FAILED: &str = "spawn failed";
+pub(crate) const REASON_EXECUTABLE_NOT_FOUND: &str = "executable not found";
+pub(crate) const REASON_MALFORMED_JSON_OUTPUT: &str = "malformed JSON output";
+pub(crate) const REASON_OUTPUT_LIMIT_EXCEEDED: &str = "hook output exceeded limit";
+pub(crate) const REASON_NONZERO_EXIT_PREFIX: &str = "hook exited with non-zero status";
+pub(crate) const REASON_NO_EXIT_STATUS: &str = "hook exited without status";
+pub(crate) const REASON_EMPTY_NOT_PROVEN: &str = "descendant emptiness not proven";
+pub(crate) const REASON_OUTPUT_NOT_JSON_OBJECT: &str = "output is not a JSON object";
+pub(crate) const REASON_MALFORMED_HOOK_OUTPUT: &str = "malformed hook output";
+pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
+    "unexpected decision 'block' for pre-tool event";
+pub(crate) const REASON_UNEXPECTED_STOP_DENY: &str =
+    "unexpected decision 'deny' for stop event";
+pub(crate) const REASON_UNKNOWN_OR_MISSING_DECISION: &str = "unknown or missing decision";
+pub(crate) const STOP_HOOK_FORCED_END_SOURCE: &str = "stop_hook_continuation_cap";
+
+/// Typed ownership map for native lifecycle boundaries. This is kept beside
+/// dispatch—not in README prose—so documentation tests can prove exhaustive
+/// classification without brittle source-text searches. Boundary tests still
+/// drive the named production seams; this table makes a newly-added event fail
+/// exhaustiveness review until it has an owner.
+pub(crate) const PRODUCTION_HOOK_BOUNDARIES: &[(HookEvent, &str)] = &[
+    (HookEvent::SessionStart, "session_worker.rehydrated"),
+    (HookEvent::UserPromptSubmit, "driver.accepted_submission"),
+    (HookEvent::PreToolUse, "tool_dispatch.pre_execution"),
+    (HookEvent::PostToolUse, "tool_dispatch.success"),
+    (HookEvent::PostToolUseFailure, "tool_dispatch.failure"),
+    (HookEvent::PermissionDenied, "tool_dispatch.permission_denied"),
+    (HookEvent::Stop, "driver.root_normal_done"),
+    (HookEvent::StopFailure, "driver.inference_failure"),
+    (HookEvent::SubagentStart, "driver.child_started"),
+    (HookEvent::SubagentStop, "child.normal_or_abnormal_terminal"),
+    (HookEvent::PreCompact, "driver.compaction_apply"),
+    (HookEvent::PostCompact, "driver.compaction_durable"),
+    (HookEvent::SessionEnd, "session_worker.teardown"),
+];
+
 /// Reserved environment keys overwritten after configured env.
 #[allow(dead_code)]
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
@@ -344,7 +387,6 @@ impl HookDecision {
 
 /// Parsed stdout JSON from a hook command.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct HookOutput {
     #[serde(default)]
     decision: Option<String>,
@@ -359,7 +401,6 @@ struct HookOutput {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct HookSpecificOutput {
     #[serde(default, rename = "additionalContext")]
     additional_context: Option<String>,
@@ -378,7 +419,7 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -386,19 +427,19 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
     let parsed: Result<Value, _> = serde_json::from_str(trimmed);
     let Ok(value) = parsed else {
         return HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         };
     };
     if !value.is_object() {
         return HookDecision::Failed {
-            reason: "output is not a JSON object".to_string(),
+            reason: REASON_OUTPUT_NOT_JSON_OBJECT.to_string(),
         };
     }
     let output: HookOutput = match serde_json::from_value(value) {
         Ok(output) => output,
         Err(_) => {
             return HookDecision::Failed {
-                reason: "malformed hook output".to_string(),
+                reason: REASON_MALFORMED_HOOK_OUTPUT.to_string(),
             };
         }
     };
@@ -416,11 +457,11 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
         Some("block") => {
             // block is a stop-gate vocabulary, not valid for pre-tool.
             HookDecision::Failed {
-                reason: "unexpected decision 'block' for pre-tool event".to_string(),
+                reason: REASON_UNEXPECTED_PRE_TOOL_BLOCK.to_string(),
             }
         }
         _ => HookDecision::Failed {
-            reason: "unknown or missing decision".to_string(),
+            reason: REASON_UNKNOWN_OR_MISSING_DECISION.to_string(),
         },
     }
 }
@@ -433,7 +474,7 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -441,19 +482,19 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
     let parsed: Result<Value, _> = serde_json::from_str(trimmed);
     let Ok(value) = parsed else {
         return HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         };
     };
     if !value.is_object() {
         return HookDecision::Failed {
-            reason: "output is not a JSON object".to_string(),
+            reason: REASON_OUTPUT_NOT_JSON_OBJECT.to_string(),
         };
     }
     let output: HookOutput = match serde_json::from_value(value) {
         Ok(output) => output,
         Err(_) => {
             return HookDecision::Failed {
-                reason: "malformed hook output".to_string(),
+                reason: REASON_MALFORMED_HOOK_OUTPUT.to_string(),
             };
         }
     };
@@ -474,7 +515,7 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
         Some("deny") => {
             // deny is not a stop-gate vocabulary; treat as fail.
             HookDecision::Failed {
-                reason: "unexpected decision 'deny' for stop event".to_string(),
+                reason: REASON_UNEXPECTED_STOP_DENY.to_string(),
             }
         }
         Some("block") => {
@@ -504,7 +545,7 @@ fn parse_observe_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision 
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -515,7 +556,7 @@ fn parse_observe_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision 
         HookDecision::Allow
     } else {
         HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         }
     }
 }
@@ -637,6 +678,9 @@ pub struct HookRawOutput {
     pub duration_ms: u64,
     pub spawn_failed: bool,
     pub timeout: bool,
+    /// Closed runner-level failure reason that must survive decision parsing.
+    pub failure_reason: Option<&'static str>,
+    pub output_truncated: bool,
 }
 
 /// A command runner trait for deterministic tests.
@@ -656,6 +700,7 @@ pub trait CommandRunner: Send + Sync {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        session_id: Uuid,
     ) -> HookRawOutput;
 }
 
@@ -664,12 +709,23 @@ pub trait CommandRunner: Send + Sync {
 pub struct TokioCommandRunner {
     #[allow(dead_code)]
     process_env: std::sync::Arc<dyn ProcessEnv>,
+    containment: Option<crate::process_containment::ProcessContainmentHandle>,
 }
 
 impl TokioCommandRunner {
     pub fn new() -> Self {
         Self {
             process_env: std::sync::Arc::new(DefaultProcessEnv),
+            containment: None,
+        }
+    }
+
+    pub fn with_containment(
+        containment: crate::process_containment::ProcessContainmentHandle,
+    ) -> Self {
+        Self {
+            process_env: std::sync::Arc::new(DefaultProcessEnv),
+            containment: Some(containment),
         }
     }
 }
@@ -677,6 +733,54 @@ impl TokioCommandRunner {
 impl Default for TokioCommandRunner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct HookContainmentDropGuard {
+    handle: crate::process_containment::ProcessContainmentHandle,
+    lease: Option<crate::process_containment::ContainmentLease>,
+}
+
+impl HookContainmentDropGuard {
+    fn disarm(&mut self) {
+        self.lease = None;
+    }
+}
+
+async fn terminate_and_prove_empty(
+    handle: &crate::process_containment::ProcessContainmentHandle,
+    lease: &crate::process_containment::ContainmentLease,
+) {
+    // A hook execution is not settled while the containment oracle can still
+    // see descendants. `Uncertain` is deliberately not converted into a hook
+    // failure: doing so would return control while an untrusted descendant may
+    // still be alive. Reconciliation remains cancellation-safe through the
+    // drop guard and is retried here until the same generation is proven empty.
+    loop {
+        let _ = handle.terminate(lease.clone()).await;
+        if matches!(
+            handle.await_empty(lease.clone()).await,
+            Ok(crate::process_containment::EmptyOutcome::ProvenEmpty { generation })
+                if generation == lease.generation()
+        ) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+impl Drop for HookContainmentDropGuard {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let handle = self.handle.clone();
+        // Drop/cancellation cannot await, so transfer reconciliation to a
+        // daemon task. Normal timeout/completion paths await the same barrier
+        // inline and disarm this guard before returning.
+        tokio::spawn(async move {
+            terminate_and_prove_empty(&handle, &lease).await;
+        });
     }
 }
 
@@ -690,21 +794,47 @@ impl CommandRunner for TokioCommandRunner {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        session_id: Uuid,
     ) -> HookRawOutput {
         let start = std::time::Instant::now();
-        let mut cmd = tokio::process::Command::new(executable);
-        cmd.args(args);
-        cmd.current_dir(cwd);
-        cmd.env_clear();
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
+        let Some(containment) = self.containment.as_ref() else {
+            return HookRawOutput {
+                stdout: String::new(),
+                exit_code: None,
+                duration_ms: 0,
+                spawn_failed: true,
+                timeout: false,
+                failure_reason: Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+                output_truncated: false,
+            };
+        };
+        let operation_id = format!("hook-{}", Uuid::new_v4());
+        let (lease, mut io) = match containment
+            .create_and_spawn_with_io(
+                session_id,
+                operation_id,
+                executable,
+                args.to_vec(),
+                env.clone(),
+                cwd,
+                true,
+            )
+            .await
+        {
+            Ok(created) => created,
+            Err(crate::process_containment::ContainmentError::DescendantContainmentUnavailable {
+                ..
+            }) => {
+                return HookRawOutput {
+                    stdout: String::new(),
+                    exit_code: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    spawn_failed: true,
+                    timeout: false,
+                    failure_reason: Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+                    output_truncated: false,
+                };
+            }
             Err(_) => {
                 return HookRawOutput {
                     stdout: String::new(),
@@ -712,28 +842,39 @@ impl CommandRunner for TokioCommandRunner {
                     duration_ms: start.elapsed().as_millis() as u64,
                     spawn_failed: true,
                     timeout: false,
+                    failure_reason: Some(REASON_SPAWN_FAILED),
+                    output_truncated: false,
                 };
             }
         };
-
-        // Write stdin.
-        if let Some(mut child_stdin) = child.stdin.take() {
-            if child_stdin.write_all(stdin.as_bytes()).await.is_err() {
-                let _ = child.kill().await;
-                return HookRawOutput {
-                    stdout: String::new(),
-                    exit_code: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    spawn_failed: true,
-                    timeout: false,
-                };
-            }
-            drop(child_stdin);
+        let mut drop_guard = HookContainmentDropGuard {
+            handle: containment.clone(),
+            lease: Some(lease.clone()),
+        };
+        if lease.guarantee() != crate::process_containment::ContainmentGuarantee::Proven {
+            terminate_and_prove_empty(containment, &lease).await;
+            drop_guard.disarm();
+            return HookRawOutput {
+                stdout: String::new(),
+                exit_code: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+                spawn_failed: true,
+                timeout: false,
+                failure_reason: Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED),
+                output_truncated: false,
+            };
         }
 
-        // Take stdout before spawning the wait future (avoids double
-        // mutable borrow of `child`).
-        let mut child_stdout = child.stdout.take();
+        let mut child_stdin = io.stdin.take();
+        let mut child_stdout = io.stdout.take();
+        let mut child_stderr = io.stderr.take();
+
+        let stdin_fut = async {
+            if let Some(mut input) = child_stdin.take() {
+                input.write_all(stdin.as_bytes()).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
 
         // Read stdout with independent cap.
         let stdout_fut = async {
@@ -747,45 +888,82 @@ impl CommandRunner for TokioCommandRunner {
                         Err(_) => break,
                     };
                     total.extend_from_slice(&temp[..n]);
-                    if total.len() >= OUTPUT_CAP_BYTES {
+                    if total.len() > OUTPUT_CAP_BYTES {
                         total.truncate(OUTPUT_CAP_BYTES);
-                        break;
+                        return Some((total, true));
                     }
                 }
-                Some(total)
+                Some((total, false))
             } else {
                 None
             }
         };
 
-        let wait_fut = async {
-            match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(status)) => status.code(),
-                Ok(Err(_)) => {
-                    let _ = child.kill().await;
-                    None
-                }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    None
+        let stderr_fut = async {
+            if let Some(mut err) = child_stderr.take() {
+                let mut buffer = vec![0_u8; OUTPUT_CAP_BYTES + 1];
+                let mut total = 0_usize;
+                loop {
+                    match err.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            total = total.saturating_add(read);
+                            if total > OUTPUT_CAP_BYTES {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
+            false
         };
 
-        let (stdout_result, exit_code) = tokio::join!(stdout_fut, wait_fut);
+        // The deadline covers stdin delivery, both pipe drains, and process
+        // exit as one operation. Timing only `wait` can deadlock forever when
+        // a descendant inherits a pipe, and writing stdin outside the deadline
+        // can block before timeout enforcement even begins.
+        let operation = async {
+            let (stdin_result, stdout_result, stderr_truncated, wait_result) =
+                tokio::join!(stdin_fut, stdout_fut, stderr_fut, io.wait.as_mut());
+            (stdin_result, stdout_result, stderr_truncated, wait_result)
+        };
+        let (stdin_failed, stdout_result, stderr_truncated, exit_code, timed_out) =
+            match tokio::time::timeout(timeout, operation).await {
+                Ok((stdin_result, stdout_result, stderr_truncated, wait_result)) => (
+                    stdin_result.is_err(),
+                    stdout_result,
+                    stderr_truncated,
+                    wait_result.unwrap_or(None),
+                    false,
+                ),
+                Err(_) => (false, None, false, None, true),
+            };
+
+        terminate_and_prove_empty(containment, &lease).await;
+        drop_guard.disarm();
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        let stdout_bytes = stdout_result.unwrap_or_default();
+        let (stdout_bytes, stdout_truncated) = stdout_result.unwrap_or_default();
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
 
-        let timed_out = exit_code.is_none();
         HookRawOutput {
             stdout,
             exit_code,
             duration_ms,
-            spawn_failed: false,
+            spawn_failed: stdin_failed,
             timeout: timed_out,
+            failure_reason: if timed_out {
+                Some(REASON_HOOK_TIMED_OUT)
+            } else if stdin_failed {
+                Some(REASON_SPAWN_FAILED)
+            } else if stdout_truncated || stderr_truncated {
+                Some(REASON_OUTPUT_LIMIT_EXCEEDED)
+            } else if exit_code.is_none() && !timed_out {
+                Some(REASON_NO_EXIT_STATUS)
+            } else {
+                None
+            },
+            output_truncated: stdout_truncated || stderr_truncated,
         }
     }
 }
@@ -974,7 +1152,7 @@ pub(crate) async fn run_pre_tool_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1024,16 +1202,21 @@ pub(crate) async fn run_pre_tool_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
+            HookDecision::Failed {
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_pre_tool_decision(&raw.stdout, raw.exit_code)
@@ -1119,7 +1302,7 @@ pub(crate) async fn run_post_tool_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1169,16 +1352,21 @@ pub(crate) async fn run_post_tool_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
+            HookDecision::Failed {
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_observe_decision(&raw.stdout, raw.exit_code)
@@ -1329,10 +1517,30 @@ pub(crate) async fn run_stop_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    subagent_id: Option<&str>,
     state: &mut StopGateState,
 ) -> StopHookOutcome {
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
+        if let Err(error) = db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::Notice,
+                None,
+                None,
+                &serde_json::json!({
+                    "text": "Stop-hook continuation cap reached; ending without reconsulting hooks.",
+                    "severity": "warning",
+                    "source": STOP_HOOK_FORCED_END_SOURCE,
+                    "hookEvent": event.key(),
+                    "continuationsGranted": state.continuation_count,
+                    "subagentId": subagent_id,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%error, event = event.key(), "failed to record stop-hook forced end");
+        }
         return StopHookOutcome::ForcedEnd;
     }
 
@@ -1356,10 +1564,11 @@ pub(crate) async fn run_stop_hooks(
         None,
         None,
         None,
-        None,
-        None,
+        (event == HookEvent::SubagentStop).then_some(match_value),
+        subagent_id,
         ObserveFields {
-            stop_reason: Some(match_value),
+            stop_reason: (event == HookEvent::Stop).then_some(match_value),
+            end_reason: (event == HookEvent::SubagentStop).then_some("completed"),
             stop_hook_active: Some(state.stop_hook_active),
             ..ObserveFields::default()
         },
@@ -1378,13 +1587,13 @@ pub(crate) async fn run_stop_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
                     None,
                     None,
-                    None,
+                    subagent_id,
                 )
                 .await;
                 continue;
@@ -1412,7 +1621,7 @@ pub(crate) async fn run_stop_hooks(
                     None,
                     None,
                     None,
-                    None,
+                    subagent_id,
                 )
                 .await;
                 continue;
@@ -1428,16 +1637,21 @@ pub(crate) async fn run_stop_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
+            HookDecision::Failed {
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_stop_decision(&raw.stdout, raw.exit_code)
@@ -1453,7 +1667,7 @@ pub(crate) async fn run_stop_hooks(
             None,
             None,
             None,
-            None,
+            subagent_id,
         )
         .await;
 
@@ -1555,7 +1769,7 @@ pub(crate) async fn run_observe_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1605,16 +1819,21 @@ pub(crate) async fn run_observe_hooks(
                 workspace_root,
                 &stdin,
                 timeout,
+                session_id,
             )
             .await;
 
-        let decision = if raw.spawn_failed {
+        let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: reason.to_string(),
+            }
+        } else if raw.spawn_failed {
+            HookDecision::Failed {
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_observe_decision(&raw.stdout, raw.exit_code)

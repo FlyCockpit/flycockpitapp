@@ -673,6 +673,8 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
         _vnext_child_admission: None,
+        stop_gate: crate::engine::agent::hooks::StopGateState::default(),
+        stop_gate_consulted: false,
     });
 }
 
@@ -741,6 +743,8 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
         _vnext_child_admission: None,
+        stop_gate: crate::engine::agent::hooks::StopGateState::default(),
+        stop_gate_consulted: false,
     });
 }
 

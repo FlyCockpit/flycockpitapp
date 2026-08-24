@@ -777,6 +777,7 @@ impl crate::engine::agent::hooks::CommandRunner for StopScriptRunner {
         _cwd: &std::path::Path,
         _stdin: &str,
         _timeout: std::time::Duration,
+        _session_id: uuid::Uuid,
     ) -> crate::engine::agent::hooks::HookRawOutput {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::engine::agent::hooks::HookRawOutput {
@@ -785,6 +786,8 @@ impl crate::engine::agent::hooks::CommandRunner for StopScriptRunner {
             duration_ms: 1,
             spawn_failed: false,
             timeout: false,
+            failure_reason: None,
+            output_truncated: false,
         }
     }
 }
@@ -802,6 +805,7 @@ impl crate::engine::agent::hooks::CommandRunner for PanicRunner {
         _cwd: &std::path::Path,
         _stdin: &str,
         _timeout: std::time::Duration,
+        _session_id: uuid::Uuid,
     ) -> crate::engine::agent::hooks::HookRawOutput {
         panic!("a capped stop gate must not reconsult its stop hooks");
     }

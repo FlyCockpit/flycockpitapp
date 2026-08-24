@@ -145,6 +145,8 @@ struct Inner {
     lsp: Arc<crate::daemon::lsp::LspManager>,
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
+    process_containment:
+        Arc<Mutex<Option<crate::process_containment::ProcessContainmentHandle>>>,
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
@@ -488,6 +490,7 @@ impl SessionRegistry {
                 ),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
+                process_containment: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
                     live: HashMap::new(),
                     starting: HashMap::new(),
@@ -533,6 +536,19 @@ impl SessionRegistry {
 
     pub fn set_scheduler(&self, handle: crate::daemon::scheduler::DaemonSchedulerHandle) {
         *crate::sync::lock_or_recover(&self.inner.scheduler) = Some(handle);
+    }
+
+    pub fn set_process_containment(
+        &self,
+        handle: crate::process_containment::ProcessContainmentHandle,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.process_containment) = Some(handle);
+    }
+
+    fn process_containment(
+        &self,
+    ) -> Option<crate::process_containment::ProcessContainmentHandle> {
+        crate::sync::lock_or_recover(&self.inner.process_containment).clone()
     }
 
     pub fn set_write_scope(
@@ -1192,6 +1208,7 @@ impl SessionRegistry {
             self.inner.resource_scheduler.clone(),
             self.scheduler_source(),
             self.write_scope_source(),
+            self.process_containment(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
             trust_policy.clone(),
             Some(cleanup),

@@ -406,6 +406,8 @@ impl SessionConfigSnapshot {
 #[derive(Clone)]
 pub struct SessionConfigHandle {
     shared: Arc<RwLock<SessionConfigSnapshot>>,
+    process_containment:
+        Arc<RwLock<Option<crate::process_containment::ProcessContainmentHandle>>>,
     /// `Some` → reads return this fixed snapshot (turn-pinned). `None` →
     /// reads observe the live shared snapshot.
     pinned: Option<Arc<SessionConfigSnapshot>>,
@@ -417,6 +419,7 @@ impl SessionConfigHandle {
     pub fn new(shared: Arc<RwLock<SessionConfigSnapshot>>) -> Self {
         Self {
             shared,
+            process_containment: Arc::new(RwLock::new(None)),
             pinned: None,
         }
     }
@@ -426,6 +429,7 @@ impl SessionConfigHandle {
     pub fn detached(snapshot: SessionConfigSnapshot) -> Self {
         Self {
             shared: Arc::new(RwLock::new(snapshot.clone())),
+            process_containment: Arc::new(RwLock::new(None)),
             pinned: Some(Arc::new(snapshot)),
         }
     }
@@ -493,12 +497,32 @@ impl SessionConfigHandle {
         }
     }
 
+    pub fn set_process_containment(
+        &self,
+        containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    ) {
+        *self
+            .process_containment
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = containment;
+    }
+
+    pub fn process_containment(
+        &self,
+    ) -> Option<crate::process_containment::ProcessContainmentHandle> {
+        self.process_containment
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Re-pin to the current shared generation. The driver calls this at each
     /// turn boundary so the in-flight turn reads a consistent view while the
     /// next turn observes any re-resolution that landed in between.
     pub fn repin(&self) -> Self {
         Self {
             shared: self.shared.clone(),
+            process_containment: self.process_containment.clone(),
             pinned: Some(Arc::new(self.read_shared())),
         }
     }
@@ -1760,6 +1784,7 @@ pub fn spawn(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
+    process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -1934,6 +1959,7 @@ pub fn spawn(
             resource_scheduler,
             scheduler,
             write_scope,
+            process_containment,
             global_bus,
             park_commit,
         ));

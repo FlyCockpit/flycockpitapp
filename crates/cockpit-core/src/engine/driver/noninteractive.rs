@@ -6,6 +6,22 @@ pub(in crate::engine::driver) struct NoninteractiveDelegationKey {
     pub(in crate::engine::driver) label: String,
 }
 
+/// Explicit identity of the child lifecycle controlled by this run. Event
+/// forwarding/steering is transport metadata and must not decide whether a
+/// `subagentStop` policy boundary exists.
+#[derive(Debug, Clone)]
+pub(in crate::engine::driver) struct ChildHookLifecycle {
+    subagent_id: String,
+}
+
+impl ChildHookLifecycle {
+    fn new(subagent_id: impl Into<String>) -> Self {
+        Self {
+            subagent_id: subagent_id.into(),
+        }
+    }
+}
+
 impl NoninteractiveDelegationKey {
     pub(crate) fn new(task_call_id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
@@ -1865,6 +1881,8 @@ impl Driver {
                         self.redact.clone(),
                         child_cwd.resolved.clone(),
                         self.config.clone(),
+                        self.process_containment.clone(),
+                        Some(ChildHookLifecycle::new(task_call_id.clone())),
                         self.interrupts.clone(),
                         cancel,
                         self.approver.clone(),
@@ -2324,6 +2342,10 @@ impl Driver {
             .entries
             .iter()
             .filter(|(key, _)| key.task_call_id == task_call_id)
+            // Normal completion already ran the controlling child-owned stop
+            // gate before producing this report. Only abnormal terminal paths
+            // need the observe-only pairing here.
+            .filter(|(_, entry)| entry.status != NoninteractiveDelegationStatus::Completed)
             .map(|(key, entry)| {
                 (
                     key.label.clone(),
@@ -4122,6 +4144,8 @@ impl Driver {
                         driver.redact.clone(),
                         child_cwd.resolved.clone(),
                         pinned.clone(),
+                        driver.process_containment.clone(),
+                        Some(ChildHookLifecycle::new(entry_task_call_id.clone())),
                         driver.interrupts.clone(),
                         child_cancel.clone(),
                         driver.approver.clone(),
@@ -4852,6 +4876,10 @@ pub(crate) async fn run_noninteractive(
         redact,
         cwd,
         config,
+        None,
+        steer_target
+            .as_ref()
+            .map(|target| ChildHookLifecycle::new(target.task_call_id.clone())),
         interrupts,
         cancel,
         approver,
@@ -5199,6 +5227,8 @@ pub(crate) async fn run_noninteractive_resumable(
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
+    process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    child_lifecycle: Option<ChildHookLifecycle>,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
@@ -5244,6 +5274,11 @@ pub(crate) async fn run_noninteractive_resumable(
     let mut next_prompt = Message::user(brief);
     let mut fallback_decision: Option<crate::engine::agent::BackupFallbackDecision> = None;
     let mut fallback_tried: Vec<crate::engine::agent::FailoverAttempt> = Vec::new();
+    // The latch belongs to this concrete child job, not to the parent driver or
+    // process. Rehydrated follow-ups are new originating task calls and
+    // therefore receive a fresh budget; every continuation of this run shares
+    // the same state.
+    let mut stop_gate = crate::engine::agent::hooks::StopGateState::default();
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). Agents
     // that hold `defer_to_orchestrator` get their deferred items folded into
     // the leaf report they return up; agents without it keep this buffer empty.
@@ -5353,6 +5388,34 @@ pub(crate) async fn run_noninteractive_resumable(
                     .expect("Continue with empty history is unreachable");
             }
             TurnOutcome::Done => {
+                if let Some(lifecycle) = &child_lifecycle {
+                    let snapshot = config.snapshot();
+                    let hook_runner = process_containment.clone().map_or_else(
+                        crate::engine::agent::hooks::TokioCommandRunner::new,
+                        crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                    );
+                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                        reason,
+                        additional_context,
+                    } = crate::engine::agent::hooks::run_stop_hooks(
+                        &hook_runner,
+                        &crate::engine::agent::hooks::DefaultProcessEnv,
+                        snapshot.hooks(),
+                        crate::config::extended::hooks::HookEvent::SubagentStop,
+                        &agent.name,
+                        session.id,
+                        &cwd,
+                        &session.db,
+                        Some(&lifecycle.subagent_id),
+                        &mut stop_gate,
+                    )
+                    .await
+                        && !cancel.is_cancelled()
+                    {
+                        next_prompt = Driver::stop_continuation_prompt(reason, additional_context);
+                        continue;
+                    }
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 // No `return` tool call: fall back to wrapping the final text
@@ -5366,6 +5429,34 @@ pub(crate) async fn run_noninteractive_resumable(
                 });
             }
             TurnOutcome::Return { fields } => {
+                if let Some(lifecycle) = &child_lifecycle {
+                    let snapshot = config.snapshot();
+                    let hook_runner = process_containment.clone().map_or_else(
+                        crate::engine::agent::hooks::TokioCommandRunner::new,
+                        crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+                    );
+                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                        reason,
+                        additional_context,
+                    } = crate::engine::agent::hooks::run_stop_hooks(
+                        &hook_runner,
+                        &crate::engine::agent::hooks::DefaultProcessEnv,
+                        snapshot.hooks(),
+                        crate::config::extended::hooks::HookEvent::SubagentStop,
+                        &agent.name,
+                        session.id,
+                        &cwd,
+                        &session.db,
+                        Some(&lifecycle.subagent_id),
+                        &mut stop_gate,
+                    )
+                    .await
+                        && !cancel.is_cancelled()
+                    {
+                        next_prompt = Driver::stop_continuation_prompt(reason, additional_context);
+                        continue;
+                    }
+                }
                 drop(child_tx);
                 let _ = forwarder.await;
                 let report =
@@ -5510,6 +5601,8 @@ pub(crate) async fn run_noninteractive_resumable(
                         redact.clone(),
                         child_cwd,
                         config.clone(),
+                        process_containment.clone(),
+                        Some(ChildHookLifecycle::new(task_call_id.clone())),
                         interrupts.clone(),
                         cancel.clone(),
                         approver.clone(),
@@ -5677,6 +5770,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     let locks = locks.clone();
                     let redact = redact.clone();
                     let config = config.clone();
+                    let process_containment = process_containment.clone();
                     let interrupts = interrupts.clone();
                     let cancel = cancel.clone();
                     let approver = approver.clone();
@@ -5685,6 +5779,7 @@ pub(crate) async fn run_noninteractive_resumable(
                     let tandem = tandem.clone();
                     let event_tx = event_tx.clone();
                     let steer_target = steer_target.clone();
+                    let child_hook_id = task_call_id.clone();
                     runs.push(async move {
                         // RAII releases each slot as soon as its child ends,
                         // including cancellation, errors, and panics.
@@ -5698,6 +5793,8 @@ pub(crate) async fn run_noninteractive_resumable(
                             redact,
                             child_cwd,
                             config,
+                            process_containment,
+                            Some(ChildHookLifecycle::new(child_hook_id)),
                             interrupts,
                             cancel,
                             approver,

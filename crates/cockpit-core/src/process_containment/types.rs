@@ -298,6 +298,12 @@ pub enum ContainmentEvent {
         reason: String,
         now_wall_ms: i64,
     },
+    /// Platform allocation failed before any user code was released. This is
+    /// an ordinary create failure, not a capability/guarantee classification.
+    CreateFailed {
+        generation: u64,
+        now_wall_ms: i64,
+    },
     /// Caller cancel or force terminate → Stopping.
     RequestStop { generation: u64, now_wall_ms: i64 },
     /// Same-generation empty oracle → Empty.

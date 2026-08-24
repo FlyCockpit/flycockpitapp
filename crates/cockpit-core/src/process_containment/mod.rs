@@ -25,8 +25,8 @@ pub use actor::{
     default_host_adapter,
 };
 pub use adapter::{
-    AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
-    NativeSpawnRequest, SharedAdapter,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest,
+    ContainmentAdapter, NativeChildIo, NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
 };
 pub use container::{ContainerRuntimeAdapter, RuntimeKind};
 pub use fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};

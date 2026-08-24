@@ -2496,7 +2496,9 @@ impl DaemonContext {
         &mut self,
         actor: crate::process_containment::ProcessContainmentActor,
     ) {
-        self.process_containment = Some(actor.handle());
+        let handle = actor.handle();
+        self.registry.set_process_containment(handle.clone());
+        self.process_containment = Some(handle);
         self._process_containment_actor = Some(actor);
     }
 

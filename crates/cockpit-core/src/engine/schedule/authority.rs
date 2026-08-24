@@ -111,6 +111,11 @@ pub enum ScheduleEvent {
         /// the `subagentStart`/`subagentStop` matcher + `subagentType` field.
         subagent_type: String,
     },
+    /// The detached child completed its controlling `subagentStop` boundary
+    /// before publishing its terminal result. This ordered marker lets the
+    /// driver distinguish a genuinely gated success from cancellation or a
+    /// producer bug instead of inferring lifecycle state from `failed`.
+    SwarmChildStopGateCompleted { job_id: String },
     /// A job reached a terminal state and its result must be injected into
     /// main context as a late-arriving turn. `notes` are the fork's
     /// accumulated notes (ephemeral loops); empty otherwise.
@@ -198,6 +203,7 @@ pub struct ScheduleContext {
     /// driver so loop/swarm iterations read the same snapshot as the
     /// foreground turn (`engine-config-snapshot-adoption`).
     pub config: crate::daemon::session_worker::SessionConfigHandle,
+    pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     /// The main agent — ephemeral-fork loop iterations run on the same
     /// agent/model/provider config (GOALS §22).
     pub agent: Arc<Agent>,
@@ -424,6 +430,13 @@ impl ScheduleAuthority {
         config: crate::daemon::session_worker::SessionConfigHandle,
     ) {
         self.ctx.config = config;
+    }
+
+    pub fn set_process_containment(
+        &mut self,
+        containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    ) {
+        self.ctx.process_containment = containment;
     }
 
     pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
@@ -1018,6 +1031,7 @@ mod tests {
             cwd: root,
             write_scope: None,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            process_containment: None,
             agent,
         };
         let authority = ScheduleAuthority::new(event_tx, cmd_tx, turn_tx, ctx, max);
@@ -1314,7 +1328,8 @@ mod tests {
                         panic!("goal-supervision worker {worker:?} must not emit SwarmChildStarted")
                     }
                     ScheduleEvent::Completed { .. } => break,
-                    ScheduleEvent::LoopIterationDue { .. } => {}
+                    ScheduleEvent::LoopIterationDue { .. }
+                    | ScheduleEvent::SwarmChildStopGateCompleted { .. } => {}
                 }
             }
         }

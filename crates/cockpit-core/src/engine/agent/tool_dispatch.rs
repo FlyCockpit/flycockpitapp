@@ -26,6 +26,13 @@ pub(crate) struct DispatchEnv<'a> {
     /// hook set changes between `preToolUse` and its matching post event.
     pub(crate) hooks: &'a crate::config::extended::hooks::HookRegistry,
 }
+
+fn hook_runner(env: &DispatchEnv<'_>) -> super::hooks::TokioCommandRunner {
+    env.ctx.config.process_containment().map_or_else(
+        super::hooks::TokioCommandRunner::new,
+        super::hooks::TokioCommandRunner::with_containment,
+    )
+}
 /// The authorization portion of ordinary dispatch, reused by Monty's builtin
 /// adapter. Monty is a transport, not a second tool-execution authority: a
 /// host invocation must consume the same safety gate, standing rejects,
@@ -141,8 +148,9 @@ async fn fire_permission_denied_hook(
     tool_call_id: &str,
     permission_kind: &'static str,
 ) {
+    let runner = hook_runner(env);
     super::hooks::run_observe_hooks(
-        &super::hooks::TokioCommandRunner::new(),
+        &runner,
         &super::hooks::DefaultProcessEnv,
         env.hooks,
         crate::config::extended::hooks::HookEvent::PermissionDenied,
@@ -571,7 +579,7 @@ pub(crate) async fn execute_ordinary_call(
         if placeholder_blocked || !repair_outcome.valid || repeated_recoverable_tool_call_reject {
             None
         } else if loop_guard_reject {
-            Some("blocked_loop_guard")
+            Some("loop_guard_denied")
         } else if gate_blocked {
             Some(gate_block_status)
         } else if cage_block.is_some() {
@@ -688,8 +696,9 @@ pub(crate) async fn execute_ordinary_call(
         // JSON `{"decision":"deny","reason":"..."}` to stdout. The first
         // explicit deny short-circuits later pre hooks and the tool is not
         // executed. Pre-hook failures are fail-open.
+        let hook_runner = hook_runner(env);
         let pre_hook_decision = super::hooks::run_pre_tool_hooks(
-            &super::hooks::TokioCommandRunner::new(),
+            &hook_runner,
             &super::hooks::DefaultProcessEnv,
             env.hooks,
             resolved_name,
@@ -756,13 +765,14 @@ pub(crate) async fn execute_ordinary_call(
     // event (the pre-hook deny and park paths already returned above; schema
     // failures and gate rejections set `tool_was_dispatched = false`).
     if tool_was_dispatched {
+        let hook_runner = hook_runner(env);
         let post_event = if result.is_ok() {
             crate::config::extended::hooks::HookEvent::PostToolUse
         } else {
             crate::config::extended::hooks::HookEvent::PostToolUseFailure
         };
         super::hooks::run_post_tool_hooks(
-            &super::hooks::TokioCommandRunner::new(),
+            &hook_runner,
             &super::hooks::DefaultProcessEnv,
             env.hooks,
             post_event,
@@ -1356,7 +1366,7 @@ pub(crate) async fn execute_ordinary_call(
         let lifecycle_status = if repeated_recoverable_tool_call_reject {
             "blocked_recoverable_repeat_guard"
         } else if loop_guard_reject {
-            "blocked_loop_guard"
+            "loop_guard_denied"
         } else if gate_blocked {
             gate_block_status
         } else if placeholder_blocked {

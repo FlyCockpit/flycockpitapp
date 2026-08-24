@@ -465,6 +465,20 @@ pub struct AgentSession {
     /// Reservation held by this child for the lifetime of its interactive
     /// frame. Dropping the frame releases its parent's vNext child slot.
     _vnext_child_admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Child-owned stop latch.  Keeping it on the frame makes the continuation
+    /// budget independent for nested children and guarantees it disappears on
+    /// every pop/unwind/terminal path.
+    pub stop_gate: crate::engine::agent::hooks::StopGateState,
+    /// True once the normal child-completion boundary has dispatched the
+    /// controlling `subagentStop` gate. Direct teardown/pop helpers use this
+    /// to retain exactly-once notification semantics.
+    pub stop_gate_consulted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SwarmSubagentHookState {
+    subagent_type: String,
+    stop_gate_completed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +657,10 @@ pub struct Driver {
     /// config for the driver and every `ToolCtx` it builds; installed by the
     /// worker via [`Self::set_config_handle`] before the loop starts.
     config: crate::daemon::session_worker::SessionConfigHandle,
+    /// Daemon-owned authority for every hook subprocess. `None` exists only
+    /// for unit-test/daemonless construction and makes hooks fail open as
+    /// `descendant_containment_unsupported` before spawn.
+    process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     pub stack: Vec<AgentSession>,
     assistant_identity_prefix: Option<String>,
     /// Minutes between `[time: ...]` preludes injected on user
@@ -705,7 +723,7 @@ pub struct Driver {
     /// exactly one stop. Goal-supervision control workers never enter this map
     /// (they never emit `SwarmChildStarted`; guidance L22). Any residual entries
     /// at driver-loop teardown are drained as `aborted` (detach loss).
-    swarm_subagents: std::collections::HashMap<String, String>,
+    swarm_subagents: std::collections::HashMap<String, SwarmSubagentHookState>,
     /// Which cache-safe capability hints have already been appended to the
     /// active history (GOALS §22). A branch is enabled by two cache-safe
     /// moves: the dispatcher starts accepting the action (always, here),
@@ -1406,6 +1424,7 @@ impl Driver {
             redact: self.redact.clone(),
             cwd: self.cwd.clone(),
             config: self.config.clone(),
+            process_containment: self.process_containment.clone(),
             agent: self.stack[0].agent.clone(),
             write_scope: self.write_scope.clone(),
         };
@@ -1436,6 +1455,8 @@ impl Driver {
                     // frame, whose reservation remains held there. New children
                     // admitted by the clone use the shared registry below.
                     _vnext_child_admission: None,
+                    stop_gate: frame.stop_gate.clone(),
+                    stop_gate_consulted: frame.stop_gate_consulted,
                 })
                 .collect(),
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
@@ -1723,6 +1744,7 @@ impl Driver {
             redact: redact.clone(),
             cwd: cwd.clone(),
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            process_containment: None,
             agent: root.clone(),
             // Installed later by `set_write_scope_source`; the authority's copy
             // is updated through the same setter.
@@ -1752,6 +1774,7 @@ impl Driver {
             redact,
             cwd,
             config: crate::daemon::session_worker::SessionConfigHandle::detached_default(),
+            process_containment: None,
             stack: vec![AgentSession {
                 queue_target: crate::engine::message::QueueTarget::root(root.name.clone()),
                 agent: root,
@@ -1760,6 +1783,8 @@ impl Driver {
                 deferred_log: crate::engine::deferred::DeferredLog::new(),
                 fallback_decision: None,
                 _vnext_child_admission: None,
+                stop_gate: crate::engine::agent::hooks::StopGateState::default(),
+                stop_gate_consulted: false,
             }],
             assistant_identity_prefix: None,
             time_injection_interval_minutes: 5,
@@ -2204,6 +2229,22 @@ impl Driver {
         self.schedule.set_config_handle(config.clone());
         self.config = config;
         self.refresh_prompt_cache_retention_from_session();
+    }
+
+    pub fn set_process_containment(
+        &mut self,
+        containment: Option<crate::process_containment::ProcessContainmentHandle>,
+    ) {
+        self.config.set_process_containment(containment.clone());
+        self.process_containment = containment.clone();
+        self.schedule.set_process_containment(containment);
+    }
+
+    fn hook_runner(&self) -> crate::engine::agent::hooks::TokioCommandRunner {
+        self.process_containment.clone().map_or_else(
+            crate::engine::agent::hooks::TokioCommandRunner::new,
+            crate::engine::agent::hooks::TokioCommandRunner::with_containment,
+        )
     }
 
     /// Refresh the driver's config handle from the layered config on disk for
@@ -4644,8 +4685,9 @@ impl Driver {
         fields: crate::engine::agent::hooks::ObserveFields<'_>,
     ) {
         let snapshot = self.config.snapshot();
+        let runner = self.hook_runner();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
             event,
@@ -4669,9 +4711,10 @@ impl Driver {
     /// report) — never a root boundary. Matcher / `subagentType` is the child
     /// agent type; `subagentId` identifies the delegating `task` call so the
     /// downstream attention consumer can pair start/stop. `subagentStop`
-    /// additionally carries `endReason` (why the child stopped). Observe-only /
-    /// fail-open; this is the notification fire ONLY — the child stop-gate
-    /// continuation (`run_stop_hooks`) is deferred to a later increment.
+    /// additionally carries `endReason` (why the child stopped). This remains
+    /// the notification path for starts and abnormal terminal branches; normal
+    /// completion is controlled by the child-owned stop gate before its
+    /// envelope or report is published.
     async fn fire_subagent_hook(
         &self,
         event: crate::config::extended::hooks::HookEvent,
@@ -4680,8 +4723,9 @@ impl Driver {
         end_reason: Option<&str>,
     ) {
         let snapshot = self.config.snapshot();
+        let runner = self.hook_runner();
         crate::engine::agent::hooks::run_observe_hooks(
-            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+            &runner,
             &crate::engine::agent::hooks::DefaultProcessEnv,
             snapshot.hooks(),
             event,
@@ -4757,7 +4801,13 @@ impl Driver {
         // Record before firing so a completion racing on the same turn boundary
         // (it cannot: SwarmChildStarted is always drained first) still pairs.
         self.swarm_subagents
-            .insert(job_id.to_string(), subagent_type.to_string());
+            .insert(
+                job_id.to_string(),
+                SwarmSubagentHookState {
+                    subagent_type: subagent_type.to_string(),
+                    stop_gate_completed: false,
+                },
+            );
         self.fire_subagent_hook(
             crate::config::extended::hooks::HookEvent::SubagentStart,
             subagent_type,
@@ -4765,6 +4815,12 @@ impl Driver {
             None,
         )
         .await;
+    }
+
+    fn mark_swarm_subagent_stop_gate_completed(&mut self, job_id: &str) {
+        if let Some(state) = self.swarm_subagents.get_mut(job_id) {
+            state.stop_gate_completed = true;
+        }
     }
 
     /// Fire the paired `subagentStop` for a detached-`Swarm` child if — and only
@@ -4778,13 +4834,19 @@ impl Driver {
     /// non-failed terminal and `failed` otherwise (a cancel synthesizes a
     /// non-failed terminal, so it settles as `completed`).
     async fn fire_swarm_subagent_stop_if_tracked(&mut self, job_id: &str, failed: bool) {
-        let Some(subagent_type) = self.swarm_subagents.remove(job_id) else {
+        let Some(state) = self.swarm_subagents.remove(job_id) else {
             return;
         };
-        let end_reason = if failed { "failed" } else { "completed" };
+        // A successful child ran its controlling gate inside `run_swarm_loop`
+        // before publishing the completion. Only failures bypass that gate and
+        // need an observe-only terminal notification here.
+        if !failed && state.stop_gate_completed {
+            return;
+        }
+        let end_reason = if failed { "failed" } else { "aborted" };
         self.fire_subagent_hook(
             crate::config::extended::hooks::HookEvent::SubagentStop,
-            &subagent_type,
+            &state.subagent_type,
             Some(job_id),
             Some(end_reason),
         )
@@ -4804,11 +4866,12 @@ impl Driver {
     pub(crate) async fn drain_orphaned_swarm_stop_hooks(&mut self) {
         // Drain first so no borrow of `self.swarm_subagents` is held across the
         // await inside `fire_subagent_hook`.
-        let orphans: Vec<(String, String)> = self.swarm_subagents.drain().collect();
-        for (job_id, subagent_type) in orphans {
+        let orphans: Vec<(String, SwarmSubagentHookState)> =
+            self.swarm_subagents.drain().collect();
+        for (job_id, state) in orphans {
             self.fire_subagent_hook(
                 crate::config::extended::hooks::HookEvent::SubagentStop,
-                &subagent_type,
+                &state.subagent_type,
                 Some(&job_id),
                 Some("aborted"),
             )
@@ -4878,9 +4941,50 @@ impl Driver {
             self.session.id,
             &self.cwd,
             &self.session.db,
+            None,
             state,
         )
         .await
+    }
+
+    /// Consult the stop gate owned by the currently-active interactive child.
+    /// The state is temporarily moved out of the frame so no stack borrow is
+    /// held across hook execution; it is restored only if the same child is
+    /// still active. Terminal unwind paths never call this helper.
+    async fn consult_active_child_stop_gate(
+        &mut self,
+    ) -> crate::engine::agent::hooks::StopHookOutcome {
+        if self.stack.len() <= 1 {
+            return crate::engine::agent::hooks::StopHookOutcome::End;
+        }
+        let frame = self.stack.last_mut().expect("stack checked nonempty");
+        let child_type = frame.agent.name.clone();
+        let child_id = frame.answering.as_ref().map(|pending| pending.call_id.clone());
+        let mut state = std::mem::take(&mut frame.stop_gate);
+        let snapshot = self.config.snapshot();
+        let runner = self.hook_runner();
+        let outcome = crate::engine::agent::hooks::run_stop_hooks(
+            &runner,
+            &crate::engine::agent::hooks::DefaultProcessEnv,
+            snapshot.hooks(),
+            crate::config::extended::hooks::HookEvent::SubagentStop,
+            &child_type,
+            self.session.id,
+            &self.cwd,
+            &self.session.db,
+            child_id.as_deref(),
+            &mut state,
+        )
+        .await;
+        if let Some(frame) = self.stack.last_mut()
+            && frame.agent.name == child_type
+            && frame.answering.as_ref().map(|pending| pending.call_id.as_str())
+                == child_id.as_deref()
+        {
+            frame.stop_gate = state;
+            frame.stop_gate_consulted = true;
+        }
+        outcome
     }
 
     /// Build the host-generated continuation message injected into the ROOT
@@ -4893,7 +4997,10 @@ impl Driver {
     /// ([`SubmissionOrigin::Internal`], whose `user_prompt_submit_source()` is
     /// `None`) marks it as host-driven — so stop-continuation feedback can never
     /// re-fire `userPromptSubmit`.
-    fn stop_continuation_prompt(reason: String, additional_context: Option<String>) -> Message {
+    pub(crate) fn stop_continuation_prompt(
+        reason: String,
+        additional_context: Option<String>,
+    ) -> Message {
         let mut text = reason;
         if let Some(ctx) = additional_context
             && !ctx.is_empty()
@@ -6974,13 +7081,15 @@ impl Driver {
         // `subagentType` is the child agent type, `subagentId` is the
         // delegating `task` call id, `endReason` is `completed` (this is the
         // normal success pop; the abort/teardown path is a separate site).
-        self.fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStop,
-            &child.agent.name,
-            task_call_id,
-            Some("completed"),
-        )
-        .await;
+        if !child.stop_gate_consulted {
+            self.fire_subagent_hook(
+                crate::config::extended::hooks::HookEvent::SubagentStop,
+                &child.agent.name,
+                task_call_id,
+                Some("completed"),
+            )
+            .await;
+        }
         let routing = ChildRoutingMetadata::from_model_with_fallback_decision(
             &child.agent.model,
             child.fallback_decision.as_ref(),
@@ -8625,6 +8734,15 @@ impl Driver {
                     // and inject the structured envelope as the parent's tool
                     // result. `Return` is only ever emitted by a delegated
                     // child, so the stack always has a parent below it.
+                    if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                        reason,
+                        additional_context,
+                    } = self.consult_active_child_stop_gate().await
+                        && !cancel.is_cancelled()
+                    {
+                        next_prompt = Self::stop_continuation_prompt(reason, additional_context);
+                        continue;
+                    }
                     if let Some(np) = self.pop_child_with_envelope(Some(&fields), tx).await {
                         next_prompt = np;
                         continue;
@@ -8633,6 +8751,16 @@ impl Driver {
                 }
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
+                        if let crate::engine::agent::hooks::StopHookOutcome::Continue {
+                            reason,
+                            additional_context,
+                        } = self.consult_active_child_stop_gate().await
+                            && !cancel.is_cancelled()
+                        {
+                            next_prompt =
+                                Self::stop_continuation_prompt(reason, additional_context);
+                            continue;
+                        }
                         // No `return` call: the envelope falls back to wrapping
                         // the child's final text as `accomplished` (priority #1
                         // — never fail the delegation). `None` selects that path.
@@ -8711,9 +8839,10 @@ impl Driver {
                     // so no aborted/errored/capped turn can enter or reopen it.
                     // Production uses the shipped runner / process-env, exactly
                     // like every other hook site.
+                    let hook_runner = self.hook_runner();
                     match self
                         .consult_root_stop_gate(
-                            &crate::engine::agent::hooks::TokioCommandRunner::new(),
+                            &hook_runner,
                             &crate::engine::agent::hooks::DefaultProcessEnv,
                             &mut root_stop_gate,
                         )
@@ -9016,6 +9145,8 @@ impl Driver {
                         // the child frame releases the parent slot when this
                         // interactive child returns or the stack unwinds.
                         _vnext_child_admission: vnext_admissions.pop(),
+                        stop_gate: crate::engine::agent::hooks::StopGateState::default(),
+                        stop_gate_consulted: false,
                     });
                     // `subagentStart` observe hooks: the INTERACTIVE child
                     // session has just been pushed onto the stack (spawn mode 1

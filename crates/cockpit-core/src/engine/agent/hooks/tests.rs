@@ -112,6 +112,7 @@ impl CommandRunner for FakeCommandRunner {
         cwd: &Path,
         stdin: &str,
         timeout: Duration,
+        _session_id: Uuid,
     ) -> HookRawOutput {
         self.invocations.lock().unwrap().push(CapturedInvocation {
             executable: executable.to_path_buf(),
@@ -159,6 +160,8 @@ fn successful_output(stdout: &str) -> HookRawOutput {
         duration_ms: 10,
         spawn_failed: false,
         timeout: false,
+        failure_reason: None,
+        output_truncated: false,
     }
 }
 
@@ -169,6 +172,8 @@ fn failed_output() -> HookRawOutput {
         duration_ms: 10,
         spawn_failed: false,
         timeout: false,
+        failure_reason: None,
+        output_truncated: false,
     }
 }
 
@@ -179,6 +184,8 @@ fn timeout_output() -> HookRawOutput {
         duration_ms: 1000,
         spawn_failed: false,
         timeout: true,
+        failure_reason: None,
+        output_truncated: false,
     }
 }
 
@@ -189,6 +196,8 @@ fn spawn_failed_output() -> HookRawOutput {
         duration_ms: 0,
         spawn_failed: true,
         timeout: false,
+        failure_reason: None,
+        output_truncated: false,
     }
 }
 
@@ -1597,6 +1606,7 @@ async fn fake_command_runner_captures_invocation() {
             Path::new("/workspace"),
             "stdin data",
             Duration::from_secs(5),
+            Uuid::nil(),
         )
         .await;
     assert_eq!(result.exit_code, Some(0));
@@ -1619,11 +1629,79 @@ async fn fake_command_runner_captures_invocation() {
 // is mutated. They prove the fail-open, deny short-circuit, matcher/ordering,
 // and stop-continuation contracts against non-vacuous ledger state.
 //
-// The containment-owned parts of these acceptance tests (the
-// `descendant_containment_unsupported` fail-open reason, proven-empty timeout
-// settlement) are deferred with the process-containment runner integration
-// (increment 2) and are not covered here.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn tool_hook_runner_envelope_bounds_and_reserved_environment() {
+    envelope_for_pre_tool_use_is_camelcase();
+    envelope_for_post_tool_use_success();
+    envelope_for_post_tool_use_failure();
+    envelope_clips_oversized_input();
+    envelope_small_input_is_not_truncated();
+    build_child_env_includes_reserved_keys();
+    build_child_env_reserved_keys_overwrite_configured_env();
+    build_child_env_delivers_configured_env();
+}
+
+#[tokio::test]
+async fn tool_hook_runner_argv_timeout_and_proven_empty() {
+    let argv = vec!["literal;not-shell".to_string(), "$(never-expanded)".to_string()];
+    let fake = FakeCommandRunner::new(timeout_output());
+    let session_id = Uuid::new_v4();
+    let timed_out = fake
+        .run(
+            Path::new("/resolved/hook"),
+            &argv,
+            &BTreeMap::new(),
+            Path::new("/workspace"),
+            "{}",
+            Duration::from_secs(7),
+            session_id,
+        )
+        .await;
+    assert!(timed_out.timeout);
+    assert_eq!(fake.invocations()[0].args, argv);
+
+    // An absent containment actor is the same production posture as a host
+    // whose adapter reports Unsupported: deterministic before-spawn failure,
+    // never a raw Tokio fallback.
+    let unsupported = TokioCommandRunner::new()
+        .run(
+            Path::new("/must/not/run"),
+            &[],
+            &BTreeMap::new(),
+            Path::new("/workspace"),
+            "{}",
+            Duration::from_secs(1),
+            session_id,
+        )
+        .await;
+    assert_eq!(
+        unsupported.failure_reason,
+        Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED)
+    );
+
+    let (db, contained_session_id) = db_session().await;
+    let adapter = crate::process_containment::FakeProvenAdapter::default();
+    let actor = crate::process_containment::ProcessContainmentActor::start(
+        db,
+        Arc::new(adapter.clone()),
+    );
+    let contained = TokioCommandRunner::with_containment(actor.handle())
+        .run(
+            Path::new("/fake/adapter-owned-hook"),
+            &argv,
+            &BTreeMap::new(),
+            Path::new("/workspace"),
+            "{}",
+            Duration::from_secs(1),
+            contained_session_id,
+        )
+        .await;
+    assert_eq!(contained.exit_code, Some(0));
+    assert_eq!(adapter.spawn_log().len(), 1);
+    assert_eq!(adapter.terminate_log().len(), 1);
+}
 
 use uuid::Uuid;
 
@@ -1753,6 +1831,11 @@ async fn pre_tool_hook_failures_are_fail_open() {
     // Every failure mode below is fail-open: the pre gate returns `Allow` (so
     // the ordinary tool dispatch proceeds) and records exactly one bounded row.
     let big_malformed = "x".repeat(200 * 1024);
+    let mut containment_unsupported = spawn_failed_output();
+    containment_unsupported.failure_reason = Some(REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED);
+    let mut output_overflow = successful_output(r#"{"decision":"allow"}"#);
+    output_overflow.output_truncated = true;
+    output_overflow.failure_reason = Some(REASON_OUTPUT_LIMIT_EXCEEDED);
     let failure_cases: Vec<(&str, HookRawOutput)> = vec![
         ("timeout", timeout_output()),
         ("spawn failure", spawn_failed_output()),
@@ -1766,6 +1849,8 @@ async fn pre_tool_hook_failures_are_fail_open() {
             "oversized malformed stdout",
             successful_output(&big_malformed),
         ),
+        ("bounded output overflow", output_overflow),
+        ("descendant containment unsupported", containment_unsupported),
     ];
     for (label, output) in failure_cases {
         let (outcome, statuses) = run_case(&resolves, output).await;
@@ -2041,6 +2126,7 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2066,6 +2152,7 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2100,6 +2187,7 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2125,6 +2213,7 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2151,6 +2240,7 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2160,6 +2250,43 @@ async fn stop_hook_continuation_state_machine() {
             hook_run_statuses(&db, sid).await,
             vec!["failed".to_string()]
         );
+    }
+
+    // A child stop uses the same bounded state machine, but is correlated to
+    // the child and exposes child fields rather than root-only stopReason.
+    {
+        let (db, sid) = db_session().await;
+        let child_hook = test_hook(
+            HookEvent::SubagentStop,
+            vec!["s".to_string()],
+            Some(vec!["builder".to_string()]),
+            BTreeMap::new(),
+            5,
+        );
+        let runner = FakeCommandRunner::new(successful_output(
+            r#"{"decision":"block","reason":"finish the review"}"#,
+        ));
+        let mut state = StopGateState::default();
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![child_hook]),
+            HookEvent::SubagentStop,
+            "builder",
+            sid,
+            workspace(),
+            &db,
+            Some("task-call-7"),
+            &mut state,
+        )
+        .await;
+        assert!(matches!(outcome, StopHookOutcome::Continue { .. }));
+        let invocation = runner.invocations().into_iter().next().unwrap();
+        let envelope: Value = serde_json::from_str(&invocation.stdin).unwrap();
+        assert_eq!(envelope["subagentType"], "builder");
+        assert_eq!(envelope["subagentId"], "task-call-7");
+        assert_eq!(envelope["endReason"], "completed");
+        assert!(envelope.get("stopReason").is_none());
     }
 }
 
@@ -2205,6 +2332,7 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
             sid,
             workspace(),
             &db,
+            None,
             &mut state,
         )
         .await;
@@ -2250,6 +2378,7 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         sid,
         workspace(),
         &db,
+        None,
         &mut state,
     )
     .await;
@@ -2642,13 +2771,15 @@ impl HookDocumentationContract {
             stop_continue_false: "continue",
             stop_additional_context_field: "hookSpecificOutput.additionalContext",
             fail_open_conditions: vec![
-                "crash",
-                "timeout",
-                "spawn-failure",
-                "malformed-output",
-                "oversized-output",
-                "nonzero-exit",
-                "missing-command",
+                REASON_SPAWN_FAILED,
+                REASON_EXECUTABLE_NOT_FOUND,
+                REASON_MALFORMED_JSON_OUTPUT,
+                REASON_HOOK_TIMED_OUT,
+                REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+                REASON_OUTPUT_LIMIT_EXCEEDED,
+                REASON_NONZERO_EXIT_PREFIX,
+                REASON_NO_EXIT_STATUS,
+                REASON_EMPTY_NOT_PROVEN,
             ],
             unsupported_formats: vec![
                 "toml",
@@ -2831,4 +2962,16 @@ fn hooks_documentation_matches_typed_contract() {
     assert!(!block.trim().is_empty(), "hooks-contract block is empty");
     let contract = HookDocumentationContract::from_typed_constants();
     assert_contract_block_matches(&block, &contract);
+    let mut reachable = PRODUCTION_HOOK_BOUNDARIES
+        .iter()
+        .map(|(event, owner)| {
+            assert!(!owner.trim().is_empty(), "{event:?} has an empty boundary owner");
+            *event
+        })
+        .collect::<Vec<_>>();
+    reachable.sort_by_key(|event| event.key());
+    reachable.dedup();
+    let mut all = HookEvent::ALL.to_vec();
+    all.sort_by_key(|event| event.key());
+    assert_eq!(reachable, all, "every typed hook event needs one production boundary owner");
 }

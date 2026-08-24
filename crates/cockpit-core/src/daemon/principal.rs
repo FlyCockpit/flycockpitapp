@@ -253,6 +253,7 @@ impl ClientPrincipal {
         self.is_owner() || self.has_scope(PrincipalScope::Terminal)
     }
 
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn has_project_scope(&self, scope: PrincipalScope, project_root: &str) -> bool {
         match self {
             Self::Owner => true,
@@ -270,6 +271,7 @@ impl ClientPrincipal {
         }
     }
 
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     fn has_scope(&self, scope: PrincipalScope) -> bool {
         match self {
             Self::Owner => true,
@@ -285,6 +287,7 @@ impl ClientPrincipal {
 }
 
 impl PrincipalGrant {
+    #[cfg(feature = "remote")]
     fn matches_project(&self, project_root: &str) -> bool {
         match self.project_root.as_deref() {
             // An `ImageGenerationAdmin` grant NEVER inherits the rootless
@@ -320,6 +323,7 @@ fn local_principal_name() -> String {
     }
 }
 
+#[cfg(feature = "remote")]
 fn roots_equal(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -327,6 +331,7 @@ fn roots_equal(a: &str, b: &str) -> bool {
     canonical_if_exists(a) == canonical_if_exists(b)
 }
 
+#[cfg(feature = "remote")]
 fn canonical_if_exists(path: &str) -> PathBuf {
     Path::new(path)
         .canonicalize()

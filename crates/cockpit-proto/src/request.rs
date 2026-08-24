@@ -127,6 +127,7 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_PROJECT_ROOT_BYTES, D>(deserializer)
 }
 
+#[cfg(feature = "remote")]
 fn deserialize_owner_org_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -4071,9 +4072,7 @@ mod tests {
 
     macro_rules! command_tags {
         (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            let mut tags = Vec::new();
-            $($(#[$row_attr])* tags.push($tag);)+
-            tags
+            vec![$($(#[$row_attr])* $tag),+]
         }};
     }
 

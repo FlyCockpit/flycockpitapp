@@ -2405,6 +2405,7 @@ impl<'de> Deserialize<'de> for SensitiveWireLiteral {
 /// literal. It carries no plaintext and no length, so the sealed plaintext never
 /// enters the (non-zeroizing) FCOR canonical digest buffer, its staging buffers,
 /// or the bytes handed to the hasher.
+#[cfg(feature = "remote")]
 const SEALED_LITERAL_FCOR_PLACEHOLDER: &[u8] = b"[sealed-literal-redacted-from-fcor]";
 
 // The apply request is an owner-remoted nonrepeatable mutation, so its params

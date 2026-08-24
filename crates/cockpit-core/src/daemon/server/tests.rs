@@ -14502,6 +14502,7 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthzExpectation {
     Allow(AuthzAllowedOutcome),
+    #[cfg(feature = "remote")]
     Deny(ErrorCode),
 }
 
@@ -14514,8 +14515,11 @@ enum AuthzAllowedOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthzLevel {
     Owner,
+    #[cfg(feature = "remote")]
     Writer,
+    #[cfg(feature = "remote")]
     Readonly,
+    #[cfg(feature = "remote")]
     NoAccess,
 }
 
@@ -14526,8 +14530,11 @@ impl AuthzLevel {
     fn label(self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            #[cfg(feature = "remote")]
             Self::Writer => "writer",
+            #[cfg(feature = "remote")]
             Self::Readonly => "readonly",
+            #[cfg(feature = "remote")]
             Self::NoAccess => "no_access",
         }
     }
@@ -14537,8 +14544,11 @@ impl AuthzLevel {
 struct AuthzDispatchCase {
     kind: &'static str,
     owner: AuthzExpectation,
+    #[cfg(feature = "remote")]
     writer: AuthzExpectation,
+    #[cfg(feature = "remote")]
     readonly: AuthzExpectation,
+    #[cfg(feature = "remote")]
     no_access: AuthzExpectation,
     #[cfg(feature = "remote")]
     known_holes: &'static [AuthzKnownHole],
@@ -14557,8 +14567,11 @@ impl AuthzDispatchCase {
     fn expectation(&self, level: AuthzLevel) -> AuthzExpectation {
         match level {
             AuthzLevel::Owner => self.owner.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::Writer => self.writer.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::Readonly => self.readonly.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::NoAccess => self.no_access.clone(),
         }
     }
@@ -14568,27 +14581,27 @@ fn authz_owner_only(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
 
+#[cfg(feature = "remote")]
 fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
-    #[cfg(feature = "remote")]
-    {
-        return authz_session_writer_with_known_holes(kind, &[]);
-    }
+    authz_session_writer_with_known_holes(kind, &[])
+}
 
-    #[cfg(not(feature = "remote"))]
+#[cfg(not(feature = "remote"))]
+fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
-        writer: authz_allow(kind),
-        readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
-        no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
     }
 }
 
@@ -14602,8 +14615,11 @@ fn authz_bulk_user_message() -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind: "send_user_message_bulk",
         owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
@@ -14620,8 +14636,11 @@ fn authz_bulk_transfer_chunk() -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind: "write_bulk_transfer_chunk",
         owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
@@ -14647,8 +14666,11 @@ fn authz_session_reader(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: authz_allow(kind),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
@@ -14659,8 +14681,11 @@ fn authz_project_files(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
@@ -14671,8 +14696,11 @@ fn authz_project_read(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: authz_allow(kind),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],
@@ -14683,8 +14711,11 @@ fn authz_terminal(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
         #[cfg(feature = "remote")]
         known_holes: &[],

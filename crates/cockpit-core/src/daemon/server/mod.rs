@@ -4926,8 +4926,6 @@ async fn handle_envelope(
                         return Ok(());
                     }
                 };
-            #[cfg(not(feature = "remote"))]
-            let remote_operation = None;
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -4939,13 +4937,14 @@ async fn handle_envelope(
                     let _permit = permit;
                     let response_shared = request_shared.clone();
                     let response_ctx = ctx.clone();
+                    #[cfg(feature = "remote")]
                     let result = run_concurrent_request_catching_panic_with_remote_operation(
-                        request,
-                        request_shared,
-                        ctx,
-                        remote_operation,
-                    )
-                    .await;
+                        request, request_shared, ctx, remote_operation,
+                    ).await;
+                    #[cfg(not(feature = "remote"))]
+                    let result = run_concurrent_request_catching_panic(
+                        request, request_shared, ctx,
+                    ).await;
                     let envelope =
                         response_envelope_for_shared(id, result, &response_shared, &response_ctx);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
@@ -4954,15 +4953,14 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
+            #[cfg(feature = "remote")]
             let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
-                request,
-                state,
-                shared,
-                ctx,
-                &mut effects,
-                remote_operation.as_ref(),
-            ))
-            .await;
+                request, state, shared, ctx, &mut effects, remote_operation.as_ref(),
+            )).await;
+            #[cfg(not(feature = "remote"))]
+            let result = Box::pin(dispatch::handle_serialized_request(
+                request, state, shared, ctx, &mut effects,
+            )).await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
@@ -5184,7 +5182,16 @@ async fn run_concurrent_request_catching_panic(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    run_concurrent_request_catching_panic_with_remote_operation(request, shared, ctx, None).await
+    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "concurrent request handler panicked".to_string(),
+        }),
+    }
 }
 
 async fn run_concurrent_request_catching_panic_with_remote_operation(

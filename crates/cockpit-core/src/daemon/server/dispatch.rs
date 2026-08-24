@@ -9695,6 +9695,16 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     }
 }
 
+/// Local-profile concurrent dispatch entry point. Remote operation identity is
+/// not part of the caller-facing contract.
+pub(super) async fn handle_concurrent_request(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    handle_concurrent_request_with_remote_operation(request, shared, ctx, None).await
+}
+
 fn current_host_capability_snapshot(ctx: &DaemonContext) -> cockpit_proto::HostCapabilitySnapshot {
     ctx.host_capabilities
         .current()

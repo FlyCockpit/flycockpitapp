@@ -1660,7 +1660,9 @@ pub(crate) async fn run_stop_hooks(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    subagent_type: Option<&str>,
     subagent_id: Option<&str>,
+    end_reason: Option<&str>,
     state: &mut StopGateState,
 ) -> StopHookOutcome {
     run_stop_hooks_cancellable(
@@ -1672,7 +1674,9 @@ pub(crate) async fn run_stop_hooks(
         session_id,
         workspace_root,
         db,
+        subagent_type,
         subagent_id,
+        end_reason,
         state,
         &tokio_util::sync::CancellationToken::new(),
     )
@@ -1689,7 +1693,9 @@ pub(crate) async fn run_stop_hooks_cancellable(
     session_id: Uuid,
     workspace_root: &Path,
     db: &crate::db::Db,
+    subagent_type: Option<&str>,
     subagent_id: Option<&str>,
+    end_reason: Option<&str>,
     state: &mut StopGateState,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> StopHookOutcome {
@@ -1723,6 +1729,16 @@ pub(crate) async fn run_stop_hooks_cancellable(
         return StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap);
     }
 
+    // Claim the lifecycle boundary before matcher resolution. Exactly-once is
+    // about dispatching the native boundary, not about whether configuration
+    // happened to contain a matching handler. Parent/drain reconciliation uses
+    // this bit to avoid redispatching a completed child as a terminal stop when
+    // the first dispatch legitimately matched zero hooks.
+    state.lifecycle_event_emitted = true;
+    if let Some(latch) = &state.lifecycle_event_latch {
+        latch.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     let hooks = matching_hooks(registry, event, match_value);
     if hooks.is_empty() {
         return StopHookOutcome::End;
@@ -1743,11 +1759,11 @@ pub(crate) async fn run_stop_hooks_cancellable(
         None,
         None,
         None,
-        (event == HookEvent::SubagentStop).then_some(match_value),
+        subagent_type,
         subagent_id,
         ObserveFields {
             stop_reason: (event == HookEvent::Stop).then_some(match_value),
-            end_reason: (event == HookEvent::SubagentStop).then_some("completed"),
+            end_reason,
             stop_hook_active: Some(state.stop_hook_active),
             ..ObserveFields::default()
         },
@@ -1766,10 +1782,6 @@ pub(crate) async fn run_stop_hooks_cancellable(
         // From this point the configured lifecycle handler owns the event,
         // even when executable resolution or process launch subsequently
         // fails (those failures are durably recorded below).
-        state.lifecycle_event_emitted = true;
-        if let Some(latch) = &state.lifecycle_event_latch {
-            latch.store(true, std::sync::atomic::Ordering::Release);
-        }
         let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
@@ -1934,11 +1946,11 @@ pub(crate) async fn run_stop_hooks_cancellable(
 ///
 /// Observe-only hooks (`sessionStart`, `userPromptSubmit`, `permissionDenied`,
 /// `subagentStart`, `preCompact`, `postCompact`, `stopFailure`, and
-/// `sessionEnd`) never block. `subagentStop`'s observe NOTIFICATION (a child
-/// stopped, with its `endReason`) is also emitted through here; its stop-gate
-/// continuation is a separate concern. All matching hooks run sequentially even
-/// if an earlier observer fails. Each failed run is recorded; a nonmatching
-/// handler produces no row.
+/// `sessionEnd`) never block. `subagentStop` is deliberately excluded: it is a
+/// `G::Stop` event and every child-stop boundary routes through
+/// [`run_stop_hooks`] exactly once. All matching observers run sequentially
+/// even if an earlier observer fails. Each failed run is recorded; a
+/// nonmatching handler produces no row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_observe_hooks(
     runner: &dyn CommandRunner,

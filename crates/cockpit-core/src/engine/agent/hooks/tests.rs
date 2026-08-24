@@ -2121,7 +2121,8 @@ async fn stop_hook_continuation_state_machine() {
         )
     };
 
-    // No matching hooks → End, state untouched.
+    // No matching hooks → End. The lifecycle boundary is still claimed so a
+    // parent/drain reconciler cannot redispatch the same child stop.
     {
         let (db, sid) = db_session().await;
         let runner = FakeCommandRunner::new(successful_output(""));
@@ -2136,11 +2137,14 @@ async fn stop_hook_continuation_state_machine() {
             workspace(),
             &db,
             None,
+            None,
+            None,
             &mut state,
         )
         .await;
         assert_eq!(outcome, StopHookOutcome::End);
         assert_eq!(state.continuation_count, 0);
+        assert!(state.lifecycle_event_emitted);
         assert!(hook_run_statuses(&db, sid).await.is_empty());
     }
 
@@ -2161,6 +2165,8 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
             None,
             &mut state,
         )
@@ -2197,6 +2203,8 @@ async fn stop_hook_continuation_state_machine() {
             workspace(),
             &db,
             None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2224,6 +2232,8 @@ async fn stop_hook_continuation_state_machine() {
             workspace(),
             &db,
             None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2250,6 +2260,8 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            None,
+            None,
             None,
             &mut state,
         )
@@ -2286,7 +2298,9 @@ async fn stop_hook_continuation_state_machine() {
             sid,
             workspace(),
             &db,
+            Some("builder"),
             Some("task-call-7"),
+            Some("completed"),
             &mut state,
         )
         .await;
@@ -2297,6 +2311,38 @@ async fn stop_hook_continuation_state_machine() {
         assert_eq!(envelope["subagentId"], "task-call-7");
         assert_eq!(envelope["endReason"], "completed");
         assert!(envelope.get("stopReason").is_none());
+
+        // Terminal child stops use the same single G::Stop dispatcher with a
+        // fresh discarded latch; only the supplied terminal reason differs.
+        let terminal_runner = FakeCommandRunner::new(successful_output(""));
+        let mut discarded = StopGateState::default();
+        let _ = run_stop_hooks(
+            &terminal_runner,
+            &env,
+            &registry(vec![test_hook(
+                HookEvent::SubagentStop,
+                vec!["s".to_string()],
+                Some(vec!["builder".to_string()]),
+                BTreeMap::new(),
+                5,
+            )]),
+            HookEvent::SubagentStop,
+            "builder",
+            sid,
+            workspace(),
+            &db,
+            Some("builder"),
+            Some("task-call-8"),
+            Some("aborted"),
+            &mut discarded,
+        )
+        .await;
+        let terminal: Value =
+            serde_json::from_str(&terminal_runner.invocations()[0].stdin).unwrap();
+        assert_eq!(terminal["subagentType"], "builder");
+        assert_eq!(terminal["subagentId"], "task-call-8");
+        assert_eq!(terminal["endReason"], "aborted");
+        assert!(terminal.get("stopReason").is_none());
     }
 }
 
@@ -2324,6 +2370,8 @@ async fn cancelled_stop_gate_does_not_spawn_or_record_handlers() {
         sid,
         workspace(),
         &db,
+        None,
+        None,
         None,
         &mut state,
         &cancel,
@@ -2379,6 +2427,8 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
             workspace(),
             &db,
             None,
+            None,
+            None,
             &mut state,
         )
         .await;
@@ -2424,6 +2474,8 @@ async fn stop_hook_grants_max_continuations_then_forces_end_without_reconsulting
         sid,
         workspace(),
         &db,
+        None,
+        None,
         None,
         &mut state,
     )

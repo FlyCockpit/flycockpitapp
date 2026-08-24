@@ -1256,12 +1256,7 @@ impl Driver {
         // `subagentType` is the child agent type, `subagentId` is the delegating
         // `task` call id. Paired with exactly one `subagentStop` at delegation
         // delivery (`finalize_background_noninteractive_completion`).
-        self.fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStart,
-            &task.child_agent,
-            Some(&task_call_id),
-            None,
-        )
+        self.fire_subagent_hook(&task.child_agent, Some(&task_call_id))
         .await;
         let mut runner = self.clone_for_background_noninteractive(tx);
         let complete_tx = self.noninteractive_complete_tx.clone();
@@ -2373,7 +2368,7 @@ impl Driver {
         }
     }
 
-    /// Fire one `subagentStop` observe hook for every NONINTERACTIVE child
+    /// Fire one terminal `subagentStop` G::Stop dispatch for every NONINTERACTIVE child
     /// registered under `task_call_id`, at the delegation-complete / delivery
     /// boundary. Pairs 1:1 with the `subagentStart` fired at `register_running`:
     /// every started noninteractive child (a single delegation, or each entry of
@@ -2392,7 +2387,7 @@ impl Driver {
     /// child prompt text, report body, tool IO, or history.
     async fn fire_noninteractive_subagent_stops(&self, task_call_id: &str, fallback: &'static str) {
         // Collect first so no borrow of the registry is held across the await in
-        // `fire_subagent_hook`. Stable order (by label) for deterministic firing.
+        // hook dispatch. Stable order (by label) for deterministic firing.
         let mut children: Vec<(String, String, &'static str)> = self
             .noninteractive_delegations
             .entries
@@ -2413,11 +2408,22 @@ impl Driver {
             .collect();
         children.sort_by(|a, b| a.0.cmp(&b.0));
         for (_label, child_agent, end_reason) in children {
-            self.fire_subagent_hook(
+            let snapshot = self.config.snapshot();
+            let runner = self.hook_runner();
+            let mut discarded = crate::engine::agent::hooks::StopGateState::default();
+            let _ = crate::engine::agent::hooks::run_stop_hooks(
+                &runner,
+                &crate::engine::agent::hooks::DefaultProcessEnv,
+                snapshot.hooks(),
                 crate::config::extended::hooks::HookEvent::SubagentStop,
                 &child_agent,
+                self.session.id,
+                &self.cwd,
+                &self.session.db,
+                Some(&child_agent),
                 Some(task_call_id),
                 Some(end_reason),
+                &mut discarded,
             )
             .await;
         }
@@ -3400,12 +3406,7 @@ impl Driver {
             // matcher / `subagentType` is the child agent type, `subagentId` is the
             // shared delegating `task` call id. Each is paired with exactly one
             // `subagentStop` at delegation delivery.
-            self.fire_subagent_hook(
-                crate::config::extended::hooks::HookEvent::SubagentStart,
-                &entry.child_agent,
-                Some(&task_call_id),
-                None,
-            )
+            self.fire_subagent_hook(&entry.child_agent, Some(&task_call_id))
             .await;
         }
         let mut runner = self.clone_for_background_noninteractive(tx);
@@ -5352,7 +5353,8 @@ async fn fire_recursive_child_abnormal_stop(
         crate::engine::agent::hooks::TokioCommandRunner::new,
         crate::engine::agent::hooks::TokioCommandRunner::with_containment,
     );
-    crate::engine::agent::hooks::run_observe_hooks(
+    let mut discarded = crate::engine::agent::hooks::StopGateState::default();
+    let _ = crate::engine::agent::hooks::run_stop_hooks(
         &hook_runner,
         &crate::engine::agent::hooks::DefaultProcessEnv,
         snapshot.hooks(),
@@ -5361,14 +5363,10 @@ async fn fire_recursive_child_abnormal_stop(
         session.id,
         cwd,
         &session.db,
-        None,
-        None,
         Some(&agent.name),
         Some(&lifecycle.subagent_id),
-        crate::engine::agent::hooks::ObserveFields {
-            end_reason: Some(end_reason),
-            ..Default::default()
-        },
+        Some(end_reason),
+        &mut discarded,
     )
     .await;
     lifecycle.publish(true);
@@ -5638,7 +5636,9 @@ pub(crate) async fn run_noninteractive_resumable(
                         session.id,
                         &cwd,
                         &session.db,
+                        Some(&agent.name),
                         Some(&lifecycle.subagent_id),
+                        Some("completed"),
                         &mut stop_gate,
                         &cancel,
                     )
@@ -5696,7 +5696,9 @@ pub(crate) async fn run_noninteractive_resumable(
                         session.id,
                         &cwd,
                         &session.db,
+                        Some(&agent.name),
                         Some(&lifecycle.subagent_id),
+                        Some("completed"),
                         &mut stop_gate,
                         &cancel,
                     )

@@ -550,7 +550,9 @@ async fn run_swarm_loop(
                     ctx.session.id,
                     &ctx.cwd,
                     &ctx.session.db,
+                    Some(spec.worker.agent_name()),
                     Some(job_id),
+                    Some("completed"),
                     &mut stop_gate,
                     &cancel,
                 )
@@ -639,7 +641,9 @@ async fn run_swarm_loop(
                     ctx.session.id,
                     &ctx.cwd,
                     &ctx.session.db,
+                    Some(spec.worker.agent_name()),
                     Some(job_id),
+                    Some("completed"),
                     &mut stop_gate,
                     &cancel,
                 )

@@ -485,12 +485,7 @@ async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
         ),
     );
     driver
-        .fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStart,
-            "builder",
-            Some("task-start-1"),
-            None,
-        )
+        .fire_subagent_hook("builder", Some("task-start-1"))
         .await;
     assert_eq!(
         observe_hook_events(&driver, "subagentStart").await,
@@ -507,12 +502,7 @@ async fn subagent_start_hook_fires_for_child_agent_type_matcher() {
         ),
     );
     driver
-        .fire_subagent_hook(
-            crate::config::extended::hooks::HookEvent::SubagentStart,
-            "builder",
-            Some("task-start-2"),
-            None,
-        )
+        .fire_subagent_hook("builder", Some("task-start-2"))
         .await;
     assert!(
         observe_hook_events(&driver, "subagentStart")

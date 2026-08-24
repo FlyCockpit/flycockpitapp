@@ -5443,10 +5443,12 @@ fn inject_hooks_keep_config(
 
 #[tokio::test]
 async fn noninteractive_single_delivery_fires_one_paired_subagent_stop() {
-    // Drive the REAL delivery boundary: an inline single-delegation completion
-    // delivered through `finalize_background_noninteractive_completion` fires
-    // exactly one `subagentStop` matched on the child agent type. This is the
-    // pair of the `subagentStart` fired at register-running.
+    // UNIFIED dispatch: an inline single-delegation completion delivered through
+    // `finalize_background_noninteractive_completion` fires exactly one
+    // `subagentStop` (through the `run_stop_hooks` G::Stop dispatcher, terminal —
+    // a delivered noninteractive child has already terminated), matched on the
+    // child agent type. This is the pair of the `subagentStart` fired at
+    // register-running.
     let (mut driver, _tmp) = test_driver(8);
     inject_hooks(
         &mut driver,
@@ -5700,10 +5702,11 @@ async fn background_batch_stop_gate_latches_are_isolated_per_child() {
 
 #[tokio::test]
 async fn noninteractive_batch_delivery_fires_one_subagent_stop_per_child() {
-    // Drive the REAL batch delivery boundary: a three-child batch completion
-    // delivered through `finalize_background_noninteractive_completion` fires
-    // exactly one `subagentStop` PER started child (all matched on the child
-    // agent type), pairing the three per-entry `subagentStart`s.
+    // UNIFIED dispatch: a three-child batch completion delivered through
+    // `finalize_background_noninteractive_completion` fires exactly one
+    // `subagentStop` PER started child (through the `run_stop_hooks` G::Stop
+    // dispatcher, terminal), all matched on the child agent type, pairing the
+    // three per-entry `subagentStart`s.
     let (mut driver, _tmp) = test_driver(8);
     inject_hooks(
         &mut driver,

@@ -1015,12 +1015,13 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version.
 ///
-/// Current wire schema version. v12 adds daemon-owned agent installation RPCs.
+/// Current wire schema version. v13 adds daemon-owned revisioned settings,
+/// workspace-agent, and assistant-definition authority RPCs.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
 /// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 13.
 pub const PROTOCOL_VERSION: u32 = 13;
 
-/// Oldest wire schema version this binary accepts. v12 is current-only: the
+/// Oldest wire schema version this binary accepts. v13 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 13;
 
@@ -6726,7 +6727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v12_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v13_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6779,11 +6780,11 @@ mod tests {
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
-        let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
+        let fixture = proto_fixture_tests::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("v12 config_refreshed fixture")
+                .expect("current v13 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6800,18 +6801,28 @@ mod tests {
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
         assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 13);
-        let fixture = proto_fixture_tests::read_fixture_for(12, "response.json");
+        let fixture = proto_fixture_tests::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("v12 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v13 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "v12 {response_name} must freeze the inclusive verification cap"
+                "current v13 {response_name} must freeze the inclusive verification cap"
             );
-            serde_json::from_value::<Response>(response.clone())
-                .unwrap_or_else(|error| panic!("v12 {response_name} must deserialize: {error}"));
+            serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
+                panic!("current v13 {response_name} must deserialize: {error}")
+            });
         }
+    }
+
+    #[test]
+    fn archived_v12_fixture_is_retained_but_not_in_the_live_compatibility_window() {
+        assert!(!is_protocol_compatible(12));
+        let archived = proto_fixture_tests::read_fixture_for(12, "response.json");
+        assert!(archived.contains_key("config_refreshed"));
+        assert!(archived.contains_key("goal_status"));
+        assert!(archived.contains_key("goal_updated"));
     }
 }

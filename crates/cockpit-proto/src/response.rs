@@ -561,10 +561,12 @@ pub enum Response {
     /// hash and can reload their own safe view.
     ExtendedConfigSaved {
         hash: String,
+        config_generation: u64,
     },
 
     ExtendedConfigSnapshot {
-        config_json: String,
+        config: Box<cockpit_config::config::extended::ExtendedConfig>,
+        denylist: Vec<crate::RedactedDenylistEntry>,
         revision: String,
         config_generation: u64,
     },

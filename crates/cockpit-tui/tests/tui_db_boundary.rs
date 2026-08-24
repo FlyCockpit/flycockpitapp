@@ -126,6 +126,52 @@ fn tui_agent_authority_is_daemon_owned() {
 }
 
 #[test]
+fn full_production_tree_rejects_agent_and_config_authority() {
+    fn visit(path: &Path, findings: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, findings);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path.components().any(|part| part.as_os_str() == "tests")
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.ends_with("_tests.rs"))
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            let production = source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(&source);
+            for forbidden in [
+                "cockpit_core::agents::resolve(",
+                "cockpit_core::agents::list_all(",
+                "cockpit_core::agents::eject_builtin(",
+                "cockpit_core::agents::reset_all_builtins(",
+                "Request::SaveExtendedConfig",
+                "patch_json:",
+            ] {
+                if production.contains(forbidden) {
+                    findings.push(format!("{}: {forbidden}", path.display()));
+                }
+            }
+        }
+    }
+    let mut findings = Vec::new();
+    visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    assert!(
+        findings.is_empty(),
+        "authority leaks:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
 fn tui_settings_use_revisioned_typed_mutation() {
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(settings.contains("GetExtendedConfigSnapshot"));

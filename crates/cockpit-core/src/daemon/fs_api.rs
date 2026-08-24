@@ -261,17 +261,15 @@ pub async fn save_extended_config(
 /// Return the safe client projection of one settings layer and an opaque
 /// revision of the authoritative raw bytes.
 pub async fn get_extended_config_snapshot(
+    ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
-    path: String,
+    layer: cockpit_proto::CockpitConfigLayer,
 ) -> Result<Response, ErrorPayload> {
+    let root = trusted_settings_root(ctx, &project_root).await?;
     join_fs_handler(
         "get_extended_config_snapshot",
         tokio::task::spawn_blocking(move || {
-            let root = canonical_project_root(&project_root)?;
-            let target = resolve_for_write(&root, &path)?;
-            if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
-                return Err(bad_request("extended config target must be config.json"));
-            }
+            let target = settings_layer_target(&root, layer)?;
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
             let raw = match std::fs::read(&target) {
@@ -281,16 +279,18 @@ pub async fn get_extended_config_snapshot(
             };
             let mut config: cockpit_config::config::extended::ExtendedConfig =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            config.redact.denylist = config
+            let denylist = config
                 .redact
                 .denylist
                 .iter()
-                .map(|_| "[redacted]".to_string())
+                .enumerate()
+                .map(|(index, value)| redacted_denylist_entry(index, value))
                 .collect();
+            config.redact.denylist.clear();
             config.image_generation = config.image_generation.redacted_for_snapshot();
-            let config_json = serde_json::to_string(&config).map_err(internal)?;
             Ok(Response::ExtendedConfigSnapshot {
-                config_json,
+                config: Box::new(config),
+                denylist,
                 revision: content_hash(&raw),
                 config_generation: crate::daemon::server::inventory::current_config_generation(),
             })
@@ -304,19 +304,17 @@ pub async fn get_extended_config_snapshot(
 /// represented in the parsed document; the final typed render validates all
 /// known settings and preserves the daemon-owned image registry.
 pub async fn apply_extended_config_patch(
+    ctx: &crate::daemon::server::DaemonContext,
     project_root: String,
-    path: String,
-    patch_json: String,
+    layer: cockpit_proto::CockpitConfigLayer,
+    patch: cockpit_proto::ExtendedConfigPatch,
     expected_revision: String,
 ) -> Result<Response, ErrorPayload> {
+    let root = trusted_settings_root(ctx, &project_root).await?;
     join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
-            let root = canonical_project_root(&project_root)?;
-            let target = resolve_for_write(&root, &path)?;
-            if target.file_name().and_then(|name| name.to_str()) != Some("config.json") {
-                return Err(bad_request("extended config target must be config.json"));
-            }
+            let target = settings_layer_target(&root, layer)?;
             let _guard =
                 cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
             let raw = match std::fs::read(&target) {
@@ -335,9 +333,37 @@ pub async fn apply_extended_config_patch(
             }
             let mut document: serde_json::Value =
                 serde_json::from_slice(&raw).map_err(bad_request_config)?;
-            let patch: serde_json::Value =
-                serde_json::from_str(&patch_json).map_err(bad_request_config)?;
-            apply_json_merge_patch(&mut document, patch);
+            let candidate = serde_json::to_value(&patch.candidate).map_err(internal)?;
+            let object = document.as_object_mut().ok_or_else(|| {
+                bad_request("extended config root must be a JSON object")
+            })?;
+            let candidate = candidate.as_object().expect("ExtendedConfig serializes as object");
+            for field in patch.fields {
+                if field == cockpit_proto::ExtendedConfigField::ImageGeneration {
+                    return Err(bad_request(
+                        "image generation settings require the dedicated daemon API",
+                    ));
+                }
+                let key = field.json_key();
+                let value = candidate.get(key).cloned().ok_or_else(|| {
+                    bad_request(format!("typed settings candidate omitted `{key}`"))
+                })?;
+                if field == cockpit_proto::ExtendedConfigField::Redact {
+                    let existing = object
+                        .get("redact")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|redact| redact.get("denylist"))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([]));
+                    let mut value = value;
+                    value.as_object_mut().expect("RedactConfig serializes as object")
+                        .insert("denylist".into(), existing);
+                    object.insert(key.into(), value);
+                } else {
+                    object.insert(key.into(), value);
+                }
+            }
+            apply_denylist_mutations(object, patch.denylist)?;
             let patched = serde_json::to_vec_pretty(&document).map_err(internal)?;
             let merged = cockpit_config::config::extended::render_saved_extended_config_preserving_image_generation(
                 &patched,
@@ -345,33 +371,171 @@ pub async fn apply_extended_config_patch(
             )
             .map_err(bad_request_config)?;
             let desired_hash = content_hash(&merged);
-            if desired_hash != current_hash {
+            let config_generation = if desired_hash != current_hash {
                 cockpit_config::config::write_config_bytes_atomic(&target, &merged)
                     .map_err(internal)?;
-                crate::daemon::server::inventory::publish_committed_config_generation();
-            }
-            Ok(Response::ExtendedConfigSaved { hash: desired_hash })
+                crate::daemon::server::inventory::publish_committed_config_generation()
+            } else {
+                crate::daemon::server::inventory::current_config_generation()
+            };
+            Ok(Response::ExtendedConfigSaved { hash: desired_hash, config_generation })
         }),
     )
     .await
 }
 
-fn apply_json_merge_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
-    let serde_json::Value::Object(patch) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = serde_json::Value::Object(serde_json::Map::new());
+async fn trusted_settings_root(
+    ctx: &DaemonContext,
+    project_root: &str,
+) -> Result<PathBuf, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::PermissionDenied,
+            message: format!("workspace trust is required for settings mutation: {error:#}"),
+        })?;
+    if policy.mode != crate::db::workspace_trust::WorkspaceTrustMode::Trust {
+        return Err(ErrorPayload {
+            code: ErrorCode::PermissionDenied,
+            message: "settings mutation requires a trusted workspace".into(),
+        });
     }
-    let target = target.as_object_mut().expect("target normalized to object");
-    for (key, value) in patch {
-        if value.is_null() {
-            target.remove(&key);
-        } else {
-            apply_json_merge_patch(target.entry(key).or_insert(serde_json::Value::Null), value);
+    Ok(root)
+}
+
+fn settings_layer_target(
+    root: &Path,
+    layer: cockpit_proto::CockpitConfigLayer,
+) -> Result<PathBuf, ErrorPayload> {
+    let directory = match layer {
+        cockpit_proto::CockpitConfigLayer::HomeXdg => dirs::home_dir()
+            .ok_or_else(|| bad_request("home directory is unavailable"))?
+            .join(".config/cockpit"),
+        cockpit_proto::CockpitConfigLayer::HomeDot => dirs::home_dir()
+            .ok_or_else(|| bad_request("home directory is unavailable"))?
+            .join(".cockpit"),
+        cockpit_proto::CockpitConfigLayer::MachineLocal => {
+            cockpit_config::config::dirs::local_config_dir_for(root).map_err(internal)?
+        }
+        cockpit_proto::CockpitConfigLayer::Project { ancestor_depth } => {
+            let mut owner = root;
+            for _ in 0..ancestor_depth {
+                owner = owner.parent().ok_or_else(|| {
+                    bad_request("project config layer escapes the trusted workspace ancestry")
+                })?;
+            }
+            owner.join(".cockpit")
+        }
+    };
+    Ok(directory.join(cockpit_config::config::dirs::CONFIG_FILE))
+}
+
+fn denylist_id(value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-redact-denylist-entry-v1\0");
+    digest.update(value.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn redacted_denylist_entry(_index: usize, value: &str) -> cockpit_proto::RedactedDenylistEntry {
+    let id = denylist_id(value);
+    cockpit_proto::RedactedDenylistEntry {
+        entry_id: id.clone(),
+        fingerprint: id[..16].to_string(),
+        display_mask: format!("•••• ({} bytes)", value.len()),
+    }
+}
+
+fn apply_denylist_mutations(
+    document: &mut serde_json::Map<String, serde_json::Value>,
+    mutations: Vec<cockpit_proto::DenylistMutation>,
+) -> Result<(), ErrorPayload> {
+    let redact = document
+        .entry("redact")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| bad_request("redact settings must be an object"))?;
+    let values = redact
+        .entry("denylist")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| bad_request("redact.denylist must be an array"))?;
+    let mut values: Vec<(String, String)> = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(|value| (denylist_id(value), value.to_owned()))
+                .ok_or_else(|| bad_request("redact.denylist entries must be strings"))
+        })
+        .collect::<Result<_, _>>()?;
+    let locate = |values: &[(String, String)], id: &str| {
+        values.iter().position(|(entry_id, _)| entry_id == id)
+    };
+    for mutation in mutations {
+        match mutation {
+            cockpit_proto::DenylistMutation::Add { value, after_id } => {
+                validate_new_denylist_literal(&value)?;
+                let index = match after_id {
+                    Some(id) => {
+                        locate(&values, &id)
+                            .ok_or_else(|| conflict("denylist entry changed since snapshot"))?
+                            + 1
+                    }
+                    None => 0,
+                };
+                values.insert(index, (denylist_id(&value), value));
+            }
+            cockpit_proto::DenylistMutation::Update { entry_id, value } => {
+                validate_new_denylist_literal(&value)?;
+                let index = locate(&values, &entry_id)
+                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
+                values[index].1 = value;
+            }
+            cockpit_proto::DenylistMutation::Remove { entry_id } => {
+                let index = locate(&values, &entry_id)
+                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
+                values.remove(index);
+            }
+            cockpit_proto::DenylistMutation::Move { entry_id, after_id } => {
+                let index = locate(&values, &entry_id)
+                    .ok_or_else(|| conflict("denylist entry changed since snapshot"))?;
+                let value = values.remove(index);
+                let target = match after_id {
+                    Some(id) => {
+                        locate(&values, &id)
+                            .ok_or_else(|| conflict("denylist entry changed since snapshot"))?
+                            + 1
+                    }
+                    None => 0,
+                };
+                values.insert(target, value);
+            }
         }
     }
+    redact.insert(
+        "denylist".into(),
+        serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|(_, value)| serde_json::Value::String(value))
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
+    if value.is_empty() || value.len() > 64 * 1024 || value.contains('\0') {
+        return Err(bad_request("denylist literal is invalid"));
+    }
+    if value.starts_with("•••• (") && value.ends_with(" bytes)") {
+        return Err(bad_request(
+            "redacted denylist display masks are not accepted as literals",
+        ));
+    }
+    Ok(())
 }
 
 fn save_extended_config_sync(
@@ -419,11 +583,16 @@ fn save_extended_config_sync(
         )
         .map_err(bad_request_config)?;
     let desired_hash = content_hash(&merged);
-    if desired_hash != current_hash {
+    let config_generation = if desired_hash != current_hash {
         cockpit_config::config::write_config_bytes_atomic(&target, &merged).map_err(internal)?;
-        crate::daemon::server::inventory::publish_committed_config_generation();
-    }
-    Ok(Response::ExtendedConfigSaved { hash: desired_hash })
+        crate::daemon::server::inventory::publish_committed_config_generation()
+    } else {
+        crate::daemon::server::inventory::current_config_generation()
+    };
+    Ok(Response::ExtendedConfigSaved {
+        hash: desired_hash,
+        config_generation,
+    })
 }
 
 pub async fn fs_write_staged_remote(
@@ -1026,6 +1195,13 @@ fn lock_conflict(err: anyhow::Error) -> ErrorPayload {
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::BadRequest,
+        message: message.into(),
+    }
+}
+
+fn conflict(message: impl Into<String>) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Conflict,
         message: message.into(),
     }
 }

@@ -134,44 +134,103 @@ fn run_settings_daemon<T>(
     Err("settings daemon RPC requires the application runtime".to_string())
 }
 
+fn config_layer_request(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> Result<(String, cockpit_core::daemon::proto::CockpitConfigLayer), String> {
+    let home = dirs::home_dir();
+    let cwd = std::env::current_dir().ok();
+    let request_root = project_root.or(cwd.as_deref());
+    if home
+        .as_ref()
+        .is_some_and(|home| path == home.join(".config/cockpit/config.json"))
+    {
+        let root =
+            request_root.ok_or_else(|| "settings request has no workspace root".to_string())?;
+        return Ok((
+            root.display().to_string(),
+            cockpit_core::daemon::proto::CockpitConfigLayer::HomeXdg,
+        ));
+    }
+    if home
+        .as_ref()
+        .is_some_and(|home| path == home.join(".cockpit/config.json"))
+    {
+        let root =
+            request_root.ok_or_else(|| "settings request has no workspace root".to_string())?;
+        return Ok((
+            root.display().to_string(),
+            cockpit_core::daemon::proto::CockpitConfigLayer::HomeDot,
+        ));
+    }
+    if let Some(root) = request_root
+        && cockpit_config::dirs::local_config_dir_for(root)
+            .ok()
+            .as_deref()
+            == path.parent()
+    {
+        return Ok((
+            root.display().to_string(),
+            cockpit_core::daemon::proto::CockpitConfigLayer::MachineLocal,
+        ));
+    }
+    let owner = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| "project settings target has no owner".to_string())?;
+    let root = request_root
+        .filter(|root| path.starts_with(root))
+        .unwrap_or(owner);
+    let depth = root
+        .ancestors()
+        .position(|ancestor| ancestor == owner)
+        .ok_or_else(|| "project settings target is outside the workspace ancestry".to_string())?;
+    let depth =
+        u16::try_from(depth).map_err(|_| "project settings ancestry is too deep".to_string())?;
+    Ok((
+        root.display().to_string(),
+        cockpit_core::daemon::proto::CockpitConfigLayer::Project {
+            ancestor_depth: depth,
+        },
+    ))
+}
+
 fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
-    let (root, relative) = project_root
-        .filter(|root| path.starts_with(root))
-        .and_then(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| (root, relative))
-        })
-        .or_else(|| {
-            path.parent().and_then(|root| {
-                path.file_name()
-                    .map(|name| (root, std::path::Path::new(name)))
-            })
-        })
-        .ok_or_else(|| "settings snapshot target has no parent".to_string())?;
-    let project_root = root.display().to_string();
-    let path = relative.display().to_string();
+    let (project_root, layer) = config_layer_request(path, project_root)?;
     run_settings_daemon(async move {
         let client = settings_daemon_client()
             .await
             .map_err(|error| error.to_string())?;
         match client
-            .request(Request::GetExtendedConfigSnapshot { project_root, path })
+            .request(Request::GetExtendedConfigSnapshot {
+                project_root,
+                layer,
+            })
             .await
             .map_err(|error| error.to_string())?
         {
             Ok(Response::ExtendedConfigSnapshot {
-                config_json,
+                config,
+                denylist,
                 revision,
                 ..
             }) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(&config_json).map_err(|error| error.to_string())?;
-                let config =
-                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                let mut config = *config;
+                config.redact.denylist = denylist
+                    .iter()
+                    .map(|entry| entry.display_mask.clone())
+                    .collect();
+                let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
+                value
+                    .as_object_mut()
+                    .expect("ExtendedConfig serializes as object")
+                    .insert(
+                        "__cockpit_denylist_entries".into(),
+                        serde_json::to_value(denylist).map_err(|error| error.to_string())?,
+                    );
                 Ok((config, value, revision))
             }
             Ok(other) => Err(format!("unexpected settings snapshot response: {other:?}")),
@@ -187,25 +246,15 @@ fn apply_settings_patch_via_daemon(
     desired: &ExtendedConfig,
     revision: &str,
 ) -> Result<(), String> {
-    let desired = serde_json::to_value(desired).map_err(|error| error.to_string())?;
-    let patch = json_merge_diff(base, &desired).unwrap_or_else(|| serde_json::json!({}));
-    let patch_json = serde_json::to_string(&patch).map_err(|error| error.to_string())?;
-    let (root, relative) = project_root
-        .filter(|root| path.starts_with(root))
-        .and_then(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| (root, relative))
-        })
-        .or_else(|| {
-            path.parent().and_then(|root| {
-                path.file_name()
-                    .map(|name| (root, std::path::Path::new(name)))
-            })
-        })
-        .ok_or_else(|| "settings patch target has no parent".to_string())?;
-    let project_root = root.display().to_string();
-    let path = relative.display().to_string();
+    let desired_value = serde_json::to_value(desired).map_err(|error| error.to_string())?;
+    let fields = changed_extended_fields(base, &desired_value)?;
+    let denylist = denylist_mutations(base, &desired.redact.denylist)?;
+    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        candidate: desired.clone(),
+        fields,
+        denylist,
+    };
+    let (project_root, layer) = config_layer_request(path, project_root)?;
     let expected_revision = revision.to_string();
     run_settings_daemon(async move {
         let client = settings_daemon_client()
@@ -214,8 +263,8 @@ fn apply_settings_patch_via_daemon(
         match client
             .request(Request::ApplyExtendedConfigPatch {
                 project_root,
-                path,
-                patch_json,
+                layer,
+                patch,
                 expected_revision,
             })
             .await
@@ -228,81 +277,183 @@ fn apply_settings_patch_via_daemon(
     })
 }
 
-pub(super) fn apply_raw_settings_patch_via_daemon(
+pub(super) fn apply_typed_settings_document_edit(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
     patch: serde_json::Value,
 ) -> Result<(), String> {
-    let (_, _, revision) = extended_config_layer_snapshot(path, project_root)?;
-    let (root, relative) = project_root
-        .filter(|root| path.starts_with(root))
-        .and_then(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| (root, relative))
-        })
-        .or_else(|| {
-            path.parent().and_then(|root| {
-                path.file_name()
-                    .map(|name| (root, std::path::Path::new(name)))
-            })
-        })
-        .ok_or_else(|| "settings patch target has no parent".to_string())?;
-    let project_root = root.display().to_string();
-    let path = relative.display().to_string();
-    let patch_json = serde_json::to_string(&patch).map_err(|error| error.to_string())?;
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        match client
-            .request(Request::ApplyExtendedConfigPatch {
-                project_root,
-                path,
-                patch_json,
-                expected_revision: revision,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
-            Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
-            Err(error) => Err(error.to_string()),
-        }
-    })
+    let (_, mut document, revision) = extended_config_layer_snapshot(path, project_root)?;
+    let authority_base = document.clone();
+    apply_json_merge_patch_local(&mut document, patch);
+    let desired: ExtendedConfig = serde_json::from_value(document)
+        .map_err(|error| format!("invalid typed settings edit: {error}"))?;
+    apply_settings_patch_via_daemon(path, project_root, &authority_base, &desired, &revision)
 }
 
-fn json_merge_diff(
+fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch;
+        return;
+    };
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(&key);
+        } else {
+            apply_json_merge_patch_local(target.entry(key).or_default(), value);
+        }
+    }
+}
+
+fn changed_extended_fields(
     base: &serde_json::Value,
     desired: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    if base == desired {
-        return None;
-    }
-    match (base, desired) {
-        (serde_json::Value::Object(base), serde_json::Value::Object(desired)) => {
-            let mut patch = serde_json::Map::new();
-            for key in base.keys() {
-                if !desired.contains_key(key) {
-                    patch.insert(key.clone(), serde_json::Value::Null);
-                }
-            }
-            for (key, desired_value) in desired {
-                match base.get(key) {
-                    Some(base_value) => {
-                        if let Some(value) = json_merge_diff(base_value, desired_value) {
-                            patch.insert(key.clone(), value);
-                        }
-                    }
-                    None => {
-                        patch.insert(key.clone(), desired_value.clone());
-                    }
-                }
-            }
-            (!patch.is_empty()).then_some(serde_json::Value::Object(patch))
+) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigField>, String> {
+    use cockpit_core::daemon::proto::ExtendedConfigField as F;
+    let all = [
+        F::ResponseMetricsTokenizer,
+        F::ImageGeneration,
+        F::Harnesses,
+        F::AgentGuidanceFiles,
+        F::Concurrency,
+        F::AgentDirs,
+        F::GitignoreAllow,
+        F::Redact,
+        F::Tui,
+        F::Name,
+        F::PackagesDirectory,
+        F::Tools,
+        F::Web,
+        F::ComputerUse,
+        F::AllowRemoteConfig,
+        F::UtilityModel,
+        F::TranslationModel,
+        F::CheapCode,
+        F::SmartCode,
+        F::Reasoning,
+        F::AgentChoosesSubagentModel,
+        F::AutoTitle,
+        F::SkillInjection,
+        F::PredictNextMessageModel,
+        F::HarnessReportSummarization,
+        F::CompactModel,
+        F::BtwModel,
+        F::EmbeddingModel,
+        F::ProjectKnowledge,
+        F::KnowledgeInjectMaxTokens,
+        F::CompactPrompt,
+        F::PromptInjectionGuard,
+        F::Preflight,
+        F::SystemPrompt,
+        F::Schedule,
+        F::ResourceScheduler,
+        F::Sandbox,
+        F::Daemon,
+        F::MediaResources,
+        F::Retention,
+        F::Delegation,
+        F::Deepthink,
+        F::Review,
+        F::GoalSupervision,
+        F::Lsp,
+        F::DataSyntax,
+        F::LoopGuard,
+        F::MaxPrimaryRounds,
+        F::Dialog,
+        F::Skills,
+        F::LlmMode,
+        F::DefaultPrimaryAgent,
+        F::RemovedDefaultPrimaryAgent,
+        F::Translation,
+        F::SandboxEscalationEnabled,
+        F::DefaultApprovalMode,
+        F::ApprovalPolicy,
+        F::PredictNextMessage,
+        F::ShellCompression,
+        F::CommandResourceProfiles,
+        F::InlineThink,
+        F::HintToolCallCorrections,
+        F::TextEmbeddedRecovery,
+        F::IntelCentralityRanking,
+    ];
+    let base = base
+        .as_object()
+        .ok_or_else(|| "settings base is not an object".to_string())?;
+    let desired = desired
+        .as_object()
+        .ok_or_else(|| "settings candidate is not an object".to_string())?;
+    Ok(all
+        .into_iter()
+        .filter(|field| base.get(field.json_key()) != desired.get(field.json_key()))
+        .collect())
+}
+
+fn denylist_mutations(
+    base: &serde_json::Value,
+    desired: &[String],
+) -> Result<Vec<cockpit_core::daemon::proto::DenylistMutation>, String> {
+    use cockpit_core::daemon::proto::{DenylistMutation as M, RedactedDenylistEntry};
+    let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
+        base.get("__cockpit_denylist_entries")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut used = std::collections::HashSet::new();
+    let mut target: Vec<(String, Option<String>)> = Vec::new();
+    for (index, value) in desired.iter().enumerate() {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.display_mask == *value && !used.contains(&entry.entry_id))
+        {
+            used.insert(entry.entry_id.clone());
+            target.push((entry.entry_id.clone(), None));
+        } else if let Some(entry) = entries
+            .get(index)
+            .filter(|entry| !used.contains(&entry.entry_id))
+        {
+            used.insert(entry.entry_id.clone());
+            target.push((entry.entry_id.clone(), Some(value.clone())));
+        } else {
+            target.push((format!("new:{index}"), Some(value.clone())));
         }
-        _ => Some(desired.clone()),
     }
+    let mut operations = Vec::new();
+    let mut after_id: Option<String> = None;
+    for (id, replacement) in &target {
+        if id.starts_with("new:") {
+            let value = replacement.clone().expect("new entry has value");
+            operations.push(M::Add {
+                value: value.clone(),
+                after_id: after_id.clone(),
+            });
+            // The server's opaque ID is intentionally not reproducible by the
+            // client, so later additions remain head inserts in reverse order.
+            after_id = None;
+        } else {
+            operations.push(M::Move {
+                entry_id: id.clone(),
+                after_id: after_id.clone(),
+            });
+            if let Some(value) = replacement {
+                operations.push(M::Update {
+                    entry_id: id.clone(),
+                    value: value.clone(),
+                });
+            }
+            after_id = Some(id.clone());
+        }
+    }
+    for entry in &entries {
+        if !used.contains(&entry.entry_id) {
+            operations.push(M::Remove {
+                entry_id: entry.entry_id.clone(),
+            });
+        }
+    }
+    Ok(operations)
 }
 
 /// Search the complete metadata-only secret inventory.  Inventory pages are
@@ -5084,7 +5235,7 @@ fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
     #[cfg(not(test))]
     {
         let config_path = dir.join(CONFIG_FILE);
-        apply_raw_settings_patch_via_daemon(
+        apply_typed_settings_document_edit(
             &config_path,
             None,
             serde_json::json!({ "agents": {}, "tools": {} }),

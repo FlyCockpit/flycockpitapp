@@ -154,19 +154,6 @@ fn validate_owner_project_root(value: &str) -> Result<(), String> {
     validate_owner_identifier("project root", value, MAX_OWNER_PROJECT_ROOT_BYTES)
 }
 
-fn validate_extended_config_path(path: &str) -> Result<(), String> {
-    if path.is_empty()
-        || path.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES
-        || path.starts_with('/')
-        || path.contains("..")
-        || path.contains('\0')
-        || !path.ends_with("config.json")
-    {
-        return Err("extended config path must name a config.json layer".to_string());
-    }
-    Ok(())
-}
-
 /// Provider endpoints are configuration, never a credential transport. Keep
 /// this check in one shared helper so every owner ingress (including the
 /// staged SaveProviderConfig path) rejects URL userinfo and covert query or
@@ -828,7 +815,7 @@ pub enum Request {
 
     FsList {
         project_root: String,
-        path: String,
+        layer: crate::CockpitConfigLayer,
         #[serde(default)]
         show_hidden: bool,
     },
@@ -1693,14 +1680,12 @@ pub enum Request {
         path: String,
     },
 
-    /// Apply an RFC 7396-style typed JSON merge patch to the authoritative
-    /// settings layer. The daemon rereads under its mutation lock and rejects
-    /// a stale revision before merging, validating, and publishing.
+    /// Apply a typed field patch to the authoritative daemon-selected layer.
     ApplyExtendedConfigPatch {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        path: String,
-        patch_json: String,
+        layer: crate::CockpitConfigLayer,
+        patch: crate::ExtendedConfigPatch,
         expected_revision: String,
     },
 
@@ -2751,20 +2736,31 @@ impl Request {
                     return Err("agent markdown exceeds maximum length".to_string());
                 }
             }
-            Self::GetExtendedConfigSnapshot { project_root, path } => {
+            Self::GetExtendedConfigSnapshot { project_root, .. } => {
                 validate_owner_project_root(project_root)?;
-                validate_extended_config_path(path)?;
             }
             Self::ApplyExtendedConfigPatch {
                 project_root,
-                path,
-                patch_json,
+                layer,
+                patch,
                 expected_revision,
             } => {
                 validate_owner_project_root(project_root)?;
-                validate_extended_config_path(path)?;
-                if patch_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                if matches!(
+                    layer,
+                    crate::CockpitConfigLayer::Project { ancestor_depth }
+                        if *ancestor_depth > 256
+                ) {
+                    return Err("project settings layer ancestry is too deep".to_string());
+                }
+                let encoded = serde_json::to_vec(patch)
+                    .map_err(|error| format!("extended config patch is invalid: {error}"))?;
+                if encoded.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("extended config patch exceeds maximum length".to_string());
+                }
+                let mut fields = std::collections::HashSet::new();
+                if !patch.fields.iter().all(|field| fields.insert(*field)) {
+                    return Err("extended config patch repeats a field".to_string());
                 }
                 if expected_revision.is_empty() || expected_revision.len() > 128 {
                     return Err("extended config revision is invalid".to_string());
@@ -3338,8 +3334,8 @@ macro_rules! command {
             (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
             (Request::BeginAgentEditorLease { project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|name:String|expected_revision:String", [project_root: String => project_root, name: String => param, expected_revision: String => param]);
             (Request::CompleteAgentEditorLease { project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|lease_id:String|markdown:Option<String>", [project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
-            (Request::GetExtendedConfigSnapshot { project_root, path }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|path:String", [project_root: String => project_root, path: String => param]);
-            (Request::ApplyExtendedConfigPatch { project_root, path, patch_json, expected_revision }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|path:String|patch_json:String|expected_revision:String", [project_root: String => project_root, path: String => param, patch_json: String => param, expected_revision: String => param]);
+            (Request::GetExtendedConfigSnapshot { project_root, layer }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|layer:crate::CockpitConfigLayer", [project_root: String => project_root, layer: crate::CockpitConfigLayer => param]);
+            (Request::ApplyExtendedConfigPatch { project_root, layer, patch, expected_revision }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|layer:crate::CockpitConfigLayer|patch:crate::ExtendedConfigPatch|expected_revision:String", [project_root: String => project_root, layer: crate::CockpitConfigLayer => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);

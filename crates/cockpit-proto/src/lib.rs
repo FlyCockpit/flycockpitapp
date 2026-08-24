@@ -27,6 +27,7 @@
 pub mod agent_installation;
 pub mod agent_management;
 pub mod capability_ceiling;
+pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use agent_installation::{
@@ -40,6 +41,10 @@ pub use agent_installation::{
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_NAME_BYTES,
+};
+pub use config_management::{
+    CockpitConfigLayer, DenylistMutation, ExtendedConfigField, ExtendedConfigPatch,
+    RedactedDenylistEntry,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;

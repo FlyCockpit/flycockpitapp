@@ -3510,7 +3510,7 @@ fn remove_project_shadow_path(
         for parent in parents.iter().rev() {
             patch = serde_json::json!({ (parent): patch });
         }
-        super::apply_raw_settings_patch_via_daemon(project_config, None, patch)?;
+        super::apply_typed_settings_document_edit(project_config, None, patch)?;
         Ok(true)
     }
 }

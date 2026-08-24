@@ -900,21 +900,8 @@ impl SettingsCx {
         };
         detail.row_errors.clear();
         if detail.revision.is_none() {
-            let current = match std::fs::read_to_string(&detail.path) {
-                Ok(text) => text,
-                Err(e) => {
-                    detail.status = Some(format!(
-                        "save failed: reading {}: {e}",
-                        detail.path.display()
-                    ));
-                    return;
-                }
-            };
-            if current != detail.original_text {
-                detail.status =
-                    Some("conflict: file changed on disk; raw editor can reconcile it".into());
-                return;
-            }
+            detail.status = Some("save failed: missing daemon-owned revision".into());
+            return;
         }
         detail.draft.write_to_def(&mut detail.def);
         let cleanup_notice = detail

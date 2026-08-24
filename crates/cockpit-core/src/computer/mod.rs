@@ -1447,6 +1447,49 @@ impl NativeComputerToolConfig {
     }
 }
 
+/// The provider identifiers reserved by the native computer-use tool.
+///
+/// These are the wire `type` strings advertised in [`native_computer_wire`]
+/// (OpenAI `computer`; Anthropic `computer_20251124` / `computer_20250124`)
+/// plus the Anthropic `tool_use` `name` (`computer`, which coincides with the
+/// OpenAI `type`). A provider may surface a native computer item to the generic
+/// Rig `AssistantContent::ToolCall` layer under one of these identifiers;
+/// ordinary function-tool dispatch must refuse them rather than re-parse native
+/// computer JSON as an ordinary tool. Native computer items are executed only
+/// through the coordinator's raw-content extraction seam. This module is the
+/// single reserved-name authority — the wire builder below references these
+/// constants so the advertised tool and the refusal set stay in lockstep — and
+/// [`is_reserved_native_computer_tool_name`] is the one predicate the dispatch
+/// path consults.
+pub const NATIVE_COMPUTER_TOOL_NAME: &str = "computer";
+/// The OpenAI Responses computer tool `type` (equals [`NATIVE_COMPUTER_TOOL_NAME`]).
+pub const OPENAI_COMPUTER_TOOL_TYPE: &str = "computer";
+/// The Anthropic 2025-11-24 computer tool `type`.
+pub const ANTHROPIC_COMPUTER_TOOL_TYPE_20251124: &str = "computer_20251124";
+/// The Anthropic 2025-01-24 computer tool `type`.
+pub const ANTHROPIC_COMPUTER_TOOL_TYPE_20250124: &str = "computer_20250124";
+
+/// True when `name` is a provider identifier reserved for the native
+/// computer-use tool (see [`NATIVE_COMPUTER_TOOL_NAME`] and the tool-type
+/// constants). Ordinary Rig function-tool dispatch refuses these names/types so
+/// a native computer call is never re-parsed and executed as an ordinary tool.
+///
+/// This is a *tool-call name/type* predicate for the generic-dispatch chokepoint
+/// — it is unrelated to the `computer` **subagent**, which is constructed only
+/// through the `task` delegation path (`engine::builtin::load`) and never
+/// reaches ordinary function-tool dispatch.
+pub fn is_reserved_native_computer_tool_name(name: &str) -> bool {
+    // `OPENAI_COMPUTER_TOOL_TYPE == NATIVE_COMPUTER_TOOL_NAME`, so the OpenAI
+    // `type` is already covered by the first arm; listing it again would be an
+    // unreachable duplicate pattern.
+    matches!(
+        name,
+        NATIVE_COMPUTER_TOOL_NAME
+            | ANTHROPIC_COMPUTER_TOOL_TYPE_20251124
+            | ANTHROPIC_COMPUTER_TOOL_TYPE_20250124
+    )
+}
+
 pub fn native_computer_wire(
     contract: ComputerToolContract,
     geometry: &DisplayGeometry,
@@ -1458,8 +1501,8 @@ pub fn native_computer_wire(
             group: contract.group(),
             beta_headers: vec!["computer-use-2025-11-24"],
             tools: vec![serde_json::json!({
-                "type": "computer_20251124",
-                "name": "computer",
+                "type": ANTHROPIC_COMPUTER_TOOL_TYPE_20251124,
+                "name": NATIVE_COMPUTER_TOOL_NAME,
                 "display_width_px": width,
                 "display_height_px": height,
                 "enable_zoom": true,
@@ -1469,8 +1512,8 @@ pub fn native_computer_wire(
             group: contract.group(),
             beta_headers: vec!["computer-use-2025-01-24"],
             tools: vec![serde_json::json!({
-                "type": "computer_20250124",
-                "name": "computer",
+                "type": ANTHROPIC_COMPUTER_TOOL_TYPE_20250124,
+                "name": NATIVE_COMPUTER_TOOL_NAME,
                 "display_width_px": width,
                 "display_height_px": height,
             })],
@@ -1478,7 +1521,7 @@ pub fn native_computer_wire(
         ComputerToolContract::OpenAiResponses => NativeComputerWire {
             group: contract.group(),
             beta_headers: Vec::new(),
-            tools: vec![serde_json::json!({ "type": "computer" })],
+            tools: vec![serde_json::json!({ "type": OPENAI_COMPUTER_TOOL_TYPE })],
         },
     }
 }
@@ -3125,6 +3168,56 @@ mod tests {
             point: provider_point(x, y, space),
             duration: Duration::from_millis(7),
             easing: Easing::EaseInOut,
+        }
+    }
+
+    #[test]
+    fn reserved_native_computer_tool_name_covers_wire_identifiers() {
+        // Every `type`/`name` the wire builder advertises is reserved.
+        for contract in [
+            ComputerToolContract::Anthropic20251124,
+            ComputerToolContract::Anthropic20250124,
+            ComputerToolContract::OpenAiResponses,
+        ] {
+            let wire = native_computer_wire(contract, &test_geometry());
+            for tool in &wire.tools {
+                let ty = tool["type"].as_str().expect("wire tool has a type");
+                assert!(
+                    is_reserved_native_computer_tool_name(ty),
+                    "advertised type `{ty}` must be reserved"
+                );
+                if let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) {
+                    assert!(
+                        is_reserved_native_computer_tool_name(name),
+                        "advertised name `{name}` must be reserved"
+                    );
+                }
+            }
+        }
+        // The three distinct reserved identifiers, spelled out.
+        assert!(is_reserved_native_computer_tool_name(NATIVE_COMPUTER_TOOL_NAME));
+        assert!(is_reserved_native_computer_tool_name(OPENAI_COMPUTER_TOOL_TYPE));
+        assert!(is_reserved_native_computer_tool_name(
+            ANTHROPIC_COMPUTER_TOOL_TYPE_20251124
+        ));
+        assert!(is_reserved_native_computer_tool_name(
+            ANTHROPIC_COMPUTER_TOOL_TYPE_20250124
+        ));
+        // Ordinary tool names — including near-misses — are not reserved.
+        for ordinary in [
+            "read",
+            "bash",
+            "task",
+            "computer_use",
+            "computers",
+            "Computer",
+            "computer_20260101",
+            "",
+        ] {
+            assert!(
+                !is_reserved_native_computer_tool_name(ordinary),
+                "`{ordinary}` must not be reserved"
+            );
         }
     }
 

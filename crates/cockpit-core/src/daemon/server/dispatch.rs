@@ -1603,7 +1603,9 @@ async fn commit_remote_idempotent_adapter(
                 outbox_kind: kind,
                 outbox_payload: &bytes,
                 now_ms: chrono::Utc::now().timestamp_millis(),
-            }, expected_dispatch_generation,
+            },
+            remote_adapter_incarnation_id(),
+            expected_dispatch_generation,
         )
         .await
         .map_err(internal)?

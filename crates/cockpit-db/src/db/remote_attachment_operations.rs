@@ -1218,6 +1218,7 @@ impl Db {
     pub async fn commit_idempotent_adapter_remote_operation(
         &self,
         request: CommitRemoteOperation<'_>,
+        expected_dispatch_owner: Uuid,
         expected_dispatch_generation: u64,
     ) -> Result<CommitRemoteOperationOutcome> {
         ensure!(expected_dispatch_generation > 0, "adapter generation must be positive");
@@ -1231,17 +1232,28 @@ impl Db {
             now_ms: request.now_ms,
         };
         let generation = i64::try_from(expected_dispatch_generation)?;
+        let owner = expected_dispatch_owner.hyphenated().to_string();
         self.transaction(move |conn| {
             let owns_generation: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM remote_attachment_operations
                  WHERE logical_attachment_id=?1 AND operation_id=?2
                    AND operation_class='idempotent_adapter_mutation'
                    AND operation_kind='generic' AND state='dispatched'
-                   AND dispatch_generation=?3)",
-                params![owned.logical_attachment_id, owned.operation_id, generation],
+                   AND dispatch_generation=?3 AND dispatch_lease_owner=?4
+                   AND dispatch_lease_expires_at_ms>?5)",
+                params![
+                    owned.logical_attachment_id,
+                    owned.operation_id,
+                    generation,
+                    owner,
+                    owned.now_ms
+                ],
                 |row| row.get(0),
             )?;
-            ensure!(owns_generation, "adapter commit lost dispatch generation authority");
+            ensure!(
+                owns_generation,
+                "adapter commit lost live dispatch owner/generation authority"
+            );
             commit_conn_with_policy(conn, &owned, false)
         }).await
     }
@@ -2676,19 +2688,70 @@ mod tests {
                 ..
             }
         ));
-        let commit = || CommitRemoteOperation {
+        let commit = |now_ms| CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,
             operation_id: operation,
             safe_response: b"adapter-safe",
             outbox_delivery_id: "00000000-0000-4000-8000-00000000009e",
             outbox_kind: "adapter_test",
             outbox_payload: b"adapter-event",
-            now_ms: 111,
+            now_ms,
         };
-        assert!(db.commit_idempotent_adapter_remote_operation(commit(), 1).await.is_err());
-        db.commit_idempotent_adapter_remote_operation(commit(), 2)
-        .await
-        .unwrap();
+        // A generation alone is not authority: the exact daemon incarnation
+        // that owns the live lease must present it.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(
+                commit(111),
+                first_incarnation,
+                2
+            )
+            .await
+            .is_err()
+        );
+        // Lease validity is a strict interval. At the expiry boundary the
+        // unreclaimed owner may no longer publish a response or outbox row.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(
+                commit(210),
+                second_incarnation,
+                2
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            db.begin_idempotent_adapter_remote_operation(request(210), first_incarnation, 100)
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 3,
+                ..
+            }
+        ));
+        // Reclaiming permanently fences the former owner and generation.
+        assert!(
+            db.commit_idempotent_adapter_remote_operation(
+                commit(211),
+                second_incarnation,
+                2
+            )
+            .await
+            .is_err()
+        );
+        let outbox_before_commit = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM remote_attachment_outbox",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbox_before_commit, 0, "rejected commits must not publish");
+        db.commit_idempotent_adapter_remote_operation(commit(211), first_incarnation, 3)
+            .await
+            .unwrap();
         assert_eq!(
             db.begin_idempotent_adapter_remote_operation(request(112), second_incarnation, 100)
                 .await
